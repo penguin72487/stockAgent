@@ -10,5 +10,7 @@
   "reserve_bytes": 21474836480,
   "batch_objects": 32,
   "poll_seconds": 30,
-  "checksum_recheck_days": 30
+  "idle_reconcile_seconds": 300,
+  "checksum_recheck_days": 30,
+  "backup_scope": "current_heads"
 }

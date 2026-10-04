@@ -1,0 +1,5 @@
+# Install into an isolated --target directory; do not replace training packages.
+rapidocr==3.9.2
+onnxruntime-gpu==1.30.0
+numpy==2.5.3
+opencv-python==5.0.0.93

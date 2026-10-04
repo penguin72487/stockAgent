@@ -4,6 +4,15 @@ import json
 import polars as pl
 import pytest
 
+from scripts.rebuild_tw_overnight_history import _blocked_replay_signal
+from scripts.run_tw_overnight_simulation import (
+    SHARED_QUOTE_MIN_INTERVAL_SECONDS,
+    _readiness_refresh_interval_seconds,
+    _service_status_text,
+    _shared_quote_due,
+    _spec_reload_due,
+    _spec_reload_interval_seconds,
+)
 from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
@@ -12,7 +21,47 @@ from stockagent.live.tw_day_trade_dashboard import (
 )
 from stockagent.live.tw_overnight_replay import TwOvernightHistoricalReplayEngine
 from stockagent.live.tw_overnight_simulation import TwOvernightSimulationEngine
+from stockagent.live.tw_day_trade_service_sync import load_service_sync
 from test_tw_overnight_simulation import _at, _row, _spec, _summary
+
+
+def test_shared_quote_poll_is_bounded_without_waiting_a_full_minute():
+    assert SHARED_QUOTE_MIN_INTERVAL_SECONDS == 1.0
+    assert _shared_quote_due(100.0, float("-inf"))
+    assert not _shared_quote_due(100.999, 100.0)
+    assert _shared_quote_due(101.0, 100.0)
+
+
+def test_overnight_idle_heartbeat_keeps_auction_windows_fast(tmp_path):
+    for observed in (_at(9, 8, 30), _at(9, 9, 0), _at(9, 13, 20)):
+        assert _readiness_refresh_interval_seconds(observed) == 10
+        assert _spec_reload_interval_seconds(observed) == 30
+    for observed in (_at(9, 7, 0), _at(9, 10, 0), _at(9, 14, 0)):
+        assert _readiness_refresh_interval_seconds(observed) == 60
+        assert _spec_reload_interval_seconds(observed) == 60
+    assert _readiness_refresh_interval_seconds(
+        _at(9, 13, 20), has_enabled_modes=False,
+    ) == 60
+    assert _spec_reload_due(100.0, 0.0, 60.0)
+    assert not _spec_reload_due(120.0, 100.0, 60.0)
+
+    engine = TwOvernightSimulationEngine(tmp_path / "live_state")
+    engine.update_readiness([_spec(tmp_path)], now=_at(9, 10, 0))
+    state_before = engine.state_path.read_bytes()
+    status_before = engine.status_path.read_bytes()
+    committed = load_service_sync(engine.state_dir)
+    assert committed is not None
+    engine.publish_liveness(_at(9, 10, 20))
+    alive = load_service_sync(engine.state_dir)
+    assert alive is not None
+    assert alive["state_revision"] == committed["state_revision"]
+    assert alive["published_at"] == committed["published_at"]
+    assert alive["heartbeat_at"] != committed["heartbeat_at"]
+    assert engine.state_path.read_bytes() == state_before
+    assert engine.status_path.read_bytes() == status_before
+
+    engine.state["enabled_markets"] = []
+    assert "no enabled modes" in _service_status_text(engine, _at(9, 14, 0))
 
 
 def select(engine, day, *, opening=103.0, close=101.0):
@@ -97,6 +146,58 @@ def test_missing_next_open_preserves_unclosed_cohort(tmp_path):
     position = next(iter(engine.state['modes'][spec.market]['positions'].values()))
     assert position['signed_shares'] == 2000
     assert len(engine.fills_path.read_text().splitlines()) == 1
+
+
+def test_missing_next_open_blocks_only_new_cohort_without_fabricating_fill(tmp_path):
+    spec = _spec(tmp_path)
+    engine = TwOvernightHistoricalReplayEngine(tmp_path / 'replay')
+    engine.update_readiness([spec], now=_at(9, 13, 25))
+    quotes = select(engine, 9)
+    summary = {**_summary(), 'counterfactual_signal_regeneration': True,
+               'replay_effective_signal_at': _at(9, 13, 25).isoformat()}
+    assert engine.register_close_signal(
+        spec=spec, summary=summary, signal_rows=[_row()],
+        quotes=quotes, now=_at(9, 13, 25),
+    ) == 'registered'
+    engine.process_quotes(quotes=quotes, now=_at(9, 13, 30))
+    quotes = select(engine, 10, opening=None)
+    engine.process_quotes(quotes=quotes, now=_at(10, 9, 0))
+    second = {**summary, 'signal_id': 'second-signal',
+              'replay_effective_signal_at': _at(10, 13, 25).isoformat()}
+    outcome = engine.register_close_signal(
+        spec=spec, summary=second, signal_rows=[_row()],
+        quotes=quotes, now=_at(10, 13, 25),
+    )
+    blocked = _blocked_replay_signal(
+        market=spec.market, day='2026-09-10', outcome=outcome,
+        mode=engine.state['modes'][spec.market], signal_id='second-signal',
+    )
+    assert blocked is not None
+    assert blocked['reason'] == 'prior_overnight_cohort_still_open'
+    assert blocked['unresolved_positions'] == ['2026-09-09:2330:working']
+    assert len(engine.fills_path.read_text().splitlines()) == 1
+    quotes = select(engine, 11, opening=103.)
+    engine.process_quotes(quotes=quotes, now=_at(11, 9, 0))
+    assert next(iter(engine.state['modes'][spec.market]['positions'].values()))['signed_shares'] == 0
+    assert len(engine.fills_path.read_text().splitlines()) == 2
+
+
+def test_historical_replay_still_rejects_unrelated_execution_block():
+    with pytest.raises(ValueError, match='signal_before_13_20_decision_gate'):
+        _blocked_replay_signal(
+            market='test', day='2026-09-10', outcome='blocked',
+            mode={'blocked_reason': 'signal_before_13_20_decision_gate', 'positions': {}},
+            signal_id='bad-signal',
+        )
+    with pytest.raises(ValueError, match='prior_overnight_cohort_still_open'):
+        _blocked_replay_signal(
+            market='test', day='2026-09-10', outcome='already_processed',
+            mode={'blocked_reason': 'prior_overnight_cohort_still_open',
+                  'signal_id': 'old-signal',
+                  'positions': {'p': {'session_date': '2026-09-09', 'symbol': '2330',
+                                      'signed_shares': 1000, 'opening_exit_order_status': 'working'}}},
+            signal_id='new-signal',
+        )
 
 
 def test_historical_short_uses_ordinary_sell_tax_and_buyback_direction(tmp_path):

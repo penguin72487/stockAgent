@@ -10,8 +10,10 @@ Group=root
 WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
-ExecCondition=/usr/bin/bash __REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh
-ExecCondition=/usr/bin/flock -n /srv/stockagent-live/.locks/tw-public-refresh.lock /usr/bin/true
+ExecCondition=/usr/bin/bash __REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh --minimum-runway-minutes 45
+# The Python producer waits at most 120 seconds for this same lock, then checks
+# the protected opening window again. A one-shot preflight would silently skip
+# the entire 07:00 release when the eligibility watcher briefly owns it.
 ExecStart=/usr/bin/bash -lc 'source scripts/runtime_env.sh && run_fintech_python scripts/refresh_tw_public_release_archives.py --output-dir /srv/stockagent-live/data_tw_public --auto-full-sunday'
 Nice=15
 CPUWeight=10

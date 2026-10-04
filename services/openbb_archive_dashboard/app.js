@@ -29,7 +29,7 @@ function bytes(value) {
 }
 
 function healthLabel(health) {
-  return ({active: "下載中", starting: "啟動／稽核中", complete: "封存完成", degraded: "活動逾時", stopped: "程序停止", unavailable: "無法取得"})[health] || "狀態未知";
+  return ({active: "下載中", waiting: "等待上游", starting: "啟動／稽核中", complete: "封存完成", degraded: "活動逾時", stopped: "程序停止", unavailable: "無法取得"})[health] || "狀態未知";
 }
 
 function renderStatus(data) {
@@ -39,13 +39,18 @@ function renderStatus(data) {
   const storage = data.storage || {};
   const health = String(data.health || "unavailable");
   const status = $("connection-status");
-  status.className = `status ${health}`;
+  status.className = `status ${health === "waiting" ? "degraded" : health}`;
   status.lastChild.textContent = healthLabel(health);
-  const phaseLabel = ({planning: "建立任務規劃", download: "下載", running: "下載", initializing: "初始化"})[process.phase] || String(process.phase || "未知階段");
+  const phaseLabel = ({planning: "建立任務規劃", download: "下載", running: "下載", waiting: "排程等待", initializing: "初始化"})[process.phase] || String(process.phase || "未知階段");
   const phaseProgress = finite(process.phase_total) > 0
     ? ` ${number.format(finite(process.phase_completed))}/${number.format(finite(process.phase_total))}`
     : "";
-  $("source-freshness").textContent = `${phaseLabel}${phaseProgress} · 程序活動 ${ageLabel(process.activity_age_seconds)} · 完整稽核 ${ageLabel(data.source_age_seconds)}（${data.snapshot_state === "current" ? "新鮮" : "逾時"}）`;
+  const waitReason = process.wait_reason === "provider_cooldown" ? "供應商配額冷卻" : "等待排程條件";
+  const waitUntil = process.wait_until
+    ? ` · 最早重試 ${new Date(process.wait_until).toLocaleString("zh-TW", {hour12: false})}`
+    : "";
+  const waitDetail = health === "waiting" ? ` · ${waitReason}${waitUntil}` : "";
+  $("source-freshness").textContent = `${phaseLabel}${phaseProgress}${waitDetail} · 程序活動 ${ageLabel(process.activity_age_seconds)} · 完整稽核 ${ageLabel(data.source_age_seconds)}（${data.snapshot_state === "current" ? "新鮮" : "逾時"}）`;
   $("archive-boundary").textContent = `${archive.start_date || "—"} 至 ${archive.end_date || "—"} · ${number.format(finite(archive.endpoint_count))} 個端點`;
   $("completion-percent").textContent = pct(archive.completion_percent);
   $("accepted-fraction").textContent = `${number.format(finite(archive.accepted_tasks))} / ${number.format(finite(archive.total_tasks))} 任務`;
@@ -89,7 +94,7 @@ function renderStatus(data) {
 
 function renderRuntimeAlert(data) {
   const panel = $("runtime-alert");
-  const stopped = !["active", "starting", "complete"].includes(String(data.health));
+  const stopped = !["active", "waiting", "starting", "complete"].includes(String(data.health));
   const stale = data.snapshot_state !== "current";
   panel.hidden = !stopped && !stale;
   if (panel.hidden) return;

@@ -1,0 +1,11 @@
+[Unit]
+Description=Audit stored FinMind and official prices after daily publication
+
+[Timer]
+OnCalendar=*-*-* 18:10:00 Asia/Taipei
+Persistent=true
+AccuracySec=5min
+Unit=stockagent-finmind-source-audit.service
+
+[Install]
+WantedBy=timers.target

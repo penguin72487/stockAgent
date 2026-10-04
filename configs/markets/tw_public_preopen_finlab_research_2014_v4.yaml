@@ -1,0 +1,40 @@
+# Local-only exploratory ABI. FinLab values are current revisions and their
+# historical publication vintages are unverified; never deploy or publish.
+base_config: tw_public_preopen_all_observed_research_2014_v3.yaml
+experiment_name: tw-public-preopen-finlab-research-2014-v4
+
+runner:
+  output_dir: artifacts/markets/tw_public_preopen_finlab_research_2014_v4
+  resume: false
+  post_train_infer: false
+
+data:
+  tw_public_feature_path: artifacts/research_features/tw_public_research_finlab_2014_v4.parquet
+  feature_include:
+    - body_ratio
+    - close_logret_1d
+    - close_raw
+    - clv
+    - clv_centered
+    - delta_body_ratio
+    - delta_clv
+    - high_raw
+    - low_raw
+    - lower_shadow
+    - max_logret_1d
+    - min_logret_1d
+    - open_logret_1d
+    - open_raw
+    - shadow_imbalance
+    - signed_body_ratio
+    - signed_vol
+    - trading_volume_logret_1d
+    - trading_volume_raw
+    - upper_shadow
+    - twpub_*
+    - twfl_*
+  feature_availability_indicators:
+    - twpub_*
+    - twfl_*
+  # twfl_* has already been assigned its next usable research session by the
+  # overlay builder; do not shift it again here. The parent twpub shifts remain.

@@ -621,6 +621,8 @@ def _run_batch(args) -> int:
             export_inventory(login(), args.contracts_file.parent)
         catalog_sha = _sha256(args.contracts_file)
         aliases = pl.read_csv(args.contracts_file).sort(['priority', 'contract']).to_dicts()
+        if not aliases:
+            raise RuntimeError('empty futures alias catalog; refuse a complete sweep')
         _atomic_write_json(receipt_path, {'schema_version': 2, 'status': 'planning',
                                          'target_end_date': str(end), 'total_contracts': len(aliases),
                                          'catalog_sha256': catalog_sha, 'started_at_utc': utc_stamp()})
@@ -685,9 +687,20 @@ def _run_batch(args) -> int:
                 print(f'[shioaji-futures-history] scanned={index + 1}/{len(aliases)} queries={queries}', flush=True)
             if exit_code:
                 break
-        payload = {'schema_version': 2, 'status': 'planned' if args.dry_run else 'batch_finished',
+            # No further API query fits this batch.  Defer the remaining
+            # catalog audit to the next sweep instead of holding the shared
+            # login while validating contracts that cannot be queried now.
+            if (not args.dry_run and args.max_dates and queries >= args.max_dates
+                    and index + 1 < len(aliases)):
+                print(f'[shioaji-futures-history] query_budget_reached={queries} '
+                      f'scanned={index + 1}/{len(aliases)}', flush=True)
+                break
+        sweep_complete = len(records) == len(aliases)
+        payload = {'schema_version': 2, 'status': 'planned' if args.dry_run else 'batch_finished' if sweep_complete else 'batch_partial',
                    'target_end_date': str(end), 'catalog_sha256': catalog_sha,
                    'total_contracts': len(aliases), 'scanned_contracts': len(records),
+                   'coverage_scope': 'full_catalog' if sweep_complete else 'scanned_contracts_only',
+                   'query_budget_reached': bool(args.max_dates and queries >= args.max_dates),
                    'queries': queries, 'planned_queries': sum(r['planned_queries'] for r in records),
                    'provider_unavailable_contracts': sum(r['provider_unavailable'] for r in records),
                    'positive_activity_empty_dates_before_batch': sum(r['positive_activity_empty_dates'] for r in records),
@@ -695,10 +708,10 @@ def _run_batch(args) -> int:
                    'failed_contracts': sum('error_type' in r for r in records),
                    'missing_dates_after_batch': sum(r['missing_dates_after_batch'] for r in records),
                    'positive_activity_empty_dates_after_batch': sum(r['positive_empty_dates_after_batch'] for r in records),
-                   'current_query_sweep_complete': len(records) == len(aliases) and all(r['latest_date_queried'] and 'error_type' not in r for r in records),
+                   'current_query_sweep_complete': sweep_complete and all(r['latest_date_queried'] and 'error_type' not in r for r in records),
                    'exit_code': exit_code, 'completed_at_utc': utc_stamp(),
                    'official_activity': activity.provenance, 'contracts': records,
-                   'completion_contract': 'Batch progress is separate from source coverage; empty replies and unavailable codes remain explicit gaps.'}
+                   'completion_contract': 'Batch progress is separate from source coverage; partial-sweep counts apply only to scanned contracts and cannot be published; empty replies and unavailable codes remain explicit gaps.'}
         _atomic_write_json(receipt_path, payload)
         print('[shioaji-futures-history] batch_receipt=' + str(receipt_path) + f' queries={queries} exit={exit_code}', flush=True)
         return exit_code or (1 if payload['failed_contracts'] else 0)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
 import threading
+import time
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,8 +21,10 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 try:
+    from .feature_stage_timing import feature_run_summary_path, stage_latency_summary
     from .ohlcv_hot_tail import hot_tail_path
 except ImportError:  # direct execution/import from downloader/
+    from feature_stage_timing import feature_run_summary_path, stage_latency_summary
     from ohlcv_hot_tail import hot_tail_path
 
 
@@ -32,6 +36,26 @@ FEATURE_SCHEMA_VERSION = 1
 
 MARK_PRICE_HISTORY_ENDPOINT = "/api/v5/market/history-mark-price-candles"
 INDEX_PRICE_HISTORY_ENDPOINT = "/api/v5/market/history-index-candles"
+INDEX_PRICE_RECENT_ENDPOINT = "/api/v5/market/index-candles"
+INDEX_PRICE_RECENT_ENTRIES = 1440
+INDEX_PRICE_PAGE_LIMIT = 100
+# Keep one full page away from the moving recent-endpoint retention edge.
+INDEX_PRICE_RETENTION_MARGIN_ENTRIES = INDEX_PRICE_PAGE_LIMIT
+FEATURE_ACQUISITION_CONTRACT = {
+    "version": 2,
+    "feature_schema_version": FEATURE_SCHEMA_VERSION,
+    "observation_contract": "completed_1m_prices_native_5m_statistics_causal_funding_v1",
+    "index_price": {
+        "recent_endpoint": INDEX_PRICE_RECENT_ENDPOINT,
+        "history_endpoint": INDEX_PRICE_HISTORY_ENDPOINT,
+        "recent_entries": INDEX_PRICE_RECENT_ENTRIES,
+        "retention_margin_entries": INDEX_PRICE_RETENTION_MARGIN_ENTRIES,
+        "page_limit": INDEX_PRICE_PAGE_LIMIT,
+        "selection": "recent_only_when_entire_page_is_within_safe_retention_window",
+        "fallback": "same_cursor_history_on_recent_error_empty_short_or_noncontiguous_page",
+    },
+    "pagination_validation": "typed_rows_valid_timestamps_strict_cursor_progress_v1",
+}
 FUNDING_RATE_HISTORY_ENDPOINT = "/api/v5/public/funding-rate-history"
 MARKET_DATA_HISTORY_ENDPOINT = "/api/v5/public/market-data-history"
 OPEN_INTEREST_HISTORY_ENDPOINT = "/api/v5/rubik/stat/contracts/open-interest-history"
@@ -139,6 +163,7 @@ HISTORICAL_FEATURE_CATALOG: tuple[dict[str, Any], ...] = (
         "category": "fair_value",
         "download_status": "included",
         "endpoint": INDEX_PRICE_HISTORY_ENDPOINT,
+        "recent_endpoint": INDEX_PRICE_RECENT_ENDPOINT,
         "history_contract": "recent years",
         "grain": "instrument_family_1m",
         "model_role": "index return, index range, mark-index and contract-index basis",
@@ -424,11 +449,25 @@ class HistoricalFeatureResult:
     stage_status_json: str
     coverage_json: str
     errors_json: str
+    stage_elapsed_seconds_json: str = "{}"
+    total_elapsed_seconds: float = 0.0
+    index_acquisition_json: str = "{}"
+
+
+def feature_acquisition_payload() -> dict[str, Any]:
+    encoded = json.dumps(
+        FEATURE_ACQUISITION_CONTRACT, sort_keys=True, separators=(",", ":")
+    )
+    return {
+        "contract": json.loads(encoded),
+        "fingerprint_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+    }
 
 
 def feature_catalog_payload() -> dict[str, Any]:
     return {
         "schema_version": FEATURE_SCHEMA_VERSION,
+        "acquisition": feature_acquisition_payload(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bar": KLINE_BAR,
         "statistics_period": RUBIK_PERIOD,
@@ -489,6 +528,47 @@ def _latest_non_null_ms(
     return max(fallback_start_ms, int(latest) - CANDLE_INTERVAL_MS)
 
 
+def _history_page(
+    client: OkxHistoricalClient,
+    path: str,
+    params: dict[str, Any],
+    *,
+    cursor_ms: int,
+    inclusive_cursor: bool = False,
+    timestamp_field: str | None = None,
+    minimum_fields: int = 1,
+) -> tuple[list[Any], int | None]:
+    """Reject malformed/stagnant pages instead of certifying silent truncation."""
+    payload = client.get(path, params)
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ValueError(f"{path}: invalid history data array")
+    chunk = payload["data"]
+    if len(chunk) > int(params["limit"]):
+        raise ValueError(f"{path}: history page exceeds requested limit")
+    oldest: int | None = None
+    for item in chunk:
+        if timestamp_field is None:
+            if not isinstance(item, list) or len(item) < minimum_fields:
+                raise ValueError(f"{path}: invalid history array row")
+            value = item[0]
+        else:
+            if not isinstance(item, dict):
+                raise ValueError(f"{path}: invalid history object row")
+            value = item.get(timestamp_field)
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError(f"{path}: invalid history timestamp")
+        try:
+            timestamp = int(value)
+        except ValueError:
+            raise ValueError(f"{path}: invalid history timestamp") from None
+        if timestamp < 0 or timestamp > cursor_ms or (
+            timestamp == cursor_ms and not inclusive_cursor
+        ):
+            raise ValueError(f"{path}: history page does not advance requested cursor")
+        oldest = timestamp if oldest is None else min(oldest, timestamp)
+    return chunk, oldest
+
+
 def _fetch_array_history(
     client: OkxHistoricalClient,
     path: str,
@@ -497,23 +577,67 @@ def _fetch_array_history(
     start_ms: int,
     end_ms: int,
     limit: int,
+    recent_path: str | None = None,
+    now_ms: int | None = None,
+    request_audit: dict[str, Any] | None = None,
 ) -> list[list[str]]:
+    if start_ms > end_ms:
+        return []
     rows: list[list[str]] = []
     cursor_after = end_ms + CANDLE_INTERVAL_MS
-    seen: set[int] = set()
+    wall_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    recent_floor = (wall_ms // CANDLE_INTERVAL_MS) * CANDLE_INTERVAL_MS - (
+        INDEX_PRICE_RECENT_ENTRIES - INDEX_PRICE_RETENTION_MARGIN_ENTRIES
+    ) * CANDLE_INTERVAL_MS
+    recent_enabled = recent_path is not None
+    page_calls: dict[str, int] = {}
+    if request_audit is not None:
+        request_audit.update(
+            acquisition_fingerprint_sha256=feature_acquisition_payload()["fingerprint_sha256"],
+            page_calls=page_calls,
+            fallback_reason=None,
+            call_count_basis="logical_pages_not_transport_retry_attempts",
+        )
     while True:
         params = {**base_params, "after": str(cursor_after), "limit": str(limit)}
-        chunk = client.get(path, params).get("data", [])
+        use_recent = recent_enabled and cursor_after - limit * CANDLE_INTERVAL_MS >= recent_floor
+        selected_path = recent_path if use_recent else path
+        assert selected_path is not None
+        page_calls[selected_path] = page_calls.get(selected_path, 0) + 1
+        try:
+            chunk, oldest = _history_page(
+                client, selected_path, params, cursor_ms=cursor_after, minimum_fields=6
+            )
+        except Exception as exc:
+            if not use_recent:
+                raise
+            recent_enabled = False
+            if request_audit is not None:
+                request_audit["fallback_reason"] = f"recent_error:{type(exc).__name__}"
+            continue  # Same cursor: no partial recent page is committed.
+        if use_recent:
+            timestamps = {int(row[0]) for row in chunk}
+            contiguous = bool(timestamps) and (
+                max(timestamps) == cursor_after - CANDLE_INTERVAL_MS
+                and min(timestamps) % CANDLE_INTERVAL_MS == 0
+                and len(timestamps) == len(chunk)
+                and max(timestamps) - min(timestamps) == (len(chunk) - 1) * CANDLE_INTERVAL_MS
+                and all(str(row[5]) == "1" for row in chunk)
+            )
+            short_before_start = len(chunk) < limit and (oldest is None or oldest > start_ms)
+            if not contiguous or short_before_start:
+                recent_enabled = False
+                if request_audit is not None:
+                    request_audit["fallback_reason"] = (
+                        "recent_empty" if not chunk else "recent_short_or_noncontiguous"
+                    )
+                continue
         if not chunk:
             break
-        timestamps = [int(row[0]) for row in chunk if row]
-        if not timestamps:
-            break
+        assert oldest is not None
         rows.extend(chunk)
-        oldest = min(timestamps)
-        if oldest <= start_ms or len(chunk) < limit or oldest in seen:
+        if oldest <= start_ms or len(chunk) < limit:
             break
-        seen.add(oldest)
         cursor_after = oldest
     return rows
 
@@ -530,24 +654,19 @@ def _fetch_object_history(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     cursor_after = end_ms + 1
-    seen: set[int] = set()
+    if start_ms > end_ms:
+        return rows
     while True:
         params = {**base_params, "after": str(cursor_after), "limit": str(limit)}
-        chunk = client.get(path, params).get("data", [])
+        chunk, oldest = _history_page(
+            client, path, params, cursor_ms=cursor_after, timestamp_field=timestamp_field
+        )
         if not chunk:
             break
-        timestamps = [
-            int(item[timestamp_field])
-            for item in chunk
-            if item.get(timestamp_field) not in {None, ""}
-        ]
-        if not timestamps:
-            break
+        assert oldest is not None
         rows.extend(chunk)
-        oldest = min(timestamps)
-        if oldest <= start_ms or len(chunk) < limit or oldest in seen:
+        if oldest <= start_ms or len(chunk) < limit:
             break
-        seen.add(oldest)
         cursor_after = oldest
     return rows
 
@@ -563,7 +682,8 @@ def _fetch_rubik_history(
 ) -> list[list[str]]:
     rows: list[list[str]] = []
     cursor_end = end_ms
-    seen: set[int] = set()
+    if start_ms > end_ms:
+        return rows
     while True:
         params = {
             **base_params,
@@ -571,17 +691,15 @@ def _fetch_rubik_history(
             "end": str(cursor_end),
             "limit": str(limit),
         }
-        chunk = client.get(path, params).get("data", [])
+        chunk, oldest = _history_page(
+            client, path, params, cursor_ms=cursor_end, inclusive_cursor=True
+        )
         if not chunk:
             break
-        timestamps = [int(row[0]) for row in chunk if row]
-        if not timestamps:
-            break
+        assert oldest is not None
         rows.extend(chunk)
-        oldest = min(timestamps)
-        if oldest <= start_ms or len(chunk) < limit or oldest in seen:
+        if oldest <= start_ms or len(chunk) < limit:
             break
-        seen.add(oldest)
         cursor_end = oldest - 1
     return rows
 
@@ -1063,18 +1181,25 @@ def enrich_symbol_historical_features(
     include_funding_archive: bool,
     stage_callback: Callable[[str, str], None] | None = None,
 ) -> HistoricalFeatureResult:
+    started = time.perf_counter()
     original = _read_parquet(output_path)
     frame = original
     stage_status: dict[str, str] = {}
     errors: dict[str, str] = {}
+    index_acquisition: dict[str, Any] = {}
+    stage_elapsed_seconds: dict[str, float] = {
+        "read_existing": round(time.perf_counter() - started, 6)
+    }
 
     def run_stage(stage: str, fn: Callable[[], None]) -> None:
+        stage_started = time.perf_counter()
         status = "ok"
         try:
             fn()
         except Exception as exc:
             status = "failed"
             errors[stage] = f"{type(exc).__name__}: {exc}"
+        stage_elapsed_seconds[stage] = round(time.perf_counter() - stage_started, 6)
         stage_status[stage] = status
         if stage_callback is not None:
             stage_callback(stage, status)
@@ -1128,7 +1253,9 @@ def enrich_symbol_historical_features(
             {"instId": inst_family, "bar": KLINE_BAR},
             start_ms=feature_start,
             end_ms=closed_end_ms,
-            limit=100,
+            limit=INDEX_PRICE_PAGE_LIMIT,
+            recent_path=INDEX_PRICE_RECENT_ENDPOINT,
+            request_audit=index_acquisition,
         )
         fresh = _normalize_price_candles(
             rows,
@@ -1304,12 +1431,20 @@ def enrich_symbol_historical_features(
         ),
     )
 
+    stage_started = time.perf_counter()
     frame = _add_derived_features(frame)
+    stage_elapsed_seconds["derive"] = round(time.perf_counter() - stage_started, 6)
+    stage_started = time.perf_counter()
     changed = not _frames_equal(original, frame)
+    stage_elapsed_seconds["compare"] = round(time.perf_counter() - stage_started, 6)
     if changed:
+        stage_started = time.perf_counter()
         _write_parquet(frame, output_path)
+        stage_elapsed_seconds["write"] = round(time.perf_counter() - stage_started, 6)
 
+    stage_started = time.perf_counter()
     coverage = _coverage_summary(frame)
+    stage_elapsed_seconds["coverage"] = round(time.perf_counter() - stage_started, 6)
     failed = len(errors)
     status = "partial" if failed else "updated" if changed else "unchanged"
     if failed == len(FEATURE_STAGE_IDS):
@@ -1324,6 +1459,9 @@ def enrich_symbol_historical_features(
         stage_status_json=json.dumps(stage_status, ensure_ascii=False, sort_keys=True),
         coverage_json=json.dumps(coverage, ensure_ascii=False, sort_keys=True),
         errors_json=json.dumps(errors, ensure_ascii=False, sort_keys=True),
+        stage_elapsed_seconds_json=json.dumps(stage_elapsed_seconds, sort_keys=True),
+        total_elapsed_seconds=round(time.perf_counter() - started, 6),
+        index_acquisition_json=json.dumps(index_acquisition, sort_keys=True),
     )
 
 

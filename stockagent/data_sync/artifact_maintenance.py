@@ -14,7 +14,7 @@ import shutil
 import stat
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from stockagent.data_sync.cold_artifacts import (
     ColdArtifactSpec,
@@ -26,7 +26,7 @@ from stockagent.data_sync.desync_snapshots import (
     _utc_iso_from_ns,
     atomic_write_json,
 )
-from stockagent.data_sync.materialized_cache import process_references
+from stockagent.data_sync.materialized_cache import process_references, process_references_many
 from stockagent.data_sync.packed_snapshots import (
     resolve_latest_packed,
     verify_packed_snapshot,
@@ -95,7 +95,18 @@ def artifact_process_references(source: Path, scope_root: Path) -> list[str]:
     """Find direct references plus orchestrators naming an ancestor suite."""
 
     references = process_references(source)
-    source = source.resolve()
+    return _ancestor_process_references((source,), scope_root, references)
+
+
+def artifact_process_references_many(sources: Iterable[Path], scope_root: Path) -> list[str]:
+    """Check a selected cleanup allowlist without treating sibling jobs as users."""
+    sources = tuple(sources)
+    references = process_references_many(sources)
+    return _ancestor_process_references(sources, scope_root, references)
+
+
+def _ancestor_process_references(sources, scope_root: Path, references: list[str]) -> list[str]:
+    sources = tuple(source.resolve() for source in sources)
     scope_root = scope_root.resolve()
     own_pid = os.getpid()
     for process in sorted(Path("/proc").glob("[0-9]*")):
@@ -112,8 +123,9 @@ def artifact_process_references(source: Path, scope_root: Path) -> list[str]:
             try:
                 argument = Path(os.fsdecode(raw_arg)).resolve(strict=False)
                 argument.relative_to(scope_root)
-                source.relative_to(argument)
             except (OSError, ValueError):
+                continue
+            if not any(source == argument or argument in source.parents for source in sources):
                 continue
             evidence = f"pid={pid}:cmdline:{argument}"
             if evidence not in references:

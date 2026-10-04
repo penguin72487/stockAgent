@@ -1,0 +1,20 @@
+# Inference recipe for the completed v5 all-fold run, selected at fold 10.
+# The training run used the 2026-09-13 99-feature release. Live inference
+# reads the same named features from the canonical mutable TW public panel.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v8_twpublic_248d0869_full.yaml
+
+experiment_name: tw-day-trade-v8-combined-annual-log-cash-sub-lot-first-session-all-folds-v5
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5
+  resume: false
+  post_train_infer: false
+
+data:
+  parquet_root: data_tw_public/stocks
+  tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
+  panel_cache_root: artifacts/cache/tw_day_trade_v8_annual_log_cash/stocks
+
+training:
+  financial_transformer:
+    portfolio_output_mode: score_entmax_log_cash

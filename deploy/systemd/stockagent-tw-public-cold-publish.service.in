@@ -11,8 +11,15 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+# A path-triggered release may take the full 3h timeout.  Do not start it
+# within that runway before Taiwan's protected opening or during the session.
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh" --minimum-runway-minutes 180 --protected-until 13:30
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_cold_publish.sh"
 Restart=on-failure
+# Stale source/derived receipts are a publication veto, not an operational
+# crash.  Keep the failed receipt visible, then wait for a receipt change or
+# the nightly timer instead of repeating the same 12-second audit every 5m.
+RestartPreventExitStatus=75
 RestartSec=5min
 Nice=10
 CPUWeight=20

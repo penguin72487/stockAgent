@@ -1,6 +1,6 @@
 market: tw_cash
 label: 台股・現股/T+2
-enabled: true
+enabled: false
 market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"

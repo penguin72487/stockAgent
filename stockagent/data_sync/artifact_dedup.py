@@ -18,6 +18,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from stockagent.data_sync.desync_snapshots import _fsync_directory, sha256_file
+
 
 DEFAULT_EXCLUDED_TOP = frozenset(
     {
@@ -35,6 +37,7 @@ DEFAULT_EXCLUDED_TOP = frozenset(
     }
 )
 DEFAULT_EXCLUDED_SUFFIXES = frozenset({".jsonl", ".lock", ".log", ".pid"})
+SAMPLE_BYTES = 64 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,6 +91,83 @@ class DuplicateGroup:
     @property
     def reclaimable_allocated_bytes(self) -> int:
         return sum(item.blocks * 512 for item in self.duplicates)
+
+
+def link_immutable_source(
+    source: Path, destination: Path, object_root: Path, expected_sha256: str
+) -> None:
+    """Copy a verified source once, then link immutable local evidence aliases.
+
+    Never hard-link the mutable producer itself. This is node-local working
+    state, not a packed release, a cold authority, or a completeness proof.
+    Existing objects and aliases are verified and never overwritten.
+    """
+
+    if (
+        len(expected_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in expected_sha256)
+    ):
+        raise ValueError("invalid immutable source SHA-256")
+    destination = destination.absolute()
+    object_root = object_root.absolute()
+    for directory in (destination.parent, object_root / expected_sha256[:2]):
+        if directory.resolve(strict=False) != directory:
+            raise ValueError("immutable evidence directory is redirected")
+        directory.mkdir(parents=True, exist_ok=True)
+        if directory.resolve() != directory:
+            raise ValueError("immutable evidence directory is redirected")
+    object_path = object_root / expected_sha256[:2] / expected_sha256
+    if destination.parent.stat().st_dev != object_path.parent.stat().st_dev:
+        raise ValueError("immutable evidence aliases must share a filesystem")
+
+    def verify(path: Path) -> None:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or sha256_file(path) != expected_sha256:
+            raise ValueError(f"immutable source hash/type mismatch: {path}")
+        after = path.lstat()
+        # Adding another immutable alias changes ctime/nlink, not the payload.
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise ValueError(f"immutable source changed during verification: {path}")
+
+    if os.path.lexists(destination):
+        verify(destination)
+        return
+    if not os.path.lexists(object_path):
+        temporary = object_path.with_name(f".{expected_sha256}.{uuid.uuid4().hex}.partial")
+        try:
+            before = source.lstat()
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("immutable source input is not a regular file")
+            digest = hashlib.sha256()
+            with source.open("rb") as reader, temporary.open("xb") as writer:
+                while chunk := reader.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+                    writer.write(chunk)
+                writer.flush()
+                os.fchmod(writer.fileno(), 0o444)
+                os.fsync(writer.fileno())
+            after = source.lstat()
+            if digest.hexdigest() != expected_sha256 or (
+                before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+            ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("immutable source changed during copy")
+            try:
+                os.link(temporary, object_path, follow_symlinks=False)
+                _fsync_directory(object_path.parent)
+            except FileExistsError:
+                pass  # Another publisher won; independently verify its bytes.
+        finally:
+            temporary.unlink(missing_ok=True)
+    verify(object_path)
+    if stat.S_IMODE(object_path.stat().st_mode) & 0o222:
+        raise ValueError("immutable evidence object is writable")
+    try:
+        os.link(object_path, destination, follow_symlinks=False)
+        _fsync_directory(destination.parent)
+    except FileExistsError:
+        verify(destination)
 
 
 def _iter_files(
@@ -197,6 +277,38 @@ def _hash_file(root: Path, item: ArtifactFile) -> str | None:
     return digest.hexdigest()
 
 
+def _sample_file(root: Path, item: ArtifactFile) -> str | None:
+    """Cheap rejection filter only; a matching sample never proves equality."""
+
+    path = root / item.relative
+    try:
+        before = path.stat(follow_symlinks=False)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != item.signature():
+            return None
+        digest = hashlib.blake2b(digest_size=16)
+        with path.open("rb", buffering=0) as stream:
+            digest.update(stream.read(SAMPLE_BYTES))
+            if item.size > SAMPLE_BYTES:
+                stream.seek(max(0, item.size - SAMPLE_BYTES))
+                digest.update(stream.read(SAMPLE_BYTES))
+        after = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) != item.signature():
+        return None
+    return digest.hexdigest()
+
+
 def find_duplicate_groups(
     root: Path,
     *,
@@ -227,6 +339,7 @@ def find_duplicate_groups(
     for item in files:
         by_size[item.size].append(item)
 
+    sampled_inodes = 0
     hashed_inodes = 0
     changed_while_hashing = 0
     exact: dict[
@@ -239,23 +352,45 @@ def find_duplicate_groups(
             distinct.setdefault((item.device, item.inode), item)
         if len(distinct) < 2:
             continue
+        by_metadata: dict[
+            tuple[int, int, int, int, tuple[tuple[str, bytes], ...]],
+            list[ArtifactFile],
+        ] = defaultdict(list)
         for item in distinct.values():
-            digest = _hash_file(root, item)
-            if digest is None:
-                changed_while_hashing += 1
-                continue
-            hashed_inodes += 1
-            exact[
-                (
-                    item.device,
-                    size,
-                    digest,
-                    item.mode,
-                    item.uid,
-                    item.gid,
-                    item.xattrs,
-                )
+            by_metadata[
+                (item.device, item.mode, item.uid, item.gid, item.xattrs)
             ].append(item)
+        for matching_metadata in by_metadata.values():
+            if len(matching_metadata) < 2:
+                continue
+            by_sample: dict[str, list[ArtifactFile]] = defaultdict(list)
+            for item in matching_metadata:
+                sample = _sample_file(root, item)
+                if sample is None:
+                    changed_while_hashing += 1
+                    continue
+                sampled_inodes += 1
+                by_sample[sample].append(item)
+            for matching_sample in by_sample.values():
+                if len(matching_sample) < 2:
+                    continue
+                for item in matching_sample:
+                    digest = _hash_file(root, item)
+                    if digest is None:
+                        changed_while_hashing += 1
+                        continue
+                    hashed_inodes += 1
+                    exact[
+                        (
+                            item.device,
+                            size,
+                            digest,
+                            item.mode,
+                            item.uid,
+                            item.gid,
+                            item.xattrs,
+                        )
+                    ].append(item)
 
     groups: list[DuplicateGroup] = []
     for (
@@ -286,6 +421,7 @@ def find_duplicate_groups(
         "eligible_files": len(files),
         "eligible_bytes": sum(item.size for item in files),
         "same_size_groups": sum(1 for value in by_size.values() if len(value) > 1),
+        "sampled_distinct_inodes": sampled_inodes,
         "hashed_distinct_inodes": hashed_inodes,
         "changed_while_hashing": changed_while_hashing,
         "exact_duplicate_groups": len(groups),
@@ -391,4 +527,5 @@ __all__ = [
     "apply_duplicate_groups",
     "find_duplicate_groups",
     "groups_as_json",
+    "link_immutable_source",
 ]

@@ -593,9 +593,7 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: True,
     )
-    assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
-        "2026-07-06:tw_day_trade:preopen"
-    )
+    assert _preopen_prepare_key(configured, now.replace(minute=45)) is None
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_ready_for_session",
         lambda cfg, session_date: False,
@@ -684,6 +682,19 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
         },
     )
     assert _preopen_market_final_armed_for_session(armed_cfg, today) is True
+    _write_preopen_readiness(
+        armed_cfg,
+        status="running",
+        started_at=f"{today}T08:56:00+08:00",
+        elapsed_seconds=0.1,
+        step=1,
+        total=23,
+        message="retry race",
+    )
+    preserved = json.loads(path.read_text(encoding="utf-8"))["markets"][
+        "tw_day_trade"
+    ]
+    assert preserved["final_arm"]["status"] == "ready"
 
 
 def test_day_trade_schedule_catches_up_after_service_restart(
@@ -2799,6 +2810,50 @@ def test_completed_session_publication_rejects_stale_core_close(
     )
 
     assert not _completed_session_publication_ready(status)
+
+
+def test_signal_now_rejects_retired_market_before_data_work(monkeypatch) -> None:
+    from services.discord_bot import bot as discord_bot
+
+    messages: list[str] = []
+
+    class Response:
+        async def defer(self, **kwargs):
+            del kwargs
+
+    class Followup:
+        async def send(self, content, **kwargs):
+            del kwargs
+            messages.append(str(content))
+
+    interaction = SimpleNamespace(
+        response=Response(),
+        followup=Followup(),
+        user=SimpleNamespace(id=101),
+    )
+    cfg = SimpleNamespace(market="retired", enabled=False)
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda market: cfg)
+    monkeypatch.setattr(discord_bot, "_record_audit_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        discord_bot,
+        "_ensure_signal_ready_cached",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("retired model ran")),
+    )
+
+    asyncio.run(
+        _handle_signal_now_command(
+            interaction,
+            market="retired",
+            mode="signal",
+            price_source="auto",
+            top_n=20,
+            min_abs_delta=0.001,
+            refresh_data=False,
+            debug=False,
+        )
+    )
+    assert len(messages) == 1
+    assert "已停用" in messages[0]
 
 
 def test_signal_now_stale_response_says_waiting_source_not_background_update(

@@ -22,6 +22,7 @@ from stockagent.data.tw_futures_margin_preparation import (
     bind_equity_margin_families, bind_dated_position_combinations, bind_dated_corporate_terms,
     bind_equity_position_families,
     bind_physical_position_inputs,
+    load_unchanged_position_member_scopes,
     bind_adjusted_terminal_values,
 )
 
@@ -37,6 +38,9 @@ def prepare_all_twd_margin_inputs(args):
     required = ('physical_history', 'rule_candidates', 'product_universe')
     if any(getattr(args, key) is None for key in required):
         raise ValueError('all-twd requires --physical-history, --rule-candidates and --product-universe')
+    member_path=getattr(args,'position_generation_proof',None)
+    if member_path and not args.position_family_review:
+        raise ValueError('position generation proof requires a dated position family law')
     out = args.output_dir
     if out.exists() and any(out.iterdir()):
         raise FileExistsError('use a new empty output directory')
@@ -100,8 +104,8 @@ def prepare_all_twd_margin_inputs(args):
     else:
         aligned = align_product_margin_intervals(frame.select('date', 'product'), intervals)
     adjusted=frame.filter(pl.col('product').str.contains(r'\d$'))
-    terms=bind_dated_corporate_terms(adjusted.select('date','product','contract'),
-        pl.read_parquet(args.rule_candidates/'corporate_terms_intervals.parquet'))
+    corporate_unit_levels=pl.read_parquet(args.rule_candidates/'corporate_terms_intervals.parquet')
+    terms=bind_dated_corporate_terms(adjusted.select('date','product','contract'),corporate_unit_levels)
     units=terms
     unit_path=args.rule_candidates/'corporate_unit_intervals.parquet'
     if unit_path.exists():
@@ -110,8 +114,9 @@ def prepare_all_twd_margin_inputs(args):
         if parent.get('outputs',{}).get(unit_path.name,{}).get('sha256')!=digest:
             raise ValueError('corporate position-unit input SHA mismatch')
         sources[str(unit_path)]=digest
+        corporate_unit_levels=pl.read_parquet(unit_path)
         units=bind_dated_corporate_terms(adjusted.select('date','product','contract'),
-            pl.read_parquet(unit_path),unit_only=True)
+            corporate_unit_levels,unit_only=True)
     position_intervals=pl.read_parquet(args.rule_candidates/'position_level_intervals.parquet')
     if args.position_family_review:
         import gzip,hashlib
@@ -135,9 +140,14 @@ def prepare_all_twd_margin_inputs(args):
     else:
         position=bind_dated_position_combinations(frame.select('date','product'),position_intervals)
     physical_position=None
+    member_scopes=None
+    if member_path:
+        member_scopes,member_sources=load_unchanged_position_member_scopes(member_path)
+        sources.update(member_sources)
     if args.position_family_review:
         physical_position=bind_physical_position_inputs(frame.select('date','product','contract'),
-            position,units,universe,review['rules'])
+            position,units,universe,review['rules'],corporate_unit_intervals=corporate_unit_levels,
+            unchanged_member_scopes=member_scopes)
     rights=None
     if args.terminal_subscription_values:
         receipt=json.loads(args.terminal_subscription_values.with_name('manifest.json').read_text())
@@ -219,7 +229,9 @@ def prepare_all_twd_margin_inputs(args):
     gaps.write_csv(out / 'margin_binding_gaps.csv')
     outputs = {path.name: dict(sha256=sha256_file(path), bytes=path.stat().st_size)
                for path in sorted(out.iterdir()) if path.is_file()}
-    summary = dict(dataset='taifex_all_twd_margin_inputs', schema_version=3,
+    summary = dict(dataset='taifex_all_twd_margin_inputs', schema_version=5 if member_scopes is not None else 4,
+        position_source_scope_contract='direct_corporate_securities_cap_verified_member_v4'
+            if member_scopes is not None else 'direct_corporate_securities_cap_original_month_v2',
         status='margin_inputs_bound_requires_product_accounting_admission',
         point_in_time_verified=False, all_products_training_ready=False,
         created_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -268,6 +280,8 @@ def main():
                         help='Source-bound subscription terminal components; never inserted into daily cash/features.')
     parser.add_argument('--position-family-review',type=Path,
                         help='Dated same-security position laws; changed shares still require an explicit cap.')
+    parser.add_argument('--position-generation-proof',type=Path,
+                        help='Immutable source-verified physical member scopes; never supplies a numeric cap.')
     parser.add_argument("--archive", type=Path, default=Path("data_taifex_public_history/rules"))
     parser.add_argument("--daily", type=Path)
     parser.add_argument("--official-evidence", type=Path)

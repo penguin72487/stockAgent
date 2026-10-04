@@ -16,11 +16,13 @@ from stockagent.backtest.tw_execution import (
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
 )
-from stockagent.backtest.tw_commission_rebate import (
+from stockagent.backtest.tw_commission_rebate_policy import (
     normalize_commission_rebate_timing,
 )
-from stockagent.backtest.tw_index_futures import FuturesCostSchedule
-from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
+from stockagent.backtest.tw_derivatives_cost_policy import (
+    FuturesCostSchedule,
+    OptionDayCostSchedule,
+)
 from stockagent.data.tw_index_futures import (
     normalize_taifex_index_futures_product,
 )
@@ -1182,7 +1184,7 @@ def _validate_tw_index_derivatives_tick_mode_contract(
         )
 
 
-class _UniqueKeySafeLoader(yaml.SafeLoader):
+class _UniqueKeySafeLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
     """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
 
 
@@ -1753,6 +1755,10 @@ class TradingConfig:
     # observed auction-liquidity claim.
     tw_day_trade_terminal_liquidation_unlimited_capacity: bool = False
     tw_day_trade_entry_remainder_policy: str = "first_minute_only"
+    # Legacy cash-equivalent rights valuation is retained only for replay.
+    # New no-subscription experiments reject an affected held position instead
+    # of inventing an exercise, cash payment, or disappearance of ownership.
+    tw_day_trade_subscription_right_policy: str = "reference_value_cash"
     tw_day_trade_margin_financing_ratio: float = 0.60
     tw_day_trade_margin_financing_annual_rate: float = 0.16
     tw_day_trade_margin_short_handling_fee_rate: float = 0.001
@@ -4746,6 +4752,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
             trading[name] = value
+    subscription_policy = str(trading["tw_day_trade_subscription_right_policy"])
+    if subscription_policy not in {"reference_value_cash", "reject_held"}:
+        raise ValueError("unsupported tw_day_trade_subscription_right_policy")
+    if subscription_policy == "reject_held" and (
+        trading["execution_mode"] != "tw_day_trade"
+        or not trading["tw_day_trade_unlimited_margin_conversion"]
+        or data["day_trade_minute_execution_root"] is None
+    ):
+        raise ValueError("reject_held subscription policy requires physical FIFO day trade")
     remainder_policy = str(trading["tw_day_trade_entry_remainder_policy"])
     if remainder_policy not in {"first_minute_only", "frozen_target_until_1320"}:
         raise ValueError("unsupported tw_day_trade_entry_remainder_policy")
@@ -4754,11 +4769,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 or float(trading["max_volume_participation"]) != 0.5
                 or not trading["tw_day_trade_unlimited_margin_conversion"]
                 or data["day_trade_minute_execution_root"] is None
-                or trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]
                 or training["day_trade_sparse_events"]
                 or training.get("day_trade_training_annual_episodes", False)):
             raise ValueError("frozen target entry sweep requires dense continuous physical "
-                             "carry without unlimited close or annual account resets")
+                             "carry without annual account resets")
     if bool(trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]):
         if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
             raise ValueError(

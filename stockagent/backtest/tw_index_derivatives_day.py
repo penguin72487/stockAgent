@@ -14,6 +14,7 @@ from stockagent.backtest.tw_index_futures import (
     FuturesCostSchedule,
     select_tw_index_futures_contract_basket,
 )
+from stockagent.backtest.tw_derivatives_cost_policy import OptionDayCostSchedule
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
     TAIFEX_OPTION_CANDIDATE_CAPACITY,
@@ -26,30 +27,6 @@ from stockagent.data.tw_index_futures import (
 
 
 TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 6
-
-
-@dataclass(frozen=True, slots=True)
-class OptionDayCostSchedule:
-    fixed_fee_per_contract_per_side_twd: float = 22.0
-    # Statutory TXO premium tax per transaction.  A daily-flat position has an
-    # opening and a closing transaction, regardless of long/short direction.
-    transaction_tax_rate: float = 0.001
-    slippage_points_per_side: float = 0.5
-
-    def __post_init__(self) -> None:
-        for name in (
-            "fixed_fee_per_contract_per_side_twd",
-            "transaction_tax_rate",
-            "slippage_points_per_side",
-        ):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-            ):
-                raise ValueError(f"{name} must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)

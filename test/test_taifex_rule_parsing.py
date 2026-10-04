@@ -77,6 +77,19 @@ def test_explicit_effective_date_interval_does_not_invent_time_of_day():
     assert [r["boundary"] for r in rows] == ["date_only", "date_only"]
 
 
+def test_explicit_temporary_session_interval_retains_scheduled_end():
+    rows = parser.temporal_mentions('發文日期：中華民國105年2月2日。'
+        '本次保證金調整實施期間自105年2月3日交易時段結束後起，'
+        '預計至105年2月16日交易時段結束止。')
+    assert [(r['date_iso'], r['role'], r['boundary']) for r in rows] == [
+        ('2016-02-02', 'publication', 'date_only'),
+        ('2016-02-03', 'effective_start', 'after_trading_session'),
+        ('2016-02-16', 'effective_end', 'after_trading_session')]
+    # A cited notice is not turned into a second activation date.
+    reference = parser.temporal_mentions('依本公司105年2月3日台期結字第10503001141號函辦理。')
+    assert reference[0]['role'] == 'reference'
+
+
 def test_operative_self_clause_is_not_a_reference_to_another_notice():
     text=('期交所依規定調高晟德期貨契約所有月份保證金適用比例，'
           '自109年6月11日(證券市場處置生效日次一營業日)該契約交易時段結束後起實施，'
@@ -290,7 +303,7 @@ def test_docx_extracts_main_text_and_physical_tables_without_executing_embeds():
         ('word/_rels/document.xml.rels', '<Relationships Target="https://example.invalid/private"/>'),
     ])
     result = parser.extract_document(raw, 'application/octet-stream', 'https://www.taifex.com.tw/file.docx')
-    assert result['parser_version'] == parser.PARSER_VERSION == 6
+    assert result['parser_version'] == parser.PARSER_VERSION == 7
     assert result['format'] == 'docx' and result['parsing_status'] == 'parsed'
     assert result['temporal_mentions'][0]['date_iso'] == '2026-09-24'
     assert result['temporal_mentions'][0]['role'] == 'effective_start'

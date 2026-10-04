@@ -25,6 +25,7 @@ from scripts.run_tw_day_trade_simulation import (  # noqa: E402
     _fee_schedule,
     _latest_signal,
     _repo_path,
+    _spec_reload_due,
 )
 from stockagent.config import load_config  # noqa: E402
 from stockagent.live.market_config import (  # noqa: E402
@@ -54,12 +55,42 @@ from stockagent.live.tw_overnight_simulation import (  # noqa: E402
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 DAY_TRADE_QUOTE_BROKER_STATE = Path("artifacts/live/tw_day_trade_simulation")
+SHARED_QUOTE_MIN_INTERVAL_SECONDS = 1.0
+
+
+def _shared_quote_due(monotonic_now: float, last_request_at: float) -> bool:
+    """Bound snapshot traffic while the pointer watcher stays event-driven."""
+
+    return monotonic_now - last_request_at >= SHARED_QUOTE_MIN_INTERVAL_SECONDS
+
+
+def _readiness_refresh_interval_seconds(
+    observed: datetime, *, has_enabled_modes: bool = True,
+) -> float:
+    """Keep both auction windows fast; publish compact liveness while idle."""
+
+    if not has_enabled_modes:
+        return 60.0
+    wall = observed.time()
+    if (
+        datetime_time(8, 10) <= wall < datetime_time(9, 11)
+        or datetime_time(12, 45) <= wall < datetime_time(13, 36)
+    ):
+        return 10.0
+    return 60.0
+
+
+def _spec_reload_interval_seconds(observed: datetime) -> float:
+    return 30.0 if _readiness_refresh_interval_seconds(observed) == 10.0 else 60.0
 
 
 def _service_status_text(
     engine: TwOvernightSimulationEngine,
     observed: datetime,
 ) -> str:
+    enabled = engine.state.get("enabled_markets")
+    if isinstance(enabled, list) and not enabled:
+        return "TW overnight paper executor running idle; no enabled modes"
     wall = observed.time()
     if wall < OVERNIGHT_SWITCH_GATE:
         phase = "waiting for 13:00 switch"
@@ -72,7 +103,8 @@ def _service_status_text(
     states = sorted(
         {
             str(mode.get("engine_status") or "unknown")
-            for mode in (engine.state.get("modes") or {}).values()
+            for market, mode in (engine.state.get("modes") or {}).items()
+            if not isinstance(enabled, list) or market in enabled
         }
     )
     state_text = ",".join(states) if states else "no-modes"
@@ -258,8 +290,10 @@ def main(argv: list[str] | None = None) -> int:
     configs: dict[str, LiveMarketConfig] = {}
     last_reload = 0.0
     last_readiness = 0.0
+    last_liveness = 0.0
     last_quote_minute = ""
     last_mark_minute = ""
+    last_quote_request_at = float("-inf")
     ready_notified = False
     print(
         f"[tw-overnight-sim] state_dir={state_dir} simulation_only=true",
@@ -269,12 +303,18 @@ def main(argv: list[str] | None = None) -> int:
         notify_systemd("WATCHDOG=1")
         observed = datetime.now(TAIPEI)
         monotonic = time.monotonic()
-        if monotonic - last_reload >= 30.0 or not specs:
+        readiness_interval = _readiness_refresh_interval_seconds(
+            observed, has_enabled_modes=bool(specs),
+        )
+        if _spec_reload_due(
+            monotonic, last_reload, _spec_reload_interval_seconds(observed)
+        ):
             specs, configs, errors = _mode_specs(_repo_path(args.markets_dir))
             watcher.configure([spec.live_output_dir for spec in specs])
             engine.update_readiness(specs, now=observed, errors=errors)
             last_reload = monotonic
             last_readiness = monotonic
+            last_liveness = monotonic
             if not ready_notified:
                 notify_systemd(
                     f"READY=1\nSTATUS={_service_status_text(engine, observed)}"
@@ -282,10 +322,14 @@ def main(argv: list[str] | None = None) -> int:
                 ready_notified = True
             else:
                 notify_systemd(f"STATUS={_service_status_text(engine, observed)}")
-        elif monotonic - last_readiness >= 10.0:
+        elif monotonic - last_readiness >= readiness_interval:
             engine.update_readiness(specs, now=observed)
             notify_systemd(f"STATUS={_service_status_text(engine, observed)}")
             last_readiness = monotonic
+            last_liveness = monotonic
+        elif readiness_interval > 10.0 and monotonic - last_liveness >= 10.0:
+            engine.publish_liveness(observed)
+            last_liveness = monotonic
 
         wall = observed.time()
         pending_signals: list[
@@ -325,10 +369,24 @@ def main(argv: list[str] | None = None) -> int:
             or (opening_reconciliation and last_quote_minute != minute_key)
         )
         all_symbols = signal_symbols | (ledger_symbols if ledger_due else set())
+        if all_symbols and not _shared_quote_due(monotonic, last_quote_request_at):
+            watcher.wait(
+                max(
+                    0.01,
+                    last_quote_request_at
+                    + SHARED_QUOTE_MIN_INTERVAL_SECONDS
+                    - monotonic,
+                )
+            )
+            continue
         fallback.update(ledger_fallback)
         quotes: dict[str, dict[str, Any]] = {}
         quote_fetch_ms = 0.0
         if all_symbols:
+            # The same quote broker also serves the opening signal and the
+            # day-trade closing auction. A 0.1s executor wake-up must not turn
+            # one 424-symbol snapshot into ten identical provider calls/s.
+            last_quote_request_at = monotonic
             quote_started = time.perf_counter()
             try:
                 quotes = _fetch_quotes(

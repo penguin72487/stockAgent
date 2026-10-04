@@ -92,6 +92,10 @@ def test_history_server_returns_verified_stale_curve_while_refreshing(
     try:
         first = server.history_snapshot(range_key="1d")
         server._history_cache["1d"] = (time.monotonic() - 60.0, first)
+        # Elapsed TTL alone cannot justify a 4-GB unchanged ledger rescan.
+        assert server.history_snapshot(range_key="1d") == first
+        assert calls == 1
+        (tmp_path / "marks.jsonl").write_text("source revision\n", encoding="utf-8")
         stale = server.history_snapshot(range_key="1d")
         assert stale == first
         assert refreshed.wait(1.0)
@@ -472,6 +476,36 @@ def test_dashboard_snapshot_fails_visible_when_source_is_stale(tmp_path: Path) -
         now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
     )
     assert payload["health"] == "stale"
+
+
+def test_newer_bootstrap_block_is_visible_without_relabeling_stale_quotes(
+    tmp_path: Path,
+) -> None:
+    state_dir, receipts = _fixture(tmp_path, age_seconds=20.0)
+    state_path = state_dir / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update({
+        "updated_at_utc": "2026-08-12T01:29:59+00:00",
+        "engine_status": "blocked_subscription_bootstrap_settlement",
+        "blocked_reason": (
+            "subscription_bootstrap_settlement_failed:RuntimeError:"
+            "cannot cash-settle cycle while a shadow futures hedge remains open"
+            "/private/account-id"
+        ),
+    })
+    _write_json(state_path, state)
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+    )
+    assert payload["health"] == "blocked"
+    assert payload["engine_status"] == "blocked_subscription_bootstrap_settlement"
+    assert payload["engine_status_source"] == "state"
+    assert payload["source_age_seconds"] == 20.0
+    assert payload["source_updated_at_utc"] == "2026-08-12T01:29:40+00:00"
+    assert "未平的模擬期貨避險部位" in payload["blocked_reason"]
+    assert "/private/account-id" not in json.dumps(payload)
 
 
 def test_dedicated_history_snapshot_is_range_aware_and_bounded(tmp_path: Path) -> None:

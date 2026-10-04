@@ -23,7 +23,7 @@ threads and sibling downloader processes observe the cooldown before sending.
 | `binance_usdm_request_weight` | Binance USD-M `exchangeInfo` | runtime `REQUEST_WEIGHT`; documented fallback 2400 weight / minute, IP | 40 weight/s | Runtime `exchangeInfo` is authoritative. Klines use limit 499 at weight 2. |
 | `binance_usdm_funding_history` | Binance funding history | 500 requests / 5 minutes, shared IP bucket | 1.667 req/s | Shared by funding-rate history and funding-info. |
 | `binance_usdm_statistics_history` | Binance `futures/data` statistics | 1000 requests / 5 minutes, IP | 3.333 req/s | OI, ratios, taker flow and basis retain a rolling 30-day window. |
-| `shioaji_quote_query` | Shioaji quote API | conflicting docs: current Python page 50/10s; older PDF/C# 50/5s | 10 req/s | User-selected deployment ceiling matching the 50/5s documentation; all historical quote downloaders share one host-global limiter. |
+| `shioaji_quote_query` | Shioaji quote API | current Python page: 50/10s | 5 req/s | All historical quote downloaders share one host-global limiter; an older PDF/C# page differs. |
 | `frankfurter_public` | Frankfurter public API | no daily/monthly quota; unspecified anti-abuse throttling | 10 req/s | Uses the project default for an unspecified limit. |
 | `tw_public` | TWSE/TPEx public endpoints | no stable public hard limit found | 10 req/s | Uses the project default; retries still handle WAF/403/429 responses. |
 | `alpaca_market_data_basic` | Alpaca historical market data | 200 requests / minute, account | 3.333333 req/s | Exact Basic plan limit; requests batch many symbols. |
@@ -66,8 +66,7 @@ threads and sibling downloader processes observe the cooldown before sending.
   endpoint buckets. HTTP 429/418 `Retry-After` applies to the shared IP limiter.
 - Shioaji's current Python `Use Restrictions` page states 50 market-data quote
   calls per 10 seconds, while an older PDF/C# page states 50 per 5 seconds. The
-  configured 10 req/s ceiling is an explicit user deployment decision matching
-  the latter; the documentation conflict remains visible in receipts/docs.
+  configured 5 req/s ceiling follows the current Python documentation.
   Daily KBars, minute KBars, and historical futures ticks share the same
   host-global limiter name. The traffic quota remains an independent hard stop.
   Separate machines using the same account still require external coordination

@@ -2,6 +2,14 @@
 import pytest
 
 
+def test_only_exactly_white_render_without_native_text_is_blank():
+    from types import SimpleNamespace
+    from scripts.extract_taifex_rule_review_candidates import is_blank_render
+    assert is_blank_render(SimpleNamespace(samples_mv=memoryview(bytes([255] * 20))), '')
+    assert not is_blank_render(SimpleNamespace(samples_mv=memoryview(bytes([255] * 19 + [254]))), '')
+    assert not is_blank_render(SimpleNamespace(samples_mv=memoryview(bytes([255] * 20))), '8,000')
+
+
 def test_cell_padding_preserves_text_but_rejects_tokens_across_two_cells():
     cv2=pytest.importorskip('cv2')
     import numpy as np

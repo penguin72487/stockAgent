@@ -204,6 +204,8 @@ artifacts/*
 artifacts_test/*
 artifacts_smoke/*
 data_forex_frankfurter/*
+data_public_economic/
+data_keyed_public_catalogs/
 data_forex_frankfurter_all/*
 data_okx/*
 data_bybit/*
@@ -212,6 +214,10 @@ data_bybit/*
 /data_free_public/
 /data_coinmetrics_community/
 /data_crypto_reference/
+/data_finlab/
+/data_finmind/
+/data_tej/
+/data_finlab_training
 /data_dune_crypto/
 /data_crypto_etf/
 data_yahoo_tw_ohlcv/*

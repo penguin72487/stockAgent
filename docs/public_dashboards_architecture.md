@@ -25,7 +25,7 @@ services/public_dashboards/dashboard-core.js
   └─ 跳過未變更文字／HTML DOM 寫入
         │
         ▼
-八個公開頁面（隔日沖重用當沖 renderer）
+十個公開頁面（首頁與九個面板；隔日沖重用當沖 renderer）
 ```
 
 公開閘道是唯讀檢視層，不是交易控制面。它不得送單、修改帳本、啟動訓練、觸發下載或將反事實回放改稱即時成交。面板部署只能重啟 `stockagent-public-dashboards.service`；不得為了更新 UI 重啟當沖模擬或交易引擎。
@@ -39,6 +39,8 @@ services/public_dashboards/dashboard-core.js
 | `/tw-day-trade/` | `/tw-day-trade/api/*` | 當沖狀態、分鐘曲線、訊號、持倉、事件與公開資料進度 |
 | `/tw-overnight/` | `/tw-overnight/api/*` | 隔日沖獨立帳本；共用畫面但保留集合競價事件時間粒度 |
 | `/shioaji/` | `/shioaji/api/status` | 永豐資料流程、配額、流量與儲存量 |
+| `/finlab/` | `/finlab/api/status` | FinLab 帳號流量與研究來源下載 |
+| `/finmind/` | `/finmind/api/status` | FinMind 免費來源回補、本站請求流量與原始資料容量；新聞不排程 |
 | `/openbb/` | `/openbb/api/status`, `/openbb/api/history` | OpenBB 封存與歷史進度 |
 | `/data-monitor/` | `/data-monitor/api/summary`, `/data-monitor/api/details`, `/data-monitor/api/features`（完整相容回應：`status`） | 全資料來源的 receipt、覆蓋、freshness 與實存 Parquet 逐欄位清冊 |
 | `/traffic/` | `/traffic/api/status`, `/traffic/api/history` | 匿名請求延遲、分階段耗時、吞吐、錯誤率、快取容量及 90 天趨勢 |
@@ -62,7 +64,7 @@ services/public_dashboards/dashboard-core.js
 
 瀏覽器排版依 CSS pixel 與可用 viewport，不依面板的物理像素名稱猜裝置。HiDPI／2K
 螢幕由 `devicePixelRatio` 提高銳利度，但相同 CSS viewport 應維持相同資訊層級。
-`dashboard-responsive.css` 是八頁最後載入的共用響應式層；頁面專屬 CSS 只保留品牌、
+`dashboard-responsive.css` 是十頁最後載入的共用響應式層；頁面專屬 CSS 只保留品牌、
 圖表與領域元件差異，不得各自複製全站導覽、觸控目標或表格窄版規則。
 
 - `dashboard-core.js` 建立同一套可收合全站導覽，手機預設關閉，Escape 與選取連結會收合；
@@ -88,7 +90,7 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
 ```
 
 固定矩陣涵蓋 320／390 手機直向、手機橫向、768／1024 平板、720p／標準／HiDPI
-筆電、1080p、2K 與 ultrawide。每個 profile 必須跑完八頁，檢查文件／導覽／筆電表格
+筆電、1080p、2K 與 ultrawide。每個 profile 必須跑完十頁，檢查文件／導覽／筆電表格
 溢位、裁切與重疊操作元件、console／API 錯誤、代表性互動、延後明細及實際截圖。
 
 ### 2026-09-12／13 可重測的請求與快取邊界
@@ -198,7 +200,7 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
 
 重測入口：`scripts/benchmark_dashboard_latency.py`（32 條路由、原始樣本、p50/p95/p99、
 first/new-session/warm-reuse、吞吐、JSON 正確性、隔離 SSE、可選原始 history profiler），
-以及 `scripts/audit_public_dashboards_browser.mjs`（八頁、Resource Timing、long tasks、
+以及 `scripts/audit_public_dashboards_browser.mjs`（十頁、Resource Timing、long tasks、
 更新按鈕、無重載、截圖、API／版面錯誤）。測速工具遇錯仍留 receipt，HTTP／瀏覽器驗收失敗
 回傳非零。HTTP timeout 是 connect/read inactivity timeout，不是單次完整下載的硬期限。
 
@@ -358,7 +360,7 @@ HTML 原文按 SHA256 保存在同層 `stock_futures_catalog_sources/`。
 2. 對所有前端 JS 執行 `node --check`。
 3. 執行公開閘道、對應資料建置器與頁面 shell 測試。
 4. 驗證同一冷 cache key 的併發請求只建置一次、回應快取不超過筆數／bytes 上限，範圍切換只有最新請求可提交。
-5. 以 GET 驗證八個頁面與所有公開 API；檢查 status、Content-Type、gzip、ETag、CSP 及敏感欄位掃描。
+5. 以 GET 驗證十個頁面與所有公開 API；檢查 status、Content-Type、gzip、ETag、CSP 及敏感欄位掃描。
 6. 重啟前記錄交易引擎 PID／restart count，只重啟公開面板服務；部署後證明交易引擎 PID 未變。
 7. 分別量測冷請求、熱快取、本機閘道及公網端到端時間。網路／TLS 與應用建置時間要分開報告，不能用熱快取數字冒充冷路徑。
 8. 檢查本次啟動後 journal 無 traceback、fatal、watchdog 或持續重試。

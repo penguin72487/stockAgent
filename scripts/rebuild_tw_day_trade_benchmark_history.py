@@ -28,10 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.run_tw_day_trade_simulation import (  # noqa: E402
-    _attach_tx_benchmark_previous_close_context,
-    _mode_specs,
-)
 from stockagent.live.benchmark_accounting import (  # noqa: E402
     DAILY_RETURN_BASIS_PREVIOUS_CLOSE,
     MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION,
@@ -70,6 +66,11 @@ DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
 DEFAULT_TX_HISTORY_ROOT = Path("data_tw_index_futures/shioaji_history/TXFR1")
 DEFAULT_TX_DAY_SESSION_PATH = Path("data_tw_index_futures/day_session_contracts.parquet")
 TX_SESSION_MINUTES = 300
+
+
+class MissingOfficialMonthlyExpiry(RuntimeError):
+    """The completed-settlement archive has no future monthly expiry yet."""
+
 
 BENCHMARK_HISTORY_MARK_FIELDS = frozenset(
     {
@@ -150,7 +151,19 @@ def _write_json_if_semantically_changed(
     compact: bool = False,
     volatile_fields: frozenset[str] = frozenset({"created_at"}),
 ) -> bool:
-    """Avoid invalidating downstream caches for a timestamp-only rebuild."""
+    """Avoid publishing an identical benchmark for live-state metadata churn."""
+
+    def semantic(value: Mapping[str, Any]) -> dict[str, Any]:
+        stable = {key: item for key, item in value.items() if key not in volatile_fields}
+        provenance = stable.get("provenance")
+        if isinstance(provenance, Mapping):
+            # The live engine updates unrelated fields in state.json while the
+            # historical marks, origins and verified market inputs stay equal.
+            # Keep the old source hash with the unchanged published bytes.
+            stable["provenance"] = {
+                key: item for key, item in provenance.items() if key != "state_sha256"
+            }
+        return stable
 
     if path.is_file():
         try:
@@ -158,17 +171,7 @@ def _write_json_if_semantically_changed(
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             existing = None
         if isinstance(existing, Mapping):
-            previous = {
-                key: value
-                for key, value in existing.items()
-                if key not in volatile_fields
-            }
-            current = {
-                key: value
-                for key, value in payload.items()
-                if key not in volatile_fields
-            }
-            if previous == current:
+            if semantic(existing) == semantic(payload):
                 return False
     _atomic_json(path, payload, compact=compact)
     return True
@@ -572,7 +575,7 @@ def _tx_historical_contract_metadata(
         .collect()
     )
     if rows.height != 1:
-        raise RuntimeError(
+        raise MissingOfficialMonthlyExpiry(
             f"official monthly TX expiry is unavailable for {trading_date}"
         )
     row = rows.row(0, named=True)
@@ -582,6 +585,50 @@ def _tx_historical_contract_metadata(
         "delivery_month": delivery_month,
         "last_trading_date": row["settlement_date"].isoformat(),
     }
+
+
+def _tx_retained_contract_metadata(
+    *,
+    capture_root: Path,
+    trading_date: date,
+    resolved_target_code: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Use a recent, completed capture only when its physical code agrees.
+
+    The final-settlement archive contains past expiries, not the next expiry
+    during an unexpired month.  A historical TXFR1 Tick receipt pins the code
+    resolved at query time; a retained capture supplies its dated expiry.  A
+    mismatched nearest capture must fail closed rather than silently cross a
+    front-month roll.
+    """
+
+    code = resolved_target_code.strip().upper()
+    if not code:
+        raise RuntimeError(f"TXFR1 historical target code missing for {trading_date}")
+    for days_back in range(1, 15):
+        captured_date = trading_date - timedelta(days=days_back)
+        manifest_root = (
+            capture_root / "manifests" / f"trade_date={captured_date.isoformat()}"
+        )
+        if not any(manifest_root.glob("worker=*.json")):
+            continue
+        metadata, receipts = _tx_front_contract_metadata(
+            capture_root=capture_root,
+            trading_date=captured_date,
+        )
+        if (
+            metadata["code"] != code
+            or _tx_contract_code(metadata["delivery_month"]) != code
+            or date.fromisoformat(metadata["last_trading_date"]) < trading_date
+        ):
+            raise RuntimeError(
+                f"TXFR1 historical target {code} disagrees with nearest "
+                f"retained capture {captured_date}: {metadata}"
+            )
+        return metadata, receipts
+    raise RuntimeError(
+        f"no recent retained TXFR1 contract metadata for {trading_date}: {code}"
+    )
 
 
 def _tx_historical_day_books(
@@ -636,6 +683,9 @@ def _tx_historical_day_books(
         "data_sha256": _sha256(data_path),
         "rows": int(receipt.get("rows") or 0),
         "source": receipt.get("source"),
+        "resolved_target_code_at_query": receipt.get(
+            "resolved_target_code_at_query"
+        ),
     }
 
 
@@ -921,6 +971,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # The read-only maintenance preflight imports this module only to validate
+    # retained TX books.  Model/config loading is needed only by a rebuild.
+    from scripts.run_tw_day_trade_simulation import (
+        _attach_tx_benchmark_previous_close_context,
+        _mode_specs,
+    )
     args = build_parser().parse_args()
     state_dir = args.state_dir.resolve()
     start = date.fromisoformat(args.start_date)
@@ -1325,14 +1381,28 @@ def main() -> None:
                     )
                     quote_source = "receipt_backed_shioaji_txfr1_historical_tick_l1"
             else:
-                metadata = _tx_historical_contract_metadata(
-                    final_settlement_path=final_settlement_path,
-                    trading_date=trading_date,
-                )
                 books, history_receipt = _tx_historical_day_books(
                     history_root=args.tx_history_root.resolve(),
                     trading_date=trading_date,
                 )
+                try:
+                    metadata = _tx_historical_contract_metadata(
+                        final_settlement_path=final_settlement_path,
+                        trading_date=trading_date,
+                    )
+                except MissingOfficialMonthlyExpiry:
+                    metadata, capture_receipts = _tx_retained_contract_metadata(
+                        capture_root=args.fop_capture_root.resolve(),
+                        trading_date=trading_date,
+                        resolved_target_code=str(
+                            history_receipt.get("resolved_target_code_at_query") or ""
+                        ),
+                    )
+                    provenance["tx_capture_manifests"][trading_date.isoformat()] = {
+                        "contract": metadata,
+                        "receipts": capture_receipts,
+                        "fallback_reason": "future_expiry_not_in_final_settlement_history",
+                    }
                 provenance["tx_history_receipts"][trading_date.isoformat()] = {
                     "contract": metadata,
                     "receipt": history_receipt,

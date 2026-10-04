@@ -73,11 +73,44 @@ function renderShioaji(data) {
     $("shioaji-progress").textContent = `${Number(data.completed_contracts || 0)}/${Number(data.inventory_contracts || 0)} 合約 · ${(Number(data.progress_ratio || 0) * 100).toFixed(2)}%`;
 }
 
+function renderFinlab(data) {
+    const used = Number(data.used_mb), limit = Number(data.limit_mb);
+    const hasQuota = data.used_mb != null && data.limit_mb != null && Number.isFinite(used) && Number.isFinite(limit);
+    const age = data.quota_observed_at_utc ? Date.now() - Date.parse(data.quota_observed_at_utc) : Infinity;
+    setHealth("finlab", !hasQuota || !Number.isFinite(age) || age > 15 * 60000 ? "degraded" : "active");
+    $("finlab-quota").textContent = hasQuota ? `${used.toFixed(0)}／${limit.toFixed(0)} MB` : "尚無帳號觀測";
+    const downloaded = Number(data.downloaded), total = Number(data.catalog_total);
+    $("finlab-progress").textContent = data.catalog_total != null && data.downloaded != null
+      ? `${downloaded.toLocaleString("zh-TW")}／${total.toLocaleString("zh-TW")} 鍵`
+      : "目錄待核實";
+}
+
+function renderFinmind(data) {
+    setHealth("finmind", data.health === "updating" ? "updating" : data.health === "waiting" ? "waiting" : data.health);
+    const used = data.observed_requests_60m;
+    const limit = data.official_requests_per_hour;
+    $("finmind-quota").textContent = used != null && limit != null
+      ? `${data.quota_state === "complete_worker_window" ? "" : "≥"}${Number(used).toLocaleString("zh-TW")}／${Number(limit).toLocaleString("zh-TW")} 次`
+      : "用量觀測未就緒";
+    $("finmind-progress").textContent = data.complete != null && data.total != null
+      ? `${Number(data.complete).toLocaleString("zh-TW")}／${Number(data.total).toLocaleString("zh-TW")} 日分區`
+      : "日分區待核實";
+}
+
 function renderOpenbb(data) {
     setHealth("openbb", data.health, healthPresentation(data.health).label);
     const snapshot = data.snapshot_state === "current" ? "快照新鮮" : "快照逾時";
     $("openbb-freshness").textContent = `${snapshot} · ${ageLabel(data.source_age_seconds)}`;
     $("openbb-progress").textContent = `${Number(data.completion_percent || 0).toFixed(2)}% · ${Number(data.accepted_tasks || 0).toLocaleString("zh-TW")}/${Number(data.total_tasks || 0).toLocaleString("zh-TW")}`;
+}
+
+function renderTej(data) {
+    setHealth("tej",data.state === "running" ? "updating" : data.state === "needs_review" ? "degraded" : "waiting",
+        data.state === "running" ? "桌面回補中" : data.state === "needs_review" ? "下載需檢查" : "等待桌面工作");
+    $("tej-catalog").textContent = data.tables != null && data.fields != null
+        ? `${Number(data.tables).toLocaleString("zh-TW")} 表／${Number(data.fields).toLocaleString("zh-TW")} 欄` : "未核實";
+    $("tej-progress").textContent = data.exported_rows != null
+        ? `${Number(data.exported_rows).toLocaleString("zh-TW")} 查詢格點 · 非原生歷史完整率` : "尚無驗收匯出";
 }
 
 function renderDataMonitor(data) {
@@ -97,7 +130,7 @@ function renderTraffic(data) {
 }
 
 function renderUnavailable() {
-  for (const prefix of ["taifex", "tw", "overnight", "shioaji", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
+  for (const prefix of ["taifex", "tw", "overnight", "shioaji", "finlab", "finmind", "tej", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
   $("overnight-freshness").textContent = "無法取得";
@@ -106,6 +139,12 @@ function renderUnavailable() {
   $("overnight-summary").textContent = "進入面板查看";
   $("shioaji-traffic").textContent = "無法取得";
   $("shioaji-progress").textContent = "進入面板查看";
+  $("finlab-quota").textContent = "無法取得";
+  $("finlab-progress").textContent = "進入面板查看";
+  $("finmind-quota").textContent = "無法取得";
+  $("finmind-progress").textContent = "進入面板查看";
+  $("tej-catalog").textContent = "無法取得";
+  $("tej-progress").textContent = "進入面板查看";
   $("openbb-freshness").textContent = "無法取得";
   $("openbb-progress").textContent = "進入面板查看";
   $("data-registered").textContent = "無法取得";
@@ -123,6 +162,9 @@ async function refresh() {
     renderTw(data.tw || {});
     renderOvernight(data.overnight || {});
     renderShioaji(data.shioaji || {});
+    renderFinlab(data.finlab || {});
+    renderFinmind(data.finmind || {});
+    renderTej(data.tej || {});
     renderOpenbb(data.openbb || {});
     renderDataMonitor(data.data_monitor || {});
     renderTraffic(data.traffic || {});

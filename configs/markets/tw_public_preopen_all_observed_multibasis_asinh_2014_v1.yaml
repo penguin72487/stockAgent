@@ -1,0 +1,11 @@
+# OFAT: same selected raw columns, with asinh instead of signed log1p.
+base_config: tw_public_preopen_all_observed_multibasis_rms_2014_v1.yaml
+experiment_name: tw-public-all-observed-multibasis-asinh-2014-v1
+
+runner:
+  output_dir: artifacts/ablations/tw_public_preopen_all_observed_multibasis_2014_v1/asinh
+
+training:
+  financial_transformer:
+    causal_feature_compression: asinh
+    causal_feature_compression_patterns: ["*_raw"]

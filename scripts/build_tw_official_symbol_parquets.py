@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any
 
 import numpy as np
@@ -2932,6 +2933,7 @@ def _write_symbol(
 
 
 def main() -> None:
+    build_started = time.perf_counter()
     args = parse_args()
     end_date_text = getattr(args, "end_date", None)
     end_date = date.fromisoformat(end_date_text) if end_date_text else None
@@ -2965,9 +2967,11 @@ def main() -> None:
     )
     if frame.is_empty():
         raise RuntimeError(f"no official rows remain through end_date={end_date_text!r}")
+    input_merged_at = time.perf_counter()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     requested_end_date = str(end_date or frame["date"].max())
     groups = frame.partition_by("symbol", as_dict=True, maintain_order=False)
+    partitioned_at = time.perf_counter()
     results: list[BuildResult] = []
     with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
         futures = {
@@ -2983,6 +2987,7 @@ def main() -> None:
         }
         for future in as_completed(futures):
             results.append(future.result())
+    symbols_built_at = time.perf_counter()
     failed = [result for result in results if result.status == "failed"]
     if failed:
         raise RuntimeError(f"official symbol parquet writes failed: {[asdict(item) for item in failed[:10]]}")
@@ -3035,6 +3040,7 @@ def main() -> None:
         },
         dry_run=bool(args.dry_run),
     )
+    metadata_finalized_at = time.perf_counter()
     status_counts: dict[str, int] = {}
     for result in results:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
@@ -3160,6 +3166,13 @@ def main() -> None:
             for result in active_results
         ),
         "status_counts": status_counts,
+        "stage_elapsed_seconds": {
+            "input_validation_and_merge": round(input_merged_at - build_started, 3),
+            "symbol_partition": round(partitioned_at - input_merged_at, 3),
+            "symbol_build": round(symbols_built_at - partitioned_at, 3),
+            "metadata_finalize": round(metadata_finalized_at - symbols_built_at, 3),
+            "total_before_receipt": round(metadata_finalized_at - build_started, 3),
+        },
         "dry_run": bool(args.dry_run),
     }
     summary_path = args.summary_path or args.output_dir / "official_symbol_build_summary.json"

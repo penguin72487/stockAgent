@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark"><meta name="theme-color" content="#071019">
+  <title>TEJ 資料監控｜StockAgent</title>
+  <link rel="stylesheet" href="../shioaji/styles.css?v=6">
+  <link rel="stylesheet" href="../finlab/styles.css?v=3">
+  <link rel="stylesheet" href="styles.css?v=6">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=9">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header"><a class="brand" href="../">STOCKAGENT</a><nav data-dashboard-nav="tej" aria-label="公開面板導覽"></nav></header>
+  <main id="main">
+    <section class="hero" aria-labelledby="page-title">
+      <div><p class="eyebrow">TEJ · READ-ONLY DATA MONITOR</p><h1 id="page-title">TEJ Smart Wizard<br>資料管線</h1><p class="lead">完整目錄、逐欄覆蓋與桌面匯出收據。沿用 FinLab／FinMind 面板架構；頁面只讀本機中繼資料，不操作 Excel、不呼叫 TEJ。</p></div>
+      <div class="health-panel"><span>管線狀態</span><strong id="tej-health" class="status loading" role="status" aria-live="polite">讀取中</strong><p id="tej-freshness">取得最新本機觀測…</p><p id="tej-automation">核對自動排程…</p><small>公開唯讀 · 帳號、金鑰、原始值及工作簿永不傳到瀏覽器</small></div>
+    </section>
+    <nav class="jump-nav" aria-label="頁內導覽"><a href="#overview">完整清冊</a><a href="#progress">資料量與估時</a><a href="#quota">限額與用量</a><a href="#tables">資料表</a><a href="#features">個別欄位</a><a href="#method">口徑</a></nav>
+    <section id="page-alert" class="alert" hidden role="status"><span>目前狀態</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
+    <section id="overview" class="section-block" aria-labelledby="overview-title">
+      <header class="section-heading"><span>01</span><div><h2 id="overview-title">帳號可見完整清冊</h2><p>目錄可見不等於每張表已成功查詢；同名欄位在不同表、頻率、合併／個體版本中保留獨立身份。</p></div></header>
+      <div class="kpi-grid overview-kpis">
+        <article class="kpi featured"><span>已巡檢 Type 分類</span><strong id="catalog-types">—</strong><p id="catalog-verified">等待完成證據</p></article>
+        <article class="kpi"><span>資料表</span><strong id="catalog-tables">—</strong><p id="catalog-empty">包含欄位清單為空的表</p></article>
+        <article class="kpi"><span>獨立表內欄位</span><strong id="catalog-fields">—</strong><p>不是不同經濟概念的數量</p></article>
+        <article class="kpi"><span>已取得非空值的欄位</span><strong id="fields-obtained">—</strong><p>不代表原生歷史或發布日完整</p></article>
+      </div>
+    </section>
+    <section id="progress" class="section-block" aria-labelledby="progress-title">
+      <header class="section-heading"><span>02</span><div><h2 id="progress-title">資料量與分階段完成時間</h2><p>已核實工作與未清點情境分開。完整查詢耗時包含來源空回、驗證與保存，不以眼前的小批次代替全歷史。</p></div></header>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>實際匯出列數 · 分片計數</span><strong id="exported-rows">—</strong><p>同公司／日期可分不同欄位片；含空值或沿用最近一期</p></article>
+        <article class="kpi"><span>實際非空儲存格</span><strong id="exported-cells">—</strong><p>零是數值；空值不補零</p></article>
+        <article class="kpi"><span>收據記錄本機容量</span><strong id="recorded-bytes">—</strong><p>選單證據、原始匯出與 ZSTD Parquet；不是網路傳輸量</p></article>
+        <article class="kpi"><span>全域查詢格點目標</span><strong id="total-rows">未知</strong><p id="discovery-progress">不是預估原生觀測筆數；尚未發現所有歷史軸</p></article>
+      </div>
+      <div class="progress-card"><div class="progress-copy"><div><span>匯出列數／全域已核實查詢格點</span><strong id="row-progress-label">分母未知</strong></div><div class="fleet-eta"><span>全部下載剩餘工時 · 中間情境</span><strong id="global-eta">未知</strong><p id="global-eta-basis">等待完整查詢實測。</p></div></div><progress id="row-progress" class="progress-track" max="1" aria-label="TEJ 全域查詢格點匯出率"></progress></div>
+      <div class="progress-card"><div class="progress-copy"><div><span>已完成查詢範圍 · 包含明確來源空回</span><strong id="scope-progress-label">等待來源回覆</strong></div></div><progress id="scope-progress" class="progress-track" max="1" aria-label="TEJ 全域已完成查詢範圍"></progress></div>
+      <p id="legacy-exports" class="data-note" hidden>舊來源與收據保留；未驗證範圍不計入目前完成率。</p>
+      <p id="forecast-execution" class="data-note" role="status">實際完成時間尚未排定。</p>
+      <div class="kpi-grid">
+        <article class="kpi"><span>已核實工作</span><strong id="forecast-known">未知</strong><p>包含 lazy 計畫，不只已建立的佇列項目</p></article>
+        <article class="kpi"><span>剩餘歷史軸清點</span><strong id="forecast-discovery">未知</strong><p>只清點的工時；正常下載會交錯清點，不能再加一次</p></article>
+        <article class="kpi"><span>全部剩餘查詢 · 中間情境</span><strong id="forecast-queries">未知</strong><p id="forecast-model">未清點表仍在估算範圍內</p></article>
+        <article class="kpi"><span>預估本機總容量／分片列</span><strong id="forecast-total-bytes">未知</strong><p><span id="forecast-total-rows">未知</span> 列；非網路流量、非原生觀測數</p></article>
+      </div>
+      <div class="progress-card"><p id="forecast-progress-label">預估查詢工作分母未知</p><progress id="forecast-progress" class="progress-track" max="1" aria-label="TEJ 預估查詢工作進度，不是已驗證歷史完整率"></progress></div>
+      <p id="forecast-storage" class="data-note">本機容量餘裕待觀測。</p>
+      <div class="table-scroll tej-stage-scroll" role="region" aria-label="分階段工作量與完成時間" tabindex="0"><table><thead><tr><th>階段／範圍</th><th>欄位／下載依賴</th><th>新增剩餘查詢</th><th>已匯出／預估總列</th><th>實際／預估總容量</th><th>完成依賴的剩餘工時</th><th>若現在連續執行的完成日 · 臺北</th><th>未解條件</th></tr></thead><tbody id="phase-rows"></tbody></table></div>
+      <details class="tej-eta-details"><summary>估算依據與限制</summary><p id="forecast-assumptions">等待本機中繼資料。</p></details>
+      <p class="data-note">P1：新增候選；P2：補歷史／口徑；P3：多源校驗候選。<a href="https://www.tej.com.tw/TEJPLUS/TEJE3_TCHINESE.pdf" target="_blank" rel="noopener noreferrer">官方 Preview 最多 30 欄</a>：單鍵目前快照最多 29 個特徵，兩鍵歷史最多 28 個，三鍵歷史最多 27 個。單鍵快照不乘歷史日期；第三鍵與同日多筆紀錄均保留，欄位片互不重複。工作格點含欄位分片，不當原生觀測筆數；請以「查詢範圍」查看排程進度。工作按需建立，附帶的低優先欄位不另抓；取得校驗候選不等於完成獨立校驗。</p>
+    </section>
+    <section id="quota" class="section-block" aria-labelledby="quota-title">
+      <header class="section-heading"><span>03</span><div><h2 id="quota-title">桌面限額與本機操作量</h2><p>Smart Wizard 桌面授權與 TEJ API 是不同通道；不把舊版 API 文件的試用／付費範例當成目前帳號上限。</p></div></header>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>最近 60 分鐘佇列工作開始</span><strong id="desktop-operations">—</strong><p id="traffic-sampled">按分鐘取樣，不包含手動診斷，不等於 HTTP requests</p></article>
+        <article class="kpi"><span>桌面每秒請求上限</span><strong id="quota-second">未知</strong><p>只允許一個桌面工作持有者</p></article>
+        <article class="kpi"><span>桌面每日請求上限</span><strong id="quota-day-calls">未知</strong><p>官方帳號實際已用量也未取得</p></article>
+        <article class="kpi"><span>桌面每日列數上限</span><strong id="quota-day-rows">未知</strong><p id="quota-reset">重置時間與時區尚未確認</p></article>
+      </div>
+      <p class="data-note">官方 <a href="https://api.tej.com.tw/document_python.html" target="_blank" rel="noopener noreferrer">TEJ API 文件</a>提供帳號每日請求、每日／每月筆數與用量；需要獨立 API key，不能由桌面登入推定。桌面限額未查證不表示無限制；遇到來源配額或權限視窗立即停止，不自動關閉或繞過。</p>
+    </section>
+    <section id="tables" class="section-block" aria-labelledby="tables-title">
+      <header class="section-heading"><span>04</span><div><h2 id="tables-title">逐表下載狀態</h2><p>依回補中、待抓、格點匯出完成、需檢查排序。此通道是批次查詢，不是即時串流。</p></div></header>
+      <div class="tej-toolbar"><label>資料表搜尋<input id="table-search" type="search" maxlength="120" placeholder="表名、分類或 SmartID"></label><label>階段<select id="table-phase"><option value="all">全部</option><option value="P1">P1 新增候選</option><option value="P2">P2 歷史缺口</option><option value="P3">P3 校驗候選</option></select></label><p id="table-count" role="status">讀取中</p></div>
+      <div class="table-scroll finlab-table-scroll" role="region" aria-label="TEJ 每張表狀態、首末期間與容量" tabindex="0"><table><thead><tr><th>資料表／SmartID</th><th>狀態／順序</th><th>欄位／公司</th><th>最早非空查詢期間</th><th>最新非空查詢期間</th><th>已匯出／格點目標</th><th>實際／估計容量</th><th>估計剩餘工時</th></tr></thead><tbody id="table-rows"><tr><td colspan="8">讀取中…</td></tr></tbody></table></div>
+      <div class="tej-pagination"><button id="table-prev" type="button" disabled>上一頁</button><span id="table-page">—</span><button id="table-next" type="button" disabled>下一頁</button></div>
+    </section>
+    <section id="features" class="section-block" aria-labelledby="features-title">
+      <header class="section-heading"><span>05</span><div><h2 id="features-title">每個 Feature 獨立列示</h2><p>搜尋全部表內欄位；顯示欄名單位提示、原始值政策、既有來源對照與已匯出非空數。尚未逐表核實單位換算與底層精度，不傳送任何原始值。</p></div></header>
+      <div class="tej-toolbar"><label>欄位搜尋<input id="feature-search" type="search" maxlength="120" placeholder="欄位名或資料表名"></label><label>資料表<select id="feature-table"><option value="">全部資料表</option></select></label><label>階段<select id="feature-phase"><option value="all">全部</option><option value="P1">P1 新增候選</option><option value="P2">P2 歷史缺口</option><option value="P3">P3 校驗候選</option></select></label></div>
+      <p id="feature-count" role="status" aria-live="polite">讀取中</p>
+      <div class="table-scroll finlab-table-scroll" role="region" aria-label="TEJ 逐欄覆蓋與單位提示" tabindex="0"><table><thead><tr><th>欄位／資料表</th><th>階段／狀態</th><th>欄名單位提示</th><th>原始值政策</th><th>已匯出非空儲存格</th><th>最早／最新查詢期間</th><th>既有資料非空數／範圍</th></tr></thead><tbody id="feature-rows"><tr><td colspan="7">讀取中…</td></tr></tbody></table></div>
+      <div class="tej-pagination"><button id="feature-prev" type="button" disabled>上一頁</button><span id="feature-page">—</span><button id="feature-next" type="button" disabled>下一頁</button></div>
+    </section>
+    <section id="method" class="section-block method" aria-labelledby="method-title"><header class="section-heading"><span>06</span><div><h2 id="method-title">資料與執行邊界</h2><p>來源可取得、匯出完整、原生觀測完整、當時可用與遠端授權分開。</p></div></header>
+      <p class="limitation">1900 年只是往前搜尋起點，不宣稱資料自該年開始。v4 先驗證公司／日期介面可用、來源通知已完成且沒有錯誤視窗，再保存完整資料格的顯示字串，避開故障的 Excel ActiveX 匯出。因 TEJ 記憶體錯誤而可能沿用的舊選單範圍保留、撤回重驗，不當成歷史完整證明。尚未逐表證明底層數值精度。另建的十進位數值欄只解析明確數字，不猜地區格式。原始值不做 log、補零、插值或任意捨入；來源自身的 log 衍生欄位仍保存，但標為不得作原始值訓練輸入。已明示「千股」的欄位另建股數換算，原值與單位保留。失敗及未知操作結果不當成完成；明確空回只計入查詢範圍，不計入資料筆數。查詢格點可能帶出最近一期，不能把其日期當發布日。本機授權資料不自動公開、同步冷庫或注入模型。下載順序候選不是已證明同義或已完成多源一致性校驗。</p>
+    </section>
+  </main>
+  <script src="../dashboard-core.js?v=11" defer></script><script src="app.js?v=14" defer></script>
+</body></html>

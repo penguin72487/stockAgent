@@ -1,0 +1,11 @@
+[Unit]
+Description=Continue TAIFEX rule archive and holiday announcement updates
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=20s
+Unit=stockagent-taifex-rules.service
+
+[Install]
+WantedBy=timers.target

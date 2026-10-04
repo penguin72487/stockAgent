@@ -1,0 +1,27 @@
+[Unit]
+Description=Refresh audited Bybit daily crypto training dataset
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+Slice=stockagent-heavy-data.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh"
+ExecStart=/usr/bin/bash -c 'source "@REPO_ROOT@/scripts/runtime_env.sh"; run_fintech_python "@REPO_ROOT@/scripts/refresh_crypto_training_dataset.py" --publish'
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryAccounting=true
+MemoryHigh=24G
+MemoryMax=32G
+MemorySwapMax=4G
+OOMScoreAdjust=750
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

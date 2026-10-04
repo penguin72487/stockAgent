@@ -50,6 +50,7 @@ try:
     from downloader.openbb_credentials import apply_openbb_environment_credentials
     from downloader.openbb_archive_contracts import (
         ARCHIVE_TIME_SHARD_PROVIDER_ALLOWLIST,
+        CATALOG_FOLLOWUP_ENDPOINTS,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
         LOCAL_ONLY_ARCHIVE_DATE_FILTERS,
         PlanContractAuditor,
@@ -61,6 +62,7 @@ except ModuleNotFoundError:  # Direct execution from downloader/.
     from openbb_credentials import apply_openbb_environment_credentials
     from openbb_archive_contracts import (
         ARCHIVE_TIME_SHARD_PROVIDER_ALLOWLIST,
+        CATALOG_FOLLOWUP_ENDPOINTS,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
         LOCAL_ONLY_ARCHIVE_DATE_FILTERS,
         PlanContractAuditor,
@@ -72,6 +74,7 @@ except ModuleNotFoundError:  # Direct execution from downloader/.
 ARCHIVE_SCHEMA_VERSION = 1
 PLANNER_STATE_VERSION = 10
 RESUME_MAINTENANCE_VERSION = 2
+CATALOG_FOLLOWUP_REPAIR_VERSION = 2
 
 # Request-cost observations are implementation-specific.  When an adapter
 # workaround changes the number of HTTP calls without changing the manifest
@@ -745,7 +748,7 @@ PROVIDER_RATE_POLICIES: dict[str, ProviderRatePolicy] = {
     "fred": ProviderRatePolicy(
         2,
         1,
-        "OpenBB FRED provider ceiling; FRED confirms 429 throttling but publishes no numeric limit",
+        "official FRED API ceiling of 120 requests per minute, smoothed to 2 requests/second",
         "https://fred.stlouisfed.org/docs/api/fred/errors.html",
     ),
     "government_us": ProviderRatePolicy(
@@ -1614,6 +1617,11 @@ def select_providers(
     return selected
 
 
+def _command_providers(context: PlannerContext, endpoint: str) -> Sequence[str]:
+    """Use the same registry lookup for initial and dynamically discovered tasks."""
+    return context.commands.get(f".{endpoint}", context.commands.get(endpoint, ()))
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
@@ -1767,7 +1775,7 @@ def make_task(
     filename = f"{_safe_scope(scope_key)}-{task_id[:16]}.parquet"
     output_path = context.output_dir / "data" / endpoint_dir / task_id[:2] / filename
     if providers is None:
-        raw = context.commands.get(f".{endpoint}", context.commands.get(endpoint, []))
+        raw = _command_providers(context, endpoint)
         providers = select_providers(endpoint, raw, context)
     return DownloadTask(
         task_id=task_id,
@@ -4713,6 +4721,16 @@ class Manifest:
             ON tasks(active, plan_token, status, endpoint)
             """
             )
+            # L1 compaction selects the earliest unassigned successful task
+            # per endpoint. Keep that order in a partial covering index so a
+            # bounded batch does not sort the entire multi-million-task plan.
+            self.connection.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_l1_tasks_compaction_order
+            ON tasks(plan_token, endpoint, task_id, rows)
+            WHERE active=1 AND status='success'
+            """
+            )
             self.connection.execute(
                 """
             CREATE INDEX IF NOT EXISTS idx_tasks_retry_not_before
@@ -5263,7 +5281,7 @@ class Manifest:
         """
         providers = select_providers(
             "economy.fred_series",
-            context.commands.get(".economy.fred_series", []),
+            _command_providers(context, "economy.fred_series"),
             context,
         )
         if not providers:
@@ -8637,12 +8655,15 @@ class ProviderRuntime:
                     if provider in HTTP_BOUNDARY_PACED_PROVIDERS
                     else SharedRateLimiter
                 )
-                # Keep independently-run Yahoo downloaders on the same
-                # process-shared limiter bucket.  ``yfinance`` is OpenBB's
-                # provider name; the direct Yahoo downloader uses the
-                # canonical upstream/account bucket ``yahoo_finance``.
+                # Adapter names do not create new upstream capacity. Match
+                # independently-run collectors' host/account buckets while
+                # retaining this provider's rate and HTTP preclaim contract.
+                # CFTC stays independent: OpenBB uses publicreporting's
+                # Socrata API, not the www.cftc.gov legacy ZIP archive bucket.
                 limiter_name = {
                     "yfinance": "yahoo_finance",
+                    "fred": "fred_api",
+                    "sec": "sec_edgar",
                 }.get(provider, provider)
                 self._limiters[provider] = limiter_class(
                     1.0 / rps,
@@ -10400,6 +10421,10 @@ def _fetch_un_comtrade_export_destinations(
                 payload = _un_comtrade_json(url, page_limiter)
                 progress.update(1)
                 data = payload.get("data", []) if isinstance(payload, Mapping) else []
+                if not isinstance(data, list) or len(data) >= 500:
+                    # Public preview is capped at 500 records. Never label a
+                    # possibly truncated response as a complete country slice.
+                    raise ProviderResponseShapeError("UN Comtrade preview cap reached; narrower or entitled query required")
                 records: list[dict[str, Any]] = []
                 for row in data:
                     if not isinstance(row, Mapping):
@@ -10426,6 +10451,8 @@ def _fetch_un_comtrade_export_destinations(
                             ),
                             "reference_year": year,
                             "source": "UN Comtrade",
+                            "history_complete": False,
+                            "source_scope": "latest_available_annual_export_destinations_public_preview",
                             "source_url": url,
                         }
                     )
@@ -11246,11 +11273,33 @@ def _fetch_eia_petroleum_status_workaround(kwargs: Mapping[str, Any]) -> list[An
         EiaPetroleumStatusReportFetcher,
     )
 
-    query = EiaPetroleumStatusReportFetcher.transform_query(dict(kwargs))
+    post_filter = str(kwargs.get("table")) in {
+        "ulta_low_sulfur_distillate_reclassification", "ulta_low_sulfur_distillate_reclassification_avg",
+    }
+    # These discontinued tables have valid old rows but no recent rows. The
+    # SDK concatenates an empty list after date filtering and reports a parser
+    # failure. Validate the full workbook first; only then prove window-empty.
+    query_kwargs = dict(kwargs)
+    if post_filter:
+        query_kwargs.update(start_date=None, end_date=None)
+    query = EiaPetroleumStatusReportFetcher.transform_query(query_kwargs)
     raw = asyncio.run(EiaPetroleumStatusReportFetcher.aextract_data(query, None))
-    return _provider_result_rows(
+    rows = _provider_result_rows(
         EiaPetroleumStatusReportFetcher.transform_data(query, raw)
     )
+    if post_filter:
+        selected = []
+        for row in rows:
+            value = row.get("date") if isinstance(row, Mapping) else getattr(row, "date", None)
+            observed = date.fromisoformat(str(value)[:10])
+            if ((not kwargs.get("start_date") or observed >= date.fromisoformat(str(kwargs["start_date"])[:10]))
+                    and (not kwargs.get("end_date") or observed <= date.fromisoformat(str(kwargs["end_date"])[:10]))):
+                selected.append(row)
+        if not selected:
+            from openbb_core.provider.utils.errors import EmptyDataError
+            raise EmptyDataError("Validated EIA workbook has no observations in this requested window")
+        return selected
+    return rows
 
 
 def _fetch_federal_reserve_central_bank_holdings_workaround(
@@ -16443,6 +16492,18 @@ def classify_error(exc: Exception) -> str:
         r"(?<!\d)(?:401|403)(?!\d)", text
     ):
         return "auth"
+    # SDK wrappers can erase the text of asyncio's TimeoutError. Preserve its
+    # typed cause so a temporary network stall cannot become a terminal gap.
+    cause, seen_causes = exc, set()
+    for _ in range(8):
+        if id(cause) in seen_causes:
+            break
+        seen_causes.add(id(cause))
+        if isinstance(cause, (TimeoutError, ConnectionError)):
+            return "transient"
+        cause = cause.__cause__ or cause.__context__
+        if cause is None:
+            break
     status_code = getattr(exc, "code", None) or getattr(exc, "status", None)
     if (
         any(marker in text for marker in TRANSIENT_ERROR_MARKERS)
@@ -17227,11 +17288,27 @@ class OpenBBWorker:
                                     page_limiter=limiter,
                                     show_progress=self.show_progress,
                                 )
+                        elif task.endpoint == "commodity.energy_history" and provider == "eia":
+                            if __package__:
+                                from .openbb_eia_history import fetch_history
+                            else:  # canonical shell invokes this file directly
+                                from openbb_eia_history import fetch_history
+
+                            result = ColumnarTaskPayload(fetch_history(provider_kwargs, self.obb))
+                        elif task.endpoint == "economy.gdp.forecast" and provider == "oecd":
+                            if __package__:
+                                from .openbb_oecd_history import fetch_gdp_forecast
+                            else:
+                                from openbb_oecd_history import fetch_gdp_forecast
+                            result = ColumnarTaskPayload(fetch_gdp_forecast(provider_kwargs))
                         elif (
                             task.endpoint == "commodity.petroleum_status_report"
                             and provider == "eia"
                             and str(provider_kwargs.get("table"))
-                            in _eia_petroleum_schema_mismatch_tables()
+                            in (_eia_petroleum_schema_mismatch_tables() | {
+                                "ulta_low_sulfur_distillate_reclassification",
+                                "ulta_low_sulfur_distillate_reclassification_avg",
+                            })
                         ):
                             result = _fetch_eia_petroleum_status_workaround(
                                 provider_kwargs
@@ -17700,7 +17777,7 @@ def discover_followup_tasks(
 
     if endpoint == "cftc.cot_search":
         providers = select_providers(
-            "cftc.cot", context.commands.get(".cftc.cot", []), context
+            "cftc.cot", _command_providers(context, "cftc.cot"), context
         )
         report_type = str(result.task.kwargs.get("report_type") or "legacy")
         futures_only = bool(result.task.kwargs.get("futures_only", False))
@@ -17751,7 +17828,7 @@ def discover_followup_tasks(
             )
             release_providers = select_providers(
                 "economy.fred_release_table",
-                context.commands.get(".economy.fred_release_table", []),
+                _command_providers(context, "economy.fred_release_table"),
                 context,
             )
             if release_providers:
@@ -17770,7 +17847,7 @@ def discover_followup_tasks(
     ):
         providers = select_providers(
             "economy.fred_series",
-            context.commands.get(".economy.fred_series", []),
+            _command_providers(context, "economy.fred_series"),
             context,
         )
         for record in _followup_record_progress(context, result, records):
@@ -17801,7 +17878,7 @@ def discover_followup_tasks(
     elif endpoint == "economy.survey.bls_search":
         providers = select_providers(
             "economy.survey.bls_series",
-            context.commands.get(".economy.survey.bls_series", []),
+            _command_providers(context, "economy.survey.bls_series"),
             context,
         )
         series_ids: list[str] = []
@@ -17905,7 +17982,7 @@ def discover_followup_tasks(
     elif endpoint == "regulators.sec.cik_map":
         providers = select_providers(
             "regulators.sec.symbol_map",
-            context.commands.get(".regulators.sec.symbol_map", []),
+            _command_providers(context, "regulators.sec.symbol_map"),
             context,
         )
         if providers:
@@ -17927,7 +18004,7 @@ def discover_followup_tasks(
     elif endpoint == "index.available":
         history_providers = select_providers(
             "index.price.historical",
-            context.commands.get(".index.price.historical", []),
+            _command_providers(context, "index.price.historical"),
             context,
         )
         for record in _followup_record_progress(context, result, records):
@@ -17954,7 +18031,7 @@ def discover_followup_tasks(
     elif endpoint == "currency.search":
         providers = select_providers(
             "currency.price.historical",
-            context.commands.get(".currency.price.historical", []),
+            _command_providers(context, "currency.price.historical"),
             context,
         )
         for record in _followup_record_progress(context, result, records):
@@ -17987,7 +18064,7 @@ def discover_followup_tasks(
             else ("url", "amendment_url")
         )
         child_providers = select_providers(
-            child_endpoint, context.commands.get(f".{child_endpoint}", []), context
+            child_endpoint, _command_providers(context, child_endpoint), context
         )
         argument = "bill_url" if endpoint.endswith("bills") else "amendment_url"
         for record in _followup_record_progress(context, result, records):
@@ -18006,7 +18083,7 @@ def discover_followup_tasks(
     elif endpoint == "equity.fundamental.filings":
         child_providers = select_providers(
             "regulators.sec.filing_headers",
-            context.commands.get(".regulators.sec.filing_headers", []),
+            _command_providers(context, "regulators.sec.filing_headers"),
             context,
         )
         for record in _followup_record_progress(context, result, records):
@@ -18078,6 +18155,123 @@ def _write_rows_parquet(rows: list[dict[str, Any]], path: Path) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def reconcile_catalog_followups(
+    context: PlannerContext,
+    manifest: Manifest,
+    *,
+    plan_token: str,
+    allowed_endpoints: set[str],
+) -> dict[str, int]:
+    """Restore missing children from verified local parents, with no provider I/O.
+
+    A legacy or interrupted plan may retain a successful parent without its
+    children. Reuse discovery and the durable manifest upsert; never redownload
+    parents, reset successful children, or change the archive right boundary.
+    """
+    counts = {"checked_parents": 0, "expected_children": 0, "restored_children": 0}
+    parent_endpoints = tuple(
+        endpoint for endpoint in CATALOG_FOLLOWUP_ENDPOINTS if endpoint in allowed_endpoints
+    )
+    if not parent_endpoints:
+        return counts
+    marks = ",".join("?" for _ in parent_endpoints)
+    cursor = manifest.connection.execute(
+        "SELECT * FROM tasks WHERE active=1 AND plan_token=? AND status='success' "
+        f"AND endpoint IN ({marks}) ORDER BY endpoint,task_id",
+        (plan_token, *parent_endpoints),
+    )
+    required = {
+        "_openbb_endpoint", "_provider", "_scope_key", "_query_json", "_retrieved_at"
+    }
+    for parent in cursor:
+        task = manifest._task_from_row(parent)
+        path = Path(str(parent["output_path"]))
+        parquet = pq.ParquetFile(path)
+        if (
+            int(parent["rows"]) <= 0
+            or parquet.metadata.num_rows != int(parent["rows"])
+            or not required.issubset(parquet.schema_arrow.names)
+        ):
+            raise ValueError(f"catalog parent receipt mismatch: {task.task_id}")
+        records = parquet.read(use_threads=False).to_pylist()
+        expected = {
+            "_openbb_endpoint": task.endpoint,
+            "_provider": parent["selected_provider"],
+            "_scope_key": task.scope_key,
+            "_query_json": str(parent["kwargs_json"]),
+        }
+        if (
+            any(records[0].get(key) != value for key, value in expected.items())
+            or not records[0].get("_retrieved_at")
+        ):
+            raise ValueError(f"catalog parent metadata mismatch: {task.task_id}")
+        result = TaskResult(
+            task=task,
+            status="success",
+            provider=parent["selected_provider"],
+            rows=int(parent["rows"]),
+            output_path=str(path),
+            attempts=int(parent["attempts"]),
+            records=records,
+        )
+        followups = {
+            child.task_id: child
+            for child in discover_followup_tasks(context, result)
+            if child.endpoint in allowed_endpoints
+        }
+        counts["checked_parents"] += 1
+        counts["expected_children"] += len(followups)
+        children = list(followups.values())
+        for offset in range(0, len(children), 512):
+            batch = children[offset : offset + 512]
+            child_marks = ",".join("?" for _ in batch)
+            current = {
+                str(row["task_id"])
+                for row in manifest.connection.execute(
+                    "SELECT task_id,active,plan_token FROM tasks "
+                    f"WHERE task_id IN ({child_marks})",
+                    tuple(child.task_id for child in batch),
+                )
+                # Keep the SQL lookup keyed only by the primary key. Combining
+                # active/plan predicates lets SQLite pick the scheduling index
+                # and scan millions of active tasks for every small batch.
+                if row["active"] == 1 and row["plan_token"] == plan_token
+            }
+            missing = [child for child in batch if child.task_id not in current]
+            if missing:
+                manifest.upsert_tasks(
+                    missing, plan_token=plan_token, task_source="followup"
+                )
+                counts["restored_children"] += len(missing)
+    return counts
+
+
+def repair_catalog_followups_once(
+    context: PlannerContext,
+    manifest: Manifest,
+    *,
+    plan_token: str,
+    coverage: Sequence[CoverageDecision],
+    no_discovery: bool = False,
+) -> dict[str, int] | None:
+    """Mark only a fully verified local repair as current, separately from replan."""
+    key = f"{plan_token}:catalog_followup_repair_version"
+    if no_discovery or manifest.meta_value(key) == str(CATALOG_FOLLOWUP_REPAIR_VERSION):
+        return None
+    counts = reconcile_catalog_followups(
+        context,
+        manifest,
+        plan_token=plan_token,
+        allowed_endpoints={
+            entry.endpoint
+            for entry in coverage
+            if entry.decision in {"included", "deferred"} and entry.selected_providers
+        },
+    )
+    manifest.set_meta_value(key, str(CATALOG_FOLLOWUP_REPAIR_VERSION))
+    return counts
 
 
 def write_catalogs(
@@ -18497,6 +18691,15 @@ def _pop_fairest_endpoint_task(
         tasks.rotate(best_index)
 
 
+def _external_queue_revision(output_dir: Path) -> tuple[int, int] | None:
+    """Cheap wake signal, not a data/completeness proof or a manifest scan."""
+    try:
+        stat = (output_dir / "_state/public_priority_queue_event.json").stat()
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
 def execute_download_tasks(
     context: PlannerContext,
     manifest: Manifest,
@@ -18588,6 +18791,7 @@ def execute_download_tasks(
     )
     completion_backpressure_limit = min(COMPLETION_BACKPRESSURE_CAP, target_inflight)
     last_full_refill_monotonic = 0.0
+    external_queue_revision = _external_queue_revision(context.output_dir)
     runtime = getattr(worker, "runtime", None)
     preload_provider_queues = bool(getattr(worker, "preload_provider_queues", False))
     unavailable_bucket = "__runtime_unavailable__"
@@ -19123,6 +19327,10 @@ def execute_download_tasks(
         nonlocal wave_number, provider_endpoint_selection_order
         nonlocal refill_threshold, provider_refill_thresholds
         nonlocal last_full_refill_monotonic
+        nonlocal external_queue_revision
+        # Capture before the query: an event arriving during that query must
+        # still wake the next refill rather than being accidentally consumed.
+        external_queue_revision = _external_queue_revision(context.output_dir)
         last_full_refill_monotonic = time.monotonic()
         capacity = target_inflight - len(futures) - buffered_task_count()
         if max_tasks is not None:
@@ -19679,6 +19887,8 @@ def execute_download_tasks(
                         # unrelated retry deadline after an expensive empty scan.
                         wait_deadline = time.monotonic() + max(0.05, delay + 0.1)
                         while True:
+                            if _external_queue_revision(context.output_dir) != external_queue_revision:
+                                break
                             remaining = max(0.0, wait_deadline - time.monotonic())
                             if remaining <= 0:
                                 break
@@ -19969,6 +20179,7 @@ def execute_download_tasks(
                     full_refill_due = (
                         time.monotonic() - last_full_refill_monotonic
                         >= full_fair_refill_interval_seconds
+                        or _external_queue_revision(context.output_dir) != external_queue_revision
                     )
                     if not completion_backpressure_active and (
                         (queued_count <= refill_threshold and provider_refilled == 0)
@@ -20273,6 +20484,9 @@ def run(argv: Sequence[str] | None = None) -> int:
                 for item in coverage
                 if item.decision in {"included", "deferred"}
             }
+            # Official EIA routes absent from the installed OpenBB SDK still
+            # belong to this worker, manifest, limiter and atomic writer.
+            followup_endpoints.add("commodity.energy_history")
             migrated_plan_followups, retired_other_plan_tasks = (
                 manifest.reconcile_active_plan_membership(
                     plan_token,
@@ -20428,6 +20642,50 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(stage="prepare resumable run", refresh=False)
+        catalog_repair_key = f"{plan_token}:catalog_followup_repair_version"
+        repaired_catalog_followups = {
+            "checked_parents": 0, "expected_children": 0, "restored_children": 0
+        }
+        catalog_followup_repair_seconds = 0.0
+        if (
+            not args.no_discovery
+            and manifest.meta_value(catalog_repair_key) != str(CATALOG_FOLLOWUP_REPAIR_VERSION)
+        ):
+            _write_json_atomic(
+                phase_path,
+                {
+                    "phase": "manifest_maintenance",
+                    "stage": "reconcile_catalog_followups",
+                    "plan_token": plan_token,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            repair_started = time.perf_counter()
+            repaired_catalog_followups = repair_catalog_followups_once(
+                context,
+                manifest,
+                plan_token=plan_token,
+                coverage=coverage,
+            )
+            catalog_followup_repair_seconds = time.perf_counter() - repair_started
+            _write_json_atomic(
+                args.output_dir / "_state" / "catalog_followup_repair_latest.json",
+                {
+                    "schema_version": 1,
+                    "repair_version": CATALOG_FOLLOWUP_REPAIR_VERSION,
+                    "plan_token": plan_token,
+                    "status": "local_catalog_reconciliation_complete",
+                    "counts": repaired_catalog_followups,
+                    "elapsed_seconds": catalog_followup_repair_seconds,
+                    "scope": "verified_local_catalogs_children_queued_not_downloaded",
+                    "plan_only": bool(args.plan_only),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            print(
+                "[openbb-catalog-repair] " + _canonical_json(repaired_catalog_followups),
+                flush=True,
+            )
         _write_json_atomic(
             phase_path,
             {
@@ -20999,6 +21257,12 @@ def run(argv: Sequence[str] | None = None) -> int:
             "plan_token": plan_token,
             "attempted_this_run": attempted,
             "run_totals": totals,
+            "catalog_followup_repair": {
+                "version": CATALOG_FOLLOWUP_REPAIR_VERSION,
+                "counts": repaired_catalog_followups,
+                "elapsed_seconds": catalog_followup_repair_seconds,
+                "scope": "verified_local_catalogs_no_provider_requests",
+            },
             "manifest_counts": final_counts,
             "disabled_providers": runtime.unavailable(),
             "disabled_provider_routes": {
@@ -21014,9 +21278,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         summary_path = args.output_dir / "_state" / "last_run_summary.json"
-        summary_path.write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _write_json_atomic(summary_path, summary)
         print(
             f"[openbb-done] attempted={attempted} totals={totals} manifest={final_counts}",
             flush=True,

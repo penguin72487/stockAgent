@@ -1,0 +1,13 @@
+[Unit]
+Description=Check WSL host memory during registered backfill
+
+[Timer]
+OnBootSec=5min
+OnActiveSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+Persistent=false
+Unit=stockagent-wsl-backfill-memory-reclaim.service
+
+[Install]
+WantedBy=timers.target

@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat as stat_module
 import sys
 import threading
 import time
@@ -43,7 +44,6 @@ from stockagent.live.public_dashboards import (  # noqa: E402
 )
 from stockagent.live.dashboard_updates import (
     DashboardUpdateHub,
-    file_signature,
     metadata_signature,
 )  # noqa: E402
 from stockagent.live.benchmark_history_projection import (  # noqa: E402
@@ -51,6 +51,16 @@ from stockagent.live.benchmark_history_projection import (  # noqa: E402
 )
 from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
     build_shioaji_public_status,
+)
+from stockagent.live.finlab_dashboard import (  # noqa: E402
+    build_finlab_public_status,
+)
+from stockagent.live.finmind_dashboard import (  # noqa: E402
+    build_finmind_public_status,
+)
+from stockagent.live.tej_dashboard import (  # noqa: E402
+    build_tej_public_status,
+    build_tej_feature_page,
 )
 from stockagent.live.openbb_archive_dashboard import (  # noqa: E402
     build_openbb_public_history,
@@ -62,6 +72,19 @@ from stockagent.live.public_performance_history import (  # noqa: E402
 from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     build_data_monitor_public_status,
     build_tw_public_monitor_status,
+    project_data_monitor_summary,
+)
+from stockagent.live.data_monitor_providers import project_provider_detail  # noqa: E402
+from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
+    trusted_feature_preview,
+    trusted_feature_snapshot,
+    trusted_feature_source_pages,
+)
+from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
+    FEATURE_PREVIEW_LIMIT,
+    FeaturePageIndex,
+    feature_page_revision,
+    page_from_source_rows,
 )
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     DEFAULT_MAX_SOURCE_AGE_SECONDS,
@@ -75,6 +98,10 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     dashboard_session_clock,
     warm_dashboard_session_indexes,
 )
+from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
+    age_seconds,
+    load_service_sync,
+)
 
 
 MAX_UPSTREAM_BYTES: Final[int] = 8 * 1024 * 1024
@@ -84,6 +111,8 @@ PUBLIC_EVENT_LIMIT: Final[int] = 250
 MAX_CACHE_ENTRIES: Final[int] = 512
 MAX_CACHE_BYTES: Final[int] = 128 * 1024 * 1024
 MONITOR_STATUS_STALE_GRACE_SECONDS: Final[float] = 30.0
+MAX_SHIOAJI_SNAPSHOT_BYTES: Final[int] = 1024 * 1024
+MAX_SHIOAJI_SNAPSHOT_AGE_SECONDS: Final[float] = 60.0
 OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 5 * 60.0
 HISTORY_STALE_GRACE_SECONDS: Final[float] = 15 * 60.0
 IMMUTABLE_ASSET_CACHE_CONTROL: Final[str] = "public, max-age=31536000, immutable"
@@ -156,12 +185,18 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-overnight/api/signals",
         "/tw-overnight/api/events",
         "/shioaji/api/status",
+        "/finlab/api/status",
+        "/finmind/api/status",
+        "/tej/api/status",
+        "/tej/api/features",
         "/openbb/api/status",
         "/openbb/api/history",
         "/data-monitor/api/status",
         "/data-monitor/api/summary",
         "/data-monitor/api/details",
+        "/data-monitor/api/provider",
         "/data-monitor/api/features",
+        "/data-monitor/api/features/page",
         "/traffic/api/status",
         "/traffic/api/history",
     }
@@ -173,8 +208,12 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/",
         "/tw-overnight/",
         "/shioaji/",
+        "/finlab/",
+        "/finmind/",
+        "/tej/",
         "/openbb/",
         "/data-monitor/",
+        "/data-monitor/providers/{provider}/",
         "/traffic/",
     }
 )
@@ -188,6 +227,9 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/signals",
         "/tw-day-trade/api/events",
         "/openbb/api/history",
+        "/data-monitor/api/provider",
+        "/data-monitor/api/features/page",
+        "/tej/api/features",
         "/tw-overnight/api/status",
         "/tw-overnight/api/history",
         "/tw-overnight/api/summary",
@@ -461,6 +503,8 @@ class PublicTrafficObserver:
             return path, "api"
         if path in _PUBLIC_PAGE_ROUTES:
             return path, "page"
+        if path.startswith("/data-monitor/providers/") and path.endswith("/"):
+            return "/data-monitor/providers/{provider}/", "page"
         if path.endswith((".css", ".js", ".ico", ".txt")):
             return "靜態資源", "asset"
         return "其他／未命中", "other"
@@ -859,7 +903,7 @@ class PublicTrafficObserver:
         current_minute = now_epoch - now_epoch % 60
         since_epoch = current_minute - (expected_minutes - 1) * 60
         rows = (
-            self._history_store.rows_since(since_epoch)
+            self._history_store.rows_since_readonly(since_epoch)
             if self._history_store is not None
             else []
         )
@@ -1020,8 +1064,11 @@ def _prepared(
     cache_control: str,
 ) -> PreparedResponse:
     digest = hashlib.sha256(body).hexdigest()
+    # A complete 1m chart is ~15 MB before transfer.  Level 3 kept almost
+    # the same wire size in the measured production payload while avoiding
+    # ~180 ms of synchronous compression on each new ledger revision.
     compressed = (
-        gzip.compress(body, compresslevel=5, mtime=0) if len(body) >= 1_024 else body
+        gzip.compress(body, compresslevel=3, mtime=0) if len(body) >= 1_024 else body
     )
     return PreparedResponse(
         body=body,
@@ -1090,6 +1137,127 @@ def _response_json(response: PreparedResponse) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("cached JSON root is not an object")
     return payload
+
+
+def _verified_recent_shioaji_status(
+    repo_root: Path,
+) -> tuple[dict[str, Any], tuple[int, ...]] | None:
+    """Read one recent, producer-owned public projection without broker I/O."""
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite Shioaji projection: {value}")
+
+    path = repo_root / "artifacts/live/data_monitor/shioaji_status.json"
+    try:
+        with os.fdopen(
+            os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb"
+        ) as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat_module.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= MAX_SHIOAJI_SNAPSHOT_BYTES
+                or before.st_uid != os.getuid()
+                or before.st_mode & 0o022
+            ):
+                return None
+            payload = json.loads(
+                stream.read(MAX_SHIOAJI_SNAPSHOT_BYTES + 1),
+                parse_constant=reject_nonfinite,
+            )
+            signature = metadata_signature(before)
+            if metadata_signature(os.fstat(stream.fileno())) != signature:
+                return None
+        after = path.lstat()
+        if (
+            not stat_module.S_ISREG(after.st_mode)
+            or metadata_signature(after) != signature
+            or not isinstance(payload, dict)
+            or payload.get("dashboard_schema_version") != 5
+            or payload.get("read_only") is not True
+            or payload.get("simulation_only") is not True
+            or payload.get("production_order_possible") is not False
+            or not isinstance(payload.get("health"), str)
+            or not isinstance(payload.get("pipelines"), list)
+        ):
+            return None
+        generated = datetime.fromisoformat(
+            str(payload.get("generated_at_utc") or "").replace("Z", "+00:00")
+        )
+        if generated.tzinfo is None:
+            return None
+        age = (datetime.now(UTC) - generated.astimezone(UTC)).total_seconds()
+        if not 0 <= age <= MAX_SHIOAJI_SNAPSHOT_AGE_SECONDS:
+            return None
+        return payload, signature
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return None
+
+
+def _verified_data_monitor_summary(repo_root: Path) -> dict[str, Any] | None:
+    """Use the small producer projection only for its exact full snapshot."""
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite summary projection: {value}")
+
+    root = repo_root / "artifacts/live/data_monitor"
+    source = root / "public_status.json"
+    sidecar = root / "public_summary.json"
+    try:
+        source_stat = source.stat()
+        if not stat_module.S_ISREG(source_stat.st_mode):
+            return None
+        with os.fdopen(
+            os.open(sidecar, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb"
+        ) as stream:
+            sidecar_stat = os.fstat(stream.fileno())
+            if (
+                not stat_module.S_ISREG(sidecar_stat.st_mode)
+                or sidecar_stat.st_size > 2 * 1024 * 1024
+                or sidecar_stat.st_uid != source_stat.st_uid
+                or sidecar_stat.st_mode & 0o022
+                or source_stat.st_mode & 0o022
+            ):
+                return None
+            receipt = json.loads(
+                stream.read(2 * 1024 * 1024 + 1),
+                parse_constant=reject_nonfinite,
+            )
+            if metadata_signature(os.fstat(stream.fileno())) != metadata_signature(sidecar_stat):
+                return None
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+            return None
+        if receipt.get("read_only") is not True or receipt.get("production_control_possible") is not False:
+            return None
+        projection = receipt.get("projection")
+        if not isinstance(projection, dict):
+            return None
+        if projection.get("read_only") is not True or projection.get("production_control_possible") is not False:
+            return None
+        if (
+            not isinstance(projection.get("schema_version"), int)
+            or not isinstance(projection.get("health"), str)
+            or not isinstance(projection.get("summary"), dict)
+        ):
+            return None
+        signature = metadata_signature(source_stat)
+        if receipt.get("source_signature") != list(signature):
+            return None
+        expected_digest = receipt.get("source_sha256")
+        if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            return None
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            if metadata_signature(os.fstat(stream.fileno())) != signature:
+                return None
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+            if metadata_signature(os.fstat(stream.fileno())) != signature:
+                return None
+        if metadata_signature(source.stat()) != signature or digest.hexdigest() != expected_digest:
+            return None
+        return project_data_monitor_summary(projection)
+    except (OSError, ValueError, UnicodeError):
+        return None
 
 
 def _open_position_summary(payload: Mapping[str, Any]) -> tuple[int, int]:
@@ -1166,21 +1334,41 @@ def build_compact_tw_overview_status(
         raise UnsafePublicDashboardPayload("production_order_possible must be false")
 
     observed = (now or datetime.now(UTC)).astimezone(UTC)
-    source_updated_at = status.get("updated_at")
-    source_age_seconds: float | None = None
-    if source_updated_at:
-        parsed = datetime.fromisoformat(str(source_updated_at).replace("Z", "+00:00"))
+    commit_updated_at = status.get("updated_at")
+    commit_age_seconds: float | None = None
+    if commit_updated_at:
+        parsed = datetime.fromisoformat(str(commit_updated_at).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             raise ValueError("TW status updated_at has no timezone")
-        source_age_seconds = max(
+        commit_age_seconds = max(
             0.0,
             (observed - parsed.astimezone(UTC)).total_seconds(),
         )
+    sync = load_service_sync(state_dir)
+    status_revision = int(status.get("state_revision") or 0)
+    status_run_id = str(status.get("engine_run_id") or "")
+    committed_identity_present = bool(status_revision or status_run_id)
+    heartbeat_matches_commit = bool(
+        sync is not None
+        and status_revision > 0
+        and status_revision == int(sync.get("state_revision") or 0)
+        and status_run_id
+        and status_run_id == str(sync.get("engine_run_id") or "")
+    )
+    heartbeat_at = (sync or {}).get("heartbeat_at") or (sync or {}).get("published_at")
+    heartbeat_age = (
+        age_seconds(heartbeat_at, now=observed) if heartbeat_matches_commit else None
+    )
+    source_updated_at = heartbeat_at if heartbeat_age is not None else commit_updated_at
+    source_age_seconds = (
+        heartbeat_age if heartbeat_age is not None else commit_age_seconds
+    )
 
     health = str(status.get("health") or "unknown")
     if (
         source_age_seconds is None
         or source_age_seconds > DEFAULT_MAX_SOURCE_AGE_SECONDS
+        or (committed_identity_present and not heartbeat_matches_commit)
     ):
         health = "stale"
 
@@ -1247,6 +1435,10 @@ def build_compact_tw_overview_status(
         "source_age_seconds": (
             round(source_age_seconds, 3) if source_age_seconds is not None else None
         ),
+        "source_commit_updated_at": commit_updated_at,
+        "source_commit_age_seconds": (
+            round(commit_age_seconds, 3) if commit_age_seconds is not None else None
+        ),
         "simulation_only": True,
         "production_order_possible": False,
         "modes": modes,
@@ -1262,6 +1454,9 @@ def build_public_overview(
     data_monitor: Mapping[str, Any] | None = None,
     traffic: Mapping[str, Any] | None = None,
     overnight: Mapping[str, Any] | None = None,
+    finlab_quota: Mapping[str, Any] | None = None,
+    finmind_status: Mapping[str, Any] | None = None,
+    tej_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return only the fields required by the public landing cards."""
 
@@ -1282,6 +1477,17 @@ def build_public_overview(
     data_monitor = data_monitor if isinstance(data_monitor, Mapping) else {}
     data_summary = data_monitor.get("summary")
     data_summary = data_summary if isinstance(data_summary, Mapping) else {}
+    finlab_acquisition = data_monitor.get("finlab_acquisition")
+    finlab_acquisition = finlab_acquisition if isinstance(finlab_acquisition, Mapping) else {}
+    finlab_quota = finlab_quota if isinstance(finlab_quota, Mapping) else {}
+    finmind_status = finmind_status if isinstance(finmind_status, Mapping) else {}
+    tej_status = tej_status if isinstance(tej_status, Mapping) else {}
+    tej_catalog = tej_status.get("catalog") if isinstance(tej_status.get("catalog"), Mapping) else {}
+    tej_workload = tej_status.get("workload") if isinstance(tej_status.get("workload"), Mapping) else {}
+    finmind_acquisition = finmind_status.get("acquisition")
+    finmind_acquisition = finmind_acquisition if isinstance(finmind_acquisition, Mapping) else {}
+    finmind_quota = finmind_status.get("quota")
+    finmind_quota = finmind_quota if isinstance(finmind_quota, Mapping) else {}
     shioaji_traffic = shioaji_traffic if isinstance(shioaji_traffic, Mapping) else {}
     traffic = traffic if isinstance(traffic, Mapping) else {}
     traffic_windows = traffic.get("windows")
@@ -1358,6 +1564,27 @@ def build_public_overview(
             "total_tasks": openbb_archive.get("total_tasks", 0),
             "success_rows": openbb_archive.get("success_rows", 0),
         },
+        "finlab": {
+            "state": finlab_acquisition.get("state"),
+            "downloaded": finlab_acquisition.get("downloaded"),
+            "catalog_total": finlab_acquisition.get("catalog_total"),
+            "used_mb": finlab_quota.get("used_mb"),
+            "limit_mb": finlab_quota.get("limit_mb"),
+            "quota_observed_at_utc": finlab_quota.get("observed_at_utc"),
+        },
+        "finmind": {
+            "health": finmind_status.get("health"),
+            "complete": finmind_acquisition.get("complete_session_day_tasks"),
+            "total": finmind_acquisition.get("total_session_day_tasks"),
+            "observed_requests_60m": finmind_quota.get("observed_requests_60m"),
+            "official_requests_per_hour": finmind_quota.get("official_requests_per_hour"),
+            "quota_state": finmind_quota.get("state"),
+        },
+        "tej": {
+            "state": tej_status.get("state"), "tables": tej_catalog.get("tables"),
+            "fields": tej_catalog.get("fields"), "exported_rows": tej_workload.get("exported_rows"),
+            "catalog_scan_complete": tej_catalog.get("catalog_scan_complete"),
+        },
         "data_monitor": {
             "health": data_monitor.get("health"),
             "registered_items": data_summary.get("registered_items", 0),
@@ -1388,6 +1615,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         taifex_static_root: Path,
         tw_static_root: Path,
         shioaji_static_root: Path,
+        finlab_static_root: Path | None = None,
+        finmind_static_root: Path | None = None,
+        tej_static_root: Path | None = None,
         openbb_static_root: Path,
         data_monitor_static_root: Path,
         traffic_static_root: Path,
@@ -1403,6 +1633,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.tw_static_root = Path(tw_static_root)
         self.overnight_static_root = Path(overnight_static_root or tw_static_root)
         self.shioaji_static_root = Path(shioaji_static_root)
+        self.finlab_static_root = Path(finlab_static_root or repo_root / "services/finlab_dashboard")
+        self.finmind_static_root = Path(finmind_static_root or repo_root / "services/finmind_dashboard")
+        self.tej_static_root = Path(tej_static_root or repo_root / "services/tej_dashboard")
         self.openbb_static_root = Path(openbb_static_root)
         self.data_monitor_static_root = Path(data_monitor_static_root)
         self.traffic_static_root = Path(traffic_static_root)
@@ -1424,6 +1657,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self._refreshing: set[str] = set()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
+        self._feature_page_lock = threading.Lock()
+        self._feature_page_index: tuple[Path, tuple[int, ...], FeaturePageIndex] | None = None
+        self._feature_page_preview: tuple[Path, tuple[int, ...], Mapping[str, Any]] | None = None
+        self._feature_source_pages: tuple[
+            Path, tuple[int, ...], Mapping[str, list[Mapping[str, Any]]], Mapping[str, Any],
+        ] | None = None
         bot = self.repo_root / "artifacts/discord_bot"
         self.update_hub = DashboardUpdateHub(
             {
@@ -1440,8 +1679,32 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     ("tw", "tw_day_trade_simulation"),
                     ("overnight", "tw_overnight_simulation"),
                 )
-            }
+            },
+            metadata_only_paths={
+                self.repo_root / "artifacts/live" / directory / filename
+                for directory in (
+                    "tw_day_trade_simulation",
+                    "tw_overnight_simulation",
+                )
+                for filename in (
+                    "marks.jsonl",
+                    "benchmark_marks.jsonl",
+                    "benchmark_history.json",
+                )
+            },
         )
+        for topic, directory in (
+            ("tw", "tw_day_trade_simulation"),
+            ("overnight", "tw_overnight_simulation"),
+        ):
+            state_root = self.repo_root / "artifacts/live" / directory
+            # Marks and benchmarks can change without an engine commit.
+            self.update_hub.paths[topic] = (
+                *self.update_hub.paths[topic],
+                state_root / "marks.jsonl",
+                state_root / "benchmark_marks.jsonl",
+                state_root / "benchmark_history.json",
+            )
         overnight_root = self.repo_root / "artifacts/live/tw_overnight_simulation"
         self.update_hub.paths["overnight"] = (
             *self.update_hub.paths["overnight"],
@@ -1477,9 +1740,14 @@ class PublicDashboardServer(ThreadingHTTPServer):
             if outer:
                 metrics["build_ms"] += (time.perf_counter() - started) * 1000
 
-    def content_token(self, topic: str = "tw") -> str:
+    def content_token(self, topic: str = "tw", *, history_only: bool = False) -> str:
         response = self.tw_revision() if topic == "tw" else self.overnight_revision()
-        revision = str(_response_json(response).get("revision_token") or "missing")
+        revision_payload = _response_json(response)
+        revision = str(
+            (revision_payload.get("history_revision") if history_only else None)
+            or revision_payload.get("revision_token")
+            or "missing"
+        )
         directory = (
             "tw_day_trade_simulation" if topic == "tw" else "tw_overnight_simulation"
         )
@@ -1849,29 +2117,36 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_prefix = f"tw-status:{date_scope}:"
         cache_key = f"{cache_prefix}{revision_token}"
 
+        def build_status() -> Mapping[str, Any]:
+            payload = sanitize_tw_status(
+                build_dashboard_snapshot(
+                    state_dir=self.repo_root
+                    / "artifacts/live/tw_day_trade_simulation",
+                    preopen_readiness_path=self.repo_root
+                    / "artifacts/discord_bot/preopen_readiness.json",
+                    session_date=normalized_date or None,
+                    maximum_event_rows=500,
+                    maximum_mark_rows=32,
+                    include_position_rows=False,
+                    include_order_fill_rows=False,
+                    # Completed-session position snapshots and immutable
+                    # benchmark history already enumerate the public selector.
+                    include_ledger_session_dates=False,
+                )
+            )
+            service_sync = dict(payload.get("service_sync") or {})
+            service_sync["revision_token"] = revision_token
+            service_sync["history_revision"] = revision.get("history_revision")
+            payload["service_sync"] = service_sync
+            return payload
+
         def build_response() -> PreparedResponse:
             return self.cached_local_json(
                 cache_key=cache_key,
                 ttl_seconds=55.0,
                 cache_control="no-store",
                 stale_grace_seconds=120.0,
-                builder=lambda: sanitize_tw_status(
-                    build_dashboard_snapshot(
-                        state_dir=self.repo_root
-                        / "artifacts/live/tw_day_trade_simulation",
-                        preopen_readiness_path=self.repo_root
-                        / "artifacts/discord_bot/preopen_readiness.json",
-                        session_date=normalized_date or None,
-                        maximum_event_rows=500,
-                        maximum_mark_rows=32,
-                        include_position_rows=False,
-                        # Completed-session position snapshots and immutable
-                        # benchmark history already enumerate the public date
-                        # selector. Avoid indexing multi-GB append-only ledgers on
-                        # a cold read merely to rediscover the same dates.
-                        include_ledger_session_dates=False,
-                    )
-                ),
+                builder=build_status,
             )
 
         # An atomic history promotion can change the content revision and the
@@ -1896,20 +2171,34 @@ class PublicDashboardServer(ThreadingHTTPServer):
         )
 
     def tw_revision(self) -> PreparedResponse:
-        signature = tuple(file_signature(path) for path in self.update_hub.paths["tw"])
+        signature = tuple(
+            self.update_hub.signature(path) for path in self.update_hub.paths["tw"]
+        )
         session_date = dashboard_session_clock(datetime.now(UTC)).get(
             "display_session_date"
         )
+
+        def build() -> Mapping[str, Any]:
+            payload = build_dashboard_revision(
+                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                discord_service_status_path=self.repo_root
+                / "artifacts/discord_bot/service_status.json",
+            )
+            history_revision = hashlib.sha256(
+                repr(signature[5:]).encode("utf-8")
+            ).hexdigest()[:16]
+            payload["history_revision"] = history_revision
+            payload["revision_token"] = (
+                f"{payload.get('revision_token') or 'missing'}:{history_revision}"
+            )
+            return payload
+
         return self.cached_local_json(
             cache_key=f"tw-revision:{signature}:{session_date}",
             ttl_seconds=0.05,
             cache_control="no-store",
             stale_grace_seconds=0.0,
-            builder=lambda: build_dashboard_revision(
-                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
-                discord_service_status_path=self.repo_root
-                / "artifacts/discord_bot/service_status.json",
-            ),
+            builder=build,
         )
 
     def tw_history(
@@ -1924,7 +2213,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         date_key = (
             f"{start_date or ''}:{end_date or ''}:{resolution}:{history_encoding}"
         )
-        revision_token = self.content_token()
+        revision_token = self.content_token(history_only=True)
         cache_prefix = f"tw-history:{range_key}:{date_key}:"
         cache_key = f"{cache_prefix}{revision_token}"
 
@@ -1961,7 +2250,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def overnight_revision(self) -> PreparedResponse:
         signature = tuple(
-            file_signature(path) for path in self.update_hub.paths["overnight"]
+            self.update_hub.signature(path)
+            for path in self.update_hub.paths["overnight"]
         )
 
         def build() -> Mapping[str, Any]:
@@ -1973,7 +2263,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 discord_engine_revision_field="overnight_engine_state_revision",
             )
             history_revision = hashlib.sha256(
-                repr(signature[4:]).encode("utf-8")
+                repr(signature[5:]).encode("utf-8")
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
             payload["revision_token"] = (
@@ -2041,6 +2331,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "missing_1325_count",
                     "close_fallback_count",
                     "valuation_stale_market_count",
+                    "unresolved_prior_position_count",
+                    "blocked_close_signal_count",
                 )
             }
             service_sync = dict(payload.get("service_sync") or {})
@@ -2090,7 +2382,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             f"{start_date or ''}:{end_date or ''}:{resolution}:{history_encoding}"
         )
         return self.cached_local_json(
-            cache_key=f"overnight-history:{range_key}:{date_key}:{self.content_token('overnight')}",
+            cache_key=f"overnight-history:{range_key}:{date_key}:{self.content_token('overnight', history_only=True)}",
             ttl_seconds=55.0,
             cache_control="no-cache",
             stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
@@ -2114,6 +2406,25 @@ class PublicDashboardServer(ThreadingHTTPServer):
             cache_control="no-store",
             stale_grace_seconds=0.0,
             builder=lambda: build_openbb_public_status(self.repo_root),
+        )
+
+    def shioaji_status(self) -> PreparedResponse:
+        snapshot = _verified_recent_shioaji_status(self.repo_root)
+        if snapshot is not None:
+            payload, signature = snapshot
+            return self.cached_local_json(
+                cache_key=f"shioaji-status-snapshot:{signature}",
+                ttl_seconds=MAX_SHIOAJI_SNAPSHOT_AGE_SECONDS,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: payload,
+            )
+        return self.cached_local_json(
+            cache_key="shioaji-status",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+            builder=lambda: build_shioaji_public_status(self.repo_root),
         )
 
     def openbb_history(self, range_key: str) -> PreparedResponse:
@@ -2166,15 +2477,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 builder=read_snapshot,
             )
         if shioaji_status is None:
-            shioaji_status = _response_json(
-                self.cached_local_json(
-                    cache_key="shioaji-status",
-                    ttl_seconds=8.0,
-                    cache_control="no-store",
-                    stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
-                    builder=lambda: build_shioaji_public_status(self.repo_root),
-                )
-            )
+            shioaji_status = _response_json(self.shioaji_status())
         if openbb_status is None:
             openbb_status = _response_json(self.openbb_status())
         return self.cached_local_json(
@@ -2191,30 +2494,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def data_monitor_summary(self) -> PreparedResponse:
         def build() -> Mapping[str, Any]:
+            projection = _verified_data_monitor_summary(self.repo_root)
+            if projection is not None:
+                return projection
             payload = _response_json(self.data_monitor_status())
-            return {
-                key: payload[key]
-                for key in (
-                    "schema_version",
-                    "generated_at_utc",
-                    "health",
-                    "read_only",
-                    "production_control_possible",
-                    "summary",
-                    "endpoint_inventory",
-                    "provider_summaries",
-                    "market_categories",
-                    "record_inventory_progress",
-                    "integrity_checks",
-                    "definitions",
-                    "tw_public_acquisition",
-                    # Physical groups are the overview immediately above the
-                    # registry. They are small enough for first paint; the
-                    # per-source records remain on the deferred detail route.
-                    "groups",
-                )
-                if key in payload
-            }
+            return project_data_monitor_summary(payload)
 
         return self.cached_local_json(
             cache_key="data-monitor-summary",
@@ -2249,6 +2533,32 @@ class PublicDashboardServer(ThreadingHTTPServer):
             builder=build,
         )
 
+    def data_monitor_provider(
+        self, provider: str, *, offset: int = 0, limit: int = 30,
+        search: str = "", operation: str = "all", market: str = "all",
+    ) -> PreparedResponse:
+        """Only serialize the selected owner label, not the full registry."""
+
+        def build() -> Mapping[str, Any]:
+            payload = _response_json(self.data_monitor_status())
+            selected = project_provider_detail(
+                payload, provider, offset=offset, limit=limit, search=search,
+                operation=operation, market=market,
+            )
+            if selected is None:
+                raise PublicRouteNotFound(provider)
+            return selected
+
+        request_key = json.dumps([provider, offset, limit, search, operation, market], ensure_ascii=False)
+        digest = hashlib.sha256(request_key.encode("utf-8")).hexdigest()
+        return self.cached_local_json(
+            cache_key=f"data-monitor-provider:{digest}",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+            builder=build,
+        )
+
     def data_monitor_features(self) -> PreparedResponse:
         """Serve the separately materialized, read-only field inventory."""
 
@@ -2257,30 +2567,205 @@ class PublicDashboardServer(ThreadingHTTPServer):
             stat = snapshot.stat()
         except FileNotFoundError:
             stat = None
-        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) if stat else None
-
-        def build() -> Mapping[str, Any]:
-            if stat is None:
-                return {
+        if stat is None:
+            return self.cached_local_json(
+                cache_key="data-monitor-features:missing",
+                ttl_seconds=45.0,
+                cache_control="no-store",
+                stale_grace_seconds=60.0,
+                builder=lambda: {
                     "schema_version": 1, "read_only": True,
                     "production_control_possible": False,
                     "summary": {"state": "waiting_inventory", "fields": 0},
                     "rows": [],
-                }
-            payload = json.loads(snapshot.read_text(encoding="utf-8"))
-            if not isinstance(payload, Mapping) or payload.get("read_only") is not True:
-                raise ValueError("data-monitor feature snapshot is not read-only")
-            if payload.get("production_control_possible") is not False or not isinstance(payload.get("rows"), list):
-                raise ValueError("data-monitor feature snapshot has invalid public contract")
-            return payload
+                },
+            )
+        signature = metadata_signature(stat)
 
-        return self.cached_local_json(
+        def build() -> PreparedResponse:
+            # The producer already writes compact public JSON. Keep its exact
+            # bytes after validation instead of allocating and serializing a
+            # second 37 MB object graph on the first visitor's request.
+            with snapshot.open("rb") as stream:
+                opened = metadata_signature(os.fstat(stream.fileno()))
+                body = stream.read()
+                finished = metadata_signature(os.fstat(stream.fileno()))
+            if signature != opened or signature != finished or signature != metadata_signature(snapshot.stat()):
+                raise ValueError("data-monitor feature snapshot changed during read")
+
+            def reject_nonfinite(value: str) -> None:
+                raise ValueError(f"data-monitor feature snapshot has non-finite JSON: {value}")
+
+            if not trusted_feature_snapshot(snapshot, source_stat=stat, body=body):
+                # The sidecar is only an optional producer proof. Never trust
+                # a missing, stale or tampered receipt over the JSON contract.
+                payload = json.loads(body, parse_constant=reject_nonfinite)
+                if not isinstance(payload, Mapping) or payload.get("read_only") is not True:
+                    raise ValueError("data-monitor feature snapshot is not read-only")
+                if payload.get("production_control_possible") is not False or not isinstance(payload.get("rows"), list):
+                    raise ValueError("data-monitor feature snapshot has invalid public contract")
+            return _prepared(
+                body if body.endswith(b"\n") else body + b"\n",
+                content_type="application/json; charset=utf-8",
+                cache_control="no-store",
+            )
+
+        return self._cached_response(
             cache_key=f"data-monitor-features:{signature}",
             ttl_seconds=45.0,
-            cache_control="no-store",
             stale_grace_seconds=60.0,
             builder=build,
         )
+
+    def _trusted_feature_page_preview(self) -> tuple[tuple[int, ...], Mapping[str, Any]] | None:
+        """Use a source-digest-bound first page without parsing all 53 MiB."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            source_stat = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        signature = metadata_signature(source_stat)
+        with self._feature_page_lock:
+            cached = self._feature_page_preview
+            if cached is not None and cached[0] == snapshot and cached[1] == signature:
+                return signature, cached[2]
+            preview = trusted_feature_preview(snapshot, source_stat=source_stat)
+            if preview is None:
+                return None
+            self._feature_page_preview = (snapshot, signature, preview)
+            return signature, preview
+
+    def _feature_index(self) -> FeaturePageIndex:
+        """Parse one producer generation once, then page it without re-reading 53 MiB."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            signature = metadata_signature(snapshot.stat())
+        except FileNotFoundError:
+            return FeaturePageIndex.from_payload(
+                {
+                    "schema_version": 1,
+                    "read_only": True,
+                    "production_control_possible": False,
+                    "summary": {"state": "waiting_inventory", "fields": 0},
+                    "rows": [],
+                },
+                source_signature=(0, 0, 0, 0, 0),
+            )
+        with self._feature_page_lock:
+            cached = self._feature_page_index
+            if cached is not None and cached[0] == snapshot and cached[1] == signature:
+                return cached[2]
+            with snapshot.open("rb") as stream:
+                opened = metadata_signature(os.fstat(stream.fileno()))
+                body = stream.read()
+                finished = metadata_signature(os.fstat(stream.fileno()))
+            if (
+                signature != opened or signature != finished
+                or signature != metadata_signature(snapshot.stat())
+            ):
+                raise ValueError("data-monitor feature snapshot changed during read")
+
+            def reject_nonfinite(value: str) -> None:
+                raise ValueError(f"data-monitor feature snapshot has non-finite JSON: {value}")
+
+            # Paging must inspect the DTO even if a producer sidecar exists;
+            # the sidecar is only an accelerator for the legacy full-byte route.
+            payload = json.loads(body, parse_constant=reject_nonfinite)
+            index = FeaturePageIndex.from_payload(payload, source_signature=signature)
+            if signature != metadata_signature(snapshot.stat()):
+                raise ValueError("data-monitor feature snapshot changed during validation")
+            self._feature_page_index = (snapshot, signature, index)
+            return index
+
+    def _small_source_page(
+        self, *, offset: int, limit: int, search: str, category: str,
+        source: str, revision: str | None,
+    ) -> dict[str, Any] | None:
+        """Use source-bound small pages; missing proof takes the full path."""
+
+        snapshot = self.repo_root / "artifacts/live/data_monitor/feature_inventory.json"
+        try:
+            source_stat = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        signature = metadata_signature(source_stat)
+        with self._feature_page_lock:
+            cached = self._feature_source_pages
+            if cached is None or cached[0] != snapshot or cached[1] != signature:
+                trusted = trusted_feature_source_pages(snapshot, source_stat=source_stat)
+                try:
+                    current_signature = metadata_signature(snapshot.stat())
+                except OSError:
+                    return None
+                if trusted is None or signature != current_signature:
+                    return None
+                pages, preview = trusted
+                self._feature_source_pages = (snapshot, signature, pages, preview)
+            else:
+                pages, preview = cached[2], cached[3]
+            source_rows = pages.get(source)
+            if source_rows is None:
+                return None
+            return page_from_source_rows(
+                rows=source_rows, preview=preview,
+                revision=feature_page_revision(signature),
+                requested_revision=revision, offset=offset, limit=limit,
+                search=search, category=category,
+            )
+
+    def data_monitor_feature_page(
+        self, *, offset: int = 0, limit: int = 80, search: str = "",
+        category: str = "all", source: str = "all", revision: str | None = None,
+    ) -> PreparedResponse:
+        """Return all matching fields through bounded, generation-safe pages."""
+
+        def build() -> PreparedResponse:
+            source_page = (
+                self._small_source_page(
+                    offset=offset, limit=limit, search=search,
+                    category=category, source=source, revision=revision,
+                ) if source != "all" else None
+            )
+            preview = (
+                self._trusted_feature_page_preview()
+                if source_page is None and offset == 0 and limit <= FEATURE_PREVIEW_LIMIT
+                and not search and category == "all" and source == "all"
+                else None
+            )
+            if source_page is not None:
+                page = source_page
+            elif preview is None:
+                page = self._feature_index().page(
+                    offset=offset, limit=limit, search=search,
+                    category=category, source=source, requested_revision=revision,
+                )
+            else:
+                signature, projection = preview
+                current_revision = feature_page_revision(signature)
+                page = {
+                    "schema_version": 1,
+                    "read_only": True,
+                    "production_control_possible": False,
+                    "generated_at_utc": projection.get("generated_at_utc"),
+                    "revision": current_revision,
+                    "reset_required": revision is not None and revision != current_revision,
+                    "offset": 0,
+                    "limit": limit,
+                    "matching_total": projection["summary"]["fields"],
+                    "has_more": limit < projection["summary"]["fields"],
+                    "summary": projection["summary"],
+                    "filters": projection["filters"],
+                    "rows": projection["rows"][:limit],
+                }
+            return _prepared(
+                (json.dumps(page, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8"),
+                content_type="application/json; charset=utf-8",
+                cache_control="no-store",
+            )
+
+        return self._measured_build(build)
 
     def public_overview(self) -> Mapping[str, Any]:
         # These sources are independent.  Build their verified snapshots on
@@ -2321,14 +2806,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     / "artifacts/live/tw_overnight_simulation/preopen_readiness.json",
                 ),
             )
-            shioaji_future = executor.submit(
-                self.cached_local_json,
-                cache_key="shioaji-status",
-                ttl_seconds=8.0,
-                cache_control="no-store",
-                stale_grace_seconds=0.0,
-                builder=lambda: build_shioaji_public_status(self.repo_root),
-            )
+            shioaji_future = executor.submit(self.shioaji_status)
             openbb_future = executor.submit(self.openbb_status)
             taifex = _response_json(taifex_future.result())
             tw = _response_json(tw_future.result())
@@ -2341,6 +2819,14 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 openbb_status=openbb,
             )
         )
+        try:
+            finlab_quota = json.loads(
+                (self.repo_root / "artifacts/live/finlab/quota_latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, ValueError):
+            finlab_quota = {}
         return build_public_overview(
             taifex,
             tw,
@@ -2349,6 +2835,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
             data_monitor,
             self.traffic_observer.snapshot(),
             overnight=overnight,
+            finlab_quota=finlab_quota,
+            finmind_status=build_finmind_public_status(self.repo_root),
+            tej_status=build_tej_public_status(self.repo_root),
         )
 
     def prewarm_overview(self) -> None:
@@ -2646,6 +3135,17 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             self._write_body(body)
 
     def _static_response(self, path: str) -> PreparedResponse | None:
+        provider_prefix = "/data-monitor/providers/"
+        if path.startswith(provider_prefix) and path.endswith("/"):
+            segment = path[len(provider_prefix):-1]
+            if (segment not in {"", ".", ".."} and len(segment) <= 512 and
+                    re.fullmatch(r"(?:[A-Za-z0-9_.~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+", segment)):
+                return self.server.cached_static(
+                    self.server.data_monitor_static_root / "provider.html",
+                    content_type="text/html; charset=utf-8",
+                    cache_control="no-cache, must-revalidate",
+                )
+            return None
         routes: dict[str, tuple[Path, str, str]] = {
             "/": (
                 self.server.public_static_root / "index.html",
@@ -2703,6 +3203,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             ("/tw-day-trade/", self.server.tw_static_root),
             ("/tw-overnight/", self.server.overnight_static_root),
             ("/shioaji/", self.server.shioaji_static_root),
+            ("/finlab/", self.server.finlab_static_root),
+            ("/finmind/", self.server.finmind_static_root),
+            ("/tej/", self.server.tej_static_root),
             ("/openbb/", self.server.openbb_static_root),
             ("/data-monitor/", self.server.data_monitor_static_root),
             ("/traffic/", self.server.traffic_static_root),
@@ -2712,9 +3215,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / "index.html",
                     "text/html; charset=utf-8",
-                    "public, max-age=60",
+                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/tej/"} else "public, max-age=60",
                 )
-            elif suffix == "app.js" or (
+            elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix == "provider.js") or (
                 prefix in {"/tw-day-trade/", "/tw-overnight/"}
                 and suffix
                 in {
@@ -2726,7 +3229,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / suffix,
                     "text/javascript; charset=utf-8",
-                    IMMUTABLE_ASSET_CACHE_CONTROL,
+                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/tej/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
             elif suffix == "styles.css" or (
                 prefix == "/traffic/" and suffix == "performance.css"
@@ -2770,6 +3273,84 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise InvalidPublicRequest("invalid date query") from error
 
     @staticmethod
+    def _tej_feature_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=5)
+            if set(query) - {"offset", "limit", "q", "table", "phase"} or any(len(v) != 1 for v in query.values()):
+                raise ValueError("invalid fields")
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["50"])[0])
+            search, table_id, phase = (query.get(k, [default])[0] for k, default in (("q", ""), ("table", ""), ("phase", "all")))
+            if (not 0 <= offset <= 1_000_000 or not 1 <= limit <= 100 or len(search) > 120
+                    or any(ord(c) < 32 for c in search) or phase not in {"all", "P1", "P2", "P3"}
+                    or table_id and not re.fullmatch(r"[a-f0-9]{24}", table_id)):
+                raise ValueError("invalid parameters")
+            return {"offset": offset, "limit": limit, "search": search, "table_id": table_id, "phase": phase}
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid TEJ feature page") from error
+
+    @staticmethod
+    def _provider_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=6)
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid provider query") from error
+        allowed = {"name", "offset", "limit", "q", "state", "market"}
+        if "name" not in query or set(query) - allowed or any(len(values) != 1 for values in query.values()):
+            raise InvalidPublicRequest("provider name required")
+        provider = query["name"][0]
+        if not 0 < len(provider) <= 200 or any(ord(char) < 32 for char in provider):
+            raise InvalidPublicRequest("invalid provider name")
+        try:
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["30"])[0])
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid provider page") from error
+        search = query.get("q", [""])[0].strip()
+        operation = query.get("state", ["all"])[0]
+        market = query.get("market", ["all"])[0]
+        if (not 0 <= offset <= 10000 or not 1 <= limit <= 1500 or len(search) > 120 or
+                any(ord(char) < 32 for char in search) or
+                operation not in {"all", "catching_up", "streaming", "complete", "unable",
+                                  "deferred", "control", "reference"} or
+                not re.fullmatch(r"all|[a-z_]{1,40}", market)):
+            raise InvalidPublicRequest("invalid provider filters")
+        return {"provider": provider, "offset": offset, "limit": limit,
+                "search": search, "operation": operation, "market": market}
+
+    @staticmethod
+    def _feature_page_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=6)
+            allowed = {"offset", "limit", "q", "category", "source", "revision"}
+            if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+                raise InvalidPublicRequest("unsupported or repeated feature query field")
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["80"])[0])
+            search = query.get("q", [""])[0].strip()
+            category = query.get("category", ["all"])[0]
+            source = query.get("source", ["all"])[0]
+            revision = query.get("revision", [None])[0]
+            if (
+                not 0 <= offset <= 1_000_000 or not 1 <= limit <= 5_000
+                or len(search) > 120 or any(ord(char) < 32 for char in search)
+                or not re.fullmatch(r"all|[a-z_]{1,40}", category)
+                or not 0 < len(source) <= 200
+                or any(ord(char) < 32 for char in source)
+                or (revision is not None and not re.fullmatch(r"[0-9a-f]{32}", revision))
+                or (offset > 0 and revision is None)
+            ):
+                raise InvalidPublicRequest("invalid feature page query")
+            return {
+                "offset": offset, "limit": limit, "search": search,
+                "category": category, "source": source, "revision": revision,
+            }
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid feature page query") from error
+
+    @staticmethod
     def _signal_query(raw_query: str) -> str:
         try:
             query = parse_qs(
@@ -2808,7 +3389,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 raise InvalidPublicRequest("start_date must not be after end_date")
             offset = int(query.get("offset", ["0"])[0])
             limit = int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0])
-            if offset < 0 or offset > 100_000:
+            if offset < 0 or offset > 10_000_000:
                 raise InvalidPublicRequest("offset is outside the public range")
             if limit < 1:
                 raise InvalidPublicRequest("limit must be positive")
@@ -2970,7 +3551,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 raise InvalidPublicRequest("start_date must not be after end_date")
             offset = int(query.get("offset", ["0"])[0])
             limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
-            if offset < 0 or offset > 100_000:
+            # Session projections page by offset without materializing the
+            # intervening event dictionaries. Keep a finite public bound.
+            if offset < 0 or offset > 10_000_000:
                 raise InvalidPublicRequest("offset is outside the public range")
             if limit < 1:
                 raise InvalidPublicRequest("limit must be positive")
@@ -3235,12 +3818,36 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 ),
             )
         if path == "/shioaji/api/status":
+            return self.server.shioaji_status()
+        if path == "/finlab/api/status":
             return self.server.cached_local_json(
-                cache_key="shioaji-status",
-                ttl_seconds=8.0,
+                cache_key="finlab-status",
+                ttl_seconds=25.0,
                 cache_control="no-store",
                 stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
-                builder=lambda: build_shioaji_public_status(self.server.repo_root),
+                builder=lambda: build_finlab_public_status(self.server.repo_root),
+            )
+        if path == "/finmind/api/status":
+            return self.server.cached_local_json(
+                cache_key="finmind-status",
+                ttl_seconds=20.0,
+                cache_control="no-store",
+                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                builder=lambda: build_finmind_public_status(self.server.repo_root),
+            )
+        if path == "/tej/api/status":
+            return self.server.cached_local_json(
+                cache_key="tej-status", ttl_seconds=20.0, cache_control="no-store",
+                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                builder=lambda: build_tej_public_status(self.server.repo_root),
+            )
+        if path == "/tej/api/features":
+            filters = self._tej_feature_query(raw_query)
+            key = json.dumps(filters, sort_keys=True)
+            return self.server.cached_local_json(
+                cache_key=f"tej-features:{key}", ttl_seconds=20.0, cache_control="no-store",
+                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                builder=lambda: build_tej_feature_page(self.server.repo_root, **filters),
             )
         if path == "/openbb/api/status":
             return self.server.openbb_status()
@@ -3252,8 +3859,14 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.data_monitor_summary()
         if path == "/data-monitor/api/details":
             return self.server.data_monitor_details()
+        if path == "/data-monitor/api/provider":
+            return self.server.data_monitor_provider(**self._provider_query(raw_query))
         if path == "/data-monitor/api/features":
             return self.server.data_monitor_features()
+        if path == "/data-monitor/api/features/page":
+            return self.server.data_monitor_feature_page(
+                **self._feature_page_query(raw_query)
+            )
         if path == "/traffic/api/status":
             payload = self.server.traffic_observer.snapshot(
                 exclude_current_request=True
@@ -3404,6 +4017,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "/tw-day-trade",
             "/tw-overnight",
             "/shioaji",
+            "/finlab",
+            "/finmind",
+            "/tej",
             "/openbb",
             "/data-monitor",
             "/traffic",
@@ -3601,6 +4217,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("services/shioaji_api_dashboard"),
     )
     parser.add_argument(
+        "--finlab-static-root",
+        type=Path,
+        default=Path("services/finlab_dashboard"),
+    )
+    parser.add_argument(
+        "--finmind-static-root",
+        type=Path,
+        default=Path("services/finmind_dashboard"),
+    )
+    parser.add_argument("--tej-static-root", type=Path, default=Path("services/tej_dashboard"))
+    parser.add_argument(
         "--openbb-static-root",
         type=Path,
         default=Path("services/openbb_archive_dashboard"),
@@ -3643,6 +4270,9 @@ def main(argv: list[str] | None = None) -> int:
         tw_static_root=Path(args.tw_static_root),
         overnight_static_root=Path(args.overnight_static_root),
         shioaji_static_root=Path(args.shioaji_static_root),
+        finlab_static_root=Path(args.finlab_static_root),
+        finmind_static_root=Path(args.finmind_static_root),
+        tej_static_root=Path(args.tej_static_root),
         openbb_static_root=Path(args.openbb_static_root),
         data_monitor_static_root=Path(args.data_monitor_static_root),
         traffic_static_root=Path(args.traffic_static_root),

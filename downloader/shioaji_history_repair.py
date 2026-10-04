@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
+import json
 from pathlib import Path
 from functools import lru_cache
 from typing import Any
@@ -63,6 +64,22 @@ def parsed_time(value: Any) -> datetime | None:
         return result.replace(tzinfo=UTC) if result.tzinfo is None else result.astimezone(UTC)
     except (TypeError, ValueError):
         return None
+
+
+def recent_login_waiter(path: Path, *, now: datetime | None = None, max_age_seconds: int = 120) -> bool:
+    """Only yield a history batch to a peer demonstrably waiting for its login lock."""
+
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get('state') != 'waiting' or payload.get('reason') != 'history_login_slot_busy':
+        return False
+    observed = parsed_time(payload.get('observed_at_utc'))
+    if observed is None:
+        return False
+    age = ((now or datetime.now(UTC)).astimezone(UTC) - observed).total_seconds()
+    return 0 <= age <= max_age_seconds
 
 
 def checked_time(receipt: dict[str, Any] | None) -> datetime:
@@ -170,7 +187,7 @@ def record_schedule(path: Path, *, reason: str, seconds: int) -> dict[str, Any]:
     payload = {'schema_version':1, 'state':'waiting' if seconds else 'running',
                'reason':reason, 'observed_at_utc':utc_stamp(now),
                'next_attempt_at_utc':utc_stamp(now + timedelta(seconds=seconds)),
-               'wait_seconds':seconds, 'history_window':'weekdays 14:31 through next 07:45 Asia/Taipei; weekends unrestricted',
+               'wait_seconds':seconds, 'history_window':'stock weekdays 05:00:10-07:45 Asia/Taipei; other off-hours only when live logins leave capacity',
                'max_traffic_fraction':0.90}
     atomic_write_json(path, payload)
     return payload

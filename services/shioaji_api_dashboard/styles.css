@@ -87,8 +87,8 @@ h2 { margin: 0; font-size: clamp(27px, 3.5vw, 38px); letter-spacing: -.025em; }.
 .pipeline-eta .eta-basis { color: #657e90; }
 .pipeline-eta.eta-complete, .pipeline-eta.eta-up_to_date { border-color: rgba(88,227,161,.2); }
 .pipeline-eta.eta-complete .eta-value, .pipeline-eta.eta-up_to_date .eta-value { color: var(--green); }
-.pipeline-eta.eta-waiting_quota, .pipeline-eta.eta-waiting_market, .pipeline-eta.eta-paused, .pipeline-eta.eta-waiting_upstream { border-color: rgba(245,189,79,.22); }
-.pipeline-eta.eta-waiting_quota .eta-value, .pipeline-eta.eta-waiting_market .eta-value, .pipeline-eta.eta-paused .eta-value, .pipeline-eta.eta-waiting_upstream .eta-value { color: var(--amber); }
+.pipeline-eta.eta-waiting_quota, .pipeline-eta.eta-waiting_market, .pipeline-eta.eta-waiting_capacity, .pipeline-eta.eta-waiting_scheduled, .pipeline-eta.eta-paused, .pipeline-eta.eta-waiting_upstream { border-color: rgba(245,189,79,.22); }
+.pipeline-eta.eta-waiting_quota .eta-value, .pipeline-eta.eta-waiting_market .eta-value, .pipeline-eta.eta-waiting_capacity .eta-value, .pipeline-eta.eta-waiting_scheduled .eta-value, .pipeline-eta.eta-paused .eta-value, .pipeline-eta.eta-waiting_upstream .eta-value { color: var(--amber); }
 .pipeline-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 16px 0 0; overflow: hidden; border: 1px solid rgba(41,68,91,.65); border-radius: 11px; background: rgba(41,68,91,.65); }
 .pipeline-metrics div { min-width: 0; padding: 11px 9px; background: #0a1b29; }
 .pipeline-metrics dt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

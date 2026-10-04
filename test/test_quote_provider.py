@@ -224,6 +224,14 @@ def test_historical_0901_vwap_uses_only_0900_minute_ticks(monkeypatch) -> None:
     assert rows["2330"]["execution_price_0901"] == 107.5
     assert rows["2330"]["execution_price_0901_method"] == "minute_vwap"
     assert rows["2330"]["tick_count_0901"] == 2
+    assert rows["2330"]["tick_volume_units_0901"] == 4.0
+    assert rows["2330"]["observed_volume_unit_0901"] == "board_lots"
+    assert rows["2330"]["session_open_price_0900"] == 100.0
+    assert (
+        rows["2330"]["session_open_price_source"]
+        == "shioaji:historical_first_trade_session_open"
+    )
+    assert quote_provider.observed_0901_minute_volume_lots(rows["2330"]) == 4.0
     assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
     assert receipt["resolved_symbols"] == 1
     assert receipt["right_label"] == "09:01:00 Asia/Taipei"
@@ -249,6 +257,7 @@ def test_historical_0901_price_uses_kbar_close_when_tick_query_is_empty(
         def kbars(**_kwargs):
             return SimpleNamespace(
                 ts=[minute],
+                Open=[100.5],
                 Close=[101.0],
                 Low=[100.0],
                 High=[102.0],
@@ -278,9 +287,146 @@ def test_historical_0901_price_uses_kbar_close_when_tick_query_is_empty(
     assert rows["2330"]["execution_price_0901"] == 101.0
     assert rows["2330"]["execution_price_0901_method"] == "minute_close"
     assert rows["2330"]["tick_count_0901"] == 0
+    assert rows["2330"]["observed_volume_unit_0901"] == "shares"
+    assert rows["2330"]["session_open_price_0900"] is None
+    assert rows["2330"]["session_open_price_source"] is None
     assert receipt["kbar_fallback_queries"] == 1
     assert receipt["kbar_fallback_resolved_symbols"] == 1
     assert receipt["source_empty_symbols"] == 0
+
+
+def test_historical_0901_kbar_with_volume_retains_first_trade_open(
+    monkeypatch,
+) -> None:
+    minute = int(np.datetime64("2026-08-13T09:01:00", "ns").astype(np.int64))
+
+    class FakeAPI:
+        contracts = SimpleNamespace(get=lambda symbol: object())
+
+        @staticmethod
+        def usage():
+            return SimpleNamespace(bytes=10, limit_bytes=1_000_000)
+
+        @staticmethod
+        def ticks(**_kwargs):
+            return SimpleNamespace(ts=[], close=[], volume=[])
+
+        @staticmethod
+        def kbars(**_kwargs):
+            return SimpleNamespace(
+                ts=[minute],
+                Open=[100.5],
+                Close=[101.0],
+                Low=[100.0],
+                High=[102.0],
+                Volume=[2_000.0],
+                Amount=[202_000.0],
+            )
+
+    @contextmanager
+    def fake_query(*_args, **_kwargs):
+        yield lambda _result: None
+
+    monkeypatch.setattr(quote_provider, "_shioaji_stock_api", lambda: FakeAPI())
+    monkeypatch.setattr(quote_provider, "shioaji_query", fake_query)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setitem(
+        sys.modules,
+        "shioaji",
+        SimpleNamespace(TicksQueryType=SimpleNamespace(RangeTime="RangeTime")),
+    )
+
+    rows, receipt = quote_provider.fetch_shioaji_historical_stock_0901_vwaps(
+        ["2330"],
+        trading_date=date(2026, 8, 13),
+        progress_every=0,
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 101.0
+    assert rows["2330"]["session_open_price_0900"] == 100.5
+    assert (
+        rows["2330"]["session_open_price_source"]
+        == "shioaji:historical_kbar_0901_open_first_trade"
+    )
+    assert receipt["attempted_symbols"] == ["2330"]
+
+
+def test_current_stock_minute_bars_are_cutoff_bounded_and_drop_zero_volume(
+    monkeypatch,
+) -> None:
+    stamps = [
+        int(np.datetime64(value, "ns").astype(np.int64))
+        for value in (
+            "2026-08-13T09:01:00",
+            "2026-08-13T09:02:00",
+            "2026-08-13T09:03:00",
+        )
+    ]
+
+    class FakeAPI:
+        contracts = SimpleNamespace(get=lambda symbol: object())
+
+        @staticmethod
+        def usage():
+            return SimpleNamespace(bytes=10, limit_bytes=1_000_000)
+
+        @staticmethod
+        def kbars(**_kwargs):
+            return SimpleNamespace(
+                ts=stamps,
+                Open=[100.0, 101.0, 102.0],
+                High=[101.0, 102.0, 103.0],
+                Low=[99.0, 100.0, 101.0],
+                Close=[100.5, 101.5, 102.5],
+                # Shioaji stock KBar deployments may expose regular-board
+                # volume in lots. Amount/OHLC are the unit proof: 2 lots here
+                # must normalize to 2,000 shares before capacity accounting.
+                Volume=[2.0, 0.0, 3.0],
+                Amount=[201_000.0, 0.0, 307_500.0],
+            )
+
+    @contextmanager
+    def fake_query(*_args, **_kwargs):
+        yield lambda _result: None
+
+    monkeypatch.setattr(quote_provider, "_shioaji_stock_api", lambda: FakeAPI())
+    monkeypatch.setattr(quote_provider, "shioaji_query", fake_query)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+
+    rows, receipt = quote_provider.fetch_shioaji_current_stock_minute_bars(
+        ["2330"],
+        trading_date=date(2026, 8, 13),
+        completed_through=datetime(
+            2026, 8, 13, 9, 2, tzinfo=ZoneInfo("Asia/Taipei")
+        ),
+        progress_every=0,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["ts"] == datetime(2026, 8, 13, 9, 1)
+    assert rows[0]["volume_shares"] == 2_000.0
+    assert receipt["attempted_symbols"] == ["2330"]
+    assert receipt["zero_volume_rows_ignored"] == 1
+
+
+def test_0901_minute_volume_legacy_receipts_keep_source_units() -> None:
+    tick = {
+        "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+        "tick_volume_units_0901": 3_174.0,
+    }
+    kbar = {
+        "source": "shioaji:historical_kbar_0901_minute_vwap",
+        "tick_volume_units_0901": 3_174_000.0,
+    }
+    local = {
+        "source": "local_minute_parquet_0901_minute_vwap:/some/partition.parquet",
+        "tick_volume_units_0901": 3_174_000.0,
+    }
+    for row in (tick, kbar, local):
+        assert quote_provider.observed_0901_minute_volume_lots(row) == 3_174.0
+    assert quote_provider.observed_0901_minute_volume_lots(
+        {"source": "unknown", "tick_volume_units_0901": 3_174_000.0}
+    ) == 0.0
 
 
 class _FakeResponse:

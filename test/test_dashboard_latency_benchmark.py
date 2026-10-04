@@ -3,6 +3,158 @@ import pytest
 from scripts.benchmark_dashboard_latency import capture_measurement, http_sample, measure_http, summarize, timing_summary, warm_samples
 
 
+def test_service_counters_are_allowlisted_and_unavailable_values_are_not_sizes(monkeypatch):
+    import subprocess
+    from scripts import benchmark_dashboard_latency as benchmark
+    output = ("Id=stockagent-test.service\nMainPID=23\nInvocationID=abc\n"
+              "Transient=yes\nUnitFileState=transient\n"
+              "CPUUsageNSec=5000000\nMemoryCurrent=18446744073709551615\n"
+              "ExecMainStartTimestampMonotonic=1000000\nExecMainExitTimestampMonotonic=3500000\n"
+              "ExecMainStatus=1\nResult=exit-code\nEnvironment=secret\n\n"
+              "Id=other.service\nCPUUsageNSec=123\n")
+    def run(args, **kwargs):
+        assert "--all" in args  # Failed/inactive oneshots must not disappear.
+        return subprocess.CompletedProcess([], 0, stdout=output)
+    monkeypatch.setattr(benchmark.subprocess, "run", run)
+    snapshot = benchmark.service_snapshot()
+    assert set(snapshot["units"]) == {"stockagent-test.service"}
+    row = snapshot["units"]["stockagent-test.service"]
+    assert row["CPUUsageNSec"] == 5000000
+    assert row["MemoryCurrent"] is None
+    assert row["last_attempt_seconds"] == 2.5
+    assert row["ExecMainStatus"] == 1
+    assert row["Result"] == "exit-code"
+    assert row["Transient"] == "yes"
+    assert row["UnitFileState"] == "transient"
+    assert row["last_attempt_outcome"] == "failed"
+    assert "Environment" not in row
+
+
+def test_cgroup_memory_breakdown_separates_file_cache_from_anon(tmp_path):
+    from scripts.benchmark_dashboard_latency import _cgroup_memory_breakdown
+
+    cgroup = tmp_path / "system.slice" / "stockagent-openbb-archive.service"
+    cgroup.mkdir(parents=True)
+    (cgroup / "memory.stat").write_text(
+        "anon 196161536\nfile 2403622912\nslab 38166088\n"
+    )
+    assert _cgroup_memory_breakdown(
+        "/system.slice/stockagent-openbb-archive.service",
+        "stockagent-openbb-archive.service", root=tmp_path,
+    ) == {"MemoryAnon": 196161536, "MemoryFile": 2403622912}
+    assert _cgroup_memory_breakdown(
+        "/system.slice/../stockagent-openbb-archive.service",
+        "stockagent-openbb-archive.service", root=tmp_path,
+    ) == {"MemoryAnon": None, "MemoryFile": None}
+
+
+def test_cgroup_memory_events_are_cumulative_and_missing_is_unknown(tmp_path):
+    from scripts.benchmark_dashboard_latency import _cgroup_memory_events
+
+    unit = "stockagent-source-events.service"
+    cgroup = tmp_path / "system.slice" / unit
+    cgroup.mkdir(parents=True)
+    (cgroup / "memory.events").write_text(
+        "low 0\nhigh 106709\nmax 0\noom 0\noom_kill 0\n"
+    )
+    assert _cgroup_memory_events(
+        f"/system.slice/{unit}", unit, root=tmp_path,
+    ) == {
+        "MemoryHighEvents": 106709,
+        "MemoryMaxEvents": 0,
+        "MemoryOomEvents": 0,
+        "MemoryOomKillEvents": 0,
+    }
+    assert all(
+        value is None for value in _cgroup_memory_events(
+            f"/system.slice/../{unit}", unit, root=tmp_path,
+        ).values()
+    )
+
+
+def test_cgroup_io_sums_devices_and_rejects_untrusted_paths(tmp_path):
+    from scripts.benchmark_dashboard_latency import _cgroup_io_bytes
+
+    unit = "stockagent-writer.service"
+    cgroup = tmp_path / "system.slice" / unit
+    cgroup.mkdir(parents=True)
+    (cgroup / "io.stat").write_text(
+        "8:32 rbytes=100 wbytes=300 rios=1 wios=2\n"
+        "8:48 rbytes=20 wbytes=50 rios=1 wios=1\n"
+    )
+    assert _cgroup_io_bytes(f"/system.slice/{unit}", unit, root=tmp_path) == {
+        "CgroupIOReadBytes": 120,
+        "CgroupIOWriteBytes": 350,
+    }
+    assert all(
+        value is None
+        for value in _cgroup_io_bytes(
+            f"/system.slice/../{unit}", unit, root=tmp_path
+        ).values()
+    )
+
+
+def test_service_attempt_nonzero_exit_is_not_hidden_by_success_result():
+    from scripts.benchmark_dashboard_latency import classify_service_attempt
+
+    assert classify_service_attempt({
+        "ActiveState": "inactive", "last_attempt_seconds": 3340.7,
+        "Result": "success", "ExecMainStatus": 15,
+    }) == "nonzero_exit"
+    assert classify_service_attempt({
+        "ActiveState": "inactive", "last_attempt_seconds": 1.0,
+        "Result": "success", "ExecMainStatus": 0,
+    }) == "process_exited_zero"
+    assert classify_service_attempt({
+        "ActiveState": "active", "last_attempt_seconds": None,
+        "Result": "success", "ExecMainStatus": 15,
+    }) == "running"
+    assert classify_service_attempt({
+        "ActiveState": "failed", "last_attempt_seconds": None,
+        "Result": "start-limit-hit", "ExecMainStatus": None,
+    }) == "failed"
+
+
+def test_service_counter_reset_and_restart_do_not_fake_low_cpu():
+    from scripts.benchmark_dashboard_latency import service_deltas
+    unit = {"MainPID": "23", "NRestarts": "0", "InvocationID": "abc", "CPUUsageNSec": 1000000000, "MemoryHighEvents": 10, "CgroupIOWriteBytes": 100, "ActiveState": "active"}
+    before = {"monotonic": 1, "units": {"stockagent-test.service": unit}}
+    after = {"monotonic": 3, "units": {"stockagent-test.service": {**unit, "CPUUsageNSec": 2000000000, "MemoryHighEvents": 12, "CgroupIOWriteBytes": 200}}}
+    row = service_deltas(before, after)["rows"][0]
+    assert row["cpu_cores_average"] == .5
+    assert row["MemoryHighEventsDelta"] == 2
+    assert row["CgroupIOWriteBytesDelta"] == 100
+    after["units"]["stockagent-test.service"]["ActiveState"] = "inactive"
+    assert service_deltas(before, after)["rows"][0]["cpu_cores_average"] is None
+    after["units"]["stockagent-test.service"]["ActiveState"] = "active"
+    after["units"]["stockagent-test.service"]["InvocationID"] = "new"
+    assert service_deltas(before, after)["rows"][0]["cpu_used_ms"] is None
+    assert service_deltas(before, after)["rows"][0]["MemoryHighEventsDelta"] is None
+    assert service_deltas(before, after)["rows"][0]["CgroupIOWriteBytesDelta"] is None
+    assert "error" in service_deltas({"error": "unavailable"}, after)
+
+
+def test_inventory_replay_fails_explicitly_without_current_inputs(tmp_path):
+    from scripts.benchmark_dashboard_latency import profile_inventory
+    with pytest.raises(ValueError, match="current footer inventory required"):
+        profile_inventory(tmp_path, 1)
+
+
+def test_shioaji_profile_preserves_one_observation_clock_and_compares_real_outputs(tmp_path, monkeypatch):
+    from scripts.benchmark_dashboard_latency import profile_shioaji_monitor
+    from stockagent.live import shioaji_api_dashboard as monitor
+    clocks = []
+    def build(root, *, now):
+        assert root == tmp_path
+        clocks.append(now)
+        return {"observed_at": now.isoformat(), "health": "degraded"}
+    monkeypatch.setattr(monitor, "build_shioaji_public_status", build)
+    result = profile_shioaji_monitor(tmp_path, 2)
+    assert len(clocks) == 4 and len(set(clocks)) == 1
+    assert result["outputs_stable"] is True
+    assert result["implementations"]["parallel"]["timing"]["n"] == 2
+
+
 def test_percentiles_are_nearest_rank_and_empty_is_explicit():
     assert summarize([])["median_ms"] is None
     assert summarize(range(1, 21))["p95_ms"] == 19
@@ -101,10 +253,13 @@ def test_local_profile_can_bypass_final_projection_caches(tmp_path, monkeypatch)
         return {"returned_points": 1, "minute_series": [{"points": [[1]]}]}
 
     monkeypatch.setattr(tw_day_trade_dashboard, "build_dashboard_history_snapshot", build)
+    monkeypatch.delenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", raising=False)
 
     report = profile_history(tmp_path, 1, source_rebuild=True)
 
     assert report["source_rebuild"] is True
+    assert report["session_projection_enabled"] is False
+    assert "unavailable" in report["boundary"]
     assert "projection bypassed" in report["boundary"]
     assert observed == [
         {
@@ -116,6 +271,23 @@ def test_local_profile_can_bypass_final_projection_caches(tmp_path, monkeypatch)
             "use_persistent_cache": False,
         }
     ]
+
+
+def test_local_profile_reports_actual_session_cache_configuration(tmp_path, monkeypatch):
+    from scripts.benchmark_dashboard_latency import profile_history
+    from stockagent.live import tw_day_trade_dashboard
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    monkeypatch.setattr(
+        tw_day_trade_dashboard,
+        "build_dashboard_history_snapshot",
+        lambda **kwargs: {"returned_points": 1, "minute_series": []},
+    )
+    report = profile_history(tmp_path, 1, source_rebuild=True)
+    assert report["session_projection_enabled"] is True
+    assert report["index_cache_dir"] == str(cache)
 
 
 def test_local_profile_retains_separate_full_source_baseline(tmp_path, monkeypatch):

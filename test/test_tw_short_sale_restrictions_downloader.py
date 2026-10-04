@@ -117,6 +117,23 @@ def test_unresolved_emerging_only_notice_is_explicitly_out_of_universe() -> None
     )
 
 
+def test_labeled_fund_beneficiary_code_is_explicitly_out_of_universe() -> None:
+    record = _announcement_record(
+        market="tpex",
+        issued_date="2026-05-06",
+        number="fund-distribution",
+        subject=(
+            "公告富邦證券投資信託基金受益憑證(簡稱：富邦FB；"
+            "受益憑證代號：T1001Y)收益分配停止受益人名簿記載之變更。"
+        ),
+        body="",
+        url="https://example.test/fund-distribution",
+    )
+    assert downloader._resolve_unparsed_announcement(record, {}) == (
+        "out_of_universe"
+    )
+
+
 @pytest.mark.parametrize(
     "subject",
     [
@@ -431,6 +448,17 @@ def test_unlabeled_parenthesized_etf_code_and_spaced_stock_label_are_extracted()
 
     assert extract_announcement_symbols(etf, "") == ["00925"]
     assert extract_announcement_symbols(spaced_label, "") == ["1591"]
+
+
+def test_bond_etf_delisting_notice_is_not_misclassified_as_corporate_bond() -> None:
+    subject = (
+        "公告中國信託投信經理之中國信託15年期以上已開發市場ESG投資級美元"
+        "公司債券ETF證券投資信託基金（證券代號：00883B）受益憑證，"
+        "將於115年5月7日起終止櫃檯買賣，另自115年3月31日起暫停融資融券交易。"
+    )
+
+    assert extract_announcement_symbols(subject, "") == ["00883B"]
+    assert is_relevant_announcement_subject(subject) is True
 
 
 def test_historical_chinese_numeral_stock_code_is_extracted_but_business_id_is_not() -> None:

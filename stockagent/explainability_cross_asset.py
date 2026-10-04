@@ -545,6 +545,10 @@ def _portfolio_weights_from_scores(
             return allocator(
                 target_logits, mask, short_mask=torch.zeros_like(mask)
             ).masked_fill(~mask, 0.0)
+        if output_mode == "score_entmax_log_cash":
+            return masked_score_entmax_log_cash_weights(
+                target_logits, mask, short_mask=torch.zeros_like(mask)
+            ).masked_fill(~mask, 0.0)
         if output_mode == "projection_l1":
             return masked_l1_projection_weights(
                 target_logits,
@@ -608,6 +612,10 @@ def _portfolio_weights_from_scores(
             ),
         }[output_mode]
         return allocator(
+            target_logits, mask, short_mask=mask
+        ).masked_fill(~mask, 0.0)
+    if output_mode == "score_entmax_log_cash":
+        return masked_score_entmax_log_cash_weights(
             target_logits, mask, short_mask=mask
         ).masked_fill(~mask, 0.0)
     if output_mode == "projection_l1":

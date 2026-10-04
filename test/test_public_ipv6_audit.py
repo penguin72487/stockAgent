@@ -25,6 +25,8 @@ def test_external_probe_and_aaaa_are_both_required() -> None:
     assert receipt["passed"] is True
     assert receipt["dns"]["aaaa"] == ["2001:db8::10"]
     assert receipt["external_probe"]["ipv6"]["success"] is True
+    assert receipt["external_probe"]["probe_request_issued"] is True
+    assert receipt["state"] == "passed"
     assert triggered == [("dashboard.example.com", 1.0)]
     assert "same-host WSL curl" in receipt["evidence_boundary"]
 
@@ -48,6 +50,24 @@ def test_missing_aaaa_or_failed_external_probe_fails_closed(
     )
 
     assert receipt["passed"] is False
+    assert receipt["state"] == "failed"
+
+
+def test_unfinished_external_probe_is_inconclusive_not_a_network_failure() -> None:
+    receipt = audit_public_ipv6(
+        "dashboard.example.com",
+        start_probe=False,
+        timeout_seconds=0.001,
+        poll_seconds=0.001,
+        resolve_ipv6=lambda _host: ["2001:db8::10"],
+        read_json=lambda _url, *, timeout_seconds: [
+            {"name": "ipv6", "done": False, "success": False}
+        ],
+    )
+
+    assert receipt["passed"] is False
+    assert receipt["state"] == "inconclusive_timeout"
+    assert receipt["external_probe"]["probe_request_issued"] is False
 
 
 def test_hostname_validation_prevents_arbitrary_probe_urls() -> None:

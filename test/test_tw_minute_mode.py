@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +48,7 @@ from stockagent.data.tw_minute import (
     summarize_minute_sessions_for_next_day,
 )
 from stockagent.data import tw_minute as minute_data
+from stockagent.data.tw_listing_admission import VERIFIED_EMERGING_TO_TPEX_LISTINGS
 from stockagent.training.minute import (
     _MinuteDayCache,
     _MinuteSlabForwardAdapter,
@@ -258,6 +259,55 @@ def test_minute_normalizer_rejects_negative_variance_statistics(
 
     with pytest.raises(RuntimeError, match="negative variance"):
         dataset.fit_normalizer([0])
+
+
+def test_prelisting_minute_rows_are_absent_from_features_labels_and_normalizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    day = "2020-03-13"
+    partition = tmp_path / f"trade_date={day}" / "data.parquet"
+    partition.parent.mkdir()
+    levels = [1.0, 3.0, 100.0]
+    pl.DataFrame({
+        "ts": [datetime(2020, 3, 13, 9, 1), datetime(2020, 3, 13, 9, 2), datetime(2020, 3, 13, 9, 1)],
+        "symbol": ["2330", "2330", "6716"],
+        **{name: levels for name in MINUTE_FEATURE_COLUMNS},
+        "feature_valid": [True, True, True],
+        "label_valid_1m": [True, True, True],
+        "execution_open_next_1m": [10.0, 11.0, 100.01],
+        "exit_close_next_1m": [10.1, 11.1, 100.02],
+        "future_volume_shares_next_1m": [10_000.0] * 3,
+        "session_close": [10.1, 11.1, 100.02],
+        "session_exit_valid": [True, True, True],
+    }).write_parquet(partition)
+    summary = {
+        "trade_date": day,
+        "feature_counts": {name: 3 for name in MINUTE_FEATURE_COLUMNS},
+        "feature_sums": {name: 104.0 for name in MINUTE_FEATURE_COLUMNS},
+        "feature_sum_squares": {name: 10_010.0 for name in MINUTE_FEATURE_COLUMNS},
+    }
+    dataset = MinuteDatasetIndex(
+        root=tmp_path,
+        manifest={"schema_version": MINUTE_DATASET_SCHEMA_VERSION},
+        symbols=("2330", "6716"),
+        dates=np.asarray([day], dtype="datetime64[D]"),
+        partitions={day: summary},
+    )
+    normalizer = dataset.fit_normalizer([0])
+    np.testing.assert_array_equal(normalizer.counts, np.full(len(MINUTE_FEATURE_COLUMNS), 2))
+    np.testing.assert_allclose(normalizer.mean, 2.0)
+    np.testing.assert_allclose(normalizer.scale, 1.0)
+    panel = dataset.load_day(0, normalizer=normalizer)
+    assert panel.feature_mask[0, 0] and panel.execution_mask[0, 0]
+    assert not panel.feature_mask[:, 1].any()
+    assert not panel.execution_mask[:, 1].any()
+    assert not panel.session_exit_mask[1]
+    assert panel.session_close[1] == 0.0
+    assert not panel.features[:, 1].any()
+    original = minute_training._minute_dataset_fingerprint(dataset)
+    monkeypatch.setitem(VERIFIED_EMERGING_TO_TPEX_LISTINGS, "6716", date(2020, 3, 26))
+    assert minute_training._minute_dataset_fingerprint(dataset) != original
 
 
 def test_minute_daily_context_uses_prior_complete_session_and_current_open(

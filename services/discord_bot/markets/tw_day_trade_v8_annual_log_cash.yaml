@@ -1,0 +1,52 @@
+market: tw_day_trade_v8_annual_log_cash
+label: 台股・V8 年度 Log Cash 當沖（初始 1,000 萬）
+enabled: true
+market_type: tw
+timezone: Asia/Taipei
+open_time: "09:00"
+close_time: "13:30"
+schedule_time: "09:00"
+preopen_prepare_time: "08:15"
+summary_time: "14:00"
+data_ready_time: "13:40"
+freshness_max_lag_days: 3
+freshness_scan_limit: 0
+holidays: []
+initial_capital: 10000000.0
+day_trade_simulation_enabled: true
+day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
+day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
+day_trade_residual_margin_conversion: true
+day_trade_terminal_liquidation_unlimited_capacity: true
+day_trade_odd_lot_execution_policy: assumed_odd_lot_at_regular_board_price_v1
+day_trade_margin_action_data_dir: /srv/stockagent-live/data_tw_public/execution_actions
+day_trade_quote_interval_seconds: 60
+pre_signal_command:
+  - scripts/activate_tw_public_opening_data.py
+  - --link
+  - data_tw_public
+pre_signal_timeout_seconds: 120
+completed_session_command:
+  - scripts/finalize_tw_public_completed_session.py
+completed_session_timeout_seconds: 600
+formal_history_timeout_seconds: 1800
+previous_signal_backfill_limit: 512
+model_selection_path: ../models/tw_day_trade_v8_annual_log_cash.yaml
+config_path: configs/deployments/tw_day_trade_v8_annual_log_cash_fold10.yaml
+output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5
+live_output_dir: artifacts/live_signals
+model_scoped_live_output: true
+fold_id: 10
+checkpoint_path: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5/fold_10/checkpoint_best.pt
+weights_path: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5/fold_10/daily_weights.parquet
+panel_date: latest
+device: cuda
+price_source: panel
+yahoo_chunk_size: 200
+top_n: 2400
+min_abs_delta: 0.001
+benchmark_window_days: 32
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 1.05
+unsupported_message: "台股・V8 年度 Log Cash 當沖模型尚未通過部署驗收。"

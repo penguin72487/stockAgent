@@ -77,9 +77,11 @@ from stockagent.live.benchmark_accounting import (
     settle_roll_wealth,
 )
 from stockagent.live.quote_provider import PriceSnapshot
+from stockagent.live.tw_day_trade_monitor_projection import build_shioaji_monitor_projection
 from stockagent.live.tw_day_trade_service_sync import (
     SERVICE_SYNC_FILENAME,
     SERVICE_SYNC_SCHEMA_VERSION,
+    load_service_sync,
 )
 from stockagent.research.taifex_capital_returns import taifex_initial_margin_twd
 from stockagent.research.taifex_transaction_tax import (
@@ -111,6 +113,9 @@ ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK: Final[str] = (
 ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK: Final[str] = (
     "market_at_best_quote_else_adverse_open_tick"
 )
+ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET: Final[str] = (
+    "causal_market_full_target_at_best_quote"
+)
 ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901: Final[str] = "official_open_at_09_01"
 ENTRY_FILL_POLICY_0901_MINUTE_VWAP: Final[str] = (
     "official_open_signal_0900_execute_0901_vwap"
@@ -122,20 +127,24 @@ ENTRY_FILL_POLICY_0901_MINUTE_PRICE: Final[str] = (
     ENTRY_FILL_POLICY_0901_MINUTE_VWAP
 )
 REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE: Final[str] = (
-    "retrospective_official_open_signal_at_09_00_observed_09_01_"
-    "minute_price_volume_capped_nav_counterfactual_v3"
+    "retrospective_official_open_signal_at_09_00_observed_minute_price_"
+    "50pct_volume_sweep_until_exit_window_nav_counterfactual_v4"
 )
 REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL: Final[str] = (
     "retrospective_prior_paper_fill_else_09_01_minute_price_"
     "full_target_no_liquidity_claim_v1"
 )
 EXECUTION_REALISM_CONTRACT: Final[str] = "nav_budget_source_capacity_no_synthetic_terminal_v1"
+TERMINAL_CLOSE_UNLIMITED_CONTRACT: Final[str] = (
+    "source_close_full_deliverable_residual_no_capacity_paper_only_v1"
+)
 HISTORICAL_MINUTE_MARK_CONTRACT: Final[str] = "right_labelled_historical_last_trade_mark_v1"
 ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
     {
         ENTRY_FILL_POLICY_CAUSAL_BOOK,
         ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
         ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+        ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
         ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
         ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
         ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
@@ -189,6 +198,70 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(TAIPEI)
 
 
+def _fresh_regular_execution_quote(
+    quote: Mapping[str, Any],
+    observed_at: datetime,
+    *,
+    max_age_seconds: float = 10.0,
+) -> bool:
+    """Prove that a fresh quote belongs to the regular session.
+
+    ``simtrade`` is Shioaji streaming metadata for exchange trial matching, not
+    the broker account's simulation/live-order switch. The request-reply
+    Snapshot schema does not expose it. Execution requires explicit non-trial
+    evidence. Snapshot is a request-type historical interface, so its timestamp
+    cannot be promoted into proof of a live executable book.
+    """
+
+    now = _now_taipei(observed_at)
+    received = _parse_timestamp(quote.get("quote_at"))
+    if received is None or received.date() != now.date():
+        return False
+    age_seconds = (now - received).total_seconds()
+    if not 0.0 <= age_seconds <= max(0.0, float(max_age_seconds)):
+        return False
+
+    source = str(quote.get("source") or "")
+    if source.startswith("shioaji:stock_snapshot"):
+        return False
+    simtrade = quote.get("simtrade")
+    if simtrade is False:
+        if source in {
+            "shioaji_stock_stream", "shioaji_stock_quote_stream"
+        }:
+            exchange_at = _parse_timestamp(
+                quote.get("book_exchange_at") or quote.get("exchange_quote_at")
+            )
+            return bool(
+                exchange_at is not None
+                and exchange_at.date() == now.date()
+                and 0 <= (now - exchange_at).total_seconds() <= max_age_seconds
+                and LIVE_ENTRY_GATE <= exchange_at.time() < AUCTION_OBSERVATION_DEADLINE
+            )
+        return True
+    if simtrade is True:
+        return False
+    return False
+
+
+def _quote_after_signal(
+    quote: Mapping[str, Any], signal_at: datetime, *, allow_equal: bool = False
+) -> bool:
+    """A pushed cached book is not a post-signal exchange observation."""
+
+    received = _parse_timestamp(quote.get("quote_at"))
+    if received is None or (received < signal_at if allow_equal else received <= signal_at):
+        return False
+    if not str(quote.get("source") or "").startswith("shioaji"):
+        return True
+    exchange_at = _parse_timestamp(
+        quote.get("book_exchange_at") or quote.get("exchange_quote_at")
+    )
+    if exchange_at is None or exchange_at > received + timedelta(seconds=1):
+        return False
+    return exchange_at >= signal_at if allow_equal else exchange_at > signal_at
+
+
 def _event_temporal_key(
     event: Mapping[str, Any], *, sequence: int = 0
 ) -> tuple[str, str, int]:
@@ -233,6 +306,18 @@ def _finite(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _pending_entry_reason_counts(
+    orders: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for order in orders.values():
+        if order.get("status") != "working":
+            continue
+        reason = str(order.get("last_wait_reason") or "waiting_quote")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 def position_net_liquidation_pnl(
@@ -438,6 +523,25 @@ def _synthetic_open_tick_entry_price(
     return moved
 
 
+def whole_lot_target_shares(weight: float, nav: float, price: float, lot_size: int) -> int:
+    """The common target-sizing operation, before independent fill constraints."""
+
+    return int(math.floor(abs(weight) * nav / price / int(lot_size))) * int(lot_size)
+
+
+def realized_account_nav(
+    mode: Mapping[str, Any], *, deduct_carry_cost: bool = True
+) -> float:
+    """Economic NAV before valuing any carried inventory at the session open."""
+
+    return (
+        float(mode["initial_capital_twd"])
+        + float(mode.get("cumulative_realized_net_pnl_twd") or 0.0)
+        + float(mode.get("cumulative_corporate_action_net_twd") or 0.0)
+        - (float(mode.get("cumulative_carry_cost_twd") or 0.0) if deduct_carry_cost else 0.0)
+    )
+
+
 def _prepare_entry_plan(
     raw_row: Mapping[str, Any],
     *,
@@ -466,6 +570,9 @@ def _prepare_entry_plan(
     )
     market_at_best_else_tick = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+    )
+    causal_market_full_target = (
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
     )
     official_open_at_0901 = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
@@ -540,14 +647,12 @@ def _prepare_entry_plan(
     top_book_capacity_shares = 0
     minute_kbar_capacity_shares = 0
     if status == "ready" and sizing_price is not None:
-        requested_shares = int(
-            math.floor(
-                abs(target_weight)
-                * float(spec.initial_capital_twd if sizing_nav_twd is None else sizing_nav_twd)
-                / sizing_price
-                / int(spec.lot_size)
-            )
-        ) * int(spec.lot_size)
+        requested_shares = whole_lot_target_shares(
+            target_weight,
+            float(spec.initial_capital_twd if sizing_nav_twd is None else sizing_nav_twd),
+            sizing_price,
+            spec.lot_size,
+        )
         if requested_shares_override is not None:
             requested_shares = int(requested_shares_override)
             if requested_shares < 0 or (requested_shares % spec.lot_size and not (
@@ -560,7 +665,11 @@ def _prepare_entry_plan(
             entry_price is not None
             and quote_at is not None
             and (
-                quote_at >= signal_at if allow_quote_at_signal else quote_at > signal_at
+                _quote_after_signal(
+                    quote_values, signal_at, allow_equal=allow_quote_at_signal
+                )
+                if causal_market_full_target or spec.strict_intraday
+                else (quote_at >= signal_at if allow_quote_at_signal else quote_at > signal_at)
             )
             and quote_at <= observation_at
         )
@@ -575,10 +684,17 @@ def _prepare_entry_plan(
                 lower_limit=lower,
                 upper_limit=upper,
             )
-        if (spec.strict_intraday and spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
-                and (quote_values.get("simtrade") is not False or quote_at is None
-                     or not 0 <= (observation_at - quote_at).total_seconds() <= 10)):
+        if ((spec.strict_intraday or causal_market_full_target)
+                and spec.entry_fill_policy in {
+                    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+                    ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+                }
+                and not _fresh_regular_execution_quote(
+                    quote_values, observation_at
+                )):
             status, reason = "blocked", "waiting_non_trial_quote"
+        elif (causal_market_full_target or spec.strict_intraday) and not quote_is_causal:
+            status, reason = "blocked", "quote_not_after_signal"
         elif entry_price is None:
             status, reason = (
                 ("blocked", "observed_09_01_minute_price_unavailable")
@@ -637,7 +753,7 @@ def _prepare_entry_plan(
                 if synthetic_fallback_fill
                 else "synthetic_open_tick_fill"
             )
-        elif market_at_best_else_tick:
+        elif market_at_best_else_tick or causal_market_full_target:
             # The configured paper-market-order contract consumes the complete
             # requested whole-lot quantity at the causally observed best Ask
             # for buys/covers or best Bid for sells/shorts. Displayed L1 size
@@ -653,6 +769,8 @@ def _prepare_entry_plan(
                 lot_size=spec.lot_size,
             )
             filled_shares = requested_shares
+            if causal_market_full_target:
+                reason = "paper_full_target_at_causal_best_quote_no_exchange_fill_claim"
         elif quote_at is None or (
             quote_at < signal_at if allow_quote_at_signal else quote_at <= signal_at
         ):
@@ -723,7 +841,10 @@ def _prepare_entry_plan(
         ),
         "synthetic_fill": synthetic_entry_fill and filled_shares > 0,
         "synthetic_fallback_fill": synthetic_fallback_fill and filled_shares > 0,
-        "paper_market_fill": market_at_best_else_tick and filled_shares > 0,
+        "paper_market_fill": (
+            (market_at_best_else_tick or causal_market_full_target)
+            and filled_shares > 0
+        ),
         "counterfactual_0901_price_fill": (
             minute_price_at_0901 and not prior_fill and filled_shares > 0
         ),
@@ -853,14 +974,20 @@ class ModeSpec:
     margin_financing_annual_rate: float = 0.16
     margin_short_annual_borrow_rate: float = 0.20
     margin_short_handling_fee_rate: float = 0.001
+    entry_sweep_funding_policy: str = "legacy_sequential"
+    terminal_liquidation_unlimited_capacity: bool = False
 
     @property
     def uses_realistic_execution(self) -> bool:
         return self.realistic_execution and self.entry_fill_policy in {
-            ENTRY_FILL_POLICY_CAUSAL_BOOK, ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+            ENTRY_FILL_POLICY_CAUSAL_BOOK,
+            ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+            ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
         }
 
     def __post_init__(self) -> None:
+        if self.entry_sweep_funding_policy not in {"legacy_sequential", "proportional_net_reservation_v1"}:
+            raise ValueError("unknown entry sweep funding policy")
         if self.historical_full_fill_at_0901 and self.entry_fill_policy != ENTRY_FILL_POLICY_0901_MINUTE_PRICE:
             raise ValueError("historical 09:01 full fill requires the 09:01 minute-price policy")
         if self.strict_intraday and not self.uses_realistic_execution:
@@ -1230,14 +1357,187 @@ class TwDayTradeSimulationEngine:
         tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
         self._audit_signal_commit_state()
+        entry_retry_recovered = False
         for mode in self.state.get("modes", {}).values():
             if mode.get("entry_retry_pending_commit"):
-                mode["ledger_state_divergence"] = {"kind": "entry_retry_commit_interrupted",
-                    "signal_id": mode.get("signal_id")}
-                mode["engine_status"] = "critical_ledger_state_divergence"
+                if self._recover_interrupted_entry_retry(mode):
+                    entry_retry_recovered = True
+                else:
+                    mode["ledger_state_divergence"] = {"kind": "entry_retry_commit_interrupted",
+                        "signal_id": mode.get("signal_id")}
+                    mode["engine_status"] = "critical_ledger_state_divergence"
         self._restore_position_artifact_paths()
-        if stock_benchmarks_migrated or tx_benchmark_migrated:
+        if stock_benchmarks_migrated or tx_benchmark_migrated or entry_retry_recovered:
             _atomic_json(self.state_path, self.state)
+
+    @staticmethod
+    def _ledger_rows_for_order_ids(
+        path: Path, order_ids: set[str]
+    ) -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        if not order_ids or not path.is_file():
+            return found
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not any(order_id in line for order_id in order_ids):
+                    continue
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                order_id = str(row.get("order_id") or "")
+                if order_id in order_ids:
+                    found[order_id] = row
+        return found
+
+    def _recover_interrupted_entry_retry(self, mode: dict[str, Any]) -> bool:
+        """Resolve a crash between durable ledgers and the state commit.
+
+        No ledger rows means the intent never executed and can be retried. A
+        matching order+fill pair is authoritative and is replayed into state.
+        A one-sided ledger append remains a hard divergence.
+        """
+
+        marker = mode.get("entry_retry_pending_commit")
+        if isinstance(marker, str):
+            order_ids = [marker]
+        elif isinstance(marker, Mapping):
+            order_ids = [
+                str(value)
+                for value in marker.get("order_ids") or ()
+                if str(value or "")
+            ]
+        else:
+            return False
+        if not order_ids:
+            return False
+        wanted = set(order_ids)
+        order_rows = self._ledger_rows_for_order_ids(self.orders_path, wanted)
+        fill_rows = self._ledger_rows_for_order_ids(self.fills_path, wanted)
+        if any((order_id in order_rows) != (order_id in fill_rows) for order_id in wanted):
+            return False
+
+        recovered_ids: list[str] = []
+        pending_orders = mode.get("pending_entry_orders") or {}
+        for order_id in order_ids:
+            if order_id not in fill_rows:
+                continue
+            fill = fill_rows[order_id]
+            order_row = order_rows[order_id]
+            symbol = str(fill.get("symbol") or "")
+            pending = pending_orders.get(symbol)
+            if (
+                not isinstance(pending, dict)
+                or str(fill.get("market") or "") != str(mode.get("market") or "")
+                or str(fill.get("signal_id") or "") != str(mode.get("signal_id") or "")
+                or str(order_row.get("order_id") or "") != order_id
+                or fill.get("simulation_only") is not True
+                or order_row.get("simulation_only") is not True
+            ):
+                return False
+            quantity = int(fill.get("quantity") or 0)
+            price = _finite(fill.get("price"))
+            remaining = int(pending.get("remaining_shares") or 0)
+            if quantity <= 0 or quantity > remaining or price is None:
+                return False
+            template = pending.get("position") or {}
+            side = str(template.get("side") or "")
+            if side not in {"long", "short"}:
+                return False
+            position = mode["positions"].get(template.get("position_id"))
+            if position is None:
+                position = dict(template)
+                position.update(
+                    entry_at=fill.get("fill_at") or fill.get("recorded_at"),
+                    entry_quote_at=fill.get("quote_at"),
+                    entry_price=price,
+                    filled_shares=0,
+                    signed_shares=0,
+                    entry_fee_twd=0.0,
+                    remaining_entry_fee_twd=0.0,
+                    entry_gross_fee_and_tax_twd=0.0,
+                    entry_commission_rebate_accrued_twd=0.0,
+                )
+                mode["positions"][position["position_id"]] = position
+            previous_filled = int(position.get("filled_shares") or 0)
+            position["entry_price"] = (
+                previous_filled * float(position["entry_price"]) + quantity * price
+            ) / (previous_filled + quantity)
+            position["filled_shares"] = previous_filled + quantity
+            position["signed_shares"] = (
+                1 if side == "long" else -1
+            ) * (previous_filled + quantity)
+            position["executable_order_shares"] = previous_filled + quantity
+            position["target_unsubmitted_shares"] = remaining - quantity
+            for key, ledger_key in (
+                ("entry_fee_twd", "fee_and_tax_twd"),
+                ("remaining_entry_fee_twd", "fee_and_tax_twd"),
+                ("entry_gross_fee_and_tax_twd", "gross_fee_and_tax_twd"),
+                (
+                    "entry_commission_rebate_accrued_twd",
+                    "commission_rebate_accrued_twd",
+                ),
+            ):
+                position[key] = float(position.get(key) or 0.0) + float(
+                    fill.get(ledger_key) or 0.0
+                )
+            rebate = float(fill.get("commission_rebate_accrued_twd") or 0.0)
+            mode["cumulative_commission_rebate_accrued_twd"] = float(
+                mode.get("cumulative_commission_rebate_accrued_twd") or 0.0
+            ) + rebate
+            mode["entry_fill_count"] = int(mode.get("entry_fill_count") or 0) + 1
+            mode["entry_best_quote_fill_count"] = int(
+                mode.get("entry_best_quote_fill_count") or 0
+            ) + 1
+            mode["entry_filled_shares"] = int(
+                mode.get("entry_filled_shares") or 0
+            ) + quantity
+            mode["entry_unfilled_shares"] = max(
+                0, int(mode.get("entry_unfilled_shares") or 0) - quantity
+            )
+            try:
+                sequence = int(order_id.rsplit(":", 1)[-1])
+            except ValueError:
+                return False
+            pending.update(
+                remaining_shares=remaining - quantity,
+                sequence=sequence,
+                minute_used_shares=int(pending.get("minute_used_shares") or 0)
+                + quantity,
+            )
+            if not pending["remaining_shares"]:
+                pending["status"] = "filled"
+            recovered_ids.append(order_id)
+
+        mode["pending_entry_shares"] = sum(
+            int(order.get("remaining_shares") or 0)
+            for order in pending_orders.values()
+            if order.get("status") == "working"
+        )
+        mode["entry_fill_outcome"] = (
+            "filled"
+            if not int(mode.get("entry_unfilled_shares") or 0)
+            else "partial"
+            if int(mode.get("entry_filled_shares") or 0)
+            else "no_fill"
+        )
+        mode["entry_retry_recovery"] = {
+            "recovered_at": _iso(),
+            "marker_contract": (
+                marker.get("contract") if isinstance(marker, Mapping) else "single_v1"
+            ),
+            "ledger_replayed_order_ids": recovered_ids,
+            "uncommitted_order_ids": [
+                order_id for order_id in order_ids if order_id not in fill_rows
+            ],
+        }
+        mode.pop("entry_retry_pending_commit", None)
+        if (mode.get("ledger_state_divergence") or {}).get("kind") == (
+            "entry_retry_commit_interrupted"
+        ):
+            mode.pop("ledger_state_divergence", None)
+            mode.pop("readiness_error", None)
+        return True
 
     def begin_deferred_ledger_writes(self) -> None:
         """Batch historical replay ledgers until the session commit boundary."""
@@ -2935,6 +3235,10 @@ class TwDayTradeSimulationEngine:
         # append-only fill ledger disagree immediately after a service restart.
         mode["configured_entry_fill_policy"] = spec.entry_fill_policy
         mode["configured_intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
+        mode["configured_terminal_close_contract"] = (
+            TERMINAL_CLOSE_UNLIMITED_CONTRACT
+            if spec.terminal_liquidation_unlimited_capacity else None
+        )
         if mode.get("entry_completed_at"):
             if not mode.get("pending_signal_id"):
                 mode.pop("missing_carried_open_symbols", None)
@@ -2958,6 +3262,7 @@ class TwDayTradeSimulationEngine:
             )
             mode["paper_fill_deterministic"] = spec.entry_fill_policy in {
                 ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+                ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
                 ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
             }
             mode["fill_guaranteed"] = bool(
@@ -3050,6 +3355,31 @@ class TwDayTradeSimulationEngine:
                 if strict_status:
                     mode["engine_status"] = strict_status
         self._persist(observed)
+
+    def publish_liveness(self, now: datetime | None = None) -> None:
+        """Refresh a compact heartbeat without inventing a ledger commit.
+
+        On an idle/closed session the full state, positions, and status files
+        need not be rewritten just to prove that the executor loop is alive.
+        Keep the committed revision and timestamp intact; readers use the
+        separate heartbeat only for process freshness. A mismatched receipt
+        must remain stale rather than laundering an interrupted commit.
+        """
+
+        observed = _now_taipei(now)
+        receipt = load_service_sync(self.state_dir)
+        if (
+            receipt is None
+            or int(receipt.get("state_revision") or 0)
+            != int(self.state.get("state_revision") or 0)
+            or receipt.get("engine_run_id") != self._engine_run_id
+        ):
+            raise RuntimeError("paper engine service-sync commit is not current")
+        heartbeat_at = _parse_timestamp(receipt.get("heartbeat_at"))
+        if heartbeat_at is not None and 0 <= (observed - heartbeat_at).total_seconds() < 9:
+            return
+        receipt["heartbeat_at"] = observed.isoformat(timespec="milliseconds")
+        _atomic_json(self.service_sync_path, receipt)
 
     def rearm_flat_session(
         self,
@@ -3607,15 +3937,21 @@ class TwDayTradeSimulationEngine:
         # and restart. The initial capital remains the reporting denominator.
         sizing_date = observed.date().isoformat()
         if mode.get("sizing_session_date") != sizing_date:
-            sizing_nav = (float(mode["initial_capital_twd"])
-                          + float(mode.get("cumulative_realized_net_pnl_twd") or 0.0)
-                          + float(mode.get("cumulative_corporate_action_net_twd") or 0.0))
+            # Carry costs are deducted below, after any new opening accrual.
+            sizing_nav = realized_account_nav(mode, deduct_carry_cost=False)
             if margin_rebalance:
                 # Only observed opening prices, not the completed 09:01 fill,
                 # may value the pre-decision inventory used for target sizing.
                 missing = [p["symbol"] for p in carrying_positions
                            if _finite(quotes.get(p["symbol"], {}).get("open")) is None
-                           and not (quotes.get(p["symbol"], {}).get("official_session_no_trade_print")
+                           and not ((
+                               quotes.get(p["symbol"], {}).get(
+                                   "official_session_no_trade_print"
+                               )
+                               or quotes.get(p["symbol"], {}).get(
+                                   "opening_no_trade_print_through_0901"
+                               )
+                           )
                                     and _finite(p.get("last_mark_price")) is not None)]
                 if missing:
                     mode["pending_signal_id"] = signal_id
@@ -3624,7 +3960,11 @@ class TwDayTradeSimulationEngine:
                     self._persist(observed)
                     return "waiting_quote"
                 self._accrue_margin_carry_cost(mode, observed)
-                mode["sizing_nav_carried_price_symbols"] = sorted({p["symbol"] for p in carrying_positions if _finite(quotes[p["symbol"]].get("open")) is None})
+                mode["sizing_nav_carried_price_symbols"] = sorted({
+                    p["symbol"]
+                    for p in carrying_positions
+                    if _finite(quotes[p["symbol"]].get("open")) is None
+                })
                 sizing_nav += sum(position_net_liquidation_pnl(p,
                     _finite(quotes[p["symbol"]].get("open")) or float(p["last_mark_price"])) for p in carrying_positions)
             sizing_nav -= float(mode.get("cumulative_carry_cost_twd") or 0.0)
@@ -3659,14 +3999,9 @@ class TwDayTradeSimulationEngine:
                 or sizing_price is None
             ):
                 continue
-            requested_shares = int(
-                math.floor(
-                    abs(weight)
-                    * sizing_nav
-                    / sizing_price
-                    / int(spec.lot_size)
-                )
-            ) * int(spec.lot_size)
+            requested_shares = whole_lot_target_shares(
+                weight, sizing_nav, sizing_price, spec.lot_size
+            )
             if requested_shares > 0:
                 actionable_symbols.append(symbol)
         later_quote_found = any(
@@ -3684,7 +4019,13 @@ class TwDayTradeSimulationEngine:
             spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
         )
         deterministic_paper_market_fill = (
-            spec.entry_fill_policy == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+            spec.entry_fill_policy in {
+                ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+                ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+            }
+        )
+        causal_market_full_target = (
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
         )
         deterministic_official_open_fill = (
             spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
@@ -3798,7 +4139,9 @@ class TwDayTradeSimulationEngine:
             else "counterfactual_official_session_open_at_09_01"
             if deterministic_official_open_fill
             else "paper_market_order_at_best_quote_else_adverse_open_tick"
-            if deterministic_paper_market_fill
+            if deterministic_paper_market_fill and not causal_market_full_target
+            else "paper_market_full_target_at_causal_shioaji_best_quote"
+            if causal_market_full_target
             else "best_ask_for_buy_best_bid_for_sell"
         )
         mode["entry_liquidity_assumption"] = summary.get(
@@ -3811,11 +4154,20 @@ class TwDayTradeSimulationEngine:
             else "official_open_price_full_requested_paper_quantity_no_exchange_fill_claim"
             if deterministic_official_open_fill
             else "full_requested_quantity_at_observed_best_quote_else_adverse_open_tick_no_exchange_depth_claim"
-            if deterministic_paper_market_fill
+            if deterministic_paper_market_fill and not causal_market_full_target
+            else "full_requested_quantity_at_causal_observed_best_quote_no_exchange_depth_or_fill_claim"
+            if causal_market_full_target
             else "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         )
         mode["entry_fill_policy"] = spec.entry_fill_policy
         mode["execution_realism_contract"] = EXECUTION_REALISM_CONTRACT if spec.uses_realistic_execution else None
+        mode["entry_sweep_funding_policy"] = spec.entry_sweep_funding_policy
+        # Freeze this assumption with the new session. A config reload must
+        # never relabel an old fill or retroactively settle a completed day.
+        mode["terminal_close_contract"] = (
+            TERMINAL_CLOSE_UNLIMITED_CONTRACT
+            if spec.terminal_liquidation_unlimited_capacity else None
+        )
         mode["intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
         mode["capital_sizing_basis"] = "session_start_account_nav"
         mode["funding_assumption"] = "paper_nav_risk_budget_not_verified_broker_buying_power"
@@ -3842,6 +4194,13 @@ class TwDayTradeSimulationEngine:
         mode.pop("execution_projection", None)
         mode["positions"] = {p["position_id"]: p for p in carrying_positions} if margin_rebalance else {}
         mode["pending_entry_orders"] = {}
+        # Historical minute replay freezes one signed inventory target at
+        # 09:00.  Reductions are orders too: if the 09:01 bar cannot absorb
+        # them, retain the unfilled quantity and sweep it before any later
+        # addition for the same symbol.  Keeping this state separate from the
+        # entry remainder prevents a missing opening print from silently
+        # turning old inventory into a permanent holding.
+        mode["pending_reduction_orders"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
         mode.pop("pending_wait_reason", None)
         mode["exit_limit_submitted_at"] = None
@@ -4021,13 +4380,44 @@ class TwDayTradeSimulationEngine:
             }
             signal_records.append(signal_record)
             counts[status] = counts.get(status, 0) + 1
-            retryable = (spec.strict_intraday and not counterfactual_open_replay
-                         and spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
-                         and requested_shares > filled_shares and upper is not None and lower is not None
-                         and reason in {"marketable_depth_exhausted", "marketable_depth_unavailable",
-                                        "no_executable_best_quote", "quote_not_after_signal",
-                                        "quote_after_local_observation", "account_nav_budget_exhausted",
-                                        "waiting_non_trial_quote"})
+            live_retryable = (
+                not counterfactual_open_replay
+                and spec.entry_fill_policy
+                in {
+                    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+                    ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+                }
+                and reason
+                in {
+                    "marketable_depth_exhausted",
+                    "marketable_depth_unavailable",
+                    "no_executable_best_quote",
+                    "quote_not_after_signal",
+                    "quote_after_local_observation",
+                    "account_nav_budget_exhausted",
+                    "waiting_non_trial_quote",
+                }
+            )
+            historical_minute_retryable = (
+                counterfactual_open_replay
+                and spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+                and reason
+                in {
+                    "counterfactual_observed_09_01_minute_price_fill",
+                    "observed_09_01_minute_capacity_exhausted",
+                    "observed_09_01_minute_liquidity_unavailable",
+                    "observed_09_01_minute_price_unavailable",
+                    "account_nav_budget_exhausted",
+                }
+            )
+            retryable = bool(
+                (live_retryable or historical_minute_retryable)
+                and requested_shares > filled_shares
+                and requested_shares > 0
+                and upper is not None
+                and lower is not None
+                and sizing_price is not None
+            )
             if (
                 status
                 not in {
@@ -4233,6 +4623,11 @@ class TwDayTradeSimulationEngine:
                     "purpose": "entry",
                     "fill_at": effective_entry_at,
                     "quote_at": effective_entry_at if prior_paper_fill_at else quote.get("quote_at"),
+                    "book_exchange_at": quote.get("book_exchange_at"),
+                    "exchange_quote_at": quote.get("exchange_quote_at"),
+                    "quote_source": quote.get("source"),
+                    "quote_simtrade": quote.get("simtrade"),
+                    "stream_subscribed": quote.get("stream_subscribed"),
                     "historical_source_quote_at": quote.get(
                         "historical_source_quote_at"
                     ),
@@ -4362,6 +4757,11 @@ class TwDayTradeSimulationEngine:
         mode["pending_entry_shares"] = sum(
             int(order["remaining_shares"])
             for order in (mode.get("pending_entry_orders") or {}).values()
+            if order.get("status") == "working"
+        )
+        mode["pending_reduction_shares"] = sum(
+            int(order.get("remaining_shares") or 0)
+            for order in (mode.get("pending_reduction_orders") or {}).values()
             if order.get("status") == "working"
         )
         mode["entry_fill_outcome"] = entry_fill_outcome
@@ -4536,15 +4936,433 @@ class TwDayTradeSimulationEngine:
                 ledger_session_date=now.date().isoformat(),
                 ledger_order_id=f"{p['position_id']}:mandatory_exit:{now.isoformat()}")
 
+    def _retry_historical_minute_entry_orders(
+        self,
+        mode: dict[str, Any],
+        quotes: Mapping[str, Mapping[str, Any]],
+        now: datetime,
+    ) -> None:
+        """Sweep a frozen replay target through later completed minute bars.
+
+        The 09:00 model output and sizing NAV never change. Each right-labelled
+        minute contributes at most 50% of its observed regular-board volume,
+        rounded down to whole lots. A missing/zero-volume bar contributes zero;
+        the opening price, a carried mark, and later volume are never borrowed.
+        Entry stops when the strategy's 13:20 exit window begins.
+        """
+
+        orders = mode.get("pending_entry_orders") or {}
+        if (
+            not orders
+            or mode.get("simulation_replay") is not True
+            or mode.get("entry_fill_policy") != ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+            or mode.get("entry_fill_contract")
+            != REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+            or mode.get("session_date") != now.date().isoformat()
+        ):
+            return
+        if now.time() >= EXIT_LIMIT_TIME:
+            for order in orders.values():
+                if order.get("status") == "working":
+                    order["status"] = "cancelled_exit_priority"
+            mode["pending_entry_shares"] = 0
+            return
+
+        reserved = sum(
+            abs(int(position.get("signed_shares") or 0))
+            * float(position["entry_price"])
+            + float(position.get("remaining_entry_fee_twd") or 0)
+            for position in mode["positions"].values()
+            if int(position.get("signed_shares") or 0) != 0
+        )
+        allocated = None
+        if mode.get("entry_sweep_funding_policy") == "proportional_net_reservation_v1":
+            # Plan the entire minute before recording any fill. This is the
+            # same linear-fee scalar allocator as the differentiable FIFO
+            # executor, so dictionary order cannot privilege the first stock.
+            candidates = []
+            for symbol, order in orders.items():
+                template = order["position"]
+                position = mode["positions"].get(template["position_id"])
+                reduction = (mode.get("pending_reduction_orders") or {}).get(symbol)
+                quote = dict(quotes.get(symbol) or {})
+                price = _finite(quote.get("execution_price_minute") or quote.get("last"))
+                if (order.get("status") != "working"
+                        or (reduction and reduction.get("status") == "working")
+                        or (position and (position.get("last_exit_at") or position.get("stop_triggered_at")))
+                        or _parse_timestamp(quote.get("quote_at")) != now
+                        or quote.get("historical_minute_valuation") is not True
+                        or price is None
+                        or not float(template["lower_limit"]) <= price <= float(template["upper_limit"])):
+                    continue
+                lot = int(template["lot_size"])
+                key = str(quote.get("capacity_bucket") or f"{now.date()}:{now.strftime('%H:%M')}:{symbol}")
+                capacity = max(0, _minute_kbar_capacity_shares(quote, lot_size=lot)
+                               - int((mode.get("margin_exit_capacity_used") or {}).get(key) or 0))
+                quantity = min(int(order.get("remaining_shares") or 0), capacity)
+                rate = float(template["buy_fee_rate"] if template["side"] == "long" else template["sell_fee_rate"])
+                candidates.append((symbol, quantity, price, lot, rate - float(template["commission_rebate_rate"])))
+            allocated = {}
+            if candidates:
+                funded = _scale_lot_buys_to_budget_with_fixed_fees(
+                    np.asarray([c[1] for c in candidates], dtype=np.int64),
+                    np.asarray([c[2] for c in candidates]),
+                    np.asarray([c[3] for c in candidates]),
+                    np.asarray([c[4] for c in candidates]),
+                    budget=max(0., float(mode["session_sizing_nav_twd"]) - reserved
+                               - float(mode.get("corporate_action_receivable_twd") or 0)),
+                    minimum_commission=0., commission_rounding="none")
+                allocated = {c[0]: int(q) for c, q in zip(candidates, funded)}
+        for symbol, order in orders.items():
+            remaining = int(order.get("remaining_shares") or 0)
+            if order.get("status") != "working" or remaining <= 0:
+                continue
+            reduction = (mode.get("pending_reduction_orders") or {}).get(symbol)
+            if reduction and reduction.get("status") == "working":
+                order["last_wait_reason"] = "inventory_reduction_incomplete"
+                continue
+            template = order["position"]
+            position = mode["positions"].get(template["position_id"])
+            if position and (
+                position.get("last_exit_at") or position.get("stop_triggered_at")
+            ):
+                order["status"] = "cancelled_exit_priority"
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            quote_at = _parse_timestamp(quote.get("quote_at"))
+            price = _finite(
+                quote.get("execution_price_minute") or quote.get("last")
+            )
+            if (
+                quote_at is None
+                or quote_at != now
+                or quote.get("historical_minute_valuation") is not True
+                or price is None
+                or not float(template["lower_limit"])
+                <= price
+                <= float(template["upper_limit"])
+            ):
+                continue
+            lot = int(template["lot_size"])
+            capacity = _minute_kbar_capacity_shares(quote, lot_size=lot)
+            # A flip can finish its old-side reduction and begin the new side
+            # in the same observed minute, but the two legs must share one
+            # 50%-of-volume budget rather than each claiming the full bar.
+            capacity_key = str(
+                quote.get("capacity_bucket")
+                or f"{now.date()}:{now.strftime('%H:%M')}:{symbol}"
+            )
+            capacity -= int(
+                (mode.get("margin_exit_capacity_used") or {}).get(capacity_key)
+                or 0
+            )
+            if capacity <= 0:
+                continue
+            side = str(template["side"])
+            rate = float(
+                template["buy_fee_rate"]
+                if side == "long"
+                else template["sell_fee_rate"]
+            )
+            rebate = float(template["commission_rebate_rate"])
+            budget = max(
+                0.0,
+                float(mode["session_sizing_nav_twd"])
+                - reserved
+                - float(mode.get("corporate_action_receivable_twd") or 0),
+            )
+            affordable = int(budget / (price * (1 + rate - rebate)) / lot) * lot
+            quantity = min(remaining, capacity, affordable)
+            if allocated is not None:
+                quantity = min(quantity, allocated.get(symbol, 0))
+            if quantity <= 0:
+                continue
+
+            # The first positive fill creates the position cohort. Every later
+            # minute extends that same cohort and must be identified as an
+            # entry completion; labelling every partial as a fresh entry makes
+            # the immutable fill ledger ambiguous and breaks independent NAV
+            # reconstruction.
+            is_initial_fill = position is None
+            sequence = int(order.get("sequence") or 0) + 1
+            order_id = f"{template['position_id']}:entry_minute:{sequence}"
+            gross_fee = quantity * price * rate
+            rebate_amount = quantity * price * rebate
+            fee = gross_fee - rebate_amount
+            if position is None:
+                position = dict(template)
+                position.update(
+                    entry_at=now.isoformat(timespec="seconds"),
+                    entry_quote_at=quote.get("quote_at"),
+                    historical_entry_quote_at=quote.get("quote_at"),
+                    entry_price=price,
+                    filled_shares=0,
+                    signed_shares=0,
+                    entry_fee_twd=0.0,
+                    remaining_entry_fee_twd=0.0,
+                    entry_gross_fee_and_tax_twd=0.0,
+                    entry_commission_rebate_accrued_twd=0.0,
+                    counterfactual_minute_sweep_fill=True,
+                )
+                mode["positions"][position["position_id"]] = position
+            previous_filled = int(position.get("filled_shares") or 0)
+            position["entry_price"] = (
+                previous_filled * float(position["entry_price"]) + quantity * price
+            ) / (previous_filled + quantity)
+            position["filled_shares"] = previous_filled + quantity
+            position["signed_shares"] = (
+                1 if side == "long" else -1
+            ) * (previous_filled + quantity)
+            position["executable_order_shares"] = previous_filled + quantity
+            position["target_unsubmitted_shares"] = remaining - quantity
+            for key, amount in (
+                ("entry_fee_twd", fee),
+                ("remaining_entry_fee_twd", fee),
+                ("entry_gross_fee_and_tax_twd", gross_fee),
+                ("entry_commission_rebate_accrued_twd", rebate_amount),
+            ):
+                position[key] = float(position.get(key) or 0.0) + amount
+            reserved += quantity * price + fee
+
+            common = {
+                "recorded_at": now.isoformat(timespec="seconds"),
+                "session_date": now.date().isoformat(),
+                "market": mode["market"],
+                "signal_id": mode["signal_id"],
+                "symbol": symbol,
+                "position_id": position["position_id"],
+                "order_id": order_id,
+                "purpose": "entry" if is_initial_fill else "entry_completion",
+                "quantity": quantity,
+                "simulation_only": True,
+                "entry_fill_policy": ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+            }
+            self._order(
+                common
+                | {
+                    "order_type": "PAPER_MINUTE_PRICE_SWEEP",
+                    "price": None,
+                    "status": "filled",
+                    "side": "buy" if side == "long" else "sell_short",
+                    "model_requested_quantity": int(template["requested_shares"]),
+                    "target_unsubmitted_quantity": remaining - quantity,
+                }
+            )
+            self._fill(
+                common
+                | {
+                    "fill_at": now.isoformat(timespec="seconds"),
+                    "quote_at": quote.get("quote_at"),
+                    "quote_source": quote.get("source"),
+                    "price": price,
+                    "fee_and_tax_twd": fee,
+                    "gross_fee_and_tax_twd": gross_fee,
+                    "commission_rebate_accrued_twd": rebate_amount,
+                    "fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+                    "depth_assumption": (
+                        "50pct_observed_completed_minute_volume_whole_lot_cap"
+                    ),
+                    "simulation_replay": True,
+                    "counterfactual_minute_sweep_fill": True,
+                    "entry_price_source": quote.get("source"),
+                    "entry_price_method": quote.get("execution_price_method"),
+                    "observed_minute_volume_lots": quote.get(
+                        "observed_minute_volume_lots"
+                    ),
+                }
+            )
+            mode["cumulative_commission_rebate_accrued_twd"] = float(
+                mode.get("cumulative_commission_rebate_accrued_twd") or 0.0
+            ) + rebate_amount
+            mode["entry_fill_count"] = int(mode.get("entry_fill_count") or 0) + 1
+            mode["entry_filled_shares"] = int(
+                mode.get("entry_filled_shares") or 0
+            ) + quantity
+            mode["entry_unfilled_shares"] = max(
+                0, int(mode.get("entry_unfilled_shares") or 0) - quantity
+            )
+            mode["entry_post_0901_minute_price_fill_count"] = int(
+                mode.get("entry_post_0901_minute_price_fill_count") or 0
+            ) + 1
+            order.update(
+                remaining_shares=remaining - quantity,
+                sequence=sequence,
+                minute=now.isoformat(timespec="minutes"),
+                minute_used_shares=quantity,
+            )
+            if not order["remaining_shares"]:
+                order["status"] = "filled"
+
+        mode["pending_entry_shares"] = sum(
+            int(order.get("remaining_shares") or 0)
+            for order in orders.values()
+            if order.get("status") == "working"
+        )
+        mode["entry_fill_outcome"] = (
+            "filled"
+            if not int(mode.get("entry_unfilled_shares") or 0)
+            else "partial"
+            if int(mode.get("entry_filled_shares") or 0)
+            else "no_fill"
+        )
+        if not mode["pending_entry_shares"]:
+            mode["entry_sweep_completed_at"] = now.isoformat(timespec="seconds")
+
+    def _retry_historical_minute_reduction_orders(
+        self,
+        mode: dict[str, Any],
+        quotes: Mapping[str, Mapping[str, Any]],
+        now: datetime,
+    ) -> None:
+        """Sweep frozen FIFO target reductions through completed minute bars.
+
+        This is the reduction-side counterpart of the entry sweep above.  It
+        consumes the same per-symbol minute capacity ledger used by ordinary
+        exits, and therefore runs before additions.  No opening price, stale
+        mark, later-day volume, or synthetic quote can satisfy a missing bar.
+        """
+
+        orders = mode.get("pending_reduction_orders") or {}
+        if (
+            not orders
+            or mode.get("simulation_replay") is not True
+            or mode.get("entry_fill_policy") != ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+            or mode.get("entry_fill_contract")
+            != REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+            or mode.get("session_date") != now.date().isoformat()
+        ):
+            return
+        if now.time() >= EXIT_LIMIT_TIME:
+            for order in orders.values():
+                if order.get("status") == "working":
+                    order["status"] = "cancelled_exit_priority"
+            mode["pending_reduction_shares"] = 0
+            return
+
+        for symbol, order in orders.items():
+            remaining = int(order.get("remaining_shares") or 0)
+            if order.get("status") != "working" or remaining <= 0:
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            quote_at = _parse_timestamp(quote.get("quote_at"))
+            price = _finite(
+                quote.get("execution_price_minute") or quote.get("last")
+            )
+            if (
+                quote_at is None
+                or quote_at != now
+                or quote.get("historical_minute_valuation") is not True
+                or price is None
+            ):
+                continue
+
+            active = sorted(
+                (
+                    position
+                    for position in (mode.get("positions") or {}).values()
+                    if str(position.get("symbol") or "") == symbol
+                    and int(position.get("signed_shares") or 0) != 0
+                ),
+                key=lambda position: str(position.get("entry_at") or ""),
+            )
+            if not active:
+                order.update(remaining_shares=0, status="filled")
+                continue
+            if any(
+                not float(position.get("lower_limit") or 0.0)
+                <= price
+                <= float(position.get("upper_limit") or 0.0)
+                for position in active
+            ):
+                order["last_wait_reason"] = "execution_price_outside_daily_limits"
+                continue
+
+            sequence = int(order.get("sequence") or 0) + 1
+            filled = 0
+            sweep_quote = {
+                **quote,
+                "fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+                "depth_assumption": (
+                    "50pct_observed_completed_minute_volume_whole_lot_shared_"
+                    "by_reduction_then_addition"
+                ),
+                "counterfactual_minute_sweep_fill": True,
+                "entry_fill_policy": ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                "entry_price_method": quote.get("execution_price_method"),
+            }
+            for position in active:
+                if filled >= remaining:
+                    break
+                before = abs(int(position.get("signed_shares") or 0))
+                self._close_position(
+                    position,
+                    mode,
+                    price=price,
+                    quote=sweep_quote,
+                    now=now,
+                    reason="next_signal_inventory_delta_minute_sweep",
+                    order_type="PAPER_MINUTE_PRICE_SWEEP",
+                    quantity=remaining - filled,
+                    ledger_session_date=now.date().isoformat(),
+                    ledger_order_id=(
+                        f"{position['position_id']}:{now.date()}:"
+                        f"target_delta_minute:{sequence}"
+                    ),
+                )
+                filled += before - abs(int(position.get("signed_shares") or 0))
+
+            if filled <= 0:
+                order["last_wait_reason"] = "minute_capacity_exhausted"
+                continue
+            remaining -= filled
+            order.update(
+                remaining_shares=remaining,
+                sequence=sequence,
+                minute=now.isoformat(timespec="minutes"),
+                minute_used_shares=filled,
+                last_wait_reason=None,
+            )
+            if remaining == 0:
+                order["status"] = "filled"
+            mode["rebalance_reduction_fill_count"] = int(
+                mode.get("rebalance_reduction_fill_count") or 0
+            ) + 1
+            mode["rebalance_reduction_post_0901_fill_count"] = int(
+                mode.get("rebalance_reduction_post_0901_fill_count") or 0
+            ) + 1
+
+        mode["pending_reduction_shares"] = sum(
+            int(order.get("remaining_shares") or 0)
+            for order in orders.values()
+            if order.get("status") == "working"
+        )
+        if not mode["pending_reduction_shares"]:
+            mode["reduction_sweep_completed_at"] = now.isoformat(
+                timespec="seconds"
+            )
+
     def _retry_entry_orders(self, mode, quotes, now):
         """Continue a frozen daily target; never re-infer, re-size, or reopen exits.
 
-        Replenishment requires new cumulative trade volume, not another poll of
-        identical depth. Fees, acquisition cost and the NAV budget are retained.
-        A durable intent marker quarantines an interrupted append on restart.
+        Depth-capped execution requires new cumulative trade volume, not another
+        poll of identical depth.  The causal full-target paper-market policy
+        instead waits only for the first admissible Shioaji best quote and then
+        books the frozen remainder without claiming exchange depth or a broker
+        fill. Fees, acquisition cost and the NAV budget are retained. A durable
+        intent marker quarantines an interrupted append on restart.
         """
         orders = mode.get("pending_entry_orders") or {}
-        if not orders or mode.get("intraday_contract") != STRICT_INTRADAY_CONTRACT:
+        entry_fill_policy = str(
+            mode.get("configured_entry_fill_policy")
+            or mode.get("entry_fill_policy")
+            or ""
+        )
+        if entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET:
+            self._retry_full_target_entry_orders(mode, quotes, now)
+            return
+        if not orders or entry_fill_policy not in {
+            ENTRY_FILL_POLICY_CAUSAL_BOOK,
+        }:
             return
         for symbol, order in orders.items():
             if order.get("status") != "working":
@@ -4558,7 +5376,8 @@ class TwDayTradeSimulationEngine:
             quote = quotes.get(symbol) or {}
             signal_at = _parse_timestamp(mode.get("signal_at"))
             quote_at = _parse_timestamp(quote.get("quote_at"))
-            if not self._fresh_regular_quote(quote, now) or signal_at is None or quote_at <= signal_at:
+            if (not self._fresh_regular_quote(quote, now) or signal_at is None
+                    or not _quote_after_signal(quote, signal_at)):
                 continue
             side = template["side"]
             price = _finite(quote.get("ask" if side == "long" else "bid"))
@@ -4570,21 +5389,25 @@ class TwDayTradeSimulationEngine:
             lot = int(template["lot_size"])
             cumulative = quote.get("cumulative_volume_lots")
             previous = order.get("last_cumulative_volume_lots")
-            if cumulative is None or previous is None:
-                order["last_cumulative_volume_lots"] = cumulative
-                if p is not None or cumulative is None:
-                    continue
-                # This zero-fill target has never consumed an executable book.
-                capacity = _top_book_capacity_shares(quote, transaction_side="buy" if side == "long" else "sell", lot_size=lot)
+            if entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET:
+                capacity = int(order["remaining_shares"])
             else:
-                delta = float(cumulative) - float(previous)
-                if not math.isfinite(delta) or delta <= 0:
-                    continue
-                capacity = min(_top_book_capacity_shares(quote, transaction_side="buy" if side == "long" else "sell", lot_size=lot),
-                               int(math.floor(delta * MINUTE_VOLUME_PARTICIPATION)) * lot)
+                if cumulative is None or previous is None:
+                    order["last_cumulative_volume_lots"] = cumulative
+                    if p is not None or cumulative is None:
+                        continue
+                    # This zero-fill target has never consumed an executable book.
+                    capacity = _top_book_capacity_shares(quote, transaction_side="buy" if side == "long" else "sell", lot_size=lot)
+                else:
+                    delta = float(cumulative) - float(previous)
+                    if not math.isfinite(delta) or delta <= 0:
+                        continue
+                    capacity = min(_top_book_capacity_shares(quote, transaction_side="buy" if side == "long" else "sell", lot_size=lot),
+                                   int(math.floor(delta * MINUTE_VOLUME_PARTICIPATION)) * lot)
             minute = now.strftime("%Y-%m-%dT%H:%M")
             used = int(order.get("minute_used_shares") or 0) if minute == order.get("minute") else 0
-            if now.time() >= FIRST_MINUTE_EXECUTION_TIME:
+            if (entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
+                    and now.time() >= FIRST_MINUTE_EXECUTION_TIME):
                 capacity = min(capacity, max(0, _minute_kbar_capacity_shares(quote, lot_size=lot) - used))
             rate = float(template["buy_fee_rate"] if side == "long" else template["sell_fee_rate"])
             rebate = float(template["commission_rebate_rate"])
@@ -4621,15 +5444,27 @@ class TwDayTradeSimulationEngine:
                 p[key] = float(p.get(key) or 0) + amount
             common = {"recorded_at": now.isoformat(), "session_date": now.date().isoformat(),
                       "market": mode["market"], "signal_id": mode["signal_id"], "symbol": symbol,
-                      "position_id": p["position_id"], "order_id": order_id, "purpose": "entry",
-                      "quantity": quantity, "simulation_only": True, "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_BOOK}
+                      "position_id": p["position_id"], "order_id": order_id,
+                      "purpose": "entry" if old == 0 else "entry_completion",
+                      "quantity": quantity, "simulation_only": True,
+                      "entry_fill_policy": entry_fill_policy}
             self._order(common | {"order_type": "MKT", "price": None, "status": "filled",
                                   "side": "buy" if side == "long" else "sell_short"})
             self._fill(common | {"fill_at": now.isoformat(), "quote_at": quote.get("quote_at"),
                                  "price": price, "fee_and_tax_twd": fee,
                                  "gross_fee_and_tax_twd": gross_fee, "commission_rebate_accrued_twd": rebate_amount,
-                                 "fill_contract": "causal_best_quote_remaining_order",
-                                 "depth_assumption": "new_volume_replenishment_and_minute_budget"})
+                                 "fill_contract": (
+                                     "causal_best_quote_remaining_order"
+                                     if entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
+                                     else "paper_market_full_target_at_causal_shioaji_best_quote"
+                                 ),
+                                 "depth_assumption": (
+                                     "new_volume_replenishment_and_minute_budget"
+                                     if entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
+                                     else "full_frozen_remainder_no_exchange_depth_or_fill_claim"
+                                 ),
+                                 "paper_market_fill": entry_fill_policy
+                                 == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET})
             mode["cumulative_commission_rebate_accrued_twd"] += rebate_amount
             mode["entry_fill_count"] += 1
             mode["entry_best_quote_fill_count"] += 1
@@ -4643,6 +5478,245 @@ class TwDayTradeSimulationEngine:
             mode.pop("entry_retry_pending_commit", None)
             self._persist(now)
         mode["pending_entry_shares"] = sum(int(o["remaining_shares"]) for o in orders.values() if o["status"] == "working")
+
+    def _retry_full_target_entry_orders(self, mode, quotes, now) -> None:
+        """Commit one causal paper-market quote batch with two durable writes.
+
+        The old retry path persisted the complete multi-mode state before and
+        after every symbol.  A 250-name target therefore required 500 atomic
+        state replacements even though every fill shared one quote snapshot.
+        This batch keeps the same fail-closed intent marker and append-only
+        ledgers, but commits one snapshot as one transaction.
+        """
+
+        orders = mode.get("pending_entry_orders") or {}
+        if not orders or mode.get("session_date") != now.date().isoformat():
+            return
+        signal_at = _parse_timestamp(mode.get("signal_at"))
+        if signal_at is None or now.time() >= EXIT_LIMIT_TIME:
+            return
+
+        candidates: list[tuple[str, dict[str, Any], dict[str, Any], float]] = []
+        for symbol, order in orders.items():
+            if (
+                order.get("status") != "working"
+                or int(order.get("remaining_shares") or 0) <= 0
+            ):
+                continue
+            template = order["position"]
+            existing = mode["positions"].get(template["position_id"])
+            if existing and (existing.get("last_exit_at") or existing.get("stop_triggered_at")):
+                order["status"] = "cancelled_exit_priority"
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            quote_at = _parse_timestamp(quote.get("quote_at"))
+            if not self._fresh_regular_quote(quote, now):
+                order["last_wait_reason"] = "waiting_fresh_regular_session_quote"
+                continue
+            if quote_at is None or not _quote_after_signal(quote, signal_at):
+                order["last_wait_reason"] = "quote_not_after_signal"
+                continue
+            side = str(template["side"])
+            price = _finite(quote.get("ask" if side == "long" else "bid"))
+            if price is None:
+                order["last_wait_reason"] = (
+                    "no_executable_best_ask"
+                    if side == "long"
+                    else "no_executable_best_bid"
+                )
+                order["last_quote_at"] = quote.get("quote_at")
+                continue
+            if not float(template["lower_limit"]) <= price <= float(template["upper_limit"]):
+                order["last_wait_reason"] = "execution_price_outside_daily_limits"
+                continue
+            if not bool(
+                    price_on_tick_grid_numpy(
+                        np.array([price]),
+                        np.array([now.date()]),
+                        security_types=template.get("security_type") or "stock",
+                    )[0]
+                ):
+                order["last_wait_reason"] = "execution_price_off_tick_grid"
+                continue
+            order.pop("last_wait_reason", None)
+            order["last_quote_at"] = quote.get("quote_at")
+            candidates.append((symbol, order, quote, price))
+
+        if not candidates:
+            mode["pending_entry_shares"] = sum(
+                int(order.get("remaining_shares") or 0)
+                for order in orders.values()
+                if order.get("status") == "working"
+            )
+            mode["pending_entry_reason_counts"] = _pending_entry_reason_counts(
+                orders
+            )
+            return
+
+        marker = {
+            "contract": "causal_full_target_quote_batch_v1",
+            "started_at": now.isoformat(timespec="milliseconds"),
+            "signal_id": mode.get("signal_id"),
+            "symbols": [symbol for symbol, _order, _quote, _price in candidates],
+            "order_ids": [
+                f"{order['position']['position_id']}:entry_retry:"
+                f"{int(order.get('sequence') or 0) + 1}"
+                for _symbol, order, _quote, _price in candidates
+            ],
+        }
+        mode["entry_retry_pending_commit"] = marker
+        self._persist(now)
+
+        order_records: list[dict[str, Any]] = []
+        fill_records: list[dict[str, Any]] = []
+        reserved = sum(
+            abs(int(position.get("filled_shares") or 0))
+            * float(position["entry_price"])
+            + float(position.get("entry_fee_twd") or 0)
+            for position in mode["positions"].values()
+        )
+        for symbol, order, quote, price in candidates:
+            template = order["position"]
+            side = str(template["side"])
+            lot = int(template["lot_size"])
+            rate = float(
+                template["buy_fee_rate"] if side == "long" else template["sell_fee_rate"]
+            )
+            rebate = float(template["commission_rebate_rate"])
+            budget = max(
+                0.0,
+                float(mode["session_sizing_nav_twd"])
+                - reserved
+                - float(mode.get("corporate_action_receivable_twd") or 0),
+            )
+            affordable = int(budget / (price * (1 + rate - rebate)) / lot) * lot
+            quantity = min(int(order["remaining_shares"]), affordable)
+            if quantity <= 0:
+                order["status"] = "cancelled_account_nav_budget_exhausted"
+                continue
+
+            sequence = int(order.get("sequence") or 0) + 1
+            order_id = f"{template['position_id']}:entry_retry:{sequence}"
+            gross_fee = quantity * price * rate
+            rebate_amount = quantity * price * rebate
+            fee = gross_fee - rebate_amount
+            position = mode["positions"].get(template["position_id"])
+            if position is None:
+                position = dict(template)
+                position.update(
+                    entry_at=now.isoformat(),
+                    entry_quote_at=quote.get("quote_at"),
+                    entry_price=price,
+                    filled_shares=0,
+                    signed_shares=0,
+                    entry_fee_twd=0.0,
+                    remaining_entry_fee_twd=0.0,
+                    entry_gross_fee_and_tax_twd=0.0,
+                    entry_commission_rebate_accrued_twd=0.0,
+                )
+                mode["positions"][position["position_id"]] = position
+            previous_filled = int(position["filled_shares"])
+            position["entry_price"] = (
+                previous_filled * float(position["entry_price"]) + quantity * price
+            ) / (previous_filled + quantity)
+            position["filled_shares"] = previous_filled + quantity
+            position["signed_shares"] = (
+                1 if side == "long" else -1
+            ) * (previous_filled + quantity)
+            position["executable_order_shares"] = previous_filled + quantity
+            position["target_unsubmitted_shares"] = (
+                int(order["remaining_shares"]) - quantity
+            )
+            for key, amount in (
+                ("entry_fee_twd", fee),
+                ("remaining_entry_fee_twd", fee),
+                ("entry_gross_fee_and_tax_twd", gross_fee),
+                ("entry_commission_rebate_accrued_twd", rebate_amount),
+            ):
+                position[key] = float(position.get(key) or 0) + amount
+            reserved += quantity * price + fee
+
+            common = {
+                "recorded_at": now.isoformat(),
+                "session_date": now.date().isoformat(),
+                "market": mode["market"],
+                "signal_id": mode["signal_id"],
+                "symbol": symbol,
+                "position_id": position["position_id"],
+                "order_id": order_id,
+                "purpose": "entry" if previous_filled == 0 else "entry_completion",
+                "quantity": quantity,
+                "simulation_only": True,
+                "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+            }
+            order_records.append(
+                common
+                | {
+                    "order_type": "MKT",
+                    "price": None,
+                    "status": "filled",
+                    "side": "buy" if side == "long" else "sell_short",
+                }
+            )
+            fill_records.append(
+                common
+                | {
+                    "fill_at": now.isoformat(),
+                    "quote_at": quote.get("quote_at"),
+                    "book_exchange_at": quote.get("book_exchange_at"),
+                    "exchange_quote_at": quote.get("exchange_quote_at"),
+                    "quote_source": quote.get("source"),
+                    "quote_simtrade": quote.get("simtrade"),
+                    "stream_subscribed": quote.get("stream_subscribed"),
+                    "price": price,
+                    "fee_and_tax_twd": fee,
+                    "gross_fee_and_tax_twd": gross_fee,
+                    "commission_rebate_accrued_twd": rebate_amount,
+                    "fill_contract": "paper_market_full_target_at_causal_shioaji_best_quote",
+                    "depth_assumption": "full_frozen_remainder_no_exchange_depth_or_fill_claim",
+                    "paper_market_fill": True,
+                }
+            )
+            mode["cumulative_commission_rebate_accrued_twd"] += rebate_amount
+            mode["entry_fill_count"] += 1
+            mode["entry_best_quote_fill_count"] += 1
+            mode["entry_filled_shares"] += quantity
+            mode["entry_unfilled_shares"] = max(
+                0, int(mode["entry_unfilled_shares"]) - quantity
+            )
+            order.update(
+                remaining_shares=int(order["remaining_shares"]) - quantity,
+                sequence=sequence,
+                last_cumulative_volume_lots=quote.get("cumulative_volume_lots"),
+                minute=now.strftime("%Y-%m-%dT%H:%M"),
+                minute_used_shares=quantity,
+            )
+            if not order["remaining_shares"]:
+                order["status"] = "filled"
+            elif quantity >= affordable:
+                # Opening capital is frozen at the session decision. Do not
+                # keep an impossible remainder alive in hopes that a later
+                # intraday exit releases cash and changes the target timing.
+                order["status"] = "cancelled_account_nav_budget_exhausted"
+
+        if order_records:
+            _append_jsonl_many(self.orders_path, order_records)
+            _append_jsonl_many(self.fills_path, fill_records)
+        mode["pending_entry_shares"] = sum(
+            int(order.get("remaining_shares") or 0)
+            for order in orders.values()
+            if order.get("status") == "working"
+        )
+        mode["pending_entry_reason_counts"] = _pending_entry_reason_counts(orders)
+        mode["entry_fill_outcome"] = (
+            "filled"
+            if not int(mode.get("entry_unfilled_shares") or 0)
+            else "partial"
+            if int(mode.get("entry_filled_shares") or 0)
+            else "no_fill"
+        )
+        mode.pop("entry_retry_pending_commit", None)
+        self._persist(now)
 
     def _block_signal(
         self,
@@ -5188,6 +6262,13 @@ class TwDayTradeSimulationEngine:
                 market=market,
                 submitted=submitted,
             )
+        # This is a pending-position count, not a fill count.  Expose the
+        # outstanding auction risk immediately at 13:25 instead of leaving
+        # the pre-auction dashboard at a misleading zero until settlement.
+        mode["closing_auction_pending_count"] = sum(
+            bool(int(position.get("signed_shares") or 0))
+            for position in (mode.get("positions") or {}).values()
+        )
 
     def _settle_closing_auction(
         self,
@@ -5196,6 +6277,9 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
+        if mode.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT:
+            self._settle_unlimited_close(market, mode, quotes, now)
+            return
         if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
             self._settle_intraday_auction(market, mode, quotes, now)
             return
@@ -5245,18 +6329,115 @@ class TwDayTradeSimulationEngine:
                 position["closing_auction_order_status"] = "part_filled"
         self._event("closing_auction_settled", recorded_at=now, market=market)
 
+    def _settle_unlimited_close(self, market, mode, quotes, now) -> None:
+        """User-authorized paper liquidation, never a broker/queue fill.
+
+        Only a same-session official close or an evidenced non-trial closing
+        auction trade establishes the price. Capacity is deliberately ignored;
+        quote provenance, tick, ownership and corporate-action gates are not.
+        Missing evidence remains retryable, including after a process restart.
+        """
+        session_date = str(mode.get("session_date") or "")
+        if session_date != now.date().isoformat() or now.time() < SESSION_CLOSE:
+            return
+        if _timestamp_is_for_session(mode.get("closing_auction_settled_at"), session_date):
+            return
+        settled = 0
+        for p in (mode.get("positions") or {}).values():
+            signed = int(p.get("signed_shares") or 0)
+            if not signed:
+                continue
+            quote = quotes.get(str(p["symbol"])) or {}
+            proof = quote.get("session_close_evidence")
+            price = None
+            evidence = None
+            if isinstance(proof, Mapping):
+                digest = str(proof.get("source_sha256") or "")
+                if (proof.get("session_date") == session_date
+                        and proof.get("price_basis") == "official_session_close"
+                        and proof.get("source") in {
+                            "twse_official_daily_close", "tpex_official_daily_close"}
+                        and len(digest) == 64
+                        and all(c in "0123456789abcdef" for c in digest)):
+                    price = _finite(proof.get("price"))
+                    evidence = dict(proof)
+            if price is None:
+                auction = self._auction_execution_quote(quote)
+                exchange_at = _parse_timestamp(auction.get("exchange_quote_at"))
+                received_at = _parse_timestamp(auction.get("quote_at"))
+                observed_trade_volume = _finite(quote.get("auction_volume_lots"))
+                if (quote.get("auction_volume_source") in {
+                            "exchange_non_trial_tick", "exchange_non_trial_quote_trade"}
+                        and auction.get("simtrade") is False
+                        and observed_trade_volume is not None and observed_trade_volume > 0
+                        and exchange_at is not None and received_at is not None
+                        and exchange_at.date() == received_at.date() == now.date()
+                        and exchange_at <= received_at <= now
+                        and SESSION_CLOSE <= exchange_at.time() < time(13, 34)):
+                    price = _finite(auction.get("last"))
+                    evidence = {"source": quote.get("auction_volume_source"),
+                                "session_date": session_date,
+                                "price_basis": "observed_regular_closing_auction",
+                                "observed_trade_volume_lots": observed_trade_volume,
+                                "price": price, "exchange_quote_at": exchange_at.isoformat(),
+                                "received_at": received_at.isoformat()}
+            halted_until = str(p.get("share_replacement_halted_until") or "")
+            security_type = classify_tw_stock_or_etf(p["symbol"])
+            valid = (price is not None and price > 0 and security_type is not None
+                     and halted_until <= session_date
+                     and quote.get("suspend") not in (True, 1))
+            if valid:
+                valid = bool(price_on_tick_grid_numpy(
+                    np.array([price]), np.array([now.date()]),
+                    security_types=security_type)[0])
+            if not valid:
+                p["closing_auction_order_status"] = "waiting_valid_terminal_close_source"
+                continue
+            effective_at = datetime.combine(now.date(), SESSION_CLOSE, tzinfo=TAIPEI)
+            receipt = {"contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+                       "source_evidence": evidence, "recorded_at": now.isoformat(),
+                       "effective_at": effective_at.isoformat(), "broker_fill": False,
+                       "full_quantity_is_user_assumption": True}
+            orders, fills = [], []
+            self._book_position_close(p, mode, price=price,
+                quote={"fill_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+                       "depth_assumption": "full_residual_ignores_close_capacity_no_exchange_fill_claim"},
+                now=effective_at, reason="13_30_unlimited_close_paper_settlement",
+                order_type="PAPER_CLOSE_SETTLEMENT", quantity=abs(signed),
+                ledger_rows=(orders, fills))
+            for row in orders:
+                self._order(row | {"recorded_at": now.isoformat(), "terminal_close_receipt": receipt})
+            for row in fills:
+                self._fill(row | {"recorded_at": now.isoformat(), "terminal_close_receipt": receipt,
+                                  "quote_at": None, "exchange_match_at": None})
+            p["terminal_close_receipt"] = receipt
+            p["closing_auction_order_status"] = "paper_settled_not_exchange_fill"
+            settled += 1
+        remaining = sum(bool(p.get("signed_shares")) for p in (mode.get("positions") or {}).values())
+        mode["closing_auction_pending_count"] = remaining
+        mode["force_exit_failures"] = remaining
+        mode["execution_evidence_complete"] = not remaining
+        mode["terminal_flatten_count"] = int(mode.get("terminal_flatten_count") or 0) + settled
+        if not remaining:
+            mode["closing_auction_settled_at"] = now.isoformat(timespec="seconds")
+            mode["residual_conversion_completed_at"] = now.isoformat(timespec="seconds")
+        else:
+            mode["engine_status"] = "waiting_valid_terminal_close_source"
+        if settled:
+            self._event("unlimited_close_paper_settlement", recorded_at=now,
+                        market=market, settled_count=settled, remaining_count=remaining,
+                        assumption_contract=TERMINAL_CLOSE_UNLIMITED_CONTRACT)
+
     @staticmethod
     def _fresh_regular_quote(quote: Mapping[str, Any], now: datetime) -> bool:
-        """Receipt freshness is not exchange event time, nor trial matching."""
-        received = _parse_timestamp(quote.get("quote_at"))
-        return bool(received is not None and received.date() == now.date()
-                    and 0 <= (now - received).total_seconds() <= 10
-                    and quote.get("simtrade") is False)
+        return _fresh_regular_execution_quote(quote, now)
 
     @staticmethod
     def _auction_execution_quote(quote: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(quote)
-        if result.get("auction_volume_source") == "exchange_non_trial_tick":
+        if result.get("auction_volume_source") in {
+            "exchange_non_trial_tick", "exchange_non_trial_quote_trade"
+        }:
             result["quote_at"] = result.get("trade_quote_at")
             result["simtrade"] = result.get("trade_simtrade")
         return result
@@ -5674,10 +6855,31 @@ class TwDayTradeSimulationEngine:
                         left -= actual
                 plan["reduction_block_reason"] = reducing["reason"] if reduction_filled < reduce else None
             remaining = held - (reduction_filled if held > 0 else -reduction_filled)
+            reduction_remaining = max(0, reduce - reduction_filled)
+            if (
+                reduction_remaining
+                and allow_quote_at_signal
+                and mode.get("simulation_replay") is True
+                and spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+                and mode.get("entry_fill_contract")
+                == REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+            ):
+                mode["pending_reduction_orders"][symbol] = {
+                    "remaining_shares": reduction_remaining,
+                    "requested_shares": reduce,
+                    "target_signed_shares": target,
+                    "status": "working",
+                    "sequence": 0,
+                    "minute": observed.strftime("%Y-%m-%dT%H:%M"),
+                    "minute_used_shares": reduction_filled,
+                }
             addition = max(0, abs(target) - abs(remaining)) if target * remaining >= 0 else 0
             # A failed reduction may not be bypassed by opening the other side.
             if remaining and target * remaining < 0:
-                addition = 0
+                # Retain the opposite-side target as a pending entry.  The
+                # minute retry path blocks it until the FIFO reduction reaches
+                # zero and shares the same source-volume budget in that minute.
+                addition = abs(target)
             plan.update(reduction_requested_shares=reduce, reduction_filled_shares=reduction_filled)
             plan["requested_shares"] = addition
             capacity = (
@@ -5687,13 +6889,19 @@ class TwDayTradeSimulationEngine:
             )
             if spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK:
                 capacity = int(plan["top_book_capacity_shares"]) if observed.time() < time(9, 1) else min(capacity, int(plan["top_book_capacity_shares"]))
+            elif spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET:
+                capacity = addition + reduction_filled
             if plan["status"] not in {"ready", "partial_depth"}:
                 capacity = 0
             capacity = max(0, capacity - reduction_filled)
             plan["filled_shares"] = min(addition, capacity)
             if not plan["filled_shares"]:
-                plan["status"] = "hold" if reduction_filled == reduce else "blocked"
-                plan["reason"] = "inventory_target_retained" if reduction_filled == reduce else "inventory_reduction_incomplete"
+                if reduction_remaining and addition:
+                    plan["status"] = "blocked"
+                    plan["reason"] = "observed_09_01_minute_capacity_exhausted"
+                else:
+                    plan["status"] = "hold" if reduction_filled == reduce else "blocked"
+                    plan["reason"] = "inventory_target_retained" if reduction_filled == reduce else "inventory_reduction_incomplete"
             elif plan["filled_shares"] < addition:
                 plan["status"] = "partial_depth"
             for p in lots:
@@ -5737,6 +6945,10 @@ class TwDayTradeSimulationEngine:
         if _timestamp_is_for_session(
             mode.get("residual_conversion_completed_at"), session_date
         ):
+            return
+        if mode.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT:
+            # Missing close evidence must remain retryable, not become a
+            # completed margin conversion or an invented fallback-price fill.
             return
         strict = mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT
         if strict and not _timestamp_is_for_session(mode.get("closing_auction_settled_at"), session_date):
@@ -6054,6 +7266,15 @@ class TwDayTradeSimulationEngine:
                     if reason == "13_30_terminal_ledger_flatten"
                     else "minimum_of_level_one_and_50pct_minute_volume_except_closing_auction_which_uses_50pct_auction_minute_volume"
                 ),
+                "counterfactual_minute_sweep_fill": bool(
+                    quote.get("counterfactual_minute_sweep_fill")
+                ),
+                "simulation_replay": bool(mode.get("simulation_replay")),
+                "entry_fill_policy": quote.get("entry_fill_policy"),
+                "entry_price_method": quote.get("entry_price_method"),
+                "observed_minute_volume_lots": quote.get(
+                    "observed_minute_volume_lots"
+                ),
             }
         )
 
@@ -6071,6 +7292,7 @@ class TwDayTradeSimulationEngine:
         open_net = 0.0
         stale_count = 0
         open_count = 0
+        indicative_count = 0
         total_notional = 0.0
         fresh_notional = 0.0
         missing_count = 0
@@ -6086,6 +7308,17 @@ class TwDayTradeSimulationEngine:
             liquidation = _finite(quote.get("bid" if side == "long" else "ask"))
             if mode.get("historical_minute_valuation") and quote.get("historical_minute_valuation"):
                 liquidation = _finite(quote.get("valuation_price_0901"))
+            indicative = False
+            valuation_at = _parse_timestamp(quote.get("valuation_quote_at"))
+            if (liquidation is None and valuation_at is not None
+                    and valuation_at.date() == now.date()
+                    and 0 <= (now - valuation_at).total_seconds() <= 10.0
+                    and quote.get("valuation_simtrade") is not True
+                    and quote.get("simtrade") is not True
+                    and quote.get("valuation_evidence") == "indicative_snapshot_book_only_not_execution_evidence_v1"):
+                liquidation = _finite(quote.get("valuation_bid" if side == "long" else "valuation_ask"))
+                indicative = liquidation is not None
+                indicative_count += int(indicative)
             mark_price = liquidation or _finite(position.get("last_mark_price"))
             if mark_price is not None:
                 total_notional += abs(signed) * mark_price
@@ -6107,6 +7340,14 @@ class TwDayTradeSimulationEngine:
             net_pnl = position_net_liquidation_pnl(position, liquidation)
             position["last_mark_at"] = now.isoformat(timespec="seconds")
             position["last_quote_at"] = quote.get("quote_at")
+            if indicative:
+                position["last_quote_at"] = quote.get("valuation_quote_at")
+            position["last_mark_quote_source"] = (
+                quote.get("valuation_quote_source") if indicative else quote.get("source")
+            )
+            position["last_mark_evidence"] = (
+                quote.get("valuation_evidence") if indicative else "observed_execution_or_historical_quote"
+            )
             position["last_mark_price"] = liquidation
             position["last_complete_net_pnl_twd"] = net_pnl
             position["total_net_pnl_twd"] = (
@@ -6137,12 +7378,17 @@ class TwDayTradeSimulationEngine:
             {
                 "open_position_count": open_count,
                 "stale_position_count": stale_count,
+                "indicative_valuation_position_count": indicative_count,
                 "open_net_liquidation_pnl_twd": open_net,
                 "total_equity_twd": total_equity,
                 "last_mark_at": now.isoformat(timespec="seconds"),
                 "valuation_stale": stale_count > 0,
                 "valuation_complete": missing_count == 0,
                 "engine_status": (
+                    "waiting_valid_terminal_close_source"
+                    if open_count and mode.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
+                    and now.timetz().replace(tzinfo=None) >= SESSION_CLOSE
+                    else
                     "margin_carried_waiting_next_signal"
                     if open_count and mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
                     and now.timetz().replace(tzinfo=None) >= SESSION_CLOSE
@@ -6216,6 +7462,7 @@ class TwDayTradeSimulationEngine:
                 "total_equity_twd": total_equity,
                 "open_position_count": open_count,
                 "stale_position_count": stale_count,
+                "indicative_valuation_position_count": indicative_count,
                 "valuation_stale": stale_count > 0,
                 **({
                     "historical_minute_replay": True,
@@ -6352,8 +7599,11 @@ class TwDayTradeSimulationEngine:
             for item in mode_rows
         )
         paper_market_at_best = bool(mode_rows) and all(
-            str(item.get("entry_fill_policy") or "")
-            == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+            str(item.get("configured_entry_fill_policy") or item.get("entry_fill_policy") or "")
+            in {
+                ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+                ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+            }
             for item in mode_rows
         )
         health = (
@@ -6375,6 +7625,9 @@ class TwDayTradeSimulationEngine:
                 "engine_run_id": self._engine_run_id,
                 "updated_at": observed.isoformat(timespec="seconds"),
                 "health": health,
+                "shioaji_monitor_projection": build_shioaji_monitor_projection(
+                    self.state, self.state_path, state_revision=revision,
+                ),
                 "simulation_only": True,
                 "production_order_possible": False,
                 "ledger_integrity": {
@@ -6388,14 +7641,14 @@ class TwDayTradeSimulationEngine:
                     "entry": (
                         "synthetic_fill_at_observed_session_open_plus_one_adverse_tick"
                         if synthetic_open_tick
-                        else "paper_market_order_at_causal_best_ask_bid_else_open_plus_one_adverse_tick"
+                        else "paper_market_full_target_at_causal_best_ask_bid"
                         if paper_market_at_best
                         else "size_at_official_open_then_execute_at_a_causally_later_best_ask_bid"
                     ),
                     "liquidity": (
                         "counterfactual_unbounded_paper_fill_no_exchange_claim"
                         if synthetic_open_tick
-                        else "full_requested_quantity_at_observed_best_quote_no_exchange_depth_claim"
+                        else "full_requested_quantity_at_causal_observed_best_quote_no_exchange_depth_or_fill_claim"
                         if paper_market_at_best
                         else "min(level_one_depth, 50pct_completed_minute_kbar_volume)"
                     ),
@@ -6405,7 +7658,7 @@ class TwDayTradeSimulationEngine:
                     "fill_caveat": (
                         "guaranteed only inside the synthetic paper ledger; not a broker or exchange fill"
                         if synthetic_open_tick
-                        else "deterministic only inside the paper ledger; displayed depth and queue position do not guarantee an exchange fill"
+                        else "deterministic only inside the paper ledger after a causal quote; not a broker fill and displayed depth is not claimed"
                         if paper_market_at_best
                         else "inside-limit prices improve fill probability but cannot guarantee a fill without executable counterparty volume"
                     ),
@@ -6434,6 +7687,7 @@ class TwDayTradeSimulationEngine:
                             "paper_fill_deterministic",
                             "exchange_fill_guaranteed",
                             "entry_fill_policy",
+                            "configured_entry_fill_policy",
                             "entry_price_offset_ticks",
                             "entry_fill_is_synthetic",
                             "entry_fill_has_synthetic_fallback",
@@ -6466,7 +7720,10 @@ class TwDayTradeSimulationEngine:
                             "entry_unfilled_shares",
                             "intraday_contract",
                             "configured_intraday_contract",
+                            "terminal_close_contract",
+                            "configured_terminal_close_contract",
                             "pending_entry_shares",
+                            "pending_entry_reason_counts",
                             "manual_close_settlement",
                             "closing_auction_pending_count",
                             "margin_exception_count",
@@ -6478,6 +7735,7 @@ class TwDayTradeSimulationEngine:
                             "open_net_liquidation_pnl_twd",
                             "open_position_count",
                             "stale_position_count",
+                            "indicative_valuation_position_count",
                             "force_exit_failures",
                             "terminal_flatten_count",
                             "terminal_flatten_degraded_count",
@@ -6507,6 +7765,7 @@ class TwDayTradeSimulationEngine:
                 "content_revision": content_revision,
                 "engine_run_id": self._engine_run_id,
                 "published_at": observed.isoformat(timespec="milliseconds"),
+                "heartbeat_at": observed.isoformat(timespec="milliseconds"),
                 "simulation_only": True,
                 "production_order_possible": False,
                 "ledger_integrity_ready": not divergence_rows,
@@ -6522,9 +7781,18 @@ class TwDayTradeSimulationEngine:
                             "signal_at",
                             "entry_completed_at",
                             "entry_fill_policy",
+                            "configured_entry_fill_policy",
                             "entry_price_offset_ticks",
                             "engine_status",
                             "checkpoint_ready",
+                            "entry_requested_shares",
+                            "entry_filled_shares",
+                            "entry_unfilled_shares",
+                            "pending_entry_shares",
+                            "pending_entry_reason_counts",
+                            "entry_fill_outcome",
+                            "signal_reason_counts",
+                            "rebalance_reduction_fill_count",
                             "open_position_count",
                             "margin_carry_contract",
                             "odd_lot_execution_policy",
@@ -6548,6 +7816,7 @@ __all__ = [
     "REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK",
+    "ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET",
     "ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK",
     "ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901",
     "ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK",

@@ -112,6 +112,12 @@ wait_for_taifex_priority() {
   fi
   local last_log=0
   while true; do
+    # This live capture cannot be recovered after 13:30.  Do not leave the
+    # service in an eternal wait if the higher-priority collector never starts.
+    if (( 10#$(TZ=Asia/Taipei date +%H%M) >= 1330 )); then
+      echo "[shioaji-top200] priority_gate=expired_without_taifex_capture"
+      return 1
+    fi
     local taifex_processes
     taifex_processes="$(pgrep -fc '[p]ython .*downloader\.stream_shioaji_taifex_bidask' || true)"
     if systemctl is-active --quiet stockagent-shioaji-taifex-bidask.service \
@@ -137,13 +143,19 @@ while true; do
     sleep "$delay"
   fi
 
-  wait_for_taifex_priority
-
   trade_date="$(TZ=Asia/Taipei date +%F)"
   required_connections=$((TAIFEX_WORKERS + RESERVED_STOCK_QUOTE_CLIENTS + TOP200_WORKERS))
   if (( required_connections > MAX_CONNECTIONS )); then
     write_capture_state "$trade_date" "skipped" "connection_budget"
     echo "[shioaji-top200] capture_skipped reason=connection_budget required=$required_connections max=$MAX_CONNECTIONS taifex=$TAIFEX_WORKERS reserved_day_trade_quotes=$RESERVED_STOCK_QUOTE_CLIENTS top200=$TOP200_WORKERS"
+    next_delay="$(seconds_until_next_capture_day)"
+    echo "[shioaji-top200] waiting_seconds=$next_delay reason=next_capture_day"
+    sleep "$next_delay"
+    continue
+  fi
+
+  if ! wait_for_taifex_priority; then
+    write_capture_state "$trade_date" "skipped" "taifex_priority_window_expired"
     next_delay="$(seconds_until_next_capture_day)"
     echo "[shioaji-top200] waiting_seconds=$next_delay reason=next_capture_day"
     sleep "$next_delay"

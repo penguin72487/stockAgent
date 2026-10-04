@@ -52,6 +52,7 @@ from stockagent.data.tw_day_trade_execution import (
     DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
     DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION,
 )
+from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.models.factory import _feature_indices_from_patterns
@@ -1773,6 +1774,10 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             ),
             "corporate_action_mode": str(trading.tw_corporate_action_mode),
         }
+        if trading.tw_day_trade_subscription_right_policy != "reference_value_cash":
+            contract["taiwan_execution"]["subscription_right_policy"] = (
+                trading.tw_day_trade_subscription_right_policy
+            )
         if trading.tw_day_trade_entry_remainder_policy != "first_minute_only":
             contract["taiwan_execution"]["entry_remainder_policy"] = (
                 trading.tw_day_trade_entry_remainder_policy
@@ -1805,6 +1810,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             # semantics because their optimizer trajectories do change.
             contract["taiwan_execution"]["benchmark_alignment"] = (
                 "prior_adjusted_close_to_execution_close_v1"
+            )
+        if (
+            execution_mode == "tw_day_trade"
+            and config.data.day_trade_minute_execution_root is not None
+        ):
+            contract["taiwan_execution"]["regular_market_admission"] = (
+                regular_market_admission_contract()
             )
         if (
             execution_mode == "tw_day_trade"
@@ -3428,6 +3440,23 @@ def _subset_panel_symbols(
     )
     present = indices >= 0
     shape_2d = (panel.num_dates, len(symbols))
+    carry_source = panel.day_trade_carry_source
+    if carry_source is not None:
+        if tuple(carry_source.universe) != tuple(panel.symbols):
+            raise ValueError("physical source universe differs from the panel before projection")
+        calendar = np.asarray(panel.dates, dtype="datetime64[D]").astype(np.int64) + 719163
+        if not np.array_equal(np.asarray(carry_source.session_days), calendar):
+            raise ValueError("physical source calendar differs from the panel before projection")
+        carry_source = carry_source.project_universe(tuple(str(symbol) for symbol in symbols))
+
+    def aligned_execution_tape(values: np.ndarray | None) -> np.ndarray | None:
+        if values is None:
+            return None
+        if values.ndim not in {3, 4} or values.shape[:2] != panel.features.shape[:2]:
+            raise ValueError("minute execution tape differs from the panel universe")
+        out = np.zeros((*shape_2d, *values.shape[2:]), dtype=values.dtype)
+        out[:, present] = values[:, indices[present]]
+        return out
 
     def aligned_3d(values: np.ndarray, fill: int | float | bool) -> np.ndarray:
         out = np.full((*shape_2d, values.shape[2]), fill, dtype=values.dtype)
@@ -3490,6 +3519,8 @@ def _subset_panel_symbols(
         ),
         short_capacity_shares=aligned_2d(panel.short_capacity_shares, 0),
         short_margin_rate=aligned_2d(panel.short_margin_rate, np.nan),
+        day_trade_minute_execution=aligned_execution_tape(panel.day_trade_minute_execution),
+        day_trade_carry_source=carry_source,
         content_fingerprints=None,
         index_futures_day_session=panel.index_futures_day_session,
         index_futures_reference_product=panel.index_futures_reference_product,

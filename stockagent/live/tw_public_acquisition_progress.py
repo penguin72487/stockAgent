@@ -9,8 +9,11 @@ import io
 import json
 import csv
 import os
+import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
+from uuid import uuid4
 
 
 ADDED_DATASETS = (
@@ -69,6 +72,111 @@ def _background_catalog_progress(
     }
 
 
+@lru_cache(maxsize=8)
+def _verified_inventory_membership(
+    inventory_path: str,
+    expected_sha256: str,
+    file_identity: tuple[int, int, int, int, int],
+    verification_hour: int,
+) -> tuple[frozenset[str], tuple[tuple[str, int], ...]]:
+    """Hash and parse an immutable inventory once per identity and hour.
+
+    The caller checks the current head, manifest, path and file identity on
+    every snapshot.  Hourly rehash also bounds undetected in-place corruption
+    whose metadata was somehow preserved.
+    """
+
+    del file_identity, verification_hour
+    compressed = Path(inventory_path).read_bytes()
+    if hashlib.sha256(compressed).hexdigest() != expected_sha256:
+        raise ValueError("cold inventory SHA-256 mismatch")
+    wanted = {
+        path
+        for name, _ in ADDED_DATASETS
+        for path in (f"{name}.parquet", f"metadata/{name}.json")
+    }
+    found: set[str] = set()
+    catalog_raw_files = {"gcis_open_data_catalog": 0, "fsc_open_data_catalog": 0}
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as rows:
+        for row in rows:
+            item = json.loads(row)
+            path = item.get("path")
+            if item.get("kind") != "file" or not isinstance(path, str):
+                continue
+            if path in wanted:
+                found.add(path)
+            for name in catalog_raw_files:
+                if path.startswith(f"raw/{name}/"):
+                    catalog_raw_files[name] += 1
+    return frozenset(found), tuple(sorted(catalog_raw_files.items()))
+
+
+def _cached_inventory_membership(
+    inventory_path: Path,
+    expected_sha256: str,
+    file_identity: tuple[int, int, int, int, int],
+    verification_hour: int,
+) -> tuple[frozenset[str], tuple[tuple[str, int], ...]]:
+    """Persist the small proof summary for the short-lived snapshot process.
+
+    Only the dedicated snapshot service opts in to disk caching.  A changed
+    head hash, file identity, or hour misses immediately and rehashes the
+    immutable inventory before another verified status can be reported.
+    """
+
+    cache_name = os.environ.get("STOCKAGENT_COLD_INVENTORY_CACHE_PATH")
+    cache_path = Path(cache_name) if cache_name else None
+    key = {
+        "schema_version": 1,
+        "inventory_path": str(inventory_path),
+        "sha256": expected_sha256,
+        "file_identity": list(file_identity),
+        "verification_hour": verification_hour,
+    }
+    if cache_path is not None:
+        cached = _object(cache_path)
+        if all(cached.get(field) == value for field, value in key.items()):
+            found = cached.get("found")
+            counts = cached.get("raw_file_counts")
+            allowed = {
+                path
+                for name, _ in ADDED_DATASETS
+                for path in (f"{name}.parquet", f"metadata/{name}.json")
+            }
+            expected_names = {"gcis_open_data_catalog", "fsc_open_data_catalog"}
+            if (
+                isinstance(found, list)
+                and all(isinstance(path, str) and path in allowed for path in found)
+                and isinstance(counts, dict)
+                and set(counts) == expected_names
+                and all(type(value) is int and value >= 0 for value in counts.values())
+            ):
+                return frozenset(found), tuple(sorted(counts.items()))
+    result = _verified_inventory_membership(
+        str(inventory_path), expected_sha256, file_identity, verification_hour
+    )
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache_path.with_name(f".{cache_path.name}.{uuid4().hex}.tmp")
+            try:
+                temporary.write_text(
+                    json.dumps({
+                        **key,
+                        "found": sorted(result[0]),
+                        "raw_file_counts": dict(result[1]),
+                    }, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, cache_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except OSError:
+            # A cache write failure does not weaken inventory verification.
+            pass
+    return result
+
+
 def _latest_cold_inventory(cold_root: Path) -> dict[str, Any]:
     """Verify the head, manifest and inventory before claiming file membership.
 
@@ -95,27 +203,21 @@ def _latest_cold_inventory(cold_root: Path) -> dict[str, Any]:
         expected_inventory_sha = inventory["sha256"]
         inventory_path = (cold_root / inventory_rel).resolve(strict=True)
         inventory_path.relative_to(cold_root.resolve(strict=True))
-        if inventory_path.stat().st_size > 64 * 1024 * 1024:
+        inventory_stat = inventory_path.stat()
+        if inventory_stat.st_size > 64 * 1024 * 1024:
             return {"state": "unverified"}
-        compressed = inventory_path.read_bytes()
-        if hashlib.sha256(compressed).hexdigest() != expected_inventory_sha:
-            return {"state": "unverified"}
-        wanted = {
-            path
-            for name, _ in ADDED_DATASETS
-            for path in (f"{name}.parquet", f"metadata/{name}.json")
-        }
-        found: set[str] = set()
-        catalog_raw_files = {"gcis_open_data_catalog": 0, "fsc_open_data_catalog": 0}
-        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as rows:
-            for row in rows:
-                item = json.loads(row)
-                if item.get("kind") == "file" and item.get("path") in wanted:
-                    found.add(item["path"])
-                if item.get("kind") == "file" and isinstance(item.get("path"), str):
-                    for name in catalog_raw_files:
-                        if item["path"].startswith(f"raw/{name}/"):
-                            catalog_raw_files[name] += 1
+        found, raw_file_counts = _cached_inventory_membership(
+            inventory_path,
+            expected_inventory_sha,
+            (
+                inventory_stat.st_dev,
+                inventory_stat.st_ino,
+                inventory_stat.st_size,
+                inventory_stat.st_mtime_ns,
+                inventory_stat.st_ctime_ns,
+            ),
+            int(time.time() // 3600),
+        )
         metadata = manifest.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
         return {
@@ -129,7 +231,7 @@ def _latest_cold_inventory(cold_root: Path) -> dict[str, Any]:
                 name for name, _ in ADDED_DATASETS
                 if f"{name}.parquet" in found and f"metadata/{name}.json" in found
             ],
-            "background_catalog_raw_files": catalog_raw_files,
+            "background_catalog_raw_files": dict(raw_file_counts),
         }
     except (OSError, ValueError, TypeError, KeyError, gzip.BadGzipFile, EOFError):
         return {"state": "unverified"}

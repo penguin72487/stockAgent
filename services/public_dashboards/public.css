@@ -75,6 +75,8 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .dashboard-card::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--cyan); opacity: .75; }
 .dashboard-card.tw::after { background: var(--green); }
 .dashboard-card.shioaji::after { background: var(--amber); }
+.dashboard-card.finlab::after { background: #71d9a1; }
+.dashboard-card.finmind::after { background: #48cbbb; }
 .dashboard-card.openbb::after { background: #ae8bff; }
 .dashboard-card.data::after { background: #ff8fc8; }
 .dashboard-card.traffic::after { background: #48d7ff; }

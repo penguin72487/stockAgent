@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argparse import Namespace
 from datetime import date
 import hashlib
 import json
@@ -7,6 +8,7 @@ import json
 import polars as pl
 import pytest
 
+from downloader import download_tw_corporate_action_entitlements as entitlement_downloader
 from downloader.download_tw_corporate_action_entitlements import (
     BulkDividendKey,
     DetailKey,
@@ -28,6 +30,67 @@ from downloader.download_tw_corporate_action_entitlements import (
     _collapse_etf_event_rows,
     _recover_retained_bulk_rows,
 )
+
+
+def test_stock_delivery_progress_reports_elapsed_rate_and_eta(capsys) -> None:
+    entitlement_downloader._print_stock_delivery_progress(
+        "listings", 100, 200, 2, 10.0
+    )
+    assert capsys.readouterr().out == (
+        "[corporate-action] stock delivery listings 100/200 "
+        "failures=2 elapsed=10.0s rate=10.00/s eta=10.0s\n"
+    )
+
+
+def test_stock_delivery_progress_handles_zero_elapsed(capsys) -> None:
+    entitlement_downloader._print_stock_delivery_progress(
+        "details", 0, 0, 0, 0.0
+    )
+    assert "rate=0.00/s eta=unknown" in capsys.readouterr().out
+
+
+def test_stock_delivery_stage_timing_keeps_exact_event(monkeypatch, tmp_path) -> None:
+    detail_key = StockDeliveryDetailKey(
+        market="twse",
+        symbol="2330",
+        roc_year=115,
+        announcement_date=date(2026, 9, 1),
+        sequence=1,
+        subject="股票發放公告",
+    )
+    monkeypatch.setattr(
+        entitlement_downloader,
+        "_fetch_stock_delivery_listing_with_market_fallback",
+        lambda _root, _key, _args: [detail_key],
+    )
+    monkeypatch.setattr(
+        entitlement_downloader,
+        "_fetch_stock_delivery_detail",
+        lambda _root, _key, _args: {
+            "key": detail_key,
+            "record_date": date(2026, 9, 2),
+            "stock_ratio": 0.1,
+            "issue_shares": 1000,
+            "delivery_date": date(2026, 9, 20),
+        },
+    )
+    rows, failures, counts, limited = (
+        entitlement_downloader._attach_exact_stock_delivery_dates(
+            [{
+                "market": "twse", "symbol": "2330", "date": date(2026, 9, 10),
+                "record_date": date(2026, 9, 2), "stock_dividend_ratio": 0.1,
+                "stock_terms_complete": True, "subscription_ratio": 0.0,
+            }],
+            raw_root=tmp_path,
+            args=Namespace(max_list_requests=0, max_detail_requests=0),
+            workers=1,
+        )
+    )
+    assert not failures and not limited
+    assert rows[0]["stock_delivery_date"] == date(2026, 9, 20)
+    assert counts["resolved_stock_delivery_events"] == 1
+    assert counts["stock_delivery_listing_elapsed_seconds"] >= 0
+    assert counts["stock_delivery_detail_elapsed_seconds"] >= 0
 
 
 def test_tpex_etf_exact_distribution_not_price_adjustment():
@@ -194,7 +257,14 @@ def test_listing_workload_adds_prior_year_only_for_first_quarter() -> None:
     ]
 
 
-def test_parse_mops_bulk_dividend_extracts_exact_cash_terms() -> None:
+def test_parse_mops_bulk_dividend_extracts_exact_cash_terms(monkeypatch) -> None:
+    original_soup = entitlement_downloader.BeautifulSoup
+
+    def assert_decoded_markup(markup, *args, **kwargs):
+        assert isinstance(markup, str)
+        return original_soup(markup, *args, **kwargs)
+
+    monkeypatch.setattr(entitlement_downloader, "BeautifulSoup", assert_decoded_markup)
     cells = [
         "2330",
         "台積電",
@@ -237,6 +307,13 @@ def test_parse_mops_bulk_dividend_extracts_exact_cash_terms() -> None:
     assert row["stock_dividend_ratio"] == 0.0
     assert row["subscription_ratio"] == 0.0
     assert row["stop_transfer_start"] is None
+
+
+def test_parse_mops_bulk_dividend_rejects_invalid_utf8() -> None:
+    with pytest.raises(UnicodeDecodeError):
+        parse_mops_bulk_dividends(
+            b"\xff", key=BulkDividendKey(market="tpex", roc_year=115)
+        )
 
 
 def test_mops_stock_dividend_uses_official_par_not_value_as_ratio() -> None:

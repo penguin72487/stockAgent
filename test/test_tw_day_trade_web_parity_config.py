@@ -44,9 +44,20 @@ def test_new_entry_policy_is_fingerprinted_without_changing_legacy_contract():
     assert new_contract == old_contract
 
 
+def test_unlimited_close_keeps_minute_sweep_and_new_checkpoint_contract():
+    config = load_config(ROOT / 'configs/deployments/tw_day_trade_v8_web_close_unlimited_v8.yaml')
+    assert config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
+    assert config.trading.tw_day_trade_entry_remainder_policy == 'frozen_target_until_1320'
+    assert config.trading.max_volume_participation == .5
+    assert config.trading.tw_day_trade_subscription_right_policy == 'reject_held'
+    assert not config.training.day_trade_sparse_events
+    assert not config.training.day_trade_training_annual_episodes
+    assert _trading_checkpoint_contract(config)['taiwan_execution']['subscription_right_policy'] == 'reject_held'
+    assert _trading_checkpoint_contract(config) != _trading_checkpoint_contract(load_config(TRAIN))
+
+
 @pytest.mark.parametrize('override', [
     {'trading': {'max_volume_participation': .25}},
-    {'trading': {'tw_day_trade_terminal_liquidation_unlimited_capacity': True}},
     {'trading': {'tw_day_trade_unlimited_margin_conversion': False}},
     {'training': {'day_trade_sparse_events': True}},
     {'training': {'day_trade_training_annual_episodes': True}},

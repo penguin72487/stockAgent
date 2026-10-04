@@ -274,7 +274,7 @@ function updatePipelineDynamics(pipelines) {
 }
 
 function backfillLabel(state) {
-  return ({downloading: "下載中", waiting_quota: "等待流量重置", waiting_market: "讓即時行情優先", complete: "全部完成", stopped: "服務停止"})[state] || "狀態未知";
+  return ({downloading: "下載中", waiting_quota: "等待流量重置", waiting_market: "讓即時行情優先", waiting_capacity: "連線保留即時行情", waiting_scheduled: "等待下次排程", complete: "全部完成", complete_with_unavailable: "可查來源已完成", scheduled: "等待排程", failed: "執行失敗", stopped: "服務停止"})[state] || "狀態未知";
 }
 
 function captureLabel(state) {
@@ -576,6 +576,14 @@ function renderAlert(data) {
     alert.hidden = false;
     setText("alert-title", "歷史下載已在安全閘門前暫停");
     setText("alert-copy", `帳面仍有 ${bytes(data.traffic?.remaining_bytes)}，但安全可用只剩 ${bytes(data.traffic?.safe_remaining_bytes)}；即時行情擷取不受影響。`);
+  } else if (data.capture?.state === "capturing" && data.capture?.strategy_bootstrap_ready === false) {
+    alert.hidden = false;
+    setText("alert-title", "期權行情擷取中，策略啟動遭安全閘門阻擋");
+    setText("alert-copy", "請稽核期權模擬帳本與未平避險腿；行情擷取成功不代表策略可執行。歷史下載依連線額度等待。");
+  } else if (state === "waiting_capacity") {
+    alert.hidden = false;
+    setText("alert-title", "歷史下載等待 Shioaji 連線額度");
+    setText("alert-copy", "目前先保留即時行情與股票報價連線；歷史服務會於下一安全窗口重試。");
   } else if (data.health === "degraded") {
     alert.hidden = false;
     setText("alert-title", "部分資料服務沒有運行");
@@ -667,6 +675,7 @@ function render(data) {
   setText("capture-session", `${capture.session === "night" ? "夜盤" : capture.session === "day" ? "日盤" : "—"} · ${capture.trade_date || "—"}`);
   setText("capture-workers", number(capture.workers));
   setText("capture-subscriptions", `${number(capture.contracts)} 合約 · ${number(capture.subscriptions)} 訂閱`);
+  setText("capture-strategy", capture.strategy_bootstrap_ready === false ? "已阻擋（僅擷取行情）" : capture.strategy_bootstrap_ready === true ? "已啟用" : "未驗證");
   setText("capture-stop", capture.scheduled_stop_at_local ? localTime(capture.scheduled_stop_at_local, {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}) : "—");
   $("capture-dot").className = capture.state === "capturing" ? "pulse active" : "pulse";
   lastHeavyRevision = heavyRevision;

@@ -28,6 +28,7 @@ try:
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from downloader.artifact_io import atomic_write_parquet
+from downloader.stock_volume_units import with_stock_share_volume
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -402,6 +403,9 @@ def normalize_kbars(
                 "Volume": pl.Float64,
                 "Amount": pl.Float64,
                 "contract_unit": pl.Float64,
+                "source_volume_multiplier": pl.Float64,
+                "volume_shares": pl.Float64,
+                "volume_unit_proof": pl.String,
             }
         )
     frame = (
@@ -447,6 +451,12 @@ def normalize_kbars(
         raise ValueError(
             f"Shioaji returned {duplicate} duplicate timestamps for {symbol}"
         )
+    # The broker's stock Volume is provider-native, not a share count.  Some
+    # historical rows are in board lots while others are already in shares.
+    # Establish the factor from the independently supplied trade notional and
+    # OHLC range.  Unknown rows retain the raw value but have no usable share
+    # volume; never silently give a model/executor 1,000x the liquidity.
+    frame = with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE)
     return frame.sort("ts")
 
 
@@ -469,49 +479,10 @@ def aggregate_daily(frame: pl.DataFrame, *, name: str) -> pl.DataFrame:
                 "data_source": pl.String,
             }
         )
-    positive_volume = (pl.col("Volume") > 0.0) & (pl.col("Amount") > 0.0)
-
-    def volume_multiplier_matches(multiplier: pl.Expr | float) -> pl.Expr:
-        candidate = (
-            multiplier if isinstance(multiplier, pl.Expr) else pl.lit(multiplier)
-        )
-        notional = pl.col("Volume") * candidate
-        return (
-            positive_volume
-            & (
-                pl.col("Amount")
-                >= notional * pl.col("Low") * (1.0 - VOLUME_NOTIONAL_TOLERANCE)
-            )
-            & (
-                pl.col("Amount")
-                <= notional * pl.col("High") * (1.0 + VOLUME_NOTIONAL_TOLERANCE)
-            )
-        )
-
-    multiplier_candidates: tuple[pl.Expr | float, ...] = (
-        pl.col("contract_unit"),
-        1_000.0,
-        100.0,
-        10.0,
-        1.0,
-    )
-    source_volume_multiplier = pl.coalesce(
-        *[
-            pl.when(volume_multiplier_matches(candidate))
-            .then(candidate)
-            .otherwise(None)
-            for candidate in multiplier_candidates
-        ]
-    )
-    normalized = frame.with_columns(
-        pl.when((pl.col("Volume") == 0.0) & (pl.col("Amount") == 0.0))
-        .then(pl.col("contract_unit"))
-        .otherwise(source_volume_multiplier)
-        .cast(pl.Float64)
-        .alias("source_volume_multiplier")
-    )
+    normalized = with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE)
     unknown_volume_units = normalized.filter(
-        positive_volume & pl.col("source_volume_multiplier").is_null()
+        pl.col("source_volume_multiplier").is_null()
+        | pl.col("volume_shares").is_null()
     ).height
     if unknown_volume_units:
         raise ValueError(
@@ -526,9 +497,7 @@ def aggregate_daily(frame: pl.DataFrame, *, name: str) -> pl.DataFrame:
             pl.col("High").max().alias("max"),
             pl.col("Low").min().alias("min"),
             pl.col("Close").last().alias("close"),
-            (pl.col("Volume") * pl.col("source_volume_multiplier"))
-            .sum()
-            .alias("Trading_Volume"),
+            pl.col("volume_shares").sum().alias("Trading_Volume"),
             pl.col("Amount").sum().alias("Trading_Value"),
             (
                 pl.col("Volume")
@@ -750,8 +719,11 @@ def _cached_minute_chunk(
             ):
                 return None
             frames.append(
-                pl.read_parquet(data_path).filter(
-                    (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
+                with_stock_share_volume(
+                    pl.read_parquet(data_path).filter(
+                        (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
+                    ),
+                    tolerance=VOLUME_NOTIONAL_TOLERANCE,
                 )
             )
         except (OSError, pl.exceptions.PolarsError):
@@ -975,7 +947,7 @@ def _verified_minute_symbol_frame(
             & (pl.col("date") <= pl.lit(requested_end))
         )
         if frame.height:
-            frames.append(frame)
+            frames.append(with_stock_share_volume(frame, tolerance=VOLUME_NOTIONAL_TOLERANCE))
     ranges.sort()
     if not ranges or ranges[0][0] > requested_start or ranges[-1][1] < requested_end:
         raise RuntimeError(
@@ -1011,6 +983,141 @@ def _verified_minute_symbol_frame(
     return minute, manifest_receipt, source_gap_dates, verified_chunks
 
 
+def _local_minute_chunk_signatures(
+    manifest: dict[str, Any], *, start: date, end: date
+) -> list[dict[str, Any]]:
+    """Persist the source identity needed to reuse already verified daily rows."""
+
+    signatures = []
+    for entry in manifest.get("chunks", []):
+        entry_start = date.fromisoformat(str(entry["start_date"]))
+        entry_end = date.fromisoformat(str(entry["end_date"]))
+        if entry_end < start or entry_start > end:
+            continue
+        signatures.append(
+            {
+                "start_date": entry_start.isoformat(),
+                "end_date": entry_end.isoformat(),
+                "status": str(entry.get("status") or ""),
+                "data_path": str(entry.get("data_path") or ""),
+                "data_sha256": str(entry.get("data_sha256") or ""),
+                "rows": int(entry.get("rows", 0)),
+                "source_gap_dates": list(entry.get("source_gap_dates") or []),
+            }
+        )
+    return signatures
+
+
+def _incremental_local_daily_plan(
+    output_dir: Path,
+    row: UniverseRow,
+    *,
+    requested_start: date,
+    requested_end: date,
+    minute_manifest: dict[str, Any],
+) -> tuple[date, pl.DataFrame, int, int] | None:
+    """Reuse a checksum-verified daily prefix when only a source suffix changed.
+
+    Old receipts without per-chunk provenance take the original full-verification
+    path. A changed historical chunk is the start of the rebuilt suffix, never
+    silently retained from the old daily file.
+    """
+
+    daily_path = output_dir / "daily" / f"{row.symbol}.parquet"
+    summary = _read_json(daily_path.with_suffix(".summary.json"))
+    if not summary or summary.get("materialization_mode") != "verified_local_minute":
+        return None
+    try:
+        manifest_start = date.fromisoformat(str(minute_manifest["requested_start"]))
+        manifest_end = date.fromisoformat(str(minute_manifest["requested_end"]))
+        old_start = date.fromisoformat(str(summary["requested_start"]))
+        old_end = date.fromisoformat(str(summary["requested_end"]))
+        old_chunks = summary["minute_source_chunks"]
+        old_source_rows = int(summary["source_minute_rows"])
+        old_daily_rows = int(summary["daily_rows"])
+        old_output = summary["output_receipt"]
+        previous_gaps = [
+            date.fromisoformat(str(value))
+            for value in summary["declared_source_gap_dates"]
+        ]
+        new_gaps = [
+            date.fromisoformat(str(value))
+            for value in minute_manifest.get("source_gap_dates", [])
+        ]
+    except (KeyError, ValueError, TypeError):
+        return None
+    if not (
+        minute_manifest.get("source") == SOURCE_NAME
+        and minute_manifest.get("storage_frequency") == MINUTE_STORAGE_FREQUENCY
+        and minute_manifest.get("symbol") == row.symbol
+        and manifest_start <= requested_start
+        and manifest_end >= requested_end
+        and summary.get("source") == SOURCE_NAME
+        and summary.get("storage_frequency") == STORAGE_FREQUENCY
+        and summary.get("symbol") == row.symbol
+        and old_start == requested_start
+        and old_end < requested_end
+        and isinstance(old_chunks, list)
+        and old_chunks
+        and int(summary.get("source_minute_chunks_verified", -1)) == len(old_chunks)
+        and isinstance(old_output, dict)
+        and old_output.get("path") == str(daily_path)
+        and daily_path.is_file()
+        and int(old_output.get("size", -1)) == daily_path.stat().st_size
+        and old_output.get("sha256") == _sha256(daily_path)
+    ):
+        return None
+    new_chunks = _local_minute_chunk_signatures(
+        minute_manifest, start=requested_start, end=requested_end
+    )
+    first_changed = next(
+        (
+            index
+            for index, (old, new) in enumerate(
+                zip(old_chunks, new_chunks, strict=False)
+            )
+            if old != new
+        ),
+        min(len(old_chunks), len(new_chunks)),
+    )
+    if first_changed >= len(new_chunks):
+        return None
+    try:
+        rebuild_start = date.fromisoformat(new_chunks[first_changed]["start_date"])
+        if first_changed < len(old_chunks):
+            old_changed_start = date.fromisoformat(
+                old_chunks[first_changed]["start_date"]
+            )
+            if old_changed_start != rebuild_start:
+                return None
+        if rebuild_start <= requested_start:
+            return None
+        # The unchanged prefix must have the same gap classification as before.
+        if {gap for gap in previous_gaps if gap < rebuild_start} != {
+            gap for gap in new_gaps if gap < rebuild_start
+        }:
+            return None
+        removed_rows = sum(int(entry["rows"]) for entry in old_chunks[first_changed:])
+        if removed_rows > old_source_rows:
+            return None
+        old_daily = pl.read_parquet(daily_path)
+        if old_daily.height != old_daily_rows or old_daily.is_empty():
+            return None
+        if (
+            old_daily.get_column("name").n_unique() != 1
+            or old_daily.get_column("name").item(0) != row.name
+            or old_daily.get_column("market").n_unique() != 1
+            or old_daily.get_column("market").item(0) != row.market
+        ):
+            return None
+        prefix = old_daily.filter(pl.col("date") < pl.lit(rebuild_start))
+        if prefix.is_empty() or prefix.get_column("date").max() >= rebuild_start:
+            return None
+    except (KeyError, ValueError, TypeError, OSError, pl.exceptions.PolarsError):
+        return None
+    return rebuild_start, prefix, old_source_rows - removed_rows, first_changed
+
+
 def _materialize_local_daily_symbol(
     output_dir: Path,
     row: UniverseRow,
@@ -1022,8 +1129,21 @@ def _materialize_local_daily_symbol(
     minute_manifest_receipt: dict[str, Any],
     source_gap_dates: list[str],
     verified_source_chunks: int,
+    minute_source_chunks: list[dict[str, Any]],
+    prefix_daily: pl.DataFrame | None = None,
+    prefix_source_minute_rows: int = 0,
+    reused_source_chunks: int = 0,
 ) -> SymbolResult:
-    daily = aggregate_daily(minute, name=row.name)
+    tail_daily = aggregate_daily(minute, name=row.name)
+    daily = (
+        pl.concat([prefix_daily, tail_daily], how="vertical_relaxed").sort("date")
+        if prefix_daily is not None and not tail_daily.is_empty()
+        else prefix_daily
+        if prefix_daily is not None
+        else tail_daily
+    )
+    if daily.height and daily.get_column("date").n_unique() != daily.height:
+        raise RuntimeError(f"duplicate Shioaji daily dates: {row.symbol}")
     daily_path = output_dir / "daily" / f"{row.symbol}.parquet"
     output_receipt = _write_parquet_atomic(daily, daily_path)
     _atomic_write_json(
@@ -1037,8 +1157,11 @@ def _materialize_local_daily_symbol(
             "requested_start": requested_start.isoformat(),
             "requested_end": requested_end.isoformat(),
             "chunks": len(chunks),
-            "source_minute_chunks_verified": verified_source_chunks,
-            "source_minute_rows": minute.height,
+            "source_minute_chunks_verified": verified_source_chunks
+            + reused_source_chunks,
+            "source_minute_chunks_reused": reused_source_chunks,
+            "minute_source_chunks": minute_source_chunks,
+            "source_minute_rows": prefix_source_minute_rows + minute.height,
             "daily_rows": daily.height,
             "first_date": str(daily["date"].min()) if daily.height else None,
             "last_date": str(daily["date"].max()) if daily.height else None,
@@ -1053,7 +1176,7 @@ def _materialize_local_daily_symbol(
         status="complete",
         chunks_total=len(chunks),
         chunks_complete=len(chunks),
-        source_minute_rows=minute.height,
+        source_minute_rows=prefix_source_minute_rows + minute.height,
         daily_rows=daily.height,
         first_date=str(daily["date"].min()) if daily.height else None,
         last_date=str(daily["date"].max()) if daily.height else None,
@@ -1079,6 +1202,10 @@ def _run_local_materialization(
     )
     results: list[SymbolResult] = []
     avoided_requests = 0
+    reused_source_chunks_total = 0
+    incremental_symbols = 0
+    full_rebuilt_symbols = 0
+    unchanged_symbols = 0
     progress_path = args.output_dir / "progress.json"
     started = time.monotonic()
     for symbol_index, row in enumerate(selected, start=1):
@@ -1166,43 +1293,81 @@ def _run_local_materialization(
         )
         if completed is not None:
             results.append(completed)
+            unchanged_symbols += 1
             continue
         try:
+            manifest = _read_json(manifest_path)
+            if manifest is None:
+                raise RuntimeError(f"missing minute manifest: {manifest_path}")
+            source_chunks = _local_minute_chunk_signatures(
+                manifest, start=symbol_start, end=end
+            )
+            incremental = _incremental_local_daily_plan(
+                args.output_dir,
+                row,
+                requested_start=symbol_start,
+                requested_end=end,
+                minute_manifest=manifest,
+            )
+            source_start = incremental[0] if incremental is not None else symbol_start
             minute, manifest_receipt, source_gaps, verified_chunks = (
                 _verified_minute_symbol_frame(
                     args.minute_cache_root,
                     row,
-                    requested_start=symbol_start,
+                    requested_start=source_start,
                     requested_end=end,
                 )
             )
-            results.append(
-                _materialize_local_daily_symbol(
-                    args.output_dir,
-                    row,
-                    requested_start=symbol_start,
-                    requested_end=end,
-                    chunks=chunks,
-                    minute=minute,
-                    minute_manifest_receipt=manifest_receipt,
-                    source_gap_dates=source_gaps,
-                    verified_source_chunks=verified_chunks,
+            if manifest_receipt["sha256"] != manifest_sha:
+                raise RuntimeError(
+                    f"minute manifest changed during materialization: {manifest_path}"
                 )
+            if incremental is not None:
+                source_gaps = sorted(
+                    str(value)
+                    for value in manifest.get("source_gap_dates", [])
+                    if symbol_start <= date.fromisoformat(str(value)) <= end
+                )
+            result = _materialize_local_daily_symbol(
+                args.output_dir,
+                row,
+                requested_start=symbol_start,
+                requested_end=end,
+                chunks=chunks,
+                minute=minute,
+                minute_manifest_receipt=manifest_receipt,
+                source_gap_dates=source_gaps,
+                verified_source_chunks=verified_chunks,
+                minute_source_chunks=source_chunks,
+                prefix_daily=incremental[1] if incremental is not None else None,
+                prefix_source_minute_rows=incremental[2]
+                if incremental is not None
+                else 0,
+                reused_source_chunks=incremental[3] if incremental is not None else 0,
             )
-            avoided_requests += verified_chunks
+            reused_chunks = incremental[3] if incremental is not None else 0
+            avoided_chunks = verified_chunks + reused_chunks
             record_avoided_query(
                 consumer="stock_daily_materializer",
                 method="kbars",
                 asset_class="stock",
                 reason="verified_minute_manifest_reuse",
-                count=verified_chunks,
-                rows=minute.height,
+                count=avoided_chunks,
+                rows=minute.height + (incremental[2] if incremental is not None else 0),
                 details={
                     "contract": row.symbol,
                     "start": symbol_start.isoformat(),
                     "end": end.isoformat(),
+                    "reused_verified_source_chunks": reused_chunks,
                 },
             )
+            results.append(result)
+            avoided_requests += avoided_chunks
+            if incremental is not None:
+                incremental_symbols += 1
+                reused_source_chunks_total += reused_chunks
+            else:
+                full_rebuilt_symbols += 1
         except Exception as exc:
             results.append(
                 SymbolResult(
@@ -1233,6 +1398,9 @@ def _run_local_materialization(
                     "current_symbol": row.symbol,
                     "api_requests_started": 0,
                     "avoided_api_requests": avoided_requests,
+                    "incremental_symbols": incremental_symbols,
+                    "full_rebuilt_symbols": full_rebuilt_symbols,
+                    "reused_source_chunks": reused_source_chunks_total,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                     "updated_at_utc": datetime.now(timezone.utc)
                     .replace(microsecond=0)
@@ -1257,6 +1425,13 @@ def _run_local_materialization(
         local_minute_summary_receipt=minute_summary_receipt,
         api_requests_started=0,
         avoided_api_requests=avoided_requests,
+        local_materialization_performance={
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "incremental_symbols": incremental_symbols,
+            "full_rebuilt_symbols": full_rebuilt_symbols,
+            "unchanged_symbols": unchanged_symbols,
+            "reused_source_chunks": reused_source_chunks_total,
+        },
     )
     failed = [item for item in results if item.status == "failed"]
     _atomic_write_json(
@@ -1273,6 +1448,9 @@ def _run_local_materialization(
             "current_symbol": results[-1].symbol if results else "",
             "api_requests_started": 0,
             "avoided_api_requests": avoided_requests,
+            "incremental_symbols": incremental_symbols,
+            "full_rebuilt_symbols": full_rebuilt_symbols,
+            "reused_source_chunks": reused_source_chunks_total,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "updated_at_utc": datetime.now(timezone.utc)
             .replace(microsecond=0)
@@ -1307,6 +1485,7 @@ def _write_summary(
     local_minute_summary_receipt: dict[str, Any] | None = None,
     api_requests_started: int | None = None,
     avoided_api_requests: int = 0,
+    local_materialization_performance: dict[str, Any] | None = None,
 ) -> None:
     report_path = output_dir / "download_report.csv"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1370,6 +1549,7 @@ def _write_summary(
             int(api_requests_started) if api_requests_started is not None else None
         ),
         "avoided_api_requests": int(avoided_api_requests),
+        "local_materialization_performance": local_materialization_performance,
         "source_minute_summary_receipt": local_minute_summary_receipt,
         "report_path": str(report_path),
         "written_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),

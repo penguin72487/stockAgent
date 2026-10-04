@@ -79,6 +79,7 @@ def audit_public_ipv6(
 
     deadline = time.monotonic() + timeout_seconds
     probes: list[dict[str, Any]] = []
+    timed_out = False
     while True:
         payload = read_json(probe_url, timeout_seconds=min(poll_seconds + 5.0, 30.0))
         if not isinstance(payload, list):
@@ -88,7 +89,8 @@ def audit_public_ipv6(
         if ipv6 is not None and bool(ipv6.get("done")):
             break
         if time.monotonic() >= deadline:
-            raise TimeoutError("Internet.nl IPv6 probe did not finish before the deadline")
+            timed_out = True
+            break
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
     ipv6 = next((item for item in probes if item.get("name") == "ipv6"), {})
@@ -98,9 +100,13 @@ def audit_public_ipv6(
         "hostname": hostname,
         "started_at_utc": started_at,
         "completed_at_utc": _utc_now(),
+        "state": (
+            "passed" if passed else "inconclusive_timeout" if timed_out else "failed"
+        ),
         "dns": {"aaaa": addresses, "has_aaaa": bool(addresses)},
         "external_probe": {
             "provider": "Internet.nl",
+            "probe_request_issued": bool(start_probe),
             "result_url": f"https://internet.nl/site/{hostname}/",
             "probe_url": probe_url,
             "ipv6": ipv6,
@@ -108,7 +114,8 @@ def audit_public_ipv6(
         "passed": passed,
         "evidence_boundary": (
             "Independent external probe plus public DNS; same-host WSL curl is not "
-            "used as WAN or router-hairpin evidence."
+            "used as WAN or router-hairpin evidence. A reused latest result does "
+            "not prove that a fresh probe ran during this audit."
         ),
     }
 

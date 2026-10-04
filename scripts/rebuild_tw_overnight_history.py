@@ -23,7 +23,11 @@ from scripts.rebuild_tw_day_trade_open_price_replay import (
 )
 from scripts.run_tw_overnight_simulation import _mode_specs
 from scripts.switch_tw_day_trade_strategy import _latest_completed_session
-from stockagent.config import load_config
+from stockagent.config import external_panel_data_kwargs, load_config
+from stockagent.data.panel import (
+    _resolve_corporate_action_reference_paths,
+    _resolve_external_data_path,
+)
 from stockagent.data.tw_overnight import (
     OVERNIGHT_CLOSE_FALLBACK_CAVEAT, overnight_minute_manifest,
     read_overnight_1325_partition,
@@ -89,6 +93,180 @@ def _positive(value: Any) -> float | None:
     return number if np.isfinite(number) and number > 0 else None
 
 
+def _source_signature(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _stable_source_hash(path: Path) -> str:
+    before = _source_signature(path)
+    digest = _sha256(path)
+    if _source_signature(path) != before:
+        raise RuntimeError(f'Source changed while fingerprinting history: {path}')
+    return digest
+
+
+def _model_source_paths(config_paths: list[str]) -> list[Path]:
+    """Pin the mutable files consumed by the selected live-tail panels."""
+
+    paths: set[Path] = set()
+    for config_path in config_paths:
+        paths.add(Path(config_path).resolve(strict=True))
+        config = load_config(config_path)
+        root = Path(config.data.parquet_root).resolve()
+        symbols = list(root.glob('*_features.parquet'))
+        if not symbols:
+            raise FileNotFoundError(f'No model symbol parquet under {root}')
+        paths.update(path.resolve() for path in symbols)
+        paths.update(path.resolve() for path in (root / '_hot_tail').glob('*_features.parquet'))
+        metadata = root / 'symbols.csv'
+        if metadata.is_file():
+            paths.add(metadata.resolve())
+        external_kwargs = external_panel_data_kwargs(config.data)
+        external = _resolve_external_data_path(
+            external_kwargs['external_feature_path'],
+            include_features=bool(external_kwargs['external_include_features']),
+            include_rules=bool(external_kwargs['external_include_rules']),
+            required=bool(external_kwargs['external_data_required']),
+        )
+        if external is None:
+            continue
+        paths.add(external.resolve())
+        feature_receipt = external.with_suffix('.summary.json')
+        if feature_receipt.is_file():
+            paths.add(feature_receipt.resolve())
+        actions = _resolve_corporate_action_reference_paths(
+            external, include_rules=bool(external_kwargs['external_include_rules']),
+        )
+        if actions is not None:
+            paths.update((actions.parquet.resolve(), actions.summary.resolve()))
+            if actions.entitlements_parquet is not None:
+                paths.update((
+                    actions.entitlements_parquet.resolve(),
+                    actions.entitlements_summary.resolve(),
+                ))
+    return sorted(paths)
+
+
+def _check_model_source_inventory(plan: dict[str, Any]) -> None:
+    if plan.get('model_config_paths'):
+        expected = set(plan.get('model_source_files') or {})
+        observed = {
+            str(path) for path in _model_source_paths(plan['model_config_paths'])
+        }
+        if observed != expected:
+            raise RuntimeError(
+                'Model source inventory changed while computing history: '
+                f'added={len(observed - expected)} removed={len(expected - observed)}'
+            )
+
+
+def _check_source_revision(
+    plan: dict[str, Any],
+    signatures: dict[str, tuple[int, int, int, int, int]] | None = None,
+) -> dict[str, tuple[int, int, int, int, int]]:
+    """Hash only at entry or when a source changes; the final audit rehashes all."""
+
+    _check_model_source_inventory(plan)
+    checked = dict(signatures or {})
+    for name, proof in {
+        **plan['source_files'],
+        **plan.get('price_limit_files', {}),
+        **plan.get('model_source_files', {}),
+    }.items():
+        path = Path(proof['path'])
+        observed = _source_signature(path)
+        if name not in checked or checked[name] != observed:
+            if _sha256(path) != proof['sha256'] or _source_signature(path) != observed:
+                raise RuntimeError(f'Source changed while computing history: {path}')
+            checked[name] = observed
+    return checked
+
+
+def _require_compatible_history_cache(
+    previous: dict[str, Any], current: dict[str, Any], output: Path,
+) -> None:
+    previous_sources = previous.get('source_files') or {}
+    revised = sorted(
+        key for key, proof in current['source_files'].items()
+        if (previous_sources.get(key) or {}).get('sha256') != proof['sha256']
+    )
+    previous_model = previous.get('model_source_files') or {}
+    current_model = current.get('model_source_files') or {}
+    model_revisions = sum(
+        (previous_model.get(key) or {}).get('sha256') != proof['sha256']
+        for key, proof in current_model.items()
+    )
+    if model_revisions or (previous_model and not current_model):
+        if not previous_model and current_model:
+            revised.append(f'model_inputs_unversioned({len(current_model)})')
+        else:
+            revised.append(f'model_inputs_changed({model_revisions or len(previous_model)})')
+    if revised and (
+        any((output / 'inputs').glob('*/source.json'))
+        or any((output / 'signals').glob('*/*/replay_signal.json'))
+    ):
+        raise RuntimeError(
+            'Historical source revision changed with cached inputs/signals; '
+            f'cannot reuse this cache namespace: {", ".join(revised)}'
+        )
+
+
+def _source_generation(plan: dict[str, Any]) -> str:
+    """Select a cache namespace from every pinned input, not a clock or mtime."""
+
+    identity = {
+        'history_lineage_fingerprint': plan['history_lineage']['fingerprint_sha256'],
+        'source_files': {
+            key: (proof['path'], proof['sha256'])
+            for key, proof in sorted(plan['source_files'].items())
+        },
+        'model_source_files': {
+            key: (proof['path'], proof['sha256'])
+            for key, proof in sorted(plan.get('model_source_files', {}).items())
+        },
+        'price_limit_files': {
+            key: (proof['path'], proof['sha256'])
+            for key, proof in sorted(plan.get('price_limit_files', {}).items())
+        },
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_current_daily_receipt(
+    prior: dict[str, Any], *, day: str, limits_path: Path,
+    minute_partition_sha256: str | None,
+) -> None:
+    if (prior.get('source_hashes') or {}).get('price_limits') != _sha256(limits_path):
+        raise RuntimeError(f'Cached historical price limits changed: {day}')
+    if prior.get('minute_partition_sha256') != minute_partition_sha256:
+        raise RuntimeError(f'Cached historical minute partition changed: {day}')
+
+
+def _blocked_replay_signal(
+    *, market: str, day: str, outcome: str, mode: dict[str, Any], signal_id: str,
+) -> dict[str, Any] | None:
+    """Carry an unfilled prior cohort without pretending a new signal filled."""
+    if outcome == 'registered':
+        return None
+    reason = mode.get('blocked_reason') or outcome
+    unresolved = [
+        f"{row.get('session_date')}:{row.get('symbol')}:{row.get('opening_exit_order_status')}"
+        for row in (mode.get('positions') or {}).values()
+        if int(row.get('signed_shares') or 0) != 0
+    ]
+    if (outcome == 'blocked' and mode.get('signal_id') == signal_id
+            and reason == 'prior_overnight_cohort_still_open' and unresolved):
+        return {
+            'market': market, 'session_date': day, 'signal_id': signal_id,
+            'reason': reason, 'unresolved_positions': unresolved,
+            'action': 'no_new_entry_carry_prior_positions_to_next_official_open',
+        }
+    detail = f"; unresolved={','.join(unresolved[:10])}" if unresolved else ''
+    raise ValueError(f'Historical signal rejected: {market}/{day}: {reason}{detail}')
+
+
 def _write_decision_csv(frame: pl.DataFrame, path: Path, day: str) -> None:
     frame.filter(pl.col('price').is_not_null()).with_columns(
         pl.when(pl.col('decision_source') == 'observed_1325')
@@ -151,7 +329,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         'minute_manifest': manifest_path,
         'calendar': args.public_root / 'twse_taiex_ohlc.parquet',
     }
-    source_hashes = {key: _sha256(path) for key, path in source_paths.items()}
+    source_hashes = {
+        key: manifest_sha if key == 'minute_manifest' else _sha256(path)
+        for key, path in source_paths.items()
+    }
     if source_hashes['calendar'] != calendar_sha:
         raise RuntimeError('Official calendar changed during preparation')
     markets = []
@@ -188,6 +369,18 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         'sessions': list(map(str, days)), 'markets': markets,
         'source_files': {key: {'path': str(path.resolve()), 'sha256': source_hashes[key]}
                          for key, path in source_paths.items()},
+        'price_limit_files': {
+            str(day): {
+                'path': str((args.price_limit_dir / f'{day}.parquet').resolve()),
+                'sha256': _stable_source_hash(args.price_limit_dir / f'{day}.parquet'),
+            }
+            for day in days
+        },
+        'model_config_paths': [str(Path(spec.config_path).resolve()) for spec in specs],
+        'model_source_files': {
+            str(path): {'path': str(path), 'sha256': _stable_source_hash(path)}
+            for path in _model_source_paths([spec.config_path for spec in specs])
+        },
         'simulation_only': True, 'production_order_possible': False,
         'missing_1325_policy': 'same_session_close', 'caveat': OVERNIGHT_CLOSE_FALLBACK_CAVEAT,
         'auction_contract': 'official_daily_open_close_counterfactual_no_exchange_timestamp_or_queue_proof',
@@ -195,6 +388,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         'model_scope': 'existing_four_day_trade_checkpoint_adapters_not_new_overnight_training',
     }
     plan['history_lineage'] = _history_lineage(plan['start_date'], markets)
+    if getattr(args, 'versioned_output', False):
+        generation = _source_generation(plan)
+        plan['source_generation_sha256'] = generation
+        args.output = args.output / 'source_generations' / generation
     args.output.mkdir(parents=True, exist_ok=True)
     old = args.output / 'plan.json'
     if old.is_file():
@@ -212,6 +409,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             ]
         ):
             raise ValueError('Existing history is not an immutable prefix of the requested plan')
+        _require_compatible_history_cache(previous, plan, args.output)
     atomic_write_json(old, plan)
     if args.stage == 'plan':
         return plan
@@ -226,6 +424,15 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 csv_path = destination / 'decision_prices.csv'
                 if _sha256(csv_path) != prior['decision_csv_sha256']:
                     raise RuntimeError(f'Historical decision input changed: {day}')
+                partition = args.minute_root / f'trade_date={day}' / 'data.parquet'
+                _require_current_daily_receipt(
+                    prior, day=day_text,
+                    limits_path=args.price_limit_dir / f'{day}.parquet',
+                    minute_partition_sha256=(
+                        parts.get(day_text, {}).get('output_sha256')
+                        if partition.is_file() else None
+                    ),
+                )
                 if 'timestamp_contract' not in prior:
                     _write_decision_csv(pl.read_parquet(prices_path), csv_path, day_text)
                     prior['decision_csv_sha256'] = _sha256(csv_path)
@@ -274,12 +481,12 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         atomic_write_json(receipt_path, receipt)
         if index == 1 or index % 20 == 0 or index == len(days):
             print(f'[inputs] {index}/{len(days)} {day}', flush=True)
-    if _sha256(manifest_path) != manifest_sha:
-        raise RuntimeError('Minute source manifest changed during preparation')
+    _check_source_revision(plan)
     return plan
 
 
 def infer_signals(args: argparse.Namespace, plan: dict[str, Any]) -> None:
+    source_signatures = _check_source_revision(plan)
     for item in plan['markets']:
         cfg = load_market_config(item['market_config'])
         config = load_config(cfg.config_path)
@@ -333,9 +540,11 @@ def infer_signals(args: argparse.Namespace, plan: dict[str, Any]) -> None:
             })
             if index == 1 or index % 10 == 0 or index == len(plan['sessions']):
                 print(f'[signals] {item["market"]} {index}/{len(plan["sessions"])} {day}', flush=True)
+        source_signatures = _check_source_revision(plan, source_signatures)
 
 
 def replay(args: argparse.Namespace, plan: dict[str, Any]) -> None:
+    source_signatures = _check_source_revision(plan)
     specs, _, errors = _mode_specs(args.markets_dir)
     if errors:
         raise ValueError(errors)
@@ -367,7 +576,10 @@ def replay(args: argparse.Namespace, plan: dict[str, Any]) -> None:
     ledger = args.output / 'ledgers' / datetime.now(TAIPEI).strftime('%Y%m%dT%H%M%S%f')
     engine = TwOvernightHistoricalReplayEngine(ledger)
     engine.update_readiness(specs, now=_at(plan['start_date'], 8, 30))
+    blocked_signals: list[dict[str, Any]] = []
     for index, day in enumerate(plan['sessions'], 1):
+        if index == 1 or index % 20 == 0:
+            source_signatures = _check_source_revision(plan, source_signatures)
         source = json.loads((args.output / 'inputs' / day / 'source.json').read_text())
         rows = pl.read_parquet(args.output / 'inputs' / day / 'prices.parquet').to_dicts()
         by_symbol = {row['symbol']: row for row in rows}
@@ -390,35 +602,37 @@ def replay(args: argparse.Namespace, plan: dict[str, Any]) -> None:
                 spec=spec, summary=summary, signal_rows=signal_rows,
                 quotes=quotes('price'), security_types=metadata[spec.market], now=_at(day, 13, 25),
             )
-            if outcome != 'registered':
-                mode = engine.state['modes'][spec.market]
-                reason = mode.get('blocked_reason') or outcome
-                unresolved = [
-                    f"{row.get('session_date')}:{row.get('symbol')}:{row.get('opening_exit_order_status')}"
-                    for row in (mode.get('positions') or {}).values()
-                    if int(row.get('signed_shares') or 0) != 0
-                ]
-                detail = f"; unresolved={','.join(unresolved[:10])}" if unresolved else ''
-                raise ValueError(
-                    f'Historical signal rejected: {spec.market}/{day}: {reason}{detail}'
-                )
+            blocked = _blocked_replay_signal(
+                market=spec.market, day=day, outcome=outcome,
+                mode=engine.state['modes'][spec.market],
+                signal_id=str(summary['signal_id']),
+            )
+            if blocked is not None:
+                blocked_signals.append(blocked)
         engine.process_quotes(quotes=quotes('close'), now=_at(day, 13, 30))
         # Expire unfilled close orders without inventing an execution price.
         engine.process_quotes(quotes=quotes('close'), now=_at(day, 13, 34), append_mark_history=False)
         if index == 1 or index % 20 == 0 or index == len(plan['sessions']):
             print(f'[replay] {index}/{len(plan["sessions"])} {day}', flush=True)
-    for proof in plan['source_files'].values():
+    for proof in (
+        *plan['source_files'].values(), *plan.get('model_source_files', {}).values(),
+    ):
         if _sha256(Path(proof['path'])) != proof['sha256']:
             raise RuntimeError(f'Source changed while computing history: {proof["path"]}')
+    _check_model_source_inventory(plan)
     for market in plan['markets']:
         if _sha256(Path(market['checkpoint'])) != market['checkpoint_sha256']:
             raise RuntimeError('Checkpoint changed during history calculation')
+        if _sha256(Path(market['market_config'])) != market['market_config_sha256']:
+            raise RuntimeError('Market config changed during history calculation')
     result = {
         'status': 'computed_counterfactual_history', 'start_date': plan['start_date'], 'end_date': plan['end_date'],
         'sessions': len(plan['sessions']), 'ledger': str(ledger.resolve()),
         'simulation_only': True, 'production_order_possible': False,
         'live_state_modified': False, 'new_overnight_training_model_used': False,
         'signal_validation': signal_validation,
+        'blocked_close_signals': blocked_signals,
+        'blocked_close_signal_count': len(blocked_signals),
         'observation_frequency': 'opening_and_closing_events',
         'markets': [{
             'market': spec.market, 'label': spec.label,
@@ -633,14 +847,16 @@ def audit_unresolved_exits(output: Path) -> None:
     result['accounting_validation']['delayed_exits'] = sum(row['sessions_held'] > 1 for row in trades)
     result['computation_complete'] = True
     result['dashboard_history_ready'] = True
-    result['fit_for_funded_performance_comparison'] = not unresolved and all(
+    result['fit_for_funded_performance_comparison'] = not unresolved and not result['blocked_close_signals'] and all(
         not item['funding_audit']['entry_fills_after_first_nonpositive_equity']
         for item in result['markets']
     )
     result['status'] = (
         'computed_counterfactual_history_ready_with_stale_unresolved_position'
-        if unresolved
-        else 'computed_counterfactual_history_ready'
+        if unresolved else
+        'computed_counterfactual_history_ready_with_blocked_signals'
+        if result['blocked_close_signals'] else
+        'computed_counterfactual_history_ready'
     )
     result['ledger_state_sha256'] = _sha256(ledger / 'state.json')
     result['ledger_relative_path'] = str(ledger.relative_to(output.resolve()))
@@ -667,6 +883,11 @@ def audit_unresolved_exits(output: Path) -> None:
                '[證交所 ETF 規則](https://www.twse.com.tw/downloads/zh/ETF/qanda01.pdf) 區分國內槓桿與海外標的；'
                '本次保留衝突作資料品質稽核；官方 OPEN/CLOSE 為歷史價格權威，輔助重建範圍不再延遲反事實退出。\n\n'
                '[價格衝突明細](price_limit_conflicts.csv) · [逐筆成交損益核對](trade_reconciliation.csv)\n')
+    if result['blocked_close_signals']:
+        report += ('\n## 前批持倉未平造成的訊號阻擋\n\n'
+                   f'共 {len(result["blocked_close_signals"])} 個模式／交易日的後續訊號未建立新部位；'
+                   '原持倉等待下一個有官方開盤價的交易日，沒有補造開盤撮合。'
+                   '逐筆原因與標的保留在 result.json 的 blocked_close_signals。\n')
     if unresolved:
         report += '\n## 未解決的退出與估值限制\n\n'
         report += '以下較早持倉未能在後續開盤退出；它們會阻擋該策略的新一批進場。來源缺價時，期末權益包含明示的舊估值，不能視為當日可變現金額。\n\n'
@@ -693,10 +914,21 @@ def main() -> None:
     parser.add_argument('--minute-root', type=Path, default=Path('data_tw_minute/research_dataset'))
     parser.add_argument('--price-limit-dir', type=Path, default=Path('artifacts/live/tw_price_limits'))
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--versioned-output', action='store_true',
+                        help='Place resumable work in a source-fingerprint cache namespace')
+    parser.add_argument('--resolved-output-receipt', type=Path,
+                        help='Write the selected output directory for a calling maintainer')
     parser.add_argument('--market', action='append')
     parser.add_argument('--stage', choices=('plan', 'inputs', 'signals', 'replay', 'report', 'all'), default='all')
     args = parser.parse_args()
     plan = prepare(args)
+    if args.resolved_output_receipt:
+        atomic_write_json(args.resolved_output_receipt, {
+            'output': str(args.output.resolve()),
+            'source_generation_sha256': plan.get('source_generation_sha256'),
+            'history_lineage_fingerprint': plan['history_lineage']['fingerprint_sha256'],
+            'end_date': plan['end_date'],
+        })
     if args.stage in ('signals', 'all'):
         infer_signals(args, plan)
     if args.stage in ('replay', 'all'):

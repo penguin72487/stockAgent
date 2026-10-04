@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+import time
 from urllib.parse import parse_qs, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +104,8 @@ class DashboardServer(ThreadingHTTPServer):
         )
         self.session_indexes_ready = threading.Event()
         self.session_index_warm_error: str | None = None
+        self.session_index_warm_started = time.perf_counter()
+        self.session_index_warm_elapsed_ms: float | None = None
         self.session_index_warm_thread = threading.Thread(
             target=self._warm_session_indexes,
             name="dashboard-session-index-warm",
@@ -115,7 +118,13 @@ class DashboardServer(ThreadingHTTPServer):
             warm_dashboard_session_indexes(state_dir=self.state_dir)
         except Exception as exc:
             self.session_index_warm_error = f"{type(exc).__name__}: {exc}"
+            self.session_index_warm_elapsed_ms = (
+                time.perf_counter() - self.session_index_warm_started
+            ) * 1_000
             return
+        self.session_index_warm_elapsed_ms = (
+            time.perf_counter() - self.session_index_warm_started
+        ) * 1_000
         self.session_indexes_ready.set()
 
     def snapshot(self, *, session_date: str | None = None) -> dict[str, object]:
@@ -189,11 +198,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         cache_control: str = "no-store",
     ) -> None:
         try:
+            compression_ms = 0.0
             accepts_gzip = "gzip" in str(
                 self.headers.get("Accept-Encoding") or ""
             ).lower()
             if accepts_gzip and len(payload) >= 1_024:
+                compression_started = time.perf_counter()
                 payload = gzip.compress(payload, compresslevel=5)
+                compression_ms = (time.perf_counter() - compression_started) * 1_000
                 self.send_response(status)
                 self.send_header("Content-Encoding", "gzip")
                 self.send_header("Vary", "Accept-Encoding")
@@ -202,6 +214,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", cache_control)
+            timing = getattr(self, "_response_timing", None)
+            if timing is not None:
+                self.send_header(
+                    "Server-Timing",
+                    "prepare;dur={:.3f}, serialize;dur={:.3f}, "
+                    "compress;dur={:.3f}".format(
+                        timing[0], timing[1], compression_ms,
+                    ),
+                )
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Frame-Options", "DENY")
@@ -219,12 +240,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _json(self, status: HTTPStatus, payload: object) -> None:
+        serialization_started = time.perf_counter()
         encoded = (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode("utf-8")
+        self._response_timing = (
+            (serialization_started - getattr(
+                self, "_request_started", serialization_started
+            )) * 1_000,
+            (time.perf_counter() - serialization_started) * 1_000,
+        )
         self._send(status, encoded, "application/json; charset=utf-8")
 
     def do_GET(self) -> None:  # noqa: N802
+        self._request_started = time.perf_counter()
+        self._response_timing = None
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/status":
@@ -364,6 +394,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "source_age_seconds": revision.get("engine_age_seconds"),
                         "state_revision": revision.get("state_revision"),
                         "revision_status": revision.get("status"),
+                        "session_index_warm_status": (
+                            "ready" if self.server.session_indexes_ready.is_set()
+                            else "failed" if self.server.session_index_warm_error
+                            else "warming"
+                        ),
+                        "session_index_warm_elapsed_ms": (
+                            round(self.server.session_index_warm_elapsed_ms, 3)
+                            if self.server.session_index_warm_elapsed_ms is not None
+                            else None
+                        ),
                     },
                 )
             except (OSError, ValueError, json.JSONDecodeError) as exc:

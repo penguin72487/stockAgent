@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     retire.add_argument("--plan-fingerprint")
     retire.add_argument("--retention-days", type=float, default=7.0)
     retire.add_argument(
+        "--manual-immediate", action="store_true",
+        help="one-shot user-authorized lease-age bypass; all recovery/usage gates still apply",
+    )
+    retire.add_argument(
         "--retention-config",
         type=Path,
         default=REPO_ROOT / "configs/data_sync/packed_retention.json",
@@ -229,8 +233,9 @@ def main() -> int:
             )
             from manage_packed_retention import _syncthing
 
+            cfg = replace(cfg, required_peer_names=required_peers)
             try:
-                peer_proof = _syncthing(replace(cfg, required_peer_names=required_peers))
+                peer_proof = _syncthing(cfg)
             except (OSError, ValueError) as exc:
                 peer_proof = {"ok": False, "error": str(exc)}
             options = {
@@ -241,9 +246,11 @@ def main() -> int:
                 "state_root": args.state_root,
                 "backup_config": cfg.backup_config,
                 "peer_proof": peer_proof,
+                "peer_probe": lambda: _syncthing(cfg),
                 "required_peer_names": required_peers,
                 "bridge_inactive": _bridge_inactive(args.live_sync_root),
                 "retention_days": args.retention_days,
+                "manual_immediate": args.manual_immediate,
             }
             result = (
                 apply_artifact_retirement(

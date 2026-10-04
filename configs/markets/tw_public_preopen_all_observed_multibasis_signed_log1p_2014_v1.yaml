@@ -1,0 +1,11 @@
+# OFAT: compress source-unit raw columns after train-only RMS, before basis.
+base_config: tw_public_preopen_all_observed_multibasis_rms_2014_v1.yaml
+experiment_name: tw-public-all-observed-multibasis-signed-log1p-2014-v1
+
+runner:
+  output_dir: artifacts/ablations/tw_public_preopen_all_observed_multibasis_2014_v1/signed_log1p
+
+training:
+  financial_transformer:
+    causal_feature_compression: signed_log1p
+    causal_feature_compression_patterns: ["*_raw"]

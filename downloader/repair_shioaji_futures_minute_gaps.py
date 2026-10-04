@@ -106,7 +106,7 @@ def main():
         api = sj.Shioaji(simulation=True)
         api.set_event_callback(lambda *_: None)
         api.login(api_key=os.environ['SHIOAJI_API_KEY'], secret_key=os.environ['SHIOAJI_SECRET_KEY'], subscribe_trade=False)
-        limiter = SharedRateLimiter(.15, name='shioaji_quote_query')
+        limiter = SharedRateLimiter(.2, name='shioaji_quote_query')
         results = []
         try:
             for index, task in enumerate(pending[:args.max_tasks], 1):

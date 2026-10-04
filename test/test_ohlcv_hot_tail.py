@@ -213,6 +213,94 @@ def test_bybit_tail_only_writes_only_hot_rows(tmp_path: Path) -> None:
     assert hot_tail_path(output).is_file()
 
 
+def test_new_okx_symbol_tail_uses_closed_bar_not_future_utc_day_end(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    start_ms = okx._date_to_ms("2024-01-01", end_of_day=False)
+    end_ms = okx._date_to_ms("2024-01-03", end_of_day=True)
+    closed_ms = okx._date_to_ms("2024-01-02", end_of_day=False) + 22 * 3_600_000
+    bar_ms = okx._date_to_ms("2024-01-02", end_of_day=False) + 11 * 3_600_000 + 60_000
+    monkeypatch.setattr(okx, "_latest_closed_candle_start_ms", lambda: closed_ms)
+
+    class FakeClient:
+        calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"data": [
+                [str(bar_ms), "1", "2", "0.5", "1.5", "10", "10", "15", "1"]
+            ]} if self.calls == 1 else {"data": []}
+
+    record = SimpleNamespace(
+        code="NEWUSDTSWAP", okx_symbol="NEW-USDT-SWAP",
+        market="okx_swap", list_time="2024-01-02 11:00:00",
+    )
+    result = okx._download_symbol_1m(
+        FakeClient(), record, tmp_path, start_ms, end_ms,
+        "incremental", False, tail_only=True,
+    )
+    assert result.status == "updated"
+    assert result.rows == 1
+    assert (tmp_path / "NEWUSDTSWAP_features.parquet").is_file()
+
+
+def test_new_bybit_symbol_tail_does_not_query_future_window(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    start_ms = bybit._date_to_ms("2024-01-01", end_of_day=False)
+    end_ms = bybit._date_to_ms("2024-01-03", end_of_day=True)
+    closed_ms = bybit._date_to_ms("2024-01-02", end_of_day=False) + 22 * 3_600_000
+    bar_ms = bybit._date_to_ms("2024-01-02", end_of_day=False) + 11 * 3_600_000 + 60_000
+    monkeypatch.setattr(bybit, "_latest_closed_candle_start_ms", lambda: closed_ms)
+
+    class FakeClient:
+        def get(self, _endpoint, params):
+            assert int(params["start"]) <= bar_ms
+            assert int(params["end"]) <= closed_ms
+            return {"result": {"list": [
+                [str(bar_ms), "1", "2", "0.5", "1.5", "10", "15"]
+            ]}}
+
+    record = SimpleNamespace(
+        code="NEWUSDT", bybit_symbol="NEWUSDT", market="bybit_linear_perp",
+        category="linear", launch_time="2024-01-02 11:00:00",
+    )
+    result = bybit._download_symbol_1m(
+        FakeClient(), record, tmp_path, start_ms, end_ms,
+        "incremental", False, tail_only=True,
+    )
+    assert result.status == "updated"
+    assert result.rows == 1
+
+
+def test_new_binance_symbol_tail_uses_closed_bar_not_future_utc_day_end(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    start_ms = binance._date_to_ms("2024-01-01", end_of_day=False)
+    end_ms = binance._date_to_ms("2024-01-03", end_of_day=True)
+    closed_ms = binance._date_to_ms("2024-01-02", end_of_day=False) + 22 * 3_600_000
+    bar_ms = binance._date_to_ms("2024-01-02", end_of_day=False) + 11 * 3_600_000 + 60_000
+    monkeypatch.setattr(binance, "_latest_closed_candle_start_ms", lambda: closed_ms)
+
+    class FakeClient:
+        def get(self, _endpoint, params, **_kwargs):
+            assert int(params["startTime"]) <= bar_ms
+            assert int(params["endTime"]) <= closed_ms + binance.CANDLE_INTERVAL_MS - 1
+            return [_binance_raw(bar_ms)]
+
+    record = SimpleNamespace(
+        code="NEWUSDT", binance_symbol="NEWUSDT",
+        market="binance_usdm_perp", onboard_time="2024-01-02 11:00:00",
+    )
+    result = binance._download_symbol(
+        FakeClient(), record, tmp_path,
+        start_ms=start_ms, end_ms=end_ms,
+        mode="incremental", refresh=False, tail_only=True,
+    )
+    assert result.status == "updated"
+    assert result.rows == 1
+
+
 def test_bybit_tail_refresh_uses_footer_without_rescanning_historical_gaps(
     tmp_path: Path,
     monkeypatch,

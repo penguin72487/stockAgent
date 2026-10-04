@@ -29,7 +29,7 @@
       "access": "configured_account",
       "implementation_status": "reused_existing",
       "cadence": "realtime_and_backfill",
-      "history_contract": "account entitlement and traffic quota; host-global 10 req/s ceiling",
+      "history_contract": "account entitlement and observed daily traffic quota; shared person quote-query ceiling 50 per 10 seconds; one session per process, subscription-first live data, cached off-hours history",
       "feature_status": "ticks, bid/ask and completed historical bars use separate contracts",
       "documentation": "https://sinotrade.github.io/"
     },
@@ -45,6 +45,21 @@
       "history_contract": "full put-call ratio history; rolling three-year positioning; rolling VIX files; content-addressed OpenAPI snapshots from first local observation",
       "feature_status": "post-close rows shift to the next receipt-verified TAIFEX session; current snapshots are never projected backward",
       "documentation": "https://openapi.taifex.com.tw/swagger.json"
+    },
+    {
+      "id": "taifex_rule_history",
+      "provider": "TAIFEX",
+      "dataset_group": "taifex-public-history",
+      "category": "taiwan_derivatives_announcements_and_rules",
+      "access": "anonymous_public",
+      "implementation_status": "implemented_resumable_announcement_and_rule_archive",
+      "registry_alias": true,
+      "canonical_endpoint": "taifex:rule-history",
+      "summary_path": "data_taifex_public_history/rules/manifest.json",
+      "cadence": "bounded_resumable_backfill_and_timer_refresh_including_holidays",
+      "history_contract": "dated announcement index plus content-addressed official documents and attachments; current rule snapshots remain distinct from historical values",
+      "feature_status": "raw research archive only; numeric historical rules and publication/effective timestamps are not yet independently verified; not an executable margin release",
+      "documentation": "https://www.taifex.com.tw/cht/11/hisNews"
     },
     {
       "id": "yahoo_finance",
@@ -130,6 +145,19 @@
       "history_contract": "raw append-only snapshots",
       "feature_status": "usable only after local observed_at",
       "documentation": "https://defillama.com/docs/api"
+    },
+    {
+      "id": "defillama_aggregate_history",
+      "provider": "DefiLlama",
+      "dataset_group": "free-public-context",
+      "category": "historical_defi_tvl_and_stablecoin_supply",
+      "access": "anonymous_public",
+      "implementation_status": "implemented_free_endpoints",
+      "dataset_ids": ["defillama_tvl_history", "defillama_stablecoin_supply_history"],
+      "cadence": "daily",
+      "history_contract": "full upstream daily aggregates retained with retrieval vintages; peg denominations remain separate",
+      "feature_status": "research-only historical values; availability starts at capture, not event date",
+      "documentation": "https://github.com/DefiLlama/api-docs/blob/main/llms-pro.txt"
     },
     {
       "id": "defillama_stablecoins",
@@ -408,6 +436,45 @@
       "documentation": "https://www.gdeltproject.org/data.html"
     },
     {
+      "id": "public_economic_history",
+      "provider": "Census / BEA / Taiwan MOI",
+      "dataset_group": "public-economic-history",
+      "category": "public_economic_history",
+      "access": "public_or_user_configured_key",
+      "implementation_status": "implemented_bounded_numeric_history_and_official_zip_backfill",
+      "registry_alias": true,
+      "cadence": "hourly independent checks including holidays; history revision overlap and per-source TTL",
+      "history_contract": "Census 18 EITS programs; BEA 9 NIPA tables; discover actual MOI archive identifiers; credential failures are not empty data",
+      "feature_status": "current revision history; publication time unknown; no automatic historical PIT claim or training injection",
+      "documentation": "https://www.census.gov/data/developers/data-sets/economic-indicators.html"
+    },
+    {
+      "id": "frankfurter_official_v2",
+      "provider": "Frankfurter / BBK / BOC / RBA / HKMA / AMCM",
+      "dataset_group": "forex-frankfurter-official",
+      "category": "forex_official_reference",
+      "access": "anonymous_public",
+      "implementation_status": "implemented_source_separated_pivot_history",
+      "registry_alias": true,
+      "cadence": "existing Frankfurter daily job; provider-specific first/last dates",
+      "history_contract": "one native pivot request per central bank, not blended rates or synthetic historical OHLC",
+      "feature_status": "local-only source history pending model and publication-time audit",
+      "documentation": "https://frankfurter.dev/"
+    },
+    {
+      "id": "keyed_public_catalogs",
+      "provider": "NOAA / BEA / Census / Finnhub / NASA FIRMS / CWA / MOENV / AirNow / API.Data.gov",
+      "dataset_group": "keyed-public-catalogs",
+      "category": "public_environment_demographics_catalog",
+      "access": "public_metadata_or_user_configured_key",
+      "implementation_status": "bounded_catalog_and_prospective_snapshot_only",
+      "registry_alias": true,
+      "cadence": "hourly_check; metadata_24h_TTL; CWA_MOENV_1h_TTL; includes_holidays",
+      "history_contract": "global detailed history requested; estimate quota and capacity first; advertised catalog date ranges are not downloaded observation history",
+      "feature_status": "metadata not training data; current snapshots never backfilled into historical vintages",
+      "documentation": "https://www.ncei.noaa.gov/cdo-web/webservices/v2"
+    },
+    {
       "id": "noaa_market_weather",
       "provider": "NOAA",
       "dataset_group": "future-public-weather",
@@ -415,7 +482,7 @@
       "access": "anonymous_or_free_token",
       "implementation_status": "registered_pending",
       "cadence": "daily_and_forecast",
-      "history_contract": "observations and forecast vintages for energy/agriculture locations",
+      "history_contract": "global station and forecast history requested; bounded NOAA CDO dataset discovery implemented separately; global bulk size and quota planning before history ingestion",
       "feature_status": "pending market-exposure mapping",
       "documentation": "https://www.weather.gov/documentation/services-web-api"
     },

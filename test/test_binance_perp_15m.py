@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,72 @@ def test_binance_kline_limit_uses_best_documented_rows_per_weight_tier() -> None
     assert binance.KLINE_REQUEST_WEIGHT == alternatives[binance.KLINE_LIMIT]
 
 
+def test_binance_statistics_pages_bound_end_time_and_keep_head():
+    interval = features.STATISTICS_INTERVAL_MS
+    observed: list[tuple[int, int]] = []
+
+    class LatestRowsClient:
+        def get(self, path, params, *, weight):
+            start, end = int(params["startTime"]), int(params["endTime"])
+            observed.append((start, end))
+            # Emulate the API returning the newest rows of the requested
+            # interval, including a sparse hole between its first and last.
+            values = [0, interval, 2 * interval, 5 * interval]
+            return [{"timestamp": ts} for ts in values if start <= ts <= end][
+                -int(params["limit"]):
+            ]
+
+    rows = features._fetch_forward(
+        LatestRowsClient(), features.TAKER_RATIO_ENDPOINT, {"symbol": "BTCUSDT"},
+        start_ms=0, end_ms=5 * interval, limit=3,
+        timestamp_field="timestamp", weight=1,
+        page_span_ms=2 * interval,
+    )
+    assert [row["timestamp"] for row in rows] == [0, interval, 2 * interval, 5 * interval]
+    assert observed == [(0, 2 * interval), (2 * interval + 1, 4 * interval + 1),
+                        (4 * interval + 2, 5 * interval)]
+
+
+def test_binance_statistics_reject_future_rows_instead_of_claiming_complete():
+    class BadClient:
+        def get(self, path, params, *, weight):
+            return [{"timestamp": int(params["endTime"]) + 1}]
+
+    with pytest.raises(RuntimeError, match="beyond requested window"):
+        features._fetch_forward(
+            BadClient(), features.TAKER_RATIO_ENDPOINT, {"symbol": "BTCUSDT"},
+            start_ms=0, end_ms=3 * features.STATISTICS_INTERVAL_MS,
+            limit=2, timestamp_field="timestamp", weight=1,
+            page_span_ms=features.STATISTICS_INTERVAL_MS,
+        )
+
+
+def test_binance_period_start_api_end_bound_does_not_drop_first_or_last_bar():
+    interval = features.STATISTICS_INTERVAL_MS
+    requested: list[tuple[int, int]] = []
+
+    class PeriodEndBoundClient:
+        def get(self, path, params, *, weight):
+            start, end = int(params["startTime"]), int(params["endTime"])
+            requested.append((start, end))
+            # Binance's taker route can include one preceding start-stamped
+            # period; endTime excludes the period starting at endTime.
+            return [{"timestamp": ts} for ts in range(-interval, 6 * interval, interval)
+                    if start - interval <= ts < end][-int(params["limit"]):]
+
+    rows = features._fetch_forward(
+        PeriodEndBoundClient(), features.TAKER_RATIO_ENDPOINT,
+        {"symbol": "BTCUSDT", "period": "5m"},
+        start_ms=0, end_ms=5 * interval, limit=3,
+        timestamp_field="timestamp", weight=1,
+        page_span_ms=2 * interval,
+        request_end_offset_ms=interval,
+    )
+    assert [row["timestamp"] for row in rows] == [0, interval, 2 * interval,
+                                                   3 * interval, 4 * interval, 5 * interval]
+    assert requested[0] == (0, 3 * interval)
+
+
 def test_binance_symbols_preserve_unicode_but_reject_path_components() -> None:
     assert binance._safe_symbol("币安人生USDT") == "币安人生USDT"
     with pytest.raises(ValueError, match="unsafe Binance symbol"):
@@ -77,6 +144,9 @@ def test_binance_runtime_exchange_limit_is_authoritative() -> None:
     assert faster.limiter.interval_seconds == pytest.approx(60 / 2400)
     assert slower.weight_per_minute == 1200
     assert slower.limiter.interval_seconds == pytest.approx(60 / 1200)
+    endpoint_activity = faster.endpoint_limiter_activity()
+    assert endpoint_activity["futures_data"]["grants_total"] == 0
+    assert endpoint_activity["futures_data"]["sharing_scope"] == "per_ip_local_process"
 
 
 def test_normalized_binance_candles_keep_trade_and_taker_fields() -> None:
@@ -183,6 +253,175 @@ def test_binance_symbol_download_paginates_and_publishes_atomically(
     assert output.exists()
     assert not list(tmp_path.glob("*.tmp"))
     assert pl.read_parquet(output).height == 2
+
+
+def test_binance_full_reconcile_probes_actual_head_before_repeating_history(
+    tmp_path: Path,
+) -> None:
+    start_ms = binance._date_to_ms("2026-01-01", end_of_day=False)
+    interval = binance.CANDLE_INTERVAL_MS
+    output = tmp_path / "BTCUSDT_features.parquet"
+    binance._normalize_candles(
+        [_raw_candle(start_ms + offset * interval) for offset in range(5, 9)]
+    ).write_parquet(output)
+    calls: list[tuple[int, int]] = []
+
+    class FakeClient:
+        def get(self, path, params, *, weight):
+            assert path == binance.KLINE_ENDPOINT
+            cursor, limit = int(params["startTime"]), int(params["limit"])
+            calls.append((cursor, limit))
+            if limit == 1:
+                assert weight == 1.0
+                return [_raw_candle(start_ms + 5 * interval)]
+            return [_raw_candle(start_ms + 8 * interval),
+                    _raw_candle(start_ms + 9 * interval)]
+
+    record = SimpleNamespace(
+        code="BTCUSDT", binance_symbol="BTCUSDT",
+        market="binance_usdm_perp", onboard_time=None,
+    )
+    result = binance._download_symbol(
+        FakeClient(), record, tmp_path,
+        start_ms=start_ms, end_ms=start_ms + 9 * interval,
+        mode="incremental", refresh=False,
+    )
+
+    assert result.status == "updated"
+    assert calls == [(start_ms, 1), (start_ms + 7 * interval, binance.KLINE_LIMIT)]
+    assert pl.read_parquet(output).height == 5
+
+
+def test_binance_full_reconcile_repairs_proven_missing_head(tmp_path: Path) -> None:
+    start_ms = binance._date_to_ms("2026-01-01", end_of_day=False)
+    interval = binance.CANDLE_INTERVAL_MS
+    output = tmp_path / "BTCUSDT_features.parquet"
+    binance._normalize_candles(
+        [_raw_candle(start_ms + offset * interval) for offset in range(5, 9)]
+    ).write_parquet(output)
+    calls: list[tuple[int, int]] = []
+
+    class FakeClient:
+        def get(self, path, params, *, weight):
+            cursor, limit = int(params["startTime"]), int(params["limit"])
+            calls.append((cursor, limit))
+            rows = [_raw_candle(start_ms + offset * interval)
+                    for offset in range(2, 10) if start_ms + offset * interval >= cursor]
+            return rows[:limit]
+
+    record = SimpleNamespace(
+        code="BTCUSDT", binance_symbol="BTCUSDT",
+        market="binance_usdm_perp", onboard_time=None,
+    )
+    result = binance._download_symbol(
+        FakeClient(), record, tmp_path,
+        start_ms=start_ms, end_ms=start_ms + 9 * interval,
+        mode="incremental", refresh=False,
+    )
+
+    assert result.status == "updated"
+    assert calls == [(start_ms, 1), (start_ms + 2 * interval, binance.KLINE_LIMIT)]
+    assert pl.read_parquet(output)["date"].to_list()[0] == binance._ms_to_date_string(
+        start_ms + 2 * interval
+    )
+
+
+def test_binance_run_report_archive_survives_latest_report_replacement(
+    tmp_path: Path,
+) -> None:
+    latest = tmp_path / "download_report.csv"
+    latest.write_bytes(b"symbol,status\nBTCUSDT,failed\n")
+    archive = tmp_path / "run-1"
+
+    binance._archive_run_reports(archive, (latest,))
+    latest.write_bytes(b"symbol,status\nBTCUSDT,updated\n")
+
+    assert (archive / latest.name).read_bytes() == b"symbol,status\nBTCUSDT,failed\n"
+
+
+def test_binance_main_archives_failure_before_raise_and_preserves_it_after_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "candles"
+    archive_dir = tmp_path / "backfill-run" / "binance_source"
+    record = binance.SymbolRecord(
+        code="BTCUSDT", name="BTCUSDT", market="binance_usdm_perp",
+        binance_symbol="BTCUSDT", pair="BTCUSDT", base_asset="BTC",
+        quote_asset="USDT", margin_asset="USDT", contract_type="PERPETUAL",
+        status="TRADING", onboard_time=None,
+    )
+    mock_client = SimpleNamespace(
+        weight_per_minute=2400,
+        limiter=SimpleNamespace(grant_activity=lambda: {}),
+        endpoint_limiter_activity=lambda: {},
+    )
+    monkeypatch.setattr(binance, "BinanceClient", lambda **kwargs: mock_client)
+    monkeypatch.setattr(
+        binance, "_fetch_symbols",
+        lambda client, path, *, limit: ([record], {"serverTime": 0}),
+    )
+    observed_tail_modes: list[bool] = []
+
+    def mock_download(client, symbol, path, *, tail_only, **kwargs):
+        assert client is mock_client
+        assert symbol is record
+        assert path == output_dir
+        observed_tail_modes.append(tail_only)
+        if not tail_only:
+            raise RuntimeError("synthetic candle failure")
+        return binance.DownloadResult(
+            "crypto_binance_usdm_perp", record.code, record.binance_symbol,
+            record.market, "updated", 1,
+            str(output_dir / "BTCUSDT_features.parquet"),
+            first_date="2026-01-01 00:00:00", last_date="2026-01-01 00:00:00",
+        )
+
+    monkeypatch.setattr(binance, "_download_symbol", mock_download)
+    common_argv = [
+        "download_binance_perp_1m.py", "--output-dir", str(output_dir),
+        "--start-date", "2026-01-01", "--end-date", "2026-01-01",
+        "--workers", "1", "--skip-historical-features",
+    ]
+    monkeypatch.setattr(
+        binance.sys, "argv",
+        common_argv + ["--mode", "full", "--archive-report-dir", str(archive_dir)],
+    )
+
+    with pytest.raises(RuntimeError, match="^Binance download incomplete: 1 symbols failed$"):
+        binance.main()
+
+    archived_report = pl.read_csv(archive_dir / "download_report.csv")
+    assert archived_report.height == 1
+    assert archived_report.select("code", "binance_symbol", "status", "message").row(0) == (
+        "BTCUSDT", "BTCUSDT", "failed", "RuntimeError: synthetic candle failure",
+    )
+    archived_receipt = json.loads((archive_dir / "download_receipt.json").read_text())
+    archived_summary = json.loads((archive_dir / "download_summary.json").read_text())
+    assert archived_receipt["status_counts"] == archived_summary["status_counts"] == {"failed": 1}
+    assert archived_receipt["tail_only"] is archived_summary["tail_only"] is False
+    assert archived_summary["lock_wait_seconds"] >= 0
+    assert archived_summary["work_elapsed_seconds"] >= 0
+    assert archived_summary["work_started_at_utc"] == archived_summary["started_at_utc"]
+    assert set(archived_receipt["artifacts"]) == {
+        "symbols.csv", "download_report.csv", "download_summary.json",
+        "historical_feature_report.csv", "binance_historical_feature_catalog.json",
+    }
+    for name, proof in archived_receipt["artifacts"].items():
+        payload = (archive_dir / name).read_bytes()
+        assert len(payload) == proof["bytes"]
+        assert hashlib.sha256(payload).hexdigest() == proof["sha256"]
+    archived_bytes = {path.name: path.read_bytes() for path in archive_dir.iterdir()}
+
+    monkeypatch.setattr(binance.sys, "argv", common_argv + ["--tail-only"])
+    binance.main()
+
+    assert observed_tail_modes == [False, True]
+    assert pl.read_csv(output_dir / "download_report.csv")["status"].to_list() == ["updated"]
+    latest_receipt = json.loads((output_dir / "download_receipt.json").read_text())
+    assert latest_receipt["status_counts"] == {"updated": 1}
+    assert latest_receipt["tail_only"] is True
+    assert {path.name: path.read_bytes() for path in archive_dir.iterdir()} == archived_bytes
 
 
 def test_binance_funding_asof_never_uses_a_future_settlement() -> None:
@@ -321,6 +560,12 @@ def test_binance_historical_features_join_every_public_family_causally(
     enriched = pl.read_parquet(output)
     assert result.status == "updated"
     assert not json.loads(result.errors_json)
+    stage_elapsed = json.loads(result.stage_elapsed_seconds_json)
+    assert set(features.FEATURE_STAGE_IDS) <= stage_elapsed.keys()
+    assert {"read_existing", "derive", "compare", "write", "coverage"} <= stage_elapsed.keys()
+    assert all(value >= 0 for value in stage_elapsed.values())
+    assert result.total_elapsed_seconds >= 0
+    assert features.stage_latency_summary([result])["mark_price"]["samples"] == 1
     assert enriched["binance_mark_close"].to_list() == [101.0, 102.0, 103.0, 104.0]
     assert enriched["binance_funding_rate"].to_list() == [
         0.0001,

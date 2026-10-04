@@ -489,10 +489,46 @@ def evaluate_readiness(
                     ("blocked", "critical", "waiting")
                 )
             )
+            resolved_entry_policy = str(
+                row.get("configured_entry_fill_policy")
+                or row.get("entry_fill_policy")
+                or ""
+            )
+            accepted_policy = resolved_entry_policy in {
+                "causal_best_quote",
+                "causal_market_full_target_at_best_quote",
+            }
+            execution_counts_present = all(
+                key in row
+                for key in (
+                    "entry_requested_shares",
+                    "entry_filled_shares",
+                    "entry_unfilled_shares",
+                    "pending_entry_shares",
+                )
+            )
+            requested_shares = int(row.get("entry_requested_shares") or 0)
+            filled_shares = int(row.get("entry_filled_shares") or 0)
+            unfilled_shares = int(row.get("entry_unfilled_shares") or 0)
+            pending_shares = int(row.get("pending_entry_shares") or 0)
+            reason_counts = row.get("signal_reason_counts")
+            reason_counts = (
+                dict(reason_counts) if isinstance(reason_counts, Mapping) else {}
+            )
+            unresolved_rebalance_count = int(
+                reason_counts.get("inventory_reduction_incomplete") or 0
+            )
+            execution_complete = bool(
+                execution_counts_present
+                and pending_shares == 0
+                and filled_shares + unfilled_shares == requested_shares
+                and unresolved_rebalance_count == 0
+            )
             accepted = bool(
                 committed
-                and row.get("entry_fill_policy") == "causal_best_quote"
+                and accepted_policy
                 and int(row.get("entry_price_offset_ticks") or 0) == 0
+                and execution_complete
                 and slo_met
             )
             mode_results[market] = {
@@ -505,7 +541,17 @@ def evaluate_readiness(
                 "engine_status": row.get("engine_status"),
                 "checkpoint_ready": row.get("checkpoint_ready"),
                 "entry_fill_policy": row.get("entry_fill_policy"),
+                "configured_entry_fill_policy": row.get(
+                    "configured_entry_fill_policy"
+                ),
+                "entry_policy_accepted": accepted_policy,
                 "entry_price_offset_ticks": row.get("entry_price_offset_ticks"),
+                "entry_requested_shares": requested_shares,
+                "entry_filled_shares": filled_shares,
+                "entry_unfilled_shares": unfilled_shares,
+                "pending_entry_shares": pending_shares,
+                "unresolved_rebalance_count": unresolved_rebalance_count,
+                "entry_execution_complete": execution_complete,
                 "entry_commit_delay_ms": entry_commit_delay_ms,
                 "commit_slo_seconds": opening_commit_slo_seconds,
                 "commit_slo_met": slo_met,
@@ -526,7 +572,7 @@ def evaluate_readiness(
         }
         if not opening_ready:
             failures.append(
-                "09:00 live signals were not durably committed with causal best-quote execution for every paper mode by 09:00:15"
+                "09:00 live signals and causal paper execution were not durably complete for every mode by 09:00:15"
             )
 
     required_services = (

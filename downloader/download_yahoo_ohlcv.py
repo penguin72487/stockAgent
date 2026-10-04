@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone, tzinfo
@@ -87,6 +87,8 @@ CRYPTO_SYMBOL_PATTERN = re.compile(r"^[a-z]{2,8}$")
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose", "Trading_Volume"}
+YAHOO_ACQUISITION_CONTRACT_VERSION = 2
+YAHOO_PRICE_SCHEMA_VERSION = 1
 PARQUET_META_SOURCE_KEY = b"stockagent.source"
 PARQUET_META_ASSET_CLASS_KEY = b"stockagent.asset_class"
 PARQUET_META_REQUESTED_START_KEY = b"stockagent.yahoo_requested_start"
@@ -95,6 +97,8 @@ PARQUET_META_REQUESTED_END_KEY = b"stockagent.yahoo_requested_end"
 PARQUET_META_FIRST_DATE_KEY = b"stockagent.first_date"
 PARQUET_META_LAST_DATE_KEY = b"stockagent.last_date"
 PARQUET_META_WRITE_TS_UTC_KEY = b"stockagent.write_ts_utc"
+PARQUET_META_ACQUISITION_VERSION_KEY = b"stockagent.yahoo_acquisition_contract_version"
+PARQUET_META_ACQUISITION_FINGERPRINT_KEY = b"stockagent.yahoo_acquisition_fingerprint"
 UNVERIFIED_YAHOO_QUARANTINE_DIR = Path("quarantine") / "unverified_yahoo"
 UNVERIFIED_YAHOO_QUARANTINE_JOURNAL = "events.jsonl"
 QUARANTINE_ELIGIBLE_PRECHECK_STATUSES = frozenset(
@@ -116,6 +120,7 @@ UNAVAILABLE_TRIGGER_TEXTS = (
     "unavailable or delisted",
 )
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
+_YAHOO_FETCH_INFLIGHT = threading.BoundedSemaphore(64)
 YAHOO_CHART_429_COOLDOWN_SECONDS = float(
     os.environ.get("YAHOO_CHART_429_COOLDOWN_SECONDS", "600")
 )
@@ -738,7 +743,12 @@ def parse_args() -> argparse.Namespace:
         "--repair-symbol-timeout-seconds",
         type=int,
         default=90,
-        help="Max seconds to wait for one symbol's repair download; 0 disables per-symbol timeout.",
+        help=(
+            "Cooperative wall-clock budget for one started symbol's repair and "
+            "retries; expiry blocks another request or parquet commit. "
+            "An already in-flight provider call cannot be forcibly cancelled. "
+            "0 disables the per-symbol budget."
+        ),
     )
     parser.add_argument(
         "--rate-limit-abort-after",
@@ -800,6 +810,11 @@ def parse_args() -> argparse.Namespace:
             "Exit nonzero when any final symbol download is failed or still stale; "
             "canonical rebuilds should enable this strict gate."
         ),
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional scheduler run identity for exact source-summary correlation.",
     )
     return parser.parse_args()
 
@@ -1089,6 +1104,32 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
     )
 
 
+def _repair_required_columns(asset_class: str) -> set[str]:
+    if asset_class not in ASSET_CLASSES:
+        raise ValueError(f"Unknown Yahoo asset class: {asset_class}")
+    # The canonical forex writer deliberately removes all-zero/null volume.
+    # Requiring that column here would re-download the full history every day.
+    # Stock and crypto volumes remain mandatory; no synthetic volume is added.
+    if asset_class == "forex":
+        return REPAIR_REQUIRED_COLUMNS - {"Trading_Volume"}
+    return REPAIR_REQUIRED_COLUMNS.copy()
+
+
+def acquisition_contract(asset_class: str) -> dict[str, object]:
+    contract = {
+        "version": YAHOO_ACQUISITION_CONTRACT_VERSION,
+        "price_schema_version": YAHOO_PRICE_SCHEMA_VERSION,
+        "source": "yahoo",
+        "asset_class": asset_class,
+        "interval": YF_CRYPTO_INTRADAY_INTERVAL if asset_class == "crypto" else "1d",
+        "required_columns": sorted(_repair_required_columns(asset_class)),
+        "volume_policy": "optional_nonzero" if asset_class == "forex" else "required",
+        "source_metadata_validation": "strict",
+    }
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {**contract, "fingerprint": hashlib.sha256(encoded).hexdigest()}
+
+
 def _prepare_arrow_table_for_write(frame: object) -> object:
     _require_polars()
     ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in frame.columns] + [
@@ -1255,6 +1296,14 @@ def _write_feature_parquet_atomic(
                     ),
                 }
             )
+            if source == "yahoo":
+                contract = acquisition_contract(asset_class)
+                metadata[PARQUET_META_ACQUISITION_VERSION_KEY] = str(
+                    contract["version"]
+                ).encode("utf-8")
+                metadata[PARQUET_META_ACQUISITION_FINGERPRINT_KEY] = str(
+                    contract["fingerprint"]
+                ).encode("utf-8")
             if requested_start_date is not None:
                 metadata[PARQUET_META_REQUESTED_START_KEY] = requested_start_date.encode(
                     "utf-8"
@@ -1825,18 +1874,38 @@ def _http_get_json(url: str, timeout: int = 30) -> object:
     return json.loads(text)
 
 
-def _fetch_with_hard_timeout(fn, *args, timeout: int = 60, **kwargs):
-    """Run fn in a daemon thread; raise concurrent.futures.TimeoutError if it takes longer than timeout seconds.
+def _fetch_with_hard_timeout(fn, *args, timeout: float = 60, **kwargs):
+    """Bound caller wait including admission, without an unbounded exit join.
 
-    Unlike urlopen(timeout=N), this is a true wall-clock timeout that covers DNS resolution,
-    TCP handshake, and any other blocking operation inside fn.
-    The worker thread is abandoned (not waited on) so we never block on shutdown.
+    Python cannot cancel a blocked provider call. Timed-out calls remain daemon
+    threads until they return, so cap their number and never let their eventual
+    result write a source file. A ThreadPoolExecutor with wait=False still joins
+    its non-daemon workers at interpreter exit and is not a hard process bound.
     """
-    ex = ThreadPoolExecutor(max_workers=1)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    if not _YAHOO_FETCH_INFLIGHT.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise TimeoutError("Yahoo fetch admission timed out")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _YAHOO_FETCH_INFLIGHT.release()
+        raise TimeoutError("Yahoo fetch timed out before start")
+    future: Future[object] = Future()
+
+    def run() -> None:
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        finally:
+            _YAHOO_FETCH_INFLIGHT.release()
+
+    worker = threading.Thread(target=run, daemon=True, name="yahoo-bounded-fetch")
     try:
-        return ex.submit(fn, *args, **kwargs).result(timeout=timeout)
-    finally:
-        ex.shutdown(wait=False)
+        worker.start()
+    except BaseException:
+        _YAHOO_FETCH_INFLIGHT.release()
+        raise
+    return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _extract_tw_codes_from_tables(url: str) -> set[str]:
@@ -2123,6 +2192,30 @@ def _filter_us_records_for_broker_tradable_universe(records: list[SymbolRecord])
         for record in records
         if is_us_broker_tradable_security(record.code, record.name, record.market)
     ]
+
+
+def _enrich_us_symbol_names(
+    records: list[SymbolRecord], references: list[SymbolRecord],
+) -> list[SymbolRecord]:
+    """Fill missing descriptions by exact code without changing symbol identity."""
+    descriptions: dict[str, str] = {}
+    for reference in references:
+        if reference.name.strip().upper() not in {
+            "", reference.code.upper(), reference.yahoo_symbol.upper()
+        }:
+            descriptions.setdefault(reference.code, reference.name)
+    enriched: list[SymbolRecord] = []
+    for record in records:
+        name = descriptions.get(record.code)
+        if name is not None and record.name.strip().upper() in {
+            "", record.code.upper(), record.yahoo_symbol.upper()
+        }:
+            record = SymbolRecord(
+                code=record.code, name=name,
+                market=record.market, yahoo_symbol=record.yahoo_symbol,
+            )
+        enriched.append(record)
+    return enriched
 
 
 def _filter_records_for_supported_universe(asset_class: str, records: list[SymbolRecord]) -> list[SymbolRecord]:
@@ -2467,6 +2560,10 @@ def _load_local_tracked_records(asset_class: str, output_dir: Path, cached: list
         records.append(cached_record if cached_record is not None else record)
         seen_codes.add(record.code)
 
+    if asset_class == "us_stocks":
+        # Excluded local files remain preserved, but must not re-enter the
+        # stock/ETF schedule merely because an old manifest lost their names.
+        records = _enrich_us_symbol_names(records, _load_repo_symbol_fallback(asset_class))
     return records
 
 
@@ -2488,7 +2585,10 @@ def _load_repo_symbol_fallback(asset_class: str) -> list[SymbolRecord]:
 
 
 def _resolve_cached_manifest(output_dir: Path, asset_class: str) -> list[SymbolRecord]:
-    return _load_symbols_from_manifest_csv(output_dir / "symbols.csv", asset_class)
+    records = _load_symbols_from_manifest_csv(output_dir / "symbols.csv", asset_class)
+    if asset_class == "us_stocks":
+        records = _enrich_us_symbol_names(records, _load_repo_symbol_fallback(asset_class))
+    return records
 
 
 def _asset_output_is_bootstrap_empty(output_dir: Path) -> bool:
@@ -2754,6 +2854,18 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
             )
         except Exception as exc:
             print(f"[symbols] failed to load us delisted list: {exc}")
+    if args.mode == "repair" and not _strict_no_fallback(args):
+        # Current listings are not the historical repair universe. Preserve
+        # durable identities and use reference descriptions only to fill names
+        # lost by an older manifest rewrite; never change source provenance or
+        # infer delisting from absence in today's listing response.
+        tracked = _load_local_tracked_records(
+            "us_stocks", _resolve_asset_output_dir(args, "us_stocks"), cached
+        )
+        records = _enrich_us_symbol_names(
+            _dedupe_records_by_code([*cached, *tracked, *records]),
+            [*records, *repo_fallback_records],
+        )
     before_filter = len(records)
     records = _filter_us_records_for_broker_tradable_universe(records)
     if before_filter != len(records):
@@ -3153,11 +3265,16 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         )
     deduped = _dedupe_records_by_code(records)
 
+    manifest_records = list(deduped)
     if args.limit is not None:
         deduped = deduped[: args.limit]
     return SymbolResolution(
         scheduled_records=deduped,
-        manifest_records=deduped,
+        manifest_records=(
+            manifest_records
+            if asset_class == "us_stocks" and args.mode == "repair"
+            else deduped
+        ),
         new_codes=set(),
         excluded_records=_dedupe_excluded_records(excluded_records),
     )
@@ -3184,8 +3301,36 @@ def _download_symbol(
     whitelist_lock: threading.Lock | None = None,
     request_rate_limiter: RequestRateLimiter | None = None,
     yfinance_session: object | None = None,
+    symbol_timeout_seconds: float | None = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
+    deadline = (
+        time.monotonic() + float(symbol_timeout_seconds)
+        if symbol_timeout_seconds is not None and symbol_timeout_seconds > 0
+        else None
+    )
+
+    def remaining_budget() -> float:
+        if deadline is None:
+            return float("inf")
+        return max(0.0, deadline - time.monotonic())
+
+    def require_budget() -> None:
+        if remaining_budget() <= 0:
+            raise TimeoutError("Yahoo symbol repair time budget exhausted")
+
+    def timed_out_result() -> DownloadResult:
+        return DownloadResult(
+            asset_class=asset_class,
+            code=record.code,
+            yahoo_symbol=record.yahoo_symbol,
+            market=record.market,
+            status="failed",
+            rows=0,
+            output_path=None,
+            message=f"repair timed out after {symbol_timeout_seconds}s",
+        )
+
     candidates_to_try = _available_candidate_symbols(asset_class, record, blacklist_symbols)
     if not candidates_to_try:
         return DownloadResult(
@@ -3282,12 +3427,15 @@ def _download_symbol(
     last_error: str | None = None
     for candidate_symbol in candidates_to_try:
         for attempt in range(retries + 1):
+            if remaining_budget() <= 0:
+                return timed_out_result()
             try:
                 bare_chart_rate_limit_error: BaseException | None = None
 
                 def _download_frame(symbol: str = candidate_symbol) -> object:
                     nonlocal bare_chart_rate_limit_error
                     def session_chart() -> object:
+                        require_budget()
                         if yfinance_session is not None:
                             return _download_yahoo_chart_frame(
                                 symbol=symbol,
@@ -3299,6 +3447,7 @@ def _download_symbol(
                             )
                         if request_rate_limiter is not None:
                             request_rate_limiter.wait()
+                        require_budget()
                         return _download_yfinance_frame(
                             symbol=symbol,
                             start_date=effective_start_date,
@@ -3312,6 +3461,7 @@ def _download_symbol(
                         return session_chart()
                     if request_rate_limiter is not None:
                         request_rate_limiter.wait()
+                    require_budget()
                     # Check the circuit only after claiming the bare-route
                     # slot. Another worker may have observed a 429 while this
                     # worker was waiting; checking earlier would let a whole
@@ -3350,8 +3500,12 @@ def _download_symbol(
                 # concurrent symbol threads.
                 frame = _fetch_with_hard_timeout(
                     _download_frame,
-                    timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
+                    timeout=min(
+                        YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
+                        remaining_budget(),
+                    ),
                 )
+                require_budget()
                 normalized = _normalize_download_frame(
                     frame,
                     keep_zero_volume=asset_class != "forex",
@@ -3402,7 +3556,7 @@ def _download_symbol(
                         )
                     last_error = f"{candidate_symbol}: Yahoo returned no rows."
                     if attempt < retries:
-                        time.sleep(0.8 * (attempt + 1))
+                        time.sleep(min(0.8 * (attempt + 1), remaining_budget()))
                         continue
                     break
 
@@ -3414,6 +3568,9 @@ def _download_symbol(
                         daily=asset_class != "crypto",
                     )
 
+                # Once the cooperative deadline expires, an old worker must
+                # not publish a repair after its caller has declared timeout.
+                require_budget()
                 first_date, last_date = _write_feature_parquet_atomic(
                     normalized,
                     output_path,
@@ -3439,6 +3596,8 @@ def _download_symbol(
                     checked_through_date=end_date,
                 )
             except Exception as exc:
+                if remaining_budget() <= 0:
+                    return timed_out_result()
                 last_error = f"{candidate_symbol}: {exc}"
                 if _captured_indicates_unavailable(str(exc).lower()):
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
@@ -3450,9 +3609,9 @@ def _download_symbol(
                         if request_rate_limiter is not None:
                             request_rate_limiter.defer(delay)
                         else:
-                            time.sleep(delay)
+                            time.sleep(min(delay, remaining_budget()))
                     else:
-                        time.sleep(0.8 * (attempt + 1))
+                        time.sleep(min(0.8 * (attempt + 1), remaining_budget()))
 
     return DownloadResult(
         asset_class=asset_class,
@@ -3704,6 +3863,7 @@ def _resolve_repair_plan(
     new_codes: set[str] | None = None,
 ) -> list[RepairCheck]:
     checks: list[RepairCheck] = []
+    required_columns = _repair_required_columns(asset_class)
     new_codes = new_codes or set()
     target_end = args.end_date or _today_str()
     requested_target_end_dt = _parse_date(target_end).date()
@@ -3879,7 +4039,7 @@ def _resolve_repair_plan(
                 )
                 continue
 
-            missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
+            missing_required = sorted(required_columns - columns)
             if missing_required:
                 if _is_delisted_record(record) and not verify_tw_delisted:
                     checks.append(
@@ -3953,6 +4113,8 @@ def _resolve_repair_plan(
             if (
                 asset_class == "us_stocks"
                 and bool(getattr(args, "verify_us_history_head", False))
+                and not info.metadata_error
+                and info.asset_class == asset_class
                 and (checked_start_dt is None or checked_start_dt > requested_start_dt)
             ):
                 checks.append(
@@ -4082,7 +4244,6 @@ def _run_parallel_symbol_downloads(
     whitelist_path: Path,
     whitelist_lock: threading.Lock,
     symbol_timeout_seconds: int | None = None,
-    timeout_handler: Callable[[SymbolRecord, object, int | None], DownloadResult] | None = None,
     result_transformer: Callable[[DownloadResult, object], DownloadResult] | None = None,
 ) -> list[DownloadResult]:
     if not tasks:
@@ -4117,6 +4278,7 @@ def _run_parallel_symbol_downloads(
                 whitelist_lock,
                 request_rate_limiter,
                 yfinance_session,
+                symbol_timeout_seconds,
             ): (record, meta)
             for record, start_date, refresh, merge_existing, meta in tasks
         }
@@ -4126,13 +4288,12 @@ def _run_parallel_symbol_downloads(
             for future in as_completed(futures, timeout=None):
                 record, meta = futures[future]
                 try:
-                    result = future.result(timeout=symbol_timeout_seconds)
+                    # as_completed yields only finished work. Its result()
+                    # timeout never bounded the symbol; the worker now owns
+                    # that monotonic request/retry budget.
+                    result = future.result()
                 except CancelledError:
                     continue
-                except TimeoutError:
-                    if timeout_handler is None:
-                        raise
-                    result = timeout_handler(record, meta, symbol_timeout_seconds)
 
                 if result_transformer is not None:
                     result = result_transformer(result, meta)
@@ -4355,20 +4516,6 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     else:
         print(f"[repair] asset={asset_class} local_range=n/a tracked=0")
 
-    def _repair_timeout_result(record: SymbolRecord, meta: object, timeout_seconds: int | None) -> DownloadResult:
-        check = meta
-        assert isinstance(check, RepairCheck)
-        return DownloadResult(
-            asset_class=asset_class,
-            code=record.code,
-            yahoo_symbol=record.yahoo_symbol,
-            market=record.market,
-            status="failed",
-            rows=0,
-            output_path=None,
-            message=f"repair timed out after {timeout_seconds}s",
-        )
-
     def _repair_result_transform(result: DownloadResult, meta: object) -> DownloadResult:
         check = meta
         assert isinstance(check, RepairCheck)
@@ -4392,7 +4539,6 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         whitelist_path=whitelist_path,
         whitelist_lock=whitelist_lock,
         symbol_timeout_seconds=args.repair_symbol_timeout_seconds or None,
-        timeout_handler=_repair_timeout_result,
         result_transformer=_repair_result_transform,
     )
 
@@ -4498,7 +4644,8 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
     return counts
 
 
-def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dict[str, int]]:
+def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dict[str, int], float]:
+    started = time.perf_counter()
     print(f"[{args.mode}] asset={asset_class} start={args.start_date} end={args.end_date}")
     if _is_incremental_mode(args):
         output_dir = _resolve_asset_output_dir(args, asset_class)
@@ -4513,8 +4660,9 @@ def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dic
         counts = _repair_asset_class(asset_class, args)
     else:
         counts = _download_asset_class(asset_class, args)
-    print(f"[{args.mode}] completed asset={asset_class} status_counts={counts}")
-    return asset_class, counts
+    elapsed = time.perf_counter() - started
+    print(f"[{args.mode}] completed asset={asset_class} elapsed_seconds={elapsed:.3f} status_counts={counts}")
+    return asset_class, counts, elapsed
 
 
 def main() -> None:
@@ -4531,21 +4679,24 @@ def main() -> None:
     print(f"[yahoo] {describe_rate_limit('yahoo_finance', args.request_interval)}")
     asset_classes = list(ASSET_CLASSES) if args.asset == "all" else [args.asset]
     summaries: dict[str, dict[str, int]] = {}
+    asset_elapsed_seconds: dict[str, float] = {}
 
     asset_workers = max(1, int(args.asset_workers))
     asset_progress = tqdm(total=len(asset_classes), desc=f"{args.mode}:assets", unit="asset")
     try:
         if len(asset_classes) == 1 or asset_workers == 1:
             for asset_class in asset_classes:
-                key, counts = _run_one_asset(asset_class, args)
+                key, counts, elapsed = _run_one_asset(asset_class, args)
                 summaries[key] = counts
+                asset_elapsed_seconds[key] = elapsed
                 asset_progress.update(1)
         else:
             with ThreadPoolExecutor(max_workers=min(asset_workers, len(asset_classes))) as executor:
                 futures = {executor.submit(_run_one_asset, asset_class, args): asset_class for asset_class in asset_classes}
                 for future in as_completed(futures):
-                    key, counts = future.result()
+                    key, counts, elapsed = future.result()
                     summaries[key] = counts
+                    asset_elapsed_seconds[key] = elapsed
                     asset_progress.update(1)
     except YahooRateLimitedError as exc:
         print(f"[{args.mode}] aborted: {exc}", file=sys.stderr, flush=True)
@@ -4564,6 +4715,26 @@ def main() -> None:
     summary_path = Path(args.output_root) / summary_name
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(summary_path, summaries)
+    # The daily runner invokes US stocks and forex separately. Preserve each
+    # asset's result instead of letting the later invocation replace the only
+    # durable summary with its own one-asset dictionary.
+    for asset_class, counts in summaries.items():
+        source_summary = {
+            "schema_version": 1,
+            "mode": args.mode,
+            "asset_class": asset_class,
+            "end_date": args.end_date,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "elapsed_seconds": round(asset_elapsed_seconds[asset_class], 3),
+            "status_counts": counts,
+            "acquisition_contract": acquisition_contract(asset_class),
+        }
+        if getattr(args, "run_id", None):
+            source_summary["run_id"] = str(args.run_id)
+        atomic_write_json(
+            summary_path.with_name(f"{summary_path.stem}.{asset_class}.json"),
+            source_summary,
+        )
     failures = []
     for asset_class, counts in summaries.items():
         reason = download_counts_failure_reason(counts)

@@ -2502,6 +2502,32 @@ def test_bounded_cash_model_uses_existing_parameters_and_audits_cash() -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0)
 
 
+def test_portfolio_output_mode_score_entmax_log_cash_matches_helper() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="score_entmax_log_cash",
+    ).eval()
+    features = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(features, mask, return_aux=True)
+
+    expected, expected_parts = masked_score_entmax_log_cash_weights(
+        aux["centered_score_logits"], mask, short_mask=mask, return_parts=True
+    )
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        aux["score_entmax_log_cash_fraction"],
+        expected_parts["score_entmax_log_cash_fraction"],
+    )
+    assert weights.dtype == torch.float32
+    assert weights[1, 10:].abs().max().item() == 0.0
+
+
 def test_log_cash_model_uses_existing_parameters_and_audits_cash() -> None:
     device = _device()
     model = _make_model(

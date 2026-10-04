@@ -1,0 +1,15 @@
+[Unit]
+Description=Observe FinMind account quota once per minute
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.snapshot_finmind_quota'
+Nice=10
+CPUWeight=20
+IOWeight=20

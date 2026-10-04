@@ -1,11 +1,10 @@
 [Unit]
-Description=Refresh StockAgent Shioaji storage inventory hourly
+Description=Refresh StockAgent Shioaji storage inventory hourly outside trading hours
 
 [Timer]
-OnBootSec=15min
-OnUnitActiveSec=1h
+OnCalendar=*-*-* 00..07,14..23:09:00 Asia/Taipei
 AccuracySec=2min
-Persistent=true
+Persistent=false
 Unit=stockagent-shioaji-storage-monitor.service
 
 [Install]

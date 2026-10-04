@@ -1,6 +1,6 @@
 market: tw_overnight_multi_basis_22
 label: 台股・多基底22 隔日沖（初始 1,000 萬）
-enabled: true
+enabled: false
 market_type: tw
 timezone: Asia/Taipei
 # These are source-availability hours for the signal engine.  The separate

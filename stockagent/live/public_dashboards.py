@@ -9,6 +9,7 @@ read-only payload could represent production order capability.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
 import math
 import re
 import threading
@@ -52,6 +53,45 @@ class UnsafePublicDashboardPayload(ValueError):
     """Raised when an upstream payload violates the public read-only contract."""
 
 
+_PUBLIC_DROPPED_KEYS: Final[frozenset[str]] = frozenset({
+    "checkpoint_fingerprint", "checkpoint_path", "config_fingerprint",
+    "config_path", "daily_return_previous_close_source", "live_output_dir",
+    "order_id", "path", "position_id", "previous_signal_id", "signal_id",
+    "source_file", "source_path",
+})
+_PUBLIC_CREDENTIAL_KEYS: Final[frozenset[str]] = frozenset({
+    "apikey", "apisecret", "secret", "secretkey", "password", "passwd",
+    "authorization", "cookie", "setcookie", "token", "accesstoken",
+    "refreshtoken", "privatekey", "accountid", "accountnumber", "brokerid",
+})
+_PUBLIC_KEY_NORMALIZER: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]")
+
+
+def _public_key_disposition_uncached(key: str) -> str:
+    normalized = _PUBLIC_KEY_NORMALIZER.sub("", key.lower())
+    if (
+        key in _PUBLIC_DROPPED_KEYS
+        or normalized in _PUBLIC_CREDENTIAL_KEYS
+        or key.endswith(("_path", "_dir", "_file"))
+    ):
+        return "drop"
+    if key == "error" or key.endswith("_error"):
+        return "redact_error"
+    return "keep"
+
+
+@lru_cache(maxsize=512)
+def _public_key_disposition_cached(key: str) -> str:
+    return _public_key_disposition_uncached(key)
+
+
+def _public_key_disposition(key: str) -> str:
+    # Do not retain an unbounded source-controlled key in the process cache.
+    if len(key) > 128:
+        return _public_key_disposition_uncached(key)
+    return _public_key_disposition_cached(key)
+
+
 def _require_simulation_only(payload: Mapping[str, Any]) -> None:
     if payload.get("simulation_only") is not True:
         raise UnsafePublicDashboardPayload("simulation_only must be true")
@@ -62,40 +102,14 @@ def _require_simulation_only(payload: Mapping[str, Any]) -> None:
 def _scrub_public_value(value: Any) -> Any:
     """Remove local paths and opaque execution identifiers recursively."""
 
-    dropped_keys = {
-        "checkpoint_fingerprint",
-        "checkpoint_path",
-        "config_fingerprint",
-        "config_path",
-        "daily_return_previous_close_source",
-        "live_output_dir",
-        "order_id",
-        "path",
-        "position_id",
-        "previous_signal_id",
-        "signal_id",
-        "source_file",
-        "source_path",
-    }
-    credential_keys = {
-        "apikey", "apisecret", "secret", "secretkey", "password", "passwd",
-        "authorization", "cookie", "setcookie", "token", "accesstoken",
-        "refreshtoken", "privatekey", "accountid", "accountnumber", "brokerid",
-    }
     if isinstance(value, Mapping):
         output: dict[str, Any] = {}
         for raw_key, item in value.items():
             key = str(raw_key)
-            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-            if (
-                key in dropped_keys
-                or normalized in credential_keys
-                or key.endswith("_path")
-                or key.endswith("_dir")
-                or key.endswith("_file")
-            ):
+            disposition = _public_key_disposition(key)
+            if disposition == "drop":
                 continue
-            if key == "error" or key.endswith("_error"):
+            if disposition == "redact_error":
                 output[key] = "unavailable" if item else None
                 continue
             output[key] = _scrub_public_value(item)
@@ -238,6 +252,21 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("signals", "orders", "fills", "events"):
         if isinstance(projected.get(key), list):
             projected[key] = []
+    opening_latency = projected.get("opening_signal_latency")
+    if isinstance(opening_latency, Mapping):
+        # The page renders historical aggregate timings, while today's modes
+        # remain in the top-level summary. Repeating every mode and failure
+        # receipt in each trend row adds >100 KiB to every status refresh.
+        latency_summary = dict(opening_latency)
+        trend = latency_summary.get("trend")
+        if isinstance(trend, list):
+            latency_summary["trend"] = [
+                {key: value for key, value in row.items()
+                 if key not in ("modes", "failures")}
+                if isinstance(row, Mapping) else row
+                for row in trend
+            ]
+        projected["opening_signal_latency"] = latency_summary
     _project_rows(
         projected,
         "positions",
@@ -622,8 +651,12 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "counterfactual_overnight_replay",
             "day_trade_eligible",
             "execution_price",
+            "entry_completion_broker_fill",
+            "entry_completion_contract",
+            "entry_completion_recorded_at",
             "exchange_quote_at",
             "filled_shares",
+            "initial_filled_shares",
             "lower_limit",
             "market",
             "name",
@@ -647,6 +680,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "status",
             "symbol",
             "target_weight",
+            "target_unsubmitted_shares",
             "temporary_day_trade_model_adapter",
             "top_book_capacity_shares",
             "order_limit_price",
@@ -704,6 +738,9 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
             "entry_fee_twd",
             "entry_price",
             "entry_price_source",
+            "entry_completion_broker_fill",
+            "entry_completion_contract",
+            "entry_completion_recorded_at",
             "inventory_basis_price",
             "odd_lot_execution_policy",
             "share_replacement_contract",
@@ -745,6 +782,7 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
             "symbol",
             "take_profit_price",
             "target_weight",
+            "target_unsubmitted_shares",
             "temporary_day_trade_model_adapter",
             "total_net_pnl_twd",
             "unrealized_net_pnl_twd",
@@ -774,6 +812,9 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
         "order_total",
         "fill_total",
         "has_more",
+        "source_rows_scanned",
+        "scan_limit",
+        "scan_limit_reached",
         "record_counts",
         "rows",
     }

@@ -19,6 +19,15 @@ Use `STOCKAGENT_SCHEDULED_MARKETS` to list only markets whose credentials and
 model artifacts are ready. A market remains available to interactive Discord
 commands when enabled even if it is not in that automatic schedule.
 
+penguin 目前只啟用五個 `tw_day_trade_*` Discord 市場；預設市場為
+`tw_day_trade_multi_basis_projection_l1_gelu`。非當沖 YAML 的 `enabled: false`
+會停掉後續排程及互動訊號；本機 `artifacts/discord_bot/state.json` 也設有
+執行期停用覆寫，避免服務重啟前沿用舊配置。獨立的
+`stockagent-tw-day-trade-simulation.service` 不由這個切換停用。
+`/set_market_enabled` 可寫入執行期覆寫，所以退役模型檔案前必須重新查驗
+YAML、state 和實際服務，而不能只看 YAML。停用 Discord 市場不代表其
+歷史訓練檔可直接刪除；仍須遵守冷庫與 D 備份驗證契約。
+
 All Taiwan daily and day-trade market configs share
 `scripts/refresh_tw_public_live_snapshot.py`. The updater writes only to the
 mutable `/srv/stockagent-live/data_tw_public` tree, runs the strict causal-data

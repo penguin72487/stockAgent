@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
+from scripts.check_tw_day_trade_preopen_readiness import _session_contract  # noqa: E402
 from stockagent.data.tw_public_features import _release_feature_content_receipt  # noqa: E402
 from scripts.watch_tw_public_publication_group import (  # noqa: E402
     _latest_completed_taiex_session,
@@ -242,6 +243,29 @@ def _derived_refresh_blockers(failures: list[str]) -> list[str]:
     ]
 
 
+def _defer_opening_bulk_step(step: str, observed: datetime) -> bool:
+    """Keep bulk writes/audits from invalidating hot 09:00 model panels.
+
+    Current-session entitlement repair is deliberately separate: a missing
+    exact cash receipt must still be allowed to recover before the decision.
+    Full derived builds and strict audits have each taken several minutes on
+    the live dataset.  Do not *start* one at 08:45 and assume the 08:50 guard
+    will stop a task that is already running.  The 09:10 timer resumes these
+    noncritical steps after opening.
+    """
+
+    if step not in {
+        "refresh_corporate_action_reference",
+        "build_official_symbol_panel",
+        "build_public_feature_panel",
+        "strict_model_safety_audit",
+    }:
+        return False
+    local = observed.astimezone(TAIPEI)
+    minute = local.hour * 60 + local.minute
+    return 8 * 60 + 40 <= minute < 9 * 60 + 5
+
+
 def _audit_command(
     *, config: Path, live_root: Path, output_dir: Path
 ) -> list[str]:
@@ -274,6 +298,8 @@ def _audit_dependency_state(*, config: Path, live_root: Path) -> dict[str, Any]:
         REPO_ROOT / "scripts" / "build_tw_public_training_features.py",
         REPO_ROOT / "stockagent" / "data" / "tw_public_features.py",
         live_root / "download_summary.json",
+        live_root / "tw_short_sale_download_report.json",
+        live_root / "twse_taiex_ohlc.summary.json",
         live_root / "tw_corporate_action_reference.summary.json",
         live_root / "tw_corporate_action_entitlements.summary.json",
         live_root / "stocks" / "official_symbol_build_summary.json",
@@ -899,8 +925,45 @@ def main() -> int:
     eligibility_path = _repo_path(args.eligibility_receipt).resolve(strict=False)
     event_path = _repo_path(args.event_receipt).resolve(strict=False)
     audit_dir = _repo_path(args.audit_root) / started.strftime("%Y%m%dT%H%M%S%f")
+    try:
+        session_state, session_reason, markets = _session_contract(started)
+    except (OSError, RuntimeError, ValueError) as exc:
+        session_state = "unknown"
+        session_reason = f"market session contract failed: {type(exc).__name__}: {exc}"
+        markets = ()
+    if session_state != "open":
+        # A verified closure needs no exact-session eligibility or model audit.
+        # Missing/conflicting calendar evidence is different: fail closed.
+        completed_at = datetime.now(TAIPEI)
+        closed = session_state == "closed"
+        payload = {
+            "schema_version": 3,
+            "status": "skipped" if closed else "failed",
+            "started_at_taipei": started.isoformat(),
+            "completed_at_taipei": completed_at.isoformat(),
+            "elapsed_seconds": (completed_at - started).total_seconds(),
+            "deadline_taipei": f"{session_date}T08:30:00+08:00",
+            "session_state": session_state,
+            "session_reason": session_reason,
+            "markets": list(markets),
+            "failures": [] if closed else ["TWSE session calendar is not verified"],
+            "steps": [],
+            "acceptance": {
+                "subprocess_ok": False,
+                "same_session_eligibility": False,
+                "strict_model_safety_audit": False,
+            },
+        }
+        _atomic_json(receipt_path, payload)
+        run_path = receipt_path.parent / "runs" / (
+            started.strftime("%Y%m%dT%H%M%S%f") + ".json"
+        )
+        _atomic_json(run_path, payload)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if closed else 1
     expected_latest = _latest_completed_taiex_session(live_root, observed=started)
     steps: list[dict[str, Any]] = []
+    deferred_opening_step: str | None = None
 
     # A later catch-up timer must not repeat the 50+ GiB strict panel audit
     # after this exact source and dependency revision has already passed.
@@ -955,8 +1018,15 @@ def main() -> int:
     )
     if args.force or publication_failures:
         command = refresh_command(config, force=bool(args.force))
+        refresh_started = time.perf_counter()
         completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
-        steps.append({"step": "preopen_full_refresh", "return_code": completed.returncode})
+        steps.append(
+            {
+                "step": "preopen_full_refresh",
+                "return_code": completed.returncode,
+                "elapsed_seconds": round(time.perf_counter() - refresh_started, 3),
+            }
+        )
         publication = _json(publication_path)
         publication_failures = _publication_errors(
             publication,
@@ -1104,6 +1174,13 @@ def main() -> int:
                 )
                 if not current_status["errors"][status_label]:
                     continue
+                if _defer_opening_bulk_step(step_name, datetime.now(TAIPEI)):
+                    deferred_opening_step = step_name
+                    steps.append(
+                        {"step": step_name, "status": "deferred_opening_window"}
+                    )
+                    failures.append(f"derived_data:{step_name} deferred until 09:10")
+                    break
                 derived_started = time.perf_counter()
                 completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
                 steps.append(
@@ -1159,6 +1236,17 @@ def main() -> int:
                             "dependency_sha256": audit_dependency_state["sha256"],
                         }
                     )
+                elif _defer_opening_bulk_step(
+                    "strict_model_safety_audit", datetime.now(TAIPEI)
+                ):
+                    deferred_opening_step = "strict_model_safety_audit"
+                    steps.append(
+                        {
+                            "step": "strict_model_safety_audit",
+                            "status": "deferred_opening_window",
+                        }
+                    )
+                    failures.append("audit:strict model-safety audit deferred until 09:10")
                 else:
                     completed = subprocess.run(
                         _audit_command(
@@ -1309,7 +1397,7 @@ def main() -> int:
     )
     accepted = not failures
     live_runtime = {
-        "status": "ok" if accepted else "failed",
+        "status": "ok" if accepted else "deferred" if deferred_opening_step else "failed",
         "authority": "catalog_mutable_live_root",
         "expected_latest_date": expected_latest,
         "download_end_date": active_summary.get("end_date"),
@@ -1324,7 +1412,7 @@ def main() -> int:
     }
     payload: dict[str, Any] = {
         "schema_version": 3,
-        "status": "ok" if accepted else "failed",
+        "status": "ok" if accepted else "deferred" if deferred_opening_step else "failed",
         "started_at_taipei": started.isoformat(),
         "completed_at_taipei": completed_at.isoformat(),
         "elapsed_seconds": (completed_at - started).total_seconds(),
@@ -1334,6 +1422,7 @@ def main() -> int:
         "expected_latest_date": expected_latest,
         "failures": failures,
         "steps": steps,
+        "deferred_opening_step": deferred_opening_step,
         "publication": publication,
         "event_monitor": event_receipt,
         "opening_revision_freeze": opening_revision_freeze,
@@ -1380,7 +1469,7 @@ def main() -> int:
         fcntl.flock(opening_gate_handle.fileno(), fcntl.LOCK_UN)
         opening_gate_handle.close()
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if accepted else 1
+    return 0 if accepted or deferred_opening_step else 1
 
 
 if __name__ == "__main__":

@@ -188,6 +188,31 @@ def _meets(first: str | None) -> bool:
     return bool(first and date.fromisoformat(first[:10]) <= CUTOFF)
 
 
+def _okx_auxiliary_finding(
+    profile: dict[str, Any], public_build: dict[str, Any]
+) -> dict[str, str] | None:
+    if profile["schema_complete_files"] == profile["files"]:
+        return None
+    actual_input = public_build.get("input_receipts", {}).get("okx_symbols", {}).get("path")
+    return {
+        "severity": "HIGH",
+        "finding": "OKX source-wide auxiliary schema is incomplete",
+        "evidence": (
+            f"{profile['schema_complete_files']}/{profile['files']} base files contain required "
+            f"mark/index columns; latest feature receipt input={actual_input}; "
+            f"failed_symbols={public_build.get('failed_symbols')}"
+        ),
+        "impact": (
+            "Source-wide schema gaps are not proof that the selected mapped universe failed. "
+            "Footer coverage excludes logical hot tails and does not establish feature completeness."
+        ),
+        "action": (
+            "Use the verified selected release and actual input receipt. Audit mapped symbols "
+            "before rebuilding; retain null/missing masks. Do not infer or force a 15m fallback."
+        ),
+    }
+
+
 def _row(
     dataset: str,
     source: str,
@@ -286,6 +311,9 @@ def main() -> None:
     cm_summary = _load_json(root / "data_coinmetrics_community/download_summary.json")
     archive = _load_json(root / "data_binance_archive/download_summary.json")
     dune = _load_json(root / "data_dune_crypto/download_summary.json")
+    dune_stored = _footer_tree_profile(
+        root / "data_dune_crypto/normalized", "*/year=*/*.parquet", "event_date"
+    )
     reference = _load_json(root / "data_crypto_reference/download_summary.json")
     public_build = _load_json(
         root / "data_bybit/public_features/bybit_crypto_public_daily_summary.json"
@@ -304,11 +332,13 @@ def main() -> None:
     fear_first, fear_last, fear_rows = free_dates("alternative_me_fear_greed")
     dex_first, dex_last, dex_rows = free_dates("defillama_dex_volume")
     fees_first, fees_last, fees_rows = free_dates("defillama_protocol_fees")
+    tvl_first, tvl_last, tvl_rows = free_dates("defillama_tvl_history")
+    supply_first, supply_last, supply_rows = free_dates("defillama_stablecoin_supply_history")
 
     rows = [
         _row("Binance USD-M 1m", "Binance", binance_1m["path"], binance_1m["earliest_event_date"], binance_1m["latest_event_date"], binance_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "可用；需保留歷史成分與上市時間 mask", f"{binance_1m['files_reaching_2020_01_01_or_earlier']}/{binance_1m['files']} files reach cutoff"),
         _row("OKX SWAP 1m core", "OKX", okx_1m["path"], okx_1m["earliest_event_date"], okx_1m["latest_event_date"], okx_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "核心 K 線可用；輔助 mark/index 不完整", f"public feature schema complete {okx_1m['schema_complete_files']}/{okx_1m['files']} files"),
-        _row("OKX SWAP 15m enriched", "OKX", okx_15m["path"], okx_15m["earliest_event_date"], okx_15m["latest_event_date"], okx_15m["rows_from_base_parquet_footers"], "A: completed exchange bars", "可因果聚合到日頻；目前正式公開特徵 fallback", f"public feature schema complete {okx_15m['schema_complete_files']}/{okx_15m['files']} files"),
+        _row("OKX SWAP 15m enriched", "OKX", okx_15m["path"], okx_15m["earliest_event_date"], okx_15m["latest_event_date"], okx_15m["rows_from_base_parquet_footers"], "A: completed exchange bars", "既有歷史封存；實際訓練來源依選定 release 收據", f"public feature schema complete {okx_15m['schema_complete_files']}/{okx_15m['files']} files"),
         _row("Bybit all perpetual 1m (linear+inverse)", "Bybit", bybit_1m["path"], bybit_1m["earliest_event_date"], bybit_1m["latest_event_date"], bybit_1m["rows_from_base_parquet_footers"], "A: completed exchange bars", "原始資料可用；2020 前只有 3 個 inverse 合約", f"{bybit_1m['files_reaching_2020_01_01_or_earlier']}/{bybit_1m['files']} files reach cutoff"),
         _row("Bybit strategy universe daily (linear USDT)", "Bybit", bybit_strategy_daily["path"], bybit_strategy_daily["earliest_event_date"], bybit_strategy_daily["latest_event_date"], bybit_strategy_daily["rows_from_base_parquet_footers"], "A: completed exchange bars plus funding", "可用；但 active strategy universe 最早 2020-03-26", f"{bybit_strategy_daily['files_reaching_2020_01_01_or_earlier']}/{bybit_strategy_daily['files']} files reach cutoff"),
         _row("Bybit funding settlements", "Bybit", bybit_funding["path"], bybit_funding["earliest_event_date"], bybit_funding["latest_event_date"], bybit_funding["rows_from_base_parquet_footers"], "A: official settlement events", "可用，但與合約上市日共同限制", f"{bybit_funding['files']} symbol files"),
@@ -321,18 +351,13 @@ def main() -> None:
         _row("Alternative.me Fear & Greed", "Alternative.me", "data_free_public/observations.parquet", fear_first, fear_last, fear_rows, "B: historical archive first observed now", "研究側車；不可回填成當時已知", "attribution required; repeated retrieval vintages retained"),
         _row("DefiLlama DEX volume", "DefiLlama", "data_free_public/observations.parquet", dex_first, dex_last, dex_rows, "B: historical archive first observed now", "研究側車；不可回填成當時已知", "no historical revision clock"),
         _row("DefiLlama fees/revenue", "DefiLlama", "data_free_public/observations.parquet", fees_first, fees_last, fees_rows, "B: historical archive first observed now", "研究側車；不可回填成當時已知", "no historical revision clock"),
+        _row("DefiLlama aggregate TVL history", "DefiLlama", "data_free_public/observations.parquet", tvl_first, tvl_last, tvl_rows, "B: historical archive first observed now", "完整上游日歷史研究側車；不可回填成當時已知", "excludes liquid staking and double counted TVL; no historical revision clock"),
+        _row("DefiLlama stablecoin supply history", "DefiLlama", "data_free_public/observations.parquet", supply_first, supply_last, supply_rows, "B: historical archive first observed now", "保留原生掛鉤單位與 USD 價值；研究側車", "no historical revision clock; row count includes separate metrics and peg denominations"),
         _row("CoinGecko market snapshots", "CoinGecko", "data_crypto_reference", None, reference.get("end_date"), reference.get("row_count"), "C: prospective snapshots", "只可從 2026-08-16 本機 observed_at 後使用", "Demo historical reach is insufficient for a full 2020 market snapshot panel"),
-        _row("Dune registered crypto queries", "Dune", "data_dune_crypto", None, None, dune.get("rows"), "D: blocked", "不可用", f"state={dune.get('state')}; completed_partitions={dune.get('completed_partitions')}; credit blocked"),
+        _row("Dune registered crypto queries", "Dune", "data_dune_crypto", dune_stored["earliest_event_date"], dune_stored["latest_event_date"], dune_stored["rows_from_base_parquet_footers"], "B: stored partial history; new acquisition blocked" if dune_stored["rows_from_base_parquet_footers"] else "D: blocked", "既有資料保留研究用；不消耗付費額度，不進正式 ABI", f"stored_files={dune_stored['files']}; last_run_state={dune.get('state')}; last_run_rows={dune.get('rows')}; stored rows are not the latest run's rows"),
     ]
 
     critical_findings = [
-        {
-            "severity": "HIGH",
-            "finding": "OKX 1m auxiliary history is incomplete",
-            "evidence": f"{okx_1m['schema_complete_files']}/{okx_1m['files']} files contain required mark/index columns",
-            "impact": "A direct 1m-source rebuild fails for mapped Bybit symbols; do not label missing fields as zero.",
-            "action": "Keep the completed 15m enriched source for daily aggregation until a bounded 1m repair release passes all-symbol audit.",
-        },
         {
             "severity": "HIGH",
             "finding": "Historical event date is not historical information availability",
@@ -356,12 +381,15 @@ def main() -> None:
         },
         {
             "severity": "MEDIUM",
-            "finding": "Dune history is unavailable",
-            "evidence": f"state={dune.get('state')}; rows={dune.get('rows')}",
-            "impact": "No CEX labelled-flow or registered Dune feature can enter training.",
-            "action": "Leave excluded until credits and every partition receipt are complete.",
+            "finding": "Dune stored history and blocked acquisition are separate",
+            "evidence": f"last_run_state={dune.get('state')}; stored_rows={dune_stored['rows_from_base_parquet_footers']}; stored_files={dune_stored['files']}",
+            "impact": "Existing partial research data is preserved; a blocked download is not proof of an empty archive or training readiness.",
+            "action": "Do not run paid queries in the free-only workflow; keep stored partitions excluded from the formal ABI pending lineage and availability audits.",
         },
     ]
+    okx_finding = _okx_auxiliary_finding(okx_1m, public_build)
+    if okx_finding is not None:
+        critical_findings.insert(0, okx_finding)
     generated_at = datetime.now(timezone.utc).isoformat()
     payload = {
         "schema_version": 1,
@@ -390,6 +418,7 @@ def main() -> None:
             "binance_1m": binance_1m,
             "okx_1m": okx_1m,
             "okx_15m": okx_15m,
+            "dune_stored": dune_stored,
         },
     }
     atomic_write_json(output_dir / "coverage_matrix.json", payload)
@@ -402,6 +431,8 @@ def main() -> None:
 ## 判定原則
 
 事件發生日期不等於模型當時可取得日期。A 類才可依收據中的 availability clock 進歷史因果訓練；B 類可保存與研究，但在補齊發布／修訂 vintage 前不得回投；C 類只可從本機首次觀測後前瞻使用；D 類不可用。
+
+此表是本機來源庫存，不是遠端固定 release 的訓練就緒證明。大型交易所的筆數與日期來自 base Parquet footer，不含 hot tail；自由公開資料的筆數包含不同抓取 vintage，不能視為獨立日數。
 
 ## 覆蓋矩陣
 

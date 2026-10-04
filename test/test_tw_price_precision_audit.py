@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from scripts import audit_tw_price_precision as precision
 from scripts.audit_tw_price_precision import (
     _aggregate_audit_status, _counts, _record_grid_result, audit_file,
 )
@@ -72,6 +73,29 @@ def test_audit_labels_foreign_currency_etf_without_changing_its_tick(tmp_path: P
     result = audit_file("twse_daily_ohlcv", tmp_path)
     assert result["status"] == "quote_grid_valid"
     assert result["currency_classes"] == {"foreign_currency_etf": 1, "twd": 1}
+
+
+def test_quote_grid_classification_cache_keeps_name_in_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "data_tw_public/twse_daily_ohlcv.parquet"
+    path.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "date": ["2026-07-06", "2026-07-07"],
+        "證券代號": ["2330", "2330"],
+        "證券名稱": ["first", "second"],
+        **{
+            field: ["100", "100"]
+            for field in ("開盤價", "最高價", "最低價", "收盤價", "最後揭示買價", "最後揭示賣價")
+        },
+    }).write_parquet(path)
+    monkeypatch.setattr(
+        precision,
+        "classify_tw_exchange_security",
+        lambda _venue, _symbol, name: "stock" if name == "first" else "etf",
+    )
+    result = audit_file("twse_daily_ohlcv", tmp_path, batch_size=1)
+    assert result["security_types"] == {"stock": 1, "etf": 1}
 
 
 def test_official_refetch_retires_only_matching_malformed_date_copy(tmp_path: Path):

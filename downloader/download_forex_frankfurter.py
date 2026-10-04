@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import math
+import sys
 import threading
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
 import requests
 
-from common import (
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from downloader.common import (
     SharedRateLimiter,
     describe_rate_limit,
     resolve_end_date,
@@ -20,13 +25,35 @@ from common import (
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from downloader.artifact_io import (
+    atomic_write_json, atomic_write_parquet, atomic_write_text, sha256_bytes, sha256_file,
+)
+from downloader.dataset_lock import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_dataset_lock, parse_lock_timeout_seconds,
+)
 
-API_BASE = "https://api.frankfurter.app"
+API_BASE = "https://api.frankfurter.dev/v1"
+HEAD_COVERAGE_VERSION = 2
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
 _RATE_LIMITER: SharedRateLimiter | None = None
 _HTTP_LOCAL = threading.local()
 _MAX_RETRIES = 4
 _RETRY_BASE = 0.6
+_BASE_RESPONSES: dict[tuple[str, str, str, int], Future] = {}
+_BASE_RESPONSE_LOCK = threading.Lock()
+_BASE_RESPONSE_CACHE_LIMIT = 8
+_HEAD_SOURCE_LOCK = threading.Lock()
+
+
+class HistoricalSourceError(ValueError):
+    """Invalid historical source evidence, not a local Parquet read failure."""
+
+
+def acquisition_contract() -> dict:
+    payload = {"head_coverage_version": HEAD_COVERAGE_VERSION, "api_base": API_BASE,
+               "provider": "ECB", "price_schema_version": 1,
+               "price_semantics": "unchanged native v1 reference rates; no synthetic rebasing"}
+    return {**payload, "fingerprint_sha256": sha256_bytes(json.dumps(payload, sort_keys=True).encode())}
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -42,36 +69,15 @@ def _read_date_column(path: Path) -> pl.DataFrame:
 
 
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        pq.write_table(
-            frame.to_arrow(),
-            temporary,
-            compression="snappy",
-            write_statistics=True,
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
 
 
 def _write_csv(frame: pl.DataFrame, path: Path) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        frame.write_csv(temporary)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_text(path, frame.write_csv())
 
 
 def _write_text(path: Path, value: str) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(value, encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_text(path, value)
 
 
 @dataclass(slots=True)
@@ -103,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         help="daily-update: append only missing dates; full: skip existing unless --refresh.",
     )
     parser.add_argument(
-        "--start-date", default="2000-01-01", help="Inclusive start date (YYYY-MM-DD)"
+        "--start-date", default="1999-01-04", help="Inclusive ECB history start date (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--end-date",
@@ -120,6 +126,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=8, help="Concurrent workers")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
+    parser.add_argument("--lock-timeout-seconds", type=parse_lock_timeout_seconds,
+                        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+                        help="Bounded wait for the canonical dataset writer lock, in seconds")
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--retry-base", type=float, default=0.6)
     parser.add_argument(
@@ -141,6 +150,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not overwrite output_dir/symbols.csv",
     )
+    parser.add_argument("--official-history", action="store_true",
+                        help="Also resume source-separated v2 central-bank history (not blended FX).")
+    parser.add_argument("--official-history-max-requests", type=int, default=16)
     return parser.parse_args()
 
 
@@ -148,6 +160,7 @@ def _get_json(url: str, timeout: int) -> dict:
     session = getattr(_HTTP_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
+        session.headers.update({"User-Agent": "stockAgent-economic-research/1.0"})
         adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
@@ -161,7 +174,7 @@ def _get_json(url: str, timeout: int) -> dict:
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
-                raise RuntimeError(f"Unexpected response shape for {url}")
+                raise HistoricalSourceError(f"Unexpected response shape for {url}")
             return data
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
@@ -185,6 +198,185 @@ def _get_json(url: str, timeout: int) -> dict:
 def _load_supported_currencies(timeout: int) -> set[str]:
     payload = _get_json(f"{API_BASE}/currencies", timeout)
     return {str(code).upper() for code in payload.keys()}
+
+
+def _base_rates(base: str, start: str, end: str, timeout: int) -> dict:
+    """One HTTP response per base/date window, shared by all quote workers."""
+    key = (base, start, end, timeout)
+    with _BASE_RESPONSE_LOCK:
+        future = _BASE_RESPONSES.get(key)
+        owner = future is None
+        if owner:
+            # Bound retained full-history JSON. In-flight futures cannot be
+            # evicted or sibling quote workers could duplicate their request.
+            for old_key in list(_BASE_RESPONSES):
+                if len(_BASE_RESPONSES) < _BASE_RESPONSE_CACHE_LIMIT:
+                    break
+                if _BASE_RESPONSES[old_key].done():
+                    del _BASE_RESPONSES[old_key]
+            future = Future()
+            _BASE_RESPONSES[key] = future
+    if owner:
+        try:
+            future.set_result(_get_json(f"{API_BASE}/{start}..{end}?from={base}", timeout))
+        except Exception as exc:
+            future.set_exception(exc)
+    return future.result()
+
+
+def _pivot_source_query(start: str, end: str) -> dict:
+    return {"head_coverage_version": HEAD_COVERAGE_VERSION, "provider": "ECB",
+            "url": f"{API_BASE}/{start}..{end}?from=EUR", "start": start, "end": end}
+
+
+def _pivot_source_path(directory: Path, start: str, end: str) -> Path:
+    query = json.dumps(_pivot_source_query(start, end), sort_keys=True).encode()
+    return directory / ".head_sources" / f"{sha256_bytes(query)}.json"
+
+
+def _validate_pivot_window(payload: dict, start: str, end: str) -> dict:
+    # A 404 is not absence evidence. Require a nonempty, complete, correctly
+    # scoped native ECB response; conservatively reject shifted boundaries.
+    if (not isinstance(payload, dict) or payload.get("base") != "EUR"
+            or payload.get("amount") != 1 or isinstance(payload.get("amount"), bool)
+            or payload.get("start_date") != start or payload.get("end_date") != end):
+        raise HistoricalSourceError("ECB pivot evidence has wrong base, amount or window")
+    rates = payload.get("rates")
+    if (not isinstance(rates, dict) or not rates or any(not isinstance(day, str) for day in rates)
+            or min(rates) != start or max(rates) != end):
+        raise HistoricalSourceError("ECB pivot evidence does not cover the exact requested window")
+    for day, items in rates.items():
+        try:
+            parsed = datetime.strptime(day, "%Y-%m-%d").date().isoformat()
+        except (TypeError, ValueError) as exc:
+            raise HistoricalSourceError("ECB pivot evidence has invalid observation dates") from exc
+        if parsed != day or not start <= day <= end or not isinstance(items, dict) or not items:
+            raise HistoricalSourceError("ECB pivot evidence has invalid observation rows")
+        for currency, value in items.items():
+            if (not isinstance(currency, str) or len(currency) != 3 or not currency.isascii()
+                    or not currency.isalpha() or currency != currency.upper()
+                    or isinstance(value, bool) or not isinstance(value, (float, int))
+                    or not math.isfinite(value) or value <= 0):
+                raise HistoricalSourceError("ECB pivot evidence has invalid currency rates")
+    return rates
+
+
+def _verified_base_absence(base: str, start: str, end: str, directory: Path, timeout: int) -> dict:
+    """Keep one source response per window; never derive/rebase price rows."""
+    if base == "EUR":
+        raise HistoricalSourceError("ECB native base cannot be treated as unpublished")
+    source_path = _pivot_source_path(directory, start, end)
+    query = _pivot_source_query(start, end)
+    with _HEAD_SOURCE_LOCK:
+        if source_path.exists():
+            source = _read_pivot_source(source_path)
+        else:
+            source = None
+    if source is None:
+        payload = _base_rates("EUR", start, end, timeout)
+        _validate_pivot_window(payload, start, end)
+        candidate = {"query": query, "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+                     "response": payload}
+        with _HEAD_SOURCE_LOCK:
+            # Sibling quote workers share both the network future and this
+            # immutable source evidence. Do not overwrite prior source bytes.
+            if source_path.exists():
+                source = _read_pivot_source(source_path)
+            else:
+                atomic_write_json(source_path, candidate)
+                source = candidate
+    if not isinstance(source, dict) or source.get("query") != query:
+        raise HistoricalSourceError("ECB pivot evidence query contract mismatch")
+    rates = _validate_pivot_window(source.get("response"), start, end)
+    if any(base in items for items in rates.values()):
+        raise HistoricalSourceError("ECB pivot contains base observations; original 404 remains a failure")
+    return {"head_status": "verified_base_unpublished", "unpublished_base": base,
+            "pivot_source_sha256": sha256_file(source_path), "pivot_observation_days": len(rates)}
+
+
+def _read_pivot_source(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HistoricalSourceError("existing ECB pivot evidence cannot be read; preserved unchanged") from exc
+
+
+def _first_observed_date(path: Path) -> str:
+    dates = _normalize_date_frame(_read_date_column(path))
+    if dates.is_empty():
+        raise ValueError("existing FX file has no valid dates")
+    return dates.select(pl.col("date").min()).item().date().isoformat()
+
+
+def _repair_history_head(record: SymbolRecord, start: str, end: str, path: Path, timeout: int) -> None:
+    """Changing --start-date must actually repair the front, not only the tail."""
+    proof_path = path.with_suffix(".head.json")
+    try:
+        proof = json.loads(proof_path.read_text())
+    except (OSError, ValueError):
+        proof = {}
+    bound = (isinstance(proof, dict) and proof.get("requested_start", "9999") <= start
+             and proof.get("source_sha256") == sha256_file(path))
+    first_value = proof.get("first_observed_date") if bound else None
+    first = datetime.strptime(first_value or _first_observed_date(path), "%Y-%m-%d").date()
+    through = min(end, (first - timedelta(days=1)).isoformat())
+    if bound and proof.get("checked_through", "") >= through:
+        if proof.get("head_status") != "verified_base_unpublished":
+            return
+        pivot_path = _pivot_source_path(path.parent, proof["requested_start"], proof["checked_through"])
+        if (proof.get("head_coverage_version") == HEAD_COVERAGE_VERSION
+                and proof.get("unpublished_base") == record.base and pivot_path.is_file()
+                and proof.get("pivot_source_sha256") == sha256_file(pivot_path)):
+            return
+    evidence = {"head_status": "not_required"}
+    if start <= through:
+        try:
+            payload = _base_rates(record.base, start, through, timeout)
+        except requests.HTTPError as exc:
+            if getattr(exc.response, "status_code", None) != 404:
+                raise
+            evidence = _verified_base_absence(record.base, start, through, path.parent, timeout)
+            payload = {"rates": {}}
+        rates = payload.get("rates")
+        if not isinstance(rates, dict) or (not rates and evidence["head_status"] != "verified_base_unpublished"):
+            raise HistoricalSourceError("invalid ECB historical response")
+        if evidence["head_status"] == "not_required":
+            evidence["head_status"] = "source_queried"
+        rows = []
+        for day, items in rates.items():
+            if not isinstance(items, dict):
+                raise HistoricalSourceError("invalid ECB historical observation row")
+            value = items.get(record.quote)
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, (float, int)):
+                    raise HistoricalSourceError("invalid ECB historical rate type")
+                number = float(value)
+                if not math.isfinite(number) or number <= 0:
+                    raise HistoricalSourceError("nonpositive or nonfinite FX rate")
+                rows.append({"date": day, "open": number, "max": number, "min": number,
+                             "close": number, "adjclose": number, "Trading_Volume": None})
+        head = _normalize_rate_rows(rows, start, through)
+        if not head.is_empty():
+            old = _normalize_date_frame(_read_parquet(path))
+            merged = pl.concat([head, old], how="diagonal_relaxed").unique(subset=["date"], keep="last").sort("date")
+            _write_parquet(merged, path)
+            first = merged.select(pl.col("date").min()).item().date()
+    atomic_write_json(proof_path, {"provider": "ECB", "head_coverage_version": HEAD_COVERAGE_VERSION,
+                                  "requested_start": start, **evidence,
+                                  "first_observed_date": first.isoformat(),
+                                  "checked_through": through, "source_sha256": sha256_file(path),
+                                  "coverage_basis": "queried source; non-publication days are not fabricated"})
+
+
+def _advance_head_proof_after_tail(path: Path, requested_start: str) -> None:
+    proof_path = path.with_suffix(".head.json")
+    try:
+        proof = json.loads(proof_path.read_text())
+    except (OSError, ValueError):
+        proof = {"provider": "ECB", "requested_start": requested_start,
+                 "coverage_basis": "original full-window source query"}
+    proof["source_sha256"] = sha256_file(path)
+    atomic_write_json(proof_path, proof)
 
 
 def _resolve_api_end_date(timeout: int) -> str:
@@ -352,6 +544,7 @@ def _download_pair(
 
     if output_path.exists() and incremental:
         try:
+            _repair_history_head(record, start_date, end_date, output_path, timeout)
             existing_rows, latest_date = _existing_row_count_and_latest_date(
                 output_path
             )
@@ -373,10 +566,16 @@ def _download_pair(
                     output_path=str(output_path),
                 )
         except Exception as exc:
+            source_failure = isinstance(exc, (requests.RequestException, HistoricalSourceError))
+            if source_failure:
+                try:
+                    existing_rows = _read_parquet_row_count(output_path)
+                except Exception:
+                    source_failure = False
             return DownloadResult(
                 code=record.code,
-                status="failed_existing_read",
-                rows=0,
+                status="failed_head_source" if source_failure else "failed_existing_read",
+                rows=existing_rows if source_failure else 0,
                 output_path=str(output_path),
                 message=str(exc),
             )
@@ -399,9 +598,8 @@ def _download_pair(
                 message=str(exc),
             )
 
-    url = f"{API_BASE}/{fetch_start_date}..{end_date}?from={record.base}&to={record.quote}"
     try:
-        payload = _get_json(url, timeout)
+        payload = _base_rates(record.base, fetch_start_date, end_date, timeout)
         rates = payload.get("rates", {})
         if not isinstance(rates, dict) or not rates:
             return DownloadResult(
@@ -420,6 +618,8 @@ def _download_pair(
             if close_value is None:
                 continue
             close_num = float(close_value)
+            if not math.isfinite(close_num) or close_num <= 0:
+                raise ValueError("nonpositive or nonfinite FX rate")
             rows.append(
                 {
                     "date": d,
@@ -463,6 +663,7 @@ def _download_pair(
                 .sort("date")
             )
             _write_parquet(merged, output_path)
+            _advance_head_proof_after_tail(output_path, start_date)
             return DownloadResult(
                 code=record.code,
                 status="updated_incremental",
@@ -471,6 +672,7 @@ def _download_pair(
             )
 
         _write_parquet(frame, output_path)
+        _advance_head_proof_after_tail(output_path, start_date)
         return DownloadResult(
             code=record.code,
             status="updated",
@@ -487,9 +689,9 @@ def _download_pair(
         )
 
 
-def main() -> None:
+def _run_download(args: argparse.Namespace) -> None:
     global _MAX_RETRIES, _RATE_LIMITER, _RETRY_BASE
-    args = parse_args()
+    _BASE_RESPONSES.clear()
     _MAX_RETRIES = max(0, int(args.max_retries))
     _RETRY_BASE = max(0.1, float(args.retry_base))
     incremental_mode = args.incremental or args.mode == "daily-update"
@@ -576,11 +778,16 @@ def main() -> None:
         "symbol_count": len(records),
         "row_count": row_count,
         "status_counts": status_counts,
+        "acquisition_contract": acquisition_contract(),
     }
     _write_text(
         output_dir / "download_summary.json",
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
     )
+    _BASE_RESPONSES.clear()
+    if args.official_history:
+        from downloader.frankfurter_official_history import run_official_history
+        run_official_history(output_dir / "official_v2", max_requests=args.official_history_max_requests)
 
     print(
         "[download] provider=frankfurter "
@@ -593,6 +800,13 @@ def main() -> None:
     )
     if failed:
         raise RuntimeError(f"Frankfurter download incomplete: {failed} pairs failed")
+
+
+def main() -> None:
+    args = parse_args()
+    with exclusive_dataset_lock(Path(args.output_dir) / ".download.lock",
+                                provider="frankfurter", timeout_seconds=args.lock_timeout_seconds):
+        _run_download(args)
 
 
 if __name__ == "__main__":

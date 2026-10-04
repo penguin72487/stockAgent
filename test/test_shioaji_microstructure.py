@@ -25,10 +25,18 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_tick,
 )
 from downloader.stream_shioaji_taifex_bidask import (
+    bidask_stream_stale,
+    bidask_watchdog_hedge,
+    bidask_watchdog_reference_ns,
+    bidask_watchdog_session_active,
+    first_required_tick_reference_ns,
     partition_contract_infos,
     prioritize_required_option_pairs,
     select_balanced_option_strips,
     select_option_strip,
+)
+from scripts.audit_shioaji_taifex_bidask_capture import (
+    strategy_hedge_tail_gap_seconds,
 )
 from stockagent.live.taifex_strategy_state import (
     load_held_option_codes,
@@ -52,6 +60,306 @@ def test_taifex_capture_module_cli_imports_from_repo_root() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "Capture TX front-month" in completed.stdout
+
+
+def test_taifex_bidask_watchdog_requires_prior_book_and_active_session() -> None:
+    assert not bidask_stream_stale(
+        now_monotonic_ns=1_000_000_000_000,
+        last_book_monotonic_ns=0,
+        in_capture_session=True,
+    )
+    assert not bidask_stream_stale(
+        now_monotonic_ns=1_000_000_000_000,
+        last_book_monotonic_ns=800_000_000_000,
+        in_capture_session=False,
+    )
+    assert not bidask_stream_stale(
+        now_monotonic_ns=1_000_000_000_000,
+        last_book_monotonic_ns=820_000_000_000,
+        in_capture_session=True,
+    )
+    assert bidask_stream_stale(
+        now_monotonic_ns=1_000_000_000_001,
+        last_book_monotonic_ns=820_000_000_000,
+        in_capture_session=True,
+    )
+    assert bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=100,
+        last_required_book_monotonic_ns=200,
+        active_session_start_monotonic_ns=1_000,
+    ) == 1_000
+    assert bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=0,
+        last_required_book_monotonic_ns=0,
+        active_session_start_monotonic_ns=1_000,
+    ) == 0
+    assert bidask_watchdog_session_active(
+        now=datetime.fromisoformat("2026-09-16T13:29:59+08:00"),
+        capture_session="day",
+        required_book_last_trading_date=date(2026, 9, 16),
+    )
+    assert not bidask_watchdog_session_active(
+        now=datetime.fromisoformat("2026-09-16T13:30:00+08:00"),
+        capture_session="day",
+        required_book_last_trading_date=date(2026, 9, 16),
+    )
+    assert bidask_watchdog_session_active(
+        now=datetime.fromisoformat("2026-09-17T13:35:00+08:00"),
+        capture_session="day",
+        required_book_last_trading_date=date(2026, 10, 21),
+    )
+
+
+def _required_hedge_tick(
+    event_at: str = "2026-09-18T09:00:00+08:00",
+    received_at: str = "2026-09-18T09:00:00.100000+08:00",
+) -> dict[str, object]:
+    return normalize_fop_tick(
+        Payload(
+            {
+                "code": "TMFJ6",
+                "datetime": datetime.fromisoformat(event_at),
+                "close": 47_000,
+                "volume": 1,
+                "simtrade": False,
+            }
+        ),
+        event_seq=1,
+        worker_index=0,
+        receive_ts_ns=int(datetime.fromisoformat(received_at).timestamp() * 1e9),
+        receive_monotonic_ns=10_000_000_000,
+    )
+
+
+def test_hedge_watchdog_follows_subscriptions_without_a_strategy_engine() -> None:
+    assert bidask_watchdog_hedge(
+        hedge_code="TMFJ6",
+        hedge_last_trading_date=date(2026, 10, 21),
+        subscribed_codes={"TXFJ6", "TMFJ6", "TXO47000I6"},
+    ) == ("TMFJ6", date(2026, 10, 21))
+    assert bidask_watchdog_hedge(
+        hedge_code="TMFJ6",
+        hedge_last_trading_date=date(2026, 10, 21),
+        subscribed_codes={"TXO47000I6"},
+    ) == (None, None)
+    with pytest.raises(RuntimeError, match="subscribed hedge has no last trading date"):
+        bidask_watchdog_hedge(
+            hedge_code="TMFJ6",
+            hedge_last_trading_date=None,
+            subscribed_codes={"TMFJ6"},
+        )
+
+
+def test_required_hedge_tick_starts_a_fixed_first_book_deadline() -> None:
+    tick = _required_hedge_tick()
+    arguments = {
+        "required_book_code": "TMFJ6",
+        "required_book_last_trading_date": date(2026, 10, 21),
+        "capture_session": "day",
+        "capture_trade_date": date(2026, 9, 18),
+        "maximum_age_seconds": 2.0,
+    }
+    first_tick = first_required_tick_reference_ns(
+        first_required_tick_monotonic_ns=0, tick=tick, **arguments
+    )
+    assert first_tick == 10_000_000_000
+    later_tick = {**tick, "receive_monotonic_ns": 189_000_000_000}
+    assert first_required_tick_reference_ns(
+        first_required_tick_monotonic_ns=first_tick,
+        tick=later_tick,
+        **arguments,
+    ) == first_tick
+
+    # A later option book is not proof that the required hedge book recovered.
+    reference = bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=189_000_000_000,
+        last_required_book_monotonic_ns=0,
+        active_session_start_monotonic_ns=9_000_000_000,
+        first_required_tick_monotonic_ns=first_tick,
+    )
+    assert reference == first_tick
+    assert not bidask_stream_stale(
+        now_monotonic_ns=190_000_000_000,
+        last_book_monotonic_ns=reference,
+        in_capture_session=True,
+    )
+    assert bidask_stream_stale(
+        now_monotonic_ns=190_000_000_001,
+        last_book_monotonic_ns=reference,
+        in_capture_session=True,
+    )
+    assert bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=0,
+        last_required_book_monotonic_ns=0,
+        active_session_start_monotonic_ns=11_000_000_000,
+        first_required_tick_monotonic_ns=first_tick,
+    ) == 11_000_000_000
+    assert bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=189_000_000_000,
+        last_required_book_monotonic_ns=189_000_000_000,
+        active_session_start_monotonic_ns=9_000_000_000,
+        first_required_tick_monotonic_ns=first_tick,
+    ) == 189_000_000_000
+    # Once a hedge book was received, a later first Tick must not extend its age.
+    assert bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=first_tick,
+        last_required_book_monotonic_ns=first_tick,
+        active_session_start_monotonic_ns=9_000_000_000,
+        first_required_tick_monotonic_ns=189_000_000_000,
+    ) == first_tick
+    assert bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=0,
+        last_required_book_monotonic_ns=0,
+        active_session_start_monotonic_ns=0,
+        first_required_tick_monotonic_ns=first_tick,
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"code": "TXO47000I6"},
+        {"simtrade": True},
+        {"suspend": True},
+        {"volume": 0},
+        {"close": float("nan")},
+        {"close": 0},
+        {"trade_date": date(2026, 9, 17)},
+        {"exchange_ts_ns": int(datetime.fromisoformat(
+            "2026-09-18T08:59:57+08:00"
+        ).timestamp() * 1e9)},
+        {"exchange_ts_ns": int(datetime.fromisoformat(
+            "2026-09-18T09:00:01+08:00"
+        ).timestamp() * 1e9)},
+    ],
+)
+def test_required_hedge_first_book_deadline_rejects_unproven_ticks(
+    overrides: dict[str, object],
+) -> None:
+    assert first_required_tick_reference_ns(
+        first_required_tick_monotonic_ns=0,
+        tick={**_required_hedge_tick(), **overrides},
+        required_book_code="TMFJ6",
+        required_book_last_trading_date=date(2026, 10, 21),
+        capture_session="day",
+        capture_trade_date=date(2026, 9, 18),
+        maximum_age_seconds=2.0,
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    "event_at,received_at,session,trade_date,expiry,expected",
+    [
+        ("2026-09-18T08:44:59+08:00", "2026-09-18T08:45:00+08:00",
+         "day", "2026-09-18", "2026-10-21", False),
+        ("2026-09-18T14:59:59+08:00", "2026-09-18T15:00:00+08:00",
+         "night", "2026-09-21", "2026-10-21", False),
+        ("2026-09-18T14:00:00+08:00", "2026-09-18T14:00:00+08:00",
+         "day", "2026-09-18", "2026-10-21", False),
+        ("2026-09-19T09:00:00+08:00", "2026-09-19T09:00:00+08:00",
+         "day", "2026-09-19", "2026-10-21", False),
+        ("2026-09-20T15:00:00+08:00", "2026-09-20T15:00:00+08:00",
+         "night", "2026-09-21", "2026-10-21", False),
+        ("2026-09-19T04:59:00+08:00", "2026-09-19T04:59:00+08:00",
+         "night", "2026-09-21", "2026-10-21", True),
+        ("2026-09-16T13:29:59+08:00", "2026-09-16T13:30:00+08:00",
+         "day", "2026-09-16", "2026-09-16", False),
+        ("2026-09-16T13:30:00+08:00", "2026-09-16T13:30:00+08:00",
+         "day", "2026-09-16", "2026-10-21", True),
+        ("2026-09-18T15:00:00+08:00", "2026-09-18T15:00:00+08:00",
+         "night", "2026-09-21", "2026-10-21", True),
+        ("2026-09-18T13:35:00+08:00", "2026-09-18T13:35:00+08:00",
+         "day", "2026-09-18", "2026-10-21", True),
+    ],
+)
+def test_required_hedge_first_book_deadline_obeys_event_and_session_clock(
+    event_at: str, received_at: str, session: str,
+    trade_date: str, expiry: str, expected: bool,
+) -> None:
+    reference = first_required_tick_reference_ns(
+        first_required_tick_monotonic_ns=0,
+        tick=_required_hedge_tick(event_at, received_at),
+        required_book_code="TMFJ6",
+        required_book_last_trading_date=date.fromisoformat(expiry),
+        capture_session=session,
+        capture_trade_date=date.fromisoformat(trade_date),
+        maximum_age_seconds=2.0,
+    )
+    assert bool(reference) is expected
+
+
+def test_options_worker_without_required_hedge_keeps_first_book_unknown() -> None:
+    assert first_required_tick_reference_ns(
+        first_required_tick_monotonic_ns=0,
+        tick=_required_hedge_tick(),
+        required_book_code=None,
+        required_book_last_trading_date=None,
+        capture_session="day",
+        capture_trade_date=date(2026, 9, 18),
+        maximum_age_seconds=2.0,
+    ) == 0
+    reference = bidask_watchdog_reference_ns(
+        first_book_monotonic_ns=0,
+        last_required_book_monotonic_ns=0,
+        active_session_start_monotonic_ns=10_000_000_000,
+    )
+    assert not bidask_stream_stale(
+        now_monotonic_ns=610_000_000_000,
+        last_book_monotonic_ns=reference,
+        in_capture_session=True,
+    )
+
+
+def test_taifex_audit_uses_strategy_hedge_tail_not_other_workers() -> None:
+    manifest = {
+        "worker_index": 0,
+        "capture_session": "day",
+        "strategy_simulation": {"enabled": True},
+        "selection": {"resolved_hedge_future_code": "TMFJ6"},
+        "contract_metadata": [
+            {"code": "TMFJ6", "last_trading_date": "2026-10-21"}
+        ],
+        "finished_at_utc": "2026-09-18T05:45:00+00:00",
+    }
+    books = pl.DataFrame(
+        {
+            "worker_index": [0, 1],
+            "code": ["TMFJ6", "TXO123"],
+            "receive_ts_ns": [
+                int(datetime.fromisoformat("2026-09-18T01:24:41+00:00").timestamp() * 1e9),
+                int(datetime.fromisoformat("2026-09-18T05:44:59+00:00").timestamp() * 1e9),
+            ],
+        }
+    )
+    assert strategy_hedge_tail_gap_seconds(manifest, books) == pytest.approx(
+        4 * 3600 + 20 * 60 + 19
+    )
+    assert strategy_hedge_tail_gap_seconds(
+        {**manifest, "strategy_simulation": {"enabled": False}}, books
+    ) is None
+
+
+def test_taifex_audit_caps_expiring_hedge_at_official_1330() -> None:
+    manifest = {
+        "worker_index": 0,
+        "capture_session": "day",
+        "strategy_simulation": {"enabled": True},
+        "selection": {"resolved_hedge_future_code": "TMFI6"},
+        "contract_metadata": [
+            {"code": "TMFI6", "last_trading_date": "2026-09-16"}
+        ],
+        "finished_at_utc": "2026-09-16T05:45:05+00:00",
+    }
+    books = pl.DataFrame(
+        {
+            "worker_index": [0],
+            "code": ["TMFI6"],
+            "receive_ts_ns": [
+                int(datetime.fromisoformat("2026-09-16T05:29:54+00:00").timestamp() * 1e9)
+            ],
+        }
+    )
+    assert strategy_hedge_tail_gap_seconds(manifest, books) == pytest.approx(6.0)
 
 
 class Payload:

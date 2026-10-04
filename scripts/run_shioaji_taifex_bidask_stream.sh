@@ -30,6 +30,7 @@ if [[ -z "${SHIOAJI_API_KEY:-}" || -z "${SHIOAJI_SECRET_KEY:-}" ]]; then
   exit 2
 fi
 source scripts/runtime_env.sh
+CAPTURE_PYTHON="$(resolve_fintech_python)"
 
 # Fail at service startup if the package entry point cannot be imported.  Running
 # the collector with ``-m`` keeps the repository root on sys.path; executing the
@@ -108,6 +109,7 @@ while true; do
     echo "[shioaji-taifex] waiting_seconds=$delay reason=next_capture_window session=$capture_session trade_date=$trade_date stop_at=$stop_at"
     sleep "$delay"
   fi
+  strategy_bootstrap_ready="$EXECUTE_STRATEGIES"
   if [[ "$EXECUTE_STRATEGIES" == true ]]; then
     if [[ "$capture_session" == night ]]; then
       # The day-session TXO/TX expiry has finished before night pre-open.  Pull
@@ -146,23 +148,24 @@ while true; do
       --strategy-option-risk-margin-c-twd "$STRATEGY_OPTION_RISK_MARGIN_C_TWD" \
       --strategy-capital-buffer-multiple "$STRATEGY_CAPITAL_BUFFER_MULTIPLE" \
       --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"; then
-      echo "[shioaji-taifex] settlement_bootstrap_failed trade_date=$trade_date retry_seconds=30" >&2
-      sleep 30
-      continue
+      # Strategy settlement must fail closed, but quotes are an independent
+      # data stream.  Run data-only capture without a strategy state mutation.
+      strategy_bootstrap_ready=false
+      echo "[shioaji-taifex] settlement_bootstrap_failed trade_date=$trade_date strategy=blocked capture=data_only" >&2
     fi
   fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
   required_option_codes=""
-  if [[ "$EXECUTE_STRATEGIES" == true ]]; then
+  if [[ "$strategy_bootstrap_ready" == true ]]; then
     required_option_codes="$(run_fintech_python -c 'from pathlib import Path; import sys; from stockagent.live.taifex_strategy_state import load_required_option_codes; print(",".join(load_required_option_codes(Path(sys.argv[1]))))' "$STRATEGY_STATE_DIR")"
   fi
-  echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at"
+  echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at strategy_bootstrap_ready=$strategy_bootstrap_ready"
   worker_pids=()
   worker_rcs=()
   set +e
   for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
     strategy_args=()
-    if [[ "$EXECUTE_STRATEGIES" == true && "$worker_index" -eq 0 ]]; then
+    if [[ "$strategy_bootstrap_ready" == true && "$worker_index" -eq 0 ]]; then
       strategy_args+=(
         --execute-strategies
         --final-settlement-path "$FINAL_SETTLEMENT_PATH"
@@ -179,7 +182,9 @@ while true; do
         --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"
       )
     fi
-    run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
+    # Launch the Python worker directly so the recorded PID can be terminated
+    # without leaving a child holding a Shioaji login after a sibling fails.
+    "$CAPTURE_PYTHON" -m downloader.stream_shioaji_taifex_bidask \
       --simulation \
       "${strategy_args[@]}" \
       --capture-id "$capture_id" \
@@ -207,12 +212,44 @@ while true; do
   }
   trap cleanup_workers TERM INT
   capture_rc=0
-  for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
-    wait "${worker_pids[$worker_index]}"
-    worker_rc=$?
-    worker_rcs+=("$worker_rc")
-    if (( worker_rc != 0 )); then
-      capture_rc=1
+  remaining_workers=$WORKERS
+  worker_finished=()
+  while (( remaining_workers > 0 )); do
+    for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+      if [[ "${worker_finished[$worker_index]:-}" == true ]]; then
+        continue
+      fi
+      if kill -0 "${worker_pids[$worker_index]}" 2>/dev/null; then
+        continue
+      fi
+      wait "${worker_pids[$worker_index]}"
+      worker_rc=$?
+      worker_rcs[$worker_index]="$worker_rc"
+      worker_finished[$worker_index]=true
+      (( remaining_workers-- ))
+      if (( worker_rc != 0 )); then
+        capture_rc=1
+        break
+      fi
+    done
+    if (( capture_rc != 0 )); then
+      # One worker's missing market data invalidates the shared capture. Stop
+      # its siblings now instead of waiting until the session close to retry.
+      for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+        if [[ "${worker_finished[$worker_index]:-}" != true ]]; then
+          kill -TERM "${worker_pids[$worker_index]}" 2>/dev/null || true
+        fi
+      done
+      for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+        if [[ "${worker_finished[$worker_index]:-}" != true ]]; then
+          wait "${worker_pids[$worker_index]}"
+          worker_rcs[$worker_index]=$?
+        fi
+      done
+      break
+    fi
+    if (( remaining_workers > 0 )); then
+      sleep 0.5
     fi
   done
   trap - TERM INT

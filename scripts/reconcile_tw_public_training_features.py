@@ -77,8 +77,9 @@ def _accepted_close_end_date(input_dir: Path, publication_root: Path) -> str | N
             or Path(str(accepted.get("live_root") or "")).resolve(strict=False)
             != input_dir.resolve(strict=False)
             or not isinstance(summary, dict)
-            or summary.get("coverage_complete") is not True
+            or summary.get("daily_close_ready") is not True
             or summary.get("blocking_failed_count") not in (0, "0")
+            or summary.get("incomplete_count") not in (0, "0")
             or not {"twse_daily_ohlcv", "tpex_daily_ohlcv"}
             <= set(accepted.get("selected_datasets") or ())
         ):
@@ -97,24 +98,28 @@ def _accepted_close_end_date(input_dir: Path, publication_root: Path) -> str | N
     return max(close_dates) if close_dates else None
 
 
-def needs_rebuild(input_dir: Path, symbols_root: Path, output_path: Path) -> tuple[bool, str]:
+def needs_rebuild(input_dir: Path, symbols_root: Path, output_path: Path) -> tuple[bool, str, bool]:
     download = _read_json(input_dir / "download_summary.json")
     if download.get("coverage_complete") is not True or int(download.get("blocking_failed_count", -1)) != 0:
         raise RuntimeError("TW public download receipt does not prove complete close-source coverage")
-    target_end = str(download.get("end_date") or "")
-    if not target_end:
+    complete_end = str(download.get("end_date") or "")
+    if not complete_end:
         raise RuntimeError("TW public download receipt lacks end_date")
     accepted_close = _accepted_close_end_date(
         input_dir, REPO_ROOT / "artifacts/data_refresh/tw_public/publications"
     )
-    if accepted_close is not None:
-        target_end = max(target_end, accepted_close)
+    target_end = max(complete_end, accepted_close or complete_end)
+    # The completed-session finalizer explicitly permits non-blocking daily
+    # publication lag after both official close files are present. Preserve
+    # that exact build contract when a later macro archive is reconciled.
+    allow_daily_publication_lag = target_end > complete_end
     compatible = _incremental_base_is_compatible(
         output_path,
         output_path.with_suffix(".summary.json"),
         market_symbol=DEFAULT_MARKET_SYMBOL,
         source_receipts=_source_content_receipts(input_dir),
         symbol_universe_receipt=_symbol_universe_receipt(symbols_root),
+        allow_daily_publication_lag=allow_daily_publication_lag,
     )
     footer = parquet_footer_stats(output_path) if output_path.is_file() else None
     prior = _read_json(output_path.with_suffix(".summary.json")) if compatible else {}
@@ -129,8 +134,8 @@ def needs_rebuild(input_dir: Path, symbols_root: Path, output_path: Path) -> tup
             f"target={target_end} existing={built_through}"
         )
     if compatible and built_through >= target_end:
-        return False, target_end
-    return True, target_end
+        return False, target_end, allow_daily_publication_lag
+    return True, target_end, allow_daily_publication_lag
 
 
 def main() -> int:
@@ -150,6 +155,10 @@ def main() -> int:
         "--research-taifex-output-path", type=Path, default=None,
         help="Also refresh the separate TAIFEX-enriched local research ABI after the wide table.",
     )
+    parser.add_argument(
+        "--research-all-output-path", type=Path, default=None,
+        help="Also refresh the all-observed research ABI after the TAIFEX table.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--source-update-lock-held", action="store_true",
@@ -160,6 +169,10 @@ def main() -> int:
         help="Timer catch-up must not run a full rebuild during the Taiwan stock session.",
     )
     args = parser.parse_args()
+    if args.research_taifex_output_path is not None and args.research_all_output_path is None:
+        args.research_all_output_path = args.research_taifex_output_path.with_name(
+            "tw_public_research_all_2014_v3.parquet"
+        )
     local_now = datetime.now(ZoneInfo("Asia/Taipei"))
     if args.defer_market_hours and _inside_taiwan_market_hours(local_now.time()):
         print("[tw-public-feature-reconcile] deferred=taiwan_market_hours", flush=True)
@@ -171,21 +184,34 @@ def main() -> int:
     )
     try:
         with lock:
-            rebuild, end_date = needs_rebuild(args.input_dir, args.symbols_root, args.output_path)
-            print(f"[tw-public-feature-reconcile] rebuild={str(rebuild).lower()} end_date={end_date}", flush=True)
+            rebuild, end_date, allow_lag = needs_rebuild(
+                args.input_dir, args.symbols_root, args.output_path
+            )
+            print(
+                f"[tw-public-feature-reconcile] rebuild={str(rebuild).lower()} "
+                f"end_date={end_date} allow_daily_publication_lag={str(allow_lag).lower()}",
+                flush=True,
+            )
             if args.dry_run:
                 return 0
             if rebuild:
+                command = [
+                    sys.executable, str(REPO_ROOT / "scripts/build_tw_public_training_features.py"),
+                    "--input-dir", str(args.input_dir), "--symbols-root", str(args.symbols_root),
+                    "--output-path", str(args.output_path), "--end-date", end_date,
+                    "--incremental-tail-days", "7",
+                ]
+                if allow_lag:
+                    command.append("--allow-daily-publication-lag")
                 subprocess.run(
-                    [sys.executable, str(REPO_ROOT / "scripts/build_tw_public_training_features.py"),
-                     "--input-dir", str(args.input_dir), "--symbols-root", str(args.symbols_root),
-                     "--output-path", str(args.output_path), "--end-date", end_date,
-                     "--incremental-tail-days", "7"],
+                    command,
                     cwd=REPO_ROOT,
                     check=True,
                 )
-                rebuild_again, checked_end = needs_rebuild(args.input_dir, args.symbols_root, args.output_path)
-                if rebuild_again or checked_end != end_date:
+                rebuild_again, checked_end, checked_allow_lag = needs_rebuild(
+                    args.input_dir, args.symbols_root, args.output_path
+                )
+                if rebuild_again or checked_end != end_date or checked_allow_lag != allow_lag:
                     raise RuntimeError("TW public feature receipt changed or remained stale after rebuild")
             if args.research_output_path is not None:
                 # The research table consumes the provisional macro ledger,
@@ -216,8 +242,19 @@ def main() -> int:
                         cwd=REPO_ROOT,
                         check=True,
                     )
+                    if args.research_all_output_path is not None:
+                        subprocess.run(
+                            [sys.executable, str(REPO_ROOT / "scripts/build_tw_public_research_all_features.py"),
+                             "--wide-path", str(args.research_taifex_output_path),
+                             "--official-path", str(args.output_path),
+                             "--output-path", str(args.research_all_output_path)],
+                            cwd=REPO_ROOT,
+                            check=True,
+                        )
             elif args.research_taifex_output_path is not None:
                 raise ValueError("--research-taifex-output-path requires --research-output-path")
+            if args.research_all_output_path is not None and args.research_taifex_output_path is None:
+                raise ValueError("--research-all-output-path requires --research-taifex-output-path")
     except RuntimeError as exc:
         if str(exc) != "canonical TW public source update is active":
             raise

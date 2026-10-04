@@ -1,0 +1,7 @@
+[Unit]
+Description=Bounded WSL memory reclaim for registered historical-data backfill
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @REPO_ROOT@/scripts/reclaim_wsl_backfill_memory.py --apply
+TimeoutStartSec=30

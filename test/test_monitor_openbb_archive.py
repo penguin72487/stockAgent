@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 import scripts.monitor_openbb_archive as monitor
 from downloader.download_openbb_archive import DownloadTask, Manifest, TaskResult
@@ -382,6 +383,155 @@ def test_full_audit_rejects_parquet_owned_by_non_success_task(
         "path": str(output),
         "issue": "parquet_exists_for_non_success_task",
     }
+
+
+def test_full_audit_retains_verified_inactive_plan_outputs(tmp_path: Path) -> None:
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    task = _task(tmp_path, "previous-plan")
+    output = Path(task.output_path)
+    output.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [1]}), output)
+    try:
+        manifest.upsert_tasks([task], plan_token="previous")
+        manifest.claim([task])
+        manifest.complete(TaskResult(task, "success", "yfinance", 1, str(output), 1))
+        manifest.connection.execute("UPDATE tasks SET active=0")
+        manifest.set_meta_value("active_plan_token", "current")
+        manifest.connection.commit()
+    finally:
+        manifest.close()
+    before = output.read_bytes()
+    connection = monitor._open_read_only(
+        tmp_path / "_state" / "openbb_archive.sqlite3"
+    )
+    try:
+        audit = monitor._audit_success_files(
+            connection, output_dir=tmp_path, plan_token="current", show_progress=False
+        )
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+    finally:
+        connection.close()
+    assert audit["checked_files"] == 0
+    assert audit["scanned_parquet_files"] == 1
+    assert audit["retained_inactive_success_parquet_files"] == 1
+    assert audit["non_success_parquet_files"] == 0
+    assert audit["passed"] is True
+    assert output.read_bytes() == before
+    assert not list((tmp_path / "_state").glob("file-audit-*"))
+
+
+@pytest.mark.parametrize("task_count", [1, 513, 1025])
+def test_ownership_audit_streams_all_batches_and_bounds_issue_samples(
+    tmp_path: Path, task_count: int
+) -> None:
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    tasks = [_task(tmp_path, f"pending-{index}") for index in range(task_count)]
+    try:
+        manifest.upsert_tasks(tasks)
+    finally:
+        manifest.close()
+    for task in tasks:
+        output = Path(task.output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.touch()
+    connection = monitor._open_read_only(
+        tmp_path / "_state" / "openbb_archive.sqlite3"
+    )
+    try:
+        audit = monitor._audit_parquet_ownership(
+            connection, output_dir=tmp_path, plan_token="default", show_progress=False
+        )
+    finally:
+        connection.close()
+    assert audit["scanned_parquet_files"] == task_count
+    assert audit["non_success_parquet_files"] == task_count
+    assert len(audit["issue_samples"]) == min(task_count, 50)
+    assert audit["ownership_batch_size"] == 512
+    assert not list((tmp_path / "_state").glob("file-audit-*"))
+
+
+def test_ownership_audit_rejects_foreign_active_success_and_unknown_output(
+    tmp_path: Path,
+) -> None:
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    task = _task(tmp_path, "foreign")
+    output = Path(task.output_path)
+    output.parent.mkdir(parents=True)
+    output.touch()
+    (output.parent / "unknown.parquet").touch()
+    try:
+        manifest.upsert_tasks([task], plan_token="foreign")
+        manifest.claim([task])
+        manifest.complete(TaskResult(task, "success", "yfinance", 1, str(output), 1))
+    finally:
+        manifest.close()
+    connection = monitor._open_read_only(
+        tmp_path / "_state" / "openbb_archive.sqlite3"
+    )
+    try:
+        audit = monitor._audit_parquet_ownership(
+            connection, output_dir=tmp_path, plan_token="current", show_progress=False
+        )
+    finally:
+        connection.close()
+    assert audit["scanned_parquet_files"] == 2
+    assert audit["non_success_parquet_files"] == 2
+    assert audit["retained_inactive_success_parquet_files"] == 0
+
+
+@pytest.mark.parametrize("failure_stage", ["connect", "insert"])
+def test_ownership_scratch_failure_preserves_sources_and_cleans_private_index(
+    tmp_path: Path, monkeypatch, failure_stage: str
+) -> None:
+    path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    manifest = Manifest(path)
+    task = _task(tmp_path, "scratch-failure")
+    output = Path(task.output_path)
+    output.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [1]}), output)
+    try:
+        manifest.upsert_tasks([task])
+        manifest.claim([task])
+        manifest.complete(TaskResult(task, "success", "yfinance", 1, str(output), 1))
+    finally:
+        manifest.close()
+    connection = monitor._open_read_only(path)
+    before = path.read_bytes(), output.read_bytes()
+    real_connect = monitor.sqlite3.connect
+    closed = []
+
+    class FailingScratch:
+        def __init__(self, database: Path):
+            self.real = real_connect(database)
+
+        def execute(self, *args, **kwargs):
+            return self.real.execute(*args, **kwargs)
+
+        def executemany(self, *args, **kwargs):
+            raise monitor.sqlite3.OperationalError("database or disk is full")
+
+        def close(self):
+            self.real.close()
+            closed.append(True)
+
+    def failing_connect(database):
+        assert Path(database).name == "owners.sqlite3"
+        if failure_stage == "connect":
+            raise OSError("No space left on device")
+        return FailingScratch(database)
+
+    monkeypatch.setattr(monitor.sqlite3, "connect", failing_connect)
+    try:
+        with pytest.raises((OSError, monitor.sqlite3.OperationalError)):
+            monitor._audit_parquet_ownership(
+                connection, output_dir=tmp_path, plan_token="default", show_progress=False
+            )
+        assert connection.total_changes == 0
+    finally:
+        connection.close()
+    assert (path.read_bytes(), output.read_bytes()) == before
+    assert not list((tmp_path / "_state").glob("file-audit-*"))
+    assert closed == ([True] if failure_stage == "insert" else [])
 
 
 def test_full_audit_snapshot_is_preserved_separately(tmp_path: Path) -> None:

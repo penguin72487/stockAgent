@@ -45,14 +45,15 @@ SESSION_OPEN = datetime_time(9, 0)
 STRATEGY_ENTRY = datetime_time(9, 1)
 SESSION_CLOSE = datetime_time(13, 30)
 MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
+MINUTE_SESSION_POINTS = 270
 LAST_TRADE_SETTLEMENT_CONTRACT = (
     "user_authorized_last_traded_price_paper_settlement_v1"
 )
 DEFAULT_LOCAL_MINUTE_ROOTS = (
     Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
     Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
-    Path("data_tw_minute/shioaji_1m"),
     Path("data_tw_minute/research_dataset"),
+    Path("data_tw_minute/shioaji_1m"),
 )
 DEFAULT_LOCAL_MINUTE_CACHE_ROOTS = (
     Path("artifacts/data_repair/tw_day_trade_minute_curve/rebuilt/tick_minutes"),
@@ -72,6 +73,57 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return payload
+
+
+def minute_curve_scope_failures(
+    receipt: Mapping[str, Any],
+    *,
+    completed_session_dates: list[str],
+    expected_markets: set[str],
+) -> list[str]:
+    """Share exact scope checks between the writer and publication acceptance.
+
+    This metadata gate is not a substitute for source, NAV, or output-hash
+    validation. It prevents an internally complete but wrongly scoped curve
+    from being written to the live ledger in the first place.
+    """
+    failures: list[str] = []
+    strategy = receipt.get("strategy")
+    strategy = strategy if isinstance(strategy, Mapping) else {}
+    if sorted(str(value) for value in strategy.get("session_dates") or ()) != completed_session_dates:
+        failures.append("minute curve session dates do not match completed replay sessions")
+    actual_markets = [str(value) for value in strategy.get("markets") or ()]
+    if set(actual_markets) != expected_markets or len(actual_markets) != len(expected_markets):
+        failures.append("minute curve markets do not match the promoted mode set")
+    expected_rows = len(completed_session_dates) * len(expected_markets) * MINUTE_SESSION_POINTS
+    if type(strategy.get("generated_rows")) is not int or strategy["generated_rows"] != expected_rows:
+        failures.append(f"minute curve generated row count does not equal {MINUTE_SESSION_POINTS} points per completed session and mode")
+    if not completed_session_dates or str(receipt.get("start_date") or "") != completed_session_dates[0]:
+        failures.append("minute curve start date does not match the replay start")
+    if not completed_session_dates or str(receipt.get("end_date") or "") != completed_session_dates[-1]:
+        failures.append("minute curve end date does not match the latest completed replay")
+    return failures
+
+
+def _expected_minute_scope(
+    args: argparse.Namespace, *, start: date, end: date,
+) -> tuple[list[str], set[str]] | None:
+    sessions = getattr(args, "expected_session_date", None)
+    markets = getattr(args, "expected_market", None)
+    if sessions is None and markets is None:
+        return None
+    if not sessions or not markets:
+        raise ValueError("expected session dates and markets must be supplied together")
+    canonical_sessions = sorted({date.fromisoformat(value).isoformat() for value in sessions})
+    if (len(canonical_sessions) != len(sessions)
+            or set(canonical_sessions) != set(sessions)
+            or canonical_sessions[0] != start.isoformat()
+            or canonical_sessions[-1] != end.isoformat()):
+        raise ValueError("expected session dates must be unique ISO dates spanning start/end")
+    if (len(set(markets)) != len(markets)
+            or any(not isinstance(market, str) or not market.strip() for market in markets)):
+        raise ValueError("expected markets must be unique nonempty strings")
+    return canonical_sessions, set(markets)
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -230,6 +282,12 @@ def _filled_quantity(position: Mapping[str, Any]) -> int:
     return int(position.get("filled_shares") or position.get("last_exit_quantity") or 0)
 
 
+def _is_entry_inventory_fill(fill: Mapping[str, Any]) -> bool:
+    """A disclosed paper completion adds inventory, not realized exit P&L."""
+
+    return str(fill.get("purpose") or "") in {"entry", "entry_completion"}
+
+
 def load_positions(
     state_dir: Path,
     *,
@@ -279,11 +337,23 @@ def load_positions(
         # Archives may retain positions from an older replay under the same
         # stable market ID. Only the current append-only entry ledger proves
         # that a position belongs to this replay; never resurrect stale trades.
-        entries = {
-            (str(row.get("session_date")), str(row.get("market")), str(row.get("position_id"))): row
-            for row in fill_rows if row.get("purpose") == "entry"
-            and _in_range(str(row.get("session_date") or ""), start, end)
-        }
+        entry_rows: dict[tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+        for row in fill_rows:
+            day = str(row.get("session_date") or "")
+            if _is_entry_inventory_fill(row) and _in_range(day, start, end):
+                entry_rows[(day, str(row.get("market")), str(row.get("position_id")))].append(row)
+        entries: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for identity, rows in entry_rows.items():
+            if not any(row.get("purpose") == "entry" for row in rows):
+                raise RuntimeError(f"entry completion has no original entry: {identity}")
+            quantity = sum(int(row["quantity"]) for row in rows)
+            if quantity <= 0:
+                raise RuntimeError(f"invalid entry quantity: {identity}")
+            entries[identity] = {
+                "session_date": identity[0],
+                "quantity": quantity,
+                "price": math.fsum(float(row["price"]) * int(row["quantity"]) for row in rows) / quantity,
+            }
         carried_entries = {(market, key): row for (_, market, key), row in entries.items()}
         for day, markets in by_day.items():
             for market, positions in markets.items():
@@ -326,6 +396,10 @@ class MinutePriceStore:
         kbar_roots: Path | Sequence[Path],
         tick_minute_roots: Path | Sequence[Path],
         *, require_receipts: bool = False,
+        replay_source_hashes: Mapping[tuple[str, str], str] | None = None,
+        replay_symbol_sources: Mapping[
+            tuple[str, str], Iterable[str | Path]
+        ] | None = None,
     ) -> None:
         def unique_paths(value: Path | Sequence[Path]) -> tuple[Path, ...]:
             candidates = (
@@ -354,12 +428,75 @@ class MinutePriceStore:
         self._root_cache: dict[tuple[str, str, str], dict[str, float]] = {}
         self._chunk_index: dict[tuple[str, str], tuple[Path, ...]] = {}
         self.require_receipts = require_receipts
+        self._replay_source_hashes = {
+            (str(day), str(Path(path).resolve())): str(digest)
+            for (day, path), digest in (replay_source_hashes or {}).items()
+        }
+        self._replay_symbol_sources = {
+            (str(day), str(symbol)): frozenset(
+                str(Path(path).resolve()) for path in paths
+            )
+            for (day, symbol), paths in (replay_symbol_sources or {}).items()
+        }
+        self._replay_pair_pins_enforced = replay_symbol_sources is not None
         self._verified_chunk_dates: dict[Path, tuple[tuple, set[str]]] = {}
         self._verified_raw_tick_signatures: dict[Path, tuple[int, int, int]] = {}
+        self._verified_replay_source_signatures: dict[
+            Path, tuple[int, int, int, str]
+        ] = {}
+
+    def _verified_replay_source(self, path: Path, session_date: str) -> bool:
+        """Verify one exact source file pinned by the execution replay receipt."""
+
+        resolved = path.resolve()
+        expected = self._replay_source_hashes.get(
+            (str(session_date), str(resolved))
+        )
+        if expected is None:
+            return False
+        stat = resolved.stat()
+        signature = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, expected)
+        previous = self._verified_replay_source_signatures.get(resolved)
+        if previous is None:
+            actual = _sha256(resolved)
+            if actual != expected:
+                raise RuntimeError(
+                    f"replay-pinned minute source hash mismatch: {resolved}"
+                )
+            current = resolved.stat()
+            if (current.st_size, current.st_mtime_ns, current.st_ctime_ns) != signature[:3]:
+                raise RuntimeError(
+                    f"replay-pinned minute source changed while hashing: {resolved}"
+                )
+            self._verified_replay_source_signatures[resolved] = signature
+        elif previous != signature:
+            raise RuntimeError(
+                f"replay-pinned minute source changed during reconstruction: {resolved}"
+            )
+        return True
 
     def _verified_chunk(self, path: Path, symbol: str, session_date: str) -> bool:
         if not self.require_receipts:
             return True
+        pair_sources = self._replay_symbol_sources.get(
+            (str(session_date), str(symbol))
+        )
+        resolved = str(path.resolve())
+        if pair_sources is not None:
+            return resolved in pair_sources and self._verified_replay_source(
+                path, session_date
+            )
+        if (
+            session_date,
+            resolved,
+        ) in self._replay_source_hashes:
+            if self._replay_pair_pins_enforced:
+                # This file is pinned for another symbol. A symbol absent from
+                # the replay's source map may still use a receipt-backed chunk,
+                # but it cannot borrow a mutable replay partition implicitly.
+                pass
+            else:
+                return self._verified_replay_source(path, session_date)
         receipt = path.with_suffix(".receipt.json")
         if not receipt.is_file():
             return False
@@ -386,6 +523,17 @@ class MinutePriceStore:
 
     def assert_sources_unchanged(self) -> None:
         """Reject a price/receipt replacement between verification and publish."""
+        for path, expected in self._verified_replay_source_signatures.items():
+            try:
+                stat = path.stat()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"replay-pinned minute source disappeared: {path}"
+                ) from exc
+            if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != expected[:3]:
+                raise RuntimeError(
+                    f"replay-pinned minute source changed during reconstruction: {path}"
+                )
         for path, expected in self._verified_raw_tick_signatures.items():
             stat = path.stat()
             if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != expected:
@@ -457,9 +605,27 @@ class MinutePriceStore:
         for path in self._chunk_paths(root, symbol, session_date):
             frame = pl.read_parquet(path, columns=["date", "ts", "Close", *(["Volume"] if self.require_receipts else [])])
             output.update(self._frame_prices(frame, session_date))
-        if not output and not self.require_receipts:
+        if not output:
             partition = root / f"trade_date={session_date}" / "data.parquet"
-            if partition.is_file():
+            pair_sources = self._replay_symbol_sources.get(
+                (str(session_date), str(symbol))
+            )
+            partition_allowed = (
+                partition.is_file()
+                and (
+                    not self.require_receipts
+                    or (
+                        pair_sources is not None
+                        and str(partition.resolve()) in pair_sources
+                        and self._verified_replay_source(partition, session_date)
+                    )
+                    or (
+                        not self._replay_pair_pins_enforced
+                        and self._verified_replay_source(partition, session_date)
+                    )
+                )
+            )
+            if partition_allowed:
                 frame = (
                     pl.scan_parquet(partition)
                     .filter(pl.col("symbol") == symbol)
@@ -504,20 +670,43 @@ class MinutePriceStore:
                 if not staged[(symbol, session_date)]:
                     by_date[session_date].add(symbol)
             for session_date, symbols in by_date.items():
-                if self.require_receipts:
-                    continue
                 partition = root / f"trade_date={session_date}" / "data.parquet"
                 if not partition.is_file():
                     continue
+                allowed_symbols = set(symbols)
+                if self.require_receipts:
+                    if self._replay_pair_pins_enforced:
+                        resolved_partition = str(partition.resolve())
+                        allowed_symbols = {
+                            symbol
+                            for symbol in symbols
+                            if resolved_partition
+                            in self._replay_symbol_sources.get(
+                                (str(session_date), str(symbol)), frozenset()
+                            )
+                        }
+                    if not allowed_symbols or not self._verified_replay_source(
+                        partition, session_date
+                    ):
+                        continue
                 frame = (
                     pl.scan_parquet(partition)
-                    .filter(pl.col("symbol").is_in(sorted(symbols)))
-                    .select("symbol", "date", "ts", "Close")
+                    .filter(pl.col("symbol").is_in(sorted(allowed_symbols)))
+                    .select(
+                        "symbol",
+                        "date",
+                        "ts",
+                        "Close",
+                        *(["Volume"] if self.require_receipts else []),
+                    )
                     .collect()
                 )
-                for symbol in symbols:
+                for symbol in allowed_symbols:
                     selected = frame.filter(pl.col("symbol") == symbol).select(
-                        "date", "ts", "Close"
+                        "date",
+                        "ts",
+                        "Close",
+                        *(["Volume"] if self.require_receipts else []),
                     )
                     staged[(symbol, session_date)] = self._frame_prices(
                         selected, session_date
@@ -882,7 +1071,7 @@ def rebuild_strategy_marks(
     for raw_fill in fill_rows:
         if (
             not isinstance(raw_fill, Mapping)
-            or str(raw_fill.get("purpose") or "") == "entry"
+            or _is_entry_inventory_fill(raw_fill)
         ):
             continue
         session_date = str(raw_fill.get("session_date") or "")
@@ -1117,8 +1306,71 @@ def _is_terminal_carry_cost(cost: Mapping[str, Any]) -> bool:
     )
 
 
-def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill_rows, start, end,
-                                   preserve_sourced=True, revalue_opening_marks=False):
+def _validated_legacy_paper_entry_retries(
+    events: Sequence[Mapping[str, Any]],
+    metadata: Mapping[str, Mapping[str, Any]],
+    *,
+    market: str,
+) -> frozenset[str]:
+    """Recognize old paper retry labels without changing the immutable fills.
+
+    A second positive paper retry extends an existing cohort, even when an old
+    producer labelled it `entry`. Only our explicit retry order IDs and paper
+    fill contracts qualify. This is not broker-event deduplication; arbitrary
+    duplicate entries and repeated paper order IDs remain hard errors.
+    Validate identities before reading all session prices or valuing minutes.
+    """
+
+    seen_positions: set[str] = set()
+    seen_orders: set[str] = set()
+    legacy_orders: set[str] = set()
+    for event in events:
+        if event.get("share_action") or not _is_entry_inventory_fill(event):
+            continue
+        identity = str(event.get("position_id") or "")
+        order_id = str(event.get("order_id") or "")
+        if identity not in metadata:
+            raise RuntimeError(f"minute entry has no accepted position: {market}:{identity}")
+        if int(event.get("quantity") or 0) <= 0:
+            raise RuntimeError(f"minute entry has invalid quantity: {market}:{identity}")
+        if order_id and order_id in seen_orders:
+            raise RuntimeError(f"duplicate paper entry order: {market}:{order_id}")
+        if event.get("purpose") == "entry" and identity in seen_positions:
+            prefix = f"{identity}:entry_retry:"
+            sequence = order_id[len(prefix):] if order_id.startswith(prefix) else ""
+            if not (
+                event.get("simulation_only") is True
+                and event.get("fill_contract") in {
+                    "causal_best_quote_remaining_order",
+                    "paper_market_full_target_at_causal_shioaji_best_quote",
+                }
+                and event.get("symbol") == metadata[identity].get("symbol")
+                and sequence and sequence[0] != "0"
+                and sequence.isascii() and sequence.isdecimal()
+            ):
+                raise RuntimeError(f"duplicate minute entry identity: {market}:{identity}")
+            legacy_orders.add(order_id)
+        elif event.get("purpose") == "entry_completion" and identity not in seen_positions:
+            raise RuntimeError(f"minute entry completion has no accepted original entry: {market}:{identity}")
+        seen_positions.add(identity)
+        if order_id:
+            seen_orders.add(order_id)
+    return frozenset(legacy_orders)
+
+
+def rebuild_carried_strategy_marks(
+    source_rows,
+    positions,
+    store,
+    *,
+    state,
+    fill_rows,
+    start,
+    end,
+    preserve_sourced=True,
+    revalue_opening_marks=False,
+    opening_valuation_prices: Mapping[str, Mapping[str, float]] | None = None,
+):
     """Revalue an immutable carried fill/action book, never re-execute trades.
 
     Unlike the flat-session path, inventory, cost basis, unallocated entry
@@ -1129,8 +1381,10 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
     """
     selected = {(r["market"], r["minute"]): r for r in source_rows
                 if _in_range(r["session_date"], start, end)}
+    opening_valuation_prices = opening_valuation_prices or {}
     days = sorted({r["session_date"] for r in selected.values()})
     output = [r for r in source_rows if not _in_range(r["session_date"], start, end)]
+    legacy_retry_rows = 0
     for market, mode in state["modes"].items():
         metadata = {p["position_id"]: p for modes in positions.values() for p in modes.get(market, [])}
         fills = [f for f in fill_rows if f["market"] == market]
@@ -1139,6 +1393,8 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
         events = sorted([*(f | {"clock": str(f.get("fill_at") or f["recorded_at"])} for f in fills),
                          *(a | {"clock": a["recorded_at"], "share_action": True}
                            for a in mode.get("share_replacement_ledger", []))], key=lambda e: e["clock"])
+        legacy_orders = _validated_legacy_paper_entry_retries(events, metadata, market=market)
+        legacy_retry_rows += len(legacy_orders)
         book, prices, price_times, seen_entries = {}, {}, {}, set()
         # A new paper entry is a price for that cohort, not a market-wide
         # trade. Until a sourced minute print arrives, older carried cohorts
@@ -1181,7 +1437,7 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                             entry_fallbacks[identity] = (
                                 (fallback - event["cash_per_old_share"]) / event["ratio"], started
                             )
-                    elif event["purpose"] == "entry":
+                    elif event["purpose"] == "entry" and event.get("order_id") not in legacy_orders:
                         if identity in seen_entries or identity not in metadata:
                             raise RuntimeError("minute entry identity is duplicate or has no accepted position")
                         seen_entries.add(identity)
@@ -1192,6 +1448,22 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                                  remaining_entry_fee_twd=float(event["fee_and_tax_twd"]))
                         book[identity] = p
                         entry_fallbacks[identity] = (float(event["price"]), event["clock"])
+                    elif event["purpose"] == "entry_completion" or event.get("order_id") in legacy_orders:
+                        if identity not in seen_entries or identity not in book:
+                            raise RuntimeError("minute entry completion has no accepted original entry")
+                        p = book[identity]
+                        old_quantity = abs(int(p["signed_shares"]))
+                        quantity = int(event["quantity"])
+                        if quantity <= 0:
+                            raise RuntimeError("minute entry completion has invalid quantity")
+                        sign = 1 if p["side"] == "long" else -1
+                        p["signed_shares"] += sign * quantity
+                        p["inventory_basis_price"] = (
+                            float(p["inventory_basis_price"]) * old_quantity
+                            + float(event["price"]) * quantity
+                        ) / (old_quantity + quantity)
+                        p["remaining_entry_fee_twd"] += float(event["fee_and_tax_twd"])
+                        entry_fallbacks[identity] = (p["inventory_basis_price"], event["clock"])
                     else:
                         p = book[identity]
                         quantity = int(event["quantity"])
@@ -1205,10 +1477,21 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
                             entry_fallbacks.pop(identity, None)
                     cursor += 1
                 fresh = set()
-                for symbol, values in source.items():
-                    if key in values:
-                        prices[symbol], price_times[symbol] = float(values[key]), clock
+                if key[11:16] == "09:01" and not revalue_opening_marks:
+                    # Mirror _mark_mode exactly: only an explicitly retained
+                    # valuation_price_0901 refreshes every cohort of a symbol.
+                    # When it is absent, a new cohort carries its own fill and
+                    # an older cohort keeps its previous observed mark.
+                    for symbol, price in opening_valuation_prices.get(
+                        day, {}
+                    ).items():
+                        prices[symbol], price_times[symbol] = float(price), clock
                         fresh.add(symbol)
+                else:
+                    for symbol, values in source.items():
+                        if key in values:
+                            prices[symbol], price_times[symbol] = float(values[key]), clock
+                            fresh.add(symbol)
                 count, fresh_count, net, notional, fresh_notional = 0, 0, 0., 0., 0.
                 for p in book.values():
                     if not p["signed_shares"]:
@@ -1274,6 +1557,7 @@ def rebuild_carried_strategy_marks(source_rows, positions, store, *, state, fill
     output.sort(key=lambda r: (r["minute"], r["market"]))
     _, stats = validate_existing_strategy_marks(output, start=start, end=end)
     stats["carried_fill_book_revalued_without_execution"] = True
+    stats["legacy_paper_entry_retry_rows_reclassified_for_valuation"] = legacy_retry_rows
     differences = [{"market": r["market"], "minute": r["minute"],
                     "original_equity_twd": float(selected[(r["market"], r["minute"])]["total_equity_twd"]),
                     "revalued_equity_twd": float(r["total_equity_twd"]),
@@ -1457,13 +1741,13 @@ def recover_terminal_marks(
             raise RuntimeError("fill and position identities disagree")
         for position in positions:
             pf = by_position[position["position_id"]]
-            entries = sum(int(f["quantity"]) for f in pf if f["purpose"] == "entry")
-            exits = sum(int(f["quantity"]) for f in pf if f["purpose"] != "entry")
+            entries = sum(int(f["quantity"]) for f in pf if _is_entry_inventory_fill(f))
+            exits = sum(int(f["quantity"]) for f in pf if not _is_entry_inventory_fill(f))
             if entries <= 0 or entries != exits or entries != int(position["filled_shares"]):
                 raise RuntimeError("incomplete or duplicated position fill lifecycle")
-            close(math.fsum(number(f["net_pnl_twd"]) for f in pf if f["purpose"] != "entry"),
+            close(math.fsum(number(f["net_pnl_twd"]) for f in pf if not _is_entry_inventory_fill(f)),
                   position["realized_net_pnl_twd"])
-        exit_fills = [f for f in session_fills if f["purpose"] != "entry"]
+        exit_fills = [f for f in session_fills if not _is_entry_inventory_fill(f)]
         realized_between = math.fsum(number(f["net_pnl_twd"]) for f in exit_fills
                                      if first_at < timestamp(f["recorded_at"]) <= anchor_at)
         close(number(first["cumulative_realized_net_pnl_twd"]) + realized_between,
@@ -1472,7 +1756,7 @@ def recover_terminal_marks(
             remaining = defaultdict(int)
             for f in session_fills:
                 if timestamp(f["recorded_at"]) <= at:
-                    remaining[f["position_id"]] += int(f["quantity"]) * (1 if f["purpose"] == "entry" else -1)
+                    remaining[f["position_id"]] += int(f["quantity"]) * (1 if _is_entry_inventory_fill(f) else -1)
             if any(q < 0 for q in remaining.values()) or sum(q > 0 for q in remaining.values()) != int(mark["open_position_count"]):
                 raise RuntimeError("anchor position count disagrees with accepted fills")
         cumulative = number(anchor["cumulative_realized_net_pnl_twd"]) + math.fsum(
@@ -1738,6 +2022,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument(
+        "--expected-session-date", action="append",
+        help="Exact completed session set from the maintenance owner; repeatable with --expected-market.",
+    )
+    parser.add_argument(
+        "--expected-market", action="append",
+        help="Exact active mode set; reject a differently scoped reconstruction before publication.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--fetch-missing-kbars",
@@ -1800,6 +2092,208 @@ def _carried_accounting_signature(state_dir: Path, end: date) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _replay_minute_source_hashes(
+    state_dir: Path,
+    *,
+    start: date,
+    end: date,
+) -> dict[tuple[str, str], str]:
+    """Load the exact minute files used by the immutable execution replay.
+
+    A receipt-backed collector chunk is sufficient for ordinary curve repair,
+    but independent execution parity is stronger: it must read the same bytes
+    that drove fills and bracket decisions.  New replay receipts therefore pin
+    every selected partition/chunk by session and SHA-256.
+    """
+
+    receipt_path = state_dir / "rebuild_receipt.json"
+    if not receipt_path.is_file():
+        return {}
+    receipt = _read_json(receipt_path)
+    output: dict[tuple[str, str], str] = {}
+    replay_days: set[str] = set()
+    for session in receipt.get("sessions") or ():
+        day = str(session.get("session_date") or "")
+        if not _in_range(day, start, end):
+            continue
+        intraday = session.get("intraday_replay") or {}
+        if not intraday:
+            continue
+        replay_days.add(day)
+        files = intraday.get("source_files") or ()
+        if not files:
+            raise RuntimeError(
+                f"execution replay has no hash-pinned minute sources: {day}"
+            )
+        for item in files:
+            path = Path(str(item.get("path") or "")).resolve()
+            digest = str(item.get("sha256") or "")
+            if not path.is_file() or len(digest) != 64:
+                raise RuntimeError(
+                    f"invalid execution replay minute-source pin: {day}:{path}"
+                )
+            key = (day, str(path))
+            previous = output.setdefault(key, digest)
+            if previous != digest:
+                raise RuntimeError(
+                    f"conflicting execution replay minute-source pin: {day}:{path}"
+                )
+    if replay_days and not output:
+        raise RuntimeError("execution replay minute-source pins are empty")
+    return output
+
+
+def _replay_minute_symbol_sources(
+    state_dir: Path,
+    *,
+    start: date,
+    end: date,
+) -> dict[tuple[str, str], frozenset[str]] | None:
+    """Return exact per-symbol source pins from a current replay receipt.
+
+    Older immutable replay receipts pinned file hashes but did not record which
+    symbols selected each file. They remain reproducible with ordered-source
+    resolution, but only a current receipt can forbid all lower-priority
+    symbol/session fallbacks. Mixed old/new receipts are invalid.
+    """
+
+    receipt_path = state_dir / "rebuild_receipt.json"
+    if not receipt_path.is_file():
+        return None
+    receipt = _read_json(receipt_path)
+    output: dict[tuple[str, str], set[str]] = defaultdict(set)
+    saw_current = False
+    saw_legacy = False
+    for session in receipt.get("sessions") or ():
+        day = str(session.get("session_date") or "")
+        if not _in_range(day, start, end):
+            continue
+        intraday = session.get("intraday_replay") or {}
+        files = intraday.get("source_files") or ()
+        if not files:
+            continue
+        session_symbols: set[str] = set()
+        session_current = False
+        for item in files:
+            symbols = item.get("symbols")
+            if symbols is None:
+                saw_legacy = True
+                continue
+            saw_current = True
+            session_current = True
+            path = str(Path(str(item.get("path") or "")).resolve())
+            declared_count = int(item.get("symbol_count") or 0)
+            normalized = [str(symbol).strip() for symbol in symbols]
+            if (
+                any(not symbol for symbol in normalized)
+                or len(normalized) != len(set(normalized))
+                or declared_count != len(normalized)
+            ):
+                raise RuntimeError(
+                    f"invalid replay minute source symbol pin: {day}:{path}"
+                )
+            for symbol in normalized:
+                if symbol in session_symbols:
+                    raise RuntimeError(
+                        f"replay symbol selected multiple minute sources: {day}:{symbol}"
+                    )
+                session_symbols.add(symbol)
+                output[(day, symbol)].add(path)
+        if session_current and int(intraday.get("resolved_symbols") or 0) != len(
+            session_symbols
+        ):
+            raise RuntimeError(
+                f"replay minute source symbol cardinality mismatch: {day}"
+            )
+    if saw_current and saw_legacy:
+        raise RuntimeError("mixed legacy/current replay minute source pins")
+    if not saw_current:
+        return None
+    return {key: frozenset(paths) for key, paths in output.items()}
+
+
+def _replay_opening_valuation_prices(
+    state_dir: Path,
+    *,
+    start: date,
+    end: date,
+) -> dict[str, dict[str, float]]:
+    """Load the exact 09:01 valuation prices retained by the replay.
+
+    Execution VWAP and the completed-minute valuation price are distinct. The
+    replay intentionally leaves ``valuation_price_0901`` null when no accepted
+    09:01 valuation print exists. In that case a new cohort keeps its fill price
+    and older inventory keeps its preceding mark until the next positive-volume
+    minute. Reading the immutable entry book preserves that distinction in the
+    independent curve reconstruction.
+    """
+
+    receipt_path = state_dir / "rebuild_receipt.json"
+    if not receipt_path.is_file():
+        return {}
+    receipt = _read_json(receipt_path)
+    state_root = state_dir.resolve()
+    output: dict[str, dict[str, float]] = {}
+    selected_days: set[str] = set()
+    for session in receipt.get("sessions") or ():
+        day = str(session.get("session_date") or "")
+        if not _in_range(day, start, end):
+            continue
+        if day in selected_days:
+            raise RuntimeError(f"duplicate replay session receipt: {day}")
+        selected_days.add(day)
+        book = session.get("historical_entry_books") or {}
+        recorded_path = Path(str(book.get("path") or ""))
+        expected = (
+            state_root / "replay_entry_books" / f"{day}.parquet"
+        ).resolve()
+        digest = str(book.get("sha256") or "")
+        # Atomic promotion/retained replay copies move the state directory.
+        # The recorded location remains provenance; read only the canonical
+        # local book and require its original content hash. Never follow an
+        # external path from a receipt or fall back to an old source directory.
+        path = expected
+        if (
+            recorded_path.name != f"{day}.parquet"
+            or recorded_path.parent.name != "replay_entry_books"
+            or not path.is_relative_to(state_root)
+            or not path.is_file()
+            or len(digest) != 64
+        ):
+            raise RuntimeError(
+                f"invalid replay entry-book pin for opening valuation: {day}:{path}"
+            )
+        if _sha256(path) != digest:
+            raise RuntimeError(
+                f"replay entry book changed before opening valuation: {day}:{path}"
+            )
+        schema = pl.read_parquet_schema(path)
+        required = {"symbol", "valuation_price_0901"}
+        if not required.issubset(schema):
+            raise RuntimeError(
+                f"replay entry book lacks opening valuation columns: {day}:{path}"
+            )
+        frame = pl.read_parquet(path, columns=sorted(required))
+        symbols = frame.get_column("symbol").cast(pl.String)
+        if symbols.n_unique() != frame.height:
+            raise RuntimeError(f"duplicate replay entry-book symbol: {day}:{path}")
+        prices: dict[str, float] = {}
+        for symbol, raw_price in frame.iter_rows():
+            normalized_symbol = str(symbol or "").strip()
+            if not normalized_symbol:
+                raise RuntimeError(f"blank replay entry-book symbol: {day}:{path}")
+            if raw_price is None:
+                continue
+            price = float(raw_price)
+            if not math.isfinite(price) or price <= 0:
+                raise RuntimeError(
+                    f"invalid replay 09:01 valuation price: {day}:{normalized_symbol}"
+                )
+            prices[normalized_symbol] = price
+        output[day] = prices
+    return output
+
+
 def _assert_minute_publication_window(state_dir: Path, now: datetime) -> None:
     if not datetime_time(8, 30) <= now.time() < datetime_time(14, 31):
         return
@@ -1822,6 +2316,9 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("start date must not be after end date")
+    expected_scope = _expected_minute_scope(args, start=start, end=end)
+    if expected_scope is not None and getattr(args, "repair_terminal_only", False):
+        raise ValueError("full minute scope cannot be validated by terminal-only repair")
     source_hashes = {name: _sha256(args.state_dir / name) for name in
                      ("marks.jsonl", "fills.jsonl", "orders.jsonl", "benchmark_history.json")
                      if (args.state_dir / name).exists()}
@@ -1860,7 +2357,28 @@ def main() -> None:
         tick_root,
         *DEFAULT_LOCAL_MINUTE_CACHE_ROOTS,
     ]
-    store = MinutePriceStore(local_roots, local_cache_roots, require_receipts=has_margin_carry)
+    replay_source_hashes = (
+        _replay_minute_source_hashes(args.state_dir, start=start, end=end)
+        if has_margin_carry and args.revalue_carried_marks
+        else {}
+    )
+    replay_symbol_sources = (
+        _replay_minute_symbol_sources(args.state_dir, start=start, end=end)
+        if has_margin_carry and args.revalue_carried_marks
+        else None
+    )
+    opening_valuation_prices = (
+        _replay_opening_valuation_prices(args.state_dir, start=start, end=end)
+        if has_margin_carry and args.revalue_carried_marks
+        else {}
+    )
+    store = MinutePriceStore(
+        local_roots,
+        local_cache_roots,
+        require_receipts=has_margin_carry,
+        replay_source_hashes=replay_source_hashes,
+        replay_symbol_sources=replay_symbol_sources,
+    )
     missing_endpoints = missing_accepted_endpoints(source_marks, start=start, end=end)
     if missing_endpoints:
         raise RuntimeError(f"missing accepted endpoints before minute-data preparation: {missing_endpoints[:20]}")
@@ -1990,7 +2508,9 @@ def main() -> None:
             source_marks, positions, store, state=_read_json(args.state_dir / "state.json"),
             fill_rows=source_fills, start=start, end=end,
             preserve_sourced=not args.recompute_existing_strategy_marks,
-            revalue_opening_marks=bool(args.revalue_opening_marks))
+            revalue_opening_marks=bool(args.revalue_opening_marks),
+            opening_valuation_prices=opening_valuation_prices,
+        )
     elif args.validate_existing_strategy_marks:
         rebuilt_marks, strategy_stats = validate_existing_strategy_marks(
             source_marks, start=start, end=end
@@ -2058,6 +2578,19 @@ def main() -> None:
         "unchanged_fills_sha256": _sha256(args.state_dir / "fills.jsonl"),
         "source_ledger_hashes": source_hashes,
         "source_carried_accounting_signature": accounting_signature,
+        "execution_replay_minute_source_pin_count": len(replay_source_hashes),
+        "execution_replay_minute_symbol_source_pin_count": (
+            len(replay_symbol_sources) if replay_symbol_sources is not None else 0
+        ),
+        "execution_replay_minute_symbol_sources_strict": (
+            replay_symbol_sources is not None
+        ),
+        "execution_replay_opening_valuation_session_count": len(
+            opening_valuation_prices
+        ),
+        "execution_replay_opening_valuation_symbol_count": sum(
+            len(prices) for prices in opening_valuation_prices.values()
+        ),
         "existing_bracket_aware_strategy_marks_preserved": bool(
             args.validate_existing_strategy_marks
         ),
@@ -2141,6 +2674,14 @@ def main() -> None:
         },
     }
     receipt_path = args.output_dir / "minute_curve_receipt.json"
+    if expected_scope is not None:
+        scope_failures = minute_curve_scope_failures(
+            receipt,
+            completed_session_dates=expected_scope[0],
+            expected_markets=expected_scope[1],
+        )
+        if scope_failures:
+            raise RuntimeError("minute curve scope mismatch; publication refused: " + "; ".join(scope_failures))
     store.assert_sources_unchanged()
     _atomic_json(receipt_path, receipt)
     if args.publish:

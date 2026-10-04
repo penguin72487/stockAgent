@@ -20,7 +20,7 @@ from scripts.audit_tw_public_data_layer import (
     _benchmark_sessions,
     _audit_input_signatures,
     audit_delisted_universe_coverage,
-    audit_cbc_release_vintage_contract,
+    audit_release_vintage_contract,
     audit_feature_availability_contract,
     audit_feature_lineage_registry,
     audit_historical_sources,
@@ -452,9 +452,14 @@ def test_active_cbc_features_fail_closed_on_incomplete_release_archive(
         "integrity_ok": True, "coverage_complete": False,
         "saved_releases": 1, "registered_releases": 2, "errors": [],
     })
-    findings = audit_cbc_release_vintage_contract(tmp_path, config)
-    assert [item.code for item in findings] == ["incomplete_cbc_release_vintage"]
-    assert findings[0].severity == "critical"
+    findings = audit_release_vintage_contract(tmp_path, config)
+    cbc_findings = [
+        item for item in findings
+        if item.code == "incomplete_release_vintage"
+        and str(item.item).startswith("cbc_")
+    ]
+    assert cbc_findings
+    assert all(item.severity == "critical" for item in cbc_findings)
 
 
 def test_availability_audit_rejects_missing_or_unjustified_panel_shift() -> None:

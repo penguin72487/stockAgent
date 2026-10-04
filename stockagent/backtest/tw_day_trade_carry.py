@@ -1043,8 +1043,8 @@ class DayTradeCarrySession:
     def validate_shape(self, symbols: int, device: torch.device) -> None:
         if (self.entry_path is None) != (self.stop_hits is None):
             raise ValueError("minute entry continuation requires prices, volume and stop observations")
-        if self.entry_path is not None and (self.uses_sparse_events or self.terminal_liquidation_price is not None):
-            raise ValueError("minute entry continuation requires dense capacity-limited carry")
+        if self.entry_path is not None and self.uses_sparse_events:
+            raise ValueError("minute entry continuation requires dense carry")
         if not isinstance(self.day, int) or isinstance(self.day, bool) or not 0 < self.day <= 3652059:
             raise ValueError("carry session requires an exact Gregorian day ordinal")
         actions = (
@@ -1687,6 +1687,18 @@ def execute_carry_session(
             buy_fee_rate=buy_fee_rate, day_sell_fee_rate=day_sell_fee_rate,
             normal_sell_fee_rate=normal_sell_fee_rate, rebate_rate=rebate_rate,
             initial_capital=initial_capital)
+        if session.terminal_liquidation_price is not None:
+            # Only the terminal reducer is unbounded. Run it against the
+            # pre-conversion FIFO state, so today's shorts never pay an
+            # overnight conversion charge merely because earlier exits lacked
+            # volume. The canonical final NAV below replaces only mark 270.
+            path_inventory, terminal_notional = (
+                _liquidate_terminal_inventory_without_capacity(
+                    path_inventory, terminal_price=session.terminal_liquidation_price
+                )
+            )
+            converted = convert_inventory_to_margin(path_inventory, day=session.day)
+            notional = notional + terminal_notional
     elif _carry_full_session_compile_enabled(funded.cohorts):
         path_inventory, converted, marks, notional = _compiled_session_execution(
             funded,

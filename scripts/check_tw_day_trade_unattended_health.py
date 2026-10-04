@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
+from scripts.check_tw_day_trade_preopen_readiness import _session_contract  # noqa: E402
 from stockagent.live.market_config import enabled_day_trade_markets  # noqa: E402
 
 
@@ -56,6 +57,9 @@ REQUIRED_TIMERS = (
     "stockagent-tw-day-trade-margin-actions.timer",
 )
 BEST_EFFORT_MAINTENANCE_UNITS = {
+    "stockagent-openbb-archive.service": (
+        "stockagent-openbb-archive.timer"
+    ),
     "stockagent-registered-data-backfill.service": (
         "stockagent-registered-data-backfill.timer"
     ),
@@ -69,6 +73,12 @@ BEST_EFFORT_MAINTENANCE_UNITS = {
 BEST_EFFORT_MAINTENANCE_SERVICES = tuple(BEST_EFFORT_MAINTENANCE_UNITS)
 OPENING_RESOURCE_GUARD_START = datetime_time(8, 20)
 OPENING_RESOURCE_GUARD_END = datetime_time(9, 10)
+CAUSAL_LIVE_ENTRY_FILL_POLICIES = frozenset(
+    {
+        "causal_best_quote",
+        "causal_market_full_target_at_best_quote",
+    }
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -196,7 +206,7 @@ def _classify_session_signals(
             missing_markets.append(market)
             continue
         if (
-            row.get("entry_fill_policy") != "causal_best_quote"
+            row.get("entry_fill_policy") not in CAUSAL_LIVE_ENTRY_FILL_POLICIES
             or int(row.get("entry_price_offset_ticks") or 0) != 0
         ):
             noncausal_recovery_markets.append(market)
@@ -411,6 +421,7 @@ def _protect_opening_resources(
     repair: bool,
     action_state: dict[str, Any],
     action_path: Path | None = None,
+    session_open: bool | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     """Pause only resumable bulk jobs across the opening critical path."""
 
@@ -426,7 +437,7 @@ def _protect_opening_resources(
 
     wall = observed.timetz().replace(tzinfo=None)
     protected = bool(
-        observed.weekday() < 5
+        (observed.weekday() < 5 if session_open is None else session_open)
         and OPENING_RESOURCE_GUARD_START <= wall < OPENING_RESOURCE_GUARD_END
     )
     session_date = observed.date().isoformat()
@@ -680,6 +691,17 @@ def main() -> int:
         actions: list[dict[str, Any]] = []
         failures: list[str] = []
         warnings: list[str] = []
+        try:
+            session_state, session_reason, session_markets = _session_contract(observed)
+        except (OSError, RuntimeError, ValueError) as exc:
+            session_state = "unknown"
+            session_reason = (
+                f"market session contract failed: {type(exc).__name__}: {exc}"
+            )
+            session_markets = ()
+        session_open = session_state == "open"
+        if session_state == "unknown":
+            failures.append("TWSE session calendar is not verified: " + session_reason)
 
         time_health = _run_time_check(repair=repair)
         if not time_health["ready"]:
@@ -691,6 +713,7 @@ def main() -> int:
                 repair=repair,
                 action_state=action_state,
                 action_path=action_path,
+                session_open=session_state != "closed",
             )
         )
         actions.extend(resource_actions)
@@ -794,7 +817,6 @@ def main() -> int:
         if not event_ready:
             warnings.append("TW public source-event receipt is stale or degraded")
 
-        weekday = observed.weekday() < 5
         wall = observed.timetz().replace(tzinfo=None)
         session_date = observed.date().isoformat()
         eligibility = _json(
@@ -804,7 +826,7 @@ def main() -> int:
             eligibility.get("status") == "ok"
             and eligibility.get("trading_date") == session_date
         )
-        if weekday and datetime_time(5, 30) <= wall <= datetime_time(10, 0):
+        if session_open and datetime_time(5, 30) <= wall <= datetime_time(10, 0):
             if not eligibility_ready:
                 warnings.append("same-session TWSE/TPEx eligibility is not accepted")
                 actions.extend(
@@ -829,7 +851,7 @@ def main() -> int:
             )
             is True
         )
-        if weekday and datetime_time(8, 0) <= wall <= datetime_time(10, 0):
+        if session_open and datetime_time(8, 0) <= wall <= datetime_time(10, 0):
             if not public_ready:
                 warnings.append("08:30 TW public-data acceptance is not ready")
                 actions.extend(
@@ -876,7 +898,10 @@ def main() -> int:
                 break
             if attempt < 2:
                 time.sleep(1.0)
-        engine_age = _age_seconds(engine_sync.get("published_at"), observed)
+        engine_age = _age_seconds(
+            engine_sync.get("heartbeat_at") or engine_sync.get("published_at"),
+            observed,
+        )
         discord_age = _age_seconds(discord_status.get("updated_at"), observed)
         modes = engine_sync.get("modes")
         modes = dict(modes) if isinstance(modes, dict) else {}
@@ -914,7 +939,7 @@ def main() -> int:
             # the independent opening execution engine disconnected.
             warnings.append("post-close Discord artifact maintenance is not ready")
 
-        if weekday and wall >= datetime_time(9, 0, 15):
+        if session_open and wall >= datetime_time(9, 0, 15):
             missing_signals, noncausal_recovery_markets = (
                 _classify_session_signals(modes, session_date=session_date)
             )
@@ -932,7 +957,7 @@ def main() -> int:
             missing_signals = []
             noncausal_recovery_markets = []
 
-        if weekday and wall >= datetime_time(13, 30):
+        if session_open and wall >= datetime_time(13, 30):
             open_markets = [
                 market
                 for market in EXPECTED_MARKETS
@@ -1004,6 +1029,9 @@ def main() -> int:
             "production_order_possible": False,
             "observed_at_taipei": observed.isoformat(timespec="milliseconds"),
             "session_date": session_date,
+            "session_state": session_state,
+            "session_reason": session_reason,
+            "session_markets": list(session_markets),
             "expected_markets": list(EXPECTED_MARKETS),
             "failures": failures,
             "warnings": warnings,

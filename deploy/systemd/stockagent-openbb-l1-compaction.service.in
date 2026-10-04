@@ -11,24 +11,29 @@ WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
 Environment="OPENBB_OUTPUT_DIR=data_openBB"
-ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --archive-idle-only --max-source-files 2048 --max-files-per-segment 128 --max-source-bytes-per-segment 16777216 --max-uncompressed-bytes-per-segment 33554432 --max-source-rows-per-segment 500000 --min-files-per-segment 32 --include-tail --threads 2 --memory-limit 1GB --no-progress
+# The compactor may legitimately run for up to 40 minutes. Leave a five-minute
+# margin before the protected 08:20 TW opening. This maintenance batch must
+# also wait until the 13:35 delayed closing-auction receipt deadline passes.
+ExecCondition=/usr/bin/bash "__REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh" --minimum-runway-minutes 45 --protected-until 13:35
+# Bootstrap with one exact full audit, then use same-transaction task changes;
+# schema drift, excessive changes and the daily integrity interval force full.
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --archive-idle-only --incremental-source-audit --schema-grouped-sec-views --max-source-files 32768 --max-files-per-segment 128 --max-source-bytes-per-segment 16777216 --max-uncompressed-bytes-per-segment 33554432 --max-source-rows-per-segment 500000 --min-files-per-segment 32 --include-tail --threads 2 --memory-limit 1GB --no-progress
 UMask=0077
 Nice=15
 CPUWeight=10
 IOWeight=10
 IOSchedulingClass=idle
 # DuckDB's 1 GB execution budget still coexists with Arrow/Python metadata and
-# the cgroup's file cache. A 2 GB soft limit caused sustained reclaim pressure
-# while the host retained tens of GiB available; keep the 3 GB hard stop and
-# allow a bounded 2.5 GB working set.
-MemoryHigh=2560M
+# the cgroup's file cache. The 2026-09-26 05:44 natural run reached the
+# 2.5 GiB soft limit and recorded 29,631 memory.high events while remaining
+# below the 3 GiB hard stop. Allow 256 MiB more reclaimable cache, without
+# changing batch size, the hard stop, or the source/derivative audits.
+MemoryHigh=2816M
 MemoryMax=3G
-# The 16 GiB manifest now needs about 15 minutes for the receipt-preserving
-# stale scan before a bounded 2,048-shard batch begins.  A clean-system run
-# reached the former 20-minute boundary while still making verified progress.
-# Preserve batch throughput and the 3 GiB hard memory limit, but allow roughly
-# 2x the current legitimate wall time.  The timer is relative to unit inactivity,
-# so this cannot overlap another compaction instance.
+# The full receipt-preserving stale scan is largely fixed cost. Bound each
+# batch at 32,768 source shards while retaining the per-segment byte/row limits,
+# 3 GiB hard memory stop, 40-minute timeout, and opening/auction guard. The
+# timer is relative to unit inactivity, so instances cannot overlap.
 TimeoutStartSec=40min
 NoNewPrivileges=true
 PrivateTmp=true

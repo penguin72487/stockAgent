@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -143,6 +144,13 @@ def audit_file(
     security_types: Counter[str] = Counter()
     invalid_date_examples: list[dict] = []
     unknown_examples: list[dict] = []
+
+    # Most daily rows repeat the same venue/symbol/name classification. Keep
+    # the name in the cache key so a future name-sensitive rule remains exact.
+    @lru_cache(maxsize=16_384)
+    def classify(symbol: object, name: object | None) -> str | None:
+        return classify_tw_exchange_security(spec["venue"], symbol, name)
+
     for batch in parquet.iter_batches(columns=columns, batch_size=batch_size):
         frame = pl.from_arrow(batch)
         rows += frame.height
@@ -155,16 +163,14 @@ def audit_file(
             symbol = pl.col(spec["symbol"]).cast(pl.String)
             if has_name:
                 classified = [
-                    classify_tw_exchange_security(
-                        spec["venue"], symbol_value, security_name
-                    )
+                    classify(symbol_value, security_name)
                     for symbol_value, security_name in frame.select(
                         spec["symbol"], spec["name"]
                     ).iter_rows()
                 ]
             else:
                 classified = [
-                    classify_tw_exchange_security(spec["venue"], symbol_value)
+                    classify(symbol_value, None)
                     for symbol_value in frame[spec["symbol"]].to_list()
                 ]
             frame = frame.with_columns(pl.Series("_kind", classified, dtype=pl.String))

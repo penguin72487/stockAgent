@@ -1051,6 +1051,14 @@ def attach_stock_context_futures_portfolio_daily(
         assert integer_execution is not None
         candidate_mask &= integer_execution[..., 8] >= 1.0
 
+    # Apply this action eligibility only after constructing all ledger facts.
+    # Channel 8 is floor(previous same-contract volume * participation), never
+    # current-session volume or eventual realized fill. A zero action must not
+    # erase valuation or liquidation metadata for an existing position.
+    if require_prior_capacity:
+        assert integer_execution is not None
+        candidate_mask &= integer_execution[..., 8] >= 1.0
+
     panel.stock_context_futures_portfolio_daily = (
         TaiwanStockContextFuturesPortfolioDaily(
             dates=dates,

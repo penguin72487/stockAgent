@@ -8,6 +8,8 @@ import torch
 from stockagent.backtest.tw_futures_portfolio import (
     _absolute_cost_with_intent,
     _globally_funded_group_candidate_indices_impl,
+    _positive_inventory_half_slope,
+    _project_margin_position_limit_axes,
     run_tw_futures_portfolio_integer_torch,
 )
 from stockagent.data import tw_futures_margin as margin
@@ -291,3 +293,42 @@ def test_sanitized_nonfinite_actions_keep_exact_forward_and_finite_backward(acti
     assert result.final_alive
     (-result.strategy_returns.sum()).backward()
     assert action.grad.item() == 0
+
+
+def test_signed_inventory_split_is_identity_in_value_and_gradient():
+    integer = torch.tensor([-50, 0, 50], dtype=torch.int64)
+    assert _positive_inventory_half_slope(integer).dtype == integer.dtype
+    assert torch.equal(_positive_inventory_half_slope(integer), integer.clamp_min(0))
+    quantity = torch.tensor([-50., -1., 0., 1., 50.], requires_grad=True)
+    positive = _positive_inventory_half_slope(quantity)
+    negative = _positive_inventory_half_slope(-quantity)
+    assert torch.equal(positive, quantity.clamp_min(0))
+    assert torch.equal(negative, (-quantity).clamp_min(0))
+    (positive - negative).sum().backward()
+    assert torch.equal(quantity.grad, torch.ones_like(quantity))
+
+
+@pytest.mark.parametrize('rows', [1, 128])
+def test_unconstrained_zero_inventory_carry_has_unit_tangent(rows):
+    # Carrying an unchanged zero position must not multiply its sensitivity
+    # every day. The old dual-clamp split produced 2**rows (FP32 overflow).
+    tape = torch.zeros(3, margin.MARGIN_GRANDFATHER_EXECUTION_WIDTH)
+    group = torch.arange(3)
+    for field in (margin.POSITION_GROUP, margin.SECOND_POSITION_GROUP):
+        tape[:, field] = group
+    for field in (margin.POSITION_UNIT, margin.SECOND_POSITION_UNIT):
+        tape[:, field] = 1
+    for field in (margin.POSITION_LIMIT, margin.SECOND_POSITION_LIMIT):
+        tape[:, field] = 1000
+    seed = torch.tensor([-1., 0., 1.], requires_grad=True)
+    current = seed
+    for _ in range(rows):
+        current, failed, _ = _project_margin_position_limit_axes(
+            current, current, execution_row=tape, position_group=group,
+            position_units=torch.ones(3), group_limits=torch.full((3,), 1000.),
+            close_capacity=torch.full((3,), 1000.), whole_contracts=False,
+        )
+        assert not failed.any()
+    assert torch.equal(current, seed)
+    current.sum().backward()
+    assert torch.equal(seed.grad, torch.ones_like(seed))

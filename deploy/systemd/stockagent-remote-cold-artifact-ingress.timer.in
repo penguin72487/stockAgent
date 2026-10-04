@@ -3,6 +3,7 @@ Description=Check allowlisted remote completed artifacts every five minutes
 
 [Timer]
 OnBootSec=2min
+OnActiveSec=2min
 OnUnitInactiveSec=5min
 Persistent=true
 Unit=stockagent-remote-cold-artifact-ingress.service

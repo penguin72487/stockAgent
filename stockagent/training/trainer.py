@@ -124,6 +124,8 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_day_trade_execution import DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION
+from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_ACTION_COUNT,
     TAIFEX_INDEX_FUTURES_PRODUCTS,
@@ -3357,6 +3359,8 @@ def _mode_artifact_contract_for_config(
                     if physical_fifo
                     else "exact_board_lot_minute_event_tape_v1"
                 ),
+                "minute_execution_contract_version": DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
+                "regular_market_admission": regular_market_admission_contract(),
                 "daily_policy_decisions_per_session": 1,
                 "daily_proxy_allowed": bool(
                     config.data.day_trade_minute_execution_allow_daily_proxy
@@ -10719,7 +10723,7 @@ def _save_fold_output_artifacts(
     *,
     fold_dir: Path,
     fold_result: FoldResult,
-    model: nn.Module,
+    model: nn.Module | None,
     test_backtest: BacktestResult,
     test_dates: np.ndarray,
     symbols: list[str],
@@ -10734,6 +10738,8 @@ def _save_fold_output_artifacts(
     write_plots: bool = True,
     mark_complete: bool = False,
     day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
+    write_model_checkpoint: bool = True,
+    source_cache_snapshot: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, float | int | str], dict[str, float | str]]:
     if not _distributed_should_write():
         return {"skipped_nonzero_rank": "1", "total_s": 0.0}, {"skipped_nonzero_rank": "1", "total_s": 0.0}
@@ -10859,8 +10865,12 @@ def _save_fold_output_artifacts(
     save_start = time.perf_counter()
     save_timing: dict[str, float | int | str] = {}
     stage_start = time.perf_counter()
-    torch.save(_state_dict_for_save(model), _model_path(fold_dir))
+    if write_model_checkpoint:
+        if model is None:
+            raise ValueError("writing a model checkpoint requires a model")
+        torch.save(_state_dict_for_save(model), _model_path(fold_dir))
     save_timing["model_checkpoint_s"] = float(time.perf_counter() - stage_start)
+    save_timing["model_checkpoint_written"] = int(write_model_checkpoint)
 
     stage_start = time.perf_counter()
     with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
@@ -11187,6 +11197,10 @@ def _save_fold_output_artifacts(
         fold_dir / "mode_artifact_contract.json",
         _mode_artifact_contract_for_config(config),
     )
+    if source_cache_snapshot is not None:
+        # Observability only: never include changing cache counters in source,
+        # optimizer or report-semantics fingerprints. No hot-loop disk writes.
+        write_training_json(fold_dir / "physical_source_cache.json", dict(source_cache_snapshot))
     if mark_complete:
         _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
     if print_report:
@@ -13857,6 +13871,19 @@ def _physical_carry_artifact_context(
     )
 
 
+def _physical_source_cache_snapshot(runtime: _ExecutionRuntime) -> dict[str, Any] | None:
+    source = runtime.day_trade_carry_source
+    if source is None or source.runtime_cache_info is None:
+        return None
+    return dict(
+        schema_version=1, release_id=source.release_id,
+        scope="rank_local_shared_source_lifetime_before_fold_reporting",
+        rank=int(os.environ.get("RANK", "0")),
+        effective_universe_count=len(source.universe),
+        **source.runtime_cache_info(),
+    )
+
+
 @contextmanager
 def _physical_carry_cpu_replay_threads():
     """Bound intra-op dispatch for the serial, CPU-only artifact oracle.
@@ -13903,6 +13930,19 @@ def _replay_physical_carry_split_prefix(
     count = max(0, min(int(rows), total))
     if count <= 0:
         raise ValueError("physical prefix replay requires at least one owned session")
+    if total != len(split):
+        raise ValueError("physical prefix requests differ from the evaluated split")
+    if count == total and initial_state is None:
+        state = result.day_trade_carry_state
+        if (
+            state is None or result.minute_nav is None
+            or state.last_session_day != source.day_at(int(split._valid_indices_cpu[count - 1]))
+        ):
+            raise ValueError("physical full prefix requires its exact recorded endpoint")
+        # The full owned interval already has its exact FIFO endpoint. A second
+        # replay would decode every immutable source session and re-run all
+        # 270 minute opportunities without changing the result.
+        return _prefix_backtest_result(result, count)
     device = torch.device("cpu")
     sessions, source_count = source.batch(split, 0, count, device)
     if source_count != count:
@@ -18275,7 +18315,10 @@ def _try_load_fresh_fold_physical_deployment_segment(
     try:
         dates = np.asarray(expected_dates, dtype="datetime64[D]").reshape(-1)
         symbols = [str(symbol) for symbol in expected_symbols]
-        if _load_deployment_symbols(fold_dir, len(symbols)) != symbols:
+        # A valid checkpoint subset/reorder is a cache-key mismatch, not a
+        # malformed one-to-one sidecar. The canonical path below expands its
+        # recorded requests into the full panel and replays the account.
+        if _load_deployment_symbols(fold_dir, None) != symbols:
             raise ValueError("stored global symbol order differs")
         stored, stored_dates = _load_backtest_artifact(
             artifact_path,
@@ -23674,7 +23717,6 @@ def _run_inference_tree_models(
             execution_mode=execution_runtime.mode,
         )
         test_bt = test_bt_t.to_numpy()
-        deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
         deployment_test_dates = test_dates[:deployment_test_rows]
         write_integer_holdings_table = bool(config.training.save_integer_share_holdings_table)
         test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
@@ -23759,10 +23801,7 @@ def _run_inference_tree_models(
             or canonical_tensor_day_trade
             else test_integer_bt
         )
-        deployment_test_bt = _prefix_backtest_result(
-            canonical_test_bt,
-            deployment_test_rows,
-        )
+        deployment_test_bt = _prefix_backtest_result(canonical_test_bt, deployment_test_rows)
 
         fold_result = FoldResult(
             fold_id=fold.fold_id,
@@ -23773,12 +23812,7 @@ def _run_inference_tree_models(
             val_ic=val_ic,
             val_metrics=val_met,
             test_ic=test_ic,
-            test_metrics=(
-                test_met
-                if execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
-                or canonical_tensor_day_trade
-                else test_integer_met
-            ),
+            test_metrics=test_met,
             test_integer_metrics=(
                 test_integer_met
                 if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
@@ -23793,114 +23827,20 @@ def _run_inference_tree_models(
         )
         results_by_fold[fold.fold_id] = fold_result
 
-        # Pure inference must persist the same pinned physical-source contract
-        # as the formal training finalizer.  The exact FIFO result contains
-        # currency NAV and minute inventory histories; writing it without the
-        # ordered universe, immutable release id, and reset-segment NAV would
-        # either make the artifact unreplayable or (correctly) trip the legacy
-        # writer guard.
         day_trade_carry_context = _physical_carry_artifact_context(
-            runtime=execution_runtime,
-            symbols=test_symbols,
-            config=config,
+            runtime=execution_runtime, symbols=test_symbols, config=config,
             initial_nav=float(config.trading.volume_participation_equity),
         )
-
-        with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
-            json.dump(asdict(fold_result), f, indent=2)
-
-        _test_symbols_path(fold_dir).write_text(
-            json.dumps([str(symbol) for symbol in test_symbols], ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-        _save_backtest_artifact(
-            _backtest_path(fold_dir),
-            canonical_test_bt,
-            test_dates,
+        _save_fold_output_artifacts(
+            fold_dir=fold_dir, fold_result=fold_result, model=None,
+            test_backtest=test_bt, test_dates=test_dates, symbols=test_symbols,
+            config=config, test_future_returns=test_returns,
+            test_integer_backtest=test_integer_bt, holdings_records=holdings_records,
+            deployment_backtest=deployment_test_bt, deployment_dates=deployment_test_dates,
+            print_report=False, write_plots=True, write_model_checkpoint=False,
             day_trade_carry_context=day_trade_carry_context,
+            source_cache_snapshot=_physical_source_cache_snapshot(execution_runtime),
         )
-        if (
-            execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
-            and not canonical_tensor_day_trade
-        ):
-            _save_backtest_artifact(
-                fold_dir / "test_backtest_continuous_surrogate.npz",
-                test_bt,
-                test_dates,
-            )
-        table_output_format = str(getattr(config.training, "table_output_format", "csv"))
-        _save_daily_portfolio_returns_table(
-            fold_dir / "daily_portfolio_returns",
-            test_dates,
-            canonical_test_bt.strategy_returns,
-            canonical_test_bt.benchmark_returns,
-            canonical_test_bt.turnovers,
-            table_output_format=table_output_format,
-        )
-        _maybe_save_daily_weights_table(
-            fold_dir / "daily_weights.csv",
-            test_dates,
-            panel.symbols,
-            canonical_test_bt.weights_history,
-            enabled=bool(config.training.save_daily_weights_table),
-            table_output_format=table_output_format,
-        )
-        report = generate_annual_report(canonical_test_bt, test_dates)
-        with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
-            f.write(report)
-        _save_deployment_test_artifacts(
-            fold_dir,
-            deployment_test_bt,
-            deployment_test_dates,
-            symbols=test_symbols,
-            backtest_artifact_compression=str(
-                getattr(config.training, "backtest_artifact_compression", "none")
-            ),
-            day_trade_carry_context=day_trade_carry_context,
-        )
-
-        benchmark_label = _benchmark_plot_label(config)
-        test_scope_label = "Full-Horizon Fold Test (Reset State)"
-        plot_equity_curve(
-            canonical_test_bt,
-            test_dates,
-            fold_dir / "equity_curve.png",
-            scope_label=test_scope_label,
-            benchmark_label=benchmark_label,
-        )
-        plot_equity_curve_log(
-            canonical_test_bt,
-            test_dates,
-            fold_dir / "equity_curve_log.png",
-            scope_label=test_scope_label,
-            benchmark_label=benchmark_label,
-        )
-        plot_annual_performance(
-            canonical_test_bt,
-            test_dates,
-            fold_dir / "annual_performance.png",
-            scope_label=test_scope_label,
-            benchmark_label=benchmark_label,
-        )
-        _write_reporting_leverage_artifacts(
-            canonical_test_bt,
-            test_returns,
-            test_dates,
-            fold_dir,
-            config,
-        )
-        if test_integer_bt is not None:
-            _save_integer_share_audit_artifacts(
-                fold_dir,
-                test_integer_bt,
-                test_dates,
-                panel.symbols,
-                holdings_records,
-                write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
-                write_holdings_table=write_integer_holdings_table,
-                table_output_format=table_output_format,
-            )
         _write_fold_complete_marker(fold_dir, fold_result, source="tree_inference_final")
 
     if results_by_fold:
@@ -24372,7 +24312,6 @@ def _run_inference_neural_models(
             execution_mode=fold_execution_runtime.mode,
         )
         test_bt = test_bt_t.to_numpy()
-        deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
         deployment_test_dates = test_dates[:deployment_test_rows]
         write_integer_holdings_table = bool(config.training.save_integer_share_holdings_table)
         test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
@@ -24465,10 +24404,15 @@ def _run_inference_neural_models(
             or canonical_tensor_exact
             else test_integer_bt
         )
-        deployment_test_bt = _prefix_backtest_result(
-            canonical_test_bt,
-            deployment_test_rows,
-        )
+        if fold_execution_runtime.day_trade_carry_source is not None:
+            deployment_test_bt = _replay_physical_carry_split_prefix(
+                test_bt, test_windowed, deployment_test_rows,
+                runtime=fold_execution_runtime, config=config,
+            )
+        else:
+            deployment_test_bt = _prefix_backtest_result(
+                canonical_test_bt, deployment_test_rows,
+            )
 
         fold_result = FoldResult(
             fold_id=fold.fold_id,
@@ -24479,12 +24423,7 @@ def _run_inference_neural_models(
             val_ic=val_ic,
             val_metrics=val_met,
             test_ic=test_ic,
-            test_metrics=(
-                test_met
-                if fold_execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
-                or canonical_tensor_exact
-                else test_integer_met
-            ),
+            test_metrics=test_met,
             test_integer_metrics=(
                 test_integer_met
                 if fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
@@ -24499,36 +24438,19 @@ def _run_inference_neural_models(
         )
         results_by_fold[fold.fold_id] = fold_result
 
-        # Match the training finalizer's exact FIFO artifact contract.  Pure
-        # inference starts the test segment from configured capital as well,
-        # so both the full test and its deployment prefix share this context.
-        day_trade_carry_context = _physical_carry_artifact_context(
-            runtime=fold_execution_runtime,
-            symbols=test_symbols,
-            config=config,
-            initial_nav=float(config.trading.volume_participation_equity),
-        )
-
-        # Reuse the formal training finalizer so pure inference cannot publish
-        # a completion marker while omitting model, settlement, mode-contract,
-        # timing, source-context, or ordered-symbol artifacts.
         _save_fold_output_artifacts(
-            fold_dir=fold_dir,
-            fold_result=fold_result,
-            model=model,
-            test_backtest=test_bt,
-            test_dates=test_dates,
-            symbols=test_symbols,
-            config=config,
-            test_future_returns=test_returns,
-            test_integer_backtest=test_integer_bt,
-            holdings_records=holdings_records,
-            deployment_backtest=deployment_test_bt,
-            deployment_dates=deployment_test_dates,
-            print_report=False,
-            write_plots=True,
+            fold_dir=fold_dir, fold_result=fold_result, model=model,
+            test_backtest=test_bt, test_dates=test_dates, symbols=test_symbols,
+            config=config, test_future_returns=test_returns,
+            test_integer_backtest=test_integer_bt, holdings_records=holdings_records,
+            deployment_backtest=deployment_test_bt, deployment_dates=deployment_test_dates,
+            print_report=False, write_plots=True, write_model_checkpoint=False,
             mark_complete=True,
-            day_trade_carry_context=day_trade_carry_context,
+            day_trade_carry_context=_physical_carry_artifact_context(
+                runtime=fold_execution_runtime, symbols=test_symbols, config=config,
+                initial_nav=float(config.trading.volume_participation_equity),
+            ),
+            source_cache_snapshot=_physical_source_cache_snapshot(fold_execution_runtime),
         )
 
     if results_by_fold:
@@ -28064,6 +27986,7 @@ def _run_training_impl(
                     config=config,
                     initial_nav=float(config.trading.volume_participation_equity),
                 ),
+                source_cache_snapshot=_physical_source_cache_snapshot(execution_runtime),
             )
             print(
                 f"[Fold {fold.fold_id}] best-val fold artifacts written in "
@@ -29487,6 +29410,7 @@ def _run_training_impl(
                         config=config,
                         initial_nav=float(config.trading.volume_participation_equity),
                     ),
+                    source_cache_snapshot=_physical_source_cache_snapshot(execution_runtime),
                 )
                 plot_total = float(plot_timing.get("total_s", 0.0))
 

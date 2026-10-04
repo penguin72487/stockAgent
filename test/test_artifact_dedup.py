@@ -58,6 +58,27 @@ def test_same_size_different_content_is_not_deduplicated(tmp_path: Path) -> None
 
     assert groups == []
     assert counters["exact_duplicate_groups"] == 0
+    assert counters["sampled_distinct_inodes"] == 2
+    assert counters["hashed_distinct_inodes"] == 0
+
+
+def test_same_edge_samples_still_compare_full_content(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    first = root / "markets" / "first.bin"
+    second = root / "markets" / "second.bin"
+    first.parent.mkdir(parents=True)
+    edge = b"x" * (64 * 1024)
+    first.write_bytes(edge + b"one" + edge)
+    second.write_bytes(edge + b"two" + edge)
+    _make_old(first)
+    _make_old(second)
+
+    groups, counters = find_duplicate_groups(root, min_age_hours=24)
+
+    assert groups == []
+    assert counters["sampled_distinct_inodes"] == 2
+    assert counters["hashed_distinct_inodes"] == 2
+    assert counters["exact_duplicate_groups"] == 0
 
 
 def test_recent_and_mutable_tree_files_are_excluded(tmp_path: Path) -> None:

@@ -1512,6 +1512,21 @@ def test_formal_config_preserves_full_contract_and_1000_epochs() -> None:
     )
 
 
+@pytest.mark.parametrize('slots,version',[(2560,5),(2816,6)])
+def test_wide_futures_action_layout_invalidates_model_and_resume_fingerprints(slots,version):
+    import copy
+    config=load_config('configs/markets/tw_stock_context_all_futures_portfolio_multi_basis_projection_l1.yaml')
+    legacy=build_checkpoint_manifest(_stock_panel(),config,include_data_content=False)
+    wide=copy.deepcopy(config);wide.data.tw_futures_portfolio_slot_count=slots
+    manifest=build_checkpoint_manifest(_stock_panel(),wide,include_data_content=False)
+    values=manifest['contracts']['trading']['taiwan_stock_context_futures_portfolio']
+    assert values['fixed_model_output_slots']==slots and values['data_contract_version']==version
+    for scope in ('model','resume'):
+        with pytest.raises(RuntimeError,match='fingerprint mismatch'):
+            validate_checkpoint_manifest({'experiment_manifest':legacy},manifest,
+                checkpoint_path=Path('legacy-1936.pt'),scope=scope)
+
+
 def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:
     config = load_config(
         "configs/markets/"

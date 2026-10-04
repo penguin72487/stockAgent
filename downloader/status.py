@@ -36,6 +36,27 @@ SUMMARY_NAME_BY_MODE = {
 }
 
 
+def reported_source_gap_counts(counts: dict[str, int]) -> dict[str, int]:
+    """Keep the actionable breakdown of final and deliberately skipped gaps.
+
+    Precheck statuses such as ``stale`` can coexist with successful repairs and
+    must not be counted twice. ``lagging_skip`` has no attempted repair in the
+    same run and remains a visible coverage gap.
+    """
+
+    return {
+        key: value for key, value in counts.items()
+        if key == "failed" or key.startswith("failed_")
+        or key in {"still_stale", "lagging_skip"}
+    }
+
+
+def count_reported_source_gaps(counts: dict[str, int]) -> int:
+    """Count the same gap statuses without double-counting precheck states."""
+
+    return sum(reported_source_gap_counts(counts).values())
+
+
 def _is_tw_public_refresh_command(command: list[str]) -> bool:
     return any(
         Path(str(item)).name == "refresh_tw_public_live_snapshot.py"

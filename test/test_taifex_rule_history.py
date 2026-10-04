@@ -50,6 +50,34 @@ def test_index_validates_each_row_against_requested_range():
         collector.parse_index(index_html(("2026/09/23", "公告", "newsDetail?idx=1")), date(2004, 1, 1), date(2004, 12, 31))
 
 
+def test_legal_archive_binds_old_attachment_notices_to_publication_dates(queue):
+    body = index_html(("2010/12/15", "臺灣50期貨契約規格", "inforDetail?idx=812&thetype=1"))
+    body = body.replace(b"id='content'", b"id='printhere'")
+    rows = collector.parse_legal_index(body)
+    assert rows[0]['url'] == collector.BASE + '/cht/6/inforDetail?idx=812&thetype=1'
+    assert rows[0]['published_date'] == '2010-12-15'
+    assert rows[0]['published_at'] is None
+    task = dict(url=collector.LEGAL_INDEX_URL, source_id='legal_revisions')
+    collector.discover_preserved_links(queue, body, task, 'html')
+    notice = queue.execute('SELECT * FROM documents').fetchone()
+    assert notice['source_id'] == 'contract_specs'
+    queue.execute("UPDATE documents SET state='complete'")
+    collector.discover_preserved_links(queue, body, task, 'html')
+    assert queue.execute('SELECT state FROM documents').fetchone()[0] == 'complete'
+    assert queue.execute('SELECT count(*) FROM announcements').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('body', [
+    b'<div id="printhere">login required</div>',
+    index_html().replace(b"id='content'", b"id='printhere'"),
+    index_html(('2010/12/15', '規格', 'https://example.org/inforDetail?idx=1')).replace(
+        b"id='content'", b"id='printhere'"),
+])
+def test_legal_archive_rejects_empty_error_or_external_listing(body):
+    with pytest.raises(ValueError):
+        collector.parse_legal_index(body)
+
+
 @pytest.mark.parametrize("html", [
     b"<html><title>Request Rejected</title>FOR SECURITY REASONS</html>",
     b"<div id='content'>FOR SECURITY REASONS</div>",

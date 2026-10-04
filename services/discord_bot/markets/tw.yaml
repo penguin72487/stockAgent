@@ -1,6 +1,6 @@
 market: tw
 label: 台股・Naive
-enabled: true
+enabled: false
 market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"

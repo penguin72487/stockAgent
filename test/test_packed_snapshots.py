@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -7,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from stockagent.data_sync.desync_snapshots import SnapshotError, scan_tree
+import stockagent.data_sync.packed_snapshots as packed_snapshots
+from scripts.packed_snapshot import main as packed_snapshot_main
 from stockagent.data_sync.packed_snapshots import (
     audit_packed_store,
     fetch_packed_snapshot,
@@ -30,6 +33,19 @@ def _source_tree(root: Path) -> Path:
     (source / "large-b.bin").write_bytes(large)
     (source / "current").symlink_to("text/first.json")
     return source
+
+
+def test_unmounted_d_cold_fallback_refuses_layout_and_publication(tmp_path: Path) -> None:
+    sync_root = tmp_path / "cold"
+    sync_root.mkdir()
+    (sync_root / ".stockagent-d-mount-required").write_text("mount required\n")
+    source = _source_tree(tmp_path)
+
+    with pytest.raises(SnapshotError, match="not mounted"):
+        initialize_packed_layout(sync_root, node_id="node-a")
+    with pytest.raises(SnapshotError, match="not mounted"):
+        publish_packed_snapshot(sync_root, "prices", source, node_id="node-a")
+    assert not (sync_root / "objects").exists()
 
 
 def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
@@ -95,6 +111,63 @@ def test_metadata_only_resolver_allows_edge_to_hydrate_missing_objects(
     )
     assert resolved.manifest["snapshot_id"] == published.manifest["snapshot_id"]
     assert by_id.manifest["snapshot_id"] == published.manifest["snapshot_id"]
+
+
+def test_selected_reconstruction_checks_pack_and_shared_blob_paths(tmp_path):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(
+        cold, "prices", source, loose_file_threshold_bytes=1024
+    )
+    result = verify_packed_snapshot(
+        cold,
+        resolved,
+        reconstruct_paths=["text/first.json", "large-a.bin", "large-b.bin", "large-a.bin"],
+    )
+    assert result["independently_reconstructed_files"] == 3
+    assert result["objects"] == resolved.manifest["archive"]["object_count"]
+    assert not result["materialized_verified"]
+
+
+@pytest.mark.parametrize("requested", ["current", "empty", "missing", "../escape"])
+def test_selected_reconstruction_rejects_non_file_inventory_paths(tmp_path, requested):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(cold, "prices", source)
+    with pytest.raises(SnapshotError, match="non-file or unknown"):
+        verify_packed_snapshot(cold, resolved, reconstruct_paths=[requested])
+
+
+def test_selected_reconstruction_checks_file_hash_independent_of_zip_crc(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(cold, "prices", source)
+    load_inventory = packed_snapshots._load_inventory
+
+    def wrong_file_hash(*args):
+        rows = load_inventory(*args)
+        next(row for row in rows if row["path"] == "text/first.json")["sha256"] = "0" * 64
+        return rows
+
+    monkeypatch.setattr(packed_snapshots, "_load_inventory", wrong_file_hash)
+    with pytest.raises(SnapshotError, match="exact cold reconstruction failed"):
+        verify_packed_snapshot(cold, resolved, reconstruct_paths=["text/first.json"])
+
+
+def test_empty_reconstruction_request_still_hashes_all_cold_objects(tmp_path):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="test-node")
+    resolved = publish_packed_snapshot(cold, "prices", source)
+    obj = cold / resolved.manifest["archive"]["objects"][0]["relpath"]
+    payload = bytearray(obj.read_bytes())
+    payload[0] ^= 1
+    obj.write_bytes(payload)
+    with pytest.raises(SnapshotError, match="checksum mismatch"):
+        verify_packed_snapshot(cold, resolved, reconstruct_paths=[])
 
 
 def test_explicit_missing_object_recovery_publishes_current_bytes_under_new_identity(tmp_path):
@@ -311,6 +384,79 @@ def test_unchanged_publish_is_a_semantic_noop(tmp_path: Path) -> None:
     assert len(list((sync_root / "manifests" / "prices").glob("*.json"))) == 1
 
 
+def test_source_guard_vetoes_semantic_noop_without_changing_existing_head(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    first = publish_packed_snapshot(sync_root, "prices", source, pack_buckets=2)
+    head_before = first.head_path.read_bytes()
+    calls = 0
+
+    def guard() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise SnapshotError("producer proof changed")
+
+    with pytest.raises(SnapshotError, match="producer proof changed"):
+        publish_packed_snapshot(sync_root, "prices", source, pack_buckets=2, source_guard=guard)
+    assert calls == 2
+    assert first.head_path.read_bytes() == head_before
+    assert len(list((sync_root / "manifests/prices").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_transport_notification_releases_global_publish_locks_even_for_noop(tmp_path, monkeypatch, defer):
+    import fcntl
+    from stockagent.data_sync import syncthing_scan
+
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="node-a")
+    observed = []
+
+    def notify(sync_root, dataset, **kwargs):
+        assert (sync_root / "heads" / dataset / "node-a.json").is_file()
+        for name in ("publish-retention-global.lock", "publish-prices.lock"):
+            with (sync_root / ".local-state/locks" / name).open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed.append(kwargs)
+        return True
+
+    monkeypatch.setattr(syncthing_scan, "queue_after_publish" if defer else "scan_after_publish", notify)
+    if defer:
+        monkeypatch.setattr(syncthing_scan, "scan_after_publish", lambda *_a, **_k: pytest.fail("deferred commit cannot do network scan"))
+    first = publish_packed_snapshot(cold, "prices", source, defer_scan=defer)
+    second = publish_packed_snapshot(cold, "prices", source, defer_scan=defer)
+    assert first.manifest["snapshot_id"] == second.manifest["snapshot_id"]
+    assert len(observed) == 2
+    assert observed[0]["new_object_paths"]
+
+
+def test_queue_failure_after_head_commit_is_not_an_unpublished_release(tmp_path, monkeypatch):
+    from stockagent.data_sync import syncthing_scan
+
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="node-a")
+    monkeypatch.setattr(syncthing_scan, "queue_after_publish", lambda *_a, **_k: (_ for _ in ()).throw(SnapshotError("queue fsync failed")))
+    with pytest.raises(SnapshotError, match="queue fsync failed"):
+        publish_packed_snapshot(cold, "prices", source, defer_scan=True)
+    assert (cold / "heads/prices/node-a.json").is_file()
+
+
+def test_deferred_scan_cannot_claim_queue_when_d_primary_disappears(tmp_path, monkeypatch):
+    from stockagent.data_sync import syncthing_scan
+
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initialize_packed_layout(cold, node_id="node-a")
+    monkeypatch.setattr(syncthing_scan, "queue_after_publish", lambda *_a, **_k: False)
+    with pytest.raises(SnapshotError, match="durable scan intent was not queued"):
+        publish_packed_snapshot(cold, "prices", source, defer_scan=True)
+    assert (cold / "heads/prices/node-a.json").is_file()
+
+
 def test_changed_small_file_uses_delta_pack_and_reuses_old_members(
     tmp_path: Path,
 ) -> None:
@@ -401,6 +547,69 @@ def test_corrupt_object_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(SnapshotError, match="checksum mismatch"):
         verify_packed_snapshot(sync_root, resolved)
+
+
+def test_small_pack_verification_reuses_one_bounded_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    resolved = publish_packed_snapshot(
+        sync_root, "prices", source, loose_file_threshold_bytes=1024,
+        pack_buckets=2,
+    )
+    packs = {
+        sync_root / item["relpath"]
+        for item in resolved.manifest["archive"]["objects"]
+        if item["kind"] == "pack"
+    }
+    blobs = {
+        sync_root / item["relpath"]
+        for item in resolved.manifest["archive"]["objects"]
+        if item["kind"] == "blob"
+    }
+    original_sha256_file = packed_snapshots.sha256_file
+    hashed_paths: list[Path] = []
+
+    def traced_sha256_file(path: Path) -> str:
+        hashed_paths.append(path)
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(packed_snapshots, "sha256_file", traced_sha256_file)
+    bounded = verify_packed_snapshot(sync_root, resolved)
+    assert not packs.intersection(hashed_paths)
+    assert blobs.issubset(hashed_paths)
+
+    hashed_paths.clear()
+    monkeypatch.setattr(packed_snapshots, "MAX_IN_MEMORY_PACK_VERIFY_BYTES", 0)
+    streamed = verify_packed_snapshot(sync_root, resolved)
+    assert packs.issubset(hashed_paths)
+    assert streamed == bounded
+
+
+def test_verify_cli_profile_keeps_complete_verification_result(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    published = publish_packed_snapshot(sync_root, "prices", source)
+
+    assert packed_snapshot_main([
+        "verify", "prices", "--snapshot-id", published.manifest["snapshot_id"],
+        "--sync-root", str(sync_root), "--profile",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["snapshot_id"] == published.manifest["snapshot_id"]
+    assert payload["objects"] == published.manifest["archive"]["object_count"]
+    assert payload["profile"]["scope"] == (
+        "local_process_resolution_and_full_verify_only"
+    )
+    assert payload["profile"]["elapsed_seconds"] >= 0
+    assert payload["profile"]["rchar_bytes"] is None or (
+        payload["profile"]["rchar_bytes"] > 0
+    )
 
 
 def test_symlink_that_escapes_source_is_rejected(tmp_path: Path) -> None:
