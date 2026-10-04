@@ -22,13 +22,15 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## 資料與多機維運 Runbook
 
+- [`penguin_source_only_storage_2026-10-01.md`](penguin_source_only_storage_2026-10-01.md)：
+  現行源本／服務機分工、遠端按需訓練生成、公開資訊與來源清單、安全清理收據及保留阻礙。
 - [`packed_dataset_storage.md`](packed_dataset_storage.md)：現行 packed 冷庫、增量 pack/blob、
-  多寫者 head、materialize、lease、penguin C 槽 rolling-current retention 與非持久 Vast
-  的 index-only edge cache。
-- [`packed_cold_backup.md`](packed_cold_backup.md)：penguin 權威冷庫至 D 槽的事件觸發增量備份、
-  防誤刪、checksum、掛載防護、續傳、驗收與還原。
-- [`live_artifact_sync.md`](live_artifact_sync.md)：可變 artifacts hot transport、完成產物 cold
-  release、衝突政策與 hard-link 去重。
+  多寫者 head、materialize、lease 與非持久 Vast 的 index-only edge cache；
+  penguin 以現行儲存契約的 D 槽單份主冷庫為準，舊 C retention 不再啟用。
+- [`packed_cold_backup.md`](packed_cold_backup.md)：已退役 C→D 獨立備份的歷史救援說明，
+  不是現行部署指令；D 單份主冷庫見 [`d_cold_store_migration_2026-09-25.md`](d_cold_store_migration_2026-09-25.md)。
+- [`live_artifact_sync.md`](live_artifact_sync.md)：退役的 artifacts hot transport 與現行
+  完成產物 cold release、衝突政策、hard-link 去重；不得重建舊 folder。
 - [`storage_pressure_maintenance.md`](storage_pressure_maintenance.md)：磁碟高水位下只回收
   allowlisted 可重建編譯快取、訓練程序保護與 receipt 稽核。
 - [`desync_multiwriter_sync.md`](desync_multiwriter_sync.md)：舊 desync snapshot 的遷移／救援流程；
@@ -39,6 +41,10 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## 資料取得、修復與儲存
 
+- [`tej_smart_wizard_acquisition_2026-10-02.md`](tej_smart_wizard_acquisition_2026-10-02.md)：TEJ 全 30 類／255 表／45,826 欄清冊、v4 可操作來源範圍驗證／下載器、桌面與 API 限額邊界、唯讀進度網站及未完成驗證。
+- [`tej_smart_wizard_export_runbook_2026-10-01.md`](tej_smart_wizard_export_runbook_2026-10-01.md)：維運 runbook，記錄 Smart Wizard 查詢復原、日期／欄位讀回、Excel 唯讀擷取、單位轉換與有限樣本驗收。
+- [`tej_smart_wizard_inventory_2026-10-01.md`](tej_smart_wizard_inventory_2026-10-01.md)：TEJ 已讀資料表逐欄清冊、未讀目錄、兩階段取得與後續跨來源校驗候選；尚未完成全帳號歷史權限查驗。
+- [`finlab_stage_eta_scheduling_2026-10-01.md`](finlab_stage_eta_scheduling_2026-10-01.md)：FinLab 分階段 ETA、SDK 增量查核、防飢餓與動態剩餘配額排程，含公開畫面及計算驗收。
 - [`tw_public_download_resume_and_rate_limits.md`](tw_public_download_resume_and_rate_limits.md)：
   台灣公開資料 rebuild、repair、daily、續傳與 rate limit。
 - [`openbb_archive_downloader.md`](openbb_archive_downloader.md)：OpenBB archive ingestion、resume 與 compaction。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import threading
 from urllib.error import HTTPError
 
 import polars as pl
@@ -10,6 +11,125 @@ import pyarrow.parquet as pq
 import pytest
 
 from downloader import download_yahoo_ohlcv as yahoo
+
+
+def test_daily_asset_summary_survives_separate_asset_invocations(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = argparse.Namespace(
+        request_interval=0.1,
+        asset="us_stocks",
+        asset_workers=1,
+        mode="daily-update",
+        output_root=str(tmp_path),
+        end_date="2026-09-23",
+        fail_on_any_error=False,
+        run_id="registered-daily-20260923T223000123456789Z",
+    )
+    monkeypatch.setattr(yahoo, "parse_args", lambda: args)
+    monkeypatch.setattr(yahoo, "resolve_request_interval", lambda *_: 0.1)
+    monkeypatch.setattr(yahoo, "_run_one_asset", lambda asset, _args: (asset, {"repaired": 1}, 12.3456))
+
+    yahoo.main()
+    args.asset = "forex"
+    yahoo.main()
+
+    us = json.loads((tmp_path / "daily_update_summary.us_stocks.json").read_text())
+    forex = json.loads((tmp_path / "daily_update_summary.forex.json").read_text())
+    legacy = json.loads((tmp_path / "daily_update_summary.json").read_text())
+    assert us["asset_class"] == "us_stocks"
+    assert us["elapsed_seconds"] == 12.346
+    assert us["end_date"] == "2026-09-23"
+    assert us["run_id"] == args.run_id
+    assert forex["asset_class"] == "forex"
+    assert forex["run_id"] == args.run_id
+    assert forex["acquisition_contract"] == yahoo.acquisition_contract("forex")
+    assert us["acquisition_contract"] == yahoo.acquisition_contract("us_stocks")
+    assert legacy == {"forex": {"repaired": 1}}
+
+
+def test_symbol_repair_budget_blocks_late_parquet_commit_and_retries(tmp_path, monkeypatch):
+    import time
+
+    calls = []
+
+    def slow_fetch(_fn, *, timeout):
+        calls.append(timeout)
+        time.sleep(0.06)
+        return pl.DataFrame()
+
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", slow_fetch)
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    result = yahoo._download_symbol(
+        "tw_stocks", record, tmp_path, "2000-01-01", "2026-09-23",
+        retries=3, refresh=True, symbol_timeout_seconds=0.05,
+    )
+
+    assert result.status == "failed"
+    assert "timed out" in str(result.message)
+    assert len(calls) == 1
+    assert 0 < calls[0] <= 0.05
+    assert not (tmp_path / "2330_features.parquet").exists()
+
+
+def test_hard_fetch_timeout_uses_daemon_and_caps_orphan_threads(monkeypatch):
+    gate = threading.Event()
+    entered = threading.Event()
+    called = []
+    limit = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(yahoo, "_YAHOO_FETCH_INFLIGHT", limit)
+
+    def blocked():
+        called.append(threading.current_thread().daemon)
+        entered.set()
+        gate.wait(1)
+
+    try:
+        with pytest.raises(TimeoutError):
+            yahoo._fetch_with_hard_timeout(blocked, timeout=0.02)
+        assert entered.is_set()
+        assert called == [True]
+        with pytest.raises(TimeoutError):
+            yahoo._fetch_with_hard_timeout(
+                lambda: called.append(False), timeout=0.02
+            )
+        assert called == [True]
+    finally:
+        gate.set()
+    assert limit.acquire(timeout=1)
+    limit.release()
+
+
+def test_parallel_repair_passes_budget_to_started_symbol_worker(tmp_path, monkeypatch):
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    seen = []
+
+    def fake_download(*args):
+        seen.append(args[-1])
+        return yahoo.DownloadResult(
+            asset_class="tw_stocks", code=record.code,
+            yahoo_symbol=record.yahoo_symbol, market=record.market,
+            status="failed", rows=0, output_path=None,
+            message="repair timed out after 7s",
+        )
+
+    monkeypatch.setattr(yahoo, "_download_symbol", fake_download)
+    monkeypatch.setattr(yahoo, "_build_yfinance_rate_limited_session", lambda *_: None)
+    monkeypatch.setattr(yahoo, "_warm_yfinance_session", lambda *_: None)
+    args = argparse.Namespace(
+        request_interval=0, workers=1, end_date="2026-09-23",
+        retries=0, rate_limit_abort_after=0,
+    )
+    results = yahoo._run_parallel_symbol_downloads(
+        "tw_stocks", args, tmp_path,
+        [(record, "2000-01-01", True, False, None)], "repair:test",
+        set(), tmp_path / "blacklist.txt", threading.Lock(),
+        set(), tmp_path / "whitelist.txt", threading.Lock(),
+        symbol_timeout_seconds=7,
+    )
+
+    assert seen == [7]
+    assert results[0].status == "failed"
 
 
 def _write_parquet(frame: pl.DataFrame, path) -> None:
@@ -622,6 +742,190 @@ def test_us_daily_resolution_prunes_cached_untradable_tools_from_manifest_and_sc
     assert {record.code for record in resolution.manifest_records} == {"AAPL", "OLD_DL"}
 
 
+@pytest.mark.parametrize("discovery_fails", [False, True])
+def test_us_repair_preserves_cached_and_local_history_universe(
+    tmp_path, monkeypatch, discovery_fails,
+):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    cached = [
+        yahoo.SymbolRecord("OLD_DL", "Historical Common Stock", "us_delisted", "OLD"),
+        yahoo.SymbolRecord("ADR", "Historical ADR", "us_stocks", "ADR"),
+        yahoo.SymbolRecord("ETF", "Preserved ETF Name", "us_stocks", "ETF"),
+    ]
+    fresh = [yahoo.SymbolRecord("ETF", "Fresh ETF Name", "us_stocks", "ETF")]
+    fallback = [
+        yahoo.SymbolRecord("LOCAL", "Local Common Stock", "us_stocks", "LOCAL"),
+        yahoo.SymbolRecord("LOCALW", "Local Warrants", "us_stocks", "LOCALW"),
+        yahoo.SymbolRecord("LOCALR", "Local Rights", "us_stocks", "LOCALR"),
+        yahoo.SymbolRecord("LOCALU", "Local Units", "us_stocks", "LOCALU"),
+    ]
+    originals = {}
+    for code in ("LOCAL", "LOCALW", "LOCALR", "LOCALU", "UNKNOWN"):
+        path = output_dir / f"{code}_features.parquet"
+        path.write_bytes(b"retained historical source, never read by resolver")
+        originals[path] = path.read_bytes()
+    monkeypatch.setattr(yahoo, "_resolve_cached_manifest", lambda *_: cached)
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda *_: [])
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: fallback)
+
+    def fetch(_fn, **_kwargs):
+        if discovery_fails:
+            raise TimeoutError("listing discovery unavailable")
+        return fresh
+
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", fetch)
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks", mode="repair"),
+    )
+    expected = {"OLD_DL", "ADR", "ETF", "LOCAL", "UNKNOWN"}
+    assert {r.code for r in resolution.scheduled_records} == expected
+    assert {r.code for r in resolution.manifest_records} == expected
+    records = {r.code: r for r in resolution.manifest_records}
+    assert records["OLD_DL"] == cached[0]
+    assert records["ETF"] == cached[2]
+    assert records["LOCAL"].name == "Local Common Stock"
+    assert records["UNKNOWN"].name == "UNKNOWN"  # Unknown is not inferred delisted.
+    assert all(path.read_bytes() == content for path, content in originals.items())
+
+
+def test_us_repair_limit_does_not_shrink_manifest_or_add_untracked_fallback(
+    tmp_path, monkeypatch,
+):
+    cached = [yahoo.SymbolRecord("OLD", "Old Common Stock", "us_stocks", "OLD")]
+    fresh = [yahoo.SymbolRecord("NEW", "New Common Stock", "us_stocks", "NEW")]
+    monkeypatch.setattr(yahoo, "_resolve_cached_manifest", lambda *_: cached)
+    monkeypatch.setattr(yahoo, "_load_local_tracked_records", lambda *_: [])
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda *_: [])
+    monkeypatch.setattr(
+        yahoo, "_load_repo_symbol_fallback",
+        lambda *_: [yahoo.SymbolRecord("OTHER", "Untracked Stock", "us_stocks", "OTHER")],
+    )
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", lambda *_a, **_kw: fresh)
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks", mode="repair", limit=1),
+    )
+    assert [r.code for r in resolution.scheduled_records] == ["OLD"]
+    assert [r.code for r in resolution.manifest_records] == ["OLD", "NEW"]
+
+
+def test_us_daily_does_not_reintroduce_excluded_local_files_after_manifest_repair(
+    tmp_path, monkeypatch,
+):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    pl.DataFrame([
+        {"code": "LOCALW", "name": "LOCALW", "market": "us_stocks", "yahoo_symbol": "LOCALW"},
+        {"code": "OLD", "name": "Old Common Stock", "market": "us_stocks", "yahoo_symbol": "OLD"},
+    ]).write_csv(output_dir / "symbols.csv")
+    for code in ("LOCALW", "LOCALU", "OLD"):
+        (output_dir / f"{code}_features.parquet").write_bytes(b"untouched source")
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda *_: [])
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: [
+        yahoo.SymbolRecord("LOCALW", "Local Warrants", "us_stocks", "LOCALW"),
+        yahoo.SymbolRecord("LOCALU", "Local Units", "us_stocks", "LOCALU"),
+    ])
+    monkeypatch.setattr(yahoo, "_discover_daily_stock_records", lambda *_: [])
+
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks"),
+    )
+    assert [r.code for r in resolution.scheduled_records] == ["OLD"]
+    assert [r.code for r in resolution.manifest_records] == ["OLD"]
+    assert all(
+        (output_dir / f"{code}_features.parquet").read_bytes() == b"untouched source"
+        for code in ("LOCALW", "LOCALU", "OLD")
+    )
+
+
+def test_us_name_enrichment_preserves_identity_and_does_not_guess_archive_aliases():
+    records = [
+        yahoo.SymbolRecord("OLD", "Old Common Stock", "us_delisted", "OLD-ORIGINAL"),
+        yahoo.SymbolRecord("DUP", "DUP", "us_stocks", "DUP-ALIAS"),
+        yahoo.SymbolRecord("OLD_DL", "OLD_DL", "us_delisted", "OLD"),
+    ]
+    references = [
+        yahoo.SymbolRecord("OLD", "New Company Warrants", "us_stocks", "OLD"),
+        yahoo.SymbolRecord("DUP", "Source Description", "us_delisted", "OTHER"),
+        yahoo.SymbolRecord("DUP", "Lower Priority Description", "us_stocks", "DUP"),
+    ]
+    enriched = yahoo._enrich_us_symbol_names(records, references)
+    assert enriched[0] == records[0]
+    assert enriched[1] == yahoo.SymbolRecord("DUP", "Source Description", "us_stocks", "DUP-ALIAS")
+    assert enriched[2] == records[2]
+
+
+def test_us_targeted_repair_retains_unscheduled_manifest_metadata(tmp_path, monkeypatch):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    rows = [
+        {"code": "OLD_DL", "name": "Historical Common Stock", "market": "us_delisted", "yahoo_symbol": "OLD"},
+        {"code": "ETF", "name": "Local ETF Name", "market": "us_stocks", "yahoo_symbol": "ETF"},
+    ]
+    pl.DataFrame(rows).write_csv(output_dir / "symbols.csv")
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: [])
+    resolution = yahoo._resolve_symbol_resolution(
+        "us_stocks", _base_args(tmp_path, asset="us_stocks", mode="repair", symbols=["ETF"]),
+    )
+    assert [r.code for r in resolution.scheduled_records] == ["ETF"]
+    assert [r.code for r in resolution.manifest_records] == ["OLD_DL", "ETF"]
+    assert resolution.manifest_records[0].market == "us_delisted"
+    assert resolution.manifest_records[0].yahoo_symbol == "OLD"
+    assert resolution.manifest_records[1].name == "Local ETF Name"
+
+
+def test_us_repair_strict_discovery_failure_remains_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda *_: [])
+    monkeypatch.setattr(
+        yahoo, "_fetch_with_hard_timeout",
+        lambda *_a, **_kw: (_ for _ in ()).throw(TimeoutError("unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="strict_no_fallback=true"):
+        yahoo._resolve_us_symbols(
+            _base_args(tmp_path, asset="us_stocks", mode="repair", strict_no_fallback=True),
+            [yahoo.SymbolRecord("OLD", "Old Stock", "us_stocks", "OLD")],
+        )
+
+
+def test_us_strict_repair_does_not_expand_fresh_discovery_with_local_history(tmp_path, monkeypatch):
+    fresh = [yahoo.SymbolRecord("NEW", "New Common Stock", "us_stocks", "NEW")]
+    monkeypatch.setattr(
+        yahoo, "_load_repo_symbol_fallback",
+        lambda *_: [yahoo.SymbolRecord("REPO", "Repo Stock", "us_stocks", "REPO")],
+    )
+    monkeypatch.setattr(yahoo, "_fetch_with_hard_timeout", lambda *_a, **_kw: fresh)
+
+    def forbidden_local_scan(*_args):
+        pytest.fail("strict discovery must not add the local universe")
+
+    monkeypatch.setattr(yahoo, "_load_local_tracked_records", forbidden_local_scan)
+    records = yahoo._resolve_us_symbols(
+        _base_args(tmp_path, asset="us_stocks", mode="repair", strict_no_fallback=True),
+        [yahoo.SymbolRecord("OLD", "Old Stock", "us_stocks", "OLD")],
+    )
+    assert records == fresh
+
+
+@pytest.mark.parametrize("source", ["cboe", None])
+def test_us_history_head_cannot_merge_unverified_source(tmp_path, monkeypatch, source):
+    info = yahoo.ExistingFileInfo(
+        "2010-01-01", "2026-06-01", None, set(yahoo.REPAIR_REQUIRED_COLUMNS),
+        checked_through_date="2026-06-11", requested_start_date="2000-01-01",
+        source=source, asset_class="us_stocks", metadata_error=f"source={source!r}",
+    )
+    monkeypatch.setattr(yahoo, "_load_existing_file_info", lambda *_: info)
+    checks = yahoo._resolve_repair_plan(
+        "us_stocks",
+        _base_args(
+            tmp_path, asset="us_stocks", mode="repair", verify_us_history_head=True,
+            start_date="1900-01-01",
+        ),
+        [yahoo.SymbolRecord("OLD", "Old Common Stock", "us_stocks", "OLD")],
+        tmp_path,
+    )
+    assert [(c.status, c.merge_existing) for c in checks] == [("metadata_invalid", False)]
+
+
 def test_unavailable_yahoo_timezone_message_is_blacklist_trigger():
     captured = "$03003T.TW: possibly delisted; no timezone found"
 
@@ -1176,6 +1480,111 @@ def test_normalize_can_drop_zero_volume_for_assets_without_meaningful_volume():
     normalized = yahoo._normalize_download_frame(frame, keep_zero_volume=False)
 
     assert "Trading_Volume" not in normalized.columns
+
+
+@pytest.mark.parametrize("mode", ["daily-update", "incremental", "repair"])
+@pytest.mark.parametrize("volume", [None, [0.0, 0.0], [100.0, 200.0]])
+def test_forex_writer_and_repair_share_optional_volume_contract(tmp_path, mode, volume):
+    frame = pl.DataFrame({
+        "date": ["2026-06-10", "2026-06-11"],
+        "open": [1.1, 1.2], "max": [1.2, 1.3], "min": [1.0, 1.1],
+        "close": [1.15, 1.25], "adjclose": [1.15, 1.25],
+    })
+    if volume is not None:
+        frame = frame.with_columns(pl.Series("Trading_Volume", volume))
+    path = tmp_path / "EURUSD_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        frame, path, asset_class="forex",
+        requested_start_date="2000-01-01", requested_end_date="2026-06-11",
+    )
+    before = path.read_bytes()
+    record = yahoo.SymbolRecord("EURUSD", "EUR/USD", "forex", "EURUSD=X")
+    checks = yahoo._resolve_repair_plan(
+        "forex", _base_args(tmp_path, asset="forex", mode=mode), [record], tmp_path,
+    )
+    assert [(c.status, c.repair_start_date) for c in checks] == [("current", None)]
+    assert path.read_bytes() == before
+    written = yahoo._read_parquet_frame(path)
+    assert ("Trading_Volume" in written.columns) == (volume == [100.0, 200.0])
+    assert written["close"].to_list() == [1.15, 1.25]
+    metadata = pq.read_metadata(path).metadata
+    assert metadata[yahoo.PARQUET_META_ACQUISITION_VERSION_KEY] == b"2"
+    assert metadata[yahoo.PARQUET_META_ACQUISITION_FINGERPRINT_KEY].decode() == (
+        yahoo.acquisition_contract("forex")["fingerprint"]
+    )
+
+
+def test_forex_stale_prices_get_incremental_merge_not_full_schema_repair(tmp_path):
+    frame = pl.DataFrame({
+        "date": ["2026-06-10"], "open": [1.1], "max": [1.2],
+        "min": [1.0], "close": [1.15], "adjclose": [1.15],
+    })
+    path = tmp_path / "EURUSD_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        frame, path, asset_class="forex",
+        requested_start_date="2000-01-01", requested_end_date="2026-06-10",
+    )
+    checks = yahoo._resolve_repair_plan(
+        "forex", _base_args(tmp_path, asset="forex"),
+        [yahoo.SymbolRecord("EURUSD", "EUR/USD", "forex", "EURUSD=X")], tmp_path,
+    )
+    assert [(c.status, c.repair_start_date, c.merge_existing) for c in checks] == [
+        ("stale", "2026-06-03", True),
+    ]
+
+
+@pytest.mark.parametrize("asset", ["tw_stocks", "us_stocks", "crypto"])
+def test_non_forex_repair_still_requires_volume(tmp_path, asset):
+    frame = pl.DataFrame({
+        "date": ["2026-06-11"], "open": [10.0], "max": [11.0],
+        "min": [9.0], "close": [10.5], "adjclose": [10.5],
+    })
+    yahoo._write_feature_parquet_atomic(
+        frame, tmp_path / "TEST_features.parquet", asset_class=asset,
+        requested_start_date="2000-01-01", requested_end_date="2026-06-11",
+    )
+    checks = yahoo._resolve_repair_plan(
+        asset, _base_args(tmp_path, asset=asset),
+        [yahoo.SymbolRecord("TEST", "Test", asset, "TEST")], tmp_path,
+    )
+    assert [(c.status, c.merge_existing) for c in checks] == [("schema_mismatch", False)]
+    assert checks[0].message == "missing_required_columns=Trading_Volume"
+
+
+@pytest.mark.parametrize("source", ["cboe", "legacy_unknown"])
+def test_optional_forex_volume_does_not_waive_source_metadata(tmp_path, source):
+    frame = pl.DataFrame({
+        "date": ["2026-06-11"], "open": [1.1], "max": [1.2],
+        "min": [1.0], "close": [1.15], "adjclose": [1.15],
+    })
+    path = tmp_path / "EURUSD_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        frame, path, asset_class="forex", source=source,
+        requested_start_date="2000-01-01", requested_end_date="2026-06-11",
+    )
+    before = path.read_bytes()
+    checks = yahoo._resolve_repair_plan(
+        "forex", _base_args(tmp_path, asset="forex"),
+        [yahoo.SymbolRecord("EURUSD", "EUR/USD", "forex", "EURUSD=X")], tmp_path,
+    )
+    assert [(c.status, c.merge_existing) for c in checks] == [("metadata_invalid", False)]
+    assert source in checks[0].message
+    assert path.read_bytes() == before
+    assert yahoo.PARQUET_META_ACQUISITION_FINGERPRINT_KEY not in pq.read_metadata(path).metadata
+
+
+def test_yahoo_acquisition_contract_is_asset_scoped_and_deterministic():
+    forex = yahoo.acquisition_contract("forex")
+    stock = yahoo.acquisition_contract("us_stocks")
+    assert forex["version"] == 2 and forex["price_schema_version"] == 1
+    assert "Trading_Volume" not in forex["required_columns"]
+    assert "Trading_Volume" in stock["required_columns"]
+    assert forex["fingerprint"] != stock["fingerprint"]
+    assert yahoo.acquisition_contract("forex") == forex
+    forex["required_columns"].append("mutated")
+    assert "mutated" not in yahoo.acquisition_contract("forex")["required_columns"]
+    with pytest.raises(ValueError, match="Unknown Yahoo asset class"):
+        yahoo.acquisition_contract("unknown")
 
 
 def test_daily_resolution_marks_cached_active_symbol_as_delisted(tmp_path, monkeypatch):

@@ -1,0 +1,62 @@
+{
+  "libraries": "artifacts/ocr/rapidocr_cuda13_v1/libraries",
+  "models": {
+    "Det": {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/ocr_rapid_models_20260929/ch_PP-OCRv5_det_mobile.onnx",
+      "sha256": "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae"
+    },
+    "Rec": {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/ocr_rapid_models_20260929/ch_PP-OCRv5_rec_server.onnx",
+      "sha256": "e09385400eaaaef34ceff54aeb7c4f0f1fe014c27fa8b9905d4709b65746562a"
+    },
+    "Cls": {
+      "path": "artifacts/markets/tw_futures_v8_margin_preparation/ocr_rapid_models_20260929/ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+      "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c"
+    }
+  },
+  "packages": {
+    "rapidocr": "3.9.2",
+    "onnxruntime-gpu": "1.30.0",
+    "numpy": "2.5.3",
+    "opencv-python": "5.0.0.93"
+  },
+  "execution": {
+    "device": "cuda",
+    "device_id": 0,
+    "cpu_threads": 1,
+    "cpu_cores": 4,
+    "nice": 10,
+    "gpu_memory_mb": 2048,
+    "min_free_gpu_mb": 2048,
+    "disable_thp": true,
+    "model_memory_mb": {"Det": 4096, "Rec": 2048, "Cls": 256}
+  },
+  "params": {
+    "Det.ocr_version": "PP-OCRv5",
+    "Det.model_type": "mobile",
+    "Rec.ocr_version": "PP-OCRv5",
+    "Rec.model_type": "server",
+    "Det.limit_side_len": 1536,
+    "Det.box_thresh": 0.3,
+    "Global.max_side_len": 4096,
+    "Global.text_score": 0.3,
+    "Global.log_level": "error",
+    "Rec.rec_batch_num": 6,
+    "Cls.cls_batch_num": 6
+  },
+  "optimizations": {
+    "det_normalize_lut": true,
+    "compact_ctc": true,
+    "direct_pixels": true,
+    "arena_shrink": true,
+    "arena_shrink_per_page": true,
+    "memory_pattern": true,
+    "rec_batch_width_budget": 12288
+  },
+  "compact_rec_model": {
+    "path": "artifacts/ocr/gpu_optimization_20260929/models/ch_PP-OCRv5_rec_server_ctc_v1.onnx",
+    "sha256": "d85083469d61170c2449c7e38b9a5ba453f5b0e4cd3f9d837bbfe76547112b62",
+    "source_sha256": "e09385400eaaaef34ceff54aeb7c4f0f1fe014c27fa8b9905d4709b65746562a",
+    "recipe": "ctc_argmax_max_nan_v1"
+  }
+}

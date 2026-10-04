@@ -1,0 +1,19 @@
+[Unit]
+Description=Reconcile public macro followups into the existing OpenBB archive
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="OMP_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+UMask=0077
+ExecStart=/usr/bin/bash -c 'source "@REPO_ROOT@/scripts/runtime_env.sh"; run_fintech_python -m scripts.queue_openbb_public_priority --apply'
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=768M
+MemoryMax=1536M
+TimeoutStartSec=10min

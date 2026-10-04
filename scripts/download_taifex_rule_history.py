@@ -37,9 +37,11 @@ from scripts.taifex_daily_download_common import sha256_path
 
 BASE = 'https://www.taifex.com.tw'
 INDEX_URL = BASE + '/cht/11/hisNews'
+LEGAL_INDEX_URL = BASE + '/cht/6/infor'
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_COMPRESSED_BYTES = MAX_RESPONSE_BYTES + 1024 * 1024
 SEEDS = (
+    ('legal_revisions', '歷史法規修訂資訊與原始附件', LEGAL_INDEX_URL),
     ('contract_adjustments', '契約調整近期表', BASE + '/cht/4/contractAdj'),
     ('position_limits_non_equity', '非個股部位限額', BASE + '/cht/4/traderPLNonEquity'),
     ('position_limits_equity', '個股部位限額', BASE + '/cht/4/traderPLEquity'),
@@ -203,6 +205,44 @@ def document_links(content: bytes, url: str, *, discover_specs: bool = False) ->
             continue
         links[target] = (target, link.get_text(' ', strip=True), kind)
     return list(links.values())
+
+
+def parse_legal_index(content: bytes) -> list[dict]:
+    """The separate legal archive retains attachments lost from old news pages.
+
+    Its complete, unpaginated listing uses #printhere, not #content. Bind
+    publication dates to its rows; neither the capture time nor a linked PDF's
+    file name supplies the historical publication clock.
+    """
+    soup = BeautifulSoup(content, 'html.parser')
+    node = soup.select_one('#printhere')
+    tables = [] if node is None else [t for t in node.select('table')
+        if [c.get_text(strip=True) for c in t.select('tr th')] == ['日期', '標題']]
+    if len(tables) != 1:
+        raise ValueError('legal_revision_table_missing_or_ambiguous')
+    rows = {}
+    for tr in tables[0].select('tr'):
+        cells = tr.find_all('td', recursive=False)
+        if not cells:
+            continue
+        if len(cells) != 2:
+            raise ValueError('unexpected_legal_revision_row')
+        match = DATE.fullmatch(cells[0].get_text(strip=True))
+        link = cells[1].find('a', href=True)
+        url = official_url(link['href'], LEGAL_INDEX_URL) if link else None
+        if not match or not url or urlsplit(url).path != '/cht/6/inforDetail':
+            raise ValueError('invalid_legal_revision_date_or_link')
+        published = date(*map(int, match.groups()))
+        title = link.get_text(' ', strip=True)
+        if not title:
+            raise ValueError('empty_legal_revision_title')
+        identity = digest(f'{published}|{title}|{url}'.encode())
+        rows[identity] = dict(id=identity, published_date=str(published), title=title,
+                             url=url, category=topic(title), download_allowed=True,
+                             published_at=None, publication_precision='date_only')
+    if not rows:
+        raise ValueError('empty_legal_revision_archive')
+    return list(rows.values())
 
 
 def open_queue(root: Path) -> sqlite3.Connection:
@@ -517,6 +557,15 @@ def persist_parse_version(conn, root: Path, task, body: bytes, *, content_type: 
 
 def discover_preserved_links(conn, body: bytes, task, parsed_format: str, *, refresh_existing: bool = True) -> None:
     if parsed_format == 'html':
+        if task['url'] == LEGAL_INDEX_URL:
+            for row in parse_legal_index(body):
+                conn.execute('INSERT OR IGNORE INTO announcements VALUES(?,?,?,?,?,?,?)',
+                    tuple(row[key] for key in ('id', 'published_date', 'title', 'url',
+                        'category', 'download_allowed', 'publication_precision')))
+                enqueue(conn, row['url'], 'announcement', row['category'],
+                        1 if row['category'] != 'other_announcements' else 5)
+                conn.execute('INSERT OR IGNORE INTO links VALUES(?,?,?)',
+                             (task['url'], row['url'], row['title']))
         for url, label, kind in document_links(body, task['url'], discover_specs=task['source_id'] == 'contract_specs'):
             enqueue(conn, url, kind, task['source_id'], 0)
             if refresh_existing:
@@ -724,6 +773,8 @@ def main(argv=None) -> int:
     parser.add_argument('--index-only', action='store_true')
     parser.add_argument('--prioritize-rules', action='store_true',
                         help='Collect dated margin, position and specification notices first; preserve the full queue')
+    parser.add_argument('--legal-revisions-only', action='store_true',
+                        help='Seed the separate historical legal archive without querying annual news indexes')
     parser.add_argument('--download-only', action='store_true',
                         help='Prioritize missing raw documents without spending the HTTP budget on offline reparse')
     parser.add_argument('--reparse-only', action='store_true',
@@ -794,6 +845,8 @@ def main(argv=None) -> int:
                 return 0
             provider_deferred = False
             for source_id, _, url in SEEDS:
+                if args.legal_revisions_only and source_id != 'legal_revisions':
+                    continue
                 enqueue(conn, url, 'snapshot', source_id, 0)
             # Current pages refresh independently from immutable historical
             # documents. Repeated URL bodies get new content-addressed versions.
@@ -813,7 +866,7 @@ def main(argv=None) -> int:
             limiter = SharedRateLimiter(args.request_interval, name='taifex_public_history')
             with requests.Session() as session:
                 session.headers['User-Agent'] = 'stockAgent/taifex-official-rule-research (bounded archive)'
-                for year in range(args.end.year, args.start_year-1, -1):
+                for year in (() if args.legal_revisions_only else range(args.end.year, args.start_year-1, -1)):
                     if time.monotonic()-started >= args.max_seconds:
                         break
                     try:

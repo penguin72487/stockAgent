@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import json
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -120,7 +121,8 @@ def main() -> None:
         "[tw-public-features] "
         f"rows={result.rows} stock_rows={result.stock_rows} market_rows={result.market_rows} "
         f"features={result.feature_count} mode={result.build_mode} "
-        f"reused_rows={result.reused_rows} output={result.output_path}"
+        f"reused_rows={result.reused_rows} output={result.output_path} "
+        f"stage_elapsed_seconds={json.dumps(result.stage_elapsed_seconds, sort_keys=True)}"
     )
 
 

@@ -28,20 +28,80 @@ MARGIN_MATERIALIZATION_VERSION = 1
 KEYS = ["date", "product", "contract"]
 
 
+def select_complete_standard_stock_lives(frame: pl.DataFrame, rules: pl.DataFrame,
+        blockers: pl.DataFrame, *, start, end) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Explicit research scope, never an inferred historical tradability mask.
+
+    Select whole observed lifetimes with complete accounting and no corporate
+    transfers. An incomplete middle day removes the entire lifetime, not only
+    its losing/unpriced day. End-of-data inventory remains marked. The source
+    admission review is a separate required step before publication.
+    """
+    bad = blockers.group_by('physical_contract').agg(
+        (pl.col('has_blocker') & ~pl.col('is_warmup')).any().alias('unresolved_rule'))
+    risk = rules.group_by('physical_contract').agg(
+        ((pl.col('carry_from_physical_contract') != '') &
+         (pl.col('carry_from_physical_contract') != pl.col('physical_contract'))).any().alias('cross_identity'),
+        (pl.col('carry_cash_twd') != 0).any().alias('corporate_cash'),
+        (pl.col('carry_quantity_numerator') != pl.col('carry_quantity_denominator')).any().alias('quantity_change'))
+    values = frame.select('date','physical_contract','open','settlement').join(
+        rules.select('date','physical_contract','contract_multiplier','opening_contract_value_twd',
+                     'settlement_contract_value_twd'), on=['date','physical_contract'], how='inner')
+    values = values.group_by('physical_contract').agg(pl.any_horizontal(
+        ((pl.col(phase+'_contract_value_twd')-pl.col(price)*pl.col('contract_multiplier')).abs()>.005)
+        .fill_null(True) for phase,price in [('opening','open'),('settlement','settlement')]
+    ).any().alias('nonstandard_value'))
+    coverage = frame.group_by('physical_contract', 'product', 'asset_class').agg(
+        pl.col('date').min().alias('start'), pl.col('date').max().alias('end'),
+        pl.col('lifetime_status').first()).join(bad, on='physical_contract').join(risk, on='physical_contract', how='left')
+    coverage = coverage.join(values, on='physical_contract', how='left')
+    accepted = ((pl.col('asset_class') == 'stock_future') & ~pl.col('product').str.contains(r'\d$')
+        & (pl.col('start') >= start) & (pl.col('start') <= end)
+        & ~pl.col('unresolved_rule') & ~pl.col('cross_identity').fill_null(True)
+        & ~pl.col('corporate_cash').fill_null(True) & ~pl.col('quantity_change').fill_null(True)
+        & ~pl.col('nonstandard_value').fill_null(True)
+        & pl.col('lifetime_status').is_in(['official_final', 'observed_at_dataset_boundary']))
+    coverage = coverage.with_columns(accepted.alias('selected'))
+    ids = coverage.filter(pl.col('selected')).select('physical_contract')
+    selected = frame.join(ids, on='physical_contract', how='semi').filter(pl.col('date') <= end)
+    if not selected.height:
+        raise ValueError('no complete standard stock-futures lifetimes in requested scope')
+    # The explicit endpoint is mark-only; do not pretend a market-close fill.
+    selected = selected.with_columns(pl.when(pl.col('next_market_date') > end)
+        .then(None).otherwise(pl.col('next_market_date')).alias('next_market_date'))
+    selected_rules = rules.join(selected.select('date', 'physical_contract'),
+                                on=['date', 'physical_contract'], how='semi')
+    validate_accounting_continuation(selected.join(selected_rules.select('date', 'physical_contract'),
+        on=['date', 'physical_contract'], how='semi'), selected_rules)
+    return selected, selected_rules, coverage
+
+
 def read_bound_output(path: Path, *, output_key: str | None = None,
-                      columns: list[str] | None = None) -> tuple[pl.DataFrame, dict]:
+                      columns: list[str] | None = None,
+                      predicate: pl.Expr | None = None) -> tuple[pl.DataFrame, dict]:
+    """Verify the whole source, then read the requested repair coordinates.
+
+    The returned manifest still describes the complete immutable source.
+    Filtering cannot hide corruption outside the selected repair rows.
+    """
     manifest = json.loads(path.with_name("manifest.json").read_text())
     expected = manifest.get("outputs", {}).get(output_key or path.name, {}).get("sha256")
     if expected != sha256_file(path):
         raise ValueError(f"materialization input SHA mismatch: {path}")
     if path.suffix == ".csv":
-        return pl.read_csv(path, infer_schema=False, columns=columns), manifest
-    return pl.read_parquet(path, columns=columns), manifest
+        frame = pl.scan_csv(path, infer_schema=False)
+    else:
+        frame = pl.scan_parquet(path)
+    if predicate is not None:
+        frame = frame.filter(predicate)
+    if columns is not None:
+        frame = frame.select(columns)
+    return frame.collect(), manifest
 
 
 def materialize_margin_market_rows(
     physical: pl.DataFrame, observations: pl.DataFrame, universe: pl.DataFrame,
-    *, slot_count: int = 2816,
+    *, slot_count: int = 2816, market_dates: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Preserve identities and marks without inventing executable prices/rules.
 
@@ -69,7 +129,11 @@ def materialize_margin_market_rows(
         raise ValueError("duplicate observed general-session contract-day")
     if raw.select(KEYS).join(physical.select(KEYS), on=KEYS, how="anti").height:
         raise ValueError("physical history drops requested observed contract-days")
-    calendar = physical.select("date").unique().sort("date").with_columns(
+    calendar_source = physical.select("date").unique() if market_dates is None else market_dates.select("date")
+    if (calendar_source['date'].null_count() or calendar_source['date'].is_duplicated().any()
+            or physical.select('date').unique().join(calendar_source,on='date',how='anti').height):
+        raise ValueError('repair calendar must uniquely cover every physical date')
+    calendar = calendar_source.sort("date").with_columns(
         pl.col("date").shift(1).alias("previous_market_date"),
         pl.col("date").shift(-1).alias("next_market_date"),
     )
@@ -257,7 +321,7 @@ def build_all_twd_execution_terms(*, materialization: Path, margin_inputs: Path,
     """
     from stockagent.data.tw_futures_execution_terms import (
         EXECUTION_TERMS_COMPILER_VERSION, SPEC_FIELDS, compile_execution_terms,
-        MARGIN_INPUT_FIELDS, POSITION_INPUT_FIELDS,
+        MARGIN_INPUT_FIELDS, POSITION_INPUT_FIELDS, POSITION_INPUT_EXTENSIONS,
     )
     from stockagent.data.tw_futures_margin import (
         validate_margin_carry_rules, validate_margin_value_bases,
@@ -283,7 +347,8 @@ def build_all_twd_execution_terms(*, materialization: Path, margin_inputs: Path,
     paths += [rule_candidates / (name + ".parquet") for name in (
         "margin_level_intervals", "corporate_terms_intervals")]
     projections = [["date", "product", *MARGIN_INPUT_FIELDS],
-                   [*KEYS, *POSITION_INPUT_FIELDS],
+                   [*KEYS, *POSITION_INPUT_FIELDS, *[c for c in POSITION_INPUT_EXTENSIONS
+                       if c in pl.read_parquet_schema(paths[1])]],
                    [*KEYS, "terminal_value_input_twd"], None, None]
     inputs = [read_bound_output(p, columns=columns)[0] for p, columns in zip(paths, projections)]
     margin_manifest = json.loads((margin_inputs / "manifest.json").read_text())

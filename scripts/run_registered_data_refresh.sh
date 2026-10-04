@@ -36,7 +36,7 @@ common_env=(
 case "$refresh_scope" in
   daily)
     exec env "${common_env[@]}" \
-      RUN_ID="registered-daily-$(date -u +%Y%m%dT%H%M%SZ)" \
+      RUN_ID="registered-daily-$(date -u +%Y%m%dT%H%M%S%NZ)" \
       LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_daily.lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_daily" \
       RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_daily_runs.tsv" \
@@ -55,7 +55,7 @@ case "$refresh_scope" in
     ;;
   intraday)
     exec env "${common_env[@]}" \
-      RUN_ID="registered-intraday-$(date -u +%Y%m%dT%H%M%SZ)" \
+      RUN_ID="registered-intraday-$(date -u +%Y%m%dT%H%M%S%NZ)" \
       LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_intraday.lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_intraday" \
       RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_intraday_runs.tsv" \
@@ -76,7 +76,7 @@ case "$refresh_scope" in
     ;;
   features)
     exec env "${common_env[@]}" \
-      RUN_ID="registered-features-$(date -u +%Y%m%dT%H%M%SZ)" \
+      RUN_ID="registered-features-$(date -u +%Y%m%dT%H%M%S%NZ)" \
       LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_features.lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_features" \
       RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_features_runs.tsv" \
@@ -98,8 +98,11 @@ case "$refresh_scope" in
       "$repo_root/downloader/run_daily_all_markets.sh"
     ;;
   backfill)
+    # Full-history symbols hold decoded candle pages and existing Parquet in
+    # memory until each symbol commits. Keep providers parallel without
+    # multiplying daily tail worker counts across three full-history jobs.
     exec env "${common_env[@]}" \
-      RUN_ID="registered-backfill-$(date -u +%Y%m%dT%H%M%SZ)" \
+      RUN_ID="registered-backfill-$(date -u +%Y%m%dT%H%M%S%NZ)" \
       LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_backfill.lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_backfill" \
       RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_backfill_runs.tsv" \
@@ -111,6 +114,10 @@ case "$refresh_scope" in
       RUN_FRANKFURTER=0 \
       RUN_PEPPERSTONE_GROUPS=0 \
       RUN_CEX_PERP=1 \
+      OKX_WORKERS="${BACKFILL_OKX_WORKERS:-8}" \
+      BYBIT_WORKERS="${BACKFILL_BYBIT_WORKERS:-8}" \
+      BINANCE_WORKERS="${BACKFILL_BINANCE_WORKERS:-12}" \
+      BINANCE_FEATURE_WORKERS="${BACKFILL_BINANCE_FEATURE_WORKERS:-8}" \
       CRYPTO_TAIL_ONLY=0 \
       CRYPTO_HISTORICAL_FEATURES=1 \
       RUN_CRYPTO_REFERENCE=0 \

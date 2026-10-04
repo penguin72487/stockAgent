@@ -25,6 +25,7 @@ TW_HOLIDAY_SCHEDULE_NAME = "twse_api_holidayschedule_holidayschedule.parquet"
 TW_TRADING_DAY_MARKERS = ("開始交易", "最後交易")
 TW_HOLIDAY_DATASET = "twse_api_holidayschedule_holidayschedule"
 TW_HOLIDAY_SOURCE = "TWSE OpenAPI"
+TW_ACTUAL_SESSION_NAME = "twse_taiex_ohlc.parquet"
 
 
 @dataclass(slots=True)
@@ -67,6 +68,17 @@ class MarketRuntimeStatus:
     config_fingerprint: str | None
     config_path: Path | None
     output_dir: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class TwStockDayDecision:
+    # Actual sessions and scheduled sessions are deliberately different evidence.
+    status: str  # actual_open, scheduled_open, closed, unknown
+    reason: str
+
+    @property
+    def is_session(self) -> bool:
+        return self.status in {"actual_open", "scheduled_open"}
 
 
 def resolve_repo_path(value: str | Path | None, *, root: Path | None = None) -> Path | None:
@@ -348,6 +360,12 @@ def _tw_holiday_schedule_path(parquet_root: Path | None) -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
 
+def _tw_public_root(parquet_root: Path | None) -> Path | None:
+    if parquet_root is None:
+        return None
+    return parquet_root.parent if parquet_root.name == "stocks" else parquet_root
+
+
 def _parse_roc_calendar_date(value: object) -> date | None:
     text = str(value or "").strip()
     if not text.isdigit() or len(text) not in {7, 8}:
@@ -360,73 +378,16 @@ def _parse_roc_calendar_date(value: object) -> date | None:
 
 
 @lru_cache(maxsize=16)
-def _tw_exchange_holidays_cached(
-    path_text: str,
-    size_bytes: int,
-    mtime_ns: int,
-    year: int,
-) -> frozenset[date]:
-    del size_bytes, mtime_ns
-    path = Path(path_text)
-    rows: list[tuple[object, object]] = []
-    if pq is not None:
-        try:
-            table = pq.read_table(path, columns=["Name", "Date"])
-            rows = list(zip(table["Name"].to_pylist(), table["Date"].to_pylist()))
-        except Exception:
-            rows = []
-    if not rows:
-        try:
-            import polars as pl
-
-            frame = pl.read_parquet(path, columns=["Name", "Date"])
-            rows = list(zip(frame["Name"].to_list(), frame["Date"].to_list()))
-        except Exception:
-            return frozenset()
-
-    holidays: set[date] = set()
-    for raw_name, raw_date in rows:
-        day = _parse_roc_calendar_date(raw_date)
-        if day is None or day.year != int(year):
-            continue
-        name = str(raw_name or "")
-        if any(marker in name for marker in TW_TRADING_DAY_MARKERS):
-            continue
-        holidays.add(day)
-    return frozenset(holidays)
-
-
-def _tw_exchange_holidays(parquet_root: Path | None, year: int) -> set[date]:
-    path = _tw_holiday_schedule_path(parquet_root)
-    if path is None:
-        return set()
-    stat = path.stat()
-    return set(
-        _tw_exchange_holidays_cached(
-            str(path.resolve()),
-            int(stat.st_size),
-            int(stat.st_mtime_ns),
-            int(year),
-        )
-    )
-
-
-@lru_cache(maxsize=16)
 def _verified_tw_exchange_schedule_cached(
     path_text: str,
     size_bytes: int,
     mtime_ns: int,
+    device: int,
+    inode: int,
     year: int,
 ) -> tuple[tuple[tuple[date, tuple[str, ...]], ...], str]:
-    """Validate the official holiday schedule used by live session gates.
+    """Validate the latest official year snapshot for stock-session gates."""
 
-    The ordinary status helper above remains tolerant for display/freshness
-    purposes.  A live order or simulation scheduler needs a stronger contract:
-    the file must carry the expected official provenance and contain the
-    requested ROC year.  Unknown evidence therefore fails closed.
-    """
-
-    del size_bytes, mtime_ns
     path = Path(path_text)
     required = {
         "Name",
@@ -454,7 +415,7 @@ def _verified_tw_exchange_schedule_cached(
         except Exception as exc:
             raise ValueError(f"official holiday schedule is unreadable: {exc}") from exc
 
-    names_by_day: dict[date, set[str]] = {}
+    snapshots: dict[str, dict[date, set[str]]] = {}
     as_of_dates: set[str] = set()
     for row in rows:
         if str(row.get("_dataset") or "") != TW_HOLIDAY_DATASET:
@@ -473,17 +434,179 @@ def _verified_tw_exchange_schedule_cached(
         name = str(row.get("Name") or "").strip()
         if not name:
             raise ValueError("official holiday schedule has an empty event name")
-        names_by_day.setdefault(day, set()).add(name)
+        snapshots.setdefault(as_of, {}).setdefault(day, set()).add(name)
 
+    # This parquet is append-only: older daily snapshots must not resurrect a
+    # holiday/open marker removed or corrected by a later official snapshot.
+    as_of = max(as_of_dates) if as_of_dates else ""
+    names_by_day = snapshots.get(as_of, {})
     if not names_by_day:
         raise ValueError(f"official holiday schedule has no rows for {year}")
+    previous_max = max(
+        (len(events) for snapshot, events in snapshots.items() if snapshot < as_of),
+        default=0,
+    )
+    if previous_max >= 4 and len(names_by_day) * 4 < previous_max * 3:
+        raise ValueError("latest official holiday snapshot is unexpectedly incomplete")
+    stat = path.stat()
+    if (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino) != (
+        size_bytes, mtime_ns, device, inode,
+    ):
+        raise ValueError("official holiday schedule changed during verification")
     return (
         tuple(
             (day, tuple(sorted(names)))
             for day, names in sorted(names_by_day.items())
         ),
-        max(as_of_dates),
+        as_of,
     )
+
+
+@lru_cache(maxsize=8)
+def _verified_tw_actual_sessions_cached(
+    path_text: str,
+    path_size: int,
+    path_mtime_ns: int,
+    path_device: int,
+    path_inode: int,
+    summary_text: str,
+    summary_size: int,
+    summary_mtime_ns: int,
+    summary_device: int,
+    summary_inode: int,
+) -> tuple[frozenset[date], date, date]:
+    """Verify the immutable byte receipt before using absence as closure proof."""
+
+    path = Path(path_text)
+    summary_path = Path(summary_text)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    receipt = summary.get("output_receipt") or {}
+    if (
+        summary.get("dataset") != "twse_taiex_ohlc"
+        or summary.get("source") != "TWSE"
+        or summary.get("source_product") != "indicesReport/MI_5MINS_HIST"
+        or summary.get("coverage_complete") is not True
+        or summary.get("replacement_promoted") is not True
+        or int(summary.get("failed_count", -1)) != 0
+        or int(summary.get("unresolved_month_count", -1)) != 0
+        or int(receipt.get("size", -1)) != path_size
+        or hashlib.sha256(path.read_bytes()).hexdigest() != receipt.get("sha256")
+    ):
+        raise ValueError("TAIEX actual-session receipt is incomplete or mismatched")
+    path_stat = path.stat()
+    summary_stat = summary_path.stat()
+    if (
+        (path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_dev, path_stat.st_ino)
+        != (path_size, path_mtime_ns, path_device, path_inode)
+        or (summary_stat.st_size, summary_stat.st_mtime_ns, summary_stat.st_dev, summary_stat.st_ino)
+        != (summary_size, summary_mtime_ns, summary_device, summary_inode)
+    ):
+        raise ValueError("TAIEX actual-session files changed during verification")
+    if pq is None:
+        raise ValueError("pyarrow is required to verify TAIEX actual sessions")
+    columns = ["date", "opening_index", "highest_index", "lowest_index", "closing_index"]
+    rows = pq.read_table(path, columns=columns).to_pylist()
+    sessions: set[date] = set()
+    for row in rows:
+        day = row["date"]
+        if isinstance(day, datetime):
+            day = day.date()
+        if not isinstance(day, date) or day in sessions:
+            raise ValueError("TAIEX actual-session dates are invalid or duplicated")
+        values = [float(row[key]) for key in columns[1:]]
+        if not all(math.isfinite(value) and value > 0 for value in values):
+            raise ValueError("TAIEX actual-session OHLC is invalid")
+        if values[1] < max(values[0], values[2], values[3]) or values[2] > min(values[0], values[1], values[3]):
+            raise ValueError("TAIEX actual-session OHLC bounds are invalid")
+        sessions.add(day)
+    start = date.fromisoformat(str(summary["effective_start_date"])[:10])
+    end = date.fromisoformat(str(summary["effective_end_date"])[:10])
+    if (
+        len(sessions) != int(summary.get("output_rows", -1))
+        or min(sessions) != start
+        or max(sessions) > end
+    ):
+        raise ValueError("TAIEX actual-session range or row count is invalid")
+    path_stat = path.stat()
+    summary_stat = summary_path.stat()
+    if (
+        (path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_dev, path_stat.st_ino)
+        != (path_size, path_mtime_ns, path_device, path_inode)
+        or (summary_stat.st_size, summary_stat.st_mtime_ns, summary_stat.st_dev, summary_stat.st_ino)
+        != (summary_size, summary_mtime_ns, summary_device, summary_inode)
+    ):
+        raise ValueError("TAIEX actual-session files changed during verification")
+    return frozenset(sessions), start, end
+
+
+def tw_stock_day_decision(
+    day: date,
+    holidays: tuple[str, ...] = (),
+    *,
+    parquet_root: Path | None,
+    observed: datetime | None = None,
+) -> TwStockDayDecision:
+    """Classify an actual/scheduled stock session, closure, or missing evidence.
+
+    Only a receipt-verified completed historical range proves a day *had no*
+    session. Current/future weekdays use the latest official TWSE schedule;
+    a missing calendar remains unknown, not a fabricated trading day.
+    """
+
+    if day.isoformat() in holidays:
+        return TwStockDayDecision("closed", f"{day.isoformat()} is a configured market holiday")
+    local_now = observed.astimezone(ZoneInfo("Asia/Taipei")) if observed else datetime.now(ZoneInfo("Asia/Taipei"))
+    public_root = _tw_public_root(parquet_root)
+    if public_root is not None:
+        path = public_root / TW_ACTUAL_SESSION_NAME
+        summary_path = path.with_suffix(".summary.json")
+        if path.is_file() and summary_path.is_file():
+            try:
+                path_stat = path.stat()
+                summary_stat = summary_path.stat()
+                sessions, start, end = _verified_tw_actual_sessions_cached(
+                    str(path.resolve()), path_stat.st_size, path_stat.st_mtime_ns,
+                    path_stat.st_dev, path_stat.st_ino,
+                    str(summary_path.resolve()), summary_stat.st_size, summary_stat.st_mtime_ns,
+                    summary_stat.st_dev, summary_stat.st_ino,
+                )
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                if day < local_now.date():
+                    return TwStockDayDecision("unknown", f"TAIEX actual-session calendar is unverified: {exc}")
+            else:
+                if day in sessions and day <= local_now.date():
+                    return TwStockDayDecision("actual_open", "receipt-verified TWSE TAIEX actual session")
+                if start <= day <= end and day < local_now.date():
+                    return TwStockDayDecision("closed", "receipt-verified TWSE TAIEX historical non-session")
+
+    path = _tw_holiday_schedule_path(parquet_root)
+    if path is None:
+        if day.weekday() >= 5:
+            return TwStockDayDecision("closed", f"{day.isoformat()} is a weekend")
+        return TwStockDayDecision("unknown", "official TWSE holiday schedule is missing")
+    try:
+        stat = path.stat()
+        rows, as_of = _verified_tw_exchange_schedule_cached(
+            str(path.resolve()), stat.st_size, stat.st_mtime_ns,
+            stat.st_dev, stat.st_ino, day.year,
+        )
+    except (OSError, ValueError) as exc:
+        return TwStockDayDecision("unknown", f"official TWSE holiday schedule is unverified: {exc}")
+    if date.fromisoformat(as_of) > local_now.date():
+        if day.weekday() >= 5:
+            return TwStockDayDecision("closed", f"{day.isoformat()} is a weekend")
+        return TwStockDayDecision("unknown", "official TWSE schedule snapshot is newer than observation time")
+    names = dict(rows).get(day, ())
+    markers = [name for name in names if any(marker in name for marker in TW_TRADING_DAY_MARKERS)]
+    if markers and len(markers) != len(names):
+        return TwStockDayDecision("unknown", "official TWSE holiday schedule has conflicting open/closed events")
+    if markers:
+        return TwStockDayDecision("scheduled_open", f"official TWSE schedule as-of {as_of}: {', '.join(markers)}")
+    if names:
+        return TwStockDayDecision("closed", f"official TWSE schedule as-of {as_of}: {', '.join(names)}")
+    if day.weekday() >= 5:
+        return TwStockDayDecision("closed", f"{day.isoformat()} is a weekend")
+    return TwStockDayDecision("scheduled_open", f"official TWSE schedule as-of {as_of}: ordinary weekday session")
 
 
 def verified_tw_stock_session_day(
@@ -493,38 +616,8 @@ def verified_tw_stock_session_day(
     parquet_root: Path | None,
 ) -> tuple[bool, str]:
     """Return a fail-closed TWSE/TPEx stock-session decision with evidence."""
-
-    if day.weekday() >= 5:
-        return False, f"{day.isoformat()} is a weekend"
-    if day.isoformat() in set(holidays):
-        return False, f"{day.isoformat()} is a configured market holiday"
-    path = _tw_holiday_schedule_path(parquet_root)
-    if path is None:
-        return False, "official TWSE holiday schedule is missing"
-    try:
-        stat = path.stat()
-        rows, as_of = _verified_tw_exchange_schedule_cached(
-            str(path.resolve()),
-            int(stat.st_size),
-            int(stat.st_mtime_ns),
-            int(day.year),
-        )
-    except (OSError, ValueError) as exc:
-        return False, f"official TWSE holiday schedule is unverified: {exc}"
-
-    names = dict(rows).get(day)
-    if not names:
-        return True, f"official TWSE schedule as-of {as_of}: ordinary weekday session"
-    markers = [
-        name
-        for name in names
-        if any(marker in name for marker in TW_TRADING_DAY_MARKERS)
-    ]
-    if markers and len(markers) == len(names):
-        return True, f"official TWSE schedule as-of {as_of}: {', '.join(markers)}"
-    if markers:
-        return False, "official TWSE holiday schedule has conflicting open/closed events"
-    return False, f"official TWSE schedule as-of {as_of}: {', '.join(names)}"
+    decision = tw_stock_day_decision(day, holidays, parquet_root=parquet_root)
+    return decision.is_session, decision.reason
 
 
 def is_trading_day(
@@ -537,11 +630,12 @@ def is_trading_day(
     kind = market_type.lower()
     if kind == "crypto":
         return True
+    if kind in {"tw", "taiwan"}:
+        root = parquet_root or Path(__file__).resolve().parents[2] / "data_tw_public"
+        return tw_stock_day_decision(day, holidays, parquet_root=root).is_session
     if day.weekday() >= 5:
         return False
     if day.isoformat() in set(holidays):
-        return False
-    if kind in {"tw", "taiwan"} and day in _tw_exchange_holidays(parquet_root, day.year):
         return False
     if kind == "us" and day in _us_market_holidays(day.year):
         return False
@@ -564,14 +658,18 @@ def expected_latest_data_date(
     candidate = local_now.date()
     if local_now.time() < ready:
         candidate -= timedelta(days=1)
-    while not is_trading_day(
-        kind,
-        candidate,
-        cfg.holidays,
-        parquet_root=parquet_root,
-    ):
+    for _ in range(370):
+        if kind in {"tw", "taiwan"}:
+            root = parquet_root or Path(__file__).resolve().parents[2] / "data_tw_public"
+            decision = tw_stock_day_decision(candidate, cfg.holidays, parquet_root=root, observed=local_now)
+            if decision.status == "unknown":
+                return None
+            if decision.is_session:
+                return candidate.isoformat()
+        elif is_trading_day(kind, candidate, cfg.holidays, parquet_root=parquet_root):
+            return candidate.isoformat()
         candidate -= timedelta(days=1)
-    return candidate.isoformat()
+    return None
 
 
 def market_is_open(
@@ -586,12 +684,14 @@ def market_is_open(
         return True, None
     tz = ZoneInfo(cfg.timezone or "Asia/Taipei")
     local_now = now.astimezone(tz) if now is not None else datetime.now(tz)
-    if not is_trading_day(
-        kind,
-        local_now.date(),
-        cfg.holidays,
-        parquet_root=parquet_root,
-    ):
+    if kind in {"tw", "taiwan"}:
+        root = parquet_root or Path(__file__).resolve().parents[2] / "data_tw_public"
+        decision = tw_stock_day_decision(local_now.date(), cfg.holidays, parquet_root=root, observed=local_now)
+        if decision.status == "unknown":
+            return False, f"market calendar unverified: {decision.reason}"
+        if not decision.is_session:
+            return False, f"{local_now.date().isoformat()} is not a trading day"
+    elif not is_trading_day(kind, local_now.date(), cfg.holidays, parquet_root=parquet_root):
         return False, f"{local_now.date().isoformat()} is not a trading day"
     if kind == "forex":
         return True, None
@@ -711,7 +811,7 @@ def data_freshness(
             else:
                 reason = f"benchmark data {benchmark_date} older than expected {expected}"
     else:
-        fresh = True
+        reason = "expected latest session is unknown because the trading calendar is unverified"
 
     return DataFreshness(
         parquet_root=parquet_root,

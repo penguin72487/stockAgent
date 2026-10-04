@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Callable
 
 
 _COPY_CHUNK_BYTES = 1 << 20
@@ -38,6 +38,34 @@ def _sync_parent(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def durable_replace(source: str | Path, destination: str | Path) -> None:
+    """Publish data durably *before* a durable receipt may point at it.
+
+    Atomic rename alone only protects concurrent readers, not power loss. Both
+    the data and the destination directory must reach storage before success.
+    """
+    source, destination = Path(source), Path(destination)
+    with source.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(source, destination)
+    _sync_parent(destination)
+
+
+def table_from_records(rows: list[dict[str, Any]]) -> Any:
+    """Preserve late top-level fields instead of inferring only from row one."""
+    import pyarrow as pa
+
+    if not rows:
+        return pa.Table.from_pylist([])
+    names = dict.fromkeys(name for row in rows for name in row)
+    if any(not isinstance(name, str) for name in names):
+        raise ValueError("record fields must be strings")
+    if set(names) == set(rows[0]):
+        return pa.Table.from_pylist(rows)
+    # The sentinel contributes schema, never an observation or a synthetic zero.
+    return pa.Table.from_pylist([dict.fromkeys(names), *rows]).slice(1)
 
 
 def atomic_write_bytes(
@@ -101,6 +129,15 @@ def atomic_write_json(
     )
 
 
+def archive_run_reports(archive_dir: str | Path, paths: tuple[Path, ...]) -> None:
+    """Keep a durable per-run copy before mutable latest reports are replaced."""
+
+    destination = Path(archive_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        atomic_write_bytes(destination / path.name, path.read_bytes(), durable=True)
+
+
 def atomic_write_parquet(
     path: str | Path,
     frame: Any,
@@ -108,6 +145,7 @@ def atomic_write_parquet(
     compression: str = "zstd",
     write_statistics: bool = True,
     durable: bool = False,
+    before_replace: Callable[[], None] | None = None,
     **writer_options: Any,
 ) -> None:
     """Atomically publish a Polars DataFrame or PyArrow Table as Parquet."""
@@ -137,6 +175,8 @@ def atomic_write_parquet(
         if durable:
             with temporary.open("rb") as handle:
                 os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, target)
         if durable:
             _sync_parent(target)

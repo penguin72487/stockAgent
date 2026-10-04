@@ -2,24 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import polars as pl
 import pyarrow.parquet as pq
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -38,13 +35,25 @@ from common import (  # noqa: E402
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from artifact_io import archive_run_reports  # noqa: E402
+from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from http_transport import RETRYABLE_NETWORK_ERRORS  # noqa: E402
+from dataset_lock import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    exclusive_dataset_lock,
+    parse_lock_timeout_seconds,
+)
 from okx_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
+    feature_acquisition_payload,
+    feature_run_summary_path,
     feature_catalog_payload,
     result_rows as historical_feature_result_rows,
     run_historical_feature_downloads,
+    stage_latency_summary,
 )
-from ohlcv_hot_tail import (  # noqa: E402
+from ohlcv_hot_tail import (
+    plan_candle_reconcile_windows,  # noqa: E402
     hot_tail_path,
     read_logical_parquet,
     remove_hot_tail,
@@ -58,6 +67,14 @@ OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Vo
 KLINE_BAR = "1m"
 CANDLE_INTERVAL_MS = 60 * 1000
 OKX_HISTORY_LIMIT = "300"
+VOLUME_UNIT_CONTRACT = {
+    "Trading_Volume": "quote_currency",
+    "okx_volume_contract": "contracts",
+    "okx_volume_base": "base_currency",
+    "okx_volume_quote": "quote_currency",
+    "missing_volume_policy": "reject_no_cross_unit_fallback",
+    "unit_source": "https://www.okx.com/docs-v5/en/#rest-api-market-data-get-candlesticks",
+}
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -193,6 +210,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Parallel workers for historical features; defaults to --workers.",
     )
+    parser.add_argument(
+        "--archive-report-dir",
+        default=None,
+        help="Optional per-run report archive before later jobs replace latest reports.",
+    )
+    parser.add_argument(
+        "--lock-timeout-seconds",
+        type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="Maximum dataset-writer lock wait; 0 makes one nonblocking attempt.",
+    )
     return parser.parse_args()
 
 
@@ -245,6 +273,7 @@ class OkxClient:
                 "okx_history_mark_price_candles"
             ),
             "/api/v5/market/history-index-candles": "okx_history_index_candles",
+            "/api/v5/market/index-candles": "okx_index_candles",
             "/api/v5/public/funding-rate-history": "okx_funding_rate_history",
         }
         profile_name = profile_by_path.get(path)
@@ -263,6 +292,38 @@ class OkxClient:
                 limiter = SharedRateLimiter(interval, name=limiter_name)
                 self._limiters[limiter_name] = limiter
             return limiter
+
+    def limiter_activity(self) -> dict[str, dict[str, float | int | str]]:
+        """Process-local grants, grouped by endpoint; not provider-wide usage."""
+
+        with self._limiter_lock:
+            limiters = list(self._limiters.items())
+        grouped: dict[str, dict[str, float | int | str]] = {}
+        for name, limiter in limiters:
+            endpoint = name.split(":", 1)[0]
+            activity = limiter.grant_activity()
+            entry = grouped.setdefault(
+                endpoint,
+                {
+                    "interval_seconds": limiter.interval_seconds,
+                    "limiter_count": 0,
+                    "sharing_scope": (
+                        "per_instrument" if endpoint == "okx_funding_rate_history"
+                        else "per_endpoint"
+                    ),
+                    "grants_total": 0,
+                    "grants_last_60s": 0,
+                    "pending_claim_observations": 0,
+                },
+            )
+            entry["limiter_count"] = int(entry["limiter_count"]) + 1
+            for key in (
+                "grants_total",
+                "grants_last_60s",
+                "pending_claim_observations",
+            ):
+                entry[key] = int(entry[key]) + int(activity[key])
+        return grouped
 
     def _defer_retry(
         self,
@@ -322,7 +383,7 @@ class OkxClient:
                     )
                     continue
                 raise
-            except URLError as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(limiter, attempt)
@@ -362,7 +423,7 @@ class OkxClient:
                     )
                     continue
                 raise
-            except URLError as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(limiter, attempt)
@@ -633,7 +694,19 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         if len(row) < 9:
-            continue
+            raise ValueError("OKX candle lacks documented volume/confirmation fields")
+        # Preserve the existing quote-volume training ABI. Contracts, base
+        # currency and quote currency are different dimensions; a missing quote
+        # value must never fall back to a contract count (nor to a guessed zero).
+        volumes = []
+        for field, raw in zip(("vol", "volCcy", "volCcyQuote"), row[5:8]):
+            try:
+                value = float(raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"OKX candle has missing/invalid {field}") from exc
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"OKX candle has nonfinite/negative {field}")
+            volumes.append(value)
         ts = int(row[0])
         rows.append(
             {
@@ -644,10 +717,10 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
                 "min": float(row[3]),
                 "close": float(row[4]),
                 "adjclose": float(row[4]),
-                "Trading_Volume": float(row[7]) if row[7] else float(row[5]),
-                "okx_volume_contract": float(row[5]) if row[5] else 0.0,
-                "okx_volume_base": float(row[6]) if row[6] else 0.0,
-                "okx_volume_quote": float(row[7]) if row[7] else 0.0,
+                "Trading_Volume": volumes[2],
+                "okx_volume_contract": volumes[0],
+                "okx_volume_base": volumes[1],
+                "okx_volume_quote": volumes[2],
                 "okx_confirm": int(row[8]) if row[8] else 0,
             }
         )
@@ -678,6 +751,7 @@ def _download_symbol_1m(
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
     effective_start_ms = start_ms
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
     if record.list_time:
         effective_start_ms = max(
             effective_start_ms,
@@ -689,6 +763,7 @@ def _download_symbol_1m(
             ),
         )
 
+    requested_start_ms = effective_start_ms
     if output_path.exists() and not refresh:
         existing_info = _load_logical_existing_candle_info(output_path)
         if existing_info.error is not None or not existing_info.interval_ok:
@@ -720,7 +795,7 @@ def _download_symbol_1m(
                 overlap_ms=CANDLE_INTERVAL_MS,
                 repair_missing_head=not tail_only,
             )
-            if effective_start_ms > end_ms:
+            if tail_only and effective_start_ms > closed_end_ms:
                 return DownloadResult(
                     asset_class="crypto_okx_perp",
                     code=record.code,
@@ -733,41 +808,78 @@ def _download_symbol_1m(
     elif tail_only:
         effective_start_ms = max(
             effective_start_ms,
-            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+            closed_end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
-    all_rows: list[list[str]] = []
-    cursor_after: str | None = None
-    seen_oldest: set[str] = set()
+    request_windows = [(effective_start_ms, closed_end_ms)]
+    existing_frame: pl.DataFrame | None = None
+    if not tail_only and existing_info is not None and existing_info.rows > 0:
+        # The merge needs this logical frame anyway. Inspect actual dates,
+        # rather than trusting footer counts or ignoring internal minute gaps.
+        existing_frame = read_logical_parquet(output_path)
+        planned = plan_candle_reconcile_windows(
+            existing_frame, earliest_ms=existing_info.earliest_ms,
+            latest_ms=existing_info.latest_ms, start_ms=requested_start_ms,
+            end_ms=closed_end_ms, interval_ms=CANDLE_INTERVAL_MS,
+        )
+        if planned is None:
+            # No proof for omitting middle requests is not permission to drop
+            # old observations or historical feature columns. Keep the legacy
+            # merge contract after a full network reconciliation.
+            request_windows = [(requested_start_ms, closed_end_ms)]
+        else:
+            request_windows = planned
+            if not request_windows:
+                return DownloadResult(
+                    asset_class="crypto_okx_perp", code=record.code,
+                    okx_symbol=record.okx_symbol, market=record.market,
+                    status="skipped_up_to_date", rows=existing_info.rows,
+                    output_path=str(output_path),
+                )
 
-    while True:
-        params: dict[str, Any] = {
-            "instId": record.okx_symbol,
-            "bar": KLINE_BAR,
-            "limit": OKX_HISTORY_LIMIT,
-        }
-        if cursor_after:
-            params["after"] = cursor_after
+    if request_windows:
+        # Gap/head responses may precede the revision tail. Their old boundary
+        # rows must enter the merge's overlap, not remain in a separate prefix.
+        effective_start_ms = min(start for start, _ in request_windows)
+    candles = CandleFrameBuffer(_normalize_candles)
+    received_rows = False
+    for window_start, window_end in request_windows:
+        if window_start > window_end:
+            continue
+        # OKX 'after' returns older records. +1 includes the exact boundary
+        # without walking down from today's latest page for historical heads.
+        cursor_after = window_end + 1
+        while True:
+            payload = client.get(
+                HISTORY_CANDLES_ENDPOINT,
+                {
+                    "instId": record.okx_symbol,
+                    "bar": KLINE_BAR,
+                    "limit": OKX_HISTORY_LIMIT,
+                    "after": str(cursor_after),
+                },
+            )
+            if page_progress_callback is not None:
+                page_progress_callback(record.code)
+            chunk = payload.get("data", [])
+            if not chunk:
+                break
+            oldest_ms = min(int(row[0]) for row in chunk)
+            if oldest_ms >= cursor_after:
+                raise RuntimeError(
+                    f"OKX pagination made no progress for {record.okx_symbol}"
+                )
+            received_rows = True
+            candles.extend(
+                row for row in chunk
+                if window_start <= int(row[0]) <= window_end
+                and (len(row) < 9 or str(row[8]) == "1")
+            )
+            if oldest_ms <= window_start:
+                break
+            cursor_after = oldest_ms
 
-        payload = client.get(HISTORY_CANDLES_ENDPOINT, params)
-        if page_progress_callback is not None:
-            page_progress_callback(record.code)
-        chunk = payload.get("data", [])
-        if not chunk:
-            break
-
-        all_rows.extend(chunk)
-
-        oldest_ms = int(chunk[-1][0])
-        if oldest_ms < effective_start_ms:
-            break
-
-        cursor_after = chunk[-1][0]
-        if cursor_after in seen_oldest:
-            break
-        seen_oldest.add(cursor_after)
-
-    if not all_rows:
+    if not received_rows:
         return DownloadResult(
             asset_class="crypto_okx_perp",
             code=record.code,
@@ -779,14 +891,7 @@ def _download_symbol_1m(
             message="No candles returned by OKX.",
         )
 
-    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    filtered_rows = [
-        row
-        for row in all_rows
-        if effective_start_ms <= int(row[0]) <= closed_end_ms
-        and (len(row) < 9 or str(row[8]) == "1")
-    ]
-    df = _normalize_candles(filtered_rows)
+    df = candles.finish()
     if df.is_empty():
         if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
@@ -856,7 +961,8 @@ def _download_symbol_1m(
                 output_path=str(output_path),
             )
         combined, changed = _merge_existing_with_fresh(
-            read_logical_parquet(output_path), df, effective_start_ms
+            existing_frame if existing_frame is not None else read_logical_parquet(output_path),
+            df, effective_start_ms,
         )
         if not changed:
             if not hot_tail_path(output_path).is_file():
@@ -892,11 +998,22 @@ def main() -> None:
     if args.tail_only and (args.refresh or args.mode == "full"):
         raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lock_handle = (output_dir / ".download.lock").open("a+", encoding="utf-8")
-    if fcntl is not None:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    print(f"[okx] acquired exclusive dataset lock: {lock_handle.name}", flush=True)
+    with exclusive_dataset_lock(
+        output_dir / ".download.lock", provider="okx",
+        timeout_seconds=args.lock_timeout_seconds,
+    ) as acquisition:
+        _run_locked_download(
+            args, output_dir, started_at=started_at,
+            lock_wait_seconds=acquisition.wait_seconds,
+        )
+
+
+def _run_locked_download(
+    args: argparse.Namespace, output_dir: Path, *,
+    started_at: datetime, lock_wait_seconds: float,
+) -> None:
+    work_started_at = datetime.now(timezone.utc)
+    work_started = time.monotonic()
 
     start_date = args.start_date.strip()
     end_date = resolve_end_date(args.end_date)
@@ -1027,6 +1144,9 @@ def main() -> None:
                 "stage_status_json": pl.String,
                 "coverage_json": pl.String,
                 "errors_json": pl.String,
+                "stage_elapsed_seconds_json": pl.String,
+                "total_elapsed_seconds": pl.Float64,
+                "index_acquisition_json": pl.String,
             }
         )
     )
@@ -1082,9 +1202,11 @@ def main() -> None:
             historical_status_counts.get(result.status, 0) + 1
         )
 
+    ended_at = datetime.now(timezone.utc)
     summary = {
         "asset_class": "crypto_okx_perp",
         "interval": KLINE_BAR,
+        "volume_units": VOLUME_UNIT_CONTRACT,
         "symbol_count": len(symbols),
         "row_count": row_count,
         "status_counts": status_counts,
@@ -1095,21 +1217,47 @@ def main() -> None:
             not args.skip_historical_features and not args.skip_funding_archive
         ),
         "historical_feature_status_counts": historical_status_counts,
+        "historical_feature_stage_latency": stage_latency_summary(historical_feature_results),
+        "historical_feature_acquisition": feature_acquisition_payload(),
+        "request_limiter_activity": client.limiter_activity(),
         "historical_feature_report": str(historical_feature_report_path),
         "historical_feature_catalog": str(feature_catalog_path),
         "start_date": start_date,
         "end_date": end_date,
+        "started_at_utc": started_at.isoformat(),
+        "ended_at_utc": ended_at.isoformat(),
+        "elapsed_seconds": (ended_at - started_at).total_seconds(),
+        "lock_wait_seconds": round(lock_wait_seconds, 6),
+        "work_started_at_utc": work_started_at.isoformat(),
+        "work_elapsed_seconds": round(time.monotonic() - work_started, 6),
     }
+    summary_text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     atomic_write_text(
-        summary_path,
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        feature_run_summary_path(
+            output_dir, features_enabled=not args.skip_historical_features
+        ),
+        summary_text,
     )
-    feature_incomplete = any(
+    atomic_write_text(summary_path, summary_text)
+    if args.archive_report_dir:
+        archive_run_reports(
+            args.archive_report_dir,
+            (
+                symbols_path,
+                report_path,
+                summary_path,
+                historical_feature_report_path,
+                feature_catalog_path,
+            ),
+        )
+    source_incomplete = sum(
+        result.status in {"failed", "repair_required"} for result in results
+    )
+    feature_incomplete = sum(
         result.status in {"failed", "partial"} for result in historical_feature_results
     )
     pipeline_progress.finish(
-        failed=any(result.status in {"failed", "repair_required"} for result in results)
-        or feature_incomplete,
+        failed=bool(source_incomplete or feature_incomplete),
         require_exact=True,
     )
 
@@ -1118,7 +1266,14 @@ def main() -> None:
     print(f"[okx] download_summary.json -> {summary_path}")
     print(f"[okx] historical_feature_report.csv -> {historical_feature_report_path}")
     print(f"[okx] okx_historical_feature_catalog.json -> {feature_catalog_path}")
-    print(f"[okx] done: {json.dumps(summary, ensure_ascii=False)}")
+    print(f"[okx] report: {json.dumps(summary, ensure_ascii=False)}")
+    if source_incomplete or feature_incomplete or pipeline_progress.current != pipeline_progress.total:
+        raise RuntimeError(
+            "OKX download incomplete: "
+            f"{source_incomplete} source symbols, {feature_incomplete} historical features, "
+            f"progress {pipeline_progress.current}/{pipeline_progress.total}"
+        )
+    print("[okx] complete")
 
 
 if __name__ == "__main__":

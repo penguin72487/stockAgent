@@ -232,7 +232,8 @@ def test_certified_suffix_matches_chronological_values_and_gradients(monkeypatch
 
 @pytest.mark.parametrize("direction", [1, -1])
 @pytest.mark.parametrize("first_volume_shares", [0., 2000.])
-def test_minute_sweep_matches_independent_paper_account(tmp_path, direction, first_volume_shares):
+@pytest.mark.parametrize("terminal_unlimited", [False, True])
+def test_minute_sweep_matches_independent_paper_account(tmp_path, direction, first_volume_shares, terminal_unlimited):
     from dataclasses import replace
     from datetime import timedelta
     import numpy as np
@@ -247,6 +248,7 @@ def test_minute_sweep_matches_independent_paper_account(tmp_path, direction, fir
 
     engine = TwDayTradeSimulationEngine(tmp_path / "paper")
     spec = replace(_spec(tmp_path), residual_margin_conversion=True,
+                   terminal_liquidation_unlimited_capacity=terminal_unlimited,
                    entry_sweep_funding_policy="proportional_net_reservation_v1",
                    margin_corporate_action_reference_path=action_reference(tmp_path),
                    entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE)
@@ -266,19 +268,29 @@ def test_minute_sweep_matches_independent_paper_account(tmp_path, direction, fir
     bars = {"2330": {(_now(9, 1) + timedelta(minutes=i)).isoformat(timespec="minutes"):
                     dict(zip(("open","high","low","close","vwap","volume_shares"), raw[0, i]))
                     for i in range(270)}}
+    terminal_quotes = lambda: {"2330": {"session_close_evidence": {
+        "session_date": _now(9, 1).date().isoformat(), "price": 1005.,
+        "source": "twse_official_daily_close", "source_sha256": "a" * 64,
+        "price_basis": "official_session_close"}}}
     _replay_historical_intraday(engine, markets=[spec.market], bars=bars,
-                                trading_date=_now(9, 1).date())
+                                trading_date=_now(9, 1).date(),
+                                terminal_close_quote_provider=terminal_quotes if terminal_unlimited else None)
     mode = engine.state["modes"][spec.market]
     candidate = replace(base, exit_prices=torch.from_numpy(schedule.prices),
                         exit_capacity=torch.from_numpy(schedule.capacity_shares),
                         marks=torch.from_numpy(schedule.marks),
                         entry_path=torch.from_numpy(raw[...,4:6].copy()),
+                        terminal_liquidation_price=torch.tensor([1005.], dtype=torch.float64) if terminal_unlimited else None,
                         stop_hits=torch.from_numpy(schedule.stop_hits.astype(np.float64)))
     result = run(torch.tensor([[direction * .401]], dtype=torch.float64), [candidate])
     assert result.shares_history[-1].sum().item() == sum(
         int(p["signed_shares"]) for p in mode["positions"].values())
     assert result.final_state.last_nav.item() == pytest.approx(mode["total_equity_twd"], abs=1e-7)
     assert_paper_minute_nav(engine, spec.market, _now(9, 1), result.minute_nav[0])
+    if terminal_unlimited:
+        assert mode['open_position_count'] == 0
+        assert result.shares_history[-1].sum().item() == 0
+        assert mode.get('cumulative_carry_cost_twd', 0) == 0
 
 
 def test_two_day_flip_matches_paper_fifo_interest_and_minute_capacity(tmp_path):

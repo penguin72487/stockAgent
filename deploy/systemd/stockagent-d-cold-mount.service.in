@@ -1,0 +1,19 @@
+[Unit]
+Description=Mount penguin D DrvFs packed cold store with 8 KiB requests
+After=local-fs.target
+Before=syncthing@root.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@REPO_ROOT@
+ExecStart=/bin/bash @REPO_ROOT@/scripts/mount_packed_d_cold.sh --mount
+ExecStop=/bin/bash @REPO_ROOT@/scripts/mount_packed_d_cold.sh --unmount
+TimeoutStartSec=180
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

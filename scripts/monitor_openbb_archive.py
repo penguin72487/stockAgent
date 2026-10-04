@@ -8,6 +8,8 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
+import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from tqdm import tqdm
 
 try:
     from downloader.openbb_archive_contracts import (
+        CATALOG_FOLLOWUP_ENDPOINTS,
         DECLARED_LIMIT_STRICTLY_BELOW_CONTRACTS,
         ENTITLEMENT_CAPPED_NONPAGEABLE_CONTRACTS,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
@@ -29,6 +32,7 @@ try:
 except ModuleNotFoundError:  # Direct execution from scripts/.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from downloader.openbb_archive_contracts import (
+        CATALOG_FOLLOWUP_ENDPOINTS,
         DECLARED_LIMIT_STRICTLY_BELOW_CONTRACTS,
         ENTITLEMENT_CAPPED_NONPAGEABLE_CONTRACTS,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
@@ -995,18 +999,7 @@ def _audit_catalog_followups(
 ) -> dict[str, Any]:
     """Rebuild expected child scopes from successful catalog Parquet files."""
     active_where, active_parameters = _active_where(plan_token)
-    catalog_endpoints = (
-        "cftc.cot_search",
-        "currency.search",
-        "economy.available_indicators",
-        "economy.fred_search",
-        "economy.survey.bls_search",
-        "equity.fundamental.filings",
-        "index.available",
-        "regulators.sec.cik_map",
-        "uscongress.amendments",
-        "uscongress.bills",
-    )
+    catalog_endpoints = CATALOG_FOLLOWUP_ENDPOINTS
     paginated_endpoints = (
         "equity.discovery.filings",
         "equity.fundamental.filings",
@@ -1229,6 +1222,133 @@ def _audit_catalog_followups(
     }
 
 
+def _audit_parquet_ownership(
+    connection: sqlite3.Connection,
+    *,
+    output_dir: Path,
+    plan_token: str | None,
+    show_progress: bool,
+) -> dict[str, Any]:
+    """Check every shard without retaining millions of resolved Path objects.
+
+    The source manifest stays read-only and in the caller's snapshot. The
+    private index lives beside it, not in /tmp (which can be a RAM filesystem).
+    Only inactive, manifest-success owners are retained historical artifacts;
+    unowned, pending/failed and foreign-active outputs still fail the audit.
+    """
+    active_where, parameters = _active_where(plan_token)
+    batch_size = 512
+    indexed_tasks = 0
+    scanned_files = 0
+    inactive_files = 0
+    non_success_files = 0
+    samples: list[dict[str, str]] = []
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(
+        prefix="file-audit-", dir=output_dir / "_state"
+    ) as scratch_dir:
+        index_path = Path(scratch_dir) / "owners.sqlite3"
+        index = sqlite3.connect(index_path)
+        try:
+            # These settings apply ONLY to disposable scratch, never to the
+            # durable task manifest. A crash discards this index and re-audits.
+            index.execute("PRAGMA journal_mode=OFF")
+            index.execute("PRAGMA synchronous=OFF")
+            index.execute("PRAGMA cache_size=-8192")
+            index.execute("PRAGMA mmap_size=0")
+            index.execute("PRAGMA temp_store=FILE")
+            index.execute(
+                "CREATE TABLE owners(path TEXT PRIMARY KEY, ownership INTEGER NOT NULL) "
+                "WITHOUT ROWID"
+            )
+            cursor = connection.execute(
+                "SELECT output_path,CASE "
+                f"WHEN ({active_where}) THEN 1 WHEN active=0 THEN 2 ELSE 4 END "
+                "FROM tasks WHERE status='success' "
+                "AND output_path IS NOT NULL AND output_path!=''",
+                parameters,
+            )
+            while batch := cursor.fetchmany(batch_size):
+                index.executemany(
+                    "INSERT INTO owners(path,ownership) VALUES (?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET "
+                    "ownership=owners.ownership | excluded.ownership",
+                    ((str(Path(str(row[0])).resolve()), int(row[1])) for row in batch),
+                )
+                indexed_tasks += len(batch)
+            index.commit()
+            build_seconds = time.perf_counter() - started
+            index_bytes = index_path.stat().st_size
+
+            def check_batch(paths: list[Path]) -> None:
+                nonlocal scanned_files, inactive_files, non_success_files
+                resolved = [(path, str(path.resolve())) for path in paths]
+                placeholders = ",".join("?" for _ in resolved)
+                owners = dict(
+                    index.execute(
+                        f"SELECT path,ownership FROM owners WHERE path IN ({placeholders})",
+                        tuple(key for _, key in resolved),
+                    )
+                )
+                for path, key in resolved:
+                    ownership = owners.get(key, 0)
+                    scanned_files += 1
+                    if ownership & 1:
+                        continue
+                    if ownership == 2:
+                        inactive_files += 1
+                        continue
+                    non_success_files += 1
+                    if len(samples) < 50:
+                        samples.append(
+                            {
+                                "task_id": "",
+                                "path": str(path),
+                                "issue": "parquet_exists_for_non_success_task",
+                            }
+                        )
+
+            data_dir = output_dir / "data"
+            progress = tqdm(
+                data_dir.rglob("*.parquet") if data_dir.is_dir() else (),
+                desc="openbb:audit shard owners",
+                unit="file",
+                position=1,
+                leave=False,
+                disable=not show_progress,
+            )
+            try:
+                pending: list[Path] = []
+                for path in progress:
+                    pending.append(path)
+                    if len(pending) == batch_size:
+                        check_batch(pending)
+                        pending.clear()
+                        progress.set_postfix(
+                            non_success=non_success_files,
+                            retained_inactive=inactive_files,
+                            refresh=False,
+                        )
+                if pending:
+                    check_batch(pending)
+            finally:
+                progress.close()
+        finally:
+            index.close()
+    return {
+        "non_success_parquet_files": non_success_files,
+        "retained_inactive_success_parquet_files": inactive_files,
+        "scanned_parquet_files": scanned_files,
+        "ownership_indexed_tasks": indexed_tasks,
+        "ownership_index_storage": "private_filesystem_sqlite",
+        "ownership_index_bytes": index_bytes,
+        "ownership_index_build_seconds": round(build_seconds, 6),
+        "ownership_scan_seconds": round(time.perf_counter() - started - build_seconds, 6),
+        "ownership_batch_size": batch_size,
+        "issue_samples": samples,
+    }
+
+
 def _audit_success_files(
     connection: sqlite3.Connection,
     *,
@@ -1257,7 +1377,7 @@ def _audit_success_files(
         """,
         active_parameters,
     ).fetchone()
-    duplicate_path_rows = connection.execute(
+    duplicate_path_cursor = connection.execute(
         f"""
         SELECT output_path,COUNT(*) count,MIN(task_id) sample_task_id
         FROM tasks
@@ -1267,40 +1387,29 @@ def _audit_success_files(
         ORDER BY output_path
         """,
         active_parameters,
-    ).fetchall()
+    )
     success_zero_rows = int(integrity["zero_rows"] or 0)
     success_missing_provider = int(integrity["missing_provider"] or 0)
     success_missing_output_path = int(integrity["missing_output_path"] or 0)
-    duplicate_output_paths = len(duplicate_path_rows)
-    success_paths = {
-        Path(str(row[0])).resolve()
-        for row in connection.execute(
-            f"SELECT output_path FROM tasks WHERE {active_where} "
-            "AND status='success' AND output_path IS NOT NULL "
-            "AND output_path!=''",
-            active_parameters,
-        )
-    }
-    non_success_parquet_files: list[Path] = []
-    data_dir = output_dir / "data"
-    orphan_progress = tqdm(
-        data_dir.rglob("*.parquet") if data_dir.is_dir() else (),
-        desc="openbb:audit non-success shards",
-        unit="file",
-        position=1,
-        leave=False,
-        disable=not show_progress,
+    duplicate_output_paths = 0
+    samples: list[dict[str, str]] = []
+    for row in duplicate_path_cursor:
+        duplicate_output_paths += 1
+        if len(samples) < 50:
+            samples.append(
+                {
+                    "task_id": str(row["sample_task_id"]),
+                    "path": str(row["output_path"]),
+                    "issue": f"duplicate_output_path tasks={int(row['count'])}",
+                }
+            )
+    ownership = _audit_parquet_ownership(
+        connection,
+        output_dir=output_dir,
+        plan_token=plan_token,
+        show_progress=show_progress,
     )
-    try:
-        for path in orphan_progress:
-            if path.resolve() not in success_paths:
-                non_success_parquet_files.append(path)
-            if orphan_progress.n % 1000 == 0:
-                orphan_progress.set_postfix(
-                    non_success=len(non_success_parquet_files), refresh=False
-                )
-    finally:
-        orphan_progress.close()
+    samples.extend(ownership.pop("issue_samples")[: max(0, 50 - len(samples))])
     cursor = connection.execute(
         f"SELECT task_id,endpoint,scope_key,kwargs_json,selected_provider,"
         f"output_path,rows FROM tasks "
@@ -1313,22 +1422,6 @@ def _audit_success_files(
     metadata_mismatch = 0
     encoded_wrapper = 0
     checked_rows = 0
-    samples: list[dict[str, str]] = [
-        {
-            "task_id": str(row["sample_task_id"]),
-            "path": str(row["output_path"]),
-            "issue": f"duplicate_output_path tasks={int(row['count'])}",
-        }
-        for row in duplicate_path_rows[:50]
-    ]
-    samples.extend(
-        {
-            "task_id": "",
-            "path": str(path),
-            "issue": "parquet_exists_for_non_success_task",
-        }
-        for path in non_success_parquet_files[: max(0, 50 - len(samples))]
-    )
     progress = tqdm(
         total=total,
         desc="openbb:audit parquet",
@@ -1442,7 +1535,7 @@ def _audit_success_files(
         "success_missing_provider_tasks": success_missing_provider,
         "success_missing_output_path_tasks": success_missing_output_path,
         "duplicate_output_paths": duplicate_output_paths,
-        "non_success_parquet_files": len(non_success_parquet_files),
+        **ownership,
         "issue_samples": samples,
         "passed": (
             missing == 0
@@ -1454,7 +1547,7 @@ def _audit_success_files(
             and success_missing_provider == 0
             and success_missing_output_path == 0
             and duplicate_output_paths == 0
-            and not non_success_parquet_files
+            and ownership["non_success_parquet_files"] == 0
         ),
     }
 

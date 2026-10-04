@@ -429,6 +429,22 @@ class PublicPerformanceHistoryStore:
         boundary = self._raw_rows_between(since_epoch, first_full_hour)
         return sorted(boundary + rollups, key=lambda row: int(row["minute_epoch"]))
 
+    def rows_since_readonly(self, since_epoch: int) -> list[dict[str, Any]]:
+        """Internal read-only view of recent immutable rows; callers must not mutate.
+
+        Published rows are never changed after indexing. Returning references
+        avoids deep-copying every nested route histogram for each history
+        request. Older ranges keep the normal copied/disk-backed contract.
+        """
+        since_epoch = int(since_epoch)
+        with self._lock:
+            if since_epoch >= int(datetime.now(UTC).timestamp()) - self._recent_seconds:
+                return [
+                    row for row in self._rows
+                    if int(row["minute_epoch"]) >= since_epoch
+                ]
+        return self.rows_since(since_epoch)
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             hour_first = None

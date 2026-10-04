@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections import Counter
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
+import polars as pl
 
 from stockagent.live import data_monitor_dashboard as dashboard
 from stockagent.live.data_monitor_dashboard import (
@@ -13,6 +17,147 @@ from stockagent.live.data_monitor_dashboard import (
     build_data_monitor_feature_inventory,
     build_tw_public_monitor_status,
 )
+
+
+def test_stock_stream_window_uses_official_closure_not_weekday(tmp_path: Path) -> None:
+    pl.DataFrame({
+        "Name": ["中秋節", "孔子誕辰紀念日/ 教師節"],
+        "Date": ["1150925", "1150928"],
+        "_dataset": ["twse_api_holidayschedule_holidayschedule"] * 2,
+        "_source": ["TWSE OpenAPI"] * 2,
+        "_as_of_date": ["2026-09-16"] * 2,
+    }).write_parquet(tmp_path / "twse_api_holidayschedule_holidayschedule.parquet")
+    observed = datetime(2026, 9, 25, 1, tzinfo=UTC)
+    window = dashboard._stock_stream_window(observed, parquet_root=tmp_path)
+    assert window["today_status"] == "closed"
+    assert window["state"] == "waiting"
+    assert window["starts_at_utc"] == "2026-09-29T00:45:00Z"
+
+
+def test_stock_stream_window_unknown_calendar_does_not_invent_next_open(tmp_path: Path) -> None:
+    window = dashboard._stock_stream_window(
+        datetime(2026, 9, 29, 1, tzinfo=UTC), parquet_root=tmp_path,
+    )
+    assert window["state"] == "calendar_unverified"
+    assert window["starts_at_utc"] is None
+
+
+def test_minute_timer_skips_official_holiday_not_just_weekend(monkeypatch: pytest.MonkeyPatch) -> None:
+    from stockagent.live.market_status import TwStockDayDecision
+    holiday = datetime(2026, 9, 28, tzinfo=UTC).date()
+    monkeypatch.setattr(
+        dashboard, "tw_stock_day_decision",
+        lambda day, **_kwargs: TwStockDayDecision(
+            "closed" if day == holiday else "scheduled_open", "fixture official calendar"
+        ),
+    )
+    profile = dashboard._AUTOMATION_PROFILES["group:tw-minute-source-cold"]
+    next_run = dashboard._next_declared_calendar(
+        profile, datetime(2026, 9, 27, 10, tzinfo=UTC),
+    )
+    assert next_run == datetime(2026, 9, 29, 6, 45, tzinfo=UTC)
+
+
+@pytest.mark.parametrize('observed,calendar_unknown,expected_state', [
+    (datetime(2026, 9, 28, 9, tzinfo=UTC), False, 'current'),
+    (datetime(2026, 9, 29, 5, 59, tzinfo=UTC), False, 'current'),
+    (datetime(2026, 9, 29, 6, tzinfo=UTC), False, 'stale'),
+    (datetime(2026, 9, 28, 9, tzinfo=UTC), True, 'unknown'),
+])
+def test_finmind_free_freshness_uses_release_session_not_72_wall_hours(
+    tmp_path, monkeypatch, observed, calendar_unknown, expected_state,
+):
+    from stockagent.live.market_status import TwStockDayDecision
+    root = tmp_path / 'data_finmind'
+    root.mkdir()
+    (root / 'status.json').write_text(json.dumps({
+        'state': 'current', 'series': {'TaiwanVariousIndicators5Seconds': {
+            'total': 5, 'complete': 5, 'last_complete_date': '2026-09-24', 'rows': 500,
+            'last_receipt_at_utc': '2026-09-26T12:06:37Z',
+        }}}))
+    monkeypatch.setattr(dashboard, 'tw_stock_day_decision', lambda day, **_kw:
+                        TwStockDayDecision('unknown' if calendar_unknown else
+                                           'closed' if '2026-09-25' <= day.isoformat() <= '2026-09-28'
+                                           else 'actual_open', 'fixture official session'))
+    rows = dashboard._finmind_free_sources(tmp_path, now=observed, service={'active': True})
+    row = next(row for row in rows if row['id'] == 'finmind:TaiwanVariousIndicators5Seconds')
+    assert row['freshness']['state'] == expected_state
+    assert row['freshness']['threshold_seconds'] is None
+    assert row['coverage']['ratio'] == 1
+    enriched = dashboard._enrich_and_sort_rows([row], now=observed, refresh_services={})[0]
+    if expected_state == 'current':
+        assert enriched['operation_state'] == 'complete'
+        assert enriched['acquisition_progress']['preparing_for_date'] == '2026-09-29'
+    else:
+        assert enriched['operation_state'] != 'complete'
+
+
+def test_finmind_sponsor_progress_explains_verified_non_sessions(tmp_path: Path) -> None:
+    sponsor = tmp_path / "sponsor"
+    sponsor.mkdir()
+    (sponsor / "status.json").write_text(json.dumps({
+        "state": "running", "observed_at_utc": "2026-09-25T23:00:00Z",
+        "session_policy": {"state": "receipt_verified"},
+        "series": {"TaiwanStockPrice": {
+            "target": 2, "complete": 1, "observed_empty": 0,
+            "failed": 0, "blocked": 0, "non_session": 1,
+        }},
+    }), encoding="utf-8")
+
+    rows = dashboard._finmind_sponsor_sources(
+        tmp_path, now=datetime(2026, 9, 25, 23, 0, 30, tzinfo=UTC)
+    )
+    price = next(row for row in rows if row["id"] == "finmind:sponsor:TaiwanStockPrice")
+
+    assert price["coverage"]["current"] == 1
+    assert price["coverage"]["total"] == 2
+    assert "已驗證非交易日排除 1" in price["status_label"]
+
+
+def test_finmind_daily_release_uses_checked_partition_not_recent_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from stockagent.live.market_status import TwStockDayDecision
+
+    observed = datetime(2026, 9, 25, 11, tzinfo=UTC)  # 19:00 Taipei
+    sponsor_root = tmp_path / "sponsor"
+    sponsor_root.mkdir()
+    (sponsor_root / "status.json").write_text(json.dumps({
+        "state": "running", "observed_at_utc": observed.isoformat(),
+        "active_tasks": [],
+        "series": {"TaiwanStockPrice": {
+            "target": 1, "complete": 1, "last_checked_partition": "2026-09-24",
+            "last_attempt_at_utc": observed.isoformat(),
+        }},
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard, "tw_stock_day_decision",
+        lambda *_args, **_kwargs: TwStockDayDecision("scheduled_open", "official calendar"),
+    )
+    price = next(row for row in dashboard._finmind_sponsor_sources(tmp_path, now=observed)
+                 if row["id"] == "finmind:sponsor:TaiwanStockPrice")
+    enriched = dashboard._enrich_and_sort_rows(
+        [price], now=observed, refresh_services={},
+    )[0]
+    assert enriched["freshness"]["state"] == "current"
+    assert enriched["publication"]["expectation"]["state"] == "due_inferred"
+    assert enriched["operation_state"] == "catching_up"
+
+
+def test_runtime_progress_uses_latest_modified_log_not_filename(tmp_path: Path) -> None:
+    logs = tmp_path / "artifacts/daily_downloader/registered_intraday"
+    logs.mkdir(parents=True)
+    old_name = logs / "registered-intraday-20260920.log"
+    new_name = logs / "registered-intraday-20260921.log"
+    old_name.write_text("download:bybit: 20%|#| 2/10 [00:10<00:40, 1.0it/s]\n")
+    new_name.write_text("download:bybit: 10%|#| 1/10 [00:10<01:30, 1.0it/s]\n")
+    os.utime(old_name, ns=(3_000_000_000, 3_000_000_000))
+    os.utime(new_name, ns=(2_000_000_000, 2_000_000_000))
+
+    progress = dashboard._runtime_progress(tmp_path)
+
+    assert len(progress) == 1
+    assert progress[0]["current"] == 2
 
 
 def test_tw_feature_inventory_distinguishes_conditional_and_unverified_fields(
@@ -100,6 +245,33 @@ def test_official_release_archives_require_their_own_active_timer() -> None:
     )
     assert scheduled["automatic_update"] is True
     assert scheduled["schedule_state"] == "scheduled"
+
+
+def test_elapsed_intraday_timer_is_not_reported_as_healthy_automation() -> None:
+    row = {
+        "id": "group:crypto-reference",
+        "status": "waiting",
+        "status_label": "等待下一輪",
+        "automation_eligible": True,
+    }
+    automation = dashboard._automation_for_row(
+        row,
+        now=datetime(2026, 9, 25, 4, tzinfo=UTC),
+        refresh_services={
+            "registered_intraday": {
+                "active": False,
+                "timer_active": True,
+                "timer_state": "elapsed",
+                "next_run_at_utc": None,
+            }
+        },
+    )
+    assert automation["automatic_update"] is False
+    assert automation["schedule_state"] == "timer_unarmed"
+    assert automation["unarmed_service_keys"] == ["registered_intraday"]
+    assert dashboard._operation_state(row, automation) == (
+        "unable", "failed", "自動 timer 已啟用，但沒有下一次觸發"
+    )
 
 
 def test_dune_subscription_gate_is_not_reported_as_scheduled_catch_up(
@@ -244,14 +416,18 @@ def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) 
         encoding="utf-8",
     )
 
+    stages: dict[str, float] = {}
     payload = build_data_monitor_public_status(
         tmp_path,
         now=datetime(2026, 8, 16, tzinfo=UTC),
         refresh_services={},
+        timing_ms=stages,
     )
 
     assert payload["read_only"] is True
     assert payload["production_control_possible"] is False
+    assert payload["tw_stock_calendar"]["today_status"] == "closed"
+    assert payload["tw_stock_calendar"]["starts_at_utc"] is None
     assert "integrity_checks" in payload
     assert payload["summary"]["storage_groups"] == 1
     assert payload["groups"][0]["id"] == "group:okx"
@@ -259,6 +435,16 @@ def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) 
     assert payload["groups"][0]["operation_state"] == "catching_up"
     assert payload["groups"][0]["coverage"]["ratio"] == 1.0
     assert payload["groups"][0]["eta"]["remaining_seconds"] is None
+    assert payload["record_inventory_progress"]["identity_unbound_files"] == 0
+    assert payload["record_inventory_progress"]["identity_rechecked_files"] == 0
+    assert {
+        "inventory_and_groups", "shioaji_status", "openbb_status",
+        "service_state_and_runtime_progress", "specialize_groups",
+        "finlab_sources_and_acquisition", "logical_sources",
+        "enrich_and_rollup", "row_stats_and_integrity",
+    } <= set(stages)
+    assert all(value >= 0 for value in stages.values())
+    assert "public_projection_stages_ms" not in payload
     json.dumps(payload, allow_nan=False)
 
 
@@ -568,7 +754,7 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert "dashboard-core.css?v=6" in html
-    assert 'src="../dashboard-core.js?v=8"' in html
+    assert 'src="../dashboard-core.js?v=11"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript
@@ -596,11 +782,16 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "已延後／未啟用" in html
     assert "設定／憑證閘門" in html
     assert "清冊參照／不重複計算" in html
-    assert "styles.css?v=15" in html
-    assert "app.js?v=32" in html
+    assert "styles.css?v=20" in html
+    assert "app.js?v=46" in html
+    assert 'id="tw-calendar-state"' in html
+    assert "data.tw_stock_calendar" in javascript
     assert 'id="feature-rows"' in html
     assert 'id="feature-search"' in html
-    assert 'fetchJson("api/features")' in javascript
+    assert "inventory.identity_unbound_files" in javascript
+    assert 'fetchWithTimeout(`api/features/page?' in javascript
+    assert 'params.set("revision", state.featureRevision)' in javascript
+    assert "data.reset_required" in javascript
     assert 'id="category-filter"' in html
     assert 'id="category-grid"' in html
     assert 'id="inventory-filter"' in html
@@ -663,6 +854,77 @@ def test_operation_sort_and_endpoint_timing_reconcile(tmp_path: Path) -> None:
     assert all(row["automation"]["schedule_label"] for row in rows)
     assert all(row["publication"]["schedule_label"] for row in rows)
     assert all("acquisition_progress" in row for row in rows)
+
+
+def test_complete_projection_enriches_each_source_only_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Roll-up and final listing must share one observation of each child."""
+
+    original = dashboard._enrich_and_sort_rows
+    visits: Counter[str] = Counter()
+
+    def counted(rows, *, now, refresh_services):
+        selected = list(rows)
+        visits.update(str(row.get("id") or "") for row in selected)
+        return original(selected, now=now, refresh_services=refresh_services)
+
+    monkeypatch.setattr(dashboard, "_enrich_and_sort_rows", counted)
+    payload = build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 16, tzinfo=UTC),
+        refresh_services={},
+        shioaji_status={"pipelines": []},
+        openbb_status={},
+    )
+
+    assert payload["sources"]
+    assert payload["integrity_checks"]["checks"]["duplicate_endpoint_ids"] == 0
+    assert set(visits) == {str(row["id"]) for row in payload["sources"]}
+    assert set(visits.values()) == {1}
+
+
+def test_reused_child_enrichment_matches_full_rebuild_order_and_fields() -> None:
+    observed = datetime(2026, 8, 16, tzinfo=UTC)
+    group = {
+        "id": "group:fixture", "scope": "storage_group", "title": "Fixture",
+        "provider": "fixture", "status": "waiting", "eta": {"state": "waiting_schedule"},
+    }
+    children = [
+        {
+            "id": f"fixture:child:{index}", "parent_id": "group:fixture",
+            "scope": "source_registry", "title": f"Child {index}",
+            "provider": "fixture", "status": status,
+            "eta": {"state": "complete"},
+            "latest_at_utc": "2026-08-16T00:00:00Z",
+        }
+        for index, status in enumerate(("current", "blocked"))
+    ]
+    physical = {
+        "id": "inventory:fixture", "parent_id": "group:fixture",
+        "scope": "physical_inventory", "title": "Physical",
+        "provider": "fixture", "status": "legacy",
+    }
+    service_states: dict[str, dict] = {}
+
+    children_for_rollup = dashboard._enrich_and_sort_rows(
+        deepcopy(children), now=observed, refresh_services=service_states
+    )
+    dashboard._rollup_storage_groups([group], children_for_rollup)
+    expected = dashboard._enrich_and_sort_rows(
+        deepcopy([group, *children, physical]),
+        now=observed,
+        refresh_services=service_states,
+    )
+    reused = dashboard._enrich_and_sort_rows(
+        deepcopy([group, physical]), now=observed, refresh_services=service_states
+    )
+    reused.extend(children_for_rollup)
+    reused.sort(key=dashboard._row_sort_key)
+    for index, row in enumerate(reused, start=1):
+        row["sort_index"] = index
+
+    assert reused == expected
 
 
 def test_first_data_advances_next_date_without_claiming_full_completion() -> None:
@@ -1159,8 +1421,10 @@ def test_data_monitor_registers_openbb_l1_compaction_progress(tmp_path: Path) ->
     assert row["status"] == "waiting"
     assert row["coverage"]["current"] == 10_000
     assert row["coverage"]["total"] == 50_000
-    assert row["eta"]["remaining_seconds"] == 24_000
-    assert "2,048 shard" in row["eta"]["basis"]
+    assert row["eta"]["remaining_seconds"] == 8_640
+    assert "32,768 shard" in row["eta"]["basis"]
+    assert f"{dashboard.OPENBB_L1_TIMER_INTERVAL_SECONDS // 60} 分鐘輪間隔" in row["eta"]["basis"]
+    assert "交易窗口延後" in row["eta"]["basis"]
     assert "小於 32 檔" in row["eta"]["basis"]
     assert "75.00%" in row["detail"]
 
@@ -1175,6 +1439,56 @@ def test_data_monitor_registers_openbb_l1_compaction_progress(tmp_path: Path) ->
         f"--min-files-per-segment {dashboard.OPENBB_L1_MIN_FILES_PER_SEGMENT}"
         in service
     )
+    assert "TimeoutStartSec=40min" in service
+    timer = (
+        Path(__file__).resolve().parents[1]
+        / "deploy/systemd/stockagent-openbb-l1-compaction.timer.in"
+    ).read_text(encoding="utf-8")
+    assert "OnUnitInactiveSec=30min" in timer
+    assert "RandomizedDelaySec=2min" in timer
+
+
+def test_openbb_l1_eta_uses_real_schedule_and_separates_runtime_states() -> None:
+    now = datetime(2026, 8, 18, 2, 0, tzinfo=UTC)
+    status = {
+        "providers": [],
+        "l1_compaction": {
+            "generated_at_utc": (now - timedelta(minutes=5)).isoformat(),
+            "source_age_seconds": 300,
+            "success_files": 50_000,
+            "compacted_files": 10_000,
+            "pending_files": 40_000,
+        },
+    }
+    runtime = {
+        "active": False,
+        "timer_active": True,
+        "result": "success",
+        "next_run_at_utc": (now + timedelta(minutes=25)).isoformat(),
+        "started_at_utc": (now - timedelta(minutes=8)).isoformat(),
+        "completed_at_utc": (now - timedelta(minutes=5)).isoformat(),
+    }
+
+    def row(service: dict[str, object]) -> dict[str, object]:
+        return next(
+            item for item in dashboard._openbb_sources(
+                status, now=now, l1_service=service
+            ) if item["id"] == "openbb:l1-compaction"
+        )
+
+    scheduled = row(runtime)
+    assert scheduled["status"] == "waiting"
+    assert scheduled["eta"]["remaining_seconds"] == 3_780
+    assert "上一輪實測 180 秒" in scheduled["eta"]["basis"]
+
+    running = row({**runtime, "active": True})
+    assert running["status"] == "active"
+    assert running["eta"]["state"] == "in_progress"
+
+    disabled = row({**runtime, "timer_active": False})
+    assert disabled["status"] == "deferred"
+    assert disabled["eta"]["state"] == "timer_inactive"
+    assert disabled["automation_eligible"] is False
 
 
 def test_data_monitor_does_not_report_complete_when_query_view_is_deferred(
@@ -1493,7 +1807,7 @@ def test_running_saturated_progress_and_expired_eta_are_not_published() -> None:
     assert any("ETA 已過期" in warning for warning in enriched["warnings"])
 
 
-def test_stale_complete_receipt_cannot_claim_current_completion() -> None:
+def test_stale_complete_receipt_waits_for_publication_evidence() -> None:
     row = {
         "id": "fixture:stale-complete",
         "parent_id": "group:fixture",
@@ -1515,12 +1829,61 @@ def test_stale_complete_receipt_cannot_claim_current_completion() -> None:
         refresh_services={},
     )[0]
 
-    assert enriched["operation_state"] == "catching_up"
+    assert enriched["operation_state"] == "waiting_publication"
     assert enriched["is_latest"] is False
-    assert enriched["eta"]["state"] == "waiting_schedule"
-    assert enriched["acquisition_progress"]["ratio"] is None
-    assert enriched["acquisition_progress"]["state"] == "stale_complete_receipt"
-    assert enriched["acquisition_progress"]["evidence_coverage"]["ratio"] == 1.0
+    assert enriched["eta"]["state"] == "waiting_publication"
+    assert enriched["acquisition_progress"]["state"] == "waiting_publication"
+    assert enriched["publication"]["expectation"]["state"] == "unknown"
+
+
+def test_observed_new_publication_becomes_catch_up_only_after_change() -> None:
+    row = {
+        "id": "fixture:release", "scope": "logical_source", "provider": "fixture",
+        "status": "complete", "latest_at_utc": "2026-08-01T00:00:00Z",
+        "freshness": {"state": "stale"}, "eta": dashboard._complete_eta(),
+        "coverage": dashboard._coverage(1, 1, unit="批", label="舊批次"),
+        "_publication_hint": {
+            "schedule_kind": "source_version",
+            "detected_at_utc": "2026-08-02T00:00:00Z",
+            "applied_at_utc": "2026-08-01T00:00:00Z",
+        },
+    }
+    result = dashboard._enrich_and_sort_rows(
+        [row], now=datetime(2026, 8, 3, tzinfo=UTC), refresh_services={},
+    )[0]
+    assert result["operation_state"] == "catching_up"
+    assert result["publication"]["expectation"]["state"] == "due_observed"
+
+
+def test_scheduled_release_only_due_after_boundary() -> None:
+    row = {
+        "id": "fixture:release", "scope": "logical_source", "provider": "fixture",
+        "status": "complete", "latest_at_utc": "2026-08-01T00:00:00Z",
+        "freshness": {"state": "stale"}, "eta": dashboard._complete_eta(),
+        "_publication_hint": {
+            "schedule_kind": "historical_inference",
+            "expected_release_at_utc": "2026-08-03T06:00:00Z",
+            "expected_release_basis": "歷史發布規律",
+        },
+    }
+    early = dashboard._enrich_and_sort_rows(
+        [row], now=datetime(2026, 8, 3, 5, tzinfo=UTC), refresh_services={},
+    )[0]
+    late = dashboard._enrich_and_sort_rows(
+        [row], now=datetime(2026, 8, 3, 7, tzinfo=UTC), refresh_services={},
+    )[0]
+    assert early["operation_state"] == "waiting_publication"
+    assert early["publication"]["expectation"]["state"] == "not_due"
+    assert late["operation_state"] == "catching_up"
+    assert late["publication"]["expectation"]["state"] == "due_inferred"
+    # A recently checked receipt may still be obsolete the instant a new
+    # source release crosses its known boundary; age alone cannot override it.
+    fresh_receipt = {**row, "freshness": {"state": "current"}}
+    just_released = dashboard._enrich_and_sort_rows(
+        [fresh_receipt], now=datetime(2026, 8, 3, 7, tzinfo=UTC),
+        refresh_services={},
+    )[0]
+    assert just_released["operation_state"] == "catching_up"
 
 
 def test_incomplete_coverage_cannot_be_overridden_by_current_status() -> None:
@@ -1547,6 +1910,26 @@ def test_incomplete_coverage_cannot_be_overridden_by_current_status() -> None:
     assert enriched["operation_state"] == "catching_up"
     assert enriched["acquisition_progress"]["ratio"] == 0.9
     assert enriched["eta"]["state"] == "waiting_schedule"
+
+
+def test_historical_gap_remains_catching_up_before_next_release() -> None:
+    row = {
+        "id": "fixture:history-gap", "scope": "logical_source", "provider": "fixture",
+        "status": "complete", "latest_at_utc": "2026-08-01T00:00:00Z",
+        "coverage": dashboard._coverage(9, 10, unit="分區", label="歷史分區"),
+        "freshness": {"state": "stale"}, "eta": dashboard._complete_eta(),
+        "automation_eligible": True,
+        "_publication_hint": {
+            "expected_release_at_utc": "2026-08-25T06:00:00Z",
+            "expected_release_basis": "歷史規律",
+        },
+    }
+    result = dashboard._enrich_and_sort_rows(
+        [row], now=datetime(2026, 8, 20, tzinfo=UTC), refresh_services={},
+    )[0]
+    assert result["publication"]["expectation"]["state"] == "not_due"
+    assert result["operation_state"] == "catching_up"
+    assert result["acquisition_progress"]["ratio"] == 0.9
 
 
 def test_blocked_endpoint_keeps_full_receipt_as_evidence_not_progress() -> None:
@@ -1687,6 +2070,18 @@ def test_monitor_integrity_checks_recompute_final_public_dto_contracts() -> None
     assert failed["checks"]["complete_with_stale_freshness"] == 1
 
 
+def test_on_demand_snapshot_is_not_a_freshness_or_completion_certificate():
+    from stockagent.live import data_monitor_dashboard as dashboard
+    row = {'id': 'shioaji:on_demand_snapshots', 'status': 'current',
+           'freshness': {'state': 'stale', 'age_seconds': 400000},
+           'automation_eligible': False, 'eta': {'state': 'unknown'}}
+    operation, execution, _ = dashboard._operation_state(row, {'mode': 'on_demand'})
+    assert (operation, execution) == ('reference', 'on_demand')
+    checks = dashboard._monitor_integrity_checks(
+        [{**row, 'operation_state': operation, 'in_active_scope': False}], active_data_endpoints=0)
+    assert checks['state'] == 'pass'
+
+
 def test_crypto_feature_catalog_separates_reference_from_deferred_scope(
     tmp_path: Path,
 ) -> None:
@@ -1734,6 +2129,120 @@ def test_crypto_feature_catalog_separates_reference_from_deferred_scope(
     )
     assert by_id["okx-feature:current_open_interest"]["operation_state"] == ("deferred")
     assert by_id["okx-feature:liquidation_orders"]["operation_state"] == "deferred"
+
+
+@pytest.mark.parametrize("provider", ["okx", "binance"])
+@pytest.mark.parametrize("feature_receipt", ["valid", "absent", "invalid"])
+def test_crypto_feature_freshness_does_not_follow_candle_catalog(
+    tmp_path: Path, provider: str, feature_receipt: str,
+) -> None:
+    import csv
+
+    now = datetime(2026, 9, 27, tzinfo=UTC)
+    old = now - timedelta(hours=12)
+    root = tmp_path / f"data_{provider}/1m"
+    root.mkdir(parents=True)
+    catalog = root / f"{provider}_historical_feature_catalog.json"
+    catalog.write_text(json.dumps({"generated_at_utc": now.isoformat(), "catalog": [
+        {"id": "trade_candles_1m", "download_status": "included"},
+        {"id": "mark_price_candles_1m", "download_status": "included"},
+    ]}))
+    report = root / "historical_feature_report.csv"
+    with report.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["stage_status_json", "coverage_json"])
+        writer.writeheader()
+        writer.writerow({"stage_status_json": json.dumps({"mark_price": "ok"}),
+                         "coverage_json": json.dumps({"mark_price": {"rows": 12}})})
+    os.utime(report, (old.timestamp(), old.timestamp()))
+    (root / "download_summary.json").write_text(json.dumps({
+        "ended_at_utc": now.isoformat(),
+        "historical_feature_report_is_current_run": False,
+        "status_counts": {"updated": 1}, "symbol_count": 1,
+    }))
+    if feature_receipt != "absent":
+        (root / "download_summary.historical_features.json").write_text(json.dumps({
+            "ended_at_utc": old.isoformat(),
+            "historical_feature_report_is_current_run": feature_receipt == "valid",
+        }))
+    rows = {r["title"]: r for r in dashboard._crypto_feature_sources(tmp_path, now=now)}
+    assert rows["trade_candles_1m"]["status"] == "current"
+    feature = rows["mark_price_candles_1m"]
+    assert feature["status"] != "current"
+    assert feature["coverage"]["current"] == 1
+    assert feature["latest_at_utc"] == (
+        None if feature_receipt == "invalid" else dashboard._iso(old)
+    )
+    if feature_receipt == "invalid":
+        assert feature["status"] == "waiting"
+        assert feature["eta"]["state"] != "complete"
+    # Touching/replacing endpoint definitions alone must be a semantic no-op.
+    before = deepcopy(rows)
+    os.utime(catalog, (now.timestamp() + 3600, now.timestamp() + 3600))
+    assert {r["title"]: r for r in dashboard._crypto_feature_sources(tmp_path, now=now)} == before
+    if feature_receipt == "valid":
+        summary = root / "download_summary.historical_features.json"
+        # Either publication ordering must not combine a new clock with an old
+        # report/summary and incorrectly advertise completed feature refresh.
+        summary.write_text(json.dumps({
+            "ended_at_utc": now.isoformat(),
+            "historical_feature_report_is_current_run": True,
+        }))
+        current = {r["title"]: r for r in dashboard._crypto_feature_sources(tmp_path, now=now)}
+        assert current["mark_price_candles_1m"]["latest_at_utc"] == dashboard._iso(old)
+        summary.write_text(json.dumps({
+            "ended_at_utc": (now + timedelta(days=1)).isoformat(),
+            "historical_feature_report_is_current_run": True,
+        }))
+        current = {r["title"]: r for r in dashboard._crypto_feature_sources(tmp_path, now=now)}
+        assert current["mark_price_candles_1m"]["latest_at_utc"] is None
+        assert current["mark_price_candles_1m"]["status"] == "waiting"
+        summary.write_text(json.dumps({
+            "ended_at_utc": old.isoformat(),
+            "historical_feature_report_is_current_run": True,
+        }))
+        os.utime(report, (now.timestamp(), now.timestamp()))
+        current = {r["title"]: r for r in dashboard._crypto_feature_sources(tmp_path, now=now)}
+        assert current["mark_price_candles_1m"]["latest_at_utc"] == dashboard._iso(old)
+
+
+def test_crypto_catalog_without_acquisition_cannot_claim_fresh_candles(tmp_path: Path) -> None:
+    root = tmp_path / "data_okx/1m"
+    root.mkdir(parents=True)
+    (root / "okx_historical_feature_catalog.json").write_text(json.dumps({
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "catalog": [{"id": "trade_candles_1m", "download_status": "included"}],
+    }))
+    row = dashboard._crypto_feature_sources(tmp_path, now=datetime.now(UTC))[0]
+    assert row["status"] == "waiting"
+    assert row["latest_at_utc"] is None
+    assert row["freshness"]["state"] == "unknown"
+    (root / "download_summary.json").write_text(json.dumps({
+        "ended_at_utc": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+    }))
+    row = dashboard._crypto_feature_sources(tmp_path, now=datetime.now(UTC))[0]
+    assert row["status"] == "waiting"
+    assert row["latest_at_utc"] is None
+
+
+@pytest.mark.parametrize("counts,expected", [
+    ({"failed": 1}, "degraded"), ({"repair_required": 1}, "degraded"),
+    ({"updated": 1, "failed": 1}, "degraded"), ({}, "waiting"),
+    ({"skipped_empty": 1}, "waiting"), ({"updated": 0}, "waiting"),
+    ({"updated": 1}, "current"), ({"skipped_up_to_date": 1}, "current"),
+])
+def test_crypto_candle_completed_clock_is_not_success_proof(tmp_path, counts, expected):
+    root = tmp_path / "data_okx/1m"
+    root.mkdir(parents=True)
+    now = datetime(2026, 9, 27, tzinfo=UTC)
+    (root / "okx_historical_feature_catalog.json").write_text(json.dumps({
+        "catalog": [{"id": "trade_candles_1m", "download_status": "included"}],
+    }))
+    (root / "download_summary.json").write_text(json.dumps({
+        "ended_at_utc": now.isoformat(), "status_counts": counts,
+    }))
+    row = dashboard._crypto_feature_sources(tmp_path, now=now)[0]
+    assert row["status"] == expected
+    assert (row["eta"]["state"] == "complete") == (expected == "current")
 
 
 def test_product_storage_presence_is_not_a_completion_denominator(
@@ -1907,6 +2416,10 @@ def test_registered_refresh_reuses_downloaders_and_preserves_tw_snapshot_owner()
     assert "CRYPTO_HISTORICAL_FEATURES=0" in daily_scope
     assert "CRYPTO_HISTORICAL_FEATURES=0" in intraday_scope
     assert "CRYPTO_HISTORICAL_FEATURES=1" in backfill_scope
+    assert 'OKX_WORKERS="${BACKFILL_OKX_WORKERS:-8}"' in backfill_scope
+    assert 'BYBIT_WORKERS="${BACKFILL_BYBIT_WORKERS:-8}"' in backfill_scope
+    assert 'BINANCE_WORKERS="${BACKFILL_BINANCE_WORKERS:-12}"' in backfill_scope
+    assert 'BINANCE_FEATURE_WORKERS="${BACKFILL_BINANCE_FEATURE_WORKERS:-8}"' in backfill_scope
     assert "registered-backfill" in runner
     assert "CRYPTO_TAIL_ONLY=0" in runner
     assert "registered_backfill" in dashboard._REFRESH_UNITS

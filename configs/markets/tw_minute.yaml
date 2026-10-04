@@ -3,7 +3,7 @@ base_config: tw.yaml
 experiment_name: tw-full-market-minute-day-trade
 
 runner:
-  output_dir: artifacts/markets/tw_minute
+  output_dir: artifacts/markets/tw_minute_listing_admission_v1
   mode: train
   resume: true
   post_train_infer: false
@@ -12,7 +12,7 @@ runner:
 
 data:
   panel_start_date: "2020-01-01"
-  minute_parquet_root: data_tw_minute/research_dataset
+  minute_parquet_root: data_tw_minute/research_dataset_developing_v5
   minute_require_research_ready: true
   minute_verify_partition_sha256: true
 

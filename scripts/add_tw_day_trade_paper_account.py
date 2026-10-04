@@ -77,6 +77,39 @@ def _rows(path):
                     yield json.loads(line)
 
 
+def _empty_configured_placeholder(mode: object) -> bool:
+    """An engine-created account with no decisions or cash movement is replaceable."""
+
+    if not isinstance(mode, dict):
+        return False
+    capital = mode.get("initial_capital_twd")
+    try:
+        if float(capital) <= 0 or float(mode.get("total_equity_twd")) != float(capital):
+            return False
+        if any(
+            float(mode.get(key) or 0) != 0
+            for key in (
+                "cumulative_realized_net_pnl_twd",
+                "open_net_liquidation_pnl_twd",
+                "cumulative_commission_rebate_accrued_twd",
+            )
+        ):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return not any(
+        mode.get(key)
+        for key in (
+            "session_date",
+            "signal_id",
+            "processed_signal_ids",
+            "pending_entry_orders",
+            "pending_reduction_orders",
+            "positions",
+        )
+    )
+
+
 def validate_new_identity(
     live: Path, candidate: Path, market: str
 ) -> tuple[dict, dict]:
@@ -84,12 +117,11 @@ def validate_new_identity(
     incoming = _load_object(candidate / "state.json")
     if set(incoming.get("modes", {})) != {market}:
         raise ValueError("candidate must contain exactly the one new account")
-    if (
-        not market
-        or market in old.get("modes", {})
-        or market in old.get("enabled_markets", [])
-    ):
+    existing = old.get("modes", {}).get(market)
+    if not market or (existing is not None and not _empty_configured_placeholder(existing)):
         raise ValueError("account addition may never replace an existing market")
+    if market in old.get("enabled_markets", []) and existing is None:
+        raise ValueError("enabled account has no state placeholder")
     for name in LEDGERS:
         if any(row.get("market") == market for row in _rows(live / name)):
             raise ValueError(f"account ID already occurs in live {name}")
@@ -153,15 +185,28 @@ def validate_composed_history(
     if not sessions or sessions != new["strategy"]["session_dates"]:
         raise ValueError("account addition requires identical completed session scope")
     for component in (old, new):
-        if not (
+        strategy = component["strategy"]
+        strict_parity = bool(
             component.get("independent_carried_valuation_parity_passed") is True
             and component.get("independent_carried_valuation_parity_required") is True
-            and component.get("carried_inventory_revalued_from_unchanged_executions")
-            is True
-            and component["strategy"].get("differing_original_equity_points") == 0
-            and 0
-            <= component["strategy"].get("maximum_original_equity_difference_twd", -1)
-            <= 1e-6
+            and strategy.get("differing_original_equity_points") == 0
+            and 0 <= strategy.get("maximum_original_equity_difference_twd", -1) <= 1e-6
+        )
+        drift_counts = strategy.get("equity_difference_counts_by_market_date") or {}
+        last_live_session_drift = bool(
+            component is old
+            and component.get("opening_marks_revalued_at_completed_minute") is True
+            and component.get("accepted_13_30_endpoints_preserved") is True
+            and isinstance(drift_counts, dict)
+            and drift_counts
+            and all(str(key).endswith(f":{sessions[-1]}") for key in drift_counts)
+            and sum(int(value) for value in drift_counts.values())
+            == int(strategy.get("differing_original_equity_points") or 0)
+            and component.get("independent_carried_valuation_parity_required") is False
+        )
+        if not (
+            (strict_parity or last_live_session_drift)
+            and component.get("carried_inventory_revalued_from_unchanged_executions") is True
             and component.get("linear_interpolation_used") is False
             and component.get("simulation_only") is True
             and component.get("production_order_possible") is False
@@ -192,10 +237,22 @@ def validate_composed_history(
     )
     shutil.copy2(live / "minute_curve_receipt.json", archive)
     receipt = copy.deepcopy(old)
+    strict_joint_parity = all(
+        component.get("independent_carried_valuation_parity_passed") is True
+        and component.get("independent_carried_valuation_parity_required") is True
+        for component in (old, new)
+    )
     receipt.update(
         created_at=datetime.now(TAIPEI).isoformat(),
         composition_contract="disjoint_account_verified_history_prefix_composition_v1",
-        independent_parity_evidence="unchanged independently revalued component histories; no new executions",
+        independent_parity_evidence=(
+            "unchanged independently revalued component histories; no new executions"
+            if strict_joint_parity
+            else "new account independently revalued; prior live account differs only "
+            "on its last completed session; all prior bytes unchanged"
+        ),
+        independent_carried_valuation_parity_passed=strict_joint_parity,
+        independent_carried_valuation_parity_required=strict_joint_parity,
         components=[
             {
                 "markets": old["strategy"]["markets"],
@@ -217,7 +274,10 @@ def validate_composed_history(
         },
         strategy={
             **stats,
-            "differing_original_equity_points": 0,
+            "differing_original_equity_points": sum(
+                int(x["strategy"]["differing_original_equity_points"])
+                for x in (old, new)
+            ),
             "maximum_original_equity_difference_twd": max(
                 x["strategy"]["maximum_original_equity_difference_twd"]
                 for x in (old, new)
@@ -251,13 +311,14 @@ def validate_composed_history(
         completed_session_dates=sessions,
         expected_markets=expected,
         failures=failures,
-        require_carried_parity=True,
+        require_carried_parity=strict_joint_parity,
     )
     if failures:
         raise ValueError("; ".join(failures))
     return {
         "minute_curves": validation,
         "benchmarks": benchmarks,
+        "strict_joint_parity": strict_joint_parity,
         "previous_minute_receipt_archive": str(archive.relative_to(merged)),
     }
 
@@ -331,16 +392,17 @@ def compose_account(live: Path, candidate: Path, merged: Path, market: str) -> d
     mode["executed_positions_path"] = str(live / "positions.json")
     mode["account_origin"] = "user_authorized_isolated_replay_account_v1"
     state.setdefault("modes", {})[market] = mode
-    state["enabled_markets"] = [
-        *old.get("enabled_markets", sorted(old["modes"])),
-        market,
-    ]
+    state["enabled_markets"] = list(
+        dict.fromkeys([*old.get("enabled_markets", sorted(old["modes"])), market])
+    )
     # Reuse projection/persistence, not an alternate cash or fill implementation.
     engine = TwDayTradeSimulationEngine(merged)
     engine.state = state
     engine._persist(datetime.now(TAIPEI))
     after = _load_object(merged / "state.json")
     for old_market, old_mode in old["modes"].items():
+        if old_market == market:
+            continue
         if after["modes"][old_market] != old_mode:
             raise ValueError(f"existing account changed: {old_market}")
     for key in ("benchmarks", "minute_liquidity"):
@@ -382,7 +444,8 @@ def compose_account(live: Path, candidate: Path, merged: Path, market: str) -> d
         "accounting_scope": "independent_market_capital_positions_and_pnl",
         "added_initial_capital_twd": mode["initial_capital_twd"],
         "source_candidate": str(candidate),
-        "preserved_markets": sorted(old["modes"]),
+        "preserved_markets": sorted(set(old["modes"]) - {market}),
+        "configured_empty_placeholder_replaced": market in old["modes"],
         "preserved_old_files": preserved,
         "old_modes_unchanged": True,
         "old_ledger_prefixes_unchanged": True,
@@ -436,7 +499,8 @@ def main(*, before_exchange=None):
     plan = {
         "action": "add_isolated_account_not_replace",
         "market": cfg.market,
-        "preserved_markets": sorted(old["modes"]),
+        "preserved_markets": sorted(set(old["modes"]) - {cfg.market}),
+        "configured_empty_placeholder_replaced": cfg.market in old["modes"],
         "acceptance": acceptance,
     }
     if not args.apply:

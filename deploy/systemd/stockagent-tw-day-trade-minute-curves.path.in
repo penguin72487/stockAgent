@@ -1,11 +1,15 @@
 [Unit]
-Description=Retry TW day-trade minute curves when verified TXFR1 receipts change
+Description=Retry TW day-trade minute curves when verified source receipts change
 
 [Path]
 # A new atomic TXFR1 receipt is the real dependency, not a fixed wall clock.
 # The maintenance service independently verifies the exact trading date and
 # every source hash before publishing; unrelated receipts are harmless retries.
 PathChanged=@REPO_ROOT@/data_tw_index_futures/shioaji_history/TXFR1/receipts
+# The stock minute collector also requires the receipt-verified TAIEX session
+# calendar. An atomic calendar publication should retry waiting_source without
+# waiting for the next scheduled sweep.
+PathChanged=@REPO_ROOT@/data_tw_public/twse_taiex_ohlc.summary.json
 Unit=stockagent-tw-day-trade-minute-curves.service
 
 [Install]

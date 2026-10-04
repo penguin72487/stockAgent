@@ -14,11 +14,12 @@ from stockagent.data.tw_price_rules import tick_size_numpy
 from stockagent.research.taifex_transaction_tax import futures_transaction_tax_rate
 
 
-EXECUTION_TERMS_COMPILER_VERSION = 3
+EXECUTION_TERMS_COMPILER_VERSION = 6
 KEYS = ["date", "physical_contract"]
 QUOTE_KEYS = ["date", "product", "contract"]
 POSITION_INPUT_FIELDS = ["position_unit", "position_limit", "monthly_position_limit", "position_root_product",
     "position_numeric_inputs_resolved", "known_at", "effective_date", "effective_phase"]
+POSITION_INPUT_EXTENSIONS = {"independent_contract_limit": pl.Float64, "unit": pl.String}
 MARGIN_INPUT_FIELDS = [prefix+c for prefix in ("opening_", "settlement_") for c in
     ("binding_status", "margin_interval_id", "margin_kind", "initial", "maintenance", "known_at")]
 SPEC_FIELDS = {
@@ -145,8 +146,11 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
     for source, keys in ((margins, ["date", "product"]), (positions, QUOTE_KEYS), (terminal_values, QUOTE_KEYS)):
         if source.select(keys).is_duplicated().any():
             raise ValueError("duplicate execution-term input")
+    positions=positions.with_columns(*[pl.lit(None,dtype=t).alias(c)
+        for c,t in POSITION_INPUT_EXTENSIONS.items() if c not in positions.columns])
     f = f.join(positions.select(*QUOTE_KEYS,
-        *[pl.col(c).alias("pos_" + c) for c in POSITION_INPUT_FIELDS]), on=QUOTE_KEYS, how="left", validate="1:1")
+        *[pl.col(c).alias("pos_" + c) for c in [*POSITION_INPUT_FIELDS,*POSITION_INPUT_EXTENSIONS]]),
+        on=QUOTE_KEYS, how="left", validate="1:1")
     f = f.join(margins.select("date", "product", *MARGIN_INPUT_FIELDS),
         on=["date", "product"], how="left", validate="m:1")
     levels = margin_intervals.with_row_index("_interval")
@@ -189,16 +193,53 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
           & (pl.col("spec_effective_date") > pl.col("previous_market_date"))
           & pl.col("previous_symbol_date").is_not_null()).fill_null(False).alias("_split_today"),
     )
+    # The same published capacity can be represented in root contracts and
+    # adjusted shares. Compare physical capacities, never raw unlike units.
+    # This converts an exactly equivalent obligation; it does not choose a
+    # smaller cap or apply a missing historical grade.
+    share=(pl.col("pos_unit").is_in(["shares","beneficial_units"])
+        & pl.col("pos_position_numeric_inputs_resolved")).fill_null(False)
+    axes=["date","pos_position_root_product"]
+    f=f.with_columns(
+        pl.when(share).then(pl.col("pos_position_limit")).otherwise(None).max().over(axes).alias("_share_cap"),
+        pl.when(share).then(pl.col("pos_unit")).otherwise(None).max().over(axes).alias("_share_measure"))
+    factor=pl.col("contract_multiplier")/pl.col("pos_position_unit")
+    equivalent=((pl.col("pos_unit")=="contracts") & pl.col("pos_position_numeric_inputs_resolved")
+        & _positive("pos_position_unit") & _positive("contract_multiplier")
+        & ((pl.col("pos_position_limit")*factor)==pl.col("_share_cap"))).fill_null(False)
+    f=f.with_columns(
+        pl.when(equivalent).then(pl.col("contract_multiplier")).otherwise(pl.col("pos_position_unit"))
+          .alias("pos_position_unit"),
+        pl.when(equivalent).then(pl.col("_share_cap")).otherwise(pl.col("pos_position_limit"))
+          .alias("pos_position_limit"),
+        pl.when(equivalent).then(pl.col("pos_monthly_position_limit")*factor)
+          .otherwise(pl.col("pos_monthly_position_limit")).alias("pos_monthly_position_limit"),
+        pl.when(equivalent).then(pl.col("_share_measure")).otherwise(pl.col("pos_unit")).alias("pos_unit"))
     if f.filter(pl.col("_corporate_event_today") & pl.col("_split_today")).height:
         raise ValueError("overlapping corporate and product-wide quantity transitions")
     f = f.with_columns((pl.col("_corporate_event_today") | pl.col("_split_today")).alias("_event_today"))
+    # The numeric day's closing snapshot belongs to the regular margin phase.
+    # Cash expiry can occur earlier. Its event clock does not move the later
+    # legal margin boundary forward: before regular close, the admitted opening
+    # phase remains in force under this two-phase source contract. Keep that
+    # interval identity and its knowledge clock, including any unresolved gap.
+    early_cash = (pl.col("cash_settlement") & pl.col("specification_bound")
+        & (pl.col("spec_settlement_method") == "cash_settlement")
+        & (pl.col("date") == pl.col("official_expiry"))
+        & (pl.col("spec_expiry_time") < pl.col("spec_settlement_time"))).fill_null(False)
+    opening_margin_fields = [c for c in MARGIN_INPUT_FIELDS if c.startswith("opening_")]
+    opening_margin_fields += [c for c in f.columns if c.startswith("opening_rule_")]
+    f = f.with_columns(*[
+        pl.when(early_cash).then(pl.col(c))
+          .otherwise(pl.col(c.replace("opening_", "settlement_", 1)))
+          .alias(c.replace("opening_", "settlement_", 1)) for c in opening_margin_fields])
     # The numeric binder deliberately leaves same-day announcements undecided.
     # Now that the actual product clock is known, resolve only that case; an
     # ended interval or a later announcement cannot revive an earlier level.
     for prefix, clock in (("opening_", "opening_time"), ("settlement_", "settlement_time")):
         effect = (pl.col(prefix + "rule_effective_date") + "T"
             + pl.when(pl.col(prefix + "rule_effective_phase") == 0).then(pl.col("opening_time"))
-              .otherwise(pl.col("settlement_time")) + "+08:00")
+              .otherwise(pl.col("spec_settlement_time")) + "+08:00")
         resolved = ((pl.col(prefix + "binding_status") == "same_day_clock_review")
             & (_utc(pl.col(prefix + "rule_known_at")) <= _utc(_clock("date", clock)))
             & (_utc(effect) <= _utc(_clock("date", clock)))).fill_null(False)
@@ -290,17 +331,21 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         pl.col("pos_position_unit").alias("position_unit"),
         pl.col("pos_position_limit").alias("position_limit"),
         pl.col("pos_position_root_product").alias("position_group"),
-        pl.when(pl.col("pos_monthly_position_limit").is_not_null())
+        pl.when(pl.col("pos_independent_contract_limit").is_not_null())
+          .then(pl.lit("POSITION_SINGLE:")+pl.col("product"))
+          .when(pl.col("pos_monthly_position_limit").is_not_null())
           .then(pl.col("pos_position_root_product") + ":" + pl.col("contract"))
           .otherwise(pl.col("pos_position_root_product")).alias("second_position_group"),
-        pl.col("pos_position_unit").alias("second_position_unit"),
-        pl.coalesce("pos_monthly_position_limit", "pos_position_limit").alias("second_position_limit"),
+        pl.when(pl.col("pos_independent_contract_limit").is_not_null()).then(1.)
+          .otherwise(pl.col("pos_position_unit")).alias("second_position_unit"),
+        pl.coalesce("pos_independent_contract_limit", "pos_monthly_position_limit", "pos_position_limit")
+          .alias("second_position_limit"),
         *[pl.col("spec_" + c).alias(c) for c in ("position_grandfather_existing", "second_position_grandfather_existing")],
     )
     for prefix, clock in (("opening_", "opening_time"), ("settlement_", "settlement_time")):
         f = f.with_columns((pl.col(prefix + "rule_effective_date") + "T"
             + pl.when(pl.col(prefix + "rule_effective_phase") == 0).then(pl.col("opening_time"))
-              .otherwise(pl.col("settlement_time")) + "+08:00").alias(prefix + "effective_at"))
+              .otherwise(pl.col("spec_settlement_time")) + "+08:00").alias(prefix + "effective_at"))
     f = f.with_columns(
         pl.max_horizontal(*[_utc(pl.col(c)) for c in
             ("opening_known_at", "pos_known_at", "spec_known_at", "corp_known_at")])
@@ -359,12 +404,23 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
     needs_owner = (~pl.col("is_warmup") & (pl.col("terminal_event") == "mark_only")
                    & pl.col("next_market_date").is_not_null())
     admitted_margin = ["bound_prior_publication", "bound_same_security_rate", "bound_same_day_clock"]
+    group_fields=["date","pos_position_root_product"]
+    group_conflict=pl.any_horizontal([
+        pl.when(pl.col("pos_position_numeric_inputs_resolved")).then(pl.col(c))
+          .otherwise(None).drop_nulls().n_unique().over(group_fields)>1
+        for c in ("pos_position_limit","pos_unit")])
+    group_conflict=group_conflict | (pl.when(pl.col("pos_position_numeric_inputs_resolved"))
+        .then(pl.col("second_position_limit")).otherwise(None).drop_nulls().n_unique()
+        .over(["date","second_position_group"])>1)
+    extra_cap=pl.col("pos_independent_contract_limit").is_not_null()
+    unsupported_extra=extra_cap & (~_positive("pos_independent_contract_limit")
+        | pl.col("pos_monthly_position_limit").is_not_null())
     reasons = {
         "missing_product_specification": ~pl.col("specification_bound"),
         "missing_opening_margin": ~pl.col("opening_binding_status").is_in(admitted_margin),
         "missing_settlement_margin": ~pl.col("settlement_binding_status").is_in(admitted_margin),
         "intraday_margin_kind_change": (pl.col("opening_margin_kind") != pl.col("settlement_margin_kind")).fill_null(False),
-        "missing_position_limit": ~pl.col("pos_position_numeric_inputs_resolved"),
+        "missing_position_limit": ~pl.col("pos_position_numeric_inputs_resolved") | group_conflict | unsupported_extra,
         "missing_contract_units": ~_positive("contract_multiplier"),
         "missing_adjusted_terms": adjusted & ~corporate,
         "unvalued_subscription_rights": (pl.col("cash_settlement")

@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly public macro plan repair without a second downloader
+
+[Timer]
+OnBootSec=6min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=60
+Persistent=true
+Unit=stockagent-openbb-public-priority.service
+
+[Install]
+WantedBy=timers.target

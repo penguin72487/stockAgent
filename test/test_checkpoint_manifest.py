@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ import stockagent.training.trainer as trainer_module
 from stockagent.backtest.simulator import CANONICAL_BACKTEST_CONTRACT_VERSION
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_listing_admission import VERIFIED_EMERGING_TO_TPEX_LISTINGS
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import load_model_from_checkpoint
 from stockagent.training.checkpoint_contract import checkpoint_manifest_symbols
@@ -275,6 +277,16 @@ def test_strict_minute_tape_content_owns_resume_fingerprint() -> None:
         ["day_trade_minute_execution_allow_daily_proxy"]
         is False
     )
+
+
+def test_minute_listing_date_change_invalidates_day_trade_checkpoint(monkeypatch) -> None:
+    config = load_config("configs/markets/tw_day_trade_1m_strict_exact_2020.yaml")
+    panel = _day_trade_minute_panel()
+    original = _checkpoint_manifest(panel, config)
+    assert original["contracts"]["trading"]["taiwan_execution"]["regular_market_admission"]
+    monkeypatch.setitem(VERIFIED_EMERGING_TO_TPEX_LISTINGS, "6716", date(2020, 3, 26))
+    revised = _checkpoint_manifest(panel, config)
+    assert original["fingerprints"]["trading"] != revised["fingerprints"]["trading"]
 
 
 def test_physical_source_domain_extension_allows_only_pinned_predecessor_resume(

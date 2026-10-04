@@ -345,8 +345,10 @@ def build_openbb_public_status(
         else {}
     )
     snapshot_age = _age_seconds(snapshot.get("checked_at"), current)
-    scheduler_age = _age_seconds(scheduler.get("updated_at"), current)
-    phase_age = _age_seconds(downloader_phase.get("updated_at"), current)
+    scheduler_updated_at = _datetime(scheduler.get("updated_at"))
+    phase_updated_at = _datetime(downloader_phase.get("updated_at"))
+    scheduler_age = _age_seconds(scheduler_updated_at, current)
+    phase_age = _age_seconds(phase_updated_at, current)
     scheduler_current = (
         scheduler_age is not None and scheduler_age <= PROCESS_ACTIVITY_STALE_SECONDS
     )
@@ -376,12 +378,28 @@ def build_openbb_public_status(
     activity_age = _age_seconds(
         activity_at.isoformat() if activity_at else None, current
     )
+    # A downloader phase can remain "download" for hours while the scheduler
+    # reports a more recent, legitimate provider cooldown. Prefer the newest
+    # fresh evidence instead of always privileging the phase file.
+    if scheduler_current and scheduler_updated_at is not None and (
+        not phase_current
+        or phase_updated_at is None
+        or scheduler_updated_at > phase_updated_at
+    ):
+        phase = _safe_phase(scheduler.get("phase"))
+    elif phase_current:
+        phase = _safe_phase(downloader_phase.get("phase"))
+    else:
+        phase = "initializing" if supervisor_alive or downloader_alive else "unknown"
+    waiting = phase == "waiting" and scheduler_current
+    wait_reason = _safe_phase(scheduler.get("wait_reason")) if waiting else None
+    wait_until = _datetime(scheduler.get("wait_until")) if waiting else None
     complete = bool(snapshot.get("complete"))
     if complete:
         health = "complete"
     elif supervisor_alive and downloader_alive:
         health = (
-            "active"
+            ("waiting" if waiting else "active")
             if activity_age is not None
             and activity_age <= PROCESS_ACTIVITY_STALE_SECONDS
             else "degraded"
@@ -395,15 +413,6 @@ def build_openbb_public_status(
         )
     else:
         health = "stopped"
-    phase = (
-        _safe_phase(downloader_phase.get("phase"))
-        if phase_current
-        else _safe_phase(scheduler.get("phase"))
-        if scheduler_current
-        else "initializing"
-        if supervisor_alive or downloader_alive
-        else "unknown"
-    )
 
     total = _integer(snapshot.get("total_tasks"))
     accepted = _integer(snapshot.get("accepted_tasks"))
@@ -447,6 +456,8 @@ def build_openbb_public_status(
             "supervisor_alive": supervisor_alive,
             "downloader_alive": downloader_alive,
             "phase": phase,
+            "wait_reason": wait_reason,
+            "wait_until": wait_until.isoformat() if wait_until else None,
             "activity_updated_at": activity_at.isoformat() if activity_at else None,
             "activity_age_seconds": activity_age,
             "scheduler_age_seconds": scheduler_age,

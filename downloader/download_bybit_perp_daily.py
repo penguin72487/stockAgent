@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from http.client import IncompleteRead, RemoteDisconnected
 import json
 import os
 import sys
@@ -11,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -39,7 +38,11 @@ from common import (
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from artifact_io import archive_run_reports
+from candle_frame_buffer import CandleFrameBuffer
+from http_transport import RETRYABLE_NETWORK_ERRORS
 from ohlcv_hot_tail import (
+    has_contiguous_timestamps,
     hot_tail_path,
     read_logical_parquet,
     remove_hot_tail,
@@ -220,6 +223,11 @@ def parse_args() -> argparse.Namespace:
         default=0.6,
         help="Base seconds for exponential backoff",
     )
+    parser.add_argument(
+        "--archive-report-dir",
+        default=None,
+        help="Optional per-run report archive before later jobs replace latest reports.",
+    )
     return parser.parse_args()
 
 
@@ -285,18 +293,18 @@ def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
 
 
 def _merge_existing_with_fresh(
-    existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int
+    existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int,
+    *, preserve_existing: bool = False,
 ) -> tuple[pl.DataFrame, bool]:
     existing = _normalize_date_frame(existing_df)
     cutoff = _ms_to_date_string(effective_start_ms)
     kept_existing = (
         existing.filter(pl.col("date") < cutoff)
-        if "date" in existing.columns
+        if "date" in existing.columns and not preserve_existing
         else existing
     )
     combined = (
         pl.concat([kept_existing, fresh_df], how="diagonal_relaxed")
-        .sort("date")
         .unique(subset=["date"], keep="last", maintain_order=True)
         .sort("date")
     )
@@ -349,6 +357,12 @@ def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
         return None
     return int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
+
+def _can_skip_existing_middle(frame: pl.DataFrame, info: ExistingCandleInfo) -> bool:
+    return has_contiguous_timestamps(
+        frame, earliest_ms=info.earliest_ms, latest_ms=info.latest_ms,
+        interval_ms=CANDLE_INTERVAL_MS,
+    )
 
 def _earliest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
     if frame.is_empty() or "date" not in frame.columns:
@@ -548,7 +562,7 @@ class BybitClient:
 
                 code = str(payload.get("retCode"))
                 message = str(payload.get("retMsg") or "")
-                retriable_code = {"10006", "429", "10000"}
+                retriable_code = {"10006", "429", "10000", "10016"}
                 if code in retriable_code and attempt < self.max_retries:
                     self._defer_retry(attempt, headers=response_headers)
                     continue
@@ -567,13 +581,7 @@ class BybitClient:
                     )
                     continue
                 raise
-            except (
-                URLError,
-                TimeoutError,
-                IncompleteRead,
-                RemoteDisconnected,
-                ConnectionError,
-            ) as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(attempt)
@@ -733,7 +741,9 @@ def _download_symbol_1m(
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
+    missing_head = False
     effective_start_ms = start_ms
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
     if record.launch_time:
         effective_start_ms = max(
             effective_start_ms,
@@ -772,7 +782,7 @@ def _download_symbol_1m(
             existing_info = None
 
         if existing_info is not None and existing_info.rows > 0:
-            effective_start_ms, _ = resolve_incremental_reconcile_start_ms(
+            effective_start_ms, missing_head = resolve_incremental_reconcile_start_ms(
                 expected_first_ms=effective_start_ms,
                 earliest_existing_ms=existing_info.earliest_ms,
                 latest_existing_ms=existing_info.latest_ms,
@@ -792,11 +802,42 @@ def _download_symbol_1m(
     elif tail_only:
         effective_start_ms = max(
             effective_start_ms,
-            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+            closed_end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
-    all_rows: list[list[str]] = []
-    for window_start, window_end in _iter_windows(effective_start_ms, end_ms):
+    request_windows: list[tuple[int, int]] | None = None
+    existing_frame: pl.DataFrame | None = None
+    preserve_existing = False
+    if (
+        missing_head and not tail_only and existing_info is not None
+        and existing_info.earliest_ms is not None
+        and existing_info.latest_ms is not None
+    ):
+        # Reconcile missing history and the revision tail, not the already
+        # validated continuous middle. Empty head responses remain retryable
+        # next run; launch time is not proof of the first available candle.
+        head_end = min(existing_info.earliest_ms, closed_end_ms)
+        tail_start = max(effective_start_ms, existing_info.latest_ms - CANDLE_INTERVAL_MS)
+        if head_end < tail_start:
+            # Footer count/bounds alone can hide a duplicate plus a gap. The
+            # merge needs this logical frame anyway; read it once and require
+            # exact minute continuity before omitting any middle requests.
+            existing_frame = read_logical_parquet(output_path)
+            if _can_skip_existing_middle(existing_frame, existing_info):
+                request_windows = [
+                    *_iter_windows(effective_start_ms, head_end),
+                    *_iter_windows(tail_start, closed_end_ms),
+                ]
+                preserve_existing = True
+            else:
+                existing_info = None
+                existing_frame = None
+    if request_windows is None:
+        request_windows = _iter_windows(effective_start_ms, closed_end_ms)
+
+    candles = CandleFrameBuffer(_normalize_candles)
+    received_rows = False
+    for window_start, window_end in request_windows:
         payload = client.get(
             KLINE_ENDPOINT,
             {
@@ -812,9 +853,14 @@ def _download_symbol_1m(
             page_progress_callback(record.code)
         chunk = payload.get("result", {}).get("list", [])
         if chunk:
-            all_rows.extend(chunk)
+            received_rows = True
+            candles.extend(
+                row
+                for row in chunk
+                if window_start <= int(row[0]) <= window_end
+            )
 
-    if not all_rows:
+    if not received_rows:
         if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
@@ -836,11 +882,7 @@ def _download_symbol_1m(
             message="No candles returned by Bybit.",
         )
 
-    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    filtered_rows = [
-        row for row in all_rows if effective_start_ms <= int(row[0]) <= closed_end_ms
-    ]
-    df = _normalize_candles(filtered_rows)
+    df = candles.finish()
     if df.is_empty():
         if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
@@ -912,7 +954,9 @@ def _download_symbol_1m(
                 output_path=str(output_path),
             )
         combined, changed = _merge_existing_with_fresh(
-            read_logical_parquet(output_path), df, effective_start_ms
+            existing_frame if existing_frame is not None else read_logical_parquet(output_path),
+            df, effective_start_ms,
+            preserve_existing=preserve_existing,
         )
         if not changed:
             if not hot_tail_path(output_path).is_file():
@@ -1121,15 +1165,31 @@ def main() -> None:
         summary_path,
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
     )
+    if args.archive_report_dir:
+        archive_run_reports(
+            args.archive_report_dir,
+            (symbols_path, report_path, summary_path),
+        )
+    source_incomplete = sum(
+        result.status in {"failed", "repair_required"} for result in results
+    )
     pipeline_progress.finish(
-        failed=any(result.status in {"failed", "repair_required"} for result in results),
+        failed=bool(source_incomplete),
         require_exact=True,
     )
 
     print(f"[bybit] symbols.csv -> {symbols_path}")
     print(f"[bybit] download_report.csv -> {report_path}")
     print(f"[bybit] download_summary.json -> {summary_path}")
-    print(f"[bybit] done: {json.dumps(summary, ensure_ascii=False)}")
+    print(f"[bybit] report: {json.dumps(summary, ensure_ascii=False)}")
+    lock_handle.close()
+    if source_incomplete or pipeline_progress.current != pipeline_progress.total:
+        raise RuntimeError(
+            "Bybit download incomplete: "
+            f"{source_incomplete} source symbols, "
+            f"progress {pipeline_progress.current}/{pipeline_progress.total}"
+        )
+    print("[bybit] complete")
 
 
 if __name__ == "__main__":

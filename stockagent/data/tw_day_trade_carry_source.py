@@ -8,16 +8,20 @@ No array produced here is a model feature or a broker fill receipt.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import Future
+from dataclasses import fields
 from datetime import date
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -45,6 +49,180 @@ from stockagent.training.day_trade_carry_bridge import (
     PackedDayTradeCarrySession,
     PreparedDayTradeCarrySource,
 )
+
+
+def _cgroup_memory_headroom(
+    available: int, *, membership: Path = Path("/proc/self/cgroup"),
+    root: Path = Path("/sys/fs/cgroup"),
+) -> int:
+    """Respect readable v2 ancestor limits; never change the service's limits."""
+    try:
+        relative = next(
+            line[3:] for line in membership.read_text(encoding="utf-8").splitlines()
+            if line.startswith("0::")
+        )
+    except (OSError, StopIteration):
+        return available
+    if not relative.startswith("/") or ".." in Path(relative).parts:
+        return available
+    group = root / relative.lstrip("/")
+    while True:
+        for name in ("memory.high", "memory.max"):
+            try:
+                raw = (group / name).read_text(encoding="ascii").strip()
+                if raw == "max":
+                    continue
+                limit = int(raw)
+                current = int((group / "memory.current").read_text(encoding="ascii"))
+                if limit < 0 or current < 0:
+                    continue
+            except (OSError, ValueError):
+                continue
+            available = min(available, max(0, limit - current))
+        if group == root:
+            return available
+        group = group.parent
+
+
+def _physical_source_cache_budget_bytes() -> int:
+    setting = os.environ.get("STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB", "auto").strip().lower()
+    if setting != "auto":
+        try:
+            gib = float(setting)
+            if not math.isfinite(gib) or gib < 0 or not math.isfinite(gib * 1024**3):
+                raise ValueError
+            return int(gib * 1024**3)
+        except ValueError as exc:
+            raise ValueError(
+                "STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB must be auto or finite nonnegative"
+            ) from exc
+    available = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                available = max(0, int(line.split()[1]) * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    available = _cgroup_memory_headroom(available)
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    reserve = min(64 * 1024**3, max(8 * 1024**3, available // 4))
+    return min(128 * 1024**3, max(0, available - reserve) // world_size)
+
+
+def _session_tensor_storages(session: Any) -> dict[tuple[str, int, int], int]:
+    """Count backing allocations, including views, once (not logical cells)."""
+    result = {}
+    for field in fields(session):
+        tensor = getattr(session, field.name)
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.device.type != "cpu":
+            raise ValueError("physical source cache only owns CPU source tensors")
+        storage = tensor.untyped_storage()
+        size = storage.nbytes()
+        if size:
+            result[(str(tensor.device), storage.data_ptr(), size)] = size
+    return result
+
+
+class _PhysicalSessionCache:
+    """One byte budget for all representations; decode outside the cache lock.
+
+    Same-key misses share one result/error, but different sessions still load
+    in parallel. Eviction drops only cache references, never active batches or
+    immutable source files. The budget covers retained tensor storage, not
+    Python overhead, source arrays, in-flight decodes or consumer-held batches.
+    """
+
+    def __init__(self, maximum_bytes: int) -> None:
+        if maximum_bytes < 0:
+            raise ValueError("physical source cache budget must be nonnegative")
+        self.maximum_bytes = int(maximum_bytes)
+        self._entries: OrderedDict[tuple[str, int], tuple[Any, dict]] = OrderedDict()
+        self._storage_refs: dict[tuple[str, int, int], int] = {}
+        self._inflight: dict[tuple[str, int], Future] = {}
+        self._lock = threading.Lock()
+        self._bytes = self._peak_bytes = 0
+        self._metrics = {
+            kind: dict(hits=0, loads=0, coalesced=0, errors=0, evictions=0,
+                       bypasses=0, load_s=0.0, wait_s=0.0)
+            for kind in ("packed", "dense", "compact")
+        }
+
+    def get_or_load(self, kind: str, row: int, loader: Callable[[], Any]) -> Any:
+        key = kind, int(row)
+        with self._lock:
+            metrics = self._metrics[kind]
+            if key in self._entries:
+                self._entries.move_to_end(key)
+                metrics["hits"] += 1
+                return self._entries[key][0]
+            future = self._inflight.get(key)
+            owner = future is None
+            if owner:
+                future = self._inflight[key] = Future()
+                metrics["loads"] += 1
+            else:
+                metrics["coalesced"] += 1
+        if not owner:
+            started = time.perf_counter()
+            try:
+                return future.result()
+            finally:
+                with self._lock:
+                    metrics["wait_s"] += time.perf_counter() - started
+        started = time.perf_counter()
+        try:
+            value = loader()
+            storages = _session_tensor_storages(value) if self.maximum_bytes else {}
+            with self._lock:
+                if not self.maximum_bytes or sum(storages.values()) > self.maximum_bytes:
+                    metrics["bypasses"] += 1
+                else:
+                    additional = lambda: sum(
+                        size for identity, size in storages.items()
+                        if identity not in self._storage_refs
+                    )
+                    while self._entries and self._bytes + additional() > self.maximum_bytes:
+                        evicted_key, (_, evicted_storages) = self._entries.popitem(last=False)
+                        self._metrics[evicted_key[0]]["evictions"] += 1
+                        for identity, size in evicted_storages.items():
+                            refs = self._storage_refs[identity] - 1
+                            if refs:
+                                self._storage_refs[identity] = refs
+                            else:
+                                del self._storage_refs[identity]
+                                self._bytes -= size
+                    self._bytes += additional()
+                    for identity in storages:
+                        self._storage_refs[identity] = self._storage_refs.get(identity, 0) + 1
+                    self._entries[key] = value, storages
+                    self._peak_bytes = max(self._peak_bytes, self._bytes)
+        except BaseException as exc:
+            with self._lock:
+                metrics["errors"] += 1
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(value)
+            return value
+        finally:
+            with self._lock:
+                metrics["load_s"] += time.perf_counter() - started
+                del self._inflight[key]
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(
+                policy="shared_byte_bounded_lru", maximum_bytes=self.maximum_bytes,
+                observed_at_unix_ns=time.time_ns(),
+                retained_tensor_bytes=self._bytes, peak_retained_tensor_bytes=self._peak_bytes,
+                entries=len(self._entries), inflight=len(self._inflight),
+                representations={kind: dict(values) for kind, values in self._metrics.items()},
+                excludes="source arrays, Python overhead, in-flight and consumer-held tensors",
+                timing_scope="load_s includes nested representation loads; do not sum as wall time",
+            )
 
 
 def compact_packed_day_trade_carry_session(
@@ -644,6 +822,7 @@ def _source_content_digest(
 
 def _exact_inventory_action_arrays(
     *, public_feature_path: Path, dates: np.ndarray, symbols: tuple[str, ...],
+    subscription_right_policy: str = "reference_value_cash",
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -663,8 +842,13 @@ def _exact_inventory_action_arrays(
     This symmetric signed claim prevents either long or short residuals from
     receiving a free mechanical ex-right price move without fabricating an
     exercise, payment date, or stock-delivery date.  It is not a model feature
-    and never relaxes incomplete or mixed terms.
+    and never relaxes incomplete or mixed terms. This legacy research policy is
+    not a realized cash receipt. ``reject_held`` instead leaves subscription
+    events unresolved (including incomplete/mixed terms); the existing physical
+    ownership gate rejects exposure without manufacturing a cash entitlement.
     """
+    if subscription_right_policy not in {"reference_value_cash", "reject_held"}:
+        raise ValueError("unsupported physical subscription right policy")
     paths = _resolve_corporate_action_reference_paths(
         public_feature_path, include_rules=True
     )
@@ -736,6 +920,11 @@ def _exact_inventory_action_arrays(
                 & (pl.col("subscription_price") > 0.0)
                 & (pl.col("reference_price") > 0.0)
             )
+            | (
+                pl.lit(subscription_right_policy == "reject_held")
+                & pl.col("handling").eq("avoid")
+                & (pl.col("subscription_ratio") > 0.0)
+            )
         )
         .sort(["date", "symbol"])
     )
@@ -744,6 +933,7 @@ def _exact_inventory_action_arrays(
     subscription_right_events = 0
     zero_value_subscription_right_events = 0
     subscription_right_flat_indices: list[int] = []
+    rejected_subscription_flat_indices: list[int] = []
     for item in actions.iter_rows(named=True):
         symbol = str(item["symbol"] or "").strip().upper()
         column = symbol_index.get(symbol)
@@ -756,6 +946,9 @@ def _exact_inventory_action_arrays(
             outside_horizon += 1
             continue
         effective_day = dates[row]
+        if item["handling"] == "avoid" and subscription_right_policy == "reject_held":
+            rejected_subscription_flat_indices.append(row * len(symbols) + column)
+            continue
         if event_mask[row, column]:
             raise ValueError(
                 "multiple exact inventory events map to one physical session: "
@@ -879,13 +1072,21 @@ def _exact_inventory_action_arrays(
         "coverage_end": str(coverage_end),
         "policy": (
             "exact_inventory_on_first_exchange_session_on_or_after_ex_date_"
-            "with_stock_locked_until_official_delivery_and_pure_subscription_"
-            "rights_settled_at_official_reference_value"
+            "with_stock_locked_until_official_delivery_and_"
+            + (
+                "subscription_rights_unresolved_without_hypothetical_cash"
+                if subscription_right_policy == "reject_held"
+                else "pure_subscription_rights_settled_at_official_reference_value"
+            )
         ),
         "subscription_right_value_policy": (
-            "subscription_ratio_times_max_official_ex_right_reference_minus_"
+            "reject_held_without_exercise_sale_or_cash_equivalent"
+            if subscription_right_policy == "reject_held"
+            else "subscription_ratio_times_max_official_ex_right_reference_minus_"
             "subscription_price_zero_as_symmetric_signed_claim"
         ),
+        "rejected_subscription_right_events": len(rejected_subscription_flat_indices),
+        "_rejected_subscription_right_flat_indices": rejected_subscription_flat_indices,
         # Private build metadata. It is removed before the public manifest is
         # written and is used only to reconstruct the exact v11 predecessor
         # fingerprint for a guarded optimizer-checkpoint resume.
@@ -1516,13 +1717,16 @@ def build_prepared_day_trade_carry_source(
     daily_proxy_price_policy: str, corporate_action_mode: str,
     terminal_liquidation_unlimited_capacity: bool = False,
     entry_remainder_policy: str = "first_minute_only",
+    subscription_right_policy: str = "reference_value_cash",
     sparse_event_slots: int | None = None,
 ) -> PreparedDayTradeCarrySource:
+    if subscription_right_policy not in {"reference_value_cash", "reject_held"}:
+        raise ValueError("unsupported physical subscription right policy")
     sweep_entries = entry_remainder_policy == "frozen_target_until_1320"
     if entry_remainder_policy not in {"first_minute_only", "frozen_target_until_1320"}:
         raise ValueError("unsupported physical entry remainder policy")
-    if sweep_entries and (terminal_liquidation_unlimited_capacity or sparse_event_slots is not None):
-        raise ValueError("entry sweeps require dense capacity-limited physical carry")
+    if sweep_entries and sparse_event_slots is not None:
+        raise ValueError("entry sweeps require dense physical carry")
     if corporate_action_mode != "avoid":
         raise ValueError(
             "physical carry source supports the requested avoid action policy only"
@@ -1533,6 +1737,13 @@ def build_prepared_day_trade_carry_source(
     public_path = _public_root(public_feature_path)
     dates = np.asarray(panel.dates, dtype="datetime64[D]").reshape(-1)
     symbols = tuple(str(symbol) for symbol in panel.symbols)
+    unsupported = [symbol for symbol in symbols if classify_tw_stock_or_etf(symbol) is None]
+    if unsupported:
+        raise ValueError(
+            "physical day-trade universe allows stocks/ETFs only; "
+            "warrants, subscription certificates and other products are forbidden: "
+            + ", ".join(unsupported[:8])
+        )
     raw_opens = np.asarray(panel.open_prices)
     raw_closes = np.asarray(panel.close_prices)
     opens = np.asarray(raw_opens, dtype=np.float64).copy()
@@ -1567,10 +1778,15 @@ def build_prepared_day_trade_carry_source(
             public_feature_path=Path(public_feature_path).resolve(),
             dates=dates,
             symbols=symbols,
+            subscription_right_policy=subscription_right_policy,
         )
     )
     subscription_right_flat = np.asarray(
         exact_action_counts.pop("_subscription_right_flat_indices", ()),
+        dtype=np.int64,
+    )
+    rejected_subscription_flat = np.asarray(
+        exact_action_counts.pop("_rejected_subscription_right_flat_indices", ()),
         dtype=np.int64,
     )
     no_regular_execution, no_execution_counts = (
@@ -1673,6 +1889,11 @@ def build_prepared_day_trade_carry_source(
         resume_compatible_release_ids.append(
             f"tw-day-trade-carry:{predecessor_digest}"
         )
+    if subscription_right_policy != "reference_value_cash":
+        digest = hashlib.sha256(
+            (digest + ":subscription_reject_held_v1").encode()
+        ).hexdigest()
+        resume_compatible_release_ids = []
     if sweep_entries:
         digest = hashlib.sha256((digest + ":frozen_target_until_1320_v1").encode()).hexdigest()
         resume_compatible_release_ids = []
@@ -1798,6 +2019,9 @@ def build_prepared_day_trade_carry_source(
             )
             gaps = np.zeros(shape, dtype=np.bool_)
             unresolved_gaps = unresolved_replacement_block.copy()
+            # This is a source/ownership failure, never an entitlement or a
+            # fabricated flatten. Do not erase prior holdings or mask history.
+            unresolved_gaps.reshape(-1)[rejected_subscription_flat] = True
             valuation_known = np.zeros(shape, dtype=np.bool_)
             # If an unresolved/terminal interval ends without liquidation, the
             # next session is an exact account-source failure for that held
@@ -2087,7 +2311,9 @@ def build_prepared_day_trade_carry_source(
                     "residual_cash_entitlement": "receipt_verified_exact_amount_and_payment_date",
                     "residual_stock_entitlement": "economic_on_ex_date_and_nonexecutable_until_official_delivery",
                     "residual_subscription_right": (
-                        "source_complete_pure_right_settled_on_ex_date_at_"
+                        "reject_held_without_exercise_sale_or_cash_equivalent"
+                        if subscription_right_policy == "reject_held"
+                        else "source_complete_pure_right_settled_on_ex_date_at_"
                         "official_reference_value_symmetrically_for_long_and_short"
                     ),
                     "unresolved_residual": "fail_closed_per_symbol_on_first_post_event_session",
@@ -2239,58 +2465,12 @@ def build_prepared_day_trade_carry_source(
             flush=True,
         )
 
-    # Re-decoding the same immutable NPZ on every one of 1000 epochs is not a
-    # semantic operation. Enable an all-or-nothing per-rank RAM cache only when
-    # the complete release fits a conservative, topology-aware budget. Partial
-    # chronological LRU caching would thrash from opposite ends each epoch.
-    vector_fields = 15
-    estimated_session_bytes = int(
-        len(symbols) * (vector_fields + (9 if sweep_entries else 5) * 270) * np.dtype(np.float64).itemsize
-    )
-    estimated_cache_bytes = estimated_session_bytes * len(dates)
-    cache_setting = os.environ.get(
-        "STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB", "auto"
-    ).strip().lower()
-    if cache_setting == "auto":
-        available_bytes = 0
-        try:
-            with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.startswith("MemAvailable:"):
-                        available_bytes = int(line.split()[1]) * 1024
-                        break
-        except OSError:
-            available_bytes = 0
-        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
-        reserve_bytes = min(
-            64 * 1024**3,
-            max(8 * 1024**3, available_bytes // 4),
-        )
-        cache_budget_bytes = min(
-            128 * 1024**3,
-            max(0, available_bytes - reserve_bytes) // world_size,
-        )
-    else:
-        try:
-            cache_budget_bytes = int(float(cache_setting) * 1024**3)
-        except ValueError as exc:
-            raise ValueError(
-                "STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB must be auto or nonnegative"
-            ) from exc
-        if cache_budget_bytes < 0:
-            raise ValueError(
-                "STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB must be auto or nonnegative"
-            )
-    cache_enabled = estimated_cache_bytes <= cache_budget_bytes
-    session_cache: dict[int, DayTradeCarrySession] = {}
-    compact_session_cache: dict[int, DayTradeCarrySession] = {}
-    packed_session_cache: dict[int, PackedDayTradeCarrySession] = {}
-    session_cache_lock = threading.Lock()
+    # One budget covers all consumers. A release that fits can remain hot over
+    # epochs; a larger release no longer bypasses the budget via sparse loaders.
+    session_cache = _PhysicalSessionCache(_physical_source_cache_budget_bytes())
     print(
-        "[physical source] dense RAM cache "
-        f"enabled={str(cache_enabled).lower()} "
-        f"estimated={estimated_cache_bytes / 1024**3:.1f}GiB "
-        f"budget={cache_budget_bytes / 1024**3:.1f}GiB",
+        "[physical source] shared byte-bounded RAM cache "
+        f"budget={session_cache.maximum_bytes / 1024**3:.1f}GiB",
         flush=True,
     )
 
@@ -2486,53 +2666,28 @@ def build_prepared_day_trade_carry_source(
             stop_hits=packed.stop_hits,
         )
 
-    def _load_session_uncached(row: int) -> DayTradeCarrySession:
-        return _densify_packed_session(_load_packed_session_uncached(row))
-
     def load_session(row: int) -> DayTradeCarrySession:
-        if cache_enabled:
-            with session_cache_lock:
-                cached = session_cache.get(int(row))
-            if cached is not None:
-                return cached
-        session = _load_session_uncached(int(row))
-        if cache_enabled:
-            with session_cache_lock:
-                # A concurrent evaluator may have won the same immutable row.
-                session = session_cache.setdefault(int(row), session)
-        return session
+        return session_cache.get_or_load(
+            "dense", row, lambda: _densify_packed_session(load_packed_session(row)),
+        )
 
     def load_packed_session(row: int) -> PackedDayTradeCarrySession:
-        index = int(row)
-        with session_cache_lock:
-            cached = packed_session_cache.get(index)
-        if cached is not None:
-            return cached
-        packed = _load_packed_session_uncached(index)
-        with session_cache_lock:
-            packed = packed_session_cache.setdefault(index, packed)
-        return packed
+        return session_cache.get_or_load(
+            "packed", row, lambda: _load_packed_session_uncached(int(row)),
+        )
 
     def load_compact_session(row: int) -> DayTradeCarrySession:
-        index = int(row)
-        with session_cache_lock:
-            cached = compact_session_cache.get(index)
-        if cached is not None:
-            return cached
-        # Preserve the immutable packed source instead of constructing a
-        # [symbol,270,2] NaN/zero tape merely to remove it immediately.
-        compact = compact_packed_day_trade_carry_session(
-            _load_packed_session_uncached(index)
+        return session_cache.get_or_load(
+            "compact", row,
+            lambda: compact_packed_day_trade_carry_session(load_packed_session(row)),
         )
-        with session_cache_lock:
-            compact = compact_session_cache.setdefault(index, compact)
-        return compact
 
     return PreparedDayTradeCarrySource(
         (), symbols, str(manifest["release_id"]),
         session_days=tuple(_ordinal(day) for day in dates), session_loader=load_session,
         compact_session_loader=load_compact_session,
         packed_session_loader=load_packed_session,
+        runtime_cache_info=session_cache.snapshot,
         audit_receipt={
             "abi": manifest["abi"],
             "cache_manifest": str(manifest_path),

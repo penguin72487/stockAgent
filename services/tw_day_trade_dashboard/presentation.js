@@ -9,6 +9,24 @@
     return mode?.label || (typeof value === "object" && value?.label) || "策略名稱未提供";
   }
 
+  function modeOperationallyReady(mode, issues = []) {
+    const engine = String(mode.engine_status || "");
+    return mode.checkpoint_ready === true
+      && mode.total_equity_twd != null && Number.isFinite(Number(mode.total_equity_twd))
+      && Boolean(engine) && !/^(critical|blocked)/.test(engine)
+      && !["historical_session_missed", "historical_signal_blocked", "historical_session_closed_with_residual"].includes(engine)
+      && !["missed", "blocked"].includes(mode.today_execution_status)
+      && !["no_fill", "partial", "blocked"].includes(mode.today_execution_outcome)
+      && !issues.some((issue) => issue.market === mode.market && ["error", "warning"].includes(issue.severity));
+  }
+
+  function accountAdjustments(mode) {
+    const account = mode.account_performance || {};
+    const carryCost = Number(account.cumulative_carry_cost_twd ?? 0);
+    const corporateNet = Number(account.cumulative_corporate_action_net_twd ?? 0);
+    return {carryCost, corporateNet, net: corporateNet - carryCost};
+  }
+
   function futuresPresentation(membership = {}) {
     const states = {
       listed: {label: "有期貨", kind: "good"},
@@ -46,6 +64,10 @@
     market_at_best_quote_else_adverse_open_tick: {
       current: (m, n) => `紙上市價買進／回補取最佳 Ask、賣出／放空取最佳 Bid，完整模擬委託；缺報價才用開盤價不利 ${n(m.configured_entry_price_offset_ticks || 1)} Tick`,
       recorded: (m, n) => `紙上市價完整成交 ${n(m.entry_paper_market_fill_count || m.entry_fill_count || 0)} 筆；不宣稱交易所深度或排隊成交`,
+    },
+    causal_market_full_target_at_best_quote: {
+      current: () => "09:00 訊號發布後，以永豐第一筆較晚正式最佳 Ask／Bid 作為紙上價格，完整建立模型目標量；不宣稱券商成交、交易所深度或排隊位置",
+      recorded: (m, n) => `因果最佳 Bid／Ask 紙上完整目標 ${n(m.entry_paper_market_fill_count || m.entry_fill_count || 0)} 筆；非券商成交證明`,
     },
     causal_best_quote_else_adverse_open_tick: {
       current: (m, n) => `因果最佳 Bid／Ask；缺報價才用開盤價不利 ${n(m.configured_entry_price_offset_ticks || 1)} Tick`,
@@ -85,14 +107,17 @@ const SIGNAL_REASON_LABELS = {
   quote_after_local_observation: "報價時間超前本機觀測",
   marketable_depth_unavailable: "可成交深度不足",
   marketable_depth_exhausted: "可成交深度僅部分足夠",
+  paper_full_target_at_causal_best_quote_no_exchange_fill_claim: "永豐因果報價完成紙上目標量（非券商成交）",
+  paper_entry_completed_after_initial_execution: "初始成交證據保留；紙上目標量已補齊（非券商成交）",
   decision_sizing_price_missing: "決策時計價不可用",
   signal_before_13_20_decision_gate: "訊號早於 13:20 決策閘門",
   outside_13_20_close_order_window: "未在 13:20 至 13:30 間完成模擬委託",
+  waiting_valid_terminal_close_source: "等待有效收盤價後依不限容量假設平倉",
   counterfactual_official_open_price_fill_at_09_01: "09:01 開盤價重建",
   counterfactual_observed_09_01_minute_vwap_fill: "09:01 首分鐘價重建",
   counterfactual_observed_09_01_minute_price_fill: "09:01 首分鐘價重建",
 };
 const signalReasonLabel = (value) => SIGNAL_REASON_LABELS[String(value || "")] || String(value || "").replaceAll("_", " ") || "未提供原因";
 
-  global.StockAgentTwPresentation = Object.freeze({strategyLabel, futuresPresentation, entryPolicy, signalReasonLabel});
+  global.StockAgentTwPresentation = Object.freeze({strategyLabel, modeOperationallyReady, accountAdjustments, futuresPresentation, entryPolicy, signalReasonLabel});
 })(globalThis);

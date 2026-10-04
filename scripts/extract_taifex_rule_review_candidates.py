@@ -16,6 +16,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -75,6 +76,7 @@ def rapidocr_review_profile(config_path, dpi, force_ocr):
     config, runtime = rapidocr_runtime(config_path)
     digest = sha256_file(config_path)
     if 'execution' in config:
+        runtime = dict(runtime, extractor_sha256=sha256_file(Path(__file__)))
         digest = hashlib.sha256(json.dumps(runtime, sort_keys=True).encode()).hexdigest()
     return f'pdf_review_rapidocr_{digest}_{dpi}dpi_force{int(force_ocr)}_v1'
 
@@ -106,6 +108,18 @@ def review_documents(conn, categories, pending_only=False):
         (priority[a['category']], a['published_date'], a['url']) for a in pair[1]['announcements'])))
 
 
+def is_blank_render(pixmap, native_text: str) -> bool:
+    """An empty OCR result is valid only for an exactly white source render.
+
+    No ink threshold: a single faint nonwhite pixel keeps the page unresolved.
+    Native text also prevents treating invisible/clipped source text as blank.
+    """
+    if native_text.strip():
+        return False
+    import numpy as np
+    return bool(np.all(np.frombuffer(pixmap.samples_mv, dtype=np.uint8) == 255))
+
+
 def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3,
             languages='chi_tra+eng', tessdata_dir=None, force_ocr=False, rapidocr_config=None,
             rapidocr_profile_dir=None) -> dict:
@@ -116,7 +130,8 @@ def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3
     runtime=rapidocr_runtime(rapidocr_config)[1] if rapidocr_config else runtime_profile(tessdata_dir,languages)
     bounded = rapidocr_config and 'execution' in rapidocr_runtime(rapidocr_config)[0]
     if bounded:
-        runtime = rapidocr_engine(rapidocr_config, rapidocr_profile_dir).runtime
+        runtime = dict(rapidocr_engine(rapidocr_config, rapidocr_profile_dir).runtime,
+                       extractor_sha256=sha256_file(Path(__file__)))
     body = read_verified_raw(root, source)
     if not body.startswith(b'%PDF-'):
         return dict(url=source['url'], status='not_pdf')
@@ -152,11 +167,30 @@ def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3
                 if page.rect.get_area() * (dpi/72)**2 > 25_000_000:
                     raise ValueError('OCR page pixel bound exceeded')
                 png = dest / f'page_{index+1:03d}.png'
-                page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False).save(png)
+                render_started = time.perf_counter()
+                pixmap = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
+                render_s = time.perf_counter() - render_started
+                save_started = time.perf_counter()
+                pixmap.save(png)
+                save_s = time.perf_counter() - save_started
+                if is_blank_render(pixmap, text):
+                    record.update(extraction='verified_blank_render', blank_check='all_pixels_255_no_native_text')
+                    chunks.append(f'\n[PAGE {index+1}]\n')
+                    pages.append(record)
+                    continue
                 output = dest / f'page_{index+1:03d}_ocr'
                 if rapidocr_config:
                     engine=rapidocr_engine(rapidocr_config, rapidocr_profile_dir)
-                    result=engine(str(png))
+                    if bounded and engine.optimizations.direct_pixels:
+                        import numpy as np
+                        # Keep the exact evidence PNG, but avoid rereading and
+                        # decompressing it for inference. Retain pixmap until
+                        # the engine finishes consuming its zero-copy view.
+                        pixels = np.frombuffer(pixmap.samples_mv, dtype=np.uint8).reshape(
+                            pixmap.height, pixmap.stride)[:, :pixmap.width]
+                        result=engine(pixels)
+                    else:
+                        result=engine(str(png))
                     if not result.txts:
                         raise ValueError(f'RapidOCR returned no text on page {index+1}')
                     text='\n'.join(result.txts)
@@ -166,6 +200,8 @@ def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3
                     record['extraction']='ocr_candidate'
                     if bounded:
                         record['ocr_execution']=dict(engine.last_call)
+                        record['ocr_execution']['render_s']=render_s
+                        record['ocr_execution']['png_write_s']=save_s
                 else:
                     model_args=['--tessdata-dir',str(tessdata_dir)] if tessdata_dir is not None else []
                     proc = subprocess.run(['tesseract',str(png),str(output),*model_args,'-l',languages,
@@ -296,6 +332,14 @@ def extract_ocr_tables(root: Path, out: Path, item: dict, max_pages: int, *, rev
     for page in proof['pages']:
         index=page['page']
         native=json.loads((folder/f'page_{index:03d}_native.json').read_text())['text']
+        if page.get('extraction') == 'verified_blank_render':
+            import numpy as np
+            pixels=cv2.imread(str(folder/f'page_{index:03d}.png'),cv2.IMREAD_GRAYSCALE)
+            if pixels is None or native.strip() or not bool(np.all(pixels == 255)):
+                raise ValueError('blank source page evidence differs from its receipt')
+            pages.append(dict(page=index,native_text='',ocr_text='',tables=[],
+                extraction_method='verified_blank_render'))
+            continue
         if page.get('ocr_backend')!='rapidocr':
             raise ValueError('OCR grid expects retained RapidOCR polygons')
         tokens=json.loads((folder/f'page_{index:03d}_ocr.json').read_text())
@@ -451,7 +495,11 @@ def main():
         try:
             for key,item in items.items():
                 record_result(key,lambda item=item:extractor(args.archive,args.output_dir,item,args.max_pages,**options))
-                if failed:
+                # A source page with no recognized text is a document-level
+                # failure, not poisoned CUDA state. Keep it failed and continue
+                # independent documents. Runtime/device/hash failures still stop.
+                if failed and any(not re.fullmatch(
+                        r'ValueError: RapidOCR returned no text on page \d+', f['error']) for f in failed):
                     break
             execution=engine.finish_profiling()
             atomic_write_json(args.output_dir/'ocr_execution.json',execution)

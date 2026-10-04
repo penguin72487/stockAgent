@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "folder_id": "stockagent-artifact-ingress-vastai1t",
+  "origin": "vastai1T",
+  "receiver": "penguin",
+  "transport_root": "/srv/stockagent-artifact-ingress-vastai1t",
+  "state_root": "/var/lib/stockagent-artifact-ingress",
+  "maximum_logical_bytes": 3000000000,
+  "maximum_entries": 1000,
+  "checkpoint": "fold_10/checkpoint_best.pt",
+  "checkpoint_sha256": "25d52616598046c7983adaf1285adc0f4efc6662c2c2e6e037e22536f213e5a2",
+  "artifact": {
+    "dataset": "artifact-tw-day-trade-v8-combined-annual-log-cash-v5",
+    "relative_root": "markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5",
+    "maximum_file_bytes": null,
+    "loose_file_threshold_bytes": 8388608,
+    "pack_buckets": 32,
+    "min_stable_hours": 0,
+    "completion_contract": "training-lifecycle-v1"
+  }
+}

@@ -3995,6 +3995,17 @@ class TransformerBasePortfolioModel(nn.Module):
                 weights, output_aux = cash_output
             else:
                 weights = cash_output
+        elif resolved_mode == "score_entmax_log_cash":
+            cash_output = masked_score_entmax_log_cash_weights(
+                target_logits,
+                mask_bool,
+                short_mask=torch.zeros_like(mask_bool) if long_only else mask_bool,
+                return_parts=return_parts,
+            )
+            if return_parts:
+                weights, output_aux = cash_output
+            else:
+                weights = cash_output
         elif resolved_mode == "projection_l1":
             weights = masked_l1_projection_weights(
                 target_logits,
@@ -4545,6 +4556,17 @@ class TransformerBasePortfolioModel(nn.Module):
                     weights, output_aux = cash_output
                 else:
                     weights = cash_output
+            elif self.portfolio_output_mode == "score_entmax_log_cash":
+                cash_output = masked_score_entmax_log_cash_weights(
+                    target_logits,
+                    mask_bool,
+                    short_mask=torch.zeros_like(mask_bool),
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = cash_output
+                else:
+                    weights = cash_output
             elif self.portfolio_output_mode == "projection_l1":
                 weights = masked_l1_projection_weights(
                     target_logits,
@@ -4669,6 +4691,17 @@ class TransformerBasePortfolioModel(nn.Module):
                     ),
                 }[self.portfolio_output_mode]
                 cash_output = allocator(
+                    target_logits,
+                    mask_bool,
+                    short_mask=mask_bool,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = cash_output
+                else:
+                    weights = cash_output
+            elif self.portfolio_output_mode == "score_entmax_log_cash":
+                cash_output = masked_score_entmax_log_cash_weights(
                     target_logits,
                     mask_bool,
                     short_mask=mask_bool,

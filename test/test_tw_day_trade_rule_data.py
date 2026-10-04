@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
+import argparse
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import polars as pl
@@ -58,6 +63,117 @@ def test_same_session_calendar_end_skips_only_weekends() -> None:
     assert downloader._calendar_end_before_same_session(
         date(2026, 8, 18)
     ) == date(2026, 8, 17)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "strict"), [
+        ("twse_day_trade_eligibility", False),
+        ("tpex_day_trade_eligibility", False),
+        ("twse_day_trade_eligibility", True),
+        ("tpex_day_trade_eligibility", True),
+    ]
+)
+def test_same_session_plan_uses_verified_holiday_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dataset: str, strict: bool,
+) -> None:
+    pl.DataFrame({
+        "Name": ["中秋節", "孔子誕辰紀念日/ 教師節"],
+        "Date": ["1150925", "1150928"],
+        "_dataset": ["twse_api_holidayschedule_holidayschedule"] * 2,
+        "_source": ["TWSE OpenAPI"] * 2,
+        "_as_of_date": ["2026-09-16"] * 2,
+    }).write_parquet(
+        tmp_path / "twse_api_holidayschedule_holidayschedule.parquet"
+    )
+    spec = downloader.DEFAULT_DATASETS[dataset]
+    (tmp_path / f"{dataset}.parquet").touch()
+    monkeypatch.setattr(
+        downloader, "_existing_date_counts",
+        lambda _path: ({date(2026, 9, 24): 1}, []),
+    )
+    monkeypatch.setattr(
+        downloader, "_load_coverage_state",
+        lambda _path, _spec: {
+            "baseline_established": True,
+            "checked_through": "2026-09-24",
+            "failed_dates": {
+                "2026-09-25": "old weekday-only failure",
+                "2026-09-28": "old weekday-only failure",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        downloader, "_suspicious_ohlcv_dates", lambda *_args: (set(), [])
+    )
+    monkeypatch.setattr(
+        downloader, "_validated_tpex_session_dates",
+        lambda *_args, **_kwargs: {date(2026, 9, 24)},
+    )
+    monkeypatch.setattr(
+        downloader, "_validated_taiex_session_dates",
+        lambda *_args, **_kwargs: ({date(2026, 9, 24)}, "fixture-receipt"),
+    )
+    args = argparse.Namespace(
+        mode="daily", start_date="2026-09-24", end_date="2026-09-29",
+        same_session_rule_date="2026-09-29", require_taiex_session_calendar=strict,
+        include_weekends=False, refresh=False, daily_overlap_days=1,
+    )
+
+    plan = downloader._plan_historical_download(spec, args, tmp_path)
+
+    assert downloader._calendar_end_before_same_session(
+        date(2026, 9, 29), schedule_root=tmp_path
+    ) == date(2026, 9, 24)
+    assert plan.all_weekdays == {date(2026, 9, 24), date(2026, 9, 29)}
+    assert plan.dates == [date(2026, 9, 29)]
+    assert plan.state["same_session_official_closed_bridge"] == [
+        "2026-09-25", "2026-09-28"
+    ]
+    assert plan.state["same_session_rule_date"] == "2026-09-29"
+
+    direct_code = (
+        "import sys; from datetime import date; from pathlib import Path; "
+        f"sys.path.insert(0, {str(Path(downloader.__file__).resolve().parent)!r}); "
+        "import download_tw_public_data as d; "
+        "print(d._calendar_end_before_same_session("
+        f"date(2026, 9, 29), schedule_root=Path({str(tmp_path)!r})))"
+    )
+    direct = subprocess.run(
+        [sys.executable, "-c", direct_code],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert direct.stdout.strip() == "2026-09-24"
+
+
+def test_same_session_bridge_fails_closed_without_official_schedule(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="cannot prove"):
+        downloader._calendar_end_before_same_session(
+            date(2026, 9, 29), schedule_root=tmp_path
+        )
+
+
+def test_same_session_bridge_rejects_conflicting_official_calendar(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame({
+        "Name": ["教師節", "開始交易"],
+        "Date": ["1150928", "1150928"],
+        "_dataset": ["twse_api_holidayschedule_holidayschedule"] * 2,
+        "_source": ["TWSE OpenAPI"] * 2,
+        "_as_of_date": ["2026-09-16"] * 2,
+    }).write_parquet(
+        tmp_path / "twse_api_holidayschedule_holidayschedule.parquet"
+    )
+    with pytest.raises(RuntimeError, match="cannot prove"):
+        downloader._calendar_end_before_same_session(
+            date(2026, 9, 29), schedule_root=tmp_path
+        )
 
 
 def test_twse_day_trade_openapi_binds_roc_date_and_schema() -> None:

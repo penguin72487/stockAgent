@@ -22,7 +22,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
 
-PARSER_VERSION = 6
+PARSER_VERSION = 7
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_PDF_PAGES = 80
 MAX_TEXT_CHARACTERS = 2_000_000
@@ -120,7 +120,8 @@ def temporal_mentions(text: str) -> list[dict[str, str]]:
               and operative_after.startswith("公告")):
             role = "publication"
         elif (before.endswith("自")
-              and re.search(r"(?:起實施|起生效|起適用|起施行|開始實施|起調高|起調整)", operative_after[:100])
+              and (re.search(r"(?:起實施|起生效|起適用|起施行|開始實施|起調高|起調整)", operative_after[:100])
+                   or re.match(r"(?:一般)?交易時段(?:結束|收盤)後起", operative_after))
               and not re.match(r"[^，,。]{0,35}(?:號函|號令)", after)):
             # 「依規定調高……，自 DATE 起實施」 is an operative clause.
             # A preceding 依 must not turn its explicit effective date into a
@@ -131,7 +132,7 @@ def temporal_mentions(text: str) -> list[dict[str, str]]:
         elif (re.search(r"(?:恢復|恢复|終止|停止適用|截止|屆滿|廢止)", after_clause[:90])
               or re.match(r"(?:一般)?交易時段(?:結束|收盤)後[,，](?:恢復|恢复)為", after)):
             role = "effective_end"
-        elif before.endswith("至") and re.match(r"(?:止|屆滿)", after_clause):
+        elif before.endswith("至") and re.match(r"(?:止|屆滿|(?:一般)?交易時段(?:結束|收盤)(?:後)?止)", after_clause):
             role = "effective_end"
         elif re.search(r"(?:起實施|起生效|起適用|起施行|生效|開始實施)", operative_after[:100]):
             role = "effective_start"
@@ -143,9 +144,9 @@ def temporal_mentions(text: str) -> list[dict[str, str]]:
             role = "effective_end"
         boundary = "date_only"
         if role in {"effective_start", "effective_end"}:
-            if re.search(r"一般交易時段(?:結束|收盤)後", after_clause):
+            if re.search(r"一般交易時段(?:結束|收盤)(?:後|止)", after_clause):
                 boundary = "after_regular_session"
-            elif re.search(r"交易時段(?:結束|收盤)後", after_clause):
+            elif re.search(r"交易時段(?:結束|收盤)(?:後|止)", after_clause):
                 boundary = "after_trading_session"
             elif re.search(r"(?:一般交易時段|日盤)(?:開盤|開始)", after_clause):
                 boundary = "regular_session_open"

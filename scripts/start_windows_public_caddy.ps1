@@ -25,6 +25,8 @@ $gatewayHealthUri = "http://127.0.0.1:8770/healthz"
 $escapedConfig = [Regex]::Escape($config)
 $wslBootstrapProcess = $null
 $lastWslAttempt = [DateTime]::MinValue
+$lastWslVerb = ""
+$lastWslReason = ""
 $lastGatewayRestartAttempt = [DateTime]::MinValue
 $lastBackendHealthy = $null
 $consecutiveBackendFailures = 0
@@ -43,6 +45,12 @@ if (-not (Test-Path -LiteralPath $WslPath -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
     throw "Caddy config does not exist: $config"
+}
+if ($DistroName -and $DistroName -notmatch '^[A-Za-z0-9._-]+$') {
+    # wsl.exe invoked through ProcessStartInfo.Arguments on this host treats
+    # quoted distro names literally and returns WSL_E_DISTRO_NOT_FOUND.
+    # Do not silently fall back to another/default distribution.
+    throw "WSL distribution name cannot be passed safely: $DistroName"
 }
 
 function Get-CaddyProcesses {
@@ -97,6 +105,44 @@ function Test-GatewayListener {
     }
 }
 
+function Record-WslGatewayCompletion {
+    if (-not $wslBootstrapProcess) {
+        return
+    }
+    try {
+        if (-not $wslBootstrapProcess.HasExited) {
+            return
+        }
+    } catch {
+        Write-StartupLog (
+            "WSL gateway completion unavailable " +
+            "error=$($_.Exception.GetType().Name)"
+        )
+        return
+    }
+    try {
+        $exitAt = $wslBootstrapProcess.ExitTime
+        $elapsed = [math]::Round(
+            ($exitAt - $wslBootstrapProcess.StartTime).TotalSeconds, 3
+        )
+        $observedLag = [math]::Round(((Get-Date) - $exitAt).TotalSeconds, 3)
+        Write-StartupLog (
+            "WSL gateway dispatch completed pid=$($wslBootstrapProcess.Id) " +
+            "verb=$lastWslVerb reason=$lastWslReason " +
+            "exit_code=$($wslBootstrapProcess.ExitCode) " +
+            "elapsed_seconds=$elapsed observed_lag_seconds=$observedLag"
+        )
+    } catch {
+        Write-StartupLog (
+            "WSL gateway completion unavailable " +
+            "error=$($_.Exception.GetType().Name)"
+        )
+    } finally {
+        $wslBootstrapProcess.Dispose()
+        $script:wslBootstrapProcess = $null
+    }
+}
+
 function Request-WslGateway(
     [string]$Reason,
     [bool]$RestartService = $false
@@ -110,7 +156,7 @@ function Request-WslGateway(
     }
     $verb = if ($RestartService) { "restart" } else { "start" }
     $arguments = if ($DistroName) {
-        "--distribution `"$DistroName`" --exec /bin/sh -lc `"systemctl $verb --no-block stockagent-public-dashboards.service`""
+        "--distribution $DistroName --exec /bin/sh -lc `"systemctl $verb --no-block stockagent-public-dashboards.service`""
     } else {
         "--exec /bin/sh -lc `"systemctl $verb --no-block stockagent-public-dashboards.service`""
     }
@@ -122,6 +168,8 @@ function Request-WslGateway(
         $startInfo.CreateNoWindow = $true
         $script:wslBootstrapProcess = [System.Diagnostics.Process]::Start($startInfo)
         $script:lastWslAttempt = $now
+        $script:lastWslVerb = $verb
+        $script:lastWslReason = $Reason
         Write-StartupLog "WSL gateway $verb dispatched pid=$($wslBootstrapProcess.Id) distro=$DistroName reason=$Reason"
         return $true
     } catch {
@@ -134,6 +182,7 @@ function Request-WslGateway(
 Set-Location $InstallRoot
 $null = Request-WslGateway "supervisor_start"
 while ($true) {
+    Record-WslGatewayCompletion
     try {
         Start-CaddyIfNeeded
     } catch {

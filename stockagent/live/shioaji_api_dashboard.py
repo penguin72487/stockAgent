@@ -8,6 +8,8 @@ viewing the dashboard consumes neither an API connection nor market-data quota.
 from __future__ import annotations
 
 import csv
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
@@ -20,6 +22,7 @@ import time
 from typing import Any, Callable, Final, Iterable, Sequence
 
 from stockagent.data.taifex_sessions import taifex_session_kind
+from stockagent.live.tw_day_trade_monitor_projection import validated_shioaji_monitor_projection
 
 
 HISTORY_UNIT: Final[str] = "stockagent-shioaji-tx-history-backfill.service"
@@ -43,7 +46,8 @@ _CALENDAR_LAG_PATTERN = re.compile(
 )
 _CAPTURE_START_PATTERN = re.compile(
     r"capture_start=([^ ]+)\s+capture_id=[^ ]+\s+session=([^ ]+)\s+"
-    r"trade_date=([^ ]+)\s+stop_at=(.+)$"
+    r"trade_date=([^ ]+)\s+stop_at=([^ ]+)"
+    r"(?:\s+strategy_bootstrap_ready=(true|false))?$"
 )
 _WORKER_PATTERN = re.compile(
     r"worker=(\d+)/(\d+)\s+contracts=(\d+)\s+subscriptions=(\d+)"
@@ -55,9 +59,19 @@ _HISTORY_PROGRESS_PATTERN = re.compile(
 HISTORY_RATE_SAMPLE_LIMIT: Final[int] = 120
 QUOTA_WINDOW_SCENARIO_SECONDS: Final[int] = 24 * 60 * 60
 JOURNAL_CACHE_SECONDS: Final[float] = 30.0
+MAX_JSON_FILE_CACHE_ENTRIES: Final[int] = 8_192
+_CAPTURE_RECEIPT_FIELDS: Final[tuple[str, ...]] = (
+    "capture_id", "worker_index", "trade_date", "capture_session", "status",
+    "contract_count", "symbol_count", "subscriptions_requested",
+    "tick_rows_written", "book_rows_written", "book_1s_rows_written",
+    "dropped_events", "missed_snapshot_seconds", "started_at_utc",
+    "finished_at_utc",
+)
 
 _FILE_CACHE_LOCK = threading.Lock()
-_JSON_FILE_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any] | None]] = {}
+_JSON_FILE_CACHE: OrderedDict[
+    Path, tuple[int, int, int, int, int, dict[str, Any] | None]
+] = OrderedDict()
 _JOURNAL_CACHE_LOCK = threading.Lock()
 _JOURNAL_CACHE: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
 
@@ -88,12 +102,15 @@ class ShioajiMonitorPaths:
     hft_audit_root: Path | None = None
     contract_inventory_manifest: Path | None = None
     snapshot_state: Path | None = None
+    snapshot_status: Path | None = None
     traffic_ledger_summary: Path | None = None
     storage_summary: Path | None = None
     minute_target_end_date: Path | None = None
     historical_market_summary: Path | None = None
     historical_market_progress: Path | None = None
     historical_market_inventory: Path | None = None
+    futures_history_scheduler: Path | None = None
+    historical_market_scheduler: Path | None = None
 
     @classmethod
     def from_repo(cls, repo_root: Path) -> ShioajiMonitorPaths:
@@ -125,6 +142,7 @@ class ShioajiMonitorPaths:
             contract_inventory_manifest=root
             / "data_tw_futures/shioaji_contracts/manifest.json",
             snapshot_state=root / "artifacts/live/tw_day_trade_simulation/state.json",
+            snapshot_status=root / "artifacts/live/tw_day_trade_simulation/status.json",
             traffic_ledger_summary=root / "artifacts/live/shioaji_traffic/summary.json",
             storage_summary=root / "artifacts/live/shioaji_storage/summary.json",
             minute_target_end_date=root
@@ -133,6 +151,10 @@ class ShioajiMonitorPaths:
             historical_market_progress=root / "data_tw_shioaji_history/progress.json",
             historical_market_inventory=root
             / "data_tw_shioaji_history/inventory/manifest.json",
+            futures_history_scheduler=root
+            / "artifacts/data_repair/shioaji_futures_history/scheduler.json",
+            historical_market_scheduler=root
+            / "artifacts/data_repair/shioaji_historical_market_data/scheduler.json",
         )
 
 
@@ -380,23 +402,71 @@ def _default_command_runner(args: Sequence[str]) -> subprocess.CompletedProcess[
     )
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
+def _read_json_with_mtime(
+    path: Path, *, use_cache: bool = True,
+) -> tuple[dict[str, Any] | None, float | None]:
     try:
-        cache_key = path.resolve()
+        # The file signature, not a resolved path, controls cache validity.
+        # Resolving every receipt follows symlinks and repeats filesystem
+        # probes for ~1,000 files on each short-lived monitor snapshot.
+        cache_key = path.absolute()
         stat = path.stat()
-        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-        with _FILE_CACHE_LOCK:
-            cached = _JSON_FILE_CACHE.get(cache_key)
-            if cached is not None and cached[:4] == signature:
-                payload = cached[4]
-                return dict(payload) if isinstance(payload, dict) else None
+        signature = (
+            stat.st_dev, stat.st_ino, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns,
+        )
+        cache_hit = False
+        if use_cache:
+            with _FILE_CACHE_LOCK:
+                cached = _JSON_FILE_CACHE.get(cache_key)
+                if cached is not None and cached[:5] == signature:
+                    _JSON_FILE_CACHE.move_to_end(cache_key)
+                    payload = cached[5]
+                    cache_hit = True
+        if cache_hit:
+            # A producer may atomically replace the receipt after the first
+            # stat. Do not hold the shared cache lock over this filesystem IO.
+            try:
+                current = path.stat()
+            except OSError:
+                return None, None
+            if (
+                current.st_dev, current.st_ino, current.st_size,
+                current.st_mtime_ns, current.st_ctime_ns,
+            ) != signature:
+                return None, None
+            return (dict(payload) if isinstance(payload, dict) else None, stat.st_mtime)
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, None
     selected = payload if isinstance(payload, dict) else None
-    with _FILE_CACHE_LOCK:
-        _JSON_FILE_CACHE[cache_key] = (*signature, selected)
-    return dict(selected) if selected is not None else None
+    try:
+        final_stat = path.stat()
+        final_signature = (
+            final_stat.st_dev, final_stat.st_ino, final_stat.st_size,
+            final_stat.st_mtime_ns, final_stat.st_ctime_ns,
+        )
+    except OSError:
+        final_signature = None
+    if final_signature != signature:
+        # A writer replaced this receipt during the read. Do not publish the
+        # previous generation as current even for a single snapshot.
+        return None, None
+    if use_cache:
+        with _FILE_CACHE_LOCK:
+            _JSON_FILE_CACHE[cache_key] = (*signature, selected)
+            _JSON_FILE_CACHE.move_to_end(cache_key)
+            while len(_JSON_FILE_CACHE) > MAX_JSON_FILE_CACHE_ENTRIES:
+                _JSON_FILE_CACHE.popitem(last=False)
+    return (
+        dict(selected) if use_cache and selected is not None else selected,
+        stat.st_mtime,
+    )
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    payload, _mtime = _read_json_with_mtime(path)
+    return payload
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -410,6 +480,22 @@ def _parse_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _current_schedule_wait(
+    path: Path | None, service: dict[str, Any], *, now: datetime
+) -> dict[str, Any] | None:
+    """Use a live runner's durable wait receipt, never an old completed wait."""
+
+    if path is None or not service.get("active"):
+        return None
+    payload = _read_json(path)
+    if not payload or payload.get("state") != "waiting":
+        return None
+    next_attempt = _parse_datetime(payload.get("next_attempt_at_utc"))
+    if next_attempt is None or next_attempt <= now:
+        return None
+    return payload
 
 
 def _age_seconds(value: Any, *, now: datetime) -> float | None:
@@ -720,6 +806,10 @@ def _history_eta(
         if backfill.get("state") == "waiting_quota"
         else "waiting_market"
         if backfill.get("state") == "waiting_market"
+        else "waiting_capacity"
+        if backfill.get("state") == "waiting_capacity"
+        else "waiting_scheduled"
+        if backfill.get("state") == "waiting_scheduled"
         else "estimated"
         if service_active
         else "paused"
@@ -983,18 +1073,16 @@ def _history_manifests(paths: ShioajiMonitorPaths) -> list[dict[str, Any]]:
     manifests: list[dict[str, Any]] = []
     seen: set[str] = set()
     for path in candidates:
-        payload = _read_json(path)
+        payload, observed_epoch = _read_json_with_mtime(path)
         contract = str((payload or {}).get("contract") or "")
         if not payload or not contract or contract in seen:
             continue
         seen.add(contract)
         payload = dict(payload)
-        try:
-            payload["_observed_at"] = _iso_from_epoch(path.stat().st_mtime)
-            payload["_observed_epoch"] = float(path.stat().st_mtime)
-        except OSError:
-            payload["_observed_at"] = None
-            payload["_observed_epoch"] = 0.0
+        payload["_observed_at"] = (
+            _iso_from_epoch(observed_epoch) if observed_epoch is not None else None
+        )
+        payload["_observed_epoch"] = observed_epoch or 0.0
         manifests.append(payload)
     return manifests
 
@@ -1082,10 +1170,16 @@ def _latest_capture_receipt(root: Path | None) -> dict[str, Any]:
     try:
         manifests = root.glob("manifests/**/worker=*.json")
         for manifest in manifests:
-            payload = _read_json(manifest)
+            # The monitor needs only scalar totals. Retaining every capture's
+            # large contract metadata in the process-wide JSON cache increases
+            # peak memory on each short-lived 30-second producer run.
+            payload, _mtime = _read_json_with_mtime(manifest, use_cache=False)
             started = _parse_datetime((payload or {}).get("started_at_utc"))
             if payload and started is not None:
-                candidates.append((started, payload))
+                candidates.append((
+                    started,
+                    {field: payload.get(field) for field in _CAPTURE_RECEIPT_FIELDS},
+                ))
     except OSError:
         return {}
     if not candidates:
@@ -1241,6 +1335,25 @@ def _top200_priority_wait(entries: Iterable[dict[str, Any]]) -> dict[str, Any] |
     return waiting
 
 
+def _minute_runner_wait(
+    entries: Iterable[dict[str, Any]], service: dict[str, Any]
+) -> str | None:
+    """Return only the current invocation's latest unsuperseded wait reason."""
+
+    invocation = service.get("invocation_id")
+    reason = None
+    for entry in entries:
+        if invocation and entry.get("_SYSTEMD_INVOCATION_ID") != invocation:
+            continue
+        message = str(entry.get("MESSAGE") or "")
+        if "[shioaji-minute-runner] download_start=" in message:
+            reason = None
+        elif "[shioaji-minute-runner] waiting_seconds=" in message:
+            match = re.search(r"\breason=([a-z_]+)", message)
+            reason = match.group(1) if match else None
+    return reason
+
+
 def _capture_status(
     paths: ShioajiMonitorPaths,
     entries: list[dict[str, Any]],
@@ -1261,12 +1374,16 @@ def _capture_status(
     trade_date = None
     stop_at = None
     start_at = None
+    strategy_bootstrap_ready = None
     workers: dict[int, tuple[int, int]] = {}
     for entry in entries:
         message = str(entry.get("MESSAGE") or "")
         start_match = _CAPTURE_START_PATTERN.search(message)
         if start_match:
-            start_at, session, trade_date, stop_at = start_match.groups()
+            start_at, session, trade_date, stop_at, strategy_state = start_match.groups()
+            strategy_bootstrap_ready = (
+                strategy_state == "true" if strategy_state is not None else None
+            )
             workers = {}
             continue
         worker_match = _WORKER_PATTERN.search(message)
@@ -1297,6 +1414,7 @@ def _capture_status(
         "trade_date": trade_date,
         "started_at_local": start_at,
         "scheduled_stop_at_local": stop_at,
+        "strategy_bootstrap_ready": strategy_bootstrap_ready,
         "workers": len(workers),
         "contracts": sum(item[0] for item in workers.values()),
         "subscriptions": sum(item[1] for item in workers.values()),
@@ -1310,7 +1428,10 @@ def _backfill_status(
     manifests: list[dict[str, Any]],
     entries: list[dict[str, Any]],
     service: dict[str, Any],
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
+    observed = now or datetime.now(UTC)
     invocation_id = service.get("invocation_id")
     if invocation_id:
         current_entries = [
@@ -1391,6 +1512,13 @@ def _backfill_status(
             waiting_reason = wait_match.group(2)
             current_contract = wait_match.group(3)
             _epoch, waiting_observed_at = _entry_timestamp(entry)
+    scheduled_wait = _current_schedule_wait(
+        paths.futures_history_scheduler, service, now=observed
+    )
+    if scheduled_wait is not None:
+        waiting_reason = str(scheduled_wait.get("reason") or "scheduled")
+        waiting_seconds = int(scheduled_wait.get("wait_seconds") or 0)
+        waiting_observed_at = scheduled_wait.get("observed_at_utc")
     current = next(
         (item for item in manifests if item.get("contract") == current_contract), None
     )
@@ -1409,6 +1537,12 @@ def _backfill_status(
         state = "waiting_quota"
     elif waiting_reason == "market_hours_priority_gate":
         state = "waiting_market"
+    elif waiting_reason in {
+        "live_connection_reservation", "history_login_slot_busy", "connection_capacity"
+    }:
+        state = "waiting_capacity"
+    elif scheduled_wait is not None:
+        state = "waiting_scheduled"
     else:
         state = "downloading"
     contract_rows = sorted(
@@ -1482,8 +1616,19 @@ def _build_pipelines(
     snapshot_service: dict[str, Any],
     historical_market_service: dict[str, Any],
     top200_entries: list[dict[str, Any]],
+    minute_entries: list[dict[str, Any]],
     traffic: dict[str, Any],
+    timing_ms: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
+    stage_started = time.perf_counter()
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        if timing_ms is not None:
+            completed = time.perf_counter()
+            timing_ms[name] = round((completed - stage_started) * 1_000, 3)
+            stage_started = completed
+
     historical_market_summary = (
         _read_json(paths.historical_market_summary)
         if paths.historical_market_summary is not None
@@ -1648,6 +1793,7 @@ def _build_pipelines(
         paths.contract_inventory_manifest,
         "generated_at",
     )
+    mark_stage("receipt_files")
 
     fop_receipt = _latest_capture_receipt(paths.capture_root)
     fop_audit = _latest_audit(paths.capture_root / "audits")
@@ -1662,55 +1808,95 @@ def _build_pipelines(
     top_receipt = _latest_capture_receipt(paths.top200_capture_root)
     top_failure = _top200_failure(top200_entries)
     top_wait = _top200_priority_wait(top200_entries)
+    top_target_missing = bool(
+        minute_target_date
+        and str(top_receipt.get("trade_date") or "") < minute_target_date
+    )
     if top_failure:
         top_state, top_label = "failed", "最近執行失敗"
     elif top_wait:
         top_state, top_label = "waiting", "期權優先暫停"
+    elif top_target_missing:
+        top_state, top_label = "partial", "最新交易日尚未擷取"
     elif top200_service.get("active"):
         top_state, top_label = "active", "服務運行"
     else:
         top_state, top_label = "stopped", "服務停止"
     top_latest = top_receipt.get("finished_at_utc")
+    mark_stage("capture_manifests")
 
     hft_totals = _hft_partition_totals(paths.hft_dataset_root)
     hft_audit = _latest_audit(paths.hft_audit_root, "hft_*.json")
     hft_ready = (
         hft_totals.get("dates", 0) > 0
         and hft_audit.get("status") == "ok"
+        and (
+            not minute_target_date
+            or (
+                str(hft_audit.get("trade_date") or "") >= minute_target_date
+                and str(hft_totals.get("last_date") or "") >= minute_target_date
+            )
+        )
         and not top_wait
         and not top_failure
     )
     hft_latest = hft_totals.get("latest_at_utc") or hft_audit.get("_observed_at")
 
-    snapshot_state = _read_json(paths.snapshot_state) if paths.snapshot_state else None
-    benchmarks = (snapshot_state or {}).get("benchmarks")
-    modes = (snapshot_state or {}).get("modes")
-    safe_benchmarks = benchmarks if isinstance(benchmarks, dict) else {}
-    safe_modes = modes if isinstance(modes, dict) else {}
-    quote_times = [
-        parsed
-        for item in safe_benchmarks.values()
-        if isinstance(item, dict)
-        if str(item.get("source") or "").startswith("shioaji:")
-        if (parsed := _parse_datetime(item.get("last_quote_at"))) is not None
-    ]
-    snapshot_latest = (
-        max(quote_times).isoformat().replace("+00:00", "Z")
-        if quote_times
-        else _payload_time(snapshot_state, paths.snapshot_state, "updated_at")
+    snapshot_status = _read_json(paths.snapshot_status) if paths.snapshot_status else None
+    snapshot_projection = (
+        validated_shioaji_monitor_projection(snapshot_status, paths.snapshot_state)
+        if paths.snapshot_state else None
     )
-    snapshot_sources = {
-        str(item.get("source") or "")
-        for item in safe_benchmarks.values()
-        if isinstance(item, dict)
-        and str(item.get("source") or "").startswith("shioaji:")
-    }
+    if snapshot_projection is not None:
+        mode_count = snapshot_projection["mode_count"]
+        benchmark_count = snapshot_projection["benchmark_count"]
+        source_count = snapshot_projection["source_count"]
+        quote_times = [
+            parsed
+            for value in snapshot_projection["quote_times"]
+            if (parsed := _parse_datetime(value)) is not None
+        ]
+        snapshot_latest = (
+            max(quote_times).isoformat().replace("+00:00", "Z")
+            if quote_times
+            else _payload_time(snapshot_status, paths.snapshot_status, "updated_at")
+        )
+    else:
+        # Old producers and mismatched generations retain the full-state path.
+        snapshot_state = _read_json(paths.snapshot_state) if paths.snapshot_state else None
+        benchmarks = (snapshot_state or {}).get("benchmarks")
+        modes = (snapshot_state or {}).get("modes")
+        safe_benchmarks = benchmarks if isinstance(benchmarks, dict) else {}
+        safe_modes = modes if isinstance(modes, dict) else {}
+        mode_count = len(safe_modes)
+        benchmark_count = len(safe_benchmarks)
+        quote_times = [
+            parsed
+            for item in safe_benchmarks.values()
+            if isinstance(item, dict)
+            if str(item.get("source") or "").startswith("shioaji:")
+            if (parsed := _parse_datetime(item.get("last_quote_at"))) is not None
+        ]
+        snapshot_latest = (
+            max(quote_times).isoformat().replace("+00:00", "Z")
+            if quote_times
+            else _payload_time(snapshot_state, paths.snapshot_state, "updated_at")
+        )
+        source_count = len({
+            str(item.get("source") or "")
+            for item in safe_benchmarks.values()
+            if isinstance(item, dict)
+            and str(item.get("source") or "").startswith("shioaji:")
+        })
+    mark_stage("hft_and_snapshot")
 
     backfill_state = str(backfill.get("state") or "stopped")
     history_state = {
         "downloading": ("active", "持續下載"),
         "waiting_quota": ("waiting", "等待流量重置"),
         "waiting_market": ("waiting", "即時行情優先"),
+        "waiting_capacity": ("waiting", "連線額度保留即時行情"),
+        "waiting_scheduled": ("waiting", "等待下次排程"),
         "complete": ("complete", "全部完成"),
         "complete_with_unavailable": ("partial", "可查契約完成；來源不可用明列"),
         "scheduled": ("waiting", "等待排程／上次成功"),
@@ -1718,6 +1904,7 @@ def _build_pipelines(
         "stopped": ("stopped", "服務停止"),
     }.get(backfill_state, ("unavailable", "狀態未知"))
     history_eta = _history_eta(backfill, traffic, now=now)
+    minute_wait_reason = _minute_runner_wait(minute_entries, minute_service)
     if minute_current:
         minute_state, minute_label = "ready", "已追到最新交易日"
         minute_eta = _complete_eta("分鐘來源與 research_ready 稽核皆已追到目標交易日。")
@@ -1734,6 +1921,20 @@ def _build_pipelines(
             "waiting_quota",
             confidence="none",
             basis="最新交易日仍有缺口；歷史流量安全閘門解除後才會續抓。",
+        )
+    elif minute_wait_reason == "shioaji_connection_capacity":
+        minute_state, minute_label = "waiting", "連線額度保留即時行情"
+        minute_eta = _eta(
+            "waiting_capacity",
+            confidence="none",
+            basis="期貨行情與股票常駐報價占用同一帳號連線；尚未啟動本輪分鐘下載，不能以舊吞吐量估完工。",
+        )
+    elif minute_wait_reason in {"top200_then_market_close", "taiwan_market_hours"}:
+        minute_state, minute_label = "waiting", "等待盤後安全窗口"
+        minute_eta = _eta(
+            "waiting_market",
+            confidence="none",
+            basis="即時行情優先；盤後安全窗口到來後才會啟動下載。",
         )
     else:
         minute_state = "partial"
@@ -2044,7 +2245,11 @@ def _build_pipelines(
             "status": top_state,
             "status_label": top_label,
             "detail": (top_failure or top_wait or {}).get("detail")
-            or "依官方市值名單擷取 200 檔股票微結構。",
+            or (
+                f"最新官方股票交易日 {minute_target_date} 尚無完整 Top-200 擷取收據。"
+                if top_target_missing
+                else "依官方市值名單擷取 200 檔股票微結構。"
+            ),
             "coverage": None,
             "latest_at_utc": top_latest,
             "eta": _continuous_eta(
@@ -2063,6 +2268,11 @@ def _build_pipelines(
             ],
             "warnings": [
                 "期貨／選擇權擷取擁有連線優先權。",
+                *(
+                    [f"{minute_target_date} 的即時資料已錯過擷取窗口，不能由服務 active 代替。"]
+                    if top_target_missing
+                    else []
+                ),
                 *([(top_failure or {}).get("detail")] if top_failure else []),
             ],
             "service": _service_view(top200_service),
@@ -2175,9 +2385,9 @@ def _build_pipelines(
                 "漲跌停價",
             ],
             "metrics": [
-                _metric("策略模式", len(safe_modes)),
-                _metric("行情基準", len(safe_benchmarks)),
-                _metric("永豐來源類型", len(snapshot_sources)),
+                _metric("策略模式", mode_count),
+                _metric("行情基準", benchmark_count),
+                _metric("永豐來源類型", source_count),
                 _metric("最新報價", snapshot_latest, value_format="datetime"),
             ],
             "warnings": [
@@ -2187,6 +2397,10 @@ def _build_pipelines(
         },
     ]
     if paths.historical_market_summary is not None:
+        market_schedule = _current_schedule_wait(
+            paths.historical_market_scheduler, historical_market_service, now=now
+        )
+        market_wait_reason = str((market_schedule or {}).get("reason") or "")
         market_state = str((historical_market_summary or {}).get("state") or "")
         market_complete = bool(
             market_state == "complete"
@@ -2199,6 +2413,10 @@ def _build_pipelines(
             market_status, market_label = "waiting", "等待歷史流量"
         elif market_state == "waiting_market":
             market_status, market_label = "waiting", "即時行情優先"
+        elif market_wait_reason in {"live_connection_reservation", "history_login_slot_busy", "connection_capacity"}:
+            market_status, market_label = "waiting", "連線額度保留即時行情"
+        elif market_schedule is not None:
+            market_status, market_label = "waiting", "等待下次排程"
         elif historical_market_service.get("active"):
             market_status, market_label = "active", "持續下載"
         elif historical_market_summary:
@@ -2326,7 +2544,41 @@ def _build_pipelines(
         pipeline["latest_age_seconds"] = _age_seconds(
             pipeline.get("latest_at_utc"), now=now
         )
+    mark_stage("assemble")
     return pipelines
+
+
+def _monitor_evidence(
+    paths: ShioajiMonitorPaths, units: Sequence[str], *, runner: CommandRunner,
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Overlap independent local I/O; never log in or query the broker.
+
+    Keep per-unit journal bounds and failure handling. Injected runners retain
+    their sequential contract; only our subprocess runner is used concurrently.
+    """
+
+    journal_specs = [(HISTORY_UNIT, 5_000, "-24hours"), (CAPTURE_UNIT, 5_000, "-24hours")]
+    if paths.top200_capture_root is not None:
+        journal_specs.append((TOP200_UNIT, 1_000, "-7days"))
+    if paths.minute_summary is not None:
+        journal_specs.append((MINUTE_UNIT, 100, "-24hours"))
+    if runner is not _default_command_runner:
+        states = _service_states(units, runner=runner)
+        journals = {
+            unit: _journal_entries(unit, runner=runner, lines=lines, since=since)
+            for unit, lines, since in journal_specs
+        }
+        return states, journals, _history_manifests(paths)
+    with ThreadPoolExecutor(
+        max_workers=1 + len(journal_specs), thread_name_prefix="monitor-evidence"
+    ) as pool:
+        states_job = pool.submit(_service_states, units, runner=runner)
+        journal_jobs = {
+            unit: pool.submit(_journal_entries, unit, runner=runner, lines=lines, since=since)
+            for unit, lines, since in journal_specs
+        }
+        manifests = _history_manifests(paths)
+        return states_job.result(), {unit: job.result() for unit, job in journal_jobs.items()}, manifests
 
 
 def build_shioaji_public_status(
@@ -2335,8 +2587,18 @@ def build_shioaji_public_status(
     now: datetime | None = None,
     runner: CommandRunner = _default_command_runner,
     paths: ShioajiMonitorPaths | None = None,
+    timing_ms: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Return a bounded, allowlisted Shioaji monitoring payload."""
+
+    stage_started = time.perf_counter()
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        if timing_ms is not None:
+            completed = time.perf_counter()
+            timing_ms[name] = round((completed - stage_started) * 1_000, 3)
+            stage_started = completed
 
     observed = now or datetime.now(UTC)
     if observed.tzinfo is None:
@@ -2352,11 +2614,14 @@ def build_shioaji_public_status(
         service_units.append(TOP200_UNIT)
     if selected_paths.snapshot_state is not None:
         service_units.append(SNAPSHOT_UNIT)
-    service_states = _service_states(service_units, runner=runner)
+    service_states, journals, manifests = _monitor_evidence(
+        selected_paths, service_units, runner=runner
+    )
+    mark_stage("local_service_journal_and_manifests")
     history_service = service_states[HISTORY_UNIT]
     capture_service = service_states[CAPTURE_UNIT]
-    history_entries = _journal_entries(HISTORY_UNIT, runner=runner)
-    capture_entries = _journal_entries(CAPTURE_UNIT, runner=runner)
+    history_entries = journals[HISTORY_UNIT]
+    capture_entries = journals[CAPTURE_UNIT]
     minute_service = (
         service_states[MINUTE_UNIT]
         if selected_paths.minute_summary is not None
@@ -2377,12 +2642,8 @@ def build_shioaji_public_status(
         if selected_paths.historical_market_summary is not None
         else {"active": False, "state": "unavailable", "restarts": None}
     )
-    top200_entries = (
-        _journal_entries(TOP200_UNIT, runner=runner, lines=1_000, since="-7days")
-        if selected_paths.top200_capture_root is not None
-        else []
-    )
-    manifests = _history_manifests(selected_paths)
+    top200_entries = journals.get(TOP200_UNIT, [])
+    minute_entries = journals.get(MINUTE_UNIT, [])
     traffic_history = _traffic_samples(history_entries, manifests)
     ledger_payload = (
         _read_json(selected_paths.traffic_ledger_summary)
@@ -2396,6 +2657,7 @@ def build_shioaji_public_status(
         else None
     )
     storage = _storage_view(storage_payload, now=observed)
+    mark_stage("traffic_and_storage_receipts")
     latest_ledger_usage = (ledger_payload or {}).get("latest_usage")
     if isinstance(latest_ledger_usage, dict):
         ledger_used = latest_ledger_usage.get("used_bytes")
@@ -2422,11 +2684,12 @@ def build_shioaji_public_status(
                 traffic_history, key=lambda item: str(item.get("observed_at_utc") or "")
             )[-MAX_TRAFFIC_SAMPLES:]
     backfill = _backfill_status(
-        selected_paths, manifests, history_entries, history_service
+        selected_paths, manifests, history_entries, history_service, now=observed
     )
     capture = _capture_status(
         selected_paths, capture_entries, capture_service, now=observed
     )
+    mark_stage("backfill_and_capture")
     latest_traffic = traffic_history[-1] if traffic_history else {}
     used = int(latest_traffic.get("used_bytes") or 0)
     limit = int(latest_traffic.get("limit_bytes") or 0)
@@ -2480,6 +2743,7 @@ def build_shioaji_public_status(
         ),
         "history": traffic_history,
     }
+    pipeline_timing_ms: dict[str, float] = {}
     pipelines = _build_pipelines(
         selected_paths,
         now=observed,
@@ -2492,8 +2756,16 @@ def build_shioaji_public_status(
         snapshot_service=snapshot_service,
         historical_market_service=historical_market_service,
         top200_entries=top200_entries,
+        minute_entries=minute_entries,
         traffic=traffic,
+        timing_ms=pipeline_timing_ms if timing_ms is not None else None,
     )
+    if timing_ms is not None:
+        timing_ms.update({
+            f"pipeline.{name}": elapsed
+            for name, elapsed in pipeline_timing_ms.items()
+        })
+    mark_stage("pipeline_receipts")
     history_pipeline = next(
         (item for item in pipelines if item.get("id") == "futures_history"), None
     )
@@ -2528,9 +2800,10 @@ def build_shioaji_public_status(
         failed_pipelines
         or not capture_service.get("active")
         or backfill.get("state") == "failed"
+        or (capture.get("state") == "capturing" and capture.get("strategy_bootstrap_ready") is False)
     ):
         health = "degraded"
-    elif backfill.get("state") in {"waiting_quota", "waiting_market"}:
+    elif backfill.get("state") in {"waiting_quota", "waiting_market", "waiting_capacity", "waiting_scheduled"}:
         health = "waiting"
     elif capture.get("state") == "capturing":
         health = "active"
@@ -2538,6 +2811,7 @@ def build_shioaji_public_status(
         health = "waiting"
     else:
         health = "stale"
+    mark_stage("health_and_traffic")
 
     return {
         "dashboard_schema_version": 5,

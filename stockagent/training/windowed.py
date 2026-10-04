@@ -28,6 +28,7 @@ from stockagent.data.tw_index_futures import (
 from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 )
+from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 from stockagent.data.tw_stock_context_futures_portfolio import (
     TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,

@@ -298,8 +298,9 @@ def test_exact_pending_stock_action_maps_ratio_and_delivery_without_price_proxy(
     assert counts["mapped_pending_stock_events"] == 1
 
 
+@pytest.mark.parametrize("policy", ["reference_value_cash", "reject_held"])
 def test_pure_subscription_right_maps_symmetric_official_reference_value(
-    tmp_path,
+    tmp_path, policy,
 ):
     public = tmp_path / "public-release"
     _write_parquet(
@@ -335,10 +336,18 @@ def test_pure_subscription_right_maps_symmetric_official_reference_value(
             / "features/tw_public_stock_daily.parquet",
             dates=np.asarray(["2020-10-23"], dtype="datetime64[D]"),
             symbols=("6625",),
+            subscription_right_policy=policy,
         )
     )
 
     expected = 0.113576395 * (37.39 - 30.0)
+    if policy == "reject_held":
+        assert not mask.any()
+        assert not cash.any()
+        assert counts["mapped_subscription_right_events"] == 0
+        assert counts["rejected_subscription_right_events"] == 1
+        assert counts["_rejected_subscription_right_flat_indices"] == [0]
+        return
     assert mask.tolist() == [[True]]
     assert ratio.tolist() == [[1.0]]
     assert cash[0, 0] == pytest.approx(expected)
@@ -391,9 +400,7 @@ def test_incomplete_subscription_right_remains_unresolved(tmp_path):
     assert counts["mapped_subscription_right_events"] == 0
 
 
-def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
-    tmp_path, monkeypatch,
-):
+def _physical_source_inputs(tmp_path):
     public = tmp_path / "public-release"
     _write_parquet(public / "features/tw_public_stock_daily.parquet", {"x": [1]})
     _write_parquet(
@@ -483,6 +490,16 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
         unresolved_corporate_action_mask=np.zeros((2, 3), dtype=bool),
         force_exit_mask=np.zeros((2, 3), dtype=bool),
     )
+    return panel, public, minute
+
+
+@pytest.mark.parametrize("cache_setting", ["0", "0.00001", "1"])
+def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
+    tmp_path, monkeypatch, cache_setting,
+):
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_SOURCE_CACHE_GIB", cache_setting)
+    panel, public, minute = _physical_source_inputs(tmp_path)
+    non_session = minute / "trade_date=2020-03-01/data.parquet"
     source = build_prepared_day_trade_carry_source(
         panel=panel, minute_root=minute,
         public_feature_path=public / "features/tw_public_stock_daily.parquet",
@@ -514,6 +531,14 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
     assert first.action_mask.tolist() == [1.0, 0.0, 0.0]
     assert first.share_ratio.tolist() == [1.0, 1.0, 1.0]
     assert first.cash_per_old_share.tolist() == [0.0, 0.0, 0.0]
+    cache_info = source.runtime_cache_info()
+    assert cache_info["maximum_bytes"] == int(float(cache_setting) * 1024**3)
+    assert cache_info["peak_retained_tensor_bytes"] <= cache_info["maximum_bytes"]
+    if cache_setting == "0":
+        assert cache_info["entries"] == cache_info["retained_tensor_bytes"] == 0
+    if cache_setting == "1":
+        # Dense and packed users decode each source row only once.
+        assert cache_info["representations"]["packed"]["loads"] == 2
     assert source.audit_receipt["corporate_action_policy"][
         "mapped_zero_value_subscription_right_events"
     ] == 1
@@ -638,6 +663,12 @@ def test_physical_source_builds_once_and_loads_lazy_symbol_day_sessions(
         for name in ("entry_path", "stop_hits"):
             torch.testing.assert_close(getattr(rebuilt, name), getattr(expected, name),
                                        rtol=0, atol=0, equal_nan=True)
+    for prepared in (source, again, terminal_source, swept):
+        stats = prepared.runtime_cache_info()
+        assert stats["peak_retained_tensor_bytes"] <= stats["maximum_bytes"]
+        assert "runtime_cache_info" not in prepared.audit_receipt
+        if cache_setting == "0":
+            assert stats["entries"] == stats["retained_tensor_bytes"] == 0
 
 
 def test_physical_source_uses_daily_proxy_when_minute_volume_exceeds_day_bound(tmp_path):

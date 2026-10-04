@@ -98,6 +98,7 @@ def test_walkforward_concentration_labels_requests_and_preserves_scope(tmp_path,
 
 
 def test_concentration_chart_discloses_requested_allocation(monkeypatch):
+    report.plt.switch_backend("Agg")
     result = _contracts()
     weights, label = report.reporting_weight_history(result)
     close = report.plt.close

@@ -1,0 +1,5 @@
+[Unit]
+Requires=stockagent-d-cold-mount.service
+BindsTo=stockagent-d-cold-mount.service
+After=stockagent-d-cold-mount.service
+ConditionPathIsMountPoint=/srv/stockagent-packed

@@ -13,6 +13,7 @@ from stockagent.ocr.rapidocr import (
 @pytest.mark.parametrize("values", [
     {"device": "auto"}, {"cpu_threads": 0}, {"cpu_threads": True},
     {"cpu_cores": 0}, {"nice": -5}, {"gpu_memory_mb": 0}, {"device_id": -1},
+    {"model_memory_mb": {'Wrong':2048}}, {"model_memory_mb": {'Det':True}},
 ])
 def test_invalid_budget_does_not_reach_optional_runtime(values):
     with pytest.raises(ValueError):

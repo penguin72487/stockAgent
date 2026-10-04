@@ -15,13 +15,14 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, Mapping, TypeVar
 import uuid
 from zoneinfo import ZoneInfo
 
 
 T = TypeVar("T")
 LEDGER_SCHEMA_VERSION = 2
+QUERY_OBSERVATION_CONTRACT = "query-phases-v1-column-rows-v1"
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
@@ -418,12 +419,13 @@ def rebuild_traffic_summary(*, root: Path | None = None) -> dict[str, Any]:
     return summary
 
 
-def _best_effort_record(event: dict[str, Any]) -> None:
+def _best_effort_record(event: dict[str, Any]) -> bool:
     try:
         record_traffic_event(event)
     except Exception:
         # Accounting must never alter quote/data availability.
-        return
+        return False
+    return True
 
 
 @contextmanager
@@ -435,6 +437,7 @@ def shioaji_query(
     asset_class: str,
     details: dict[str, Any] | None = None,
     request_count: int = 1,
+    timing: dict[str, Any] | None = None,
 ) -> Iterator[Callable[[Any], None]]:
     """Record one or more billed requests without changing error behavior.
 
@@ -442,8 +445,18 @@ def shioaji_query(
     one causal operation. Accounting that operation as a group avoids adding
     two synchronous ``usage()`` observations and one durable ledger write per
     request while preserving the exact number of requests in the event.
+
+    New events separate both usage reads from the request body. ``duration_ms``
+    retains its historical boundaries for existing readers; it is not total
+    latency. The optional caller-owned ``timing`` also measures the ledger
+    write and complete context. These last two spans cannot be embedded in the
+    same event before that event is written, so they are returned to the caller
+    for its existing operation receipt rather than causing a second write.
+    Request-body time includes caller processing inside the context, not just
+    broker transport. No additional usage calls or requests are introduced.
     """
 
+    context_started = time.monotonic()
     before = _usage(api)
     started = time.monotonic()
     rows = 0
@@ -451,60 +464,81 @@ def shioaji_query(
 
     def set_result(value: Any) -> None:
         nonlocal rows
+        # Native Ticks/KBars can implement len() as their field count. Count
+        # observations from their columns before falling back to row sequences.
+        for name in ("ts", "close"):
+            try:
+                column = value.get(name) if isinstance(value, Mapping) else getattr(value, name)
+                rows = len(column)
+                return
+            except (TypeError, AttributeError):
+                continue
         try:
             rows = len(value)
         except (TypeError, AttributeError):
-            for name in ("ts", "close"):
-                try:
-                    rows = len(getattr(value, name))
-                    break
-                except (TypeError, AttributeError):
-                    continue
+            return
+
+    def finish(error: BaseException | None = None) -> None:
+        body_finished = time.monotonic()
+        after = _usage(api)
+        usage_finished = time.monotonic()
+        phases = {
+            "contract": QUERY_OBSERVATION_CONTRACT,
+            "usage_before_ms": round((started - context_started) * 1000.0, 3),
+            "request_body_ms": round((body_finished - started) * 1000.0, 3),
+            "usage_after_ms": round((usage_finished - body_finished) * 1000.0, 3),
+        }
+        event = {
+            "consumer": consumer,
+            "method": method,
+            "asset_class": asset_class,
+            "operation": "query",
+            "status": "failed" if error is not None else "success",
+            "request_count": billed_requests,
+            "avoided_request_count": 0,
+            "rows": rows,
+            "query_observation_contract": QUERY_OBSERVATION_CONTRACT,
+            "duration_ms": round(
+                ((body_finished if error is not None else usage_finished) - started)
+                * 1000.0,
+                3,
+            ),
+            "usage_before": before,
+            "usage_after": after,
+            "details": _safe_details(details),
+            "timing": phases,
+        }
+        if error is not None:
+            event["error_type"] = type(error).__name__
+        else:
+            delta = None
+            if before is not None and after is not None:
+                candidate = after["used_bytes"] - before["used_bytes"]
+                delta = candidate if candidate >= 0 else None
+            event["usage_delta_bytes"] = delta
+        record_started = time.monotonic()
+        phases["pre_record_ms"] = round((record_started - context_started) * 1000.0, 3)
+        recorded = _best_effort_record(event)
+        context_finished = time.monotonic()
+        if timing is not None:
+            try:
+                timing.update({
+                    **phases,
+                    "ledger_record_ms": round((context_finished - record_started) * 1000.0, 3),
+                    "total_context_ms": round((context_finished - context_started) * 1000.0, 3),
+                    "ledger_record_failed": not recorded,
+                })
+            except Exception:
+                # A reporting sink must not replace the broker result/error.
+                pass
 
     try:
         yield set_result
     except BaseException as exc:
-        _best_effort_record(
-            {
-                "consumer": consumer,
-                "method": method,
-                "asset_class": asset_class,
-                "operation": "query",
-                "status": "failed",
-                "error_type": type(exc).__name__,
-                "request_count": billed_requests,
-                "avoided_request_count": 0,
-                "rows": rows,
-                "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
-                "usage_before": before,
-                "usage_after": _usage(api),
-                "details": _safe_details(details),
-            }
-        )
+        finish(exc)
         raise
     else:
-        after = _usage(api)
-        delta = None
-        if before is not None and after is not None:
-            candidate = after["used_bytes"] - before["used_bytes"]
-            delta = candidate if candidate >= 0 else None
-        _best_effort_record(
-            {
-                "consumer": consumer,
-                "method": method,
-                "asset_class": asset_class,
-                "operation": "query",
-                "status": "success",
-                "request_count": billed_requests,
-                "avoided_request_count": 0,
-                "rows": rows,
-                "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
-                "usage_before": before,
-                "usage_after": after,
-                "usage_delta_bytes": delta,
-                "details": _safe_details(details),
-            }
-        )
+        finish()
 
 
 def record_avoided_query(

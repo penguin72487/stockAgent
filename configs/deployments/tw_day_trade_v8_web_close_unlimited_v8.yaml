@@ -1,0 +1,16 @@
+# V5 architecture and annual folds; corrected training-only execution contract.
+# No broker orders, no reuse of v5/v7 optimizer, no automatic web deployment.
+base_config: tw_day_trade_v8_web_parity_v7.yaml
+experiment_name: tw-day-trade-v8-web-close-unlimited-no-subscription-v8
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_web_close_unlimited_v8
+  start_fold: 1
+  resume: true
+
+trading:
+  tw_day_trade_terminal_liquidation_unlimited_capacity: true
+  tw_day_trade_subscription_right_policy: reject_held
+
+# Keep the content-addressed cache workspace. Policy digests isolate new
+# entitlement arrays; market data never overwrite a pinned source release.

@@ -14,6 +14,7 @@ Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
 Environment="OPENBB_OUTPUT_DIR=data_openBB"
 Environment="OPENBB_SUPERVISOR_TQDM=0"
+ExecCondition=/usr/bin/bash "__REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh"
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_archive_until_complete.sh"
 Restart=on-failure
 RestartPreventExitStatus=2 3

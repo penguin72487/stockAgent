@@ -15,6 +15,7 @@ from pathlib import Path
 from queue import Queue
 import re
 import socket
+import sys
 import threading
 import tempfile
 import time
@@ -374,11 +375,11 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         requests=2,
         seconds=1,
         basis=(
-            "OpenBB FRED provider safety ceiling; FRED documents HTTP 429 "
-            "throttling but no public numeric limit"
+            "official FRED API ceiling of 120 requests per minute, "
+            "smoothed to 2 requests/second"
         ),
         source_url="https://fred.stlouisfed.org/docs/api/fred/errors.html",
-        note="Direct FRED API v2 requests share this process-wide limiter.",
+        note="Direct FRED and OpenBB FRED requests share this host-global bucket.",
     ),
     "okx_history_candles": ProviderRateLimit(
         provider="okx_history_candles",
@@ -403,6 +404,14 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="official endpoint limit; IP",
         source_url="https://www.okx.com/docs-v5/en/",
         note="GET /api/v5/market/history-index-candles",
+    ),
+    "okx_index_candles": ProviderRateLimit(
+        provider="okx_index_candles",
+        requests=20,
+        seconds=2,
+        basis="official endpoint limit; IP",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/market/index-candles; latest 1,440 entries, not all history.",
     ),
     "okx_funding_rate_history": ProviderRateLimit(
         provider="okx_funding_rate_history",
@@ -465,12 +474,12 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
     "shioaji_quote_query": ProviderRateLimit(
         provider="shioaji_quote_query",
         requests=50,
-        seconds=5,
-        basis="user-selected account ceiling; matches legacy PDF/C# 50/5s",
+        seconds=10,
+        basis="current official Python API market-data account ceiling 50/10s",
         source_url="https://sinotrade.github.io/tutor/limit/",
         note=(
             "Ticks, snapshots, Kbars, credit and short-source queries share this "
-            "ceiling. Current Python docs also contain a conflicting 50/10s value."
+            "ceiling; older PDF/C# 50/5s text is not the current Python limit."
         ),
     ),
     "frankfurter_public": ProviderRateLimit(
@@ -1269,7 +1278,13 @@ def run_parallel_tasks(
     results: list[TResult] = []
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
         futures = {executor.submit(worker, item): item for item in item_list}
-        progress = tqdm(total=len(futures), desc=desc, unit=unit)
+        # Journald keeps every carriage-return update as log traffic. Keep
+        # interactive feedback responsive, but bound the non-TTY fallback;
+        # registered crypto jobs also publish source-backed progress receipts.
+        progress = tqdm(
+            total=len(futures), desc=desc, unit=unit,
+            mininterval=0.1 if sys.stderr.isatty() else 10.0,
+        )
         try:
             for future in as_completed(futures):
                 item = futures[future]

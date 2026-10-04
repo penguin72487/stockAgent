@@ -87,3 +87,25 @@ def test_adjusted_contract_final_value_includes_rights_beyond_price_times_multip
         parse_stock_futures_final_settlement_html(body.replace(b'59,923', b'-'),
             start_date=date(2024,10,1), end_date=date(2024,10,31), source_file='bad.html',
             source_sha256='bad', source_url='https://www.taifex.com.tw/cht/5/sSFFSP')
+
+
+def test_commodity_futures_do_not_import_gold_options_or_nonfinite_prices():
+    body = '''<table><tr><th>最後結算日</th><th>契約月份</th>
+    <th>台幣黃金期貨(TGF)</th><th>黃金選擇權(TGO)</th><th>布蘭特原油期貨(BRF)</th></tr>
+    <tr><td>2026/08/28</td><td>202608</td><td>17,659.5</td><td>17659.5</td><td>-</td></tr>
+    <tr><td>2026/08/04</td><td>202609</td><td>inf</td><td>-</td><td>2926.02</td></tr></table>'''.encode()
+    result = parse_index_futures_final_settlement_html(body,
+        start_date=date(2026,1,1), end_date=date(2026,12,31), source_file='commodity.html',
+        source_sha256='abc', source_url='https://www.taifex.com.tw/cht/5/goldFSP',
+        source_kind='official_commodity_futures_html', allowed_products=frozenset({'TGF','BRF'}))
+    assert result.select('product','final_settlement_price').rows() == [('BRF',2926.02),('TGF',17659.5)]
+    assert set(result['source_kind']) == {'official_commodity_futures_html'}
+
+
+def test_official_empty_interest_period_is_not_a_fake_settlement():
+    body = '<table><thead><tr><th>最後交易日</th><th>契約月份</th></tr></thead></table>'.encode()
+    result = parse_index_futures_final_settlement_html(body,
+        start_date=date(2026,1,1), end_date=date(2026,12,31), source_file='interest.html',
+        source_sha256='abc', source_url='https://www.taifex.com.tw/cht/5/interestRateFSP',
+        source_kind='official_interest_rate_futures_html', allowed_products=frozenset({'GBF','CPF'}))
+    assert result.is_empty()

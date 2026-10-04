@@ -4,16 +4,16 @@ import contextlib
 import dataclasses
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
-import shutil
 import stat
 import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from stockagent.data_sync.desync_snapshots import (
     DEFAULT_MAX_CLOCK_SKEW_SECONDS,
@@ -45,6 +45,7 @@ PACKED_HEAD_SCHEMA_VERSION = 1
 DEFAULT_LOOSE_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024
 DEFAULT_PACK_BUCKETS = 64
 DEFAULT_COMPRESSION_LEVEL = 6
+MAX_IN_MEMORY_PACK_VERIFY_BYTES = 64 * 1024 * 1024
 PACKED_ARCHIVE_FORMAT = "stockagent-path-bucket-zip-v1"
 INVENTORY_FORMAT = "jsonl-gzip-v1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -506,6 +507,11 @@ def initialize_packed_layout(
     replace_node_id: bool = False,
 ) -> str:
     sync_root = sync_root.resolve()
+    if (sync_root / ".stockagent-d-mount-required").exists():
+        raise SnapshotError(
+            f"D-backed cold volume is not mounted at {sync_root}; "
+            "refusing to recreate the packed store on the fallback filesystem"
+        )
     if git_root := _contains_git_metadata(sync_root):
         raise SnapshotError(
             f"sync root {sync_root} is inside Git worktree {git_root}; "
@@ -787,6 +793,31 @@ def _observed_stamps(
     return [HLC.from_mapping(item.manifest["hlc"]) for item in candidates]
 
 
+def _archive_d_primary_head(sync_root: Path, head_path: Path) -> str | None:
+    """Preserve the replaced head bytes when D is the only cold history."""
+
+    if not (sync_root / ".stockagent-d-primary").exists() or not head_path.exists():
+        return None
+    if head_path.is_symlink():
+        raise SnapshotError("D primary head is redirected")
+    from stockagent.data_sync.cold_primary import _check_d_primary_mount
+
+    _check_d_primary_mount(sync_root)
+    previous = head_path.read_bytes()
+    digest = hashlib.sha256(previous).hexdigest()
+    relative = Path("head-history") / head_path.relative_to(sync_root).with_suffix("") / f"{digest}.json"
+    archived = sync_root / relative
+    _ensure_shared_packed_directory(sync_root, archived.parent)
+    if archived.is_symlink():
+        raise SnapshotError("D primary head history is redirected")
+    if archived.exists():
+        if archived.read_bytes() != previous:
+            raise SnapshotError("D primary head history checksum collision")
+    else:
+        atomic_write_bytes(archived, previous)
+    return relative.as_posix()
+
+
 def publish_packed_snapshot(
     sync_root: Path,
     dataset: str,
@@ -802,6 +833,8 @@ def publish_packed_snapshot(
     maximum_file_bytes: int | None = None,
     repo_root: Path | None = None,
     recover_missing_base_objects: bool = False,
+    source_guard: Callable[[], None] | None = None,
+    defer_scan: bool = False,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     source = source.resolve()
@@ -831,12 +864,16 @@ def publish_packed_snapshot(
     # Publication and rolling-retention deletion must never race. Serializing
     # local publishes is cheap compared with hashing/packing and makes the
     # atomic head/object boundary explicit.
-    with _exclusive_lock(retention_lock), _exclusive_lock(lock_path):
+    with contextlib.ExitStack() as publication_locks:
+        publication_locks.enter_context(_exclusive_lock(retention_lock))
+        publication_locks.enter_context(_exclusive_lock(lock_path))
         entries, before = _collect_entries(
             source,
             excluded_subtrees=excluded,
             maximum_file_bytes=maximum_file_bytes,
         )
+        if source_guard is not None:
+            source_guard()
         staging_root = sync_root / ".local-state" / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
         previous: ResolvedSnapshot | None = None
@@ -997,6 +1034,11 @@ def publish_packed_snapshot(
                 "source tree changed while it was being packed; publish from a frozen "
                 "snapshot or under the downloader's dataset lock"
             )
+        # An optional producer proof binds these fully hashed source bytes to
+        # the inputs used to build their derived tables. It supplements, never
+        # replaces, the complete inventory and source-stability checks above.
+        if source_guard is not None:
+            source_guard()
 
         # The immutable inventory is the semantic dataset identity.  Reusing
         # the previous release when it is identical prevents a no-op publish
@@ -1009,6 +1051,10 @@ def publish_packed_snapshot(
         ):
             if recover_missing_base_objects:
                 verify_packed_snapshot(sync_root, previous)
+            # Transport does not read mutable source bytes. A no-op must not
+            # retain global publication locks through external scan requests.
+            publication_locks.close()
+            _notify_packed_publication(sync_root, dataset, defer_scan=defer_scan, retry_full=True)
             return previous
 
         wall_time_ns = time.time_ns()
@@ -1150,13 +1196,43 @@ def publish_packed_snapshot(
         }
         head_path = sync_root / "heads" / dataset / f"{publisher_node}.json"
         _ensure_shared_packed_directory(sync_root, head_path.parent)
+        archived_head = _archive_d_primary_head(sync_root, head_path)
+        if source_guard is not None:
+            source_guard()
         atomic_write_json(head_path, head)
-        return ResolvedSnapshot(
+        published = ResolvedSnapshot(
             manifest=manifest,
             manifest_path=manifest_path,
             manifest_sha256=manifest_sha,
             head_path=head_path,
         )
+        scan_paths = tuple(
+            str(created_objects[digest]["relpath"])
+            for digest in sorted(newly_installed_hashes)
+        ) + (() if inventory_already_present else (inventory_relpath.as_posix(),))
+        if archived_head is not None:
+            scan_paths += (archived_head,)
+    _notify_packed_publication(sync_root, dataset, new_object_paths=scan_paths, defer_scan=defer_scan)
+    return published
+
+
+def _notify_packed_publication(
+    sync_root: Path, dataset: str, *, new_object_paths: tuple[str, ...] = (),
+    defer_scan: bool = False, retry_full: bool = False,
+) -> None:
+    from stockagent.data_sync.syncthing_scan import queue_after_publish, scan_after_publish
+
+    if defer_scan:
+        # The caller can release its source lease only after this durable
+        # notification and the unique commit receipt have both succeeded.
+        if not queue_after_publish(sync_root, dataset, new_object_paths=new_object_paths):
+            raise SnapshotError("publication committed but durable scan intent was not queued")
+    else:
+        acknowledged = scan_after_publish(
+            sync_root, dataset, new_object_paths=new_object_paths, retry_full=retry_full,
+        )
+        if not acknowledged and (sync_root / ".local-state/scan-pending" / f"{dataset}.json").exists():
+            raise SnapshotError("publication committed but a newer scan notification remains pending")
 
 
 def _load_inventory(
@@ -1256,6 +1332,7 @@ def verify_packed_snapshot(
     resolved: ResolvedSnapshot,
     *,
     materialized_path: Path | None = None,
+    reconstruct_paths: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     sync_root = sync_root.resolve()
     manifest = resolved.manifest
@@ -1267,10 +1344,36 @@ def verify_packed_snapshot(
     _validate_object_presence(sync_root, manifest)
     entries = _load_inventory(sync_root, manifest)
     inventory_result = _validate_inventory(manifest, entries)
+    selected_paths = set(reconstruct_paths) if reconstruct_paths is not None else None
+    file_rows = (
+        {row["path"]: row for row in entries if row["kind"] == "file"}
+        if selected_paths is not None else {}
+    )
+    if selected_paths is not None and not selected_paths.issubset(file_rows):
+        raise SnapshotError(
+            "reconstruction request contains a non-file or unknown inventory path"
+        )
+    selected_by_object: dict[str, list[dict[str, Any]]] = {}
+    for relative in sorted(selected_paths or ()):
+        row = file_rows[relative]
+        selected_by_object.setdefault(row["storage"]["object_sha256"], []).append(row)
+    reconstructed_files = 0
     verified_bytes = 0
     for item in manifest["archive"]["objects"]:
         path = _path_under(sync_root, str(item["relpath"]), "object relpath")
-        actual = sha256_file(path)
+        # Packs are already size-checked above.  For a bounded pack, use the
+        # same immutable bytes for SHA-256 and ZIP CRC instead of reading the
+        # cold volume twice.  Large packs and blobs keep the streaming path.
+        pack_bytes = (
+            path.read_bytes()
+            if item["kind"] == "pack"
+            and int(item["bytes"]) <= MAX_IN_MEMORY_PACK_VERIFY_BYTES
+            else None
+        )
+        actual = (
+            hashlib.sha256(pack_bytes).hexdigest()
+            if pack_bytes is not None else sha256_file(path)
+        )
         if actual != item["sha256"]:
             raise SnapshotError(
                 f"packed object checksum mismatch: expected {item['sha256']}, got {actual}"
@@ -1279,10 +1382,30 @@ def verify_packed_snapshot(
         if item["kind"] == "pack":
             expected_names = inventory_result["object_members"][str(item["sha256"])]
             try:
-                with zipfile.ZipFile(path, mode="r") as archive:
+                source = io.BytesIO(pack_bytes) if pack_bytes is not None else path
+                with zipfile.ZipFile(source, mode="r") as archive:
                     names = archive.namelist()
                     bad_member = archive.testzip()
-            except (OSError, zipfile.BadZipFile) as exc:
+                    # Reuse these already-hashed immutable pack bytes, rather
+                    # than reopen a DrvFs/HDD pack per small cached file.
+                    for row in selected_by_object.get(str(item["sha256"]), ()):
+                        digest = hashlib.sha256()
+                        decoded_size = 0
+                        with archive.open(
+                            str(row["storage"]["member"]), mode="r"
+                        ) as stream:
+                            while chunk := stream.read(8 * 1024 * 1024):
+                                decoded_size += len(chunk)
+                                digest.update(chunk)
+                        if (
+                            decoded_size != int(row["size"])
+                            or digest.hexdigest() != row["sha256"]
+                        ):
+                            raise SnapshotError(
+                                f"exact cold reconstruction failed: {row['path']}"
+                            )
+                        reconstructed_files += 1
+            except (OSError, KeyError, zipfile.BadZipFile) as exc:
                 raise SnapshotError(f"invalid ZIP pack {path}: {exc}") from exc
             if item.get("member_selection") == "subset":
                 if not _is_ordered_subset(expected_names, names):
@@ -1293,6 +1416,13 @@ def verify_packed_snapshot(
                 raise SnapshotError(f"ZIP member list differs from inventory: {path}")
             if bad_member is not None:
                 raise SnapshotError(f"ZIP CRC check failed for {bad_member} in {path}")
+        else:
+            for row in selected_by_object.get(str(item["sha256"]), ()):
+                if actual != row["sha256"] or int(item["bytes"]) != int(row["size"]):
+                    raise SnapshotError(
+                        f"exact cold blob reconstruction failed: {row['path']}"
+                    )
+                reconstructed_files += 1
     result: dict[str, Any] = {
         "snapshot_id": manifest["snapshot_id"],
         "manifest_sha256": resolved.manifest_sha256,
@@ -1301,6 +1431,10 @@ def verify_packed_snapshot(
         "verified_object_bytes": verified_bytes,
         "materialized_verified": False,
     }
+    if selected_paths is not None:
+        if reconstructed_files != len(selected_paths):
+            raise SnapshotError("not every requested file was reconstructed")
+        result["independently_reconstructed_files"] = reconstructed_files
     if materialized_path is not None:
         _verify_materialized(materialized_path, manifest, entries)
         result["materialized_verified"] = True

@@ -17,6 +17,9 @@ import sys
 import time
 
 from downloader.artifact_io import sha256_file
+from stockagent.ocr.fastpath import (
+    ComponentBoundary, ExactDetPreprocess, GPUDetPreprocess, InferenceCall, Optimizations, TimedCall,
+)
 
 NATIVE_THREAD_VARIABLES = (
     "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
@@ -31,6 +34,7 @@ class ExecutionBudget:
     cpu_cores: int = 4
     nice: int = 10
     gpu_memory_mb: int = 2048  # Per ONNX session arena, not total device memory.
+    model_memory_mb: dict | None = None
     min_free_gpu_mb: int = 2048
     disable_thp: bool = True
 
@@ -48,10 +52,19 @@ class ExecutionBudget:
             value = getattr(self, name)
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"invalid OCR execution budget: {name}")
+        if self.model_memory_mb is not None:
+            if (type(self.model_memory_mb) is not dict or not self.model_memory_mb
+                    or not set(self.model_memory_mb) <= {'Det', 'Rec', 'Cls'}
+                    or any(type(v) is not int or not 128 <= v <= 131072 for v in self.model_memory_mb.values())):
+                raise ValueError('invalid per-model GPU memory budget')
+
+
+def rapidocr_runtime(config_path):
+    return _rapidocr_runtime(str(Path(config_path).resolve()))
 
 
 @cache
-def rapidocr_runtime(config_path):
+def _rapidocr_runtime(config_path):
     """Verify retained models/packages before importing an inference engine.
 
 Legacy CPU configuration and receipt fields are deliberately kept compatible.
@@ -77,6 +90,23 @@ An execution block opts into the bounded runner and a separate fingerprint.
         raise ValueError("bind exactly one ONNX runtime and all OCR packages")
     if "execution" in config:
         budget = ExecutionBudget(**config["execution"])
+        optimization = Optimizations(**config.get("optimizations", {}))
+        compact = config.get("compact_rec_model")
+        if optimization.compact_ctc:
+            if (not compact or compact.get("source_sha256") != hashes['Rec']
+                    or compact.get('recipe') != 'ctc_argmax_max_nan_v1'
+                    or sha256_file(Path(compact['path'])) != compact['sha256']):
+                raise ValueError('compact CTC model provenance mismatch')
+        elif compact:
+            raise ValueError('compact recognition model requires compact_ctc')
+        det_model = config.get('uint8_det_model')
+        if optimization.gpu_det_normalize:
+            if (not det_model or det_model.get('source_sha256') != hashes['Det']
+                    or det_model.get('recipe') != 'uint8_nhwc_exact_normalization_lut_v1'
+                    or sha256_file(Path(det_model['path'])) != det_model['sha256']):
+                raise ValueError('GPU detector model provenance mismatch')
+        elif det_model:
+            raise ValueError('uint8 detector requires gpu_det_normalize')
         if budget.device == "cuda" and runtime_packages != {"onnxruntime-gpu"}:
             raise ValueError("CUDA OCR requires the pinned onnxruntime-gpu distribution")
         # Mixing binary modules from two isolated directories cannot be repaired
@@ -97,8 +127,15 @@ An execution block opts into the bounded runner and a separate fingerprint.
     runtime = dict(engine="rapidocr", packages=installed, model_sha256=hashes,
                    config_sha256=sha256_file(config_path))
     if "execution" in config:
-        runtime.update(execution=asdict(budget), implementation="bounded_rapidocr_v1",
-                       implementation_sha256=sha256_file(Path(__file__)))
+        runtime.update(execution=asdict(budget), implementation="bounded_rapidocr_v2",
+                       optimizations=asdict(optimization),
+                       implementation_sha256=sha256_file(Path(__file__)),
+                       implementation_files_sha256={name: sha256_file(Path(__file__).with_name(name))
+                           for name in ['rapidocr.py', 'fastpath.py']})
+        if compact:
+            runtime['compact_rec_model'] = compact
+        if det_model:
+            runtime['uint8_det_model'] = det_model
     return config, runtime
 
 
@@ -128,7 +165,7 @@ def require_provider(session, device):
 
 def summarize_profile(path):
     """Actual executed nodes, distinct from an advertised provider list."""
-    counts, duration, cpu_compute = Counter(), Counter(), Counter()
+    counts, duration, cpu_compute, optimized = Counter(), Counter(), Counter(), Counter()
     for event in json.loads(Path(path).read_text()):
         args = event.get("args", {})
         provider = args.get("provider")
@@ -137,11 +174,13 @@ def summarize_profile(path):
         counts[provider] += 1
         duration[provider] += event.get("dur", 0)
         op = args.get("op_name", "")
+        if 'stockagent_' in event.get('name', ''):
+            optimized[provider + ':' + op] += 1
         if provider == "CPUExecutionProvider" and any(k in op for k in ("Conv", "MatMul", "Gemm", "LSTM")):
             cpu_compute[op] += 1
     return {"path": str(path), "sha256": sha256_file(path),
             "node_events": dict(counts), "node_duration_us": dict(duration),
-            "cpu_neural_compute": dict(cpu_compute)}
+            "cpu_neural_compute": dict(cpu_compute), 'optimization_nodes':dict(optimized)}
 
 
 class RapidOCRRunner:
@@ -154,12 +193,16 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
     def __init__(self, config_path, *, profile_dir=None):
         config, runtime = rapidocr_runtime(config_path)
         self.budget = ExecutionBudget(**config["execution"])
+        self.optimizations = Optimizations(**config.get('optimizations', {}))
         self.owner_pid = os.getpid()
         self.closed = False
         self.lock = None
         self.sessions = {}
         self.calls = 0
         self.elapsed_s = 0.0
+        self.events = []
+        self.stage_totals = Counter()
+        self.transfer_totals = Counter()
         self.profile_dir = Path(profile_dir) if profile_dir is not None else None
         self.runtime = dict(runtime)
         started = time.perf_counter()
@@ -227,6 +270,7 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
             opts.intra_op_num_threads = budget.cpu_threads
             opts.inter_op_num_threads = 1
             opts.enable_cpu_mem_arena = False
+            opts.enable_mem_pattern = self.optimizations.memory_pattern
             opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
             opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
             if self.profile_dir:
@@ -236,17 +280,35 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
             if budget.device == "cuda":
                 providers.insert(0, ("CUDAExecutionProvider", {
                     "device_id": budget.device_id,
-                    "gpu_mem_limit": budget.gpu_memory_mb * 1024**2,
+                    "gpu_mem_limit": (budget.model_memory_mb or {}).get(name, budget.gpu_memory_mb) * 1024**2,
                     "arena_extend_strategy": "kSameAsRequested",
-                    "cudnn_conv_algo_search": "HEURISTIC",
-                    "cudnn_conv_use_max_workspace": "0",
-                    "use_tf32": "0", "do_copy_in_default_stream": "1",
+                    "cudnn_conv_algo_search": self.optimizations.conv_search,
+                    "cudnn_conv_use_max_workspace": str(int(self.optimizations.conv_workspace)),
+                    "use_tf32": str(int(self.optimizations.use_tf32)), "do_copy_in_default_stream": "1",
                 }))
-            session = ort.InferenceSession(entry["path"], sess_options=opts, providers=providers)
+            model_path = config['compact_rec_model']['path'] if name == 'Rec' and self.optimizations.compact_ctc else entry['path']
+            if name == 'Det' and self.optimizations.gpu_det_normalize:
+                model_path = config['uint8_det_model']['path']
+            session = ort.InferenceSession(model_path, sess_options=opts, providers=providers)
             require_provider(session, budget.device)
             self.sessions[name] = session
+        self.runtime['model_compute_precision'] = {
+            name: session.get_modelmeta().custom_metadata_map.get('stockagent_compute_precision', 'fp32')
+            for name, session in self.sessions.items()}
         if "character" not in self.sessions["Rec"].get_modelmeta().custom_metadata_map:
             raise ValueError("retained recognition model lacks its character dictionary; downloads are forbidden")
+        if self.optimizations.compact_ctc:
+            meta = self.sessions['Rec'].get_modelmeta().custom_metadata_map
+            if (meta.get('stockagent_ctc_source_sha256') != config['models']['Rec']['sha256']
+                    or meta.get('stockagent_ctc_recipe') != config['compact_rec_model']['recipe']):
+                raise ValueError('compact CTC embedded source provenance mismatch')
+        det_lut_sha256 = None
+        if self.optimizations.gpu_det_normalize:
+            meta = self.sessions['Det'].get_modelmeta().custom_metadata_map
+            if (meta.get('stockagent_det_source_sha256') != config['models']['Det']['sha256']
+                    or meta.get('stockagent_det_recipe') != config['uint8_det_model']['recipe']):
+                raise ValueError('GPU detector embedded source provenance mismatch')
+            det_lut_sha256 = meta['stockagent_det_lut_sha256']
         from rapidocr import RapidOCR
         from omegaconf import flag_override
         sessions = self.sessions
@@ -260,6 +322,39 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
                 return cfg
 
         self.engine = RetainedSessionsOCR(params=_parameters(config))
+        run_options = None
+        if budget.device == 'cuda' and self.optimizations.arena_shrink:
+            run_options = ort.RunOptions()
+            run_options.add_run_config_entry('memory.enable_memory_arena_shrinkage', f'gpu:{budget.device_id}')
+        for name, attr in [('Det', 'text_det'), ('Cls', 'text_cls'), ('Rec', 'text_rec')]:
+            component = getattr(self.engine, attr)
+            component.session = InferenceCall(self.sessions[name], name, self.events,
+                compact=name == 'Rec' and self.optimizations.compact_ctc, run_options=run_options,
+                batch_width_budget=self.optimizations.rec_batch_width_budget if name == 'Rec' else 0,
+                shrink_per_page=self.optimizations.arena_shrink_per_page)
+            if hasattr(component, 'postprocess_op'):
+                component.postprocess_op = TimedCall(component.postprocess_op, name+'.postprocess', self.events)
+        native_preprocess = self.engine.text_det.get_preprocess
+
+        def get_preprocess(*args):
+            operation = native_preprocess(*args)
+            if self.optimizations.det_normalize_lut:
+                operation = ExactDetPreprocess(operation)
+            elif self.optimizations.gpu_det_normalize:
+                operation = GPUDetPreprocess(operation, det_lut_sha256)
+            return TimedCall(operation, 'Det.preprocess', self.events)
+
+        self.engine.text_det.get_preprocess = get_preprocess
+        if self.optimizations.arena_shrink_per_page:
+            for method, component, batch in [
+                ('detect_and_crop', self.engine.text_det, 1),
+                ('cls_and_rotate', self.engine.text_cls, self.engine.text_cls.cls_batch_num),
+                ('recognize_txt', self.engine.text_rec, self.engine.text_rec.rec_batch_num),
+            ]:
+                setattr(self.engine, method, ComponentBoundary(getattr(self.engine, method),
+                    component.session, batch, detector=method == 'detect_and_crop'))
+        for name in ['load_img', 'preprocess_img', 'crop_text_regions', 'build_final_output']:
+            setattr(self.engine, name, TimedCall(getattr(self.engine, name), name, self.events))
         self.process_budget = dict(
             cpu_affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
             nice=os.getpriority(os.PRIO_PROCESS, 0) if hasattr(os, "getpriority") else None,
@@ -271,11 +366,17 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
             raise RuntimeError("OCR session must be used by its live owning process")
         for session in self.sessions.values():
             require_provider(session, self.budget.device)
+        self.events.clear()
         started = time.perf_counter()
         result = self.engine(image)
         self.last_call = dict(wall_s=time.perf_counter() - started,
                               stages_s=[float(x) if x is not None else None for x in result.elapse_list],
-                              device=self.budget.device)
+                              device=self.budget.device, operations=list(self.events))
+        for event in self.events:
+            self.stage_totals[event['stage']] += event['wall_s']
+            for key in ['input_bytes', 'output_bytes']:
+                if key in event:
+                    self.transfer_totals[event['stage']+'.'+key] += event[key]
         self.calls += 1
         self.elapsed_s += self.last_call["wall_s"]
         return result
@@ -290,9 +391,16 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
                 for name, profile in profiles.items():
                     if not profile["node_events"].get("CUDAExecutionProvider") or profile["cpu_neural_compute"]:
                         raise RuntimeError(f"{name}: GPU neural execution not established by profile")
+                required = {'Det': ['Gather'] if self.optimizations.gpu_det_normalize else [],
+                            'Rec': ['ArgMax', 'ReduceMax'] if self.optimizations.compact_ctc else []}
+                for name, ops in required.items():
+                    for op in ops:
+                        if not profiles[name]['optimization_nodes'].get('CUDAExecutionProvider:'+op):
+                            raise RuntimeError(f'{name}: optimized {op} did not execute on GPU')
         return dict(runtime=self.runtime, owner_pid=self.owner_pid,
                     initialization_s=self.initialization_s, pages_inferred=self.calls,
                     inference_wall_s=self.elapsed_s,
+                    stages_s=dict(self.stage_totals), tensor_bytes=dict(self.transfer_totals),
                     process_budget=self.process_budget,
                     providers={k: s.get_providers() for k, s in self.sessions.items()}, profiles=profiles)
 
@@ -300,13 +408,24 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
         self.closed = True
         self.sessions.clear()
         self.engine = None
+        # Bound-method timing hooks form cycles inside RapidOCR. Reclaim them
+        # before releasing device ownership, not at an arbitrary later GC.
+        import gc
+        gc.collect()
         if self.lock is not None:
             self.lock.close()
             self.lock = None
 
 
-@cache
 def rapidocr_engine(config_path, profile_dir=None):
+    # A Path versus str, omitted versus explicit None, or relative versus
+    # absolute paths must not accidentally create a second CUDA owner.
+    return _rapidocr_engine(str(Path(config_path).resolve()),
+        str(Path(profile_dir).resolve()) if profile_dir is not None else None)
+
+
+@cache
+def _rapidocr_engine(config_path, profile_dir):
     config, _ = rapidocr_runtime(config_path)
     if "execution" in config:
         return RapidOCRRunner(config_path, profile_dir=profile_dir)

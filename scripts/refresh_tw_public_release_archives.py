@@ -17,10 +17,16 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from downloader.release_archive_io import read_release_resume_state  # noqa: E402
+
 ARCHIVES = ("dgbas_release_vintages", "cbc_fx_reserve_release_vintages",
             "cbc_money_release_vintages", "cbc_overnight_official_pages")
 SCRIPTS = {
@@ -34,15 +40,9 @@ SCRIPTS = {
 def _money_recent_pages(root: Path, *, full_index: bool) -> int:
     if full_index:
         return 0
-    try:
-        state = json.loads((root / "state" / "cbc_money_release_vintages.json").read_text(
-            encoding="utf-8"
-        ))
-        if state.get("complete") is True and state.get("status") == "complete":
-            return 2
-    except (OSError, ValueError, TypeError):
-        pass
-    return 0
+    # Planning hint only. The collector revalidates every pinned source under
+    # its writer lock; a checkpoint never changes current health/completeness.
+    return 2 if read_release_resume_state(root, "cbc_money_release_vintages") else 0
 
 
 def _mof_recent_pages(root: Path) -> int:
@@ -77,18 +77,41 @@ def _command(name: str, root: Path, *, money_recent_pages: int) -> list[str]:
 
 
 @contextmanager
-def _source_update_lock(root: Path):
+def _source_update_lock(root: Path, *, wait_seconds: float = 120.0):
     # Share the canonical TW-public producer lock with the completed-session
     # finalizer and publication sweep. An overlapping build must never take a
     # source receipt while originals are being promoted underneath it.
     path = root.parent / ".locks" / "tw-public-refresh.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
+        started = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() - started >= wait_seconds:
+                    raise RuntimeError(
+                        "Taiwan public source update remained busy after "
+                        f"{wait_seconds:g} seconds; retry later"
+                    ) from exc
+                remaining = wait_seconds - (time.monotonic() - started)
+                time.sleep(min(0.1, max(0.0, remaining)))
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("Taiwan public source update is already active; retry later") from exc
-        try:
+            print(
+                "[tw-public-release-archives] "
+                f"source_lock_wait_seconds={time.monotonic() - started:.3f}",
+                flush=True,
+            )
+            # A producer may have held the lock across the protected opening
+            # boundary. Recheck after acquisition, not only at systemd start.
+            subprocess.run(
+                ["/usr/bin/bash", str(REPO_ROOT / "scripts" /
+                 "run_outside_tw_opening_resource_window.sh"),
+                 "--minimum-runway-minutes", "45"],
+                cwd=REPO_ROOT,
+                check=True,
+            )
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -185,6 +208,12 @@ def _refresh(root: Path, commands: dict[str, list[str]]) -> None:
         [sys.executable, str(REPO_ROOT / "scripts" /
          "build_tw_public_research_taifex.py"),
          "--base-path", str(root / "features" / "tw_public_research_wide_2014_v1.parquet")],
+        cwd=REPO_ROOT, check=True,
+    )
+    subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" /
+         "build_tw_public_research_all_features.py"),
+         "--official-path", str(root / "features" / "tw_public_stock_daily.parquet")],
         cwd=REPO_ROOT, check=True,
     )
 

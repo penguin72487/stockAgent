@@ -26,7 +26,8 @@ done
 mkdir -p "$repo_root/artifacts/live/data_monitor"
 chmod 0755 \
     "$repo_root/scripts/run_data_refresh_status_snapshot.sh" \
-    "$repo_root/scripts/snapshot_data_refresh_services.py"
+    "$repo_root/scripts/snapshot_data_refresh_services.py" \
+    "$repo_root/scripts/wait_public_dashboard_ready.sh"
 systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 systemctl daemon-reload

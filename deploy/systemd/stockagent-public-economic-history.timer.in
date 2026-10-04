@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume bounded public economic histories including closed-market days
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=60
+Persistent=true
+Unit=stockagent-public-economic-history.service
+
+[Install]
+WantedBy=timers.target

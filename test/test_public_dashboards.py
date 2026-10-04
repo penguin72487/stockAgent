@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from http.client import HTTPConnection
 import json
@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from scripts import snapshot_data_refresh_services as snapshot_service
 from scripts.serve_public_dashboards import (
     InvalidPublicRequest,
     PublicRouteNotFound,
@@ -57,6 +58,31 @@ def test_public_projections_fail_closed_on_non_simulation_payload() -> None:
         )
     with pytest.raises(UnsafePublicDashboardPayload):
         sanitize_tw_status({"simulation_only": True, "production_order_possible": True})
+
+
+def test_tw_status_keeps_opening_timing_history_without_repeating_mode_receipts() -> None:
+    source = {
+        "simulation_only": True,
+        "production_order_possible": False,
+        "opening_signal_latency": {
+            "modes": [{"market": "today", "ready_from_0900_ms": 800}],
+            "trend": [
+                {
+                    "session_date": "2026-09-22",
+                    "final_ready_ms": 800,
+                    "failure_count": 1,
+                    "modes": [{"market": "historical", "ready_from_0900_ms": 800}],
+                    "failures": [{"reason": "source"}],
+                }
+            ],
+        },
+    }
+    public = sanitize_tw_status(source)["opening_signal_latency"]
+    assert public["modes"][0]["market"] == "today"
+    assert public["trend"] == [
+        {"session_date": "2026-09-22", "final_ready_ms": 800, "failure_count": 1}
+    ]
+    assert source["opening_signal_latency"]["trend"][0]["modes"][0]["market"] == "historical"
 
 
 def test_taifex_public_projection_removes_local_receipts() -> None:
@@ -309,6 +335,7 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
             "rows": [
                 {
                     "signal_id": "private",
+                    "signal_source_path": "/private/model/summary.json",
                     "symbol": "2330",
                     "bid": float("nan"),
                     "counterfactual_overnight_replay": True,
@@ -353,11 +380,39 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
         )
 
 
+def test_tw_signal_nested_scrub_keeps_security_rules_after_key_cache_hits() -> None:
+    long_private_key = "x" * 129 + "_path"
+    payload = {
+        "simulation_only": True,
+        "production_order_possible": False,
+        "feature_drivers_by_signal": {
+            "public-row": {
+                "drivers": [{
+                    "feature": "volume",
+                    "api_key": "secret",
+                    "private_key": "secret",
+                    "source_path": "/private/file",
+                    long_private_key: "/private/long-key",
+                    "data_error": "private traceback",
+                }],
+            },
+        },
+    }
+    first = sanitize_tw_signals(payload)
+    second = sanitize_tw_signals(payload)
+    assert first == second
+    record = first["feature_drivers_by_signal"]["public-row"]["drivers"][0]
+    assert record == {"feature": "volume", "data_error": "unavailable"}
+
+
 def test_tw_event_projection_enforces_simulation_and_scrubs_ids() -> None:
     public = sanitize_tw_events(
         {
             "simulation_only": True,
             "production_order_possible": False,
+            "scan_limit": 100_000,
+            "scan_limit_reached": True,
+            "source_rows_scanned": {"orders": 100_000, "fills": 4},
             "rows": [
                 {
                     "order_id": "private-order",
@@ -369,6 +424,9 @@ def test_tw_event_projection_enforces_simulation_and_scrubs_ids() -> None:
         }
     )
     assert public["rows"] == [{"symbol": "2330", "price": None}]
+    assert public["scan_limit_reached"] is True
+    assert public["scan_limit"] == 100_000
+    assert public["source_rows_scanned"] == {"orders": 100_000, "fills": 4}
     with pytest.raises(UnsafePublicDashboardPayload):
         sanitize_tw_events(
             {"simulation_only": False, "production_order_possible": False}
@@ -520,6 +578,12 @@ def test_public_signal_query_accepts_dashboard_date_contract() -> None:
     assert normalized == (
         "date=2026-08-13&mode=all&symbol=&status=all&offset=0&limit=250"
     )
+    deep_signals = PublicDashboardHandler._signal_query(
+        "date=2026-08-13&offset=1900000&limit=250"
+    )
+    assert "offset=1900000" in deep_signals
+    with pytest.raises(ValueError):
+        PublicDashboardHandler._signal_query("date=2026-08-13&offset=10000001")
     assert PublicDashboardHandler._date_query("date=2026-08-14") == "2026-08-14"
     with pytest.raises(ValueError):
         PublicDashboardHandler._date_query("date=2026-08-14&date=2026-08-13")
@@ -528,6 +592,12 @@ def test_public_signal_query_accepts_dashboard_date_contract() -> None:
         "date=2026-08-13&mode=all&symbol=&offset=250&limit=999"
     )
     assert events == "date=2026-08-13&mode=all&symbol=&offset=250&limit=250"
+    deep_events = PublicDashboardHandler._event_query(
+        "date=2026-08-13&offset=200000&limit=250"
+    )
+    assert "offset=200000" in deep_events
+    with pytest.raises(ValueError):
+        PublicDashboardHandler._event_query("date=2026-08-13&offset=10000001")
     ranged = PublicDashboardHandler._signal_query(
         "start_date=2026-08-13&end_date=2026-08-16&mode=all&status=all"
     )
@@ -550,11 +620,14 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=8"' in html
-    assert 'src="public.js?v=10"' in html
+    assert 'src="dashboard-core.js?v=11"' in html
+    assert 'src="public.js?v=13"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
+    assert 'id="finlab-health"' in html
+    assert 'id="finmind-health"' in html
+    assert 'id="tej-health"' in html
     assert 'id="openbb-health"' in html
     assert 'id="data-health"' in html
     assert 'id="traffic-health"' in html
@@ -565,6 +638,9 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     assert "shioaji/api/status" not in javascript
     assert '"流量保護"' in javascript
     assert "renderOpenbb(data.openbb || {})" in javascript
+    assert "renderFinlab(data.finlab || {})" in javascript
+    assert "renderFinmind(data.finmind || {})" in javascript
+    assert "renderTej(data.tej || {})" in javascript
     assert "renderDataMonitor(data.data_monitor || {})" in javascript
     assert "renderTraffic(data.traffic || {})" in javascript
     assert "textContent" in javascript
@@ -748,6 +824,50 @@ def test_compact_overnight_waiting_does_not_treat_scheduled_unfilled_entry_as_er
     assert payload["operational_issue_modes"] == 0
 
 
+def test_compact_tw_overview_uses_only_matching_engine_heartbeat(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "health": "waiting",
+                "updated_at": "2026-09-01T01:00:00+00:00",
+                "state_revision": 7,
+                "engine_run_id": "engine-one",
+                "simulation_only": True,
+                "production_order_possible": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = {
+        "schema_version": 1,
+        "state_revision": 7,
+        "engine_run_id": "engine-one",
+        "published_at": "2026-09-01T01:00:00+00:00",
+        "heartbeat_at": "2026-09-01T01:00:44+00:00",
+    }
+    sync_path = state_dir / "service_sync.json"
+    sync_path.write_text(json.dumps(receipt), encoding="utf-8")
+    observed = datetime.fromisoformat("2026-09-01T01:00:45+00:00")
+
+    current = build_compact_tw_overview_status(
+        state_dir, opening_gate_path=tmp_path / "missing-gate.json", now=observed
+    )
+    assert current["health"] == "waiting"
+    assert current["source_age_seconds"] == 1.0
+    assert current["source_commit_age_seconds"] == 45.0
+
+    receipt["engine_run_id"] = "different-run"
+    sync_path.write_text(json.dumps(receipt), encoding="utf-8")
+    mismatched = build_compact_tw_overview_status(
+        state_dir, opening_gate_path=tmp_path / "missing-gate.json", now=observed
+    )
+    assert mismatched["health"] == "stale"
+
+
 def test_compact_tw_overview_fails_closed_on_unsafe_receipt(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -776,7 +896,23 @@ def test_day_trade_clock_ends_at_auction_without_overnight_contract_details() ->
     assert re.findall(r"<time>([^<]+)</time>", timeline) == [
         "09:00", "盤中", "13:20", "13:24", "13:25", "13:30",
     ]
-    assert "沒有成交證據的部位仍顯示未平倉" in timeline
+    closing_step = re.search(r"<li><time>13:30</time>.*?</li>", timeline, re.DOTALL)
+    assert closing_step is not None
+    # Closing capacity was explicitly removed from the paper contract. Price
+    # provenance and deliverability still govern whether a position can close.
+    # Assert those requirements in the closing step, not obsolete generic copy.
+    for requirement in (
+        "收盤價不限容量紙上平倉",
+        "有效的當日官方收盤",
+        "非試撮收盤價格",
+        "不限制成交量",
+        "缺收盤價",
+        "停牌",
+        "未交付",
+        "仍顯示未平倉",
+        "不是券商成交回報",
+    ):
+        assert requirement in closing_step.group(0)
     assert '<template id="overnight-source-contract"><dl class="source-list">' in panel
     assert 'timeline.after(sourceTemplate.content.cloneNode(true))' in javascript
     assert "if (!IS_OVERNIGHT) return;" in javascript
@@ -801,6 +937,9 @@ def test_public_pages_share_visual_tokens() -> None:
         "taifex_dashboard/index.html": "taifex",
         "tw_day_trade_dashboard/index.html": "tw-day-trade",
         "shioaji_api_dashboard/index.html": "shioaji",
+        "finlab_dashboard/index.html": "finlab",
+        "finmind_dashboard/index.html": "finmind",
+        "tej_dashboard/index.html": "tej",
         "openbb_archive_dashboard/index.html": "openbb",
         "data_monitor_dashboard/index.html": "data-monitor",
         "traffic_dashboard/index.html": "traffic",
@@ -810,8 +949,8 @@ def test_public_pages_share_visual_tokens() -> None:
         assert "dashboard-core.css?v=6" in html
         assert "dashboard-responsive.css?v=9" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=8" defer' in html
-        assert html.index("dashboard-core.js?v=8") < html.index(
+        assert 'dashboard-core.js?v=11" defer' in html
+        assert html.index("dashboard-core.js?v=11") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -824,7 +963,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f'src="../time-axis.js?v={version}"' in html
     tw_html = (root / "tw_day_trade_dashboard/index.html").read_text(encoding="utf-8")
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in tw_html
-    assert 'src="chart-renderer.js?v=3"' in tw_html
+    assert 'src="chart-renderer.js?v=4"' in tw_html
     assert "https://" not in tw_html and "http://" not in tw_html
 
     shared_javascript = (root / "public_dashboards" / "dashboard-core.js").read_text(
@@ -954,6 +1093,8 @@ def test_public_pages_have_valid_accessible_static_shells() -> None:
         "taifex_dashboard/index.html",
         "tw_day_trade_dashboard/index.html",
         "shioaji_api_dashboard/index.html",
+        "finlab_dashboard/index.html",
+        "finmind_dashboard/index.html",
         "openbb_archive_dashboard/index.html",
         "data_monitor_dashboard/index.html",
         "traffic_dashboard/index.html",
@@ -989,6 +1130,81 @@ def _test_server() -> PublicDashboardServer:
     )
 
 
+def test_shioaji_status_reuses_recent_read_only_snapshot_and_falls_back(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from scripts import serve_public_dashboards as public_module
+
+    snapshot = tmp_path / "artifacts/live/data_monitor/shioaji_status.json"
+    payload = {
+        "dashboard_schema_version": 5,
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "health": "degraded",
+        "read_only": True,
+        "simulation_only": True,
+        "production_order_possible": False,
+        "pipelines": [{"id": "futures_history", "status": "waiting"}],
+    }
+    snapshot_service._atomic_json(snapshot, payload, compact=True, strict_json=True)
+    server = _test_server()
+    server.repo_root = tmp_path
+    called = []
+    monkeypatch.setattr(
+        public_module, "build_shioaji_public_status",
+        lambda _root: called.append(True) or {**payload, "health": "fallback"},
+    )
+    try:
+        assert json.loads(server.shioaji_status().body)["health"] == "degraded"
+        assert called == []
+        assert json.loads(server.shioaji_status().body)["health"] == "degraded"
+        assert called == []
+
+        snapshot_service._atomic_json(
+            snapshot,
+            {**payload, "generated_at_utc": (
+                datetime.now(UTC) - timedelta(minutes=2)
+            ).isoformat()},
+            compact=True, strict_json=True,
+        )
+        assert json.loads(server.shioaji_status().body)["health"] == "fallback"
+        assert called == [True]
+    finally:
+        server.server_close()
+
+
+def test_shioaji_snapshot_rejects_unsafe_or_nonfinite_projection(
+    tmp_path: Path,
+) -> None:
+    from scripts.serve_public_dashboards import _verified_recent_shioaji_status
+
+    snapshot = tmp_path / "artifacts/live/data_monitor/shioaji_status.json"
+    payload = {
+        "dashboard_schema_version": 5,
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "health": "waiting",
+        "read_only": True,
+        "simulation_only": True,
+        "production_order_possible": False,
+        "pipelines": [],
+    }
+    snapshot_service._atomic_json(snapshot, payload, compact=True)
+    assert _verified_recent_shioaji_status(tmp_path) is not None
+    snapshot_service._atomic_json(
+        snapshot, {**payload, "production_order_possible": True}, compact=True,
+    )
+    assert _verified_recent_shioaji_status(tmp_path) is None
+    snapshot.write_text(json.dumps(payload)[:-1] + ',"bad":NaN}', encoding="utf-8")
+    assert _verified_recent_shioaji_status(tmp_path) is None
+    snapshot_service._atomic_json(snapshot, payload, compact=True)
+    snapshot.chmod(0o666)
+    assert _verified_recent_shioaji_status(tmp_path) is None
+    snapshot.chmod(0o600)
+    original = snapshot.with_name("original.json")
+    snapshot.rename(original)
+    snapshot.symlink_to(original)
+    assert _verified_recent_shioaji_status(tmp_path) is None
+
+
 @pytest.mark.parametrize(
     ("path", "needle"),
     [
@@ -1014,6 +1230,224 @@ def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> No
         assert needle in response.body
     finally:
         server.server_close()
+
+
+def test_public_gateway_serves_finlab_page_and_assets() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        for path, content_type, needle in (
+            ("/finlab/", "text/html; charset=utf-8", b"FinLab API"),
+            ("/finlab/app.js", "text/javascript; charset=utf-8", b"quota-used"),
+            ("/finlab/styles.css", "text/css; charset=utf-8", b"finlab-table-scroll"),
+        ):
+            response = PublicDashboardHandler._static_response(handler, path)
+            assert response is not None
+            assert response.content_type == content_type
+            assert needle in response.body
+            if path in {"/finlab/", "/finlab/app.js"}:
+                assert response.cache_control == "no-cache, must-revalidate"
+        page = PublicDashboardHandler._static_response(handler, "/finlab/").body
+        assert b'app.js?v=15' in page
+        assert b'id="volume-progress"' in page
+        assert b'id="volume-total"' in page
+    finally:
+        server.server_close()
+
+
+def test_public_gateway_serves_finmind_page_and_assets() -> None:
+    server = _test_server()
+    try:
+        handler = SimpleNamespace(server=server)
+        for path, content_type, needle in (
+            ("/finmind/", "text/html; charset=utf-8", b"FinMind API"),
+            ("/finmind/app.js", "text/javascript; charset=utf-8", b"quota-used"),
+            ("/finmind/styles.css", "text/css; charset=utf-8", b"finlab-table-scroll"),
+        ):
+            response = PublicDashboardHandler._static_response(handler, path)
+            assert response is not None
+            assert response.content_type == content_type
+            assert needle in response.body
+            if path in {"/finmind/", "/finmind/app.js"}:
+                assert response.cache_control == "no-cache, must-revalidate"
+    finally:
+        server.server_close()
+
+
+def test_finmind_browser_renders_and_filters_without_provider_calls(protocol_server) -> None:
+    playwright = pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import Error as PlaywrightError
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+
+    now = "2026-09-25T08:00:00+00:00"
+    # This independent rolling quota chart must stay within its 1-day window
+    # and 12-minute continuity bound; dataset/session date identities stay fixed.
+    quota_now = datetime.now(UTC)
+    datasets = [
+        {"id": key, "label": label, "kind": kind, "state": state,
+         "target_partitions": target, "complete_partitions": complete,
+         "pending_partitions": target - complete, "deferred_partitions": 0,
+         "rows": rows, "local_bytes": size, "first_data_date": "2005-01-03",
+         "last_data_date": "2026-09-24", "last_receipt_at_utc": now,
+         "minimum_network_seconds_remaining": 1200 if kind == "session_history" else None}
+        for key, label, kind, state, target, complete, rows, size in [
+            ("TaiwanStockStatisticsOfOrderBookAndTrade", "全市場委託與成交統計", "session_history", "backfilling", 100, 5, 1000, 6000),
+            ("TaiwanVariousIndicators5Seconds", "全市場盤中指標", "session_history", "backfilling", 100, 4, 900, 5000),
+            ("TaiwanStockTradingDate", "台股交易日曆", "reference", "complete", 1, 1, 100, 400),
+            ("TaiwanStockInfoWithWarrant", "權證主檔全表快照", "snapshot", "complete", 1, 1, 2000, 8000),
+        ]
+    ]
+    payload = {
+        "schema_version": 1, "generated_at_utc": now, "read_only": True,
+        "production_control_possible": False, "health": "updating", "status_age_seconds": 12,
+            "acquisition": {"state": "backfilling", "observed_at_utc": now,
+                            "total_session_day_tasks": 200, "complete_session_day_tasks": 9,
+                            "total_tasks": 202, "complete_tasks": 11, "pending_tasks": 191,
+                            "observed_empty_tasks": 0, "not_entitled_tasks": 0,
+                            "unknown_universe_datasets": 0,
+                        "pending_session_day_tasks": 191, "retry_deferred_tasks": 0,
+                        "minimum_network_seconds_remaining": 2292,
+                        "last_task": {"dataset": datasets[0]["id"], "date": "2026-09-24", "status": "complete", "rows": 271},
+                        "active_task": {"dataset": datasets[1]["id"], "date": "2026-09-23", "started_at_utc": now},
+                        "queue_preview": [{"dataset": datasets[1]["id"], "date": "2026-09-22"}],
+                        "news": "disabled_by_user"},
+        "quota": {"state": "complete_worker_window", "official_requests_per_hour": 300,
+                  "observed_requests_60m": 12, "worker_headroom_60m": 288,
+                  "tracking_started_at_utc": "2026-09-25T06:00:00+00:00",
+                  "history": [{"at_utc": (quota_now - timedelta(minutes=2)).isoformat(),
+                               "observed_requests_60m": 2},
+                              {"at_utc": (quota_now - timedelta(minutes=1)).isoformat(),
+                               "observed_requests_60m": 12}]},
+        "storage": {"local_bytes": 19400, "filesystem_free_bytes": 1000000000,
+                    "estimated_total_bytes": None},
+        "datasets": datasets,
+        "scope": {"cold_published": False},
+    }
+    try:
+        with playwright.sync_playwright() as p:
+            # Explicit 2D runtime workaround for this SVG page: WSL's default
+            # software-GL path can stall native rAF. This is not WebGL coverage.
+            browser = p.chromium.launch(**browser_profile_launch_options("cpu-2d"))
+            try:
+                for width in (1280, 390):
+                    page = browser.new_page(viewport={"width": width, "height": 800})
+                    page.route("**/finmind/api/status", lambda route: route.fulfill(
+                        status=200, content_type="application/json", body=json.dumps(payload)))
+                    page.goto(f"http://127.0.0.1:{protocol_server.port}/finmind/", wait_until="domcontentloaded")
+                    page.locator("#finmind-health").get_by_text("歷史回補進行中").wait_for(timeout=5000)
+                    assert page.locator("#pipeline-grid .pipeline-card").count() == 4
+                    assert "11 / 202" in page.locator("#download-progress-label").text_content()
+                    assert page.locator("#dataset-rows tr").count() == 4
+                    quota_series = page.locator("#quota-chart polyline.series")
+                    assert quota_series.count() == 1
+                    assert quota_series.get_attribute("points") == "58.00,218.69 926.00,212.16"
+                    assert page.locator("#quota-chart-empty").is_hidden()
+                    page.get_by_role("button", name="盤中歷史").click()
+                    assert page.locator("#pipeline-grid .pipeline-card").count() == 2
+                    page.get_by_role("button", name="主檔／日曆").click()
+                    assert page.locator("#pipeline-grid .pipeline-card").count() == 2
+                    page.get_by_role("button", name="全部", exact=True).click()
+                    assert page.locator("#pipeline-grid .pipeline-card").count() == 4
+                    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                    page.close()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc):
+            pytest.skip("Playwright Chromium is not installed")
+        raise
+
+
+def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) -> None:
+    playwright = pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import Error as PlaywrightError
+
+    payload = {
+        "health": "active", "monitor_age_seconds": 4, "quota_age_seconds": 6,
+        "quota": {}, "quota_history": [], "acquisition": {}, "release_gate": {},
+        "training": {}, "storage": {}, "datasets": [],
+        "workload": {
+            "state": "available", "generated_at_utc": "2026-09-28T02:00:00Z",
+            "transfer": {"completed_bytes": 60 * 1024 ** 2,
+                         "remaining_bytes_estimate": 60 * 1024 ** 2,
+                         "total_bytes_estimate": 120 * 1024 ** 2, "ratio": .5},
+            "unknown_transfer_keys": 0, "unknown_record_keys": 0,
+            "work_time": {"completed_seconds": 300, "remaining_seconds_estimate": 100,
+                          "total_seconds_estimate": 400, "unknown_keys": 0, "ratio": .75},
+            "records": [{"unit": "wide_values", "label": "寬表非空資料格",
+                         "local_count": 10000, "completed_count": 5000,
+                         "remaining_estimate": 5000, "total_estimate": 10000, "ratio": .5}],
+            "scenarios": {"reference": {"finish_at_utc": "2026-09-29T00:07:00Z",
+                                         "processing_seconds": 420, "quota_opening_wait_seconds": 78000}},
+        },
+    }
+    attempts = 0
+
+    def status_route(route):
+        nonlocal attempts
+        attempts += 1
+        if attempts in {1, 3}:
+            route.fulfill(status=503, content_type="application/json", body='{"error":"temporarily_unavailable"}')
+        elif attempts == 5:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({**payload, "datasets": [None]}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.route("**/finlab/api/status", status_route)
+                page.goto(f"http://127.0.0.1:{protocol_server.port}/finlab/", wait_until="domcontentloaded")
+                page.locator("#finlab-health").get_by_text("面板暫時無法讀取").wait_for(timeout=5000)
+                page.locator("#finlab-health").get_by_text("資料觀測正常").wait_for(timeout=8000)
+                assert attempts >= 2
+                assert "前前" not in page.locator("#finlab-freshness").inner_text()
+                assert page.locator("#pipeline-grid .pipeline-card").count() == 5
+                assert page.locator("#volume-downloaded").text_content() == "60 MiB"
+                assert page.locator("#volume-total").text_content() == "約 120 MiB"
+                assert page.locator("#volume-downloaded").is_visible()
+                # Read-only assertions must not depend on Chromium animation frames:
+                # headless WSL may suppress rAF, making scroll_into_view hang.
+                assert page.locator("#volume-progress-label").is_visible()
+                assert page.locator("#volume-progress-label").text_content() == "50.0% · 可估範圍"
+                assert page.locator("#volume-progress").get_attribute("value") == "0.5"
+                assert page.locator("#workload-time-progress").get_attribute("value") == "0.75"
+                assert "75.0%" in page.locator("#workload-time-ratio").text_content()
+                assert "2026" in page.locator("#download-global-eta").text_content()
+                assert "10,000" in page.locator("#workload-records").text_content()
+                assert "5,000" in page.locator("#workload-records").text_content()
+                assert page.locator("#download-progress").count() == 0
+                page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+                page.locator("#finlab-health").get_by_text("更新暫停，顯示上次資料").wait_for(timeout=5000)
+                assert page.locator("#pipeline-grid .pipeline-card").count() == 5
+                page.locator("#finlab-health").get_by_text("資料觀測正常").wait_for(timeout=8000)
+                assert attempts >= 4
+                page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+                page.locator("#finlab-health").get_by_text("資料顯示失敗").wait_for(timeout=5000)
+                assert attempts == 5
+            finally:
+                browser.close()
+    except PlaywrightError as error:
+        if "Executable doesn't exist" in str(error):
+            pytest.skip("Playwright Chromium is not installed")
+        raise
+
+
+def test_finlab_page_reuses_shioaji_information_architecture() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "services"
+    finlab = (root / "finlab_dashboard/index.html").read_text(encoding="utf-8")
+    shioaji = (root / "shioaji_api_dashboard/index.html").read_text(encoding="utf-8")
+    for section in ("pipelines", "traffic", "storage", "backfill", "capture", "method"):
+        assert f'id="{section}"' in finlab
+        assert f'id="{section}"' in shioaji
+    for component in ("pipeline-grid", "pipeline-toolbar", "kpi-grid", "storage-layout", "capture-card"):
+        assert component in finlab and component in shioaji
+    assert 'href="../shioaji/styles.css' in finlab
+    assert "單鍵估計耗時" in finlab
 
 
 def test_public_gateway_serves_traffic_performance_stylesheet() -> None:
@@ -1062,8 +1496,9 @@ def test_public_gateway_serves_shared_responsive_stylesheet() -> None:
         server.server_close()
 
 
-def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
+def test_data_monitor_summary_omits_heavy_detail_rows(tmp_path: Path) -> None:
     server = _test_server()
+    server.repo_root = tmp_path
     try:
         full = server.cached_local_json(
             cache_key="data-monitor-test-full",
@@ -1082,6 +1517,7 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
                 "record_inventory_progress": {"selected_files": 7, "inspected_files": 6},
                 "definitions": {"freshness": "fixture"},
                 "tw_public_acquisition": {"observation": {"registered": 159}},
+                "finlab_acquisition": {"downloaded": 7, "catalog_total": 20},
                 "groups": [{"id": "large"}],
                 "sources": [{"endpoint_id": "private-heavy-row"}],
             },
@@ -1091,6 +1527,7 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
         assert summary["summary"]["registered_items"] == 390
         assert summary["groups"] == [{"id": "large"}]
         assert summary["tw_public_acquisition"]["observation"]["registered"] == 159
+        assert summary["finlab_acquisition"] == {"downloaded": 7, "catalog_total": 20}
         assert summary["market_categories"] == [{"id": "crypto", "items": 5}]
         assert summary["record_inventory_progress"]["selected_files"] == 7
         assert "sources" not in summary
@@ -1099,6 +1536,214 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
         assert details["sources"] == [{"endpoint_id": "private-heavy-row"}]
         assert "summary" not in details
         assert "groups" not in details
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_provider_page_and_filtered_api(tmp_path: Path) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        handler = SimpleNamespace(server=server)
+        page = PublicDashboardHandler._static_response(
+            handler, "/data-monitor/providers/MOPS%20%2F%20%E5%85%AC%E9%96%8B/"
+        )
+        assert page is not None and b'provider.js' in page.body
+        assert PublicDashboardHandler._static_response(
+            handler, "/data-monitor/providers/../"
+        ) is None
+        script = PublicDashboardHandler._static_response(handler, "/data-monitor/provider.js")
+        assert script is not None and b"provider-name" in script.body
+        payload = server.cached_local_json(
+            cache_key="provider-fixture", ttl_seconds=60, cache_control="no-store",
+            builder=lambda: {
+                "read_only": True, "production_control_possible": False,
+                "sources": [
+                    {"id": "a", "provider": "FinMind", "operation_state": "complete",
+                     "in_active_scope": True},
+                    {"id": "b", "provider": "TWSE", "operation_state": "unable",
+                     "in_active_scope": True},
+                ],
+            },
+        )
+        server.data_monitor_status = lambda **_kwargs: payload  # type: ignore[method-assign]
+        selected = json.loads(server.data_monitor_provider("FinMind").body)
+        assert selected["provider"] == "FinMind"
+        assert [row["id"] for row in selected["sources"]] == ["a"]
+        assert selected["read_only"] is True
+        assert PublicDashboardHandler._provider_query("name=FinMind") == {
+            "provider": "FinMind", "offset": 0, "limit": 30,
+            "search": "", "operation": "all", "market": "all",
+        }
+        with pytest.raises(InvalidPublicRequest):
+            PublicDashboardHandler._provider_query("name=FinMind&name=TWSE")
+        with pytest.raises(PublicRouteNotFound):
+            server.data_monitor_provider("Missing")
+    finally:
+        server.server_close()
+
+
+def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) -> None:
+    playwright = pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import Error as PlaywrightError
+
+    rows = [
+        {"id": "finlab:price:收盤價", "endpoint_id": "finlab:price:收盤價", "title": "收盤價",
+         "provider": "FinLab", "market_category": "taiwan_public",
+         "market_category_label": "臺灣公開資料", "operation_state": "reference",
+         "registry_alias": True, "record_stats": {"state": "verified", "count": 100,
+         "first": "2014-01-02", "last": "2026-09-25"},
+         "acquisition_progress": {"state": "reference", "label": "請見目錄收據"}},
+        {"id": "finlab:price:開盤價", "endpoint_id": "finlab:price:開盤價", "title": "開盤價",
+         "provider": "FinLab", "market_category": "taiwan_public",
+         "market_category_label": "臺灣公開資料", "operation_state": "reference",
+         "registry_alias": True, "record_stats": {"state": "unverified", "count": None}},
+    ]
+
+    def provider_route(route):
+        from urllib.parse import parse_qs, urlparse
+        query = parse_qs(urlparse(route.request.url).query)
+        searched = [row for row in rows if query.get("q", [""])[0] in row["title"]]
+        offset = int(query.get("offset", ["0"])[0])
+        limit = int(query.get("limit", ["30"])[0])
+        result = {
+            "read_only": True, "generated_at_utc": "2026-09-26T01:00:00Z", "provider": "FinLab",
+            "summary": {"registered": 2, "active_endpoints": 0, "registry_aliases": 2,
+                        "operation_state_counts": {"reference": 2},
+                        "active_operation_state_counts": {},
+                        "inventory_state_counts": {"verified": 1, "unverified": 1},
+                        "market_categories": {"臺灣公開資料": 2},
+                        "market_category_options": {"taiwan_public": "臺灣公開資料"},
+                        "active_current_ratio": None},
+            "finlab_acquisition": {"downloaded": 1, "catalog_total": 2, "not_downloaded": 1},
+            "page": {"offset": offset, "limit": limit, "matched_total": len(searched),
+                     "has_more": offset + limit < len(searched)},
+            "sources": searched[offset:offset + limit],
+        }
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(result))
+
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                for width in (1280, 390):
+                    page = browser.new_page(viewport={"width": width, "height": 800})
+                    page.route("**/data-monitor/api/provider?*", provider_route)
+                    page.route("**/finlab/api/status", lambda route: route.fulfill(
+                        status=200, content_type="application/json",
+                        body=json.dumps({"quota": {"used_mb": 10, "limit_mb": 5000,
+                                                   "observed_at_utc": "2026-09-26T01:00:00Z"}})))
+                    page.goto(f"http://127.0.0.1:{protocol_server.port}/data-monitor/providers/FinLab/",
+                              wait_until="domcontentloaded")
+                    page.locator("#provider-name").get_by_text("FinLab").wait_for(timeout=8000)
+                    assert page.locator("#provider-ratio").text_content() == "不適用"
+                    assert page.locator("#provider-source-rows tr").count() == 2
+                    page.locator("#provider-source-search").fill("收盤")
+                    page.get_by_text("1/1 項符合結果").wait_for(timeout=8000)
+                    assert page.locator("#provider-source-rows tr").count() == 1
+                    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                    if width == 390:
+                        assert page.locator("#provider-source-rows td").first.evaluate(
+                            "element => getComputedStyle(element).display"
+                        ) == "flex"
+                    page.close()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc):
+            pytest.skip("Playwright Chromium is not installed")
+        raise
+
+
+@pytest.mark.parametrize("browser_test_name", [
+    "test_finmind_browser_renders_and_filters_without_provider_calls",
+    "test_finlab_browser_recovers_from_temporary_status_failure",
+    "test_provider_browser_deep_link_search_and_mobile_layout",
+])
+def test_browser_interaction_errors_are_not_environment_skips(
+    browser_test_name, monkeypatch,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    playwright = pytest.importorskip("playwright.sync_api")
+
+    def broken_navigation(*_args, **_kwargs):
+        raise playwright.Error("synthetic page navigation failure after browser launch")
+
+    page = SimpleNamespace(route=lambda *_args: None, goto=broken_navigation)
+    browser = SimpleNamespace(new_page=lambda **_kwargs: page, close=lambda: None)
+
+    @contextmanager
+    def fake_playwright():
+        yield SimpleNamespace(chromium=SimpleNamespace(launch=lambda **_kwargs: browser))
+
+    monkeypatch.setattr(playwright, "sync_playwright", fake_playwright)
+    with pytest.raises(playwright.Error, match="synthetic page navigation failure"):
+        globals()[browser_test_name](SimpleNamespace(port=1))
+
+
+def test_data_monitor_summary_uses_exact_producer_projection_and_rejects_stale_source(
+    tmp_path: Path,
+) -> None:
+    from scripts import serve_public_dashboards as public_module
+
+    source = tmp_path / "artifacts/live/data_monitor/public_status.json"
+    original = {
+        "schema_version": 8,
+        "generated_at_utc": "2026-09-25T00:00:00+00:00",
+        "health": "critical",
+        "read_only": True,
+        "production_control_possible": False,
+        "summary": {"registered_items": 3},
+        "sources": [{"id": "private-heavy-row"}],
+    }
+    snapshot_service._atomic_json(source, original, compact=True)
+    snapshot_service._write_public_summary_snapshot(source, original)
+    sidecar = source.with_name("public_summary.json")
+    server = _test_server()
+    server.repo_root = tmp_path
+    server.data_monitor_status = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("matching projection must not parse the full status")
+    )
+    try:
+        summary = json.loads(server.data_monitor_summary().body)
+        assert summary["health"] == "critical"
+        assert summary["summary"] == {"registered_items": 3}
+        assert "sources" not in summary
+        sidecar.chmod(0o666)
+        assert public_module._verified_data_monitor_summary(tmp_path) is None
+        sidecar.chmod(0o600)
+        assert public_module._verified_data_monitor_summary(tmp_path) == summary
+        original_sidecar = sidecar.with_name("public_summary.original.json")
+        sidecar.rename(original_sidecar)
+        sidecar.symlink_to(original_sidecar)
+        assert public_module._verified_data_monitor_summary(tmp_path) is None
+        replacement = {**original, "health": "degraded"}
+        snapshot_service._atomic_json(source, replacement, compact=True)
+        assert public_module._verified_data_monitor_summary(tmp_path) is None
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_summary_projection_falls_back_when_source_changes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "artifacts/live/data_monitor/public_status.json"
+    original = {
+        "schema_version": 8, "health": "critical", "read_only": True,
+        "production_control_possible": False, "summary": {"registered_items": 3},
+    }
+    snapshot_service._atomic_json(source, original, compact=True)
+    snapshot_service._write_public_summary_snapshot(source, original)
+    snapshot_service._atomic_json(
+        source, {**original, "health": "degraded"}, compact=True,
+    )
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        summary = json.loads(server.data_monitor_summary().body)
+        assert summary["health"] == "degraded"
     finally:
         server.server_close()
 
@@ -1120,6 +1765,234 @@ def test_data_monitor_features_reads_separate_read_only_snapshot(tmp_path: Path)
         }), encoding="utf-8")
         payload = json.loads(server.data_monitor_features().body)
         assert payload["rows"] == [{"dataset_id": "tw-public:twse_daily_ohlcv", "field": "close"}]
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_feature_page_filters_and_rebuilds_on_source_change(
+    tmp_path: Path,
+) -> None:
+    from scripts.serve_public_dashboards import PublicDashboardHandler, InvalidPublicRequest
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    try:
+        missing = json.loads(server.data_monitor_feature_page().body)
+        assert missing["summary"]["state"] == "waiting_inventory"
+        rows = [
+            {"field": name, "dataset_id": "tw:stock", "source_title": "台股",
+             "provider": "TWSE", "market_category": "taiwan_equity",
+             "market_category_label": "台股"}
+            for name in ("close", "volume", "open")
+        ]
+        payload = {
+            "schema_version": 1, "read_only": True,
+            "production_control_possible": False,
+            "summary": {"fields": 3, "state": "complete"}, "rows": rows,
+        }
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        first = json.loads(server.data_monitor_feature_page(limit=1).body)
+        assert first["matching_total"] == 3
+        assert len(first["rows"]) == 1
+        second = json.loads(server.data_monitor_feature_page(
+            offset=1, limit=2, revision=first["revision"],
+        ).body)
+        assert first["rows"] + second["rows"] == rows
+        searched = json.loads(server.data_monitor_feature_page(search="TWSE", limit=2).body)
+        assert searched["matching_total"] == 3
+        assert len(searched["rows"]) == 2
+        assert len(first["filters"]["sources"]) == 1
+        payload["rows"] = rows[:2]
+        payload["summary"]["fields"] = 2
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        updated = json.loads(server.data_monitor_feature_page(
+            offset=1, limit=2, revision=first["revision"],
+        ).body)
+        assert updated["reset_required"] is True
+        assert updated["offset"] == 0
+        assert updated["matching_total"] == 2
+        with pytest.raises(InvalidPublicRequest):
+            PublicDashboardHandler._feature_page_query("offset=2&limit=2")
+        assert PublicDashboardHandler._feature_page_query(
+            f"offset=1&revision={updated['revision']}"
+        )["offset"] == 1
+    finally:
+        server.server_close()
+
+
+def test_feature_first_page_uses_verified_preview_without_full_parse(
+    tmp_path: Path,
+) -> None:
+    from scripts import snapshot_data_refresh_services as snapshot_service
+    from stockagent.live.data_monitor_feature_pages import feature_page_preview
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    payload = {
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False,
+        "summary": {"fields": 2, "state": "complete"},
+        "rows": [
+            {"field": field, "dataset_id": "tw:stock", "source_title": "台股",
+             "provider": "TWSE", "market_category": "taiwan_equity",
+             "market_category_label": "台股"}
+            for field in ("close", "volume")
+        ],
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot_service._write_feature_reuse_receipt(
+        snapshot, 2, validated_contract=True, preview=feature_page_preview(payload),
+    )
+    def forbid_full_parse() -> None:
+        raise AssertionError("first page must not parse full source")
+
+    server._feature_index = forbid_full_parse
+    try:
+        first = json.loads(server.data_monitor_feature_page(limit=1).body)
+        assert first["matching_total"] == 2
+        assert first["rows"] == payload["rows"][:1]
+        assert first["has_more"] is True
+        assert server._feature_page_index is None
+        stale = json.loads(server.data_monitor_feature_page(
+            limit=1, revision="0" * 32,
+        ).body)
+        assert stale["reset_required"] is True
+        with pytest.raises(AssertionError, match="first page must not parse full source"):
+            server.data_monitor_feature_page(limit=1, search="close")
+    finally:
+        server.server_close()
+
+
+def test_feature_small_source_page_uses_bound_projection_or_full_fallback(
+    tmp_path: Path,
+) -> None:
+    from scripts import snapshot_data_refresh_services as snapshot_service
+    from stockagent.live.data_monitor_feature_pages import feature_page_projections
+    from stockagent.live.data_monitor_feature_receipt import feature_source_pages_path
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    rows = [
+        {"field": field, "dataset_id": source, "source_title": source,
+         "provider": "TWSE", "market_category": category,
+         "market_category_label": category}
+        for source, category, field in (
+            ("tw:stock", "taiwan_equity", "close"),
+            ("tw:stock", "taiwan_equity", "volume"),
+            ("crypto:minute", "crypto", "close"),
+        )
+    ]
+    payload = {
+        "schema_version": 1, "read_only": True,
+        "production_control_possible": False,
+        "summary": {"fields": 3, "state": "complete"}, "rows": rows,
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    preview, pages = feature_page_projections(payload)
+    snapshot_service._write_feature_reuse_receipt(
+        snapshot, 3, validated_contract=True, preview=preview, source_pages=pages,
+    )
+    original_full_index = server._feature_index
+
+    def forbid_full_parse() -> None:
+        raise AssertionError("small source must not parse the full snapshot")
+
+    server._feature_index = forbid_full_parse
+    try:
+        page = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=1, search="close",
+        ).body)
+        assert page["matching_total"] == 1
+        assert page["rows"] == rows[:1]
+        assert page["summary"]["fields"] == 3
+        assert page["read_only"] is True
+        assert page["production_control_possible"] is False
+        stale = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=1, offset=1, revision="0" * 32,
+        ).body)
+        assert stale["reset_required"] is True
+        assert stale["offset"] == 0
+        assert stale["rows"] == rows[:1]
+
+        sidecar = feature_source_pages_path(snapshot)
+        sidecar.write_bytes(sidecar.read_bytes().replace(b'"close"', b'"cloze"'))
+        server._feature_source_pages = None
+        with pytest.raises(AssertionError, match="must not parse"):
+            server.data_monitor_feature_page(source="tw:stock", limit=1)
+        server._feature_index = original_full_index
+        fallback = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=1,
+        ).body)
+        assert fallback["rows"] == rows[:1]
+
+        payload["rows"] = rows[:1]
+        payload["summary"]["fields"] = 1
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        changed = json.loads(server.data_monitor_feature_page(
+            source="tw:stock", limit=5, revision=page["revision"],
+        ).body)
+        assert changed["reset_required"] is True
+        assert changed["matching_total"] == 1
+        assert changed["rows"] == rows[:1]
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_features_preserves_validated_compact_source_bytes(tmp_path: Path) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+        snapshot.parent.mkdir(parents=True)
+        body = b'{"schema_version":1,"read_only":true,"production_control_possible":false,"rows":[],"summary":{"fields":0}}\n'
+        snapshot.write_bytes(body)
+        assert server.data_monitor_features().body == body
+        assert server.data_monitor_features().body == body
+        snapshot.write_bytes(body.replace(b'"fields":0', b'"fields":1'))
+        assert json.loads(server.data_monitor_features().body)["summary"]["fields"] == 1
+        snapshot.write_bytes(body.replace(b'"fields":0', b'"fields":NaN'))
+        with pytest.raises(ValueError, match="non-finite JSON"):
+            server.data_monitor_features()
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_features_uses_matching_producer_receipt_without_full_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import serve_public_dashboards as public_module
+
+    snapshot = tmp_path / "artifacts/live/data_monitor/feature_inventory.json"
+    snapshot.parent.mkdir(parents=True)
+    body = (
+        b'{"schema_version":1,"read_only":true,'
+        b'"production_control_possible":false,"rows":[{"field":"close"}]}'
+        b"\n"
+    )
+    snapshot.write_bytes(body)
+    snapshot_service._write_feature_reuse_receipt(snapshot, 1)
+    original_loads = json.loads
+
+    def loads_without_full_source(data, *args, **kwargs):
+        if data == body:
+            raise AssertionError("trusted feature snapshot was fully parsed")
+        return original_loads(data, *args, **kwargs)
+
+    monkeypatch.setattr(public_module.json, "loads", loads_without_full_source)
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        assert server.data_monitor_features().body == body
+        # A modified source cannot ride an old receipt and must fail closed.
+        snapshot.write_bytes(body.replace(b'"read_only":true', b'"read_only":false'))
+        with pytest.raises(ValueError, match="not read-only"):
+            server.data_monitor_features()
     finally:
         server.server_close()
 
@@ -1191,6 +2064,68 @@ def test_tw_status_wall_clock_boundary_reuses_same_content_revision(
         second = server.tw_status()
         assert first.body == second.body
         assert calls == 1
+    finally:
+        server.server_close()
+
+
+def test_tw_history_revision_tracks_marks_without_engine_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    sources = tuple(tmp_path / f"revision-source-{index}" for index in range(8))
+    server.update_hub.paths["tw"] = sources
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.build_dashboard_revision",
+        lambda **_kwargs: {
+            "revision_token": "engine-7",
+            "content_revision": 7,
+            "simulation_only": True,
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.build_dashboard_snapshot",
+        lambda **_kwargs: {
+            "simulation_only": True,
+            "production_order_possible": False,
+            "modes": [],
+        },
+    )
+    try:
+        before = json.loads(server.tw_revision().body)
+        status = json.loads(server.tw_status().body)
+        assert status["service_sync"]["history_revision"] == before["history_revision"]
+        assert status["service_sync"]["revision_token"] == before["revision_token"]
+        sources[5].write_text("one minute\n", encoding="utf-8")
+        after = json.loads(server.tw_revision().body)
+        assert after["history_revision"] != before["history_revision"]
+        assert after["revision_token"] != before["revision_token"]
+        sources[7].write_text("replaced benchmark history\n", encoding="utf-8")
+        final = json.loads(server.tw_revision().body)
+        assert final["history_revision"] != after["history_revision"]
+    finally:
+        server.server_close()
+
+
+def test_history_cache_token_ignores_status_only_revisions(tmp_path: Path) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    revision = {"revision_token": "status-1", "history_revision": "marks-1"}
+    server.tw_revision = lambda: server.cached_local_json(  # type: ignore[method-assign]
+        cache_key=f"revision-{revision['revision_token']}",
+        ttl_seconds=60,
+        cache_control="no-store",
+        builder=lambda: revision,
+    )
+    try:
+        source_token = server.content_token(history_only=True)
+        status_token = server.content_token()
+        revision["revision_token"] = "status-2"
+        assert server.content_token(history_only=True) == source_token
+        assert server.content_token() != status_token
+        revision["history_revision"] = "marks-2"
+        revision["revision_token"] = "status-3"
+        assert server.content_token(history_only=True) != source_token
     finally:
         server.server_close()
 
@@ -1414,6 +2349,13 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     assert "MemorySwapMax=1G" in unit
     assert "TasksMax=4096" in unit
     assert "OOMScoreAdjust=-250" in unit
+    assert "ExecStartPost=/usr/bin/bash \"__REPO_ROOT__/scripts/wait_public_dashboard_ready.sh\"" in unit
+    assert "TimeoutStartSec=70s" in unit
+    readiness = (root / "scripts/wait_public_dashboard_ready.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "http://127.0.0.1:8770/healthz" in readiness
+    assert "deadline=$((SECONDS + 60))" in readiness
     assert "systemctl restart stockagent-public-dashboards.service" in installer
     assert '"--no-restart"' in installer
     snapshot_unit = (
@@ -1855,6 +2797,7 @@ def test_read_only_chunked_request_is_rejected_without_reading_body(protocol_ser
     [
         "/api/overview",
         "/taifex/api/status",
+        "/finmind/api/status",
         "/data-monitor/api/status",
         "/traffic/api/status",
     ],
@@ -2036,6 +2979,39 @@ def test_public_traffic_history_persists_phases_and_survives_restart(
         assert request_buckets[0]["observed_minutes"] == 1
     finally:
         restarted.close()
+
+
+def test_public_traffic_recent_readonly_view_preserves_copying_api(
+    tmp_path: Path,
+) -> None:
+    minute = int(time.time()) // 60 * 60 - 60
+    aggregate = TrafficAggregate()
+    aggregate.record(
+        latency_ms=4.0, response_body_bytes=50, status=200, route_kind="api"
+    )
+    store = PublicPerformanceHistoryStore(
+        tmp_path,
+        allowed_routes={"/traffic/api/status"},
+        allowed_cache_outcomes={"fresh_hit"},
+    )
+    try:
+        assert store.enqueue({
+            "schema_version": 1,
+            "minute_epoch": minute,
+            "process_key": "0123456789abcdef",
+            "aggregate": aggregate.to_payload(),
+            "routes": {"/traffic/api/status": aggregate.to_payload()},
+            "cache": {"fresh_hit": 1},
+        })
+        view = store.rows_since_readonly(minute)
+        copied = store.rows_since(minute)
+        assert view == copied
+        assert view[0] is store._rows[0]
+        assert copied[0] is not view[0]
+        copied[0]["aggregate"]["requests"] = 99
+        assert store.rows_since_readonly(minute)[0]["aggregate"]["requests"] == 1
+    finally:
+        store.close()
 
 
 def test_public_performance_history_compacts_old_minutes_without_losing_counts(

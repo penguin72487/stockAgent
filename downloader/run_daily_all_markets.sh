@@ -68,6 +68,9 @@ BYBIT_WORKERS="${BYBIT_WORKERS:-24}"
 BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
+# Must match the Bybit catalog source_coordination_lock. Do not allow a
+# per-service override that would silently split the writer/publisher lease.
+BYBIT_SOURCE_LOCK_FILE="$ROOT_DIR/artifacts/daily_downloader/bybit_source_publish.lock"
 RUN_BINANCE_PERP="${RUN_BINANCE_PERP:-1}"
 BINANCE_WORKERS="${BINANCE_WORKERS:-32}"
 BINANCE_REQUEST_WEIGHT_PER_MINUTE="${BINANCE_REQUEST_WEIGHT_PER_MINUTE:-}"
@@ -276,6 +279,11 @@ run_step() {
   local end_ts
   local elapsed
   local rc
+  local -a source_summary_args=()
+
+  if [[ -n "${STEP_SOURCE_SUMMARY_PATH:-}" ]]; then
+    source_summary_args=(--source-summary "$STEP_SOURCE_SUMMARY_PATH")
+  fi
 
   start_ts="$(date +%s)"
   log "step=${name} start"
@@ -305,7 +313,8 @@ run_step() {
       --started-epoch "$start_ts" \
       --elapsed-seconds "$elapsed" \
       --exit-code 0 \
-      --runner-pid "$$"; then
+      --runner-pid "$$" \
+      "${source_summary_args[@]}"; then
       log "step=${name} receipt_failed state=complete"
       record_failure "${name}_receipt"
       return 1
@@ -328,7 +337,8 @@ run_step() {
     --started-epoch "$start_ts" \
     --elapsed-seconds "$elapsed" \
     --exit-code "$rc" \
-    --runner-pid "$$"; then
+    --runner-pid "$$" \
+    "${source_summary_args[@]}"; then
     log "step=${name} receipt_failed state=failed"
     record_failure "${name}_receipt"
   fi
@@ -389,7 +399,9 @@ run_yahoo_incremental_assets() {
   local prev_assets="$YAHOO_ASSETS"
   local rc=0
   YAHOO_ASSETS="$assets_text"
-  if ! run_yahoo_incremental; then
+  if run_yahoo_incremental; then
+    :
+  else
     rc=$?
   fi
   YAHOO_ASSETS="$prev_assets"
@@ -446,13 +458,16 @@ run_yahoo_incremental() {
   for asset in "${assets[@]}"; do
     local yahoo_mode="daily-update"
     local step_suffix="daily_update"
+    local summary_name="daily_update_summary"
     local -a history_flags=()
     if [[ "$asset" == "crypto" ]]; then
       yahoo_mode="incremental"
       step_suffix="1m_update"
+      summary_name="incremental_update_summary"
     elif [[ "$asset" == "us_stocks" && "$YAHOO_VERIFY_US_HISTORY_HEAD" == "1" ]]; then
       yahoo_mode="repair"
       step_suffix="history_head_repair"
+      summary_name="repair_summary"
       history_flags=(--verify-us-history-head --start-date "$YAHOO_HISTORY_START_DATE")
     fi
     base_cmd=(
@@ -468,6 +483,7 @@ run_yahoo_incremental() {
       --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
       --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
       --rate-limit-abort-after "$YAHOO_RATE_LIMIT_ABORT_AFTER"
+      --run-id "$RUN_ID"
       "${history_flags[@]}"
       "${yahoo_flags[@]}"
     )
@@ -481,7 +497,8 @@ run_yahoo_incremental() {
       fi
     fi
 
-    if ! run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}"; then
+    if ! STEP_SOURCE_SUMMARY_PATH="$ROOT_DIR/data_yahoo/${summary_name}.${asset}.json" \
+      run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}"; then
       rc=1
       continue
     fi
@@ -545,6 +562,8 @@ run_frankfurter_incremental() {
     cmd=(
       "$PYTHON_BIN" downloader/download_forex_frankfurter.py
       --mode daily-update
+      --start-date 1999-01-04
+      --official-history
       --output-dir "$FRANKFURTER_OUTPUT_DIR"
       --symbols-file "$FRANKFURTER_SYMBOLS_FILE"
       --end-date "$today"
@@ -580,6 +599,23 @@ run_pepperstone_incremental() {
   fi
 }
 
+# A head/full source reconciliation must rebuild the full daily projection.
+# Tail jobs keep their bounded two-day overlap; neither path issues more HTTP.
+run_perp_daily_materialize() {
+  local step="$1"
+  shift
+  local -a scope_args=()
+  if [[ "$CRYPTO_TAIL_ONLY" != "1" ]]; then
+    scope_args+=(--refresh)
+  fi
+  run_step "$step" \
+    env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+    OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+    OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
+    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    "$@" "${scope_args[@]}"
+}
+
 run_okx_perp_incremental() {
   local today
   local -a cmd=()
@@ -605,6 +641,8 @@ run_okx_perp_incremental() {
   fi
   if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
     cmd+=(--tail-only)
+  else
+    cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/okx_source")
   fi
   if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
     cmd+=(--skip-historical-features)
@@ -614,11 +652,7 @@ run_okx_perp_incremental() {
   fi
   run_step okx_perp_1m_update "${cmd[@]}" || return $?
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
-    run_step okx_perp_daily_materialize \
-      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
-      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    run_perp_daily_materialize okx_perp_daily_materialize \
       --input-dir data_okx/1m --output-dir data_okx/daily \
       --provider OKX --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
   else
@@ -628,6 +662,9 @@ run_okx_perp_incremental() {
 
 run_bybit_perp_incremental() {
   local today
+  local bybit_lock_fd
+  local bybit_rc=0
+  local bybit_lock_wait_start_ms
   local -a categories=()
   local -a cmd=()
 
@@ -654,19 +691,29 @@ run_bybit_perp_incremental() {
   fi
   if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
     cmd+=(--tail-only)
-  fi
-  run_step bybit_perp_1m_update "${cmd[@]}" || return $?
-  if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
-    run_step bybit_perp_daily_materialize \
-      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
-      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
-      --input-dir data_bybit/1m --output-dir data_bybit/daily \
-      --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
   else
+    cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/bybit_source")
+  fi
+  mkdir -p "$(dirname "$BYBIT_SOURCE_LOCK_FILE")"
+  exec {bybit_lock_fd}>"$BYBIT_SOURCE_LOCK_FILE"
+  bybit_lock_wait_start_ms="$(( $(date +%s%N) / 1000000 ))"
+  if ! flock -w 180 "$bybit_lock_fd"; then
+    log "step=bybit_perp_1m_update failed reason=source_publish_lock_timeout wait_ms=$(( $(date +%s%N) / 1000000 - bybit_lock_wait_start_ms ))"
+    exec {bybit_lock_fd}>&-
+    return 1
+  fi
+  log "step=bybit_source_lock acquired wait_ms=$(( $(date +%s%N) / 1000000 - bybit_lock_wait_start_ms ))"
+  run_step bybit_perp_1m_update "${cmd[@]}" || bybit_rc=$?
+  if [[ "$bybit_rc" == "0" && "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
+    run_perp_daily_materialize bybit_perp_daily_materialize \
+      --input-dir data_bybit/1m --output-dir data_bybit/daily \
+      --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS" || bybit_rc=$?
+  elif [[ "$bybit_rc" == "0" ]]; then
     log "skip=bybit_perp_daily_materialize reason=RUN_CRYPTO_DAILY_MATERIALIZE=${RUN_CRYPTO_DAILY_MATERIALIZE}"
   fi
+  flock -u "$bybit_lock_fd"
+  exec {bybit_lock_fd}>&-
+  return "$bybit_rc"
 }
 
 run_binance_perp_incremental() {
@@ -695,17 +742,16 @@ run_binance_perp_incremental() {
   fi
   if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
     cmd+=(--tail-only)
+  else
+    # Save the full-history symbol report before a later intraday job replaces it.
+    cmd+=(--archive-report-dir "$STEP_RECEIPT_DIR/binance_source")
   fi
   if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
     cmd+=(--skip-historical-features)
   fi
   run_step binance_perp_1m_update "${cmd[@]}" || return $?
   if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
-    run_step binance_perp_daily_materialize \
-      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
-      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
-      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    run_perp_daily_materialize binance_perp_daily_materialize \
       --input-dir data_binance/1m --output-dir data_binance/daily \
       --provider Binance --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
   else

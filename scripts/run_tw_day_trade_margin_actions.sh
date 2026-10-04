@@ -8,4 +8,4 @@ python_bin="$(resolve_fintech_python)"
 # Cold publication is independent from opening readiness. If another registered
 # writer is active, this records a successful deferred attempt instead of
 # repeating the expensive action rebuild every five minutes.
-exec "$python_bin" scripts/publish_tw_public_cold_release.py
+exec "$python_bin" scripts/publish_tw_public_cold_release.py --defer-stale-derived-receipts

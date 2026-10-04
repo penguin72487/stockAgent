@@ -52,7 +52,7 @@ _TWSE_CURRENT_FIRST_MONTH = (2020, 10)
 _LABELED_SECURITY_CODE_RE = re.compile(
     r"(?:上市|上櫃|興櫃)?(?:普通股|股票|證券|公司|有價證券)?\s*"
     r"(?:股票|證券)?\s*(?:代\s*(?:號|碼)|編\s*號)\s*[：:=#、，\s（(]*"
-    r"(?P<symbol>[0-9]{4,6}[A-Z]?)",
+    r"(?P<symbol>[A-Z]?[0-9]{4,6}[A-Z]?)",
     re.I,
 )
 
@@ -790,7 +790,13 @@ def _download_tpex_month(
     response = _rate_limited_call(
         session.post,
         TPEX_SEARCH,
-        data={"inputY": str(year), "inputM": str(month), "inputD": "00", "inputType": "4", "inputKeyword": ""},
+        # Category 4 contains stock lifecycle notices, but TPEx classifies a
+        # bond ETF termination under category 17 because the fund owns bonds.
+        # Querying ALL once and applying the narrow semantic prefilter below is
+        # both complete and cheaper than issuing one request for every product
+        # category.  The parser still rejects bonds, warrants, ETNs and other
+        # securities outside the canonical stock/ETF universe.
+        data={"inputY": str(year), "inputM": str(month), "inputD": "00", "inputType": "ALL", "inputKeyword": ""},
         timeout=timeout,
     )
     response.raise_for_status()

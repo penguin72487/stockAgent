@@ -9,6 +9,7 @@ complete; those semantics stay in each downloader adapter.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from http.client import IncompleteRead
 import time
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -22,6 +23,9 @@ except ImportError:  # direct ``python downloader/<script>.py`` execution
 
 
 DEFAULT_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# Includes disconnects while opening or reading a response. Provider adapters
+# retain their own API/status policy and bounded retry budget.
+RETRYABLE_NETWORK_ERRORS = (URLError, TimeoutError, ConnectionError, IncompleteRead)
 # Public request selectors are useful in provider diagnostics. Unknown fields
 # still fail closed; do not infer that a short value cannot be a credential.
 _PUBLIC_QUERY_FIELDS = frozenset({
@@ -183,7 +187,7 @@ class ResilientHttpTransport:
                 # worker as well would apply the same backoff twice and leave
                 # the official bucket unnecessarily idle.
                 self.limiter.defer(cooldown)
-            except (URLError, TimeoutError, OSError) as exc:
+            except (OSError, IncompleteRead) as exc:
                 if attempt >= retries:
                     detail = _sanitized_error_body(str(exc).encode(), url).decode(errors="replace")
                     raise URLError(f"{type(exc).__name__} for {sanitized_url(url)}: {detail}") from None

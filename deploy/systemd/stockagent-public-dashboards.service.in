@@ -20,14 +20,17 @@ CacheDirectoryMode=0700
 StateDirectory=stockagent-public-dashboards
 StateDirectoryMode=0700
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_public_dashboards.sh"
+ExecStartPost=/usr/bin/bash "__REPO_ROOT__/scripts/wait_public_dashboard_ready.sh"
+TimeoutStartSec=70s
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
 KillMode=control-group
-# Full history is bounded and the measured process peak is below 1 GiB.  This
-# leaves broad burst headroom without allowing one public request path to take
-# down the host.  TasksMax is an OS safety boundary, not an application rate or
-# 32-request concurrency limiter.
+# Keep headroom for complete history and concurrent detail projections.  On
+# 2026-09-25 the running gateway reached 3.38 GiB (below MemoryHigh=4G, with
+# zero high/oom events); an older below-1-GiB observation is not the current
+# sizing basis.  Re-measure before changing either boundary.  TasksMax is an
+# OS safety boundary, not an application rate or 32-request concurrency limit.
 MemoryAccounting=true
 MemoryHigh=4G
 MemoryMax=8G

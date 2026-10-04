@@ -1,0 +1,49 @@
+main{width:min(1180px,calc(100% - 36px))}
+.finlab-chart{margin-top:18px}
+.finlab-chart svg{margin-top:12px}
+.finlab-chart .axis{stroke:#385166;stroke-width:1}
+.finlab-chart .ceiling{stroke:#f5bd4f;stroke-width:1;stroke-dasharray:5 5}
+.finlab-chart .series{fill:none;stroke:#71d9a1;stroke-width:2.4}
+.finlab-chart .point{fill:#71d9a1}
+.finlab-chart .tick{fill:#8da4b6;font:12px system-ui,sans-serif}
+.finlab-chart .time-range-control{margin-top:16px}
+.storage-layout{grid-template-columns:1fr}
+.storage-layout .storage-bars-card{margin-top:14px}
+.finlab-table-scroll table{min-width:1100px}
+.finlab-table-scroll td:first-child{max-width:270px}
+.data-note a{color:var(--cyan)}
+.update-monitor{display:block;line-height:1.65;overflow-wrap:anywhere;color:var(--muted)}
+.update-monitor p{margin:5px 0;font-size:12px}
+#dataset-rows td:last-child{white-space:pre-line;min-width:220px;max-width:340px;font-size:12px;line-height:1.65}
+#backfill .progress-copy{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(240px,1fr);align-items:start}
+#backfill .fleet-eta{max-width:none}
+/* This small summary must remain rendered when reached by an anchor below
+   the long source list; deferred containment can leave an empty 420px card. */
+#traffic,#backfill,#backfill .progress-card{content-visibility:visible;contain-intrinsic-size:none}
+#download-global-eta{font-size:23px;line-height:1.4}
+.completion-estimates{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:20px}
+.completion-estimate{min-width:0;padding:16px;border:1px solid var(--line);border-radius:12px;background:rgba(5,17,27,.6);overflow-wrap:anywhere}
+.completion-estimate-central{border-color:#467b91;background:rgba(26,56,69,.32)}
+.completion-estimate h3{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:0 0 14px;font-size:15px}
+.completion-estimate h3 span{color:var(--muted);font-size:11px;font-weight:400}
+.completion-estimate>strong{display:block;color:var(--cyan);font-size:26px;line-height:1.3;font-variant-numeric:tabular-nums}
+.completion-estimate p{margin:10px 0;font-size:12px;line-height:1.6}
+.completion-estimate small{display:block;margin-top:6px;color:var(--muted);font-size:11px;line-height:1.65}
+.estimate-caveat,.estimate-exclusions,.estimate-blockers,.estimate-method{font-size:12px;line-height:1.7;overflow-wrap:anywhere}
+.estimate-caveat{margin:16px 0 0;color:var(--muted)}
+.estimate-exclusions,.estimate-blockers{color:#e5bf77}
+.estimate-exclusions{margin:12px 0 0}
+.estimate-blockers{padding-left:20px;margin:8px 0 0}
+.estimate-method{margin-top:14px;border-top:1px solid var(--line);color:var(--muted)}
+.estimate-method summary{min-height:44px;display:list-item;padding:12px 0;cursor:pointer;color:var(--text)}
+.estimate-method summary:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
+.estimate-method p{margin:0 0 8px}
+.estimate-method ul{padding-left:20px;margin:0 0 4px}
+.estimate-rate-bridge{margin-top:16px;padding:14px;border:1px solid var(--line);border-radius:10px;background:rgba(26,56,69,.32);overflow-wrap:anywhere}
+.estimate-rate-bridge h3,.estimate-stage-heading{font-size:14px;margin:0 0 10px}
+.estimate-rate-bridge p{font-size:13px;line-height:1.8;margin:0 0 8px}
+.estimate-rate-bridge small,.estimate-stage-table small{display:block;color:var(--muted);font-size:11px;line-height:1.7;margin-top:7px}
+.estimate-stage-heading{margin-top:22px}
+.estimate-stage-table table{min-width:760px;table-layout:fixed;width:100%}
+.estimate-stage-table td{white-space:normal;overflow-wrap:anywhere;vertical-align:top;font-size:12px;line-height:1.7}
+@media(max-width:720px){#backfill .progress-copy{grid-template-columns:minmax(0,1fr)}.completion-estimates{grid-template-columns:1fr}.completion-estimate>strong{font-size:25px}.completion-estimate h3{margin-bottom:9px}}

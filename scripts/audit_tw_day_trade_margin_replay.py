@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, time
 import json
 import math
 from pathlib import Path
@@ -18,13 +18,39 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.rebuild_tw_day_trade_minute_curves import (
-    _read_json, _read_jsonl, _sha256, _atomic_json, validate_existing_strategy_marks,
+    _read_json, _read_jsonl, _sha256, _atomic_json, _is_entry_inventory_fill,
+    validate_existing_strategy_marks,
 )
-from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+from scripts.complete_tw_day_trade_paper_entry import CONTRACT as PAPER_COMPLETION_CONTRACT
+from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+    MARGIN_CARRY_CONTRACT,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+)
 from downloader.download_shioaji_tw_minute_kbars import minute_receipt_valid
 from downloader.download_tw_public_data import _validated_taiex_session_dates
+from downloader.stock_volume_units import with_stock_share_volume
 from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE, load_share_replacements
 from stockagent.data.panel import _CorporateActionReferencePaths, _load_corporate_action_reference
+
+
+def _with_verified_share_volume(frame: pl.LazyFrame) -> pl.LazyFrame:
+    """Keep canonical shares or prove the encoding of legacy raw stock KBars."""
+
+    schema = frame.collect_schema()
+    if "volume_shares" in schema:
+        shares = pl.col("volume_shares").cast(pl.Float64, strict=False)
+        return frame.with_columns(
+            pl.when(shares.is_finite() & (shares >= 0)
+                    & ((shares - shares.round(0)).abs() <= 1e-6))
+            .then(shares.round(0)).otherwise(None).alias("volume_shares")
+        )
+    frame = frame.with_columns(*[
+        (pl.col(name).cast(pl.Float64, strict=False) if name in schema
+         else pl.lit(None, dtype=pl.Float64)).alias(name)
+        for name in ("Volume", "Amount", "Low", "High", "contract_unit")
+    ])
+    return with_stock_share_volume(frame, tolerance=0.001)
 
 
 def _entry_source_path(source: str) -> Path:
@@ -37,6 +63,131 @@ def _entry_source_path(source: str) -> Path:
     return Path(name)
 
 
+def _retained_entry_book_source_days(
+    state_dir: Path,
+    session: dict,
+    opening_fill_symbols: set[str],
+    source_signatures: dict[str, tuple[int, int, int]],
+    retained_opening_bars: list[dict] | None = None,
+) -> dict[str, set[date]]:
+    """Recover exact 09:01 source files from a hash-pinned retained entry book.
+
+    A carried position can be fully reduced at 09:01 and therefore never enter
+    the subsequent intraday inventory scan.  Its minute source is still present
+    in the replay's immutable entry book, so audit that book rather than treating
+    the missing intraday source-count entry as missing market data.
+    """
+    if not opening_fill_symbols:
+        return {}
+    proof = session.get("historical_entry_books") or {}
+    raw_path, expected_sha = proof.get("path"), proof.get("sha256")
+    if not raw_path or not expected_sha:
+        return {}
+    path = Path(str(raw_path))
+    expected_dir = (state_dir / "replay_entry_books").resolve()
+    if (not path.is_absolute() or path.resolve().parent != expected_dir
+            or path.name != f"{session['session_date']}.parquet"):
+        raise ValueError(f"retained entry book is outside candidate: {path}")
+    stat = path.stat()
+    signature = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    source_signatures[str(path)] = signature
+    if _sha256(path) != expected_sha:
+        raise ValueError(f"retained entry book hash mismatch: {path}")
+    columns = [
+        "symbol",
+        "quote_at",
+        "source",
+        "execution_price_0901",
+        "tick_volume_units_0901",
+        "source_window_start",
+        "source_window_end",
+    ]
+    schema = pl.read_parquet_schema(path)
+    frame = pl.read_parquet(
+        path, columns=[column for column in columns if column in schema]
+    )
+    missing_columns = [column for column in columns if column not in frame.columns]
+    if missing_columns:
+        frame = frame.with_columns(
+            *(pl.lit(None).alias(column) for column in missing_columns)
+        )
+    frame = frame.filter(pl.col("symbol").is_in(sorted(opening_fill_symbols)))
+    if frame.select(pl.col("symbol").is_duplicated().any()).item():
+        raise ValueError(f"retained entry book has duplicate symbols: {path}")
+    day = session["session_date"]
+    result: dict[str, set[date]] = defaultdict(set)
+    for row in frame.iter_rows(named=True):
+        if str(row["quote_at"])[:16] != f"{day}T09:01":
+            raise ValueError(
+                f"retained entry book has non-09:01 quote: {row['symbol']}:{row['quote_at']}"
+            )
+        source_identity = str(row["source"])
+        shioaji_volume_multiplier: float | None = None
+        if source_identity == (
+            "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
+        ):
+            shioaji_volume_multiplier = 1_000.0
+        elif source_identity in {
+            "shioaji:historical_kbar_0901_minute_vwap",
+            "shioaji:historical_kbar_0901_minute_close",
+        }:
+            shioaji_volume_multiplier = 1.0
+        if shioaji_volume_multiplier is not None:
+            try:
+                opening = datetime.fromisoformat(str(row["source_window_start"]))
+                closing = datetime.fromisoformat(str(row["source_window_end"]))
+                quote_at = datetime.fromisoformat(str(row["quote_at"]))
+                price = float(row["execution_price_0901"])
+                volume = float(row["tick_volume_units_0901"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid retained Shioaji 09:01 evidence: {day}:{row['symbol']}"
+                ) from exc
+            window_start = datetime.combine(
+                date.fromisoformat(day), time(9, 0), tzinfo=opening.tzinfo
+            )
+            window_end = datetime.combine(
+                date.fromisoformat(day), time(9, 1), tzinfo=opening.tzinfo
+            )
+            if (
+                not window_start <= opening < window_end
+                or not opening <= closing <= window_end
+                or quote_at != window_end
+                or not math.isfinite(price)
+                or price <= 0.0
+                or not math.isfinite(volume)
+                or volume <= 0.0
+            ):
+                raise ValueError(
+                    f"invalid retained Shioaji 09:01 evidence: {day}:{row['symbol']}"
+                )
+            if retained_opening_bars is not None:
+                retained_opening_bars.append(
+                    {
+                        "symbol": str(row["symbol"]),
+                        "minute_key": f"{day}T09:01",
+                        "high": price,
+                        "low": price,
+                        "volume_shares": volume * shioaji_volume_multiplier,
+                    }
+                )
+            continue
+        source = str(_entry_source_path(source_identity))
+        source_path = Path(source)
+        is_symbol_chunk = (
+            "minute_chunks" in source_path.parts
+            and source_path.parent.name == row["symbol"]
+        )
+        is_daily_research_partition = (
+            "research_dataset" in source_path.parts
+            and source_path.name == "data.parquet"
+        )
+        if not (is_symbol_chunk or is_daily_research_partition):
+            raise ValueError(f"entry source symbol mismatch: {row['symbol']}:{source}")
+        result[source].add(date.fromisoformat(day))
+    return result
+
+
 def _verify_calendar_coverage(rebuild: dict, dates: list[str], *, prefix: bool) -> dict:
     """An internally consistent truncated replay is not a full-range result."""
     proof = rebuild.get("official_session_calendar") or {}
@@ -45,15 +196,32 @@ def _verify_calendar_coverage(rebuild: dict, dates: list[str], *, prefix: bool) 
         raise ValueError("completed-history audit requires a pinned completed-session calendar")
     start, end = date.fromisoformat(proof["start_date"]), date.fromisoformat(proof["end_date"])
     expected, digest = _validated_taiex_session_dates(path.parent, start, end)
-    if (path.name != "twse_taiex_ohlc.parquet" or digest != proof.get("sha256")
+    if (path.name != "twse_taiex_ohlc.parquet"
             or len(expected) != proof.get("session_count")):
         raise ValueError("official replay calendar identity or session count changed")
     expected_dates = sorted(day.isoformat() for day in expected)
     wanted = expected_dates[:len(dates)] if prefix else expected_dates
     if dates != wanted:
         raise ValueError("replay omitted or added official sessions within its requested range")
-    return {"path": str(path), "sha256": digest,
-            "requested_sessions": len(expected_dates), "verified_sessions": len(dates)}
+    # The canonical calendar is append-only in normal operation. A later
+    # completed session changes the whole-file SHA even though the replay's
+    # bounded session set is unchanged. Verify the exact requested semantic
+    # prefix and retain both hashes instead of treating a valid later append as
+    # historical corruption.
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "replay_source_sha256": proof.get("sha256"),
+        "current_source_sha256": digest,
+        "source_file_unchanged": digest == proof.get("sha256"),
+        "identity_contract": (
+            "exact_file_sha256"
+            if digest == proof.get("sha256")
+            else "receipt_validated_exact_requested_session_set_after_append"
+        ),
+        "requested_sessions": len(expected_dates),
+        "verified_sessions": len(dates),
+    }
 
 
 def _verified_action_sources(path: Path, start: str, end: str) -> tuple:
@@ -85,6 +253,86 @@ def _claim_matches_source(claim: dict, reference) -> bool:
                 and str(terms[2][matches[0]]) == claim["payment_date"])
 
 
+def _verify_terminal_close_fills(fills, rebuild, modes, *, verify_sources=True):
+    """Verify the sole capacity exception against raw official close reports.
+
+    A contract string alone never exempts an arbitrary exit from minute volume.
+    Ordinary exits remain in the existing shared-capacity audit below.
+    """
+    from scripts.settle_tw_day_trade_official_close import official_closes
+    from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT as contract
+    from stockagent.data.tw_security import classify_tw_stock_or_etf
+    from stockagent.data.tw_price_rules import price_on_tick_grid_numpy
+    selected = [f for f in fills if f.get("fill_contract") == contract
+                or f.get("terminal_close_receipt") is not None
+                or f.get("purpose") == "13_30_unlimited_close_paper_settlement"]
+    enabled = (rebuild.get("replay_contract") or {}).get("terminal_close_contract") == contract
+    if selected and not enabled:
+        raise ValueError("terminal close fills lack explicit replay authorization")
+    if not enabled:
+        return {}
+    if any(m.get("terminal_close_contract") != contract for m in modes.values()):
+        raise ValueError("terminal close state/replay policy mismatch")
+    sessions = {s["session_date"]: s for s in rebuild["sessions"]}
+    source_hashes, prices, counts, seen = {}, {}, defaultdict(int), set()
+    for fill in selected:
+        day, market, symbol = fill["session_date"], fill["market"], fill["symbol"]
+        proof = fill.get("terminal_close_receipt") or {}
+        evidence = proof.get("source_evidence") or {}
+        stamp = f"{day}T13:30:00+08:00"
+        kind = classify_tw_stock_or_etf(symbol)
+        if not (enabled and fill.get("fill_contract") == contract
+                and proof.get("contract") == contract
+                and proof.get("broker_fill") is False
+                and proof.get("full_quantity_is_user_assumption") is True
+                and fill.get("simulation_only") is True
+                and fill.get("purpose") == "13_30_unlimited_close_paper_settlement"
+                and fill.get("fill_at") == proof.get("effective_at") == stamp
+                and datetime.fromisoformat(fill["recorded_at"]) >= datetime.fromisoformat(stamp)
+                and fill.get("quote_at") is None and fill.get("exchange_match_at") is None
+                and fill["quantity"] == fill["requested_quantity"] > 0
+                and fill.get("remaining_quantity") == 0
+                and evidence.get("session_date") == day
+                and evidence.get("price_basis") == "official_session_close"
+                and evidence.get("price") == fill["price"]
+                and kind is not None
+                and price_on_tick_grid_numpy(np.array([fill["price"]]), np.array([date.fromisoformat(day)]),
+                                              security_types=kind)[0]):
+            raise ValueError(f"invalid terminal close receipt: {market}/{day}/{symbol}")
+        identity = (market, day, fill["position_id"])
+        if identity in seen:
+            raise ValueError(f"duplicate terminal close: {identity}")
+        seen.add(identity)
+        counts[(market, day)] += 1
+        if verify_sources:
+            if day not in prices:
+                prices[day] = {}
+                for source in sessions[day]["close"]["terminal_close_sources"]:
+                    path = Path(source["path"])
+                    exchange = path.parent.name.removesuffix("_daily_ohlcv")
+                    if exchange not in ("twse", "tpex") or path.name != f"{day}.json" or _sha256(path) != source["sha256"]:
+                        raise ValueError(f"terminal close raw source mismatch: {path}")
+                    rows, _ = official_closes(path.parent.parent, date.fromisoformat(day), exchanges=(exchange,))
+                    if prices[day].keys() & rows.keys():
+                        raise ValueError(f"duplicate terminal close source: {day}")
+                    prices[day].update(rows)
+                    source_hashes[str(path)] = source["sha256"]
+            row = prices[day].get(symbol) or {}
+            raw = row.get("official_row") or {}
+            volume = float(str(raw.get("成交股數", raw.get("成交量", 0))).replace(",", ""))
+            if (row.get("price") != fill["price"] or row.get("source") != evidence.get("source")
+                    or row.get("source_sha256") != evidence.get("source_sha256") or not volume > 0):
+                raise ValueError(f"terminal close differs from traded official source: {market}/{day}/{symbol}")
+    for day, session in sessions.items():
+        for row in session["modes"]:
+            close = row.get("after_close") or {}
+            if (close.get("terminal_close_contract") != contract
+                    or close.get("open_position_rows") != 0
+                    or int(close.get("terminal_flatten_count") or 0) != counts[(row["market"], day)]):
+                raise ValueError(f"terminal close count/flat proof mismatch: {row['market']}/{day}")
+    return source_hashes
+
+
 def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: bool = False) -> dict:
     names = ("state.json", "rebuild_receipt.json", "fills.jsonl", "marks.jsonl", "orders.jsonl")
     before = {name: _sha256(state_dir / name) for name in names}
@@ -110,6 +358,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     calendar_check = (_verify_calendar_coverage(rebuild, dates, prefix=bool(incomplete))
                       if verify_sources else None)
     fills, marks = _read_jsonl(state_dir / "fills.jsonl"), _read_jsonl(state_dir / "marks.jsonl")
+    terminal_source_hashes = _verify_terminal_close_fills(
+        fills, rebuild, state["modes"], verify_sources=verify_sources)
     order_sides = {}
     for order in _read_jsonl(state_dir / "orders.jsonl"):
         key, side = (order["market"], order["order_id"]), order.get("side")
@@ -174,7 +424,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                     key = item["position_id"]
                     if item.get("_share_action"):
                         held[key] = int(item["new_signed_shares"])
-                    elif item["purpose"] == "entry":
+                    elif _is_entry_inventory_fill(item):
                         held[key] += int(item["quantity"]) * (1 if item["side"] in {"buy", "buy_to_cover"} else -1)
                     else:
                         held[key] -= int(item["quantity"]) * (1 if held[key] > 0 else -1)
@@ -235,6 +485,62 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                         errors.append(f"{key}: duplicate entry identity")
                     entries[key] = fill
                     inventory[key] += quantity if fill["side"] in {"buy", "buy_to_cover"} else -quantity
+                elif fill["purpose"] == "entry_completion":
+                    disclosure = fill.get("counterfactual_paper_completion") or {}
+                    minute_sweep_completion = False
+                    try:
+                        fill_at = datetime.fromisoformat(str(fill.get("fill_at")))
+                        minute_volume_lots = float(
+                            fill.get("observed_minute_volume_lots")
+                        )
+                        minute_capacity = int(
+                            math.floor(minute_volume_lots * 0.5)
+                        ) * 1000
+                        minute_sweep_completion = bool(
+                            key in entries
+                            and fill.get("fill_contract")
+                            == REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+                            and fill.get("entry_fill_policy")
+                            == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+                            and fill.get("counterfactual_minute_sweep_fill") is True
+                            and fill.get("simulation_replay") is True
+                            and math.isfinite(float(fill["price"]))
+                            and float(fill["price"]) > 0.0
+                            and math.isfinite(minute_volume_lots)
+                            and minute_volume_lots > 0.0
+                            and quantity <= minute_capacity
+                            and time(9, 1) < fill_at.timetz().replace(tzinfo=None)
+                            < time(13, 20)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        minute_sweep_completion = False
+                    paper_completion = bool(
+                        key in entries
+                        and fill.get("fill_contract") == PAPER_COMPLETION_CONTRACT
+                        and disclosure.get("contract") == PAPER_COMPLETION_CONTRACT
+                        and disclosure.get("full_quantity_is_user_assumption") is True
+                        and disclosure.get("same_price_as_original_entry") is True
+                        and disclosure.get("broker_fill") is False
+                        and fill.get("broker_fill") is False
+                        and float(fill["price"])
+                        == float(entries.get(key, {}).get("price") or 0.0)
+                    )
+                    if not (minute_sweep_completion or paper_completion):
+                        errors.append(f"{key}: unverified paper entry completion")
+                    else:
+                        direction = 1 if inventory[key] > 0 else -1
+                        if direction * (1 if fill["side"] in {"buy", "buy_to_cover"} else -1) < 0:
+                            errors.append(f"{key}: entry completion changes inventory direction")
+                        if minute_sweep_completion:
+                            old_quantity = abs(inventory[key])
+                            entries[key] = entries[key] | {
+                                "price": (
+                                    old_quantity * float(entries[key]["price"])
+                                    + quantity * float(fill["price"])
+                                )
+                                / (old_quantity + quantity)
+                            }
+                        inventory[key] += direction * quantity
                 else:
                     entry = entries[key]
                     direction = 1 if inventory[key] > 0 else -1
@@ -277,7 +583,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                 if fill.get("_share_action"):
                     held = int(fill["new_signed_shares"])
                     continue
-                if fill["purpose"] == "entry":
+                if _is_entry_inventory_fill(fill):
                     held += int(fill["quantity"]) * (1 if fill["side"] == "buy" else -1)
                 else:
                     held -= int(fill["quantity"]) * (1 if held > 0 else -1)
@@ -293,9 +599,16 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     source_days = defaultdict(set)
     filled_symbol_days = {(row["symbol"], row["session_date"]) for row in fills}
     minute_source_signatures = {}
+    retained_opening_bars: list[dict] = []
+    opening_fill_symbols_by_day = defaultdict(set)
+    for row in fills:
+        if (not row.get("prior_paper_fill_reused")
+                and str(row.get("recorded_at", ""))[11:16] == "09:01"):
+            opening_fill_symbols_by_day[row["session_date"]].add(row["symbol"])
     for session in sessions:
+        day = session["session_date"]
         for name in (session.get("intraday_replay") or {}).get("source_counts", {}):
-            source_days[name].add(date.fromisoformat(session["session_date"]))
+            source_days[name].add(date.fromisoformat(day))
         # A carried position fully reduced at 09:01 is absent from the later
         # intraday inventory scan, but its exit still needs source validation.
         entry_local = ((session.get("historical_entry_books") or {}).get("local") or {})
@@ -303,8 +616,17 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             # Entry provenance includes the method tag before its absolute
             # file path. It is not itself a filesystem path.
             path = _entry_source_path(source)
-            if (path.parent.name, session["session_date"]) in filled_symbol_days:
-                source_days[str(path)].add(date.fromisoformat(session["session_date"]))
+            if (path.parent.name, day) in filled_symbol_days:
+                source_days[str(path)].add(date.fromisoformat(day))
+        retained_sources = _retained_entry_book_source_days(
+            state_dir,
+            session,
+            opening_fill_symbols_by_day[day],
+            minute_source_signatures,
+            retained_opening_bars,
+        )
+        for name, source_dates in retained_sources.items():
+            source_days[name].update(source_dates)
     if verify_sources and not full_target_counterfactual and any(
         row.get("prior_paper_fill_reused") for row in fills
     ):
@@ -349,14 +671,11 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                                 or entry.get("trade_date") not in {d.isoformat() for d in days}
                                 or _sha256(path) != entry.get("output_sha256")):
                             raise ValueError("research partition hash/date mismatch")
-                        schema = pl.read_parquet_schema(path)
-                        volume = (pl.col("volume_shares") if "volume_shares" in schema else
-                                  pl.col("Volume") * (pl.col("contract_unit") if "contract_unit" in schema else 1000))
-                        source_bars.append(pl.scan_parquet(path)
+                        source_bars.append(_with_verified_share_volume(pl.scan_parquet(path))
                             .select(pl.col("symbol"), pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M").alias("minute_key"),
                                     pl.col("High").cast(pl.Float64).alias("high"),
                                     pl.col("Low").cast(pl.Float64).alias("low"),
-                                    volume.cast(pl.Float64).alias("volume_shares"))
+                                    pl.col("volume_shares"))
                             .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
                         continue
                     except (OSError, ValueError, StopIteration, KeyError) as exc:
@@ -376,22 +695,45 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             if not minute_receipt_valid(receipt_path, symbol=path.parent.name, start=start, end=end, required_dates=days):
                 errors.append(f"invalid minute source receipt: {name}")
                 continue
-            schema = pl.read_parquet_schema(path)
-            volume = (pl.col("volume_shares") if "volume_shares" in schema else
-                      pl.col("Volume") * (pl.col("contract_unit") if "contract_unit" in schema else 1000))
-            source_bars.append(pl.scan_parquet(path).filter(pl.col("date").is_in(sorted(days)))
+            source_bars.append(_with_verified_share_volume(pl.scan_parquet(path))
+                .filter(pl.col("date").is_in(sorted(days)))
                 .select(pl.col("symbol"), pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M").alias("minute_key"),
                         pl.col("High").cast(pl.Float64).alias("high"), pl.col("Low").cast(pl.Float64).alias("low"),
-                        volume.cast(pl.Float64).alias("volume_shares"))
+                        pl.col("volume_shares"))
                 .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
-        if source_bars:
-            frame = pl.concat(source_bars).unique()
-            if frame.select(pl.struct("symbol", "minute_key").is_duplicated().any()).item():
-                errors.append("retained minute sources disagree on fill OHLCV")
-            bars = {(row["symbol"], row["minute_key"]): row for row in frame.to_dicts()}
+        if source_bars or retained_opening_bars:
+            retained_by_key = {
+                (row["symbol"], row["minute_key"]): row
+                for row in retained_opening_bars
+            }
+            if len(retained_by_key) != len(retained_opening_bars):
+                errors.append("retained opening evidence has duplicate symbol/minute")
+            bars = {}
+            if source_bars:
+                frame = pl.concat(source_bars).unique()
+                duplicate_keys = {
+                    (row["symbol"], row["minute_key"])
+                    for row in frame.filter(
+                        pl.struct("symbol", "minute_key").is_duplicated()
+                    ).select("symbol", "minute_key").iter_rows(named=True)
+                }
+                unresolved_duplicates = duplicate_keys - set(retained_by_key)
+                if unresolved_duplicates:
+                    errors.append("retained minute sources disagree on fill OHLCV")
+                bars = {
+                    (row["symbol"], row["minute_key"]): row
+                    for row in frame.to_dicts()
+                    if (row["symbol"], row["minute_key"])
+                    not in retained_by_key
+                }
+            bars.update(retained_by_key)
             usage = defaultdict(int)
             for fill in fills:
                 if fill.get("prior_paper_fill_reused"):
+                    continue
+                if fill.get("terminal_close_receipt") is not None:
+                    # Fully verified separately against the exact official raw
+                    # close; never add user-assumed liquidity to minute volume.
                     continue
                 key = (fill["symbol"], fill["recorded_at"][:16])
                 bar = bars.get(key)
@@ -401,6 +743,10 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                 price = float(fill["price"])
                 if not bar["low"] - 1e-7 <= price <= bar["high"] + 1e-7:
                     errors.append(f"fill outside source OHLC range: {key}: {price}")
+                volume = bar.get("volume_shares")
+                if volume is None or not math.isfinite(volume) or volume <= 0:
+                    errors.append(f"fill minute has no verified share volume: {key}")
+                    continue
                 usage[(fill["market"], *key)] += int(fill["quantity"])
             for (market, symbol, minute), quantity in usage.items():
                 capacity = math.floor(bars[(symbol, minute)]["volume_shares"] * .5 / 1000) * 1000
@@ -412,6 +758,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
         raise RuntimeError("calendar changed during replay audit")
     if any(_sha256(Path(name)) != digest for name, digest in action_source_hashes.items()):
         raise RuntimeError("corporate-action source changed during replay audit")
+    if any(_sha256(Path(name)) != digest for name, digest in terminal_source_hashes.items()):
+        raise RuntimeError("terminal close source changed during replay audit")
     for name, signature in minute_source_signatures.items():
         stat = Path(name).stat()
         if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != signature:
@@ -426,6 +774,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
             "minute_stats": minute_stats, "accounts": accounts, "max_accounting_error_twd": max_error,
             "source_files_checked": len(source_days) if verify_sources else 0,
             "source_hashes": before, "corporate_action_source_hashes": action_source_hashes,
+            "terminal_close_source_hashes": terminal_source_hashes,
             "minute_source_signatures": minute_source_signatures,
             "errors": errors[:100], "error_count": len(errors)}
 

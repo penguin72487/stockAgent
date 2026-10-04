@@ -28,6 +28,23 @@ class SourceRefreshBusy(RuntimeError):
     """Another canonical refresh or publication owns the mutable source."""
 
 
+class StaleDerivedReceipts(RuntimeError):
+    """The cold source cannot be released until upstream derivatives are fresh."""
+
+    def __init__(
+        self, codes: list[str], *, failed_checks: Mapping[str, list[str]] | None = None
+    ) -> None:
+        self.codes = sorted(set(codes))
+        self.failed_checks = {
+            stage: sorted(set(checks))
+            for stage, checks in (failed_checks or {}).items()
+            if checks
+        }
+        super().__init__(
+            "TW public derived receipts are stale: " + ", ".join(self.codes)
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -36,6 +53,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/data_refresh/tw_public/cold_publish/latest.json"),
     )
     parser.add_argument("--timeout-seconds", type=float, default=7200.0)
+    parser.add_argument(
+        "--defer-stale-derived-receipts",
+        action="store_true",
+        help="Record a deferred cold publish after a separate source-only job succeeded",
+    )
     return parser.parse_args()
 
 
@@ -112,16 +134,22 @@ def _check_training_receipts(live_root: Path) -> None:
 
     stocks = live_root / "stocks"
     features = live_root / "features/tw_public_stock_daily.parquet"
-    _, symbol_findings = audit_official_symbol_build(stocks, live_root)
-    _, feature_findings = audit_feature_build_receipt(features, live_root, stocks)
+    symbol_stats, symbol_findings = audit_official_symbol_build(stocks, live_root)
+    feature_stats, feature_findings = audit_feature_build_receipt(features, live_root, stocks)
     blocking = [
         finding.code
         for finding in [*symbol_findings, *feature_findings]
         if finding.severity in {"critical", "high"}
     ]
     if blocking:
-        raise RuntimeError(
-            "TW public derived receipts are stale: " + ", ".join(sorted(set(blocking)))
+        raise StaleDerivedReceipts(
+            blocking,
+            failed_checks={
+                stage: [name for name, passed in stats.get("checks", {}).items() if passed is False]
+                for stage, stats in (
+                    ("official_symbols", symbol_stats), ("public_features", feature_stats)
+                )
+            },
         )
 
 
@@ -217,6 +245,9 @@ def main() -> int:
         "publish",
         "tw-public",
     ]
+    stale_derived_receipts = False
+    blocking_findings: list[str] = []
+    blocking_checks: dict[str, list[str]] = {}
     try:
         completed = _publish_while_source_stable(command, args.timeout_seconds)
         return_code = int(completed.returncode)
@@ -249,6 +280,37 @@ def main() -> int:
         _persist_receipt(receipt, started=started, payload=payload)
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0
+    except StaleDerivedReceipts as exc:
+        blocking_findings = exc.codes
+        blocking_checks = exc.failed_checks
+        if not args.defer_stale_derived_receipts:
+            stale_derived_receipts = True
+            return_code = 75
+            release = None
+            error = str(exc)
+        else:
+            completed_at = datetime.now(TAIPEI)
+            payload = {
+                "schema_version": 1,
+                "status": "deferred",
+                "reason": "stale_derived_receipts",
+                "blocking_findings": exc.codes,
+                "blocking_checks": exc.failed_checks,
+                "started_at_taipei": started.isoformat(),
+                "completed_at_taipei": completed_at.isoformat(),
+                "elapsed_seconds": (completed_at - started).total_seconds(),
+                "dataset": "tw-public",
+                "source_authority": "catalog_mutable_live_root",
+                "opening_dependency": False,
+                "runtime_link_changed": False,
+                "materialization_performed": False,
+                "return_code": 0,
+                "release": None,
+                "error": None,
+            }
+            _persist_receipt(receipt, started=started, payload=payload)
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
     except (OSError, ValueError, RuntimeError) as exc:
         return_code = 75
         release = None
@@ -268,10 +330,15 @@ def main() -> int:
         "return_code": return_code,
         "release": release,
         "error": error,
+        "blocking_findings": blocking_findings,
+        "blocking_checks": blocking_checks,
     }
     _persist_receipt(receipt, started=started, payload=payload)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if payload["status"] == "ok" else 1
+    # Input freshness is a durable publication gate, not a crashed worker.
+    # The systemd unit suppresses only this exit status until a source receipt
+    # changes or the next scheduled backup; other failures still retry.
+    return 0 if payload["status"] == "ok" else 75 if stale_derived_receipts else 1
 
 
 if __name__ == "__main__":

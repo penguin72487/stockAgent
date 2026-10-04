@@ -417,8 +417,11 @@ def _release_minute_group_runtime(device: torch.device) -> dict[str, int]:
 
 
 def _minute_dataset_fingerprint(dataset: MinuteDatasetIndex) -> str:
+    from stockagent.data.tw_listing_admission import regular_market_admission_contract
+
     return _stable_fingerprint(
         {
+            "regular_market_admission": regular_market_admission_contract(),
             "schema_version": dataset.manifest.get("schema_version"),
             "symbols": list(dataset.symbols),
             "dates": [str(value) for value in dataset.dates.astype("datetime64[D]")],

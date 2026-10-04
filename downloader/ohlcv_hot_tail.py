@@ -179,3 +179,92 @@ def read_logical_parquet(
     if tail_rows is not None and merged.height > int(tail_rows):
         merged = merged.tail(int(tail_rows))
     return merged
+
+def _validated_candle_timestamps(
+    frame: pl.DataFrame, *, earliest_ms: int | None, latest_ms: int | None,
+    interval_ms: int,
+) -> pl.Series | None:
+    """Verify actual grid-aligned dates against the planning bounds."""
+    if interval_ms <= 0 or frame.is_empty() or "date" not in frame.columns:
+        return None
+    try:
+        values = frame.get_column("date")
+        dates = (
+            values.str.to_datetime(strict=False, time_zone="UTC", time_unit="ns")
+            if values.dtype == pl.String
+            else values.cast(pl.Datetime("ns", "UTC"), strict=False)
+        )
+    except (pl.exceptions.PolarsError, TypeError, ValueError):
+        return None
+    if dates.null_count() or len(dates) != frame.height:
+        return None
+    timestamps = dates.dt.epoch("ns").sort()
+    interval_ns = interval_ms * 1_000_000
+    if (
+        timestamps[0] // 1_000_000 != earliest_ms
+        or timestamps[-1] // 1_000_000 != latest_ms
+        or not bool((timestamps % interval_ns == 0).all())
+    ):
+        return None
+    return timestamps
+
+
+def has_contiguous_timestamps(
+    frame: pl.DataFrame, *, earliest_ms: int | None, latest_ms: int | None,
+    interval_ms: int,
+) -> bool:
+    """Retain the strict contiguous-middle contract used by Bybit."""
+    timestamps = _validated_candle_timestamps(
+        frame, earliest_ms=earliest_ms, latest_ms=latest_ms, interval_ms=interval_ms,
+    )
+    return timestamps is not None and bool(
+        (timestamps.diff().drop_nulls() == interval_ms * 1_000_000).all()
+    )
+
+
+def plan_candle_reconcile_windows(
+    frame: pl.DataFrame, *, earliest_ms: int | None, latest_ms: int | None,
+    start_ms: int, end_ms: int, interval_ms: int,
+) -> list[tuple[int, int]] | None:
+    """Inclusive head, internal-gap and revision-tail windows; None means rebuild.
+
+    An absent minute is a request, never an invented observation. Adjacent valid
+    rows bound each internal request so existing values and provider revisions
+    can be merged using the caller's canonical non-null precedence.
+    """
+    timestamps = _validated_candle_timestamps(
+        frame, earliest_ms=earliest_ms, latest_ms=latest_ms, interval_ms=interval_ms,
+    )
+    if timestamps is None:
+        return None
+    lower = ((start_ms + interval_ms - 1) // interval_ms) * interval_ms
+    upper = (end_ms // interval_ms) * interval_ms
+    if lower > upper:
+        return []
+    deltas = timestamps.diff().drop_nulls()
+    if not bool((deltas > 0).all()):
+        return None
+    first = int(timestamps[0] // 1_000_000)
+    last = int(timestamps[-1] // 1_000_000)
+    windows: list[tuple[int, int]] = []
+    if lower < first:
+        windows.append((lower, min(first, upper)))
+    if len(timestamps) > 1:
+        gap_mask = deltas > interval_ms * 1_000_000
+        preceding = timestamps.head(-1).filter(gap_mask).to_list()
+        following = timestamps.slice(1).filter(gap_mask).to_list()
+        for left, right in zip(preceding, following, strict=True):
+            lo = max(lower, left // 1_000_000)
+            hi = min(upper, right // 1_000_000)
+            if lo <= hi:
+                windows.append((lo, hi))
+    tail_start = max(lower, last - interval_ms)
+    if tail_start <= upper:
+        windows.append((tail_start, upper))
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(windows):
+        if merged and lo <= merged[-1][1] + interval_ms:
+            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+        else:
+            merged.append((lo, hi))
+    return merged

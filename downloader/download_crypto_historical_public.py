@@ -111,6 +111,7 @@ def _gzip(payload: bytes) -> bytes:
 
 def _write_raw(path: Path, payload: bytes) -> dict[str, Any]:
     compressed = _gzip(payload)
+    _preserve_previous(path)
     atomic_write_bytes(path, compressed)
     return {
         "path": str(path),
@@ -119,6 +120,46 @@ def _write_raw(path: Path, payload: bytes) -> dict[str, Any]:
         "sha256_uncompressed": sha256_bytes(payload),
         "sha256_compressed": sha256_bytes(compressed),
     }
+
+
+def _preserve_previous(path: Path) -> None:
+    """Retain the exact previous capture before replacing a latest-view file."""
+    if path.is_file():
+        payload = path.read_bytes()
+        version = path.parent / "versions" / f"{sha256_bytes(payload)}-{path.name}"
+        if not version.exists():
+            atomic_write_bytes(version, payload)
+
+
+def _upsert_history(path: Path, fresh: pl.DataFrame, keys: list[str]) -> pl.DataFrame:
+    """Preserve old keys and first-seen clocks only for equal normalized values.
+
+    A revised value receives today's clock, while the complete old table remains
+    retrievable in versions/. A bounded refresh must never truncate old history.
+    """
+    if fresh.select(pl.struct(keys).n_unique()).item() != fresh.height:
+        raise ValueError(f"duplicate incoming historical keys: {keys}")
+    if not path.is_file():
+        return fresh
+    old = pl.read_parquet(path)
+    if old.select(pl.struct(keys).n_unique()).item() != old.height:
+        raise ValueError(f"duplicate existing historical keys: {keys}")
+    clock = "strict_available_at_utc"
+    values = [name for name in fresh.columns if name not in [*keys, clock]]
+    if set(fresh.columns) == set(old.columns):
+        matched = fresh.join(old, on=keys, how="left", suffix="__previous", validate="1:1")
+        same = pl.all_horizontal(
+            [pl.col(name).eq_missing(pl.col(f"{name}__previous")) for name in values]
+        )
+        fresh = matched.with_columns(
+            pl.when(same & pl.col(f"{clock}__previous").is_not_null())
+            .then(pl.col(f"{clock}__previous"))
+            .otherwise(pl.col(clock)).alias(clock)
+        ).select(fresh.columns)
+    retained = old.join(fresh.select(keys), on=keys, how="anti")
+    result = pl.concat([retained, fresh], how="diagonal_relaxed").sort(keys)
+    _preserve_previous(path)
+    return result
 
 
 def _cftc_url(start: date, end: date) -> str:
@@ -242,7 +283,7 @@ def normalize_wikimedia(
 def _profile(frame: pl.DataFrame, keys: Iterable[str], time_col: str) -> dict[str, Any]:
     key_list = list(keys)
     duplicates = (
-        frame.group_by(key_list).len().filter(pl.col("len") > 1).select(pl.col("len").sum()).item()
+        frame.group_by(key_list).len().filter(pl.col("len") > 1).select((pl.col("len") - 1).sum()).item()
         if frame.height
         else 0
     )
@@ -280,6 +321,7 @@ def download_cftc(
     if frame.is_empty():
         raise RuntimeError("CFTC returned no digital-asset rows")
     destination = output_dir / "normalized/cftc_tff_digital_assets.parquet"
+    frame = _upsert_history(destination, frame, ["id"])
     atomic_write_parquet(destination, frame, row_group_size=min(10_000, frame.height))
     profile = _profile(frame, ("id",), "report_date_utc")
     receipt = {
@@ -298,6 +340,7 @@ def download_cftc(
             "training_status": "quarantined until release-calendar audit",
         },
     }
+    _preserve_previous(output_dir / "receipts/cftc.json")
     atomic_write_json(output_dir / "receipts/cftc.json", receipt)
     return receipt
 
@@ -335,6 +378,7 @@ def download_wikimedia(
         frames.append(normalize_wikimedia(items, article, observed_at))
     frame = pl.concat(frames, how="vertical").sort(["event_date_utc", "requested_article"])
     destination = output_dir / "normalized/wikimedia_crypto_pageviews_daily.parquet"
+    frame = _upsert_history(destination, frame, ["requested_article", "event_date_utc"])
     atomic_write_parquet(destination, frame, row_group_size=min(10_000, frame.height))
     profile = _profile(frame, ("requested_article", "event_date_utc"), "event_date_utc")
     coverage = (
@@ -367,6 +411,7 @@ def download_wikimedia(
             "training_status": "research-only until revision and redirect audit",
         },
     }
+    _preserve_previous(output_dir / "receipts/wikimedia.json")
     atomic_write_json(output_dir / "receipts/wikimedia.json", receipt)
     return receipt
 
@@ -401,7 +446,10 @@ def main() -> None:
         HttpRequestPolicy(provider="crypto_historical_public", timeout_seconds=90, max_retries=5),
         limiter=SharedRateLimiter(0.25, name="crypto_historical_public"),
     )
-    results: dict[str, Any] = {}
+    # A single-source refresh does not erase another source's coverage receipt.
+    summary_path = output_dir / "download_summary.json"
+    previous = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+    results: dict[str, Any] = dict(previous.get("sources", {}))
     if "cftc" in args.sources:
         results["cftc"] = download_cftc(output_dir, start, end, observed_at, transport)
     if "wikimedia" in args.sources:
@@ -416,7 +464,8 @@ def main() -> None:
         "sources": results,
         "feature_abi_status": "not_integrated_research_sidecar",
     }
-    atomic_write_json(output_dir / "download_summary.json", summary)
+    _preserve_previous(summary_path)
+    atomic_write_json(summary_path, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

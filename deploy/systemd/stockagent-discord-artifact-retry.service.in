@@ -1,0 +1,29 @@
+[Unit]
+Description=Lightweight deadline wakeup for the canonical Discord artifact worker
+After=time-sync.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+StateDirectory=stockagent-discord-artifact-retry
+Environment="STOCKAGENT_ARTIFACT_RETRY_STATE_PATH=/var/lib/stockagent-discord-artifact-retry/latest.json"
+# The owner retains its existing 2h budget/cgroup. Do not dispatch a new history
+# job without enough runway, and never put model inference in this controller.
+ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh" --minimum-runway-minutes 123 --protected-until 13:40
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh" --request-due-retry
+TimeoutStartSec=30s
+Nice=15
+CPUWeight=10
+IOWeight=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

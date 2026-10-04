@@ -52,6 +52,25 @@ def test_full_market_rows_keep_zero_print_product_and_no_synthetic_fills():
     assert daily['contract_multiplier'].null_count() == daily.height
 
 
+def test_scoped_materialization_keeps_parent_calendar_gaps_visible():
+    source,raw,universe=source_rows()
+    calendar=source.select('date').unique()
+    missing=date(2026,1,3)
+    source=source.filter(pl.col('date')!=missing)
+    raw=raw.filter(pl.col('date')!=missing)
+    daily,_=materialize_margin_market_rows(source,raw,universe,market_dates=calendar)
+    assert daily.height==source.height and missing not in daily['date']
+    after=daily.filter(pl.col('date')==date(2026,1,4))
+    assert after['previous_market_date'].to_list()==[missing]*2
+    assert after['previous_symbol_date'].to_list()==[date(2026,1,2)]*2
+    assert not after['same_contract_as_previous_session'].any()
+    assert not daily.filter(pl.col('date')==date(2026,1,2))['can_hold_overnight'].any()
+    for invalid in [pl.concat([calendar,calendar.head(1)]),
+                    calendar.filter(pl.col('date')!=date(2026,1,4))]:
+        with pytest.raises(ValueError,match='repair calendar'):
+            materialize_margin_market_rows(source,raw,universe,market_dates=invalid)
+
+
 def test_future_price_perturbation_cannot_change_earlier_features():
     source, raw, universe = source_rows()
     first, _ = materialize_margin_market_rows(source, raw, universe)
@@ -175,7 +194,8 @@ def test_publisher_rejects_candidate_terms_and_does_not_publish(tmp_path):
     assert not output.exists()
 
 
-def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path):
+@pytest.mark.parametrize('product', ['TX', 'MTX'])
+def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, product):
     """Synthetic integration proof, deliberately not historical admission."""
     from stockagent.data.tw_futures_margin_preparation import index_margin_corporate_execution_rules
     from stockagent.data.tw_futures_margin import attach_futures_margin_rules, TERMINAL_CAPACITY
@@ -185,6 +205,12 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path):
     source = source.filter(pl.col('product') == 'TX')
     raw = raw.filter(pl.col('product') == 'TX')
     universe = universe.filter(pl.col('product') == 'TX')
+    if product != 'TX':
+        source = source.with_columns(pl.lit(product).alias('product'),
+            pl.col('physical_contract').str.replace('TX',product),
+            pl.col('physical_instance').str.replace('TX',product))
+        raw = raw.with_columns(pl.lit(product).alias('product'))
+        universe = universe.with_columns(pl.lit(product).alias('product'))
     daily, _ = materialize_margin_market_rows(source, raw, universe)
     material = tmp_path/'material'; material.mkdir()
     daily.write_parquet(material/'continuous_daily.parquet')
@@ -192,10 +218,11 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path):
         *[pl.lit(False).alias(c) for c in ('missing_valuation', 'intermediate_calendar_gap', 'unresolved_lifetime')])
     dependencies.write_parquet(material/'execution_dependencies.parquet')
     (material/'manifest.json').write_text(json.dumps(dict(materialization_version=1,
-        requested_products=['TX'], zero_print_products=[], products=1,
+        requested_products=[product], zero_print_products=[], products=1,
         contract_version=6, feature_contract_version=3, fixed_model_output_slots=2816,
         outputs={p.name: {'sha256': sha256_file(p)} for p in material.glob('*.parquet')})))
-    account = daily.filter(pl.col('previous_symbol_date').is_not_null()).with_columns(pl.lit(200.).alias('contract_multiplier'))
+    account = daily.filter(pl.col('previous_symbol_date').is_not_null()).with_columns(
+        pl.lit(200. if product == 'TX' else 50.).alias('contract_multiplier'))
     rules = account.select('date', 'physical_contract').with_columns(
         pl.lit('fixed_twd').alias('margin_kind'), pl.lit(2000.).alias('initial'), pl.lit(1500.).alias('maintenance'),
         pl.lit(2000.).alias('settlement_initial'), pl.lit(1500.).alias('settlement_maintenance'),
@@ -222,7 +249,7 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path):
     final_dir=tmp_path/'final'; final_dir.mkdir()
     receipt=final_dir/'source.json'; receipt.write_text('{"synthetic_test_only":true}')
     final=final_dir/'final.parquet'
-    pl.DataFrame([dict(product='TX', contract='202601', settlement_date=date(2026, 1, 21),
+    pl.DataFrame([dict(product=product, contract='202601', settlement_date=date(2026, 1, 21),
         final_settlement_price=110., final_settlement_value=None, reported_date_role='final_settlement_day',
         settlement_method='cash_settlement', source_sha256=sha256_file(receipt))]).write_parquet(final)
     (final_dir/'manifest.json').write_text(json.dumps(dict(schema_version=2,status='complete',
@@ -238,6 +265,7 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path):
         denomination_context_basis='prior_settlement',max_volume_participation=.5,
         futures_slot_count=2816,margin_rules_path=result['rules'],final_settlement_path=final)
     attached=attach_futures_margin_rules(attached,result['rules'])
+    assert not attached.stock_context_futures_portfolio_daily.benchmark_log_returns.any()
     execution=torch.from_numpy(attached.stock_context_futures_portfolio_daily.integer_execution[1:, :1])
     assert execution[0,0,TERMINAL_CAPACITY]==0
     weights=torch.tensor([[.1],[.1],[.1]],requires_grad=True)

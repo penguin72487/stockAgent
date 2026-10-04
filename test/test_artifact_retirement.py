@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import stockagent.data_sync.artifact_retirement as retirement
+import stockagent.data_sync.cold_primary as cold_primary
 from stockagent.data_sync.cold_artifacts import ColdArtifactSpec
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.live_artifacts import reconcile_artifacts
@@ -56,11 +58,11 @@ def _fixture(tmp_path: Path, monkeypatch):
     backup = tmp_path / "backup"
     shutil.copytree(sync_root, backup)
     monkeypatch.setattr(
-        retirement.BackupConfig,
+        cold_primary.BackupConfig,
         "load",
         lambda path: SimpleNamespace(source=sync_root, destination=backup),
     )
-    monkeypatch.setattr(retirement.VolumeGuard, "check", lambda self: None)
+    monkeypatch.setattr(cold_primary.VolumeGuard, "check", lambda self: None)
     monkeypatch.setattr(retirement, "artifact_process_references", lambda *args: [])
     monkeypatch.setattr(retirement, "process_references", lambda *args: [])
     options = {
@@ -98,6 +100,38 @@ def test_retirement_enrolls_before_seven_day_deletion(tmp_path: Path, monkeypatc
         spec, **{**options, "now_ns": start + 6 * 86_400 * 1_000_000_000}
     )
     assert "seven-day-use-lease-active" in later["blockers"]
+
+
+def test_full_run_retirement_protects_enabled_service(tmp_path, monkeypatch):
+    spec, _resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    service = options["artifact_root"].parent / "services/discord_bot/markets/paper.yaml"
+    service.parent.mkdir(parents=True)
+    service.write_text(f"enabled: true\noutput_dir: artifacts/{spec.relative_root}\n")
+    plan = retirement.plan_artifact_retirement(spec, **options)
+    assert "enabled-service-references-artifact" in plan["blockers"]
+    assert plan["service_references"]
+    assert not plan["apply_ready"]
+    assert source.is_dir() and hot_tree.is_dir()
+
+
+def test_retirement_accepts_verified_single_d_primary_without_backup_claim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spec, _resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    cold_primary_marker = options["sync_root"] / cold_primary.D_PRIMARY_MARKER
+    cold_primary_marker.write_text(json.dumps({
+        "schema_version": 1,
+        "volume_id": cold_primary.D_PRIMARY_VOLUME_ID,
+        "backing": cold_primary.D_PRIMARY_BACKING,
+        "authority_node_id": "penguin",
+        "resilience": "single_d_volume",
+    }))
+    monkeypatch.setattr(cold_primary, "_check_d_primary_mount", lambda root: None)
+    plan = retirement.plan_artifact_retirement(spec, **options)
+    assert plan["cold_primary_verified"] is True
+    assert plan["backup_verified"] is False
+    assert plan["resilience"] == "single_d_volume"
+    assert source.exists() and hot_tree.exists()
 
 
 def test_retirement_removes_both_hot_names_and_rehydrates_on_use(
@@ -253,3 +287,108 @@ def test_penguin_hot_retirement_does_not_require_lab203(tmp_path: Path, monkeypa
     assert plan["required_peer_names"] == []
     assert "intended-cold-peers-not-converged" not in plan["blockers"]
     assert plan["blockers"] == ["seven-day-use-lease-not-enrolled"]
+
+
+@pytest.mark.parametrize("enrolled", [False, True])
+def test_manual_immediate_only_bypasses_age_and_records_real_time(tmp_path, monkeypatch, enrolled):
+    spec, resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    start = time.time_ns()
+    options["now_ns"] = start
+    if enrolled:
+        initial = retirement.plan_artifact_retirement(spec, **options)
+        retirement.apply_artifact_retirement(spec, expected_fingerprint=initial["plan_fingerprint"], **options)
+    ordinary = retirement.plan_artifact_retirement(spec, **options)
+    assert not ordinary["apply_ready"]
+    options["manual_immediate"] = True
+    plan = retirement.plan_artifact_retirement(spec, **options)
+    assert plan["apply_ready"]
+    assert plan["plan_fingerprint"] != ordinary["plan_fingerprint"]
+    with pytest.raises(SnapshotError, match="plan changed"):
+        retirement.apply_artifact_retirement(spec, expected_fingerprint=ordinary["plan_fingerprint"], **options)
+    allocated = (source / "checkpoint.pt").stat().st_blocks * 512
+    result = retirement.apply_artifact_retirement(spec, expected_fingerprint=plan["plan_fingerprint"], **options)
+    assert not source.exists() and not hot_tree.exists()
+    assert result["reclaimed_allocated_file_bytes"] == allocated
+    state = json.loads(retirement._state_path(options["state_root"], spec.dataset).read_text())
+    assert state["last_used_ns"] == start and state["manual_immediate"] is True
+    lease = use_materialized_snapshot(options["sync_root"], options["materialized_root"],
+                                      spec.dataset, snapshot_id=resolved.manifest["snapshot_id"], links=[source])
+    assert (source / "checkpoint.pt").read_bytes() == b"verified checkpoint payload"
+    assert lease["ttl_days"] == 7.0
+
+
+@pytest.mark.parametrize("gate", ["process", "service", "pin", "bridge", "state", "quarantine", "peer"])
+def test_manual_immediate_never_bypasses_other_gates(tmp_path, monkeypatch, gate):
+    spec, resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    options["manual_immediate"] = True
+    if gate == "process":
+        monkeypatch.setattr(retirement, "artifact_process_references", lambda *args: ["pid=123:fd"])
+    elif gate == "service":
+        monkeypatch.setattr(retirement, "artifact_service_references", lambda *args: {str(source): ["service"]})
+    elif gate == "pin":
+        monkeypatch.setattr(retirement, "_pinned_snapshot_ids", lambda *args: {resolved.manifest["snapshot_id"]})
+    elif gate == "bridge":
+        options["bridge_inactive"] = False
+    elif gate == "state":
+        path = retirement._state_path(options["state_root"], spec.dataset)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"schema_version": 1, "dataset": spec.dataset,
+                                   "artifact_relative_root": spec.relative_root,
+                                   "state": "cold-only", "last_used_ns": time.time_ns()}))
+    elif gate == "quarantine":
+        path = options["state_root"] / "retirements/quarantine" / spec.dataset
+        path.mkdir(parents=True)
+        (path / "unknown-evidence").write_bytes(b"keep")
+    else:
+        options["peer_proof"]["ok"] = False
+    plan = retirement.plan_artifact_retirement(spec, **options)
+    assert not plan["apply_ready"]
+    with pytest.raises(SnapshotError, match="blocked"):
+        retirement.apply_artifact_retirement(spec, expected_fingerprint=plan["plan_fingerprint"], **options)
+    assert source.is_dir() and hot_tree.is_dir()
+
+
+def test_full_retirement_refreshes_peer_after_expensive_checks(tmp_path, monkeypatch):
+    spec, _, _, _, options = _fixture(tmp_path, monkeypatch)
+    options["peer_proof"] = {"ok": False, "checked_at": "2020-01-01T00:00:00+00:00"}
+    options["peer_probe"] = lambda: {"ok": True, "checked_at": datetime.now(timezone.utc).isoformat(),
+                                     "peers": [{"name": "lab203", "ok": True}]}
+    assert retirement.plan_artifact_retirement(spec, **options)["blockers"] == ["seven-day-use-lease-not-enrolled"]
+
+
+def test_reclaimed_bytes_exclude_external_hardlinks(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    payload = first / "payload"
+    payload.write_bytes(b"allocated payload")
+    os.link(payload, second / "payload")
+    os.link(payload, tmp_path / "external")
+    assert retirement._reclaimable_file_bytes(first, second) == 0
+    (tmp_path / "external").unlink()
+    assert retirement._reclaimable_file_bytes(first, second) == payload.stat().st_blocks * 512
+
+
+def test_manual_immediate_missing_cold_payload_never_changes_hot_paths(tmp_path, monkeypatch):
+    spec, resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    options["manual_immediate"] = True
+    payload = options["sync_root"] / resolved.manifest["archive"]["objects"][0]["relpath"]
+    payload.unlink()
+    with pytest.raises(SnapshotError):
+        retirement.plan_artifact_retirement(spec, **options)
+    assert source.is_dir() and hot_tree.is_dir()
+
+
+def test_manual_new_pin_after_rename_keeps_exact_bytes_in_quarantine(tmp_path, monkeypatch):
+    spec, resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
+    options["manual_immediate"] = True
+    plan = retirement.plan_artifact_retirement(spec, **options)
+    monkeypatch.setattr(retirement, "_pinned_snapshot_ids", lambda *args:
+                        {resolved.manifest["snapshot_id"]} if not source.exists() else set())
+    with pytest.raises(SnapshotError, match="post-rename release pinned"):
+        retirement.apply_artifact_retirement(spec, expected_fingerprint=plan["plan_fingerprint"], **options)
+    state = json.loads(retirement._state_path(options["state_root"], spec.dataset).read_text())
+    assert state["state"] == "retiring"
+    assert (Path(state["quarantine"]) / "source/checkpoint.pt").read_bytes() == b"verified checkpoint payload"
+    assert (Path(state["quarantine"]) / "hot/checkpoint.pt").exists()

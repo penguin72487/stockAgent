@@ -118,13 +118,16 @@ def last_traded_price(raw_root: Path, day: date, symbol: str, current):
     raise ValueError(f"no proven last trade within 366 days: {symbol}")
 
 
-def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()):
+def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=(), markets=()):
     state = json.loads((root / "state.json").read_text())
     if state.get("simulation_only") is not True or state.get("production_order_possible") is not False:
         raise ValueError("not an exclusively paper ledger")
     prices, sources = official_closes(raw_root, day)
     allowed = set(last_traded_price_for)
-    open_symbols = {p["symbol"] for m in state["modes"].values()
+    selected = set(markets) if markets else set(state["modes"])
+    if not selected <= state["modes"].keys():
+        raise ValueError("settlement scope includes unknown market")
+    open_symbols = {p["symbol"] for k, m in state["modes"].items() if k in selected
                     for p in m.get("positions", {}).values() if p.get("signed_shares")}
     if allowed - open_symbols:
         raise ValueError("last-price scope includes symbols without residual positions")
@@ -136,6 +139,8 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
     sources = list({s["path"]: s for s in sources}.values())
     entries, blocked = [], []
     for market, mode in state["modes"].items():
+        if market not in selected:
+            continue
         if mode.get("session_date") != str(day):
             raise ValueError(f"scope must match current ledger session: {market}")
         if mode.get("ledger_state_divergence"):
@@ -156,6 +161,7 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
             entries.append(row)
     key = hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()[:16]
     return {"contract": LAST_PRICE_CONTRACT if allowed else CONTRACT,
+            "markets": sorted(selected),
             "last_traded_price_for": sorted(allowed), "raw_root": str(raw_root.resolve()),
             "operation_id": f"{day}:{key}", "session_date": str(day),
             "simulation_only": True, "production_order_possible": False,
@@ -167,7 +173,10 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
 def reconcile_candidate(root: Path, plan, *, recorded_at: datetime):
     """Mutate only an isolated candidate. All original ledger prefixes survive."""
     day = date.fromisoformat(plan["session_date"])
-    if recorded_at.astimezone(TAIPEI).date() != day or recorded_at.astimezone(TAIPEI).time() < time(13, 35):
+    # The effective paper close remains on the selected completed session.
+    # An audited reconciliation may be recorded after midnight; rejecting it
+    # would force callers to backdate the actual recording time.
+    if recorded_at.astimezone(TAIPEI) < datetime.combine(day, time(13, 35), TAIPEI):
         raise ValueError("offline reconciliation must run after today's closing auction")
     engine = TwDayTradeSimulationEngine(root)
     if book_fingerprint(engine.state) != plan["book_fingerprint"]:
@@ -253,7 +262,8 @@ def reconcile_candidate(root: Path, plan, *, recorded_at: datetime):
                   remaining_count=len(plan["blocked"]), simulation_only=True, production_order_possible=False)
     engine._persist(recorded_at)
     return {"rows": rows, "conversion_cost_reversed_twd": reversal_total,
-            "remaining_count": sum(bool(p.get("signed_shares")) for m in engine.state["modes"].values() for p in m["positions"].values()),
+            "remaining_count": sum(bool(p.get("signed_shares")) for k, m in engine.state["modes"].items()
+                                   if k in plan.get("markets", engine.state["modes"]) for p in m["positions"].values()),
             "ending_equity_twd": {k: m["total_equity_twd"] for k,m in engine.state["modes"].items()}}
 
 
@@ -311,7 +321,7 @@ def apply_plan(live: Path, plan, *, recorded_at: datetime):
             if _sha256(Path(source["path"])) != source["sha256"]:
                 raise ValueError("official source changed")
         verified = make_plan(live, Path(plan["raw_root"]), date.fromisoformat(plan["session_date"]),
-                             last_traded_price_for=plan["last_traded_price_for"])
+                             last_traded_price_for=plan["last_traded_price_for"], markets=plan.get("markets", ()))
         if verified != plan:
             raise ValueError("plan price or scope differs from the official source and current book")
         staging = Path(tempfile.mkdtemp(prefix="official-close-settlement-", dir=live.parent))
@@ -365,6 +375,8 @@ def main():
     parser.add_argument("--date", required=True, type=date.fromisoformat)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--only-market", action="append", default=[],
+                        help="Settle only these named paper accounts; preserve retired accounts unchanged.")
     parser.add_argument("--confirm-counterfactual-settlement", action="store_true")
     parser.add_argument("--last-traded-price-for", action="append", default=[], metavar="SYMBOL",
                         help="Explicit fallback only for this residual symbol when today's official close is absent")
@@ -379,7 +391,7 @@ def main():
         print(json.dumps({k: result.get(k) for k in ("status", "settle_count", "remaining_count", "rollback_directory", "ending_equity_twd")}, ensure_ascii=False))
     else:
         plan = make_plan(args.state_dir.resolve(), args.raw_root, args.date,
-                         last_traded_price_for=args.last_traded_price_for)
+                         last_traded_price_for=args.last_traded_price_for, markets=args.only_market)
         _atomic_json(args.plan, plan)
         print(json.dumps({"settle_count": plan["settle_count"], "blocked_count": plan["blocked_count"],
                           "blocked_symbols": sorted({e["symbol"] for e in plan["blocked"]}), "plan": str(args.plan)}, ensure_ascii=False))

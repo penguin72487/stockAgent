@@ -1,0 +1,41 @@
+{
+  "contract_version": 4,
+  "source_scope_contract": "editable_source_scope_v1",
+  "provider": "tej_smart_wizard",
+  "history_search_start": "1900-01-01",
+  "max_cells_per_export": 200000,
+  "max_rows_per_export": 10000,
+  "max_companies_per_export": 32,
+  "preview_max_columns": 30,
+  "download_planning_contract": "preview_30_columns_lazy_fields_v1",
+  "query_tiling_contract": "minimum_uniform_company_date_rectangles_v1",
+  "capture_method": "native_msaa_preview_full",
+  "source_value_representation": "vendor_display_strings_not_underlying_excel_values",
+  "desktop_parallelism": 1,
+  "minimum_export_interval_seconds": 2,
+  "download_burst_between_discoveries": 4,
+  "metadata_failure_isolation": true,
+  "acknowledge_known_metadata_runtime_notices": true,
+  "minimum_free_disk_bytes": 5368709120,
+  "unknown_outcome_auto_retry": false,
+  "automation": {
+    "enabled": true,
+    "idle_poll_seconds": 60,
+    "blocked_poll_seconds": 60,
+    "heartbeat_seconds": 30
+  },
+  "auto_key3_replanning": true,
+  "auto_snapshot_replanning": true,
+  "auto_month_period_replanning": true,
+  "raw_source_publish": false,
+  "date_axis": "requested_smart_wizard_grid_not_native_observation_dates",
+  "quota": {
+    "smart_wizard_requests_per_second": null,
+    "smart_wizard_requests_per_day": null,
+    "smart_wizard_rows_per_day": null,
+    "smart_wizard_reset_timezone": null,
+    "basis": "No current account-specific desktop download cap was found in the official guides. Unknown is not unlimited. Stop on permission/quota/auth/unknown dialogs; only the exact owned normal No data response is acknowledged after scope verification. No bypass.",
+    "api_quota_separate": true,
+    "api_quota_source": "https://api.tej.com.tw/document_python.html"
+  }
+}

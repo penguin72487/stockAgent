@@ -274,3 +274,20 @@ def test_daily_runner_records_real_failed_exit_code(tmp_path: Path) -> None:
     receipt = json.loads((receipt_dir / "fixture_failure.json").read_text())
     assert receipt["state"] == "failed"
     assert receipt["exit_code"] == 7
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 7, 42, 124])
+def test_yahoo_asset_wrapper_restores_scope_and_preserves_exit_code(exit_code):
+    command = "\n".join((
+        "source downloader/run_daily_all_markets.sh",
+        "YAHOO_ASSETS='us_stocks forex'",
+        f"run_yahoo_incremental() {{ [[ \"$YAHOO_ASSETS\" == forex ]] || return 99; return {exit_code}; }}",
+        "if run_yahoo_incremental_assets forex; then fixture_rc=0; else fixture_rc=$?; fi",
+        '[[ "$YAHOO_ASSETS" == "us_stocks forex" ]] || exit 98',
+        'exit "$fixture_rc"',
+    ))
+    result = subprocess.run(
+        ["bash", "-c", command], cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == exit_code, result.stderr

@@ -817,6 +817,15 @@ def _maybe_init_distributed_for_panel(active_strategy: str, config) -> None:
 
 
 def _build_panel_kwargs(config) -> dict:
+    if (
+        str(config.trading.execution_mode) == "tw_day_trade"
+        and config.data.day_trade_minute_execution_root is not None
+    ):
+        from stockagent.data.tw_day_trade_execution import (
+            discover_day_trade_minute_execution_source,
+        )
+
+        discover_day_trade_minute_execution_source(config.data.day_trade_minute_execution_root)
     if config.data.crypto_exchange_scope:
         from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
 
@@ -2221,6 +2230,9 @@ def main() -> None:
                         config.data.day_trade_minute_execution_daily_proxy_price_policy
                     ),
                     corporate_action_mode=config.trading.tw_corporate_action_mode,
+                    subscription_right_policy=(
+                        config.trading.tw_day_trade_subscription_right_policy
+                    ),
                     entry_remainder_policy=config.trading.tw_day_trade_entry_remainder_policy,
                     terminal_liquidation_unlimited_capacity=(
                         config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity

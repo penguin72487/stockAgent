@@ -1,6 +1,6 @@
 """Same-day flatten is an obligation, not a fabricated fill guarantee."""
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace
 
@@ -205,8 +205,7 @@ def test_stream_subscriptions_are_shared_and_not_snapshot_polling(monkeypatch):
     calls=[]
     class API:
         contracts=SimpleNamespace(get=lambda code: SimpleNamespace(code=code,reference=1000,limit_up=1100,limit_down=900))
-        def set_on_tick_stk_v1_callback(self, callback): self.tick=callback
-        def set_on_bidask_stk_v1_callback(self, callback): self.book=callback
+        def set_on_quote_stk_v1_callback(self, callback): self.quote=callback
         def subscribe(self, contract, **kw): calls.append(("subscribe",contract.code))
         def unsubscribe(self, contract, **kw): calls.append(("unsubscribe",contract.code))
     api=API()
@@ -214,9 +213,104 @@ def test_stream_subscriptions_are_shared_and_not_snapshot_polling(monkeypatch):
     monkeypatch.setattr(provider,"_SHIOAJI_STREAM_API",None)
     monkeypatch.setattr(provider,"_SHIOAJI_STREAM_ROWS",{})
     monkeypatch.setattr(provider,"_SHIOAJI_STREAM_SUBSCRIPTIONS",set())
+    monkeypatch.setattr(provider,"_SHIOAJI_STREAM_CURSOR",0)
+    monkeypatch.setattr(provider,"_SHIOAJI_STREAM_ROTATION_AT",0.0)
     monkeypatch.setattr(provider,"_load_prepared_tw_price_limits",lambda day:({},None))
     provider.fetch_shioaji_stock_live_quotes(["2330"],trading_date=_now(9,0).date())
     provider.fetch_shioaji_stock_live_quotes(["2330"],trading_date=_now(9,0).date())
-    assert calls == [("subscribe","2330"),("subscribe","2330")]
+    assert calls == [("subscribe","2330")]
     provider.fetch_shioaji_stock_live_quotes([],trading_date=_now(9,0).date())
-    assert calls[-2:] == [("unsubscribe","2330"),("unsubscribe","2330")]
+    assert calls[-1:] == [("unsubscribe","2330")]
+
+
+def test_quote_stream_carries_book_trial_and_auction_evidence(monkeypatch):
+    import stockagent.live.quote_provider as provider
+    callbacks = {}
+    class API:
+        contracts = SimpleNamespace(get=lambda code: SimpleNamespace(code=code, reference=1000, limit_up=1100, limit_down=900))
+        def set_on_quote_stk_v1_callback(self, callback): callbacks["quote"] = callback
+        def subscribe(self, contract, **kw): pass
+        def unsubscribe(self, contract, **kw): pass
+    monkeypatch.setattr(provider, "_shioaji_stock_api", lambda: API_INSTANCE)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_API", None)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROWS", {})
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_SUBSCRIPTIONS", set())
+    monkeypatch.setattr(provider, "_load_prepared_tw_price_limits", lambda day: ({}, None))
+    API_INSTANCE = API()
+    observed = datetime.now(_now(9, 0).tzinfo)
+    day = observed.date()
+    provider.fetch_shioaji_stock_live_quotes(["2330"], trading_date=day)
+    callbacks["quote"](SimpleNamespace(
+        code="2330", datetime=observed, simtrade=False, suspend=False,
+        intraday_odd=False, open=1000, close=1001, high=1002, low=999,
+        volume=2, total_volume=123, bid_price=[1000], ask_price=[1001],
+        bid_volume=[5], ask_volume=[4],
+    ))
+    quote = provider.fetch_shioaji_stock_live_quotes(["2330"], trading_date=day)["2330"]
+    assert quote["source"] == "shioaji_stock_quote_stream"
+    assert quote["simtrade"] is False
+    assert quote["bid"] == 1000
+    assert quote["ask"] == 1001
+    assert quote["cumulative_volume_lots"] == 123
+    assert quote["quote_at"] is not None
+    provider._SHIOAJI_STREAM_ROWS.clear()
+    auction_at = observed.replace(hour=13, minute=30, second=2, microsecond=0)
+    callbacks["quote"](SimpleNamespace(
+        code="2330", datetime=auction_at, simtrade=False, suspend=False,
+        intraday_odd=False, open=1000, close=1005, high=1005, low=999,
+        volume=10, total_volume=133, bid_price=[1004], ask_price=[1005],
+        bid_volume=[0], ask_volume=[0],
+    ))
+    callbacks["quote"](SimpleNamespace(
+        code="2330", datetime=auction_at + timedelta(seconds=1),
+        simtrade=False, suspend=False, intraday_odd=False,
+        open=1000, close=1005, high=1005, low=999,
+        volume=0, total_volume=133, bid_price=[1004], ask_price=[1005],
+        bid_volume=[0], ask_volume=[0],
+    ))
+    quote = provider.fetch_shioaji_stock_live_quotes(["2330"], trading_date=day)["2330"]
+    assert quote["auction_volume_lots"] == 10
+    assert quote["auction_volume_source"] == "exchange_non_trial_quote_trade"
+    assert quote["last"] == 1005
+    assert quote["trade_quote_at"] == provider._SHIOAJI_STREAM_ROWS["2330"]["auction"]["received_at"]
+
+
+def test_quote_stream_rotates_without_exceeding_subscription_limit(monkeypatch):
+    import stockagent.live.quote_provider as provider
+    calls = []
+    callbacks = {}
+    class API:
+        contracts = SimpleNamespace(get=lambda code: SimpleNamespace(code=code, reference=10, limit_up=11, limit_down=9))
+        def set_on_quote_stk_v1_callback(self, callback): callbacks["quote"] = callback
+        def subscribe(self, contract, **kw): calls.append(("subscribe", contract.code))
+        def unsubscribe(self, contract, **kw): calls.append(("unsubscribe", contract.code))
+    api = API()
+    monkeypatch.setattr(provider, "_shioaji_stock_api", lambda: api)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_API", None)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROWS", {})
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_SUBSCRIPTIONS", set())
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_CURSOR", 0)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROTATION_AT", 0.0)
+    monkeypatch.setattr(provider, "_load_prepared_tw_price_limits", lambda day: ({}, None))
+    symbols = [str(1000 + idx) for idx in range(258)]
+    observed = datetime.now(_now(9, 0).tzinfo)
+    for _ in range(8):
+        first = provider.fetch_shioaji_stock_live_quotes(symbols, trading_date=observed.date())
+    assert len(provider._SHIOAJI_STREAM_SUBSCRIPTIONS) == provider._SHIOAJI_STOCK_STREAM_LIMIT
+    assert sum(bool(row["stream_capacity_limited"]) for row in first.values()) == 58
+    cached_code = symbols[142]
+    callbacks["quote"](SimpleNamespace(
+        code=cached_code, datetime=observed, simtrade=False, suspend=False,
+        intraday_odd=False, open=10, close=10, high=10, low=10,
+        volume=1, total_volume=10, bid_price=[10], ask_price=[10],
+        bid_volume=[1], ask_volume=[1],
+    ))
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROTATION_AT", 0.0)
+    for _ in range(5):
+        second = provider.fetch_shioaji_stock_live_quotes(symbols, trading_date=observed.date())
+    assert len(provider._SHIOAJI_STREAM_SUBSCRIPTIONS) == provider._SHIOAJI_STOCK_STREAM_LIMIT
+    assert all(first[code]["stream_subscribed"] or second[code]["stream_subscribed"] for code in symbols)
+    assert second[cached_code]["stream_capacity_limited"] is True
+    assert second[cached_code]["stream_subscribed"] is False
+    assert second[cached_code]["available"] is True
+    assert len([action for action, _ in calls if action == "subscribe"]) > provider._SHIOAJI_STOCK_STREAM_LIMIT
