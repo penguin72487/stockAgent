@@ -547,12 +547,25 @@ def test_cpu_artifact_replay_restores_threads_after_source_failure(monkeypatch):
         torch.set_num_threads(4)
         with pytest.raises(RuntimeError, match="source failure"):
             trainer._replay_physical_carry_split_prefix(
-                SimpleNamespace(requested_weights_history=np.zeros((1, 2))),
+                SimpleNamespace(requested_weights_history=np.zeros((len(split), 2))),
                 split, 1, runtime=runtime, config=None,
             )
         assert torch.get_num_threads() == 4
     finally:
         torch.set_num_threads(previous)
+
+
+def test_artifact_prefix_rejects_mismatched_requests_before_source_decode(monkeypatch):
+    split, runtime, _ = fixture()
+    monkeypatch.setattr(PreparedDayTradeCarrySource, "batch",
+                        lambda *args, **kwargs: pytest.fail("invalid prefix must not decode source"))
+    previous = torch.get_num_threads()
+    with pytest.raises(ValueError, match="physical prefix requests differ"):
+        trainer._replay_physical_carry_split_prefix(
+            SimpleNamespace(requested_weights_history=np.zeros((1, 2))),
+            split, 1, runtime=runtime, config=None,
+        )
+    assert torch.get_num_threads() == previous
 
 
 def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_account():

@@ -469,11 +469,16 @@ SHA are checked; AST comparison rejects any other accounting edit.
     if hashlib.sha256(source.encode()).hexdigest() != previous['functions']['_compile_accounting']:
         raise ValueError('information-halt baseline is not the accepted accounting kernel')
     effective = ast.parse(inspect.getsource(_compile_accounting)).body[0]
-    if (effective.args.kwonlyargs[-1].arg != 'information_halt_reviews'
-            or ast.dump(effective.args.kw_defaults[-1]) != ast.dump(ast.parse('()').body[0].value)):
+    hook_parameters = [i for i, argument in enumerate(effective.args.kwonlyargs)
+                       if argument.arg == 'information_halt_reviews']
+    if (len(hook_parameters) != 1
+            or effective.args.kw_defaults[hook_parameters[0]] is None
+            or ast.dump(effective.args.kw_defaults[hook_parameters[0]])
+                != ast.dump(ast.parse('()').body[0].value)):
         raise ValueError('information-halt extension has an unexpected input parameter')
-    effective.args.kwonlyargs.pop()
-    effective.args.kw_defaults.pop()
+    hook_index = hook_parameters[0]
+    effective.args.kwonlyargs.pop(hook_index)
+    effective.args.kw_defaults.pop(hook_index)
     hooks = [n for n in effective.body if isinstance(n, ast.If)
              and isinstance(n.test, ast.Name) and n.test.id == 'information_halt_reviews']
     expected = ast.parse('''if information_halt_reviews:
