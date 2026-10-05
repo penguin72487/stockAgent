@@ -44,6 +44,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 - [`continuous_nas_backup_2026-10-04.md`](continuous_nas_backup_2026-10-04.md)：來源端持續增量服務、lab203 既有 worker 回傳收據交接、固定 NAS snapshot 重建與受控 USB 金鑰保管。
 - [`lab203_nas_recovery_acceptance_2026-10-04.md`](lab203_nas_recovery_acceptance_2026-10-04.md)：lab203 本機執行三個固定 NAS snapshot 的 packed／SQL 獨立驗收；USB 保管已由使用者確認完成。
 - [`agent_workflow.md`](agent_workflow.md)：本機 agent 工具安裝、唯讀狀態、任務紀錄與 tmux／systemd 命令監督。
+- [`codex_skill_sync_2026-10-06.md`](codex_skill_sync_2026-10-06.md)：penguin／Vastai1T 自訂 skills 的雙向聯集、共同基線三方合併、衝突保留、回復備份與實際載入驗收。
 - [`stockagent-storage-operations` skill](../.agents/skills/stockagent-storage-operations/SKILL.md)：供其他 agent 使用的四節點操作流程；含進度查詢、唯一 owner、自動 NAS 備份、遠端按需資料與恢復／回收判準。
 - [`control_plane_workflow.md`](control_plane_workflow.md)：正式固定程式碼驗證 owner，以及 PostgreSQL 工程工作、版本／lease／attempt、私有節點與備份還原。
 - [`architecture_production_completion_2026-10-05.md`](architecture_production_completion_2026-10-05.md)：第一性原理技術取捨、四節點正式服務、精確 code work 與重啟／同步驗收。

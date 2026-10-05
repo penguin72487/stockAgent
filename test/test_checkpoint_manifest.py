@@ -208,6 +208,48 @@ def _config():
     return load_config("configs/experiment_baseline.yaml")
 
 
+@pytest.mark.parametrize(
+    "execution_mode,backward_contract_key",
+    [
+        ("tw_stock_context_futures_portfolio", "futures_margin_backward_contract_version"),
+        ("crypto_perpetual", "crypto_backward_contract_version"),
+    ],
+)
+def test_pca_schedule_coexists_with_market_training_contracts(
+    execution_mode: str,
+    backward_contract_key: str,
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    config.training.model_name = "financial_transformer"
+    config.training.financial_transformer.temporal_basis_families = ["pca_klt"]
+    config.trading.execution_mode = execution_mode
+    config.trading.tw_futures_portfolio_capital_basis = "initial_margin"
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        config.training.futures_training_max_drawdown = 0.2
+    before = _checkpoint_manifest(_panel(), config)
+    config.training.temporal_basis_covariance_lag_batch_size = 8
+    after = _checkpoint_manifest(_panel(), config)
+    training = after["contracts"]["training"]
+    assert training["temporal_basis_covariance_schedule"]["lag_batch_size"] == min(
+        8, config.training.lookback
+    )
+    assert training[backward_contract_key] == before["contracts"]["training"][backward_contract_key]
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        assert training["exact_policy_step"]["training_max_drawdown"] == 0.2
+    assert before["fingerprints"]["model"] == after["fingerprints"]["model"]
+    for scope in ("resume", "artifact"):
+        with pytest.raises(RuntimeError, match="training"):
+            _validate_checkpoint_manifest(
+                {"experiment_manifest": before}, after,
+                checkpoint_path=tmp_path / "before_batching.pt", scope=scope,
+            )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": before}, after,
+        checkpoint_path=tmp_path / "before_batching.pt", scope="inference",
+    )
+
+
 def _day_trade_minute_panel() -> PanelData:
     panel = _panel()
     rows, symbols = panel.tradable_mask.shape
