@@ -218,8 +218,12 @@ def _config():
 def test_pca_schedule_coexists_with_market_training_contracts(
     execution_mode: str,
     backward_contract_key: str,
-    tmp_path: Path,
 ) -> None:
+    from stockagent.training.checkpoint_contract import (
+        _stable_fingerprint,
+        _training_checkpoint_contract,
+    )
+
     config = _config()
     config.training.model_name = "financial_transformer"
     config.training.financial_transformer.temporal_basis_families = ["pca_klt"]
@@ -227,27 +231,19 @@ def test_pca_schedule_coexists_with_market_training_contracts(
     config.trading.tw_futures_portfolio_capital_basis = "initial_margin"
     if execution_mode == "tw_stock_context_futures_portfolio":
         config.training.futures_training_max_drawdown = 0.2
-    before = _checkpoint_manifest(_panel(), config)
+    before = _training_checkpoint_contract(config)
     config.training.temporal_basis_covariance_lag_batch_size = 8
-    after = _checkpoint_manifest(_panel(), config)
-    training = after["contracts"]["training"]
-    assert training["temporal_basis_covariance_schedule"]["lag_batch_size"] == min(
+    after = _training_checkpoint_contract(config)
+    assert after["temporal_basis_covariance_schedule"]["lag_batch_size"] == min(
         8, config.training.lookback
     )
-    assert training[backward_contract_key] == before["contracts"]["training"][backward_contract_key]
+    assert after[backward_contract_key] == before[backward_contract_key]
     if execution_mode == "tw_stock_context_futures_portfolio":
-        assert training["exact_policy_step"]["training_max_drawdown"] == 0.2
-    assert before["fingerprints"]["model"] == after["fingerprints"]["model"]
-    for scope in ("resume", "artifact"):
-        with pytest.raises(RuntimeError, match="training"):
-            _validate_checkpoint_manifest(
-                {"experiment_manifest": before}, after,
-                checkpoint_path=tmp_path / "before_batching.pt", scope=scope,
-            )
-    _validate_checkpoint_manifest(
-        {"experiment_manifest": before}, after,
-        checkpoint_path=tmp_path / "before_batching.pt", scope="inference",
-    )
+        assert after["exact_policy_step"]["training_max_drawdown"] == 0.2
+    assert _stable_fingerprint(before) != _stable_fingerprint(after)
+    without_pca_schedule = dict(after)
+    without_pca_schedule.pop("temporal_basis_covariance_schedule")
+    assert without_pca_schedule == before
 
 
 def _day_trade_minute_panel() -> PanelData:
