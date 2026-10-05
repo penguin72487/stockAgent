@@ -1,0 +1,14 @@
+# One fixed feature-axis SVD; no temporal multi-basis or learned bottleneck.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v1.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-svd32-bf16-v1
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_svd32_v1/training-bf16
+  resume: false
+training:
+  pretrained_initialization_root: null
+  financial_transformer:
+    feature_svd_components: 32
+    feature_svd_analysis_components: 128
+    feature_svd_oversampling: 32
+    feature_svd_power_iterations: 2
+    feature_svd_seed: 7

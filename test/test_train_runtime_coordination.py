@@ -17,6 +17,29 @@ import train as train_entry
 from stockagent.config import load_config
 
 
+def test_epoch_wall_max_is_available_without_hot_path_profiling(monkeypatch):
+    from stockagent.training import trainer
+
+    payload = {"epoch_total_s": 4.0, "train_total_s": 3.0}
+    monkeypatch.setattr(trainer, "_distributed_is_initialized", lambda: False)
+    assert trainer._epoch_max_rank_wall_times(payload, torch.device("cpu")) == {
+        "epoch_max_rank_s": 4.0, "train_max_rank_s": 3.0,
+    }
+    monkeypatch.setattr(trainer, "_distributed_is_initialized", lambda: True)
+    calls = []
+
+    def reduce_wall_times(tensor, *, op):
+        calls.append((tensor.shape, op))
+        tensor.copy_(torch.maximum(tensor, torch.tensor([5.0, 2.0], dtype=tensor.dtype)))
+
+    monkeypatch.setattr(trainer.dist, "all_reduce", reduce_wall_times)
+    assert trainer._epoch_max_rank_wall_times(payload, torch.device("cpu")) == {
+        "epoch_max_rank_s": 5.0, "train_max_rank_s": 3.0,
+    }
+    assert calls == [(torch.Size([2]), trainer.dist.ReduceOp.MAX)]
+    assert payload == {"epoch_total_s": 4.0, "train_total_s": 3.0}
+
+
 def test_startup_timing_buffers_until_output_path_is_known(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

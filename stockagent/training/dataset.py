@@ -1264,10 +1264,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             force_short_cover = np.zeros_like(tradable, dtype=bool)
         # build_panel sanitizes feature NaN/inf values before caching.  Re-running
         # torch.nan_to_num here would duplicate the full panel for every split.
-        features = panel.features.astype(np.float32, copy=False)
-        if not features.flags.c_contiguous:
-            features = np.ascontiguousarray(features)
-        self.features_t = torch.from_numpy(features)
+        if getattr(panel.features, "_stockagent_factorized_features", False):
+            self.features_t = panel.features.as_torch()
+        else:
+            features = panel.features.astype(np.float32, copy=False)
+            if not features.flags.c_contiguous:
+                features = np.ascontiguousarray(features)
+            self.features_t = torch.from_numpy(features)
         self.future_log_returns_t = torch.from_numpy(returns)
         self.overnight_log_returns_t = torch.from_numpy(
             np.asarray(overnight_returns, dtype=np.float32)

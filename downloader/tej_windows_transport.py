@@ -33,11 +33,14 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _command(command: str, ready: str, permit: str, token: str, digest: str, wait_seconds: float) -> str:
+def _command(command: str, ready: str, permit: str, token: str, digest: str, wait_seconds: float,
+             windows_session_id: int | None = None) -> str:
     """The reviewed bridge command is unreachable until the exact permit exists."""
     acknowledgement = json.dumps({'contract':CONTRACT, 'token':token, 'request_sha256':digest}, separators=(',', ':'))
     return (
-        "$ErrorActionPreference='Stop';$ready="+_quote(ready)+";$permit="+_quote(permit)+";"
+        "$ErrorActionPreference='Stop';" + ("if([Diagnostics.Process]::GetCurrentProcess().SessionId -ne " +
+        str(windows_session_id) + "){exit 77};" if windows_session_id is not None else "") +
+        "$ready="+_quote(ready)+";$permit="+_quote(permit)+";"
         "$token="+_quote(token)+";$tmp=$ready+'.tmp';"
         "[IO.File]::WriteAllText($tmp,"+_quote(acknowledgement)+",[Text.UTF8Encoding]::new($false));"
         "Move-Item -LiteralPath $tmp -Destination $ready;"
@@ -71,12 +74,19 @@ def _stop_unpermitted(process) -> bytes:
 
 
 def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: float = 900,
-                        readiness_seconds: float = 20) -> subprocess.CompletedProcess:
+                        readiness_seconds: float = 20,
+                        windows_session_id: int | None = None,
+                        interop_socket: str | None = None) -> subprocess.CompletedProcess:
     request = request.resolve()
     if not re.fullmatch(r'[0-9a-f]{24}-[0-9a-f]{32}\.json', request.name):
         raise ValueError('Exact canonical bridge request required')
     if not 0 < readiness_seconds <= 30 or timeout < readiness_seconds:
         raise ValueError('Bounded Windows admission deadline required')
+    if windows_session_id is not None and (type(windows_session_id) is not int or windows_session_id <= 0):
+        raise ValueError('Exact interactive Windows session required')
+    if interop_socket is not None and (windows_session_id is None or
+            not re.fullmatch(r'/run/WSL/[0-9]+_interop', interop_socket) or not Path(interop_socket).is_socket()):
+        raise ValueError('Exact live interactive WSL relay required')
     root = request.parent.parent
     digest = hashlib.sha256(request.read_bytes()).hexdigest()
     gates = root/'launches'
@@ -86,14 +96,20 @@ def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: f
     # shell relay. It is a candidate, never considered healthy without an ACK.
     stable = Path('/run/WSL/1_interop')
     environments = [None]
-    if stable.is_socket() and os.environ.get('WSL_INTEROP') != str(stable):
-        environments.insert(0, {**os.environ, 'WSL_INTEROP':str(stable)})
+    if interop_socket is not None:
+        environments = [{**os.environ, 'WSL_INTEROP': interop_socket}]
+    elif stable.is_socket() and os.environ.get('WSL_INTEROP') != str(stable):
+        # GUI startup must prefer its logged-in scheduled task's own relay.
+        # The stable boot relay may belong to a noninteractive Session 0.
+        environments.insert(len(environments) if windows_session_id is not None else 0,
+                            {**os.environ, 'WSL_INTEROP':str(stable)})
     for slot, environment in enumerate(environments):
         token = uuid.uuid4().hex
         prefix = request.stem+'-'+str(slot)+'-'+token
         ready, permit = gates/(prefix+'.ready.json'), gates/(prefix+'.permit')
         argv = [POWERSHELL, '-NoProfile', '-NonInteractive', '-Command',
-                _command(command, windows_path(ready), windows_path(permit), token, digest, readiness_seconds+2)]
+                _command(command, windows_path(ready), windows_path(permit), token, digest,
+                         readiness_seconds+2, windows_session_id)]
         started = time.monotonic()
         process = None
         try:
@@ -114,7 +130,9 @@ def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: f
                         process.kill()
                         process.communicate(timeout=2)
                         raise  # Durable permit means unknown, never another launch.
-                    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                    completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                    completed.windows_interop_socket = (environment or os.environ).get('WSL_INTEROP')
+                    return completed
                 time.sleep(.05)
         stderr = _stop_unpermitted(process) if process is not None else b''
         diagnostic = root/'diagnostics'/(prefix+'-unpermitted.txt')

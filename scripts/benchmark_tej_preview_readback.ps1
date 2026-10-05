@@ -15,12 +15,14 @@ param(
     [switch]$Fixture,
     [int]$FixtureRows=1000,
     [int]$FixtureColumns=30,
-    [int]$Rounds=2
+    [int]$Rounds=2,
+    [switch]$CheckStability
 )
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 if(Test-Path -LiteralPath $Output){throw 'Retain the original benchmark evidence'}
 if($Rounds -lt 1 -or $Rounds -gt 3){throw 'Unreviewed repetition bound'}
+if($CheckStability -and -not $Fixture){throw 'Mutation checks may only modify the owned fixture'}
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Accessibility
 Add-Type -AssemblyName UIAutomationClient
@@ -75,6 +77,24 @@ public static class TejReadbackBenchmark {
     public static void Close() {
         if(form!=null&&!form.IsDisposed)form.Invoke(new Action(()=>form.Close()));
         if(thread!=null&&!thread.Join(5000))throw new Exception("Owned fixture did not close");
+    }
+    public static void ChangeFixtureRows(bool add) {
+        if(form==null||form.IsDisposed)throw new Exception("Owned fixture is not open");
+        form.Invoke(new Action(()=> {
+            if(add)grid.Rows.Add(new object[]{"OWNED_EXTRA_ROW"});
+            else grid.Rows.RemoveAt(grid.Rows.Count-2);
+        }));
+    }
+    public static void ChangeFixtureColumns(bool add) {
+        if(form==null||form.IsDisposed)throw new Exception("Owned fixture is not open");
+        form.Invoke(new Action(()=> {
+            if(add) {
+                grid.Columns.Add("owned_extra1","OWNED_EXTRA_1");
+                grid.Columns.Add("owned_extra2","OWNED_EXTRA_2");
+            }else {
+                grid.Columns.Remove("owned_extra2");grid.Columns.Remove("owned_extra1");
+            }
+        }));
     }
     public static string Digest(object[][] rows) {
         using(var sha=SHA256.Create()) {
@@ -149,6 +169,7 @@ try {
     $signatureBefore=[TejBridgeNative]::PreviewSignature($grid)
     $shapeBefore=[TejBridgeNative]::PreviewShape($grid)
     $referenceSample=$null
+    $baselineCapture=[TejBridgeBaseline].GetMethod('CaptureFullPreview')
     for($round=0;$round -lt $Rounds;$round++) {
         # Balanced AB/BA ordering. Full-array parity, including null and all
         # strings, is checked after each complete read, outside its timing.
@@ -156,8 +177,13 @@ try {
         foreach($method in $order) {
             $clock=[Diagnostics.Stopwatch]::StartNew();$fallback=0;$sample=$null;$timing=$null
             if($method -eq 'baseline') {
-                $sample=[TejBridgeBaseline]::Preview($grid,$maxRows,$columns)
-                $matrix=[TejBridgeBaseline]::FullPreview($grid,$maxRows,$columns,[ref]$fallback)
+                if($null -ne $baselineCapture) {
+                    $matrix=[TejBridgeBaseline]::CaptureFullPreview($grid,$maxRows,$columns,[ref]$fallback,
+                        [ref]$sample,[ref]$timing,$null,$null,$null)
+                } else {
+                    $sample=[TejBridgeBaseline]::Preview($grid,$maxRows,$columns)
+                    $matrix=[TejBridgeBaseline]::FullPreview($grid,$maxRows,$columns,[ref]$fallback)
+                }
             } else {
                 $matrix=[TejBridgeNative]::CaptureFullPreview($grid,$maxRows,$columns,[ref]$fallback,
                     [ref]$sample,[ref]$timing,$null,$null,$null)
@@ -176,6 +202,59 @@ try {
     }
     if([TejBridgeNative]::PreviewSignature($grid) -cne $signatureBefore -or
        ([TejBridgeNative]::PreviewShape($grid) -join ',') -cne ($shapeBefore -join ',')){throw 'Grid changed during benchmark'}
+    $stabilityChecks=@{}
+    if($CheckStability) {
+        # Reflection only calls our reviewed client helper, not vendor internals.
+        # No source form/query can reach these mutations: fixture-only guard
+        # above precedes all UI interactions.
+        $verify=[TejBridgeNative].GetMethod('VerifyPreviewRowStability',
+            ([Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static))
+        if($null -eq $verify){throw 'Candidate stability helper missing'}
+        $count=[int]$sample[0]
+        [void]$verify.Invoke($null,@([long]$grid,[int]$maxRows,$count))
+        $stabilityChecks.unchanged_all_roles_accepted=$true
+        [TejReadbackBenchmark]::ChangeFixtureRows($true)
+        try {
+            $rejected=$false
+            try {[void]$verify.Invoke($null,@([long]$grid,[int]($maxRows+1),$count))}
+            catch {if($_.Exception.ToString() -notmatch 'Source grid changed during readback'){throw};$rejected=$true}
+            if(-not $rejected){throw 'Changed row count was incorrectly accepted'}
+            $stabilityChecks.changed_row_count_rejected=$true
+        }finally {[TejReadbackBenchmark]::ChangeFixtureRows($false)}
+        [void]$verify.Invoke($null,@([long]$grid,[int]$maxRows,$count))
+        $stabilityChecks.restored_grid_accepted=$true
+        $rejected=$false
+        try {[void]$verify.Invoke($null,@([long]$grid,[int]0,$count))}
+        catch {if($_.Exception.ToString() -notmatch 'Preview row bound exceeded'){throw};$rejected=$true}
+        if(-not $rejected){throw 'Over-bound native grid was incorrectly accepted'}
+        $stabilityChecks.row_bound_rejected=$true
+        [TejReadbackBenchmark]::ChangeFixtureColumns($true)
+        try {
+            $rejected=$false;$discardSample=$null;$discardTiming=$null;$discardFallback=0
+            try {
+                [void][TejBridgeNative]::CaptureFullPreview($grid,$maxRows,$columns,[ref]$discardFallback,
+                    [ref]$discardSample,[ref]$discardTiming,$null,$null,$null)
+            }catch {
+                if($_.Exception.ToString() -notmatch 'Preview column bound exceeded|Unexpected full Preview row schema'){throw}
+                $rejected=$true
+            }
+            if(-not $rejected){throw 'Changed full row schema was incorrectly adopted'}
+            $stabilityChecks.changed_schema_full_capture_rejected=$true
+        }finally {[TejReadbackBenchmark]::ChangeFixtureColumns($false)}
+        [TejReadbackBenchmark]::Close();$opened=$false
+        $rejected=$false
+        try {[void]$verify.Invoke($null,@([long]$grid,[int]$maxRows,$count))}
+        catch {$rejected=$true}
+        if(-not $rejected){throw 'Destroyed source window was incorrectly accepted'}
+        $stabilityChecks.destroyed_window_rejected=$true
+        $rejected=$false;$discardSample=$null;$discardTiming=$null;$discardFallback=0
+        try {
+            [void][TejBridgeNative]::CaptureFullPreview($grid,$maxRows,$columns,[ref]$discardFallback,
+                [ref]$discardSample,[ref]$discardTiming,$null,$null,$null)
+        }catch {$rejected=$true}
+        if(-not $rejected){throw 'Destroyed grid complete capture was incorrectly adopted'}
+        $stabilityChecks.destroyed_window_full_capture_rejected=$true
+    }
     $receipt=@{contract='tej_same_grid_complete_readback_benchmark_v1';observed_at_utc=[DateTime]::UtcNow.ToString('o');
         basis=$basis;readback_contract=[TejBridgeNative]::ReadbackContract;measurements=$records.ToArray();
         baseline_script_sha256=(Get-FileHash -LiteralPath $BaselineScript).Hash.ToLowerInvariant();
@@ -183,6 +262,7 @@ try {
         provider_queries_sent=0;source_values_exposed=$false;queue_modified=$false;accepted=$true;
         source_signature_unchanged=$true;balanced_order=$true;
         exact_saved_source_result_matches=$(-not $Fixture);
+        stability_checks=$stabilityChecks;
         interpretation='Complete readback component comparison, not end-to-end query speed, official throughput, API quota or all-table equivalence'}
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Output))|Out-Null
     [IO.File]::WriteAllText($Output,($receipt|ConvertTo-Json -Depth 6 -Compress),[Text.UTF8Encoding]::new($false))

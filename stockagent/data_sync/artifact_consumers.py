@@ -30,6 +30,9 @@ def service_artifact_paths(repo_root: Path) -> list[dict[str, str]]:
     runner and initialization paths. A disabled Discord toggle does not stop an
     overnight engine. Missing or malformed referenced configs fail closed.
     """
+    from stockagent.data_sync.node_roles import training_only_node
+    if training_only_node():
+        return []
     from stockagent.config import load_config
     from stockagent.live.market_config import (
         _apply_model_selection,

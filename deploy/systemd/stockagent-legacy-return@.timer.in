@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry retained Vast legacy cohort %i when its owner is idle
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=30s
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=stockagent-legacy-return@%i.service
+
+[Install]
+WantedBy=timers.target

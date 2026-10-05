@@ -2,7 +2,7 @@
 Description=Resume TEJ trial history when the conserved API budget permits
 
 [Timer]
-OnBootSec=3min
+OnActiveSec=3min
 OnUnitInactiveSec=15min
 AccuracySec=30s
 Unit=stockagent-tej-api-trial.service

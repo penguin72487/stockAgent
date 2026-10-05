@@ -631,9 +631,31 @@ def test_opening_latency_uses_dedicated_source_and_stage_telemetry() -> None:
     assert summary["failure_count"] == 1
     assert summary["modes"][0]["bottleneck_stage"] == "artifact_discovery_ms"
     assert summary["modes"][0]["input_to_ledger_ms"] == 1_350.0
+    assert summary["modes"][0]["ledger_from_0900_ms"] == 1_400.0
+    assert summary["ledger_observed_mode_count"] == 1
+    assert summary["ledger_complete"] is False
+    assert summary["final_ledger_ms"] is None
+    assert summary["latest_observed_ledger_ms"] == 1_400.0
+    assert summary["all_ledgers_goal_met"] is False
     assert summary["modes"][0]["telemetry_source"] == (
         "opening_attempt_v2+executor_latency_v1"
     )
+
+
+def test_opening_ledger_latency_uses_real_commit_not_reconstructed_fill_time() -> None:
+    row = {"result": "registered", "session_date": "2026-10-05", "market": "mode",
+           "signal_id": "late", "signal_started_at": "2026-10-05T09:00:00+08:00",
+           "signal_ready_at": "2026-10-05T09:00:14+08:00",
+           "ledger_persisted_at": "2026-10-05T09:04:52.500000+08:00",
+           "entry_completed_at": "2026-10-05T09:01:00+08:00"}
+    summary = dashboard_module._opening_signal_latency_summary([row], expected_markets=["mode"], session_date="2026-10-05")
+    assert summary["final_ready_ms"] == 14_000.0
+    assert summary["ledger_complete"] is True
+    assert summary["final_ledger_ms"] == 292_500.0
+    assert summary["all_ledgers_goal_met"] is False
+    missing = dashboard_module._opening_signal_latency_summary([], expected_markets=["mode"], session_date="2026-10-05")
+    assert missing["ledger_observed_mode_count"] == 0
+    assert missing["final_ledger_ms"] is None
 
 
 def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
@@ -5670,7 +5692,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert 'src="app.js?v=93"' in html
+    assert 'src="app.js?v=94"' in html
     assert 'src="chart-renderer.js?v=4"' in html
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript

@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print a compact cold/hot table instead of JSON",
     )
+    automation = subparsers.add_parser("automation-status", help="read-only scheduler, receipt and optional live transport status")
+    automation.add_argument("--human", action="store_true")
+    automation.add_argument("--live", action="store_true", help="also check current paired cold-index convergence")
 
     use = subparsers.add_parser("use", help="materialize and renew a hot lease")
     use.add_argument("dataset")
@@ -160,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     edge_mode = edge_state.is_file()
     try:
+        if args.command == "automation-status":
+            from stockagent.data_sync.storage_automation import automation_status, print_human_status
+            result = automation_status(REPO_ROOT, args.sync_root, live=args.live)
+            print_human_status(result) if args.human else _print(result)
+            return 0
         if args.command == "prune-partial":
             result = prune_partial_materialization(
                 args.sync_root,

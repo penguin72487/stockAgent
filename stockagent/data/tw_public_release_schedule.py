@@ -15,7 +15,7 @@ import re
 
 import polars as pl
 
-CONTRACT = "tw_preopen_release_schedule_research_v6_dated_cadence"
+CONTRACT = "tw_preopen_release_schedule_research_v9_native_quarter_families"
 LAW = "https://twse-regulation.twse.com.tw/tw/law/DOC01_print.aspx?FLCODE=fl007009&FLNO=36"
 SPECIAL = "https://twse-regulation.twse.com.tw/TW/law/DAT08_print.aspx?FLCODE=FL067432"
 HOLIDAY = "https://investoredu.twse.com.tw/FileSystem/FileUpload/f506f947-0f96-48d2-8248-b28f5a431c7a.pdf"
@@ -41,6 +41,10 @@ class ReleaseRule:
 
 
 RULES = {
+    "quarter_date": ReleaseRule("quarter_provider_deadline_date_plus1d", "quarter_date", 200, "stock",
+        "Provider revised statement index is its stated deadline date, not a fiscal period. "
+        "Roll a non-session deadline then +1 calendar day; current revised values are NOT historical vintages",
+        (LAW, FINLAB)),
     "quarter": ReleaseRule("quarter_upload_or_general_deadline_plus1d", "quarter", 200, "stock",
         "Known issuer upload takes precedence. Otherwise general-company deadline "
         "Q1 May15/Q2 Aug14/Q3 Nov14/Q4 Mar31 proxy, holiday extended; special issuer "
@@ -69,6 +73,7 @@ RULES = {
 }
 FAMILIES = {
     "financial_statement": "quarter", "monthly_revenue": "revenue",
+    "fundamental_features": "quarter", "financial_statement_revised": "quarter_date",
     "security_lending": "daily", "foreign_investors_shareholding": "daily",
     "tw_total_pmi": "pmi", "tw_total_nmi": "pmi",
     "tw_business_indicators": "business",
@@ -80,6 +85,8 @@ EXACT = {
 
 
 def rule_for(key: str) -> ReleaseRule | None:
+    if key.startswith("etl:inventory:"):
+        return RULES["weekly"]
     kind = EXACT.get(key, FAMILIES.get(key.split(":")[0]))
     return RULES.get(kind)
 
@@ -93,7 +100,7 @@ def feature_category(key: str) -> str:
     rule = rule_for(key)
     if rule is None:
         raise ValueError("unknown research source family")
-    if rule.kind in {"quarter", "revenue"}:
+    if rule.kind in {"quarter", "quarter_date", "revenue"}:
         return "fundamentals"
     if rule.kind in {"pmi", "business"}:
         return "macro"
@@ -156,11 +163,26 @@ def schedule_lookup(indexes: list[str], rule: ReleaseRule, sessions: list[date])
         period_year_grace = 1 if rule.kind in {"quarter", "revenue"} else 0
         if not year.isdigit() or int(year) < sessions[0].year - period_year_grace:
             continue
+        if rule.kind == "pmi":
+            observed = datetime.fromisoformat(str(value)).date()
+            month = (observed.year, observed.month)
+            first_month = (sessions[0].year, sessions[0].month)
+            last_month = (sessions[-1].year, sessions[-1].month)
+            # The source may already expose its newest release-month row.
+            # A bounded historical calendar cannot invent the future third
+            # session. Defer only outside/unfinished boundary windows; an
+            # absent month INSIDE the archive still fails in publication_proxy.
+            if month < first_month or month > last_month:
+                continue
+            if month == last_month:
+                index = bisect_left(sessions, date(*month, 1))
+                if len(sessions) - index < 3:
+                    continue
         day = publication_proxy(value, rule, sessions)
         if day < sessions[0]:
             continue
         # Roll a legal deadline, not an observed/provider-mapped publication date.
-        deadline = rule.kind == "quarter" or (rule.kind == "revenue" and "-M" in str(value))
+        deadline = rule.kind in {"quarter", "quarter_date"} or (rule.kind == "revenue" and "-M" in str(value))
         if deadline:
             index = bisect_left(sessions, day)
             if index < len(sessions):
@@ -208,31 +230,75 @@ def carry_limit(rule: ReleaseRule, date_column: str = "date") -> pl.Expr:
     return pl.lit(rule.carry_days)
 
 
-def align_observations(keys: pl.DataFrame, observations: pl.DataFrame,
-                       feature: str, rule: ReleaseRule) -> pl.Series:
+ALIGNMENT_CONTRACT = "tw_mixed_frequency_alignment_v2_scope_lifecycle"
+
+
+@dataclass(frozen=True)
+class ObservationKeys:
+    """One validated/sorted target grain reused for many heterogeneous measures."""
+    _left: pl.DataFrame
+    rows: int
+
+
+def prepare_observation_keys(keys: pl.DataFrame) -> ObservationKeys:
+    if keys.select(pl.struct("date", "symbol").is_duplicated().any()).item():
+        raise ValueError("ambiguous duplicate target key")
+    if keys.select(pl.any_horizontal(pl.col("date").is_null(), pl.col("symbol").is_null()).any()).item():
+        raise ValueError("null target key")
+    return ObservationKeys(keys.with_row_index("_order").sort("date"), keys.height)
+
+
+def align_observation_frame(keys: pl.DataFrame | ObservationKeys, observations: pl.DataFrame,
+                            feature: str, rule: ReleaseRule) -> pl.DataFrame:
     """Causal state carry, bounded age; never interpolate values or fill events.
 
     Input order is preserved. A feature's observed 0 stays 0. No observation
     before the target date -> NULL. Retired concepts expire instead of leaking
     across taxonomy eras. A repeated report period cannot overwrite a newer one.
     """
-    left = keys.with_row_index("_order")
+    if rule.scope not in {"stock", "market"} or rule.carry_days < 0:
+        raise ValueError("unsupported scope or negative state lifetime")
+    prepared = keys if isinstance(keys, ObservationKeys) else prepare_observation_keys(keys)
+    left = prepared._left
     by = [] if rule.scope == "market" else ["symbol"]
-    right = observations.select("date", *by, feature).sort("date")
+    right = observations.select("date", *by, feature).with_columns(
+        pl.when(pl.col(feature).cast(pl.Float64, strict=False).is_finite())
+        .then(pl.col(feature).cast(pl.Float64, strict=False)).otherwise(None).alias(feature)
+    ).sort("date")
+    if right.select(pl.any_horizontal(pl.col(c).is_null() for c in ["date", *by]).any()).item():
+        raise ValueError("null observation key")
     if right.select(pl.struct("date", *by).is_duplicated().any()).item():
         raise ValueError("ambiguous duplicate observation key")
+    right = right.with_columns(pl.col("date").alias("_state_date"))
     if rule.carry_days:
-        right = right.with_columns(pl.col("date").alias("_state_date"))
-        joined = left.sort("date").join_asof(right, on="date", by=by or None,
+        joined = left.join_asof(right, on="date", by=by or None,
             strategy="backward", tolerance=f"{max_carry_days(rule)}d", check_sortedness=False)
         joined = joined.with_columns(pl.when(
             (pl.col("date") - pl.col("_state_date")).dt.total_days() <= carry_limit(rule))
             .then(pl.col(feature)).otherwise(None).alias(feature))
     else:
         joined = left.join(right, on=["date", *by], how="left", validate="m:1")
-    if joined.height != keys.height:
+    if rule.scope == "stock" and "lifecycle_start" in left.columns:
+        # A reused security code must not inherit the former issuer's state.
+        joined = joined.with_columns(pl.when(
+            pl.col("_state_date") >= pl.col("lifecycle_start")
+        ).then(pl.col(feature)).otherwise(None).alias(feature))
+    if joined.height != prepared.rows:
         raise ValueError("research alignment changed row count")
-    return joined.sort("_order").get_column(feature).cast(pl.Float32)
+    available = pl.col(feature).is_not_null()
+    return joined.sort("_order").select(
+        "date", "symbol", pl.col(feature).cast(pl.Float32),
+        available.alias(feature + "__available"),
+        pl.when(available).then((pl.col("date") - pl.col("_state_date")).dt.total_days())
+        .otherwise(None).cast(pl.Float32).alias(feature + "__age_days"),
+        (pl.col("date") == pl.col("_state_date")).fill_null(False).alias(feature + "__updated"),
+    )
+
+
+def align_observations(keys: pl.DataFrame, observations: pl.DataFrame,
+                       feature: str, rule: ReleaseRule) -> pl.Series:
+    """Compatibility value-only API; clocks, masks and ages share one join."""
+    return align_observation_frame(keys, observations, feature, rule).get_column(feature)
 
 
 def rule_manifest() -> dict:

@@ -3,6 +3,8 @@
 One bounded run_one owns the desktop at a time. Between queries the dataset
 lock is released; waits use an Event rather than polling the source or spinning.
 A dead/unknown Preview is never changed back to pending by a service restart.
+An explicit standing user grant permits audited, bounded exact-scope replays
+only after original-result reconciliation and an independent idle UI check.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ from typing import Callable
 from downloader.artifact_io import atomic_write_json
 from downloader.dataset_lock import DatasetLockTimeout, exclusive_dataset_lock
 from downloader.tej_history import CONTRACT_VERSION, connect, recover_evidence, run_one
+RESPONSE_RECOVERY_CONTRACT = 'exact_retained_preview_no_resubmission_recovery_v1'
 
 CONTRACT = "persistent_serial_evidence_preserving_supervision_v1"
 PROGRESS_STATES = frozenset({
@@ -38,6 +41,7 @@ SAFETY_STATES = frozenset({
     "source_period_replan_required",
     "source_capacity_requires_review",
     "list_selection_prequery_needs_review", "query_activation_prequery_needs_review",
+    "source_binding_prequery_needs_review", "query_preparation_prequery_needs_review",
 })
 
 
@@ -54,6 +58,12 @@ class WatchPolicy:
         automatic = config.get("automation", {})
         if automatic.get("enabled") is not True:
             raise ValueError("TEJ automation requires explicit automation.enabled=true")
+        if automatic.get('response_recovery_contract') not in (None, RESPONSE_RECOVERY_CONTRACT):
+            raise ValueError('Unreviewed automatic response recovery contract')
+        from downloader.tej_desktop_attempts import authorized_replay_policy
+        from downloader.tej_startup import startup_policy
+        authorized_replay_policy(config)
+        startup_policy(config)
         values = {
             "idle_seconds": automatic.get("idle_poll_seconds", 60),
             "blocked_seconds": automatic.get("blocked_poll_seconds", 60),
@@ -207,7 +217,236 @@ def recover_complete_local_response(root: Path) -> bool:
         except (ValueError, OSError, RuntimeError):
             continue
         recovered = True
+    from downloader.tej_startup import retire_expired_worker
+    try:
+        recovered = retire_expired_worker(root) or recovered
+    except (OSError, ValueError, KeyError, TypeError):
+        pass  # Missing/foreign worker identity does not authorize retirement.
     return recovered
+
+
+def recover_retained_desktop_response(root: Path, bridge, config: dict, *, before_authorized_replay: bool = False) -> bool:
+    """Read the exact late response, never repeat a source query or selection.
+
+    Caller holds the canonical dataset lock. Only a finished active attempt
+    with its original verified stage is eligible; a missing stage is NOT proof
+    of an unsent query. Local saved evidence is reconciled first by the caller.
+    Readback failures get a durable bounded backoff, including across restarts.
+    """
+    automatic=config.get('automation',{})
+    if before_authorized_replay:
+        from downloader.tej_desktop_attempts import authorized_replay_policy
+        if authorized_replay_policy(config) is None:
+            raise ValueError('Explicit standing grant required for due-replay readback recheck')
+    if automatic.get('response_recovery_contract') != RESPONSE_RECOVERY_CONTRACT:
+        return False
+    from downloader.tej_desktop_attempts import query_stage
+    from downloader.tej_history import SOURCE_SCOPE_CONTRACT, recover_desktop_response, task_request
+    import re
+    import hashlib
+    with closing(connect(root)) as con:
+        rows=con.execute("SELECT * FROM tasks WHERE state='blocked' AND "
+            "last_error_code='unknown_outcome_no_auto_retry'").fetchall()
+        if len(rows)!=1 or con.execute("SELECT 1 FROM tasks WHERE state='running' LIMIT 1").fetchone():
+            return False
+        task=dict(rows[0]);attempt=task.get('active_attempt_id')
+        if (task['kind']!='download' or task['scope_contract']!=SOURCE_SCOPE_CONTRACT
+                or not isinstance(attempt,str) or not re.fullmatch(re.escape(task['task_id'])+r'-[0-9a-f]{32}',attempt)):
+            return False
+        row=con.execute('SELECT state,finished_at_utc FROM desktop_attempts WHERE attempt_id=?',(attempt,)).fetchone()
+        if row is None or row['state']!='unknown_outcome' or not row['finished_at_utc']:
+            return False
+    req=task_request(root,task)
+    try:
+        stage,stage_path=query_stage(root,task,req)
+        signatures=stage.get('before_preview_signatures')
+        if (stage.get('query_attempt_id')!=attempt
+                or not isinstance(signatures,list) or len(signatures)>16
+                or any(not isinstance(s,str) or not 0<len(s)<=1024 for s in signatures)
+                or (root/'raw'/(attempt+'.json')).exists()):
+            return False
+    except (ValueError,OSError,TypeError):
+        return False
+    status_path=root/'desktop_response_recovery.json'
+    now=datetime.now(UTC);previous={}
+    try:
+        if status_path.stat().st_size<=16384:
+            previous=json.loads(status_path.read_text())
+    except (ValueError,OSError):
+        pass
+    if not isinstance(previous,dict):previous={}
+    if (previous.get('contract')==RESPONSE_RECOVERY_CONTRACT
+            and previous.get('query_attempt_id')==attempt):
+        try:
+            due=datetime.fromisoformat(previous['next_check_at_utc'])
+            if due.tzinfo is not None and now<due<=now+timedelta(seconds=300):
+                checked = datetime.fromisoformat(previous['observed_at_utc'])
+                if (not before_authorized_replay or checked.tzinfo is not None
+                        and 0 <= (now-checked).total_seconds() <= 30):
+                    return False
+        except (KeyError,ValueError,TypeError):
+            pass
+    failures=previous.get('failures',0) if previous.get('query_attempt_id')==attempt else 0
+    failures=failures if type(failures) is int and 0<=failures<=100000 else 0
+    cooldown=min(300,60*2**min(failures,3))
+    status={'contract':RESPONSE_RECOVERY_CONTRACT,'state':'checking_original_response',
+        'observed_at_utc':now.isoformat(),'task_id':task['task_id'],'query_attempt_id':attempt,
+        'original_stage_sha256':hashlib.sha256(stage_path.read_bytes()).hexdigest(),
+        'next_check_at_utc':(now+timedelta(seconds=cooldown)).isoformat(),'failures':failures+1,
+        'data_query_repeated':False,'unknown_outcome_auto_retry':False}
+    atomic_write_json(status_path,status)
+    try:
+        checked=datetime.now(UTC)
+        probe,readback,_=bridge.execute(root,{**task,'request_json':json.dumps({**req,'action':'inspect_notices'})})
+        observed=datetime.fromisoformat(probe['observed_at_utc'].replace('Z','+00:00'))
+        if (probe.get('provider')!='tej_smart_wizard'
+                or probe.get('action')!='inspect_notices' or probe.get('task_id')!=task['task_id']
+                or probe.get('contract_version')!=CONTRACT_VERSION
+                or probe.get('data_query_repeated') is not False or probe.get('credentials_read') is not False
+                or not isinstance(probe.get('notices'),list)
+                or observed.tzinfo is None or not checked <= observed <= datetime.now(UTC)+timedelta(seconds=5)
+                or readback.resolve().parent!=(root/'raw').resolve()
+                or not readback.name.startswith(task['task_id']+'-') or readback.stat().st_size>2*1024**2
+                or json.loads(readback.read_text(encoding='utf-8-sig'))!=probe):
+            raise ValueError('Exact owned no-query notice probe required')
+        notices=probe['notices'];response='preview'
+        if notices:
+            if len(notices)!=1:raise ValueError('Unreviewed notices retained')
+            controls=notices[0].get('controls',[])
+            texts=[x.get('name','') for x in controls if x.get('class')=='Static' and x.get('name')]
+            buttons=[x.get('name','') for x in controls if x.get('class')=='Button']
+            if (len(texts)!=1 or not re.fullmatch(r'ERROR1:No data !!\([a-zA-Z0-9_]{1,32}\)',texts[0])
+                    or buttons!=['OK']):
+                raise ValueError('Unreviewed notice retained, not an empty response')
+            response='empty'
+        result=recover_desktop_response(root,task['task_id'],bridge,response=response)
+        recovered=result['state'] in {'evidence_recovered','source_capacity_replanned'}
+        status.update(state='original_response_recovered' if recovered else 'response_requires_review',
+                      failures=0 if recovered else failures+1)
+    except (ValueError,OSError,RuntimeError,subprocess.SubprocessError,TypeError,KeyError,AttributeError):
+        status['state']='waiting_original_response'
+        status['next_check_at_utc']=(datetime.now(UTC)+timedelta(seconds=cooldown)).isoformat()
+        recovered=False
+    status['observed_at_utc'] = datetime.now(UTC).isoformat()
+    atomic_write_json(status_path,status)
+    return recovered
+
+
+def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
+    """Use the canonical once-only replay ledger under a standing user grant.
+
+    Caller holds .download.lock and reconciles saved/retained results first.
+    Quota/auth dialogs, unfinished attempts and ambiguous source scopes remain
+    barriers. Probe failures have restart-persistent backoff; consumed replays
+    share the SQLite rolling budget with the manual CLI.
+    """
+    from downloader.tej_desktop_attempts import (AUTHORIZED_REPLAY_CONTRACT,
+        authorized_replay_policy, authorized_replay_window, query_stage,
+        retry_unknown_download, unstaged_interop_diagnostic)
+    from downloader.tej_history import SOURCE_SCOPE_CONTRACT, task_request
+    import re
+    policy = authorized_replay_policy(config)
+    if policy is None:
+        return None
+    now = datetime.now(UTC)
+    with closing(connect(root)) as con:
+        rows = con.execute("SELECT * FROM tasks WHERE state='blocked' AND "
+                           "last_error_code='unknown_outcome_no_auto_retry' LIMIT 2").fetchall()
+        if (len(rows) != 1 or con.execute("SELECT 1 FROM tasks WHERE state='running' LIMIT 1").fetchone()
+                or con.execute("SELECT 1 FROM meta WHERE key IN "
+                               "('desktop_interface_recovery_required','source_period_replan_required') LIMIT 1").fetchone()):
+            return None
+        task = dict(rows[0])
+        attempt = task.get('active_attempt_id')
+        if (task['kind'] != 'download' or task['scope_contract'] != SOURCE_SCOPE_CONTRACT
+                or not isinstance(attempt, str)
+                or not re.fullmatch(re.escape(task['task_id']) + r'-[0-9a-f]{32}', attempt)):
+            return None
+        try:
+            window = authorized_replay_window(con, task, policy, now)
+        except (ValueError, TypeError, KeyError):
+            return None
+    path = root / 'authorized_replay_status.json'
+    previous = {}
+    try:
+        if path.stat().st_size <= 16384:
+            previous = json.loads(path.read_text())
+    except (OSError, ValueError):
+        pass
+    if not isinstance(previous, dict):
+        previous = {}
+    status = {'contract': AUTHORIZED_REPLAY_CONTRACT, 'task_id': task['task_id'],
+              'query_attempt_id': attempt, 'observed_at_utc': now.isoformat(),
+              'original_unknown_evidence_retained': True, 'possible_additional_provider_usage': True,
+              'performed': False, **window}
+    if not window['allowed']:
+        status['state'] = window['reason']
+        atomic_write_json(path, status)
+        return status
+    if previous.get('contract') == AUTHORIZED_REPLAY_CONTRACT and previous.get('query_attempt_id') == attempt:
+        try:
+            due = datetime.fromisoformat(previous['next_check_at_utc'])
+            if due.tzinfo is not None and now < due <= now + timedelta(seconds=300):
+                return {**previous, 'performed': False}
+        except (KeyError, ValueError, TypeError):
+            pass
+    failures = previous.get('failures', 0) if previous.get('query_attempt_id') == attempt else 0
+    failures = failures if type(failures) is int and 0 <= failures <= 100000 else 0
+    cooldown = min(policy['cooldown_max_seconds'], policy['cooldown_base_seconds'] * 2**min(failures, 6))
+    status.update(state='checking_authorized_replay', failures=failures + 1,
+                  next_check_at_utc=(now + timedelta(seconds=cooldown)).isoformat())
+    atomic_write_json(path, status)
+    prepared = root / 'requests' / (attempt + '.json')
+    raw = root / 'raw' / (attempt + '.json')
+    try:
+        if raw.exists():
+            raise ValueError('Saved original result must be reconciled, never replayed')
+        request = task_request(root, task)
+        interop = script_prepare = orphan_loss = False
+        from downloader.tej_startup import orphan_desktop_loss_proof
+        try:
+            orphan_desktop_loss_proof(root, task, request, prepared)
+            orphan_loss = True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if orphan_loss:
+            pass  # Original owner was independently proven lost, not unsent.
+        elif raw.with_suffix('.json.stage.json').exists():
+            query_stage(root, task, request, prepared)
+            if recover_retained_desktop_response(root, bridge, config, before_authorized_replay=True):
+                status.update(state='original_response_recovered', performed=False, failures=0,
+                              next_check_at_utc=None, observed_at_utc=datetime.now(UTC).isoformat())
+                atomic_write_json(path, status)
+                return status
+        else:
+            try:
+                unstaged_interop_diagnostic(root, task, request, prepared)
+                interop = True
+            except ValueError:
+                unstaged_interop_diagnostic(root, task, request, prepared, script_preparation=True)
+                script_prepare = True
+        result = retry_unknown_download(root, task['task_id'], bridge, prepared,
+            allow_unstaged_interop=interop, allow_unstaged_script_preparation=script_prepare,
+            allow_orphaned_desktop_loss=orphan_loss,
+            standing_authorization=policy)
+        status.update(state=result['state'], performed=True, failures=0,
+                      authorization_id=result['authorization_id'], next_check_at_utc=None,
+                      observed_at_utc=datetime.now(UTC).isoformat())
+        with closing(connect(root)) as con:
+            observed = datetime.now(UTC)
+            counts = con.execute('SELECT count(*) AS total, sum(task_id=?) AS own FROM desktop_replays '
+                'WHERE consumed_at_utc>?', (task['task_id'], (observed-timedelta(hours=1)).isoformat())).fetchone()
+            status.update(replays_in_hour=counts['total'], task_replays_in_hour=counts['own'] or 0)
+            if result['state'] == 'unknown_outcome_no_auto_retry':
+                current = con.execute('SELECT * FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()
+                next_window = authorized_replay_window(con, dict(current), policy, observed)
+                status['next_check_at_utc'] = next_window['next_check_at_utc']
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, TypeError, KeyError, AttributeError):
+        if not status['performed']:
+            status['state'] = 'authorized_replay_context_unverified'
+        status['next_check_at_utc'] = (datetime.now(UTC) + timedelta(seconds=cooldown)).isoformat()
+    atomic_write_json(path, status)
+    return status
 
 
 def queue_wait(root: Path, observed: datetime, fallback: float) -> float:
@@ -232,13 +471,16 @@ def queue_wait(root: Path, observed: datetime, fallback: float) -> float:
 def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                 runner: Callable = run_one, max_cycles: int | None = None,
                 emit: Callable = print, session_path: Path | None = None) -> int:
-    """Serve the existing queue until shutdown, with no unsafe automatic replay.
+    """Serve the existing queue; only explicit bounded user grants permit replay.
 
     The outer service owns .scheduler.lock. CLI/manual actions retain their
     existing .download.lock and Windows mutex. A safety pause remains visible
     and is checked locally; a restart does not turn it into a fresh query.
     """
     policy = WatchPolicy.from_config(config)
+    from downloader.tej_desktop_attempts import authorized_replay_policy
+    from downloader.tej_startup import desktop_ready
+    replay_policy = authorized_replay_policy(config)
     stop = stop if stop is not None else Event()
     started = datetime.now(UTC).isoformat()
     owner_ticks = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()[19]
@@ -251,7 +493,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
         observed = datetime.now(UTC)
         # A single query/metadata recovery is bounded separately by run_one.
         # This is supervisor liveness, never a renewal of a query's deadline.
-        deadline = 1800 if state == "executing" else max(60, policy.heartbeat_seconds * 2)
+        deadline = 1800 if state in {"executing", "recovering_response", "replaying_authorized"} else max(60, policy.heartbeat_seconds * 2)
         atomic_write_json(root / "scheduler_status.json", {
             "contract": CONTRACT, "state": state, "observed_at_utc": observed.isoformat(),
             "deadline_at_utc": (observed + timedelta(seconds=deadline)).isoformat(),
@@ -262,6 +504,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
             "paused_reason": paused_reason,
             "next_check_at_utc": (observed + timedelta(seconds=wait)).isoformat() if wait is not None else None,
             "unknown_outcome_auto_retry": False,
+            "authorized_unknown_replay": replay_policy,
             "query_deadline_renewed_by_heartbeat": False,
             "query_interval_contract": policy.interval_contract,
         })
@@ -271,7 +514,19 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
         while remaining > 0 and not stop.is_set():
             publish(state, wait=remaining)
             step = min(remaining, policy.heartbeat_seconds)
-            stop.wait(step)
+            if state == 'waiting_desktop' and config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True:
+                # Local readiness only: no API/GUI probes or new source claim.
+                # Keep telemetry on its original heartbeat, but wake within
+                # five seconds of the Interactive relay being restored.
+                part = step
+                while part > 0 and not stop.is_set():
+                    tick = min(5, part)
+                    stop.wait(tick)
+                    part -= tick
+                    if not stop.is_set() and desktop_ready(root, require_recent=False):
+                        return
+            else:
+                stop.wait(step)
             remaining -= step
 
     def local_barrier() -> str | None:
@@ -295,12 +550,40 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
         while not stop.is_set() and (max_cycles is None or cycles < max_cycles):
             delay = policy.minimum_interval_seconds
             wait_state = "between_tasks"
+            replay_result = None
+            ran_query = False
             try:
                 with exclusive_dataset_lock(root / ".download.lock", provider="tej_smart_wizard", timeout_seconds=0):
+                    if session_path is not None:
+                        from downloader.tej_startup import valid_session
+                        session = json.loads(session_path.read_text())
+                        if not valid_session(session):
+                            raise ValueError('Exact private desktop session required')
+                        bridge.session = session  # Recovered private identity before replay too.
                     barrier = local_barrier()
                     if barrier == "inflight_requires_recovery":
                         recover_complete_local_response(root)
                         barrier = local_barrier()
+                        from downloader.tej_startup import desktop_ready
+                        startup_enabled = config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True
+                        # A busy query prevents the GUI watchdog taking the
+                        # writer lock. Its age must not force a one-minute
+                        # idle gap every three minutes. The live birth-pinned
+                        # relay authorizes an attempt, whose native bridge
+                        # independently verifies window/Excel/scope again.
+                        ready = not startup_enabled or desktop_ready(root, require_recent=False)
+                        if barrier == 'inflight_requires_recovery' and ready:
+                            publish('recovering_response')
+                            recover_retained_desktop_response(root,bridge,config)
+                            barrier=local_barrier()
+                        if barrier == 'inflight_requires_recovery' and replay_policy is not None and ready:
+                            publish('replaying_authorized')
+                            query_started = time.monotonic()
+                            replay_result = replay_authorized_unknown(root, bridge, config)
+                            ran_query = bool(replay_result and replay_result.get('performed'))
+                            if ran_query:
+                                delay = remaining_query_interval(config, time.monotonic() - query_started)
+                            barrier = local_barrier()
                     from downloader.tej_desktop_attempts import EXHAUSTED_PREQUERY_ERRORS, defer_unsent_prequery
                     if barrier in EXHAUSTED_PREQUERY_ERRORS and config.get('prequery_failure_isolation') is True:
                         with closing(connect(root)) as con:
@@ -316,6 +599,11 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                     if barrier:
                         last_result = paused_reason = barrier
                         wait_state, delay = "waiting_recovery", policy.blocked_seconds
+                    elif ran_query:
+                        paused_reason = None
+                    elif config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True and not desktop_ready(root, require_recent=False):
+                        last_result = 'waiting_interactive_desktop'
+                        wait_state, delay = 'waiting_desktop', policy.blocked_seconds
                     else:
                         paused_reason = None
                         from downloader.tej_value_priority import refresh_if_due
@@ -325,17 +613,17 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                             # after reconciliation. Never discover or select a
                             # different workbook/session on the service's own.
                             session = json.loads(session_path.read_text())
-                            if (set(session) != {'TejProcessId','ExpectedWindow','ExpectedTitle','ExpectedWorkbook','ExpectedExcelWindow'}
-                                    or any(not isinstance(session[k],int) or isinstance(session[k],bool) or session[k] <= 0
-                                           for k in ('TejProcessId','ExpectedWindow','ExpectedExcelWindow'))
-                                    or not isinstance(session['ExpectedWorkbook'],str)
-                                    or session['ExpectedTitle'] != 'TEJ Smart Wizard (Version 4.1.1.7) -- ' + session['ExpectedWorkbook']):
+                            if not valid_session(session):
                                 raise ValueError('Exact private desktop session required')
                             bridge.session = session
                         publish("executing")
                         query_started = time.monotonic()
                         last_result = runner(root, bridge)
+                        ran_query = True
                         delay = remaining_query_interval(config,time.monotonic()-query_started)
+                    if ran_query:
+                        if replay_result and replay_result.get('performed'):
+                            last_result = replay_result['state']
                         cycles += 1
                         emit(json.dumps({"event": "tej_automatic_task", "state": last_result, "cycle": cycles}), flush=True)
                         if last_result == "completed_task":

@@ -384,19 +384,16 @@ def test_batch_candidate_exact_coverage_three_ordered_phases_and_request_cost(
 
 
 @pytest.mark.parametrize("count", [0, 1, 64, 65, 256, 257])
-def test_batch_many_paths_are_bounded_and_keep_full_objects_fallback(
+def test_batch_many_paths_keep_exact_coverage_with_bounded_requests(
     queue_root: Path, scan_api, count: int,
 ) -> None:
     paths = tuple(f"objects/blobs/{index:04d}.blob" for index in range(count))
     assert scan.scan_after_publish(queue_root, "dataset", new_object_paths=paths, batch_object_paths=True)
     calls = scan_api["calls"]
     assert calls[-2:] == [["manifests/dataset"], ["heads/dataset"]]
-    if count > 256:
-        assert calls == [["objects"], ["manifests/dataset"], ["heads/dataset"]]
-    else:
-        assert [path for group in calls[:-2] for path in group] == sorted(paths)
-        assert all(1 <= len(group) <= scan.MAX_BATCH_SUB_PATHS for group in calls[:-2])
-        assert len(calls) == (count + 63) // 64 + 2
+    assert [path for group in calls[:-2] for path in group] == sorted(paths)
+    assert all(1 <= len(group) <= scan.MAX_BATCH_SUB_PATHS for group in calls[:-2])
+    assert len(calls) == (count + 63) // 64 + 2
 
 
 def test_batch_query_bytes_bound_and_encoding_preserve_exact_sub_values(
@@ -438,6 +435,19 @@ def test_batch_failed_middle_object_chunk_never_scans_manifest_or_head(queue_roo
         scan.scan_after_publish(queue_root, "dataset", new_object_paths=paths, batch_object_paths=True)
     assert scan_api["calls"] == [list(paths[:64]), list(paths[64:128])]
     assert (queue_root / ".local-state/scan-pending/dataset.json").is_file()
+
+
+def test_large_exact_batch_does_not_expand_to_the_entire_objects_tree(queue_root: Path, scan_api):
+    paths = tuple(f"objects/blobs/{index:04d}.blob" for index in range(1000))
+    assert scan.scan_after_publish(queue_root, "dataset", new_object_paths=paths, batch_object_paths=True)
+    calls = scan_api["calls"]
+    assert len(calls) == 18
+    assert tuple(p for group in calls[:-2] for p in group) == paths
+    assert all(len(group) <= 64 for group in calls[:-2])
+    assert calls[-2:] == [["manifests/dataset"], ["heads/dataset"]]
+    assert ["objects"] not in calls
+    assert scan._scan_request_groups("dataset", paths, full_objects_scan=False) == (
+        ("objects",), ("manifests/dataset",), ("heads/dataset",))
 
 
 def test_batch_retry_bad_receipt_retains_full_objects_fallback(queue_root: Path, scan_api) -> None:

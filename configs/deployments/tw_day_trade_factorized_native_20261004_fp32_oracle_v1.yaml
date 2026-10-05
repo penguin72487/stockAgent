@@ -1,0 +1,10 @@
+base_config: tw_day_trade_factorized_native_20261004_v1.yaml
+experiment_name: tw-day-trade-native-nullable-factorized-20261004-fp32-oracle-v3-coordinate-nulls
+environment:
+  # Engineering candidate only. Do not silently replace the requested BF16
+  # experiment or import any of its optimizer state.
+  amp_dtype: none
+  use_tensor_cores: false
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261004_v1/training-fp32-oracle-v3
+  resume: false

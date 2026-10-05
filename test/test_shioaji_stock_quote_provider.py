@@ -11,6 +11,33 @@ import numpy as np
 from stockagent.live import quote_provider
 
 
+def test_fast_quote_scalar_parser_preserves_legacy_values():
+    from decimal import Decimal
+    from fractions import Fraction
+
+    values = [None, True, False, 0, -1, 100, 2**53 + 1, 10**400, 0.0,
+              -0.0, 0.1, 5e-324, float("nan"), float("inf"), -float("inf"),
+              np.float32(0.1), np.float64(0.1), np.int64(100), Decimal("0.1"),
+              Decimal("NaN"), Fraction(1, 3), " 1,234.50 ", "1e-8", "0", "-",
+              "--", "null", "None", "bad", [100], complex(1, 0)]
+
+    def legacy(value):
+        try:
+            text = str(value).strip()
+            if not text or text in {"-", "--", "null", "None"}:
+                return None
+            parsed = float(text.replace(",", ""))
+        except Exception:
+            return None
+        return parsed if np.isfinite(parsed) and parsed > 0.0 else None
+
+    for value in values:
+        expected = legacy(value)
+        actual = quote_provider._float_or_none(value)
+        assert actual == expected
+        assert type(actual) is type(expected)
+
+
 class _Contracts:
     def __init__(self, values):
         self.values = values
@@ -70,6 +97,48 @@ def _reset_shioaji_connection_state(monkeypatch):
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_RETRY_AFTER", 0.0)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_FAILURES", 0)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LAST_LOGIN_ERROR", None)
+
+
+def test_stock_snapshot_does_not_wait_for_quota_observations(monkeypatch, tmp_path):
+    from stockagent.live import shioaji_traffic_ledger as traffic
+
+    contract = SimpleNamespace(code="2330", reference=100.0, limit_up=110.0, limit_down=90.0)
+
+    class MeterApi(_FakeApi):
+        def __init__(self):
+            super().__init__({"2330": contract})
+            self.usage_calls = 0
+
+        def usage(self):
+            self.usage_calls += 1
+            raise AssertionError("slow quota meter must not delay a valid quote")
+
+    api, events = MeterApi(), []
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+    monkeypatch.setattr(traffic, "record_traffic_event", events.append)
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+
+    snapshot = quote_provider.fetch_shioaji_stock_snapshots(["2330"], np.array([99.0]))
+
+    assert snapshot.available_count == 1
+    np.testing.assert_allclose(snapshot.bid_prices, [100.5])
+    assert api.usage_calls == 0
+    assert events[0]["request_count"] == 1 and events[0]["rows"] == 1
+    assert events[0]["usage_observation"] == "not_sampled_latency_critical"
+    assert snapshot.transport_timing["snapshot_request_body_ms"] >= 0.0
+    assert snapshot.transport_timing["snapshot_usage_before_ms"] == 0.0
+    assert snapshot.transport_timing["snapshot_usage_after_ms"] == 0.0
+    assert snapshot.transport_timing["snapshot_ledger_record_ms"] >= 0.0
+    assert snapshot.transport_timing["snapshot_total_ms"] >= 0.0
+    for phase in (
+        "lock_queue", "contract_prepare", "submit", "callback_wait",
+        "callback_parse", "output_assemble", "limit_resolve",
+    ):
+        assert 0.0 <= snapshot.transport_timing[f"snapshot_{phase}_ms"] <= snapshot.transport_timing["snapshot_total_ms"]
+    assert 0.0 <= snapshot.transport_timing["snapshot_first_callback_ms"] <= snapshot.transport_timing["snapshot_last_callback_ms"]
 
 
 def test_shioaji_login_failure_uses_fast_bounded_adaptive_retry(monkeypatch):

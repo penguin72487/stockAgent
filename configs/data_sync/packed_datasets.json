@@ -2,6 +2,123 @@
   "schema_version": 1,
   "datasets": [
     {
+      "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v4",
+      "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v4",
+      "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_panel_sources.py", "stage_tw_day_trade_mixed_sources.py"],
+      "freshness": {
+        "receipt": "source_manifest.json", "field": "end_date", "format": "iso-date",
+        "required_values": {"status": "complete", "source_only": true,
+          "private_personal_research": true, "private_delivery_authorized": true,
+          "research_only": true, "historical_point_in_time": false, "training_ready": false}
+      },
+      "note": "Latest local private sources after 377 finite upstream checks. Retains 80285 verified real prior observations only where latest provider response lacks a finite value; preserves every latest finite value and actual monthly fills, with archived source manifests and per-cell evidence. Owner confirmed Vast space cleared on 2026-10-05; exact-source private publication/delivery may resume after capacity and transport verification. Not public redistribution, historical PIT, complete NULL resolution or training readiness; do not reuse incompatible caches or optimizers."
+    },
+    {
+      "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v3",
+      "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v3",
+      "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
+      "publish": false,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_panel_sources.py", "stage_tw_day_trade_mixed_sources.py"],
+      "freshness": {
+        "receipt": "source_manifest.json", "field": "end_date", "format": "iso-date",
+        "required_values": {"status": "complete", "source_only": true,
+          "private_personal_research": true, "private_delivery_authorized": true,
+          "research_only": true, "historical_point_in_time": false, "training_ready": false}
+      },
+      "note": "Raw-current local response after 377 upstream checks, retained for regression evidence: 80285 finite historical observations from gaprepair-v2 are absent in this response. Use verified gaprepair-v4 missing-only retention candidate instead for the latest local research source. Not a claim of provider corruption. Publication/remote delivery deferred by owner; do not auto-publish, hydrate or change training inputs."
+    },
+    {
+      "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v1",
+      "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v1",
+      "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
+      "publish": false,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_panel_sources.py", "stage_tw_day_trade_mixed_sources.py"],
+      "freshness": {
+        "receipt": "source_manifest.json", "field": "end_date", "format": "iso-date",
+        "required_values": {"status": "complete", "source_only": true,
+          "private_personal_research": true, "private_delivery_authorized": true,
+          "research_only": true, "historical_point_in_time": false, "training_ready": false}
+      },
+      "note": "Failed integration candidate retained for audit only: repair count did not correspond to staged observation values. Publication cancelled before completion; do not use for training or remote delivery."
+    },
+    {
+      "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v2",
+      "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v2",
+      "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_panel_sources.py", "stage_tw_day_trade_mixed_sources.py"],
+      "freshness": {
+        "receipt": "source_manifest.json", "field": "end_date", "format": "iso-date",
+        "required_values": {"status": "complete", "source_only": true,
+          "private_personal_research": true, "private_delivery_authorized": true,
+          "research_only": true, "historical_point_in_time": false, "training_ready": false}
+      },
+      "note": "2026-10-04 immutable private sources with verified real monthly repairs, exact per-cell write-back proof and publication lower bounds. No public redistribution, credentials, historical PIT, full NULL resolution or training readiness claim."
+    },
+    {
+      "dataset": "tw-daytrade-physical-20261004-v1",
+      "source": "/srv/stockagent-live/data_tw_daytrade_physical_20261004_v1",
+      "role": "owner-private-physical-execution-source-companions",
+      "publish": true,
+      "pack_buckets": 4,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_physical_companions.py"],
+      "freshness": {"receipt": "source_manifest.json", "field": "end_date", "format": "iso-date",
+        "required_values": {"status": "complete", "source_only": true,
+          "private_delivery_authorized": true, "model_observations_changed": false}},
+      "note": "Incremental canonical raw daily prices and replacement-rule companions. Same pinned model feature/action bytes; no model view rebuild, credentials, public redistribution, or fabricated executable prices."
+    },
+    {
+      "dataset": "tw-daytrade-panel-sources-20261004-v3",
+      "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_v3",
+      "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_panel_sources.py"],
+      "freshness": {
+        "receipt": "source_manifest.json", "field": "end_date", "format": "iso-date",
+        "required_values": {"status": "complete", "source_only": true,
+          "private_personal_research": true, "private_delivery_authorized": true,
+          "research_only": true, "historical_point_in_time": false, "training_ready": false}
+      },
+      "note": "2026-10-04 owner-authorized private Vast source projections, native MOPS fiscal contexts and official taxonomy dictionary. No credentials, housing, TEJ unproven observations, model panels or fitted transforms. Original provider restrictions remain; source delivery is not historical PIT or training readiness."
+    },
+    {
+      "dataset": "tw-daytrade-mixed-sources-20261004-v1",
+      "source": "/srv/stockagent-live/data_tw_daytrade_mixed_sources_20261004_v1",
+      "role": "owner-private-source-observations-for-remote-research-not-live",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["stage_tw_day_trade_mixed_sources.py"],
+      "freshness": {
+        "receipt": "source_manifest.json",
+        "field": "end_date",
+        "format": "iso-date",
+        "required_values": {
+          "status": "complete",
+          "source_only": true,
+          "private_personal_research": true,
+          "private_delivery_authorized": true,
+          "research_only": true,
+          "historical_point_in_time": false,
+          "training_ready": false
+        }
+      },
+      "note": "User-authorized 2026-10-04 private noncommercial vastai1T observation projections, exact hashes and clocks. No credentials, full provider catalog/cache, TEJ unproven history, fitted transforms, panel, labels or training matrix. Original FinLab/FinMind raw publish:false policies remain unchanged; no public redistribution."
+    },
+    {
       "dataset": "tw-public",
       "source": "/srv/stockagent-live/data_tw_public",
       "source_coordination_lock": ".locks/tw-public-refresh.lock",
@@ -404,11 +521,20 @@
       "publish": true,
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
+      "excluded_subtrees": [
+        "preparation_sources/margin_sources",
+        "preparation_sources/current_release_source_refs",
+        "preparation_sources/.margin-sources-pending",
+        "preparation_sources/.margin-sources-previous"
+      ],
       "active_process_substrings": [
         "download_tw_index_futures_day_session.py",
-        "download_shioaji_tx_futures_ticks"
+        "download_shioaji_tx_futures_ticks",
+        "relocate_futures_preparation_sources.py",
+        "restore_vast_futures_raw_sources.py",
+        "stage_tw_futures_margin_sources.py"
       ],
-      "note": "TAIFEX index-futures daily/session data."
+      "note": "TAIFEX index-futures daily/session data and canonical preparation raw originals under preparation_sources. The separately published margin_sources bundle, node-local inode-only current_release_source_refs and refresh staging/history are excluded to avoid duplicate transport. No experiment panel or trainer cache belongs here."
     },
     {
       "dataset": "tw-index-derivatives-ticks",
@@ -507,6 +633,8 @@
         "taifex_stock_futures_minute_history_v2",
         "shioaji_gap_repair",
         "margin_sources",
+        "margin_repair_pending",
+        "margin_repair_inputs",
         ".margin-sources-pending",
         ".margin-sources-previous"
       ],
@@ -522,13 +650,13 @@
     },
     {
       "dataset": "tw-futures-margin-sources",
-      "source": "data_tw_futures/margin_sources",
+      "source": "data_tw_index_futures/preparation_sources/margin_sources",
       "role": "official-source-and-rule-evidence",
       "publish": true,
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
-      "active_process_substrings": ["stage_tw_futures_margin_sources.py"],
-      "note": "SHA-audited TAIFEX originals, observations and reviewed rule evidence for a pinned remote rebuild. source_manifest.json declares remaining financial gaps and source-only status; publication does not assert training readiness. No licensed TEJ/FinLab source, execution ledger, panel or training cache. The maintained rule editing authority remains all_products_rule_facts."
+      "active_process_substrings": ["stage_tw_futures_margin_sources.py", "relocate_futures_preparation_sources.py"],
+      "note": "SHA-audited TAIFEX originals, observations and reviewed rule evidence for a pinned remote rebuild, physically owned by data_tw_index_futures/preparation_sources. Old data_tw_futures/margin_sources is only a compatibility link, not another payload copy. source_manifest.json declares remaining financial gaps and source-only status; publication does not assert training readiness. No licensed TEJ/FinLab source, execution ledger, panel or training cache. The maintained rule editing authority remains all_products_rule_facts."
     },
     {
       "dataset": "forex-frankfurter",

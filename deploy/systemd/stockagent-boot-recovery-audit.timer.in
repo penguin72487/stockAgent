@@ -1,0 +1,11 @@
+[Unit]
+Description=Observe StockAgent recovery after boot and keep readiness current
+
+[Timer]
+OnActiveSec=90s
+OnUnitInactiveSec=5min
+AccuracySec=5s
+Unit=stockagent-boot-recovery-audit.service
+
+[Install]
+WantedBy=timers.target

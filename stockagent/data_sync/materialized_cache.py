@@ -343,11 +343,13 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
     return process_references_many((target,), limit=limit)
 
 
-def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list[str]:
+def process_references_many(targets: Iterable[Path], *, limit: int = 20,
+                            inode_keys: set[tuple[int, int]] | None = None) -> list[str]:
     """Scan /proc once for exact selected roots, excluding unrelated siblings."""
 
     targets = tuple(sorted({target.resolve() for target in targets}))
-    if not targets:
+    inode_keys = set(inode_keys or ())
+    if not targets and not inode_keys:
         return []
     references: list[str] = []
     own_pid = os.getpid()
@@ -376,7 +378,14 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list
                 value = os.readlink(descriptor)
             except OSError:
                 continue
-            if any(_path_is_under(value, target) for target in targets):
+            matches = any(_path_is_under(value, target) for target in targets)
+            if inode_keys and not matches:
+                try:
+                    info = descriptor.stat()
+                    matches = (info.st_dev, info.st_ino) in inode_keys
+                except OSError:
+                    pass
+            if matches:
                 references.append(f"pid={pid}:fd={descriptor.name}:{value}")
                 if len(references) >= limit:
                     return references
@@ -387,6 +396,18 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list
         except OSError:
             maps = ""
         map_lines = maps.splitlines()
+        if inode_keys:
+            for line in map_lines:
+                try:
+                    columns = line.split(maxsplit=5)
+                    major, minor = columns[3].split(":")
+                    key = (os.makedev(int(major, 16), int(minor, 16)), int(columns[4]))
+                except (IndexError, ValueError):
+                    continue
+                if key in inode_keys:
+                    references.append(f"pid={pid}:maps-inode:{key[0]}:{key[1]}")
+                    if len(references) >= limit:
+                        return references
         for target in targets:
             target_text = str(target)
             if f" {target_text}/" in maps or any(

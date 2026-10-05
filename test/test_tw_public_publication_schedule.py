@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time
 import fcntl
 import hashlib
 import json
@@ -2207,6 +2207,12 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
             }
         }
     }
+    latency_rows = [{
+        "market": market, "signal_id": "signal-1", "session_date": "2026-08-17",
+        "result": "registered", "simulation_only": True,
+        "measurement_boundary": "signal_input_to_simulation_ledger_persisted",
+        "ledger_persisted_at": "2026-08-17T09:00:02.500000+08:00",
+    }]
     result = evaluate_readiness(
         observed=observed,
         strict_after=datetime(2026, 8, 17, 8, 57, tzinfo=TAIPEI).time(),
@@ -2216,9 +2222,20 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
         simulation_receipt={},
         service_states={},
         engine_sync_receipt=engine_sync,
+        execution_latency_rows=latency_rows,
     )
     assert result["opening_execution"]["ready"] is True
     assert result["opening_execution"]["modes"][market]["commit_slo_met"] is True
+    assert result["opening_execution"]["modes"][market]["entry_commit_delay_ms"] == 2500.0
+
+    unknown_commit = evaluate_readiness(
+        observed=observed, strict_after=datetime_time(8, 57), market_names=(market,),
+        public_receipt={}, model_receipt={}, simulation_receipt={}, service_states={},
+        engine_sync_receipt=engine_sync,
+    )
+    assert unknown_commit["opening_execution"]["operational_ready"] is True
+    assert unknown_commit["opening_execution"]["ready"] is False
+    assert unknown_commit["opening_execution"]["modes"][market]["entry_commit_delay_ms"] is None
 
     engine_sync["modes"][market]["entry_completed_at"] = None
     failed = evaluate_readiness(
@@ -2230,6 +2247,7 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
         simulation_receipt={},
         service_states={},
         engine_sync_receipt=engine_sync,
+        execution_latency_rows=latency_rows,
     )
     assert failed["opening_execution"]["ready"] is False
     assert (
@@ -2240,6 +2258,7 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
     engine_sync["modes"][market]["entry_completed_at"] = (
         "2026-08-17T09:00:16+08:00"
     )
+    latency_rows[0]["ledger_persisted_at"] = "2026-08-17T09:00:16.125000+08:00"
     late = evaluate_readiness(
         observed=observed,
         strict_after=datetime(2026, 8, 17, 8, 57, tzinfo=TAIPEI).time(),
@@ -2249,10 +2268,58 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
         simulation_receipt={},
         service_states={},
         engine_sync_receipt=engine_sync,
+        execution_latency_rows=latency_rows,
     )
     assert late["opening_execution"]["ready"] is False
     assert late["opening_execution"]["modes"][market]["commit_slo_met"] is False
     assert late["opening_execution"]["operational_ready"] is True
+
+
+def test_post_open_gate_keeps_fractional_commit_overrun_and_replay_delay():
+    from scripts.check_tw_day_trade_preopen_readiness import _execution_commit_times
+
+    market = "tw_day_trade"
+    mode = {"session_date": "2026-08-17", "signal_id": "signal-1",
+            "signal_at": "2026-08-17T09:00:14+08:00",
+            "entry_completed_at": "2026-08-17T09:00:14+08:00",
+            "engine_status": "active", "checkpoint_ready": True,
+            "entry_fill_policy": "causal_market_full_target_at_best_quote",
+            "entry_price_offset_ticks": 0, "entry_requested_shares": 1000,
+            "entry_filled_shares": 1000, "entry_unfilled_shares": 0,
+            "pending_entry_shares": 0}
+    record = {"market": market, "signal_id": "signal-1", "session_date": "2026-08-17",
+              "result": "registered", "simulation_only": True,
+              "measurement_boundary": "signal_input_to_simulation_ledger_persisted",
+              "ledger_persisted_at": "2026-08-17T09:00:15.001000+08:00"}
+
+    def evaluate(rows):
+        return evaluate_readiness(
+            observed=datetime(2026, 8, 17, 9, 10, tzinfo=TAIPEI),
+            strict_after=datetime_time(8, 57), market_names=(market,),
+            public_receipt={}, model_receipt={}, simulation_receipt={}, service_states={},
+            engine_sync_receipt={"modes": {market: mode}}, execution_latency_rows=rows,
+        )["opening_execution"]["modes"][market]
+
+    late = evaluate([record])
+    assert late["entry_commit_delay_ms"] == 15001.0
+    assert late["commit_slo_met"] is False
+    assert late["same_session_commit_present"] is True
+    at_boundary = evaluate([{**record, "ledger_persisted_at": "2026-08-17T09:00:15+08:00"}])
+    assert at_boundary["commit_slo_met"] is True
+
+    mode["entry_completed_at"] = "2026-08-17T09:01:00+08:00"
+    replay = evaluate([{**record, "ledger_persisted_at": "2026-08-17T09:04:52.500000+08:00"}])
+    assert replay["entry_commit_delay_ms"] == 292500.0
+    assert replay["commit_slo_met"] is False
+    assert replay["entry_ledger_persisted_at"] == "2026-08-17T09:04:52.500000+08:00"
+    for changes in ({"signal_id": "other"}, {"session_date": "2026-08-16"},
+                    {"result": "duplicate"}, {"simulation_only": False},
+                    {"ledger_persisted_at": "invalid"},
+                    {"ledger_persisted_at": "2026-08-16T09:00:02+08:00"}):
+        assert evaluate([{**record, **changes}])["entry_commit_delay_ms"] is None
+    repeated = [{**record, "ledger_persisted_at": "2026-08-17T09:05:00+08:00"},
+                {**record, "ledger_persisted_at": "2026-08-17T09:04:00+08:00"}]
+    assert _execution_commit_times(repeated, "2026-08-17")[(market, "signal-1")].minute == 4
 
 
 def test_final_preopen_gate_timer_checks_until_085930() -> None:

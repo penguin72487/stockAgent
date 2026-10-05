@@ -16,6 +16,32 @@ from stockagent.live import signal_engine
 from stockagent.live.quote_provider import PriceSnapshot
 
 
+def test_static_bool_schema_cache_never_caches_or_skips_yaml_values(monkeypatch):
+    from dataclasses import dataclass
+
+    @dataclass
+    class Config:
+        enabled: bool = True
+        optional: bool | None = None
+        count: int = 1
+
+    calls = []
+    real_hints = config_module.get_type_hints
+
+    def hints(cls):
+        calls.append(cls)
+        return real_hints(cls)
+
+    monkeypatch.setattr(config_module, "get_type_hints", hints)
+    config_module._strict_bool_config_fields.cache_clear()
+    config_module._validate_config_bool_values({"enabled": False, "optional": None}, Config, section="test")
+    for key, value in (("enabled", "false"), ("enabled", 0), ("optional", 1)):
+        with pytest.raises(ValueError, match="YAML true/false"):
+            config_module._validate_config_bool_values({key: value}, Config, section="test")
+    assert calls == [Config]
+    assert config_module._strict_bool_config_fields(Config) == ("enabled", "optional")
+
+
 @pytest.mark.parametrize("text", [
     "flag: true\nlist: [1, 2.3, null, 'false']\ndate: 2026-09-23\n",
     "unicode: 開盤\na: &A {x: 1}\nb: *A\n",

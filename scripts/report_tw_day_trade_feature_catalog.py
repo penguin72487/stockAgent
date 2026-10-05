@@ -53,10 +53,35 @@ def source_admission(row: dict) -> dict:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dataset-dir", type=Path, required=True)
-    p.add_argument("--audit-dir", type=Path, required=True)
-    p.add_argument("--report-path", type=Path, required=True)
+    p.add_argument("--dataset-dir", type=Path)
+    p.add_argument("--audit-dir", type=Path)
+    p.add_argument("--report-path", type=Path)
+    p.add_argument("--all-source-catalog", type=Path,
+                   help="Economic-meaning inventory; never modifies training admission")
+    p.add_argument("--admission-dir", type=Path)
+    p.add_argument("--tej-root", type=Path)
+    p.add_argument("--tej-inventory", type=Path)
+    p.add_argument("--output-dir", type=Path)
+    p.add_argument("--page-size", type=int, default=250)
+    p.add_argument("--reuse-source-report", type=Path,
+                   help="Reclassify hash-accepted frozen observations; not a freshness check")
     args = p.parse_args()
+    if args.all_source_catalog:
+        if not all((args.admission_dir, args.tej_root, args.tej_inventory, args.output_dir)):
+            p.error("all-source mode requires --admission-dir, --tej-root, --tej-inventory, --output-dir")
+        if any((args.dataset_dir, args.audit_dir, args.report_path)):
+            p.error("all-source economic report and legacy admission report are separate scopes")
+        from stockagent.data.tw_feature_semantic_report import build_report
+        result = build_report(args.all_source_catalog.resolve(), args.admission_dir.resolve(),
+                              args.tej_root.resolve(), args.tej_inventory.resolve(), args.output_dir.resolve(),
+                              repo=ROOT, page_size=args.page_size,
+                              reuse_source_report=args.reuse_source_report.resolve() if args.reuse_source_report else None)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.reuse_source_report:
+        p.error("--reuse-source-report requires --all-source-catalog")
+    if not all((args.dataset_dir, args.audit_dir, args.report_path)):
+        p.error("legacy mode requires --dataset-dir, --audit-dir, --report-path")
     out, audit = args.dataset_dir.resolve(), args.audit_dir.resolve()
     manifest = read_json(out / "dataset_manifest.json")
     catalog = read_json(audit / "catalog_summary.json")

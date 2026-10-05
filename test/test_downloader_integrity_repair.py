@@ -52,6 +52,7 @@ def test_proven_corruption_requeues_only_target_and_keeps_original_evidence(tmp_
         assert repaired["checked"] == 2 and repaired["requeued"] == 1
         assert receipt_path.read_bytes() == raw
         assert conn.execute("SELECT state FROM tasks WHERE partition='history'").fetchone()[0] == "pending"
+        assert conn.execute("SELECT priority FROM tasks WHERE partition='history'").fetchone()[0] <= 1
         assert conn.execute("SELECT state FROM tasks WHERE partition='other'").fetchone()[0] == "complete"
         audit = conn.execute("SELECT receipt_bytes,prior_task_json FROM local_integrity_audit").fetchone()
         assert audit[0] == raw and json.loads(audit[1])["state"] == "complete"
@@ -67,6 +68,15 @@ def test_same_size_change_invalidates_hash_cache(tmp_path):
         raw[16] ^= 1
         source.write_bytes(raw)
         assert parquet_receipt_error(tmp_path, receipt) == "parquet_hash_mismatch"
+
+
+def test_integrity_repair_promotes_background_priority_but_preserves_live_zero(tmp_path):
+    with complement._db(tmp_path / 'queue.sqlite3') as conn:
+        _, _, source = seed(tmp_path, conn, 'background')
+        conn.execute("UPDATE tasks SET priority=80 WHERE partition='background'")
+        source.write_bytes(b'')
+        assert audit_queue(conn, tmp_path, repair=True)['requeued'] == 1
+        assert conn.execute("SELECT priority FROM tasks WHERE partition='background'").fetchone()[0] == 1
 
 
 def test_rotating_cursor_reaches_later_files_and_wraps(tmp_path):

@@ -12,20 +12,22 @@ import sqlite3
 from statistics import median
 from typing import Any
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 15
 STATUS_CACHE_SECONDS = 4.0
 STATUS_REFRESH_SECONDS = 5
 PROGRESS_CONTRACT = 'tej_native_readback_progress_v1'
 PROGRESS_STAGES = frozenset({'preparing_scope', 'awaiting_preview', 'reading_preview',
                             'response_saved', 'validating_and_saving'})
 SCHEDULER_STATES = frozenset({'starting', 'executing', 'between_tasks', 'waiting_local_retry', 'waiting_desktop',
-    'waiting_queue', 'waiting_storage', 'waiting_owner', 'waiting_metadata', 'waiting_recovery', 'stopped'})
+    'waiting_queue', 'waiting_storage', 'waiting_owner', 'waiting_metadata', 'waiting_recovery', 'recovering_response',
+    'replaying_authorized', 'stopped'})
 SCHEDULER_REASONS = frozenset({'desktop_interface_recovery_required', 'inflight_requires_recovery',
     'unknown_outcome_no_auto_retry', 'source_validation_failed', 'local_storage_failed',
     'source_key_layout_replan_required', 'date_input_prequery_needs_review',
     'source_period_replan_required',
     'source_capacity_requires_review',
-    'list_selection_prequery_needs_review', 'query_activation_prequery_needs_review'})
+    'list_selection_prequery_needs_review', 'query_activation_prequery_needs_review',
+    'source_binding_prequery_needs_review', 'query_preparation_prequery_needs_review'})
 METHOD = "Smart Wizard 查詢可能沿用最近一期。v4 另驗證公司／日期介面可用及無錯誤視窗；保存的是來源顯示字串，不是 Excel 底層精度、原生歷史或發布時點證明。舊範圍需重新驗證。"
 TABLE_COLUMNS = ("table_id", "smart_id", "name", "category", "phase", "frequency", "state",
                  "universe_count", "grid_dates", "grid_rows", "last_error_code",
@@ -82,7 +84,7 @@ def _worker_alive(worker: dict, observed: datetime) -> bool:
 
 def _automatic_execution_state(state: str | None) -> str:
     """A live supervisor waiting for resources is not continuous acquisition."""
-    if state == 'waiting_recovery':
+    if state in {'waiting_recovery','recovering_response','replaying_authorized'}:
         return 'automatic_waiting_recovery'
     return 'automatic_running' if state in {'executing','between_tasks'} else 'automatic_waiting'
 
@@ -92,7 +94,8 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
     valid = (value.get('contract') == 'persistent_serial_evidence_preserving_supervision_v1'
              and value.get('continuous') is True)
     state = value.get('state') if valid and value.get('state') in SCHEDULER_STATES else None
-    alive = valid and _owner_alive(value, observed, SCHEDULER_STATES - {'stopped'}, 1800 if state == 'executing' else 300)
+    alive = valid and _owner_alive(value, observed, SCHEDULER_STATES - {'stopped'},
+                                 1800 if state in {'executing','recovering_response','replaying_authorized'} else 300)
 
     def stamp(key):
         parsed = _stamp(value.get(key)) if valid else None
@@ -102,6 +105,31 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
         count = value.get(key) if valid else None
         return count if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 10**12 else None
 
+    grant = value.get('authorized_unknown_replay') if valid else None
+    enabled = (isinstance(grant, dict) and grant.get('enabled') is True
+               and grant.get('contract') == 'exact_unknown_download_user_authorized_replay_v1')
+    recovery = _json(root / 'authorized_replay_status.json') if enabled else {}
+    recovery_valid = recovery.get('contract') == grant.get('contract') if enabled else False
+    replay_states = {'authorized_replay_cooldown', 'authorized_replay_task_budget',
+                     'authorized_replay_global_budget', 'checking_authorized_replay',
+                     'authorized_replay_context_unverified', 'completed_task', 'unknown_outcome_no_auto_retry',
+                     'local_disk_headroom_low', 'local_metadata_busy', 'prequery_retry_scheduled',
+                     'original_response_recovered'}
+    replay = {'enabled': bool(enabled), 'unconditional_retry': False}
+    if enabled:
+        for key in ('cooldown_base_seconds', 'cooldown_max_seconds', 'max_replays_per_task_hour', 'max_replays_per_hour'):
+            limit = grant.get(key)
+            replay[key] = limit if type(limit) is int and 0 < limit <= 300 else None
+        clock = _stamp(recovery.get('observed_at_utc')) if recovery_valid else None
+        fresh = bool(clock and clock <= observed + timedelta(seconds=5) and (observed-clock).total_seconds() <= 3600)
+        next_check = _stamp(recovery.get('next_check_at_utc')) if fresh else None
+        recovery_state = recovery.get('state')
+        replay.update(state=recovery_state if fresh and isinstance(recovery_state, str) and recovery_state in replay_states else None,
+                      next_check_at_utc=next_check.isoformat() if next_check else None)
+        for key in ('task_replays_in_hour', 'replays_in_hour'):
+            count = recovery.get(key) if fresh else None
+            replay[key] = count if type(count) is int and 0 <= count <= 10**12 else None
+
     # This is an independent process heartbeat. Never expose the PID, owner
     # identity, raw exceptions or private desktop/session paths to the browser.
     return {'alive': bool(alive), 'continuous': valid, 'state': state,
@@ -110,7 +138,8 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
             'last_completed_at_utc': stamp('last_completed_at_utc'),
             'completed_tasks': counter('completed_tasks'), 'cycles': counter('cycles'),
             'paused_reason': value.get('paused_reason') if valid and value.get('paused_reason') in SCHEDULER_REASONS else None,
-            'query_deadline_renewed_by_heartbeat': False, 'unknown_outcome_auto_retry': False}
+            'query_deadline_renewed_by_heartbeat': False, 'unknown_outcome_auto_retry': False,
+            'authorized_unknown_replay': replay}
 
 
 def _current_task_public(root: Path, task: dict | None, worker: dict, alive: bool,
@@ -159,6 +188,22 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
             "read_only": True, "raw_values_exposed": False, "method": METHOD,
             "native_observation_completeness_verified": False, "publication_verified": False,
             "raw_source_publish": False, "tables": []}
+    # Local receipts only. Never reveal workbook/PID/handle/session/path,
+    # launcher details or private vendor errors to the public browser.
+    from downloader.tej_startup import CONTRACT as STARTUP_CONTRACT, desktop_ready
+    startup = _json(root/'desktop_startup_status.json')
+    startup_config = _json(repo_root/'configs/tej_history.json').get('automation', {}).get('desktop_startup', {})
+    startup_states = {'desktop_ready','interactive_windows_transport_unavailable','interactive_session_required',
+        'desktop_writer_active','owned_query_needs_reconciliation','retired_addin_still_present',
+        'startup_launcher_outcome_unresolved','desktop_restart_cooldown','tej_addin_not_ready','desktop_waiting_login_or_addin',
+        'desktop_startup_unverified','owned_workbook_context_unavailable','owned_workbook_identity_changed',
+        'owned_query_identity_unverified'}
+    enabled = startup_config.get('enabled') is True and startup_config.get('contract') == STARTUP_CONTRACT
+    base['desktop_startup'] = {'contract': STARTUP_CONTRACT, 'enabled': enabled,
+        'state': startup.get('state') if startup.get('contract') == STARTUP_CONTRACT and startup.get('state') in startup_states else 'desktop_startup_unverified',
+        'observed_at_utc': startup.get('observed_at_utc'), 'ready': desktop_ready(root, now=observed),
+        'check_interval_seconds': 60, 'requires_windows_user_logon': True,
+        'source_receipts_preserved': True, 'windows_autologin_changed': False}
     worker = _json(root / 'worker_status.json')
     if not (root / "queue.sqlite3").is_file():
         return {**base, "state": "not_registered", "catalog": {"tables": None, "fields": None}}

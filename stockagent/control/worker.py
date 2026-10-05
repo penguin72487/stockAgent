@@ -41,11 +41,13 @@ def node_observation(root: Path, *, cpu_slots: int = 2, memory_bytes: int = 512 
 
 
 def execute_one(dsn: str, *, schema: str, node_id: str, worker_id: str,
-                receipt: Path, root: Path, output: Path, lease_seconds: int = 60) -> dict[str, Any]:
+                receipt: Path, root: Path, output: Path, lease_seconds: int = 60,
+                work_key: str | None = None) -> dict[str, Any]:
     integer(lease_seconds, 'lease', minimum=3, maximum=3600)
     with ControlStore(dsn, schema=schema) as store:
         store.register_node(node_id, **node_observation(root), ttl_seconds=max(60, lease_seconds*2))
-        claim = store.claim(node_id, worker_id, lease_seconds=lease_seconds)
+        claim = store.claim(node_id, worker_id, lease_seconds=lease_seconds,
+                            job_keys=(work_key,) if work_key is not None else None)
         if claim is None:
             return {'state': 'no_eligible_work', 'node_id': node_id}
         stopped = threading.Event()

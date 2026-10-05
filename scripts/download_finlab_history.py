@@ -46,6 +46,7 @@ from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     quota_cycle_start,
     safe_stem,
     source_check_due,
+    process_owner,
 )
 
 
@@ -535,6 +536,20 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
             raise ValueError(f"FinLab staged parquet failed validation: {validation}")
         checked_at = stats.get("source_checked_at_utc", datetime.now(UTC).isoformat())
         check_mode = stats.get("source_check_mode", "upstream_forced" if refresh else "sdk_cache_allowed")
+        if key.startswith(('financial_statement:','financial_statement_revised:','fundamental_features:','monthly_revenue:')) and previous.get('dataset')==key:
+            # A fresh, valid response can omit previously observed securities
+            # or cells. Preserve both immutable versions and expose the loss;
+            # do not call it corruption or silently claim history complete.
+            old_fields,new_fields=previous.get('field_columns'),stats.get('field_columns')
+            old_values,new_values=previous.get('non_null_values'),stats.get('non_null_values')
+            field_loss=(old_fields-new_fields) if type(old_fields) is int and type(new_fields) is int else 0
+            value_loss=(old_values-new_values) if type(old_values) is int and type(new_values) is int else 0
+            if field_loss>0 or value_loss>0:
+                stats['history_scope_regression']={'contract':'finlab_native_history_scope_observation_v1',
+                    'prior_source_sha256':previous.get('sha256'),'prior_parquet_path':previous.get('parquet_path'),
+                    'omitted_field_count_lower_bound':max(0,field_loss),'non_null_count_decline':max(0,value_loss),
+                    'source_corruption_proven':False,'all_history_complete':False,
+                    'next_action':'verify_native_missing_only_history_union; preserve_latest_finite_and_both_raw_versions'}
         if receipt_path.is_file():
             if previous.get("dataset") == key and previous.get("sha256") == content_hash:
                 old_relative = Path(str(previous.get("parquet_path") or ""))
@@ -638,6 +653,8 @@ def _build_sync_work_plan(available, curated, output_root, *, now, refresh_days,
     account to repeated overlap queries or its lowest-priority Tick consumer.
     """
     available_set = set(available)
+    from stockagent.data.finlab_gap_priority import pending_gap_requests
+    gap_requests = pending_gap_requests(output_root, now=now, available=available_set)
     curated_keys = [key for key in curated if key in available_set]
     extra_keys = [key for key in available if key not in curated]
     eligible_curated: list[str] = []
@@ -651,7 +668,8 @@ def _build_sync_work_plan(available, curated, output_root, *, now, refresh_days,
             continue
         downloaded = has_local_download(key, output_root)
         downloaded_by_key[key] = downloaded
-        due = not downloaded or source_check_due(read_key_state(key, output_root), now=now, days=refresh_days)
+        due = (key in gap_requests or not downloaded
+               or source_check_due(read_key_state(key, output_root), now=now, days=refresh_days))
         secondary = downloaded and key in SECONDARY_VALIDATION_REFRESH_KEYS
         if due and not secondary and key not in NON_NUMERIC_DEFERRED_KEYS:
             required_outstanding.append(key)
@@ -691,12 +709,17 @@ def _build_sync_work_plan(available, curated, output_root, *, now, refresh_days,
     # ages tie; older due receipts still outrank repeatedly checked prefixes.
     def stable_priority(key):
         stage_priority, age, _ = priority(key)
-        return stage_priority, age
+        # Explicit finite rechecks outrank the normal backlog, but only after
+        # ordinary cooldown/entitlement admission above. Never erase attempts.
+        # Market-price priority stays first; research rechecks precede normal
+        # history/updates but must not starve opening preparation.
+        return (0.5, gap_requests[key]["priority"], age) if key in gap_requests else (stage_priority, 0, age)
     primary.sort(key=stable_priority)
     return {"primary": primary, "validation": validation_refresh,
             "required_outstanding": required_outstanding,
             "required_blocked": sorted(set(required_outstanding) - set(primary)),
-            "local_downloads": downloaded_by_key}
+            "local_downloads": downloaded_by_key,
+            "gap_priority_pending": sorted(gap_requests)}
 
 
 def sync_selection(
@@ -937,6 +960,7 @@ def sync_catalog(
         "incremental_quota_policy": "provider_enforced_no_local_reserve",
         "incremental_quota_exempt_attempted": 0, "quota_managed_deferred": 0,
         "attempt_id": attempt_id,
+        "owner": process_owner(),
     }
     quota_deferred_state = None
     try:

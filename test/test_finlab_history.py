@@ -533,6 +533,20 @@ class FinLabHistoryTest(unittest.TestCase):
             self.assertTrue((root / "versions" / safe_stem(key) / f"{first['sha256']}.json").is_file())
             self.assertEqual(audit_local(root), (1, 0))
 
+    def test_smaller_financial_response_has_explicit_history_scope_warning(self):
+        key='financial_statement:資產總額'
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            old=pd.DataFrame({'2330':[1.],'2315':[2.]},index=pd.Index(['2014-Q1']))
+            with patch('finlab.data.get',return_value=old):first=fetch_one(key,root)
+            with patch('finlab.data.get',return_value=old[['2330']]):second=fetch_one(key,root)
+            warning=second['history_scope_regression']
+            self.assertEqual(warning['omitted_field_count_lower_bound'],1)
+            self.assertEqual(warning['prior_source_sha256'],first['sha256'])
+            self.assertFalse(warning['source_corruption_proven'])
+            self.assertTrue((root/first['parquet_path']).is_file())
+            self.assertTrue((root/second['parquet_path']).is_file())
+
     def test_sync_selection_prioritizes_missing_curated_and_skips_vip(self):
         now = datetime.now(UTC)
         with tempfile.TemporaryDirectory() as directory:

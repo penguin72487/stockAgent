@@ -6,13 +6,14 @@ const state = {latest:null,statusPending:false,tableOffset:0,featureOffset:0,fea
 const PAGE = 50;
 const labels = {running:"正在匯出",backfilling:"歷史回補中",pending_discovery:"待清點歷史軸",query_grid_exported:"格點匯出完成 · 非歷史驗證",query_scope_checked:"查詢範圍完成 · 含來源空回",needs_review:"需檢查",stalled_requires_recovery:"工作中斷 · 待收據恢復",empty_field_menu:"目錄欄位為空 · 待核對",empty_query_axis_unverified:"查詢軸空回 · 待核對",queued:"已排工作 · 未執行"};
 const order = {running:0,backfilling:1,pending_discovery:2,query_grid_exported:3,query_scope_checked:3,needs_review:4,stalled_requires_recovery:4,empty_query_axis_unverified:5,empty_field_menu:6};
-const errors={vendor_metadata_allocation_failed_deferred:"來源選單配置失敗 · 已隔離，仍待修復",metadata_preparation_failed_deferred:"選單準備失敗 · 已隔離，未冒充清點完成",unknown_outcome_no_auto_retry:"結果未明 · 禁止自動重送",source_validation_failed:"資料鍵／schema 驗證未過 · 原始檔保留",date_input_prequery_needs_review:"日期輸入需檢查 · 未送 Preview",list_selection_prequery_needs_review:"欄位／公司／日期選取需檢查 · 未送 Preview",query_activation_prequery_needs_review:"查詢視窗啟用需檢查 · 未送 Preview",preview_column_limit_repartition_required:"預覽超過 30 欄 · 已拒絕，待安全分片",source_key_layout_replan_required:"來源鍵格式不符 · 未送 Preview，待保留粒度重排"};
-const waitLabels={waiting_recovery:"等待安全恢復",waiting_storage:"等待磁碟空間",waiting_owner:"等待桌面操作鎖",waiting_desktop:"等待互動桌面",waiting_metadata:"等待本機中繼資料寫入",waiting_local_retry:"等待本機輸入重試",waiting_queue:"待命 · 暫無到期工作",between_tasks:"工作間隔",executing:"正在核對工作",starting:"自動排程啟動中"};
+const errors={vendor_metadata_allocation_failed_deferred:"來源選單配置失敗 · 已隔離，仍待修復",metadata_preparation_failed_deferred:"選單準備失敗 · 已隔離，未冒充清點完成",unknown_outcome_no_auto_retry:"結果未明 · 禁止自動重送",source_validation_failed:"資料鍵／schema 驗證未過 · 原始檔保留",date_input_prequery_needs_review:"日期輸入需檢查 · 未送 Preview",list_selection_prequery_needs_review:"欄位／公司／日期選取需檢查 · 未送 Preview",query_activation_prequery_needs_review:"查詢視窗啟用需檢查 · 未送 Preview",source_binding_prequery_needs_review:"來源選單尚未載入 · 自動修復，未送 Preview",query_preparation_prequery_needs_review:"查詢準備失敗 · 有界重試，未送 Preview",preview_column_limit_repartition_required:"預覽超過 30 欄 · 已拒絕，待安全分片",source_key_layout_replan_required:"來源鍵格式不符 · 未送 Preview，待保留粒度重排"};
+const waitLabels={waiting_recovery:"等待安全恢復",recovering_response:"自動核對原查詢結果 · 不重送",replaying_authorized:"依使用者授權核對／重排 · 保留原紀錄",waiting_storage:"等待磁碟空間",waiting_owner:"等待桌面操作鎖",waiting_desktop:"等待互動桌面",waiting_metadata:"等待本機中繼資料寫入",waiting_local_retry:"等待本機輸入重試",waiting_queue:"待命 · 暫無到期工作",between_tasks:"工作間隔",executing:"正在核對工作",starting:"自動排程啟動中"};
 const stageLabels={awaiting_progress:"工作執行中 · 等待步驟回報",preparing_scope:"核對並準備查詢範圍",awaiting_preview:"等待來源回覆",reading_preview:"讀回來源資料格",response_saved:"原始回覆已保存 · 待驗證",validating_and_saving:"驗證與寫入資料／收據"};
 errors.source_validation_failed_deferred="來源結果驗證未過 · 此表隔離，其他表可續抓；原始檔保留";
 labels.waiting_local_retry="此表等待重試 · 其他表可續抓";
 order.waiting_local_retry=2;
 errors.prequery_failure_deferred="已證明未送查詢 · 此表排定重試";
+errors.unknown_outcome_no_auto_retry="原查詢結果未明 · 核對後依授權重排";
 const int = new Intl.NumberFormat("zh-TW",{maximumFractionDigits:0});
 function num(v){return v===null||v===undefined||v===""?null:Number.isFinite(Number(v))?Number(v):null;}
 function count(v){return num(v)===null?"未知":int.format(v);}
@@ -128,11 +129,22 @@ function renderStatus(data){
   if(data.worker?.state==="desktop_interface_recovery_required")text("tej-health","桌面查詢介面停用 · 等待安全恢復");
   if(data.worker?.state==="batch_finished"&&["queued","needs_review"].includes(data.state))text("tej-health",data.state==="needs_review"?"批次已結束 · 仍有工作需檢查":"有限批次已結束 · 仍有待抓歷史");
   const scheduler=data.scheduler||{};
-  if(scheduler.alive&&!data.worker?.alive)text("tej-health",({starting:"自動排程啟動中",executing:"自動排程正在核對工作",between_tasks:"自動排程運行中 · 工作間隔",waiting_queue:"自動排程待命 · 暫無到期工作",waiting_storage:"自動排程等待磁碟空間",waiting_owner:"自動排程等待桌面操作鎖",waiting_desktop:"自動排程等待互動桌面 · 未送 Preview",waiting_metadata:"自動排程等待本機中繼資料寫入",waiting_local_retry:"自動排程等待本機輸入重試",waiting_recovery:"自動排程等待安全恢復 · 未送新查詢"})[scheduler.state]||"自動排程存活 · 狀態待核對");
+  if(scheduler.alive&&!data.worker?.alive)text("tej-health",({starting:"自動排程啟動中",executing:"自動排程正在核對工作",between_tasks:"自動排程運行中 · 工作間隔",waiting_queue:"自動排程待命 · 暫無到期工作",waiting_storage:"自動排程等待磁碟空間",waiting_owner:"自動排程等待桌面操作鎖",waiting_desktop:"自動排程等待互動桌面 · 未送 Preview",waiting_metadata:"自動排程等待本機中繼資料寫入",waiting_local_retry:"自動排程等待本機輸入重試",waiting_recovery:"自動排程等待安全恢復 · 未送新查詢",recovering_response:"自動修復中 · 核對原查詢結果，未重送"})[scheduler.state]||"自動排程存活 · 狀態待核對");
+  if(scheduler.alive&&!data.worker?.alive&&scheduler.state==="replaying_authorized")text("tej-health","依使用者授權核對／重排 · 保留原紀錄");
   $("tej-health").className=`status ${data.state==="running"?"updating":data.state==="needs_review"?"degraded":"waiting"}`;
   text("tej-freshness",`面板 ${time(data.observed_at_utc)} · 工作觀測 ${time(data.worker?.observed_at_utc)}（臺北）`);
   if(data.worker?.state==="batch_finished")text("tej-freshness",`面板 ${time(data.observed_at_utc)} · 批次結束 ${time(data.worker.observed_at_utc)} · 本批嘗試 ${count(data.worker.attempted_tasks)} 個工作；不代表全歷史完成（臺北）`);
   text("tej-automation",scheduler.alive?`自動排程存活 · heartbeat ${time(scheduler.observed_at_utc)}${scheduler.next_check_at_utc?` · 下次檢查 ${time(scheduler.next_check_at_utc)}`:""}（臺北）；排程存活不等於正在下載。`:"自動排程未運行；已下載來源與收據保留。");
+  const startup=data.desktop_startup||{};
+  if(startup.enabled){
+    const startupLabels={desktop_ready:startup.ready?"桌面已核對可用":"桌面或互動通道尚待重新核對",interactive_session_required:"等待 Windows 使用者登入",interactive_windows_transport_unavailable:"等待互動 Windows 通道恢復",desktop_writer_active:"保留目前下載操作",owned_query_needs_reconciliation:"等待原查詢結果恢復",retired_addin_still_present:"舊外掛仍在，未另開查詢",startup_launcher_outcome_unresolved:"查詢視窗開啟結果待核對，未重複開啟",desktop_restart_cooldown:"短時間已恢復三次；保留原查詢，稍後再核對",tej_addin_not_ready:"等待 Excel／TEJ 外掛就緒",desktop_waiting_login_or_addin:"等待 TEJ 登入／外掛就緒"};
+    $("tej-automation").textContent+=` 開機恢復已設定：Windows 登入後每 ${count(startup.check_interval_seconds)} 秒核對 · ${startupLabels[startup.state]||"專用桌面恢復狀態待核對"} · 觀測 ${time(startup.observed_at_utc)}（臺北）。`;
+  }
+  const replay=scheduler.authorized_unknown_replay||{};
+  if(replay.enabled){
+    const reasons={authorized_replay_cooldown:"重排冷卻中",authorized_replay_task_budget:"此筆重排額度等待",authorized_replay_global_budget:"全域重排額度等待",authorized_replay_context_unverified:"介面／原範圍尚未可驗證",checking_authorized_replay:"核對授權重排條件"};
+    $("tej-automation").textContent+=` 已授權有界自動重排：每筆滾動一小時最多 ${count(replay.max_replays_per_task_hour)} 次、全域 ${count(replay.max_replays_per_hour)} 次（本機恢復上限，非官方配額）；${reasons[replay.state]||"先核對原結果"}${replay.next_check_at_utc?` · 重排條件下次到期 ${time(replay.next_check_at_utc)}（臺北）`:""}。`;
+  }
   const observed=new Date(data.observed_at_utc||""),age=Date.now()-observed.getTime();
   if(!Number.isFinite(age)||age>30000){text("tej-health","觀測已過期 · 不代表目前正在下載");$("tej-health").className="status degraded";$("active-readback-card").hidden=true;}
   text("activity-sync",`每 5 秒原位更新 · 最新資料觀測 ${time(data.observed_at_utc)} · ${age>30000?"觀測已過期，等待新狀態":"切回此頁立即同步"}`);
@@ -156,7 +168,7 @@ function renderStatus(data){
   text("local-capacity",`本機批次：最多 ${count(planning.local_max_rows)} 列／${count(planning.local_max_cells)} 儲存格／${count(planning.local_max_companies)} 個代號，預覽最多 ${count(planning.preview_max_columns)} 欄；${planning.query_interval_contract==="minimum_query_start_interval_v1"?"查詢開始間距（包含工作耗時）":"完成後間距"} ${count(planning.minimum_query_interval_seconds)} 秒。這些是本機容量與限流設定，不是官方配額；已完成與隔離的舊批次保留原範圍。`);
   const interfaceBlocked=data.worker?.state==="desktop_interface_recovery_required";
   const alert=$("page-alert");alert.hidden=!(interfaceBlocked||w.blocked_tasks>0||["metadata_unavailable","paused_for_storage"].includes(data.state));
-  if(!alert.hidden){text("alert-title",interfaceBlocked?"桌面查詢介面需要恢復":data.state==="paused_for_storage"?"磁碟餘裕不足":`${count(w.blocked_tasks)} 個工作需檢查`);text("alert-copy",interfaceBlocked?"TEJ 查詢視窗不可用，排程未送新查詢。只在明確允許後重開指定查詢；Excel、工作簿、原始來源與失敗收據都保留，恢復後仍須核對來源介面與實際下載。":data.state==="paused_for_storage"?"保留至少 5 GiB 空間；沒有送新查詢，也不刪除既有來源與收據。":"已取得的來源檔與收據保留；失敗或未知操作結果不自動重送。原始資料問題與介面／本機處理問題分開。");}
+  if(!alert.hidden){text("alert-title",interfaceBlocked?"桌面查詢介面需要恢復":data.state==="paused_for_storage"?"磁碟餘裕不足":`${count(w.blocked_tasks)} 個工作需檢查`);text("alert-copy",interfaceBlocked?"TEJ 查詢視窗不可用，排程未送新查詢。只在明確允許後重開指定查詢；Excel、工作簿、原始來源與失敗收據都保留，恢復後仍須核對來源介面與實際下載。":data.state==="paused_for_storage"?"保留至少 5 GiB 空間；沒有送新查詢，也不刪除既有來源與收據。":replay.enabled?"已取得的來源檔與收據保留。先收回原結果，再依授權有界重排；登入／配額／來源範圍不明仍暫停，不以重送掩蓋資料錯誤。":"已取得的來源檔與收據保留；失敗或未知操作結果不自動重送。原始資料問題與介面／本機處理問題分開。");}
   const select=$("feature-table"),selected=select.value;
   const tableCatalogKey=(data.tables||[]).map(t=>t.table_id).join("|");
   if(state.tableCatalogKey!==tableCatalogKey){

@@ -723,9 +723,15 @@ def build_model(
                 )
             ),
             feature_bottleneck_dim=fin_cfg.feature_bottleneck_dim,
+            feature_svd_components=fin_cfg.feature_svd_components,
+            factorized_input_compile=bool(config.training.enable_torch_compile),
             temporal_basis_algebraic_contraction=(
                 fin_cfg.temporal_basis_algebraic_contraction
             ),
+            temporal_basis_fp32_contraction=fin_cfg.temporal_basis_fp32_contraction,
+            temporal_blocks_fp32=fin_cfg.temporal_blocks_fp32,
+            portfolio_blocks_fp32=fin_cfg.portfolio_blocks_fp32,
+            candle_projection_fp32=fin_cfg.candle_projection_fp32,
             daily_context_num_features=len(daily_context_feature_names or ()),
             daily_context_categorical_feature_indices=(
                 _feature_indices_from_patterns(

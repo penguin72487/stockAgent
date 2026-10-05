@@ -200,6 +200,46 @@ def test_training_temporal_covariance_matches_direct_training_windows() -> None:
     assert metadata["observation_count"] == len(targets) * 3 * 2
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("lookback", [2, 8, 32])
+@pytest.mark.parametrize("lag_batch_size", [2, 8, 32])
+def test_batched_temporal_lags_preserve_covariance_and_training_scope(
+    dtype, lookback, lag_batch_size,
+) -> None:
+    features = np.random.default_rng(482).normal(size=(85, 3, 13)).astype(dtype)
+    features[20, 1, 3] = np.nan
+    features[25, 2, 4] = np.inf
+    features[29, 0, 5] = -np.inf
+    targets = np.array([lookback, lookback + 3, 57, 69, 69], dtype=np.int64)
+    kwargs = dict(lookback=lookback, feature_lag=1, feature_chunk_columns=7)
+    expected, scope = training_temporal_covariance(features, targets, **kwargs)
+    actual, metadata = training_temporal_covariance(
+        features, targets, **kwargs, lag_batch_size=lag_batch_size,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    assert metadata == scope
+    features[69:] += 50_000  # Validation/test data cannot affect the fit.
+    outside_changed, changed_metadata = training_temporal_covariance(
+        features, targets, **kwargs, lag_batch_size=lag_batch_size,
+    )
+    torch.testing.assert_close(outside_changed, actual, rtol=0, atol=0)
+    assert changed_metadata == scope
+
+
+def test_batched_temporal_lags_reject_zero_batch_and_preserve_pca_bank() -> None:
+    features = np.random.default_rng(519).normal(size=(65, 3, 5)).astype(np.float32)
+    targets = np.arange(32, 60)
+    kwargs = dict(lookback=32, feature_lag=1, components=31)
+    with pytest.raises(ValueError, match="lag_batch_size must be positive"):
+        fit_training_only_pca_klt(features, targets, **kwargs, lag_batch_size=0)
+    expected = fit_training_only_pca_klt(features, targets, **kwargs)
+    actual = fit_training_only_pca_klt(features, targets, **kwargs, lag_batch_size=32)
+    torch.testing.assert_close(actual.covariance, expected.covariance, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual.eigenvalues, expected.eigenvalues, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual.basis, expected.basis, rtol=1e-6, atol=1e-6)
+    assert actual.metadata == expected.metadata
+
+
 def test_pca_klt_requires_training_override_and_round_trips_in_state_dict() -> None:
     assert temporal_basis_overrides_from_state_dict(None) == {}
     with pytest.raises(ValueError, match="fold-training covariance override"):
@@ -288,6 +328,8 @@ def test_fold_training_fit_writes_metadata_and_builds_checkpointable_model(
         "pca_klt",
     ]
     config.training.financial_transformer.temporal_basis_components = 4
+    config.training.temporal_basis_covariance_cpu_threads = 1
+    config.training.temporal_basis_covariance_lag_batch_size = 8
     generator = np.random.default_rng(1021)
     train_dataset = SimpleNamespace(
         features_t=torch.from_numpy(
@@ -297,6 +339,13 @@ def test_fold_training_fit_writes_metadata_and_builds_checkpointable_model(
         execution_mode="naive",
     )
     synchronized_phases: list[str] = []
+    observed_fit = []
+    original_fit = trainer_module.fit_training_only_pca_klt
+    ambient_threads = torch.get_num_threads()
+    def record_fit(*args, **kwargs):
+        observed_fit.append((torch.get_num_threads(),kwargs["lag_batch_size"]))
+        return original_fit(*args, **kwargs)
+    monkeypatch.setattr(trainer_module,"fit_training_only_pca_klt",record_fit)
     original_phase_runner = trainer_module._run_rank0_store_synchronized_phase
 
     def _record_phase(phase, operation, **kwargs):
@@ -321,6 +370,8 @@ def test_fold_training_fit_writes_metadata_and_builds_checkpointable_model(
         ],
         output_path=tmp_path,
     )
+    assert observed_fit == [(1,8)]
+    assert torch.get_num_threads() == ambient_threads
 
     assert metadata is not None
     assert synchronized_phases == ["temporal_basis_fit"]

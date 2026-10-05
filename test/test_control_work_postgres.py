@@ -60,6 +60,72 @@ def test_duplicate_submit_is_idempotent_but_new_source_is_rejected(db):
     assert len(store.snapshot()['jobs']) == 1
 
 
+def test_exact_claim_scope_does_not_consume_other_release_attempts(db):
+    store, _, _ = db
+    node(store)
+    store.submit(work('other-release', priority=100))
+    store.submit(work('selected-release'))
+    assert store.claim('node-a', 'bounded', job_keys=()) is None
+    claim = store.claim('node-a', 'bounded', job_keys=('selected-release',))
+    assert claim.spec.key == 'selected-release'
+    rows = {row['key']: row for row in store.snapshot()['jobs']}
+    assert rows['other-release']['state'] == 'pending' and rows['other-release']['attempt'] == 0
+    assert store.claim('node-a', 'another-worker', job_keys=('selected-release',)) is None
+    store.finish(claim, proof(claim))
+    assert store.claim('node-a', 'another-worker', job_keys=('selected-release',)) is None
+
+
+@pytest.mark.parametrize('scope', [('same', 'same'), ['list-is-not-an-immutable-scope'], ('bad key',)])
+def test_invalid_claim_scope_preserves_pending_work(db, scope):
+    store, _, _ = db
+    node(store)
+    store.submit(work())
+    with pytest.raises(ValueError):
+        store.claim('node-a', 'bounded', job_keys=scope)
+    assert store.snapshot()['jobs'][0]['attempt'] == 0
+
+
+def test_registered_code_queue_restarts_without_duplicate_attempt_and_detects_mutation(db, tmp_path):
+    from stockagent.control.release_queue import cycle, enroll
+    store, dsn, schema = db
+    frozen = tmp_path / 'frozen'
+    frozen.mkdir()
+    code = frozen / 'example.py'
+    code.write_bytes(b'exact code release\n')
+    files = {'example.py': hashlib.sha256(code.read_bytes()).hexdigest()}
+    artifacts = {}
+    for kind in ('wheel', 'source_bundle'):
+        path = tmp_path / (kind + '.zip')
+        import zipfile
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('example.py', code.read_bytes())
+        artifacts[kind] = {'file': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                           'bytes': path.stat().st_size, **({'files': files} if kind == 'source_bundle' else {})}
+    receipt = tmp_path / 'release.json'
+    receipt.write_text(json.dumps({'schema_version': 1, 'state': 'built',
+        'code': {'files': files, 'source_sha256': identity_sha256(files)}, **artifacts}))
+    state = tmp_path / 'private-state'
+    state.mkdir(mode=0o700)
+    policy = {'state_root': str(state), 'node_id': 'production-verifier',
+              'lease_seconds': 120, 'maximum_jobs_per_cycle': 8}
+    unrelated = work('other-high-priority-release', priority=100)
+    store.submit(unrelated)
+    first = enroll(policy, dsn, receipt, frozen, schema=schema)
+    assert enroll(policy, dsn, receipt, frozen, schema=schema)['work_key'] == first['work_key']
+    accepted = cycle(policy, dsn, schema=schema)
+    assert accepted['state'] == 'ready' and accepted['attempts_executed'] == 1
+    restart = cycle(policy, dsn, schema=schema)
+    assert restart['state'] == 'ready' and restart['attempts_executed'] == 0
+    rows = {row['key']: row for row in store.snapshot()['jobs']}
+    assert rows[unrelated.key]['state'] == 'pending' and rows[unrelated.key]['attempt'] == 0
+    assert rows[first['work_key']]['state'] == 'succeeded' and rows[first['work_key']]['attempt'] == 1
+    code.write_bytes(b'changed after prior completion\n')
+    invalid = cycle(policy, dsn, schema=schema)
+    assert invalid['state'] == 'degraded' and invalid['verified_release_count'] == 0
+    assert invalid['attempts_executed'] == 0 and invalid['errors'][0]['state'] == 'current_source_invalid'
+    assert len(store.snapshot()['attempts']) == 1
+
+
 @pytest.mark.parametrize('version', [None, 2])
 def test_each_deployed_reader_rejects_missing_or_unknown_stored_contract(db, version):
     store, dsn, schema = db

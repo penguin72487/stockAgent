@@ -64,6 +64,48 @@ def test_invalid_regular_timestamp_fails_closed():
         ticks_to_minutes(frame, "2330", DAY)
 
 
+def test_delayed_closing_auction_is_preserved_not_backdated():
+    frame = ticks()
+    frame.loc[3, "timestamp"] = pd.Timestamp("2026-06-01 13:33:00+08:00")
+    bars = ticks_to_minutes(frame, "2330", DAY)
+    assert bars["timestamp"].dt.strftime("%H:%M").tolist() == ["09:00", "13:33"]
+    assert bars.iloc[-1]["close"] == 99
+    assert bars["volume"].sum() == 10
+    for bad_time in ["13:31:00", "13:32:00", "13:34:00"]:
+        frame.loc[3, "timestamp"] = pd.Timestamp(f"2026-06-01 {bad_time}+08:00")
+        with pytest.raises(ValueError, match="outside"):
+            ticks_to_minutes(frame, "2330", DAY)
+
+
+def test_delayed_close_rule_is_dated_and_normal_auction_subseconds_are_valid():
+    frame = ticks()
+    frame.loc[3, "timestamp"] += pd.Timedelta(microseconds=1)
+    assert ticks_to_minutes(frame, "2330", DAY).iloc[-1]["timestamp"].hour == 13
+    early = date(2012, 2, 17)
+    frame["trade_date"] = early.isoformat()
+    frame["timestamp"] -= pd.Timedelta(days=(DAY-early).days)
+    frame.loc[3, "timestamp"] = pd.Timestamp("2012-02-17 13:33:00+08:00")
+    with pytest.raises(ValueError, match="dated 13:33"):
+        ticks_to_minutes(frame, "2330", early)
+
+
+def test_old_derivation_receipt_is_rebuilt_and_preserved_without_refetch(tmp_path, monkeypatch):
+    from finlab import data
+    monkeypatch.setattr(data, "get", lambda *args, **kwargs: ticks())
+    source = fetch_partition(tmp_path, "tw_tick:2330", DAY, now=datetime(2026, 9, 25, tzinfo=UTC))
+    first = derive_partition(tmp_path, "2330", DAY)
+    legacy = {**first, "schema_version": 3}
+    legacy.pop("minute_derivation_contract_version")
+    derived_receipt_path(tmp_path, "2330", DAY).write_text(json.dumps(legacy))
+    monkeypatch.setattr(data, "get", lambda *args, **kwargs: pytest.fail("local repair must not refetch API"))
+    assert stored_derived_receipt(tmp_path, "2330", DAY, source["sha256"]) is None
+    current = derive_partition(tmp_path, "2330", DAY)
+    assert current["minute_derivation_contract_version"] == 2
+    assert current["sha256"] == first["sha256"]
+    versions = list((tmp_path / "intraday/derived_minute/versions").rglob("*.json"))
+    assert len(versions) == 1 and json.loads(versions[0].read_text()) == legacy
+
+
 def test_finlab_tick_volume_is_shares_only_after_exact_shioaji_reconciliation(
     tmp_path, monkeypatch,
 ):

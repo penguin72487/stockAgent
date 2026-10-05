@@ -35,9 +35,18 @@ configs、Git refs 與 systemd 產生 AI 可讀清單的唯讀命令。
 Agent 的狀態查詢、任務紀錄與長命令操作使用
 [Agent 工作流程](docs/agent_workflow.md)：安裝後先執行 `stockagent-agent status`。
 
+其他 agent 操作四節點儲存架構可使用
+[`stockagent-storage-operations` skill](.agents/skills/stockagent-storage-operations/SKILL.md)。
+它整理節點分工、同步／NAS 備份、Vast 按需建置與成果回傳、恢復和安全回收入口。
+在此 checkout 的 Codex 輸入 `$stockagent-storage-operations` 加本次需求；
+skill 隨專案放在 `.agents/skills`，其他節點取得此目錄後可沿用同一份規範。
+
 [架構現代化分析與開發證據](docs/architecture_modernization_2026-10-03.md) 記錄
 實際比較與採用界線；[程式發布與節點環境](docs/packaging_and_runtime_releases.md)
 說明角色依賴、固定 code/runtime 身分、GPU admission 和型別契約驗證。
+[正式採用方案與服務驗收](docs/architecture_production_completion_2026-10-05.md)
+保留前階段決策；最新已部署的 DuckLake、Temporal、Parquet/ZSTD、rclone 與
+自動 NAS 驗收，見[四節點 lakehouse 部署／操作／證據](docs/ducklake_temporal_replication_2026-10-05.md)。
 
 ### 要解決的限制
 
@@ -182,6 +191,12 @@ FinLab／FinMind 等 catalog 授權限制不因遠端訓練而解除。
 
 [完整分工與清點結果](docs/penguin_source_only_storage_2026-10-01.md)；
 [所有 agent 適用的儲存契約](docs/agents/storage.md#penguin-source-host-and-remote-training-ownership)。
+遠端既有 `artifacts/markets`／`artifacts/ablations` 另有
+[逐項回傳 D 冷庫及安全回收指令](docs/vast_all_artifacts_cold_return_2026-10-04.md)。
+期貨 preparation 的原始資料改放 `data_tw_index_futures/preparation_sources/`，
+不再把 raw originals 當成 `artifacts/markets` 的訓練產物。
+[目錄分工、誤刪恢復與相容連結](docs/vast_futures_preparation_recovery_2026-10-04.md)。
+封存不代表模型完成或可部署；未解決的服務依賴、使用中資料和恢復未通過的項目不回收。
 清點不會下載、解封、訓練或刪除資料；檔案大小不含原始附件與 D 槽壓縮副本：
 
 ```bash
@@ -208,6 +223,20 @@ run_fintech_python scripts/audit_training_source_inventory.py \
 [源本保留紀錄的安全清理章節](docs/penguin_source_only_storage_2026-10-01.md#10-本次後續安全清理)。
 
 ## 資料冷庫與多機同步
+
+penguin 是 authority，D 保存不可變主冷庫；DuckLake 用 SSD PostgreSQL catalog
+管版本，Temporal 管增量生命週期。lab203 自動接收封閉批次、rclone 複寫至 NAS，
+獨立還原後回 ACK。Vast 按需取固定版本並在遠端建訓練視圖；索引用 Syncthing，
+已登錄的 payload 由唯一 rclone SFTP owner 傳送。Restic 接傳統 code/config/SQL
+加密備份並保留原歷史，兩套覆蓋分開列出。
+
+```bash
+bash scripts/run_lakehouse_control.sh status
+bash scripts/run_data_cache.sh automation-status --human --live
+```
+
+操作與驗收見[部署 runbook](docs/ducklake_temporal_replication_2026-10-05.md)及
+[agent skill](.agents/skills/stockagent-storage-operations/SKILL.md)。
 
 ### 新機器一次性部署
 
@@ -955,11 +984,46 @@ sudo ./scripts/install_artifact_dedup_service.sh
 完整遷移、ignore 與 penguin 衝突權威規則見
 [即時 artifacts 同步](docs/live_artifact_sync.md)。
 
+## 自動增量冷儲存與安全回收
+
+penguin 的 D 是唯一冷資料權威；Vast 不發布 cold head，也不常駐整份冷 payload。
+新完成的 `markets`／`ablations` 由既有 ingress 每 5 分鐘巡檢，通過 lifecycle、
+穩定與容量門檻後增量回傳；完整 D 解碼核 SHA、前後同步檢查與新鮮 ACK 都通過，
+才允許回收遠端熱原值。使用中的資料、唯一來源、未完成工作與失敗證據保留。
+這不是「所有 artifacts 按年齡刪除」，也不是又複製一份完整 snapshot。
+
+冷版到達不自動解壓；自己使用 `use` 取固定版本。七日熱 lease 由原 GC 排程監控、
+引用續租並安全回收；編譯快取另依 14 日／磁碟壓力規則處理，不混用生命週期。
+
+```bash
+# 兩台皆可：排程、在途根與收據摘要；唯讀，不解壓、不清理
+stockagent-data automation-status --human
+
+# 加上當前 Syncthing packed index 的完整健康檢查
+stockagent-data automation-status --human --live
+
+# 舊入口保留：詳細資料／租約狀態與不刪資料的 GC 預演
+stockagent-data status --human
+stockagent-data gc --dry-run
+```
+
+尚未安裝 CLI 可改用 `bash scripts/run_data_cache.sh`。排程 active／索引 100%
+不代表所有在途資料已冷恢復；詳細責任、限制、安裝／停用、恢復指令見
+[自動冷儲存與安全回收](docs/automatic_cold_storage.md)。
+
+本次 Vast 全量 `markets`／`ablations` 及不使用 cache 的一次性壓縮保存，
+執行、精確 prefix 續傳與新路徑恢復見
+[全量壓縮回傳與安全回收](docs/vast_bulk_compressed_return_2026-10-04.md)。
+四節點角色、硬體完整流程實測、D pack 還原與五分鐘回收排程見
+[2026-10-05 儲存架構優化](docs/four_node_storage_optimization_2026-10-05.md)。
+進度可用 `run_fintech_python scripts/status_vast_bulk_return.py`；收到壓縮檔不等於
+完成 D 冷驗證或來源回收。日常增量發布與七日 GC 不變。
+
 ## 磁碟壓力與可重建快取
 
-資料、checkpoint、artifact 與 cold release 不能因為磁碟不足而直接刪除。唯一可自動回收
-的是 allowlist 內、已超過 14 日的 TorchInductor、Triton 與 CUDA 編譯快取；預設磁碟
-達 95% 才清到 92%。只要有 `train.py`、`torchrun`、distributed launcher 或 compiler
+資料、checkpoint、artifact 與 cold release 不能因為磁碟不足而直接刪除。這個壓力維護器只回收
+allowlist 內、已超過 14 日的 TorchInductor、Triton 與 CUDA 編譯快取；預設磁碟
+達 89% 才清到 88%（可由環境參數調整）。只要有 `train.py`、`torchrun`、distributed launcher 或 compiler
 worker，整次清理會延後，不只依賴當下 fd/mmap。
 
 ```bash
@@ -971,13 +1035,29 @@ run_fintech_python scripts/maintain_storage_pressure.py
 # 使用相同 fail-closed 規則套用
 run_fintech_python scripts/maintain_storage_pressure.py --apply
 
+# Vast 的 PyTorch 預設可能寫 /tmp，而非 ~/.cache；先單獨盤點此明確範圍
+# 僅 root 可用，不接受其他 --cache-root，不會清整個 /tmp 或修改排程
+run_fintech_python scripts/maintain_storage_pressure.py --tmp-torchinductor-only
+run_fintech_python scripts/maintain_storage_pressure.py --tmp-torchinductor-only --apply
+
 # 安裝 hourly systemd timer；無 systemd 的 Vast container 安裝 cron fallback
 sudo ./scripts/install_storage_pressure_service.sh
+
+# Vast 的明確本機 profile：先驗證，不掃 cache／不刪資料
+run_fintech_python scripts/maintain_storage_pressure.py \
+  --policy "$PWD/configs/data_sync/vastai_storage_pressure.json" --check-policy
+
+# 尚未安裝維護排程時才用此安裝器；已有 cron 可只 --enroll-policy
+# 仍沿用同名 owner，含 ~/.cache 與 /tmp/torchinductor_root，不含其他 /tmp
+sudo ./scripts/install_storage_pressure_service.sh \
+  --policy "$PWD/configs/data_sync/vastai_storage_pressure.json"
 ```
 
 Receipt 位於 `/var/lib/stockagent-storage-pressure/receipts/`。`--force` 只供人工測試，會
 明確繞過程序級保護，禁止放進排程。完整邊界與常態環境變數見
 [磁碟壓力維護](docs/storage_pressure_maintenance.md)。
+上述 `/tmp` 回收仍要求 14 日未讀寫、無 fd/mmap／訓練程序引用、單一 inode link 與
+unlink 前一致性檢查。只刪可重建編譯結果，不動資料或模型；之後首次使用可能需要重新編譯。
 
 沒有持久卷的 Vast 計算節點不應常駐整份 packed payload。完成 durable peer 全量 checksum
 與 Syncthing 收斂驗證後，可切為 index-only edge：heads、manifests、inventories 繼續即時
@@ -1086,8 +1166,16 @@ source scripts/runtime_env.sh
 run_fintech_python -m downloader.download_tej_history run --max-tasks 100
 ```
 
-遇到結果不明先按 runbook 恢復，不能直接重送。桌面登入不等於獨立 TEJ API 授權，
-目前也沒有自動每日 GUI timer／遠端訓練注入。
+已沿用原服務加入[登入後自動恢復與直接搜尋優化](docs/tej_startup_search_2026-10-05.md)：
+WSL 服務自動啟動，Windows 登入後每分鐘核對專用桌面與互動通道；目前登入前的
+WSL 開機任務仍需 Windows 管理員權限。遇到結果不明先按 runbook 收回原結果，
+只有符合既有授權與精確證據的工作才有界重排，原 UNKNOWN 紀錄保留。
+桌面登入不等於獨立 TEJ API 授權；本次沒有新增遠端訓練注入或宣稱全歷史完整。
+
+完整操作、大表讀回的候選比較、真實來源交錯計時及部署驗收見
+[TEJ 全鏈路最快可驗證路徑](docs/tej_chain_fast_paths_2026-10-05.md)。
+保留單一 Wizard 條件寫入者，只對大表做有界唯讀併行；不減少欄位或略過驗證。
+速度結論限於實測範圍，不代表官方理論最高速。
 
 ### 台灣官方資料
 

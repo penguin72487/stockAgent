@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from stockagent.data_sync.backup_stream import BackupStream, capture_catalog  # noqa: E402
 from stockagent.data_sync.offhost_backup import private_json  # noqa: E402
+from stockagent.data_sync.desync_snapshots import SnapshotError  # noqa: E402
 
 
 def main() -> None:
@@ -49,7 +50,13 @@ def main() -> None:
     elif args.action == "publish-recovery-requests":
         print(json.dumps(BackupStream(config).publish_recovery_requests(wait_for_owner=args.wait_for_owner)))
     else:
-        result = BackupStream(config).cycle(publish=not args.inspect_only)
+        try:
+            result = BackupStream(config).cycle(publish=not args.inspect_only)
+        except SnapshotError as error:
+            if isinstance(error.__cause__, BlockingIOError):
+                print(json.dumps({"state": "existing_source_owner_busy", "backup_completed": False}))
+                raise SystemExit(75) from None
+            raise
         print(json.dumps(result, ensure_ascii=False))
         if result["receipt_errors"] or result["auxiliary_error"] or result.get("cold_transport_cache", {}).get("errors"):
             raise SystemExit(1)

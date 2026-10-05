@@ -129,6 +129,19 @@ def test_wrapper_requires_exact_permit_before_any_source_command():
     assert 'exit 75' in command and 'exit 76' in command
 
 
+def test_interactive_gui_session_is_checked_before_any_readiness_or_permit():
+    command=transport._command('SOURCE_ACTION','ready','permit','t'*32,'d'*64,20,1)
+    assert command.index('SessionId -ne 1') < command.index('WriteAllText') < command.index('SOURCE_ACTION')
+    assert 'exit 77' in command
+
+
+@pytest.mark.parametrize('session', [0,-1,True,'1'])
+def test_invalid_gui_session_never_launches_windows(launch_request, monkeypatch, session):
+    monkeypatch.setattr(transport.subprocess,'Popen',lambda *a,**k:pytest.fail('No Windows launch permitted'))
+    with pytest.raises(ValueError):
+        transport.run_guarded_windows('SOURCE_ACTION',request=launch_request,windows_path=str,windows_session_id=session)
+
+
 def test_exhausted_transport_returns_pending_without_input_bug_retry_budget(registry,monkeypatch):
     from contextlib import closing
     from downloader.tej_history import DesktopBridge, connect, run_one
@@ -137,7 +150,7 @@ def test_exhausted_transport_returns_pending_without_input_bug_retry_budget(regi
     run_one(root,FakeBridge())
     monkeypatch.setattr(DesktopBridge,'windows_path',staticmethod(str))
     monkeypatch.setattr(transport.subprocess,'Popen',lambda argv,**_:Process(argv[-1],acknowledgement=False))
-    bridge = DesktopBridge(root.parent,dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='test',ExpectedWorkbook='test',ExpectedExcelWindow=3))
+    bridge = DesktopBridge(Path(__file__).resolve().parents[1],dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='test',ExpectedWorkbook='test',ExpectedExcelWindow=3))
     assert run_one(root,bridge) == 'desktop_unavailable'
     with closing(connect(root)) as con:
         task = dict(con.execute("SELECT * FROM tasks WHERE kind='download'").fetchone())

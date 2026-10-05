@@ -1,0 +1,10 @@
+# Transport/lifecycle-only candidate. Preserve the v3 model, precision, data,
+# optimizer and formal output; canonical resume verifies their fingerprints.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v3.yaml
+
+data:
+  factorized_transfer_mode: compact_cuda_cached
+
+runner:
+  resume: true
+  isolate_train_folds: false

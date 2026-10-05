@@ -3,6 +3,25 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 service_name=stockagent-storage-pressure
+policy_source=""
+while (( $# )); do
+  case "$1" in
+    --policy)
+      [[ $# -ge 2 ]] || exit 64
+      policy_source="$2"
+      shift 2
+      ;;
+    *) echo "Usage: $0 [--policy /ABSOLUTE/LOCAL/COMPILER_POLICY.json]" >&2; exit 64 ;;
+  esac
+done
+
+if [[ -n "$policy_source" ]]; then
+  source "$repo_root/scripts/runtime_env.sh"
+  run_fintech_python "$repo_root/scripts/maintain_storage_pressure.py" \
+    --policy "$policy_source" --check-policy
+  run_fintech_python "$repo_root/scripts/maintain_storage_pressure.py" \
+    --policy "$policy_source" --enroll-policy
+fi
 
 for path in \
   "$repo_root/scripts/maintain_storage_pressure.py" \

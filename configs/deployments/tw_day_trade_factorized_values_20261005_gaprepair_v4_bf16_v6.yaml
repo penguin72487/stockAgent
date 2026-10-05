@@ -1,0 +1,7 @@
+# Lossless rectangles -> full CUDA dense tensor; no host union/scatter.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_bf16_v5.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-bf16-v6
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_gaprepair_v4/training-bf16-v6
+  resume: false

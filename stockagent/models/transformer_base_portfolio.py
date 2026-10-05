@@ -1140,6 +1140,7 @@ class TemporalBasisFeatureEncoder(nn.Module):
             raise ValueError("TemporalBasisFeatureEncoder source_dim must be positive")
         self.sanitize_inputs = bool(sanitize_inputs)
         self.fuse_projection = bool(fuse_projection)
+        self.fp32_contraction = False
         self.family_names = _normalize_temporal_basis_families(families)
         if not self.family_names:
             raise ValueError("TemporalBasisFeatureEncoder requires at least one family")
@@ -1256,8 +1257,22 @@ class TemporalBasisFeatureEncoder(nn.Module):
         self,
         temporal_source: torch.Tensor,
         z_base: torch.Tensor,
+        effective_kernel: torch.Tensor | None = None,
+        *, lag_batched: bool = False,
     ) -> torch.Tensor:
         """Apply the concatenated coefficient projection without materializing it."""
+
+        if self.fp32_contraction:
+            with torch.autocast(temporal_source.device.type,enabled=False):
+                output=F.linear(z_base.float(),self.feature_projection.weight[:,:self.dim].float(),
+                    self.feature_projection.bias.float())
+                if effective_kernel is None:
+                    effective_kernel=self.fused_effective_kernel(temporal_source.float())
+                if lag_batched:
+                    return output+self._lag_batched_projection(effective_kernel.float(),temporal_source.float())
+                return output+torch.einsum("olf,blsf->bso",effective_kernel.float(),temporal_source.float())
+        if lag_batched:
+            raise ValueError("lag-batched contraction requires the explicit FP32 basis precision contract")
 
         weight = self.feature_projection.weight
         output = F.linear(
@@ -1271,8 +1286,37 @@ class TemporalBasisFeatureEncoder(nn.Module):
         # launching one contraction and one accumulation per family.  The
         # learned dictionary remains differentiable through ``torch.cat`` and
         # ``_basis``; only the execution schedule changes.
+        if effective_kernel is None:
+            effective_kernel=self.fused_effective_kernel(temporal_source)
+        return output + torch.einsum("olf,blsf->bso",effective_kernel,temporal_source)
+
+    def _lag_batched_projection(self,kernel:torch.Tensor,source:torch.Tensor)->torch.Tensor:
+        """Same linear map without B*L replicated raw rows for overlapping windows.
+
+        A prepared slab's [B,L,S,F] windows have strides [S*F,S*F,F,1].
+        Moving L first leaves B*S contiguous within each lag, so reshape is
+        a view and batched GEMM only allocates [L,B*S,D], not [B*S,L*F].
+        FP32 lag summation is explicitly numerical-oracle tested; it does not
+        remove any feature, family, parameter or optimizer state.
+        """
+        batch,steps,stocks,features=source.shape
+        if (source.stride(-1)!=1 or source.stride(0)!=stocks*features or source.stride(2)!=features):
+            raise ValueError("lag-batched basis requires canonical contiguous slab rolling views")
+        by_lag=source.permute(1,0,2,3).reshape(steps,batch*stocks,features)
+        products=torch.bmm(by_lag,kernel.permute(1,2,0))
+        return products.sum(dim=0).reshape(batch,stocks,self.dim)
+
+    def fused_effective_kernel(self,source: torch.Tensor) -> torch.Tensor:
+        """Shared exact contraction, reusable across independent stock chunks."""
+        if self.fp32_contraction:
+            with torch.autocast(source.device.type,enabled=False):
+                return self._effective_kernel_contraction(source.float())
+        return self._effective_kernel_contraction(source)
+
+    def _effective_kernel_contraction(self,source:torch.Tensor)->torch.Tensor:
+        weight=self.feature_projection.weight
         basis_bank = torch.cat(
-            [self._basis(family, temporal_source) for family in self.family_names],
+            [self._basis(family, source) for family in self.family_names],
             dim=0,
         )
         basis_weight = weight[:, self.dim :].reshape(
@@ -1280,15 +1324,10 @@ class TemporalBasisFeatureEncoder(nn.Module):
             self.total_basis_components,
             self.source_dim,
         )
-        effective_kernel = torch.einsum(
+        return torch.einsum(
             "okf,kl->olf",
             basis_weight,
             basis_bank,
-        )
-        return output + torch.einsum(
-            "olf,blsf->bso",
-            effective_kernel,
-            temporal_source,
         )
 
     def explainability_decomposition(

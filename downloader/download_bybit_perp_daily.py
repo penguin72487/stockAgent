@@ -40,10 +40,12 @@ from common import (
 )
 from artifact_io import archive_run_reports
 from candle_frame_buffer import CandleFrameBuffer
+from quality_priority import collect_with_quality_priority, prioritize_records
 from http_transport import RETRYABLE_NETWORK_ERRORS
 from ohlcv_hot_tail import (
     has_contiguous_timestamps,
     hot_tail_path,
+    plan_candle_reconcile_windows,
     read_logical_parquet,
     remove_hot_tail,
 )
@@ -499,6 +501,62 @@ def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
     return windows
 
 
+def _fetch_sparse_head(
+    client: Any,
+    record: SymbolRecord,
+    start_ms: int,
+    end_ms: int,
+    candles: CandleFrameBuffer,
+    page_progress_callback: Any,
+) -> dict[str, Any]:
+    """Walk returned keys, not thousands of presumed populated minute pages.
+
+    The official endpoint returns the newest (at most 1,000) rows in a bounded
+    interval. Moving the upper bound before the oldest returned key retrieves
+    earlier data without assuming every minute exists. An empty response only
+    proves this *current request* returned no earlier rows; it is not a listing
+    date, a synthetic candle, or a permanent historical-completeness receipt.
+    """
+    cursor = end_ms
+    pages = rows = 0
+    remaining_interval_empty = False
+    while cursor >= start_ms:
+        payload = client.get(KLINE_ENDPOINT, {
+            "category": record.category,
+            "symbol": record.bybit_symbol,
+            "interval": KLINE_INTERVAL,
+            "start": str(start_ms),
+            "end": str(cursor),
+            "limit": BYBIT_MAX_KLINE_LIMIT,
+        })
+        pages += 1
+        if page_progress_callback is not None:
+            page_progress_callback(record.code)
+        result = payload.get("result") if isinstance(payload, dict) else None
+        chunk = result.get("list") if isinstance(result, dict) else None
+        if not isinstance(chunk, list) or len(chunk) > BYBIT_MAX_CANDLES_PER_REQUEST:
+            raise ValueError("Bybit historical head response violates the page contract")
+        if not chunk:
+            remaining_interval_empty = True
+            break
+        timestamps = []
+        for row in chunk:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                raise ValueError("Bybit historical head response has an incomplete candle")
+            timestamp = int(row[0])
+            if not start_ms <= timestamp <= cursor or timestamp % CANDLE_INTERVAL_MS:
+                raise ValueError("Bybit historical head response has an out-of-window key")
+            timestamps.append(timestamp)
+        candles.extend(chunk)
+        rows += len(chunk)
+        cursor = min(timestamps) - CANDLE_INTERVAL_MS
+    return {
+        "start_ms": start_ms, "end_ms": end_ms, "request_pages": pages,
+        "returned_rows": rows, "remaining_interval_empty": remaining_interval_empty,
+        "history_complete": False,
+    }
+
+
 class BybitClient:
     def __init__(
         self, request_interval: float | None, max_retries: int, retry_base: float
@@ -755,10 +813,12 @@ def _download_symbol_1m(
             ),
         )
 
+    requested_start_ms = effective_start_ms
+
     if output_path.exists() and not refresh:
         existing_info = _load_logical_existing_candle_info(
             output_path,
-            require_contiguous=not tail_only,
+            require_contiguous=False,
         )
         if existing_info.error is not None or not existing_info.interval_ok:
             if tail_only:
@@ -789,7 +849,7 @@ def _download_symbol_1m(
                 overlap_ms=CANDLE_INTERVAL_MS,
                 repair_missing_head=not tail_only,
             )
-            if effective_start_ms > end_ms:
+            if tail_only and effective_start_ms > end_ms:
                 return DownloadResult(
                     asset_class="crypto_bybit_perp",
                     code=record.code,
@@ -808,35 +868,44 @@ def _download_symbol_1m(
     request_windows: list[tuple[int, int]] | None = None
     existing_frame: pl.DataFrame | None = None
     preserve_existing = False
-    if (
-        missing_head and not tail_only and existing_info is not None
-        and existing_info.earliest_ms is not None
-        and existing_info.latest_ms is not None
-    ):
-        # Reconcile missing history and the revision tail, not the already
-        # validated continuous middle. Empty head responses remain retryable
-        # next run; launch time is not proof of the first available candle.
-        head_end = min(existing_info.earliest_ms, closed_end_ms)
-        tail_start = max(effective_start_ms, existing_info.latest_ms - CANDLE_INTERVAL_MS)
-        if head_end < tail_start:
-            # Footer count/bounds alone can hide a duplicate plus a gap. The
-            # merge needs this logical frame anyway; read it once and require
-            # exact minute continuity before omitting any middle requests.
-            existing_frame = read_logical_parquet(output_path)
-            if _can_skip_existing_middle(existing_frame, existing_info):
-                request_windows = [
-                    *_iter_windows(effective_start_ms, head_end),
-                    *_iter_windows(tail_start, closed_end_ms),
-                ]
-                preserve_existing = True
-            else:
-                existing_info = None
-                existing_frame = None
+    sparse_head: tuple[int, int] | None = None
+    if not tail_only and existing_info is not None and existing_info.rows:
+        existing_frame = read_logical_parquet(output_path)
+        if existing_info.earliest_ms is not None:
+            requested_start_ms = max(start_ms, min(requested_start_ms, existing_info.earliest_ms))
+        planned = plan_candle_reconcile_windows(
+            existing_frame, earliest_ms=existing_info.earliest_ms, latest_ms=existing_info.latest_ms,
+            start_ms=requested_start_ms, end_ms=closed_end_ms, interval_ms=CANDLE_INTERVAL_MS,
+        )
+        ranges = planned if planned is not None else [(requested_start_ms, closed_end_ms)]
+        if ranges and requested_start_ms < ranges[0][0] < requested_start_ms + CANDLE_INTERVAL_MS:
+            # Preserve the exact launch boundary in the source request; its
+            # filter still excludes every prelaunch candle.
+            ranges[0] = (requested_start_ms, ranges[0][1])
+        if planned is not None and existing_info.earliest_ms is not None:
+            head_end = min(closed_end_ms, existing_info.earliest_ms - CANDLE_INTERVAL_MS)
+            if head_end - requested_start_ms > BYBIT_WINDOW_SPAN_MS:
+                # Exclude the known first candle from the emptiness probe. Its
+                # boundary revision, real internal gaps and tail remain in the
+                # normal reconcile plan, including merged head/gap windows.
+                sparse_head = (requested_start_ms, head_end)
+                ranges = [(max(lo, head_end + CANDLE_INTERVAL_MS), hi)
+                          for lo, hi in ranges if hi > head_end]
+        request_windows = [window for lo, hi in ranges for window in _iter_windows(lo, hi)]
+        # Window repairs must never drop healthy rows between the requests.
+        preserve_existing = True
+        if request_windows:
+            effective_start_ms = min(window[0] for window in request_windows)
     if request_windows is None:
         request_windows = _iter_windows(effective_start_ms, closed_end_ms)
 
     candles = CandleFrameBuffer(_normalize_candles)
     received_rows = False
+    probe_message = None
+    if sparse_head is not None:
+        probe = _fetch_sparse_head(client, record, *sparse_head, candles, page_progress_callback)
+        received_rows = probe["returned_rows"] > 0
+        probe_message = json.dumps({"source_head_probe": probe}, sort_keys=True)
     for window_start, window_end in request_windows:
         payload = client.get(
             KLINE_ENDPOINT,
@@ -870,6 +939,7 @@ def _download_symbol_1m(
                 status="skipped_up_to_date",
                 rows=existing_info.rows,
                 output_path=str(output_path),
+                message=probe_message,
             )
         return DownloadResult(
             asset_class="crypto_bybit_perp",
@@ -893,6 +963,7 @@ def _download_symbol_1m(
                 status="skipped_up_to_date",
                 rows=existing_info.rows,
                 output_path=str(output_path),
+                message=probe_message,
             )
         return DownloadResult(
             asset_class="crypto_bybit_perp",
@@ -923,6 +994,7 @@ def _download_symbol_1m(
                     status="skipped_up_to_date",
                     rows=existing_info.rows,
                     output_path=str(output_path),
+                    message=probe_message,
                 )
             if tail_path.is_file():
                 df, changed = _merge_existing_with_fresh(
@@ -968,6 +1040,7 @@ def _download_symbol_1m(
                     status="skipped_up_to_date",
                     rows=existing_info.rows,
                     output_path=str(output_path),
+                    message=probe_message,
                 )
         df = combined
 
@@ -983,6 +1056,7 @@ def _download_symbol_1m(
         status="updated",
         rows=df.height,
         output_path=str(output_path),
+        message=probe_message,
     )
 
 
@@ -1031,8 +1105,13 @@ def main() -> None:
         symbols = symbols[: max(0, int(args.limit))]
     if not symbols:
         raise RuntimeError("No Bybit perpetual symbols found for selected categories.")
+    symbols = prioritize_records(symbols, output_dir, tail_only=args.tail_only)
 
-    symbols_path = output_dir / "symbols.csv"
+    report_root = output_dir
+    if requested_symbols:
+        report_root = output_dir / 'quality_repair_runs' / started_at.strftime('%Y%m%dT%H%M%S%fZ')
+        report_root.mkdir(parents=True, exist_ok=False)
+    symbols_path = report_root / "symbols.csv"
     atomic_write_text(
         symbols_path,
         pl.DataFrame([asdict(s) for s in symbols]).write_csv(),
@@ -1040,7 +1119,7 @@ def main() -> None:
 
     total_symbols = len(symbols)
     pipeline_progress = PersistentProgress(
-        output_dir / "progress.json",
+        report_root / "progress.json",
         label="Bybit 永續合約 1 分鐘 K線",
         total=total_symbols,
         unit="symbol",
@@ -1073,7 +1152,7 @@ def main() -> None:
                 f"{record.bybit_symbol} ({record.category})"
             )
 
-        result = _download_symbol_1m(
+        result = collect_with_quality_priority(lambda page: _download_symbol_1m(
             client,
             record,
             output_dir,
@@ -1082,10 +1161,9 @@ def main() -> None:
             args.mode,
             args.refresh,
             tail_only=args.tail_only,
-            page_progress_callback=lambda _code: pipeline_progress.observe(
-                "candles", "request_pages"
-            ),
-        )
+            page_progress_callback=page,
+        ), root=output_dir, code=record.code, tail_only=args.tail_only,
+            page_observer=lambda _code: pipeline_progress.observe('candles', 'request_pages'))
         pipeline_progress.update("candles", result.status)
 
         with progress_lock:
@@ -1123,8 +1201,8 @@ def main() -> None:
         on_error=_on_error,
     )
 
-    report_path = output_dir / "download_report.csv"
-    summary_path = output_dir / "download_summary.json"
+    report_path = report_root / "download_report.csv"
+    summary_path = report_root / "download_summary.json"
 
     result_rows = [asdict(r) for r in results]
     result_df = (
@@ -1148,6 +1226,8 @@ def main() -> None:
     summary = {
         "asset_class": "crypto_bybit_perp",
         "interval": KLINE_INTERVAL_LABEL,
+        "requested_symbol_filter": sorted(requested_symbols) or None,
+        "provider_scope_is_complete": not bool(requested_symbols),
         "symbol_count": len(symbols),
         "row_count": row_count,
         "current_symbol_count": len(symbols),

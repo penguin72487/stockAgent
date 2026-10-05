@@ -30,18 +30,37 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## 資料與多機維運 Runbook
 
+- [`ducklake_temporal_replication_2026-10-05.md`](ducklake_temporal_replication_2026-10-05.md)：最新正式四節點 lakehouse、PostgreSQL-backed Temporal、rclone 按需複寫、自動 NAS archive 與恢復證據。
+- [`lab203_immutable_lake_relay_install_2026-10-05.md`](lab203_immutable_lake_relay_install_2026-10-05.md)：已完成的一次性固定 relay 安裝；日常不需逐批轉貼。
+
+- [`all_services_boot_recovery_2026-10-05.md`](all_services_boot_recovery_2026-10-05.md)：Windows／WSL 持續存活、正式 owner 退避與依賴接續、命名空間一致的自動稽核及跨節點驗收界線。
+- [`four_node_storage_architecture_2026-10-04.md`](four_node_storage_architecture_2026-10-04.md)：
+  penguin／Vast／lab203／NAS 的檔案系統實測、資料權責、完成產物自動回傳與精確 cold 重建 ACK 後的受控回收。
+- [`four_node_storage_optimization_2026-10-05.md`](four_node_storage_optimization_2026-10-05.md)：
+  四節點清冊、CPU quota／雙 socket 實測、D 原生完整還原、縮短共用鎖、訓練機角色及舊 cache 自動重試；保留未完成遷移的界線。
 - [`lab203_complete_backup_rollout_2026-10-04.md`](lab203_complete_backup_rollout_2026-10-04.md)：全量冷庫盤點、明確放棄已缺歷史、硬體實測與 NAS ACK 後有界傳輸回收。
 - [`lab203_automatic_backup_2026-10-04.md`](lab203_automatic_backup_2026-10-04.md)：持續自動同步／NAS 檔案驗收；固定程式一次安裝後，自動派送 packed 與新 PostgreSQL 邏輯狀態的還原任務、重試及回傳。
+- [`lab203_parallel_backup_2026-10-04.md`](lab203_parallel_backup_2026-10-04.md)：四批並行來源與接收管線、來源完整流程實測、失敗獨立重排，以及 lab203 固定 v10 修正升級與實際 NAS 並行度量測。
 - [`continuous_nas_backup_2026-10-04.md`](continuous_nas_backup_2026-10-04.md)：來源端持續增量服務、lab203 既有 worker 回傳收據交接、固定 NAS snapshot 重建與受控 USB 金鑰保管。
 - [`lab203_nas_recovery_acceptance_2026-10-04.md`](lab203_nas_recovery_acceptance_2026-10-04.md)：lab203 本機執行三個固定 NAS snapshot 的 packed／SQL 獨立驗收；USB 保管已由使用者確認完成。
 - [`agent_workflow.md`](agent_workflow.md)：本機 agent 工具安裝、唯讀狀態、任務紀錄與 tmux／systemd 命令監督。
-- [`control_plane_workflow.md`](control_plane_workflow.md)：opt-in PostgreSQL 工程工作、版本／lease／attempt、SSH 私有節點與備份還原。
+- [`stockagent-storage-operations` skill](../.agents/skills/stockagent-storage-operations/SKILL.md)：供其他 agent 使用的四節點操作流程；含進度查詢、唯一 owner、自動 NAS 備份、遠端按需資料與恢復／回收判準。
+- [`control_plane_workflow.md`](control_plane_workflow.md)：正式固定程式碼驗證 owner，以及 PostgreSQL 工程工作、版本／lease／attempt、私有節點與備份還原。
+- [`architecture_production_completion_2026-10-05.md`](architecture_production_completion_2026-10-05.md)：第一性原理技術取捨、四節點正式服務、精確 code work 與重啟／同步驗收。
 - [`penguin_source_only_storage_2026-10-01.md`](penguin_source_only_storage_2026-10-01.md)：
   現行源本／服務機分工、遠端按需訓練生成、公開資訊與來源清單、安全清理收據及保留阻礙。
 - [`markets_storage_review_2026-10-03.md`](markets_storage_review_2026-10-03.md)：
   markets 容量排名、歷史規則版本、服務保留範圍及逐檔冷覆蓋差異；不是刪除許可。
 - [`markets_safe_retirement_2026-10-03.md`](markets_safe_retirement_2026-10-03.md)：
   四個研究目錄的完整 D 冷封存／立即回收、恢復指令及 117 個期貨解析版本的保留阻礙。
+- [`vastai_storage_cleanup_2026-10-04.md`](vastai_storage_cleanup_2026-10-04.md)：
+  Vast 容量盤點、逐檔核 SHA 去重、到期熱副本回收及 QUIC 冷索引／產物 ingress 修復。
+- [`vast_all_artifacts_cold_return_2026-10-04.md`](vast_all_artifacts_cold_return_2026-10-04.md)：
+  全部遠端 markets／ablations 的逐項 D 封存、獨立恢復、回收安全閘門和自助進度／恢復指令。
+- [`vast_bulk_compressed_return_2026-10-04.md`](vast_bulk_compressed_return_2026-10-04.md)：
+  一次性整根 tar/zstd 回 D、Windows 原生 binary I/O、cache 精確去重、續傳和逐根冷驗證回收。
+- [`vast_sync_cleanup_acceleration_2026-10-04.md`](vast_sync_cleanup_acceleration_2026-10-04.md)：
+  共用鎖交接、精確批次掃描、Vast 索引傳輸實測與四個真實來源回收證據；歷史回傳和 NAS 補齊持續運作。
 - [`packed_dataset_storage.md`](packed_dataset_storage.md)：現行 packed 冷庫、增量 pack/blob、
   多寫者 head、materialize、lease 與非持久 Vast 的 index-only edge cache；
   penguin 以現行儲存契約的 D 槽單份主冷庫為準，舊 C retention 不再啟用。
@@ -51,6 +70,8 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
   完成產物 cold release、衝突政策、hard-link 去重；不得重建舊 folder。
 - [`storage_pressure_maintenance.md`](storage_pressure_maintenance.md)：磁碟高水位下只回收
   allowlisted 可重建編譯快取、訓練程序保護與 receipt 稽核。
+- [`automatic_cold_storage.md`](automatic_cold_storage.md)：既有 owner 的自動增量回傳、
+  完整恢復／新鮮 ACK 後回收、七日熱租約、Vast 明確 compiler profile 和單一唯讀狀態入口。
 - [`desync_multiwriter_sync.md`](desync_multiwriter_sync.md)：舊 desync snapshot 的遷移／救援流程；
   不再是新部署的日常入口。
 - [`RUN_GUIDE.md`](RUN_GUIDE.md)：補充 operator 指令；使用前仍要核對當前 config 與本機路徑。
@@ -62,6 +83,8 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 ## 資料取得、修復與儲存
 
 - [`tej_smart_wizard_acquisition_2026-10-02.md`](tej_smart_wizard_acquisition_2026-10-02.md)：TEJ 全 30 類／255 表／45,826 欄清冊、v4 可操作來源範圍驗證／下載器、桌面與 API 限額邊界、唯讀進度網站及未完成驗證。
+- [`tej_startup_search_2026-10-05.md`](tej_startup_search_2026-10-05.md)：登入後 Windows／WSL 自動恢復、精確搜尋／操作等待優化、通道 drain、收據／網頁／AB／BA 驗收，以及登入前任務的管理員權限缺口。
+- [`tej_full_flow_speed_2026-10-05.md`](tej_full_flow_speed_2026-10-05.md)：TEJ 全流程操作與有限換表優化、真實來源完整 AB／BA、批次讀回候選拒絕、部署收據與剩餘速度瓶頸。
 - [`tej_smart_wizard_export_runbook_2026-10-01.md`](tej_smart_wizard_export_runbook_2026-10-01.md)：維運 runbook，記錄 Smart Wizard 查詢復原、日期／欄位讀回、Excel 唯讀擷取、單位轉換與有限樣本驗收。
 - [`tej_smart_wizard_inventory_2026-10-01.md`](tej_smart_wizard_inventory_2026-10-01.md)：TEJ 已讀資料表逐欄清冊、未讀目錄、兩階段取得與後續跨來源校驗候選；尚未完成全帳號歷史權限查驗。
 - [`finlab_stage_eta_scheduling_2026-10-01.md`](finlab_stage_eta_scheduling_2026-10-01.md)：FinLab 分階段 ETA、SDK 增量查核、防飢餓與動態剩餘配額排程，含公開畫面及計算驗收。
@@ -100,6 +123,8 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## Review 與歷史工程快照
 
+- [`prompt_audit_2026-10-05.md`](prompt_audit_2026-10-05.md) 是新增儲存 skill 與偏好的增量稽核，釐清低頻 NULL／訓練視圖、正式服務恢復、可攜交接及 dry run 的實際副作用。
+- [`prompt_audit_2026-10-04.md`](prompt_audit_2026-10-04.md) 是後續指令與偏好的增量稽核，涵蓋自動化／並行、重試、特徵 panel 與具名研究修正。
 - [`prompt_audit_2026-10-03.md`](prompt_audit_2026-10-03.md) 是提示規則與個人偏好的增量稽核，包含來源、適用範圍與本輪驗證。
 - [`user_working_preferences_2026-09-30.md`](user_working_preferences_2026-09-30.md) 是個人偏好技能的初次建立紀錄；後續修正見上方稽核。
 - [`PROJECT_REVIEW_2026-09-05.md`](PROJECT_REVIEW_2026-09-05.md) 是該日全專案 review 的歷史快照，包含當時修正、驗證與保留的決策邊界；後續架構進度見本頁現行架構文件。

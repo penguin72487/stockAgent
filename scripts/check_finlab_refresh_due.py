@@ -37,6 +37,12 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
     local = now.astimezone(TAIPEI)
     if local.hour == 8 and local.minute < 20:
         return True, "reset_confirmation_window"
+    from stockagent.data.finlab_gap_priority import pending_gap_requests
+    try:
+        if pending_gap_requests(root / "data_finlab", now=now):
+            return True, "owner_gap_recheck_due"
+    except (OSError, ValueError, TypeError):
+        return True, "gap_priority_unverified_recovery"
     workload = read(root / "artifacts/live/finlab/workload_latest.json")
     observed = utc_time(workload.get("generated_at_utc"))
     rows = workload.get("datasets")
@@ -65,14 +71,19 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
     if isinstance(reserve, bool) or not isinstance(reserve, (int, float)) or not math.isfinite(reserve):
         reserve = 500
     market = read(root / "data_finlab/intraday/market_status.json")
-    tick = market.get("by_kind", {}).get("tw_tick", {})
+    kinds = market.get("by_kind")
+    tick = kinds.get("tw_tick", {}) if isinstance(kinds, dict) else {}
+    tick = tick if isinstance(tick, dict) else {}
+    partitions = tick.get("remaining_partitions", 1)
+    if type(partitions) is not int or partitions < 0:
+        partitions = 1  # unknown scope is not zero remaining work
     checked = utc_time(market.get("observed_at_utc"))
     # A fully searched frontier can only advance after another source cycle;
     # keep unknown history incomplete without rediscovering it every minute.
     exhausted = (market.get("state") == "frontiers_scanned; retries_due_next_cycle"
                  and checked and checked >= quota_cycle_start(now))
     if (core.get("supplemental_allowed") is True and not exhausted
-            and remaining > max(50, reserve) and tick.get("remaining_partitions", 1) > 0):
+            and remaining > max(50, reserve) and partitions > 0):
         return True, "residual_tick_capacity"
     return False, "nothing_actionable_now"
 

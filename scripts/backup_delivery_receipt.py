@@ -168,14 +168,14 @@ def atomic_public(path: Path, value: dict, *, replace: bool = False) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def verify_dispatch_delivery(delivery: Path, dispatch: dict) -> dict:
+def verify_dispatch_delivery(delivery: Path, dispatch: dict, *, workers: int = 1) -> dict:
     """Shared pre-backup gate; a dispatch may arrive before its file set."""
     validate_dispatch(dispatch)
     if delivery.name != dispatch["batch_relative"]:
         raise ValueError("delivery path differs from the source dispatch")
     if hashlib.sha256(regular(delivery, "backup-envelope.json").read_bytes()).hexdigest() != dispatch["envelope_file_sha256"]:
         raise ValueError("raw envelope differs from the source-pinned file hash")
-    verification = verify(delivery, dispatch["envelope_identity_sha256"])
+    verification = verify(delivery, dispatch["envelope_identity_sha256"], workers=workers)
     if verification["files_verified"] + 2 != dispatch["complete_files"]:
         raise ValueError("complete file count differs")
     complete_bytes = verification["bytes_verified"] + sum(regular(delivery, x).stat().st_size for x in ("READY", "backup-envelope.json"))
@@ -184,9 +184,9 @@ def verify_dispatch_delivery(delivery: Path, dispatch: dict) -> dict:
     return verification
 
 
-def publish(delivery: Path, dispatch: dict, proof_file: Path, output_root: Path) -> dict:
+def publish(delivery: Path, dispatch: dict, proof_file: Path, output_root: Path, *, workers: int = 1) -> dict:
     """Adapter called by the existing worker after its fixed-snapshot proof."""
-    verify_dispatch_delivery(delivery, dispatch)
+    verify_dispatch_delivery(delivery, dispatch, workers=workers)
     proof = read_json(proof_file)
     # Select known fields; private configuration, raw log output and keys can
     # never be copied into the reverse Syncthing folder.

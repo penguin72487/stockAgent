@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 
@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/live/tw_day_trade_simulation/service_sync.json"),
     )
     parser.add_argument(
+        "--execution-latency",
+        type=Path,
+        help="Canonical latency.jsonl; defaults beside the engine-sync receipt.",
+    )
+    parser.add_argument(
         "--discord-status",
         type=Path,
         default=Path("artifacts/discord_bot/service_status.json"),
@@ -102,6 +107,35 @@ def _parse_time(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=TAIPEI)
+
+
+def _execution_commit_times(
+    rows: Sequence[Mapping[str, Any]], session_date: str,
+) -> dict[tuple[str, str], datetime]:
+    """Use actual successful ledger commits, never logical paper fill clocks."""
+    commits: dict[tuple[str, str], datetime] = {}
+    for row in rows:
+        if (
+            row.get("session_date") != session_date
+            or row.get("result") != "registered"
+            or row.get("simulation_only") is not True
+            or row.get("measurement_boundary")
+            != "signal_input_to_simulation_ledger_persisted"
+        ):
+            continue
+        timestamp = _parse_time(row.get("ledger_persisted_at"))
+        market = str(row.get("market") or "")
+        signal_id = str(row.get("signal_id") or "")
+        if (
+            timestamp is None or not market or not signal_id
+            or timestamp.astimezone(TAIPEI).date().isoformat() != session_date
+        ):
+            continue
+        key = (market, signal_id)
+        previous = commits.get(key)
+        if previous is None or timestamp < previous:
+            commits[key] = timestamp
+    return commits
 
 
 def _service_states() -> dict[str, str]:
@@ -170,6 +204,7 @@ def evaluate_readiness(
     engine_status_receipt: Mapping[str, Any] | None = None,
     engine_sync_receipt: Mapping[str, Any] | None = None,
     discord_status_receipt: Mapping[str, Any] | None = None,
+    execution_latency_rows: Sequence[Mapping[str, Any]] = (),
     opening_check_after: datetime_time = datetime_time(9, 0, 15),
     opening_commit_slo_seconds: float = 15.0,
 ) -> dict[str, Any]:
@@ -459,24 +494,29 @@ def evaluate_readiness(
         engine_sync = dict(engine_sync_receipt or {})
         raw_modes = engine_sync.get("modes")
         sync_modes = dict(raw_modes) if isinstance(raw_modes, Mapping) else {}
+        commit_times = _execution_commit_times(execution_latency_rows, session_date)
         mode_results: dict[str, dict[str, Any]] = {}
         for market in market_names:
             raw_row = sync_modes.get(market)
             row = dict(raw_row) if isinstance(raw_row, Mapping) else {}
             entry_completed = _parse_time(row.get("entry_completed_at"))
+            ledger_completed = commit_times.get((market, str(row.get("signal_id") or "")))
             entry_commit_delay_ms = (
                 round(
                     (
-                        entry_completed.astimezone(TAIPEI) - execution_boundary
+                        ledger_completed.astimezone(TAIPEI) - execution_boundary
                     ).total_seconds()
                     * 1000.0,
                     3,
                 )
-                if entry_completed is not None
+                if ledger_completed is not None
                 else None
             )
             slo_met = bool(
-                entry_commit_delay_ms is not None
+                entry_completed is not None
+                and ledger_completed is not None
+                and ledger_completed >= entry_completed
+                and entry_commit_delay_ms is not None
                 and 0.0 <= entry_commit_delay_ms <= opening_commit_slo_seconds * 1000.0
             )
             committed = bool(
@@ -538,6 +578,8 @@ def evaluate_readiness(
                 "signal_id": row.get("signal_id"),
                 "signal_at": row.get("signal_at"),
                 "entry_completed_at": row.get("entry_completed_at"),
+                "entry_ledger_persisted_at": ledger_completed.isoformat(timespec="microseconds")
+                if ledger_completed is not None else None,
                 "engine_status": row.get("engine_status"),
                 "checkpoint_ready": row.get("checkpoint_ready"),
                 "entry_fill_policy": row.get("entry_fill_policy"),
@@ -553,6 +595,7 @@ def evaluate_readiness(
                 "unresolved_rebalance_count": unresolved_rebalance_count,
                 "entry_execution_complete": execution_complete,
                 "entry_commit_delay_ms": entry_commit_delay_ms,
+                "commit_measurement_boundary": "09:00_gate_to_actual_simulation_ledger_persisted",
                 "commit_slo_seconds": opening_commit_slo_seconds,
                 "commit_slo_met": slo_met,
             }
@@ -729,6 +772,19 @@ def main() -> int:
         _repo_path(args.engine_sync),
         _repo_path(args.discord_status),
     )
+    latency_path = _repo_path(args.execution_latency) if args.execution_latency else (
+        _repo_path(args.engine_sync).with_name("latency.jsonl")
+    )
+    latency_rows: list[dict[str, Any]] = []
+    latency_read_error = None
+    if observed.timetz().replace(tzinfo=None) >= datetime_time(9, 0, 15):
+        # Reuse the bounded canonical reader; no history scan or extra provider
+        # calls on the preopen path. Missing/partial evidence fails closed.
+        from stockagent.live.tw_day_trade_dashboard import _tail
+        try:
+            latency_rows = _tail(latency_path, 2_000)
+        except (OSError, TypeError, ValueError) as exc:
+            latency_read_error = type(exc).__name__
     payload = evaluate_readiness(
         observed=observed,
         strict_after=strict_after,
@@ -741,7 +797,10 @@ def main() -> int:
         engine_status_receipt=_read_json(_repo_path(args.engine_status)),
         engine_sync_receipt=engine_sync,
         discord_status_receipt=discord_status,
+        execution_latency_rows=latency_rows,
     )
+    if latency_read_error is not None:
+        payload["execution_latency_read_error"] = latency_read_error
     payload["session_reason"] = session_reason
     payload["sources"] = {
         "public_receipt": str(_repo_path(args.public_receipt)),
@@ -750,6 +809,7 @@ def main() -> int:
         "event_receipt": str(_repo_path(args.event_receipt)),
         "engine_status": str(_repo_path(args.engine_status)),
         "engine_sync": str(_repo_path(args.engine_sync)),
+        "execution_latency": str(latency_path),
         "discord_status": str(_repo_path(args.discord_status)),
     }
     _atomic_json(output, payload)

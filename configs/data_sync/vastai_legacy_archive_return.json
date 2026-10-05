@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "authority_node_id": "penguin",
+  "origin_node_id": "vastai1T",
+  "scopes": ["markets", "ablations"],
+  "minimum_stable_hours": 12,
+  "reserve_bytes": 68719476736,
+  "maximum_item_bytes": 68719476736,
+  "archive_only": true,
+  "retire_verified_source": true,
+  "transfer_compression": "zstd-1",
+  "archive_compression": "gzip-1-adaptive-over-8m",
+  "batch_directory_fsync": false
+}

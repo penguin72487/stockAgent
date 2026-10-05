@@ -55,21 +55,34 @@ def normalize_source(path: Path, key: str, sessions: list[date], symbols: list[s
         raise ValueError("duplicate/null source index")
     lookup = apply_known_release_overrides(schedule_lookup(indexes, rule, sessions), key, sessions)
     usable = lookup.filter(pl.col("date").is_not_null()).select("source_index", "date")
-    if rule.kind == "quarter" and uploads is not None:
+    if rule.kind in {"quarter", "quarter_date"} and uploads is not None:
         usable = lookup.select("source_index", pl.col("date").fill_null(sessions[-1] + timedelta(days=1)))
     if rule.scope == "market":
-        table = _wide_market(path, feature, sessions, date_lookup=usable)
+        table = _wide_market(path, feature, sessions, date_lookup=usable, keep_invalid_barriers=True)
     else:
         table = _wide_stock(path, feature, sessions, date_lookup=usable, keep_source_index=True,
                             defer_collapse=True)
         table = table.filter(pl.col("symbol").is_in(symbols))
         table = table.join(lookup.select("source_index", "estimated_published_on"),
                            on="source_index", how="left", validate="m:1")
-        if rule.kind in {"quarter", "revenue"}:
+        if rule.kind in {"quarter", "quarter_date", "revenue"}:
             # TDR foreign reporting periods/deadlines do not obey this envelope.
             table = table.filter(~pl.col("symbol").str.starts_with("91"))
-        if rule.kind == "quarter" and uploads is not None:
-            table = table.join(uploads, on=["source_index", "symbol"], how="left", validate="m:1")
+        if rule.kind in {"quarter", "quarter_date"} and uploads is not None:
+            if rule.kind == "quarter_date":
+                stamp=pl.col("source_index").str.slice(0,10).str.to_date()
+                # This adapter is only for the provider's fixed reporting
+                # deadline indexes, NOT arbitrary observation dates.
+                if table.filter(~stamp.dt.month().is_in([3,5,8,11])).height:
+                    raise ValueError("revised statement index is not a known deadline month")
+                table=table.with_columns(pl.concat_str(
+                    (stamp.dt.year()-(stamp.dt.month()==3).cast(pl.Int32)).cast(pl.String),
+                    pl.lit("-Q"),stamp.dt.month().replace_strict({3:4,5:1,8:2,11:3}).cast(pl.String)
+                ).alias("_upload_index"))
+                table=table.join(uploads.rename({"source_index":"_upload_index"}),
+                    on=["_upload_index","symbol"],how="left",validate="m:1").drop("_upload_index")
+            else:
+                table = table.join(uploads, on=["source_index", "symbol"], how="left", validate="m:1")
             late = {d: next_session(d, sessions) for d in table["known_upload_on"].drop_nulls().unique()}
             table = table.with_columns(pl.col("known_upload_on").replace_strict(
                 late, default=None, return_dtype=pl.Date).alias("known_usable_on"))
@@ -94,7 +107,7 @@ def normalize_source(path: Path, key: str, sessions: list[date], symbols: list[s
                         (pl.col("date") <= pl.col("estimated_published_on"))).height:
             raise ValueError("observation precedes estimated publication boundary")
         # A late restatement of an old quarter must not replace a newer quarter.
-        if rule.kind in {"quarter", "revenue"}:
+        if rule.kind in {"quarter", "quarter_date", "revenue"}:
             table = table.sort("symbol", "date", "source_index").with_columns(
                 pl.col("source_index").rank("dense").over("symbol").alias("_period_order"))
             table = table.with_columns(pl.col("_period_order").cum_max().over("symbol").alias("_newest"))

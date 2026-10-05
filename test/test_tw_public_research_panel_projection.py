@@ -5,6 +5,8 @@ from datetime import date
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import polars as pl
+import stockagent.data.panel as panel_module
 
 from stockagent.data.panel import (
     _forward_fill_point_in_time_features,
@@ -112,3 +114,31 @@ def test_tifrs_400_day_expiry_does_not_expire_m2() -> None:
     assert values[1].tolist() == [100.0, 10.0]
     assert np.isnan(values[2, 0])
     assert values[2, 1] == 10.0
+
+
+def test_native_float32_model_view_does_not_widen_rules_or_model_buffers(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "native-f32.parquet"
+    # The rule needs Float64 precision even though the model uses Float32.
+    price = 123.456789123456
+    pq.write_table(pa.table({
+        "date": pa.array([date(2020,1,2), date(2020,1,2), date(2020,1,3)], type=pa.date32()),
+        "symbol": ["2330"]*3,
+        "twcad_value": pa.array([1.25, None, -3.5], type=pa.float32()),
+        "_twpub_price_limit_upper": [price, None, price+0.1],
+    }), path)
+    seen = []
+    original = panel_module._external_frame_to_arrays
+
+    def capture(frame, names, **kwargs):
+        seen.append({n: frame.schema[n] for n in names})
+        return original(frame, names, **kwargs)
+
+    monkeypatch.setattr(panel_module, "_external_frame_to_arrays", capture)
+    result = _load_external_feature_arrays(path)
+    assert seen[0]["twcad_value"] == pl.Float32
+    assert seen[1]["_twpub_price_limit_upper"] == pl.Float64
+    _, values = result.by_symbol["2330"]
+    np.testing.assert_array_equal(values[:,0], np.array([1.25,-3.5], dtype=np.float32))
+    _, rules = result.by_symbol_rules["2330"]
+    assert rules.dtype == np.float64
+    np.testing.assert_array_equal(rules[:,0], np.array([price,price+0.1], dtype=np.float64))

@@ -46,6 +46,7 @@ def main(argv=None) -> int:
     sub.add_argument('--root', required=True, type=Path)
     sub.add_argument('--output', required=True, type=Path)
     sub.add_argument('--lease-seconds', type=int, default=60)
+    sub.add_argument('--work-key', help='claim only this exact immutable work; never consume another release attempt')
     args = parser.parse_args(argv)
     dsn = os.environ.get('CONTROL_PLANE_DSN')
     if not dsn:
@@ -53,7 +54,7 @@ def main(argv=None) -> int:
     if args.command == 'worker-once':
         result = execute_one(dsn, schema=args.schema, node_id=args.node, worker_id=args.worker,
                              receipt=args.receipt, root=args.root, output=args.output,
-                             lease_seconds=args.lease_seconds)
+                             lease_seconds=args.lease_seconds, work_key=args.work_key)
     else:
         with ControlStore(dsn, schema=args.schema) as store:
             if args.command == 'init':

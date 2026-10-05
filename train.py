@@ -724,13 +724,13 @@ def _install_graceful_termination_handlers() -> None:
             signal.signal(signum, _handle_termination)
 
 
-def _configure_cuda_runtime(*, cudnn_benchmark: bool = True) -> None:
+def _configure_cuda_runtime(*, cudnn_benchmark: bool = True, use_tensor_cores: bool = True) -> None:
     normalize_cuda_env()
     if not torch.cuda.is_available():
         return
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high" if use_tensor_cores else "highest")
+    torch.backends.cuda.matmul.allow_tf32 = bool(use_tensor_cores)
+    torch.backends.cudnn.allow_tf32 = bool(use_tensor_cores)
     torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
     torch.backends.cudnn.deterministic = False
     for attr in (
@@ -830,8 +830,17 @@ def _build_panel_kwargs(config) -> dict:
 
 def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
     kwargs = _build_panel_kwargs(config)
+    def attach_features(panel):
+        manifest = getattr(config.data, "factorized_feature_manifest", "")
+        if manifest:
+            if str(config.trading.execution_mode) != "tw_day_trade":
+                raise ValueError("factorized lag-one research features require tw_day_trade")
+            from stockagent.data.factorized_panel import attach_factorized_features
+            panel = attach_factorized_features(panel, manifest,
+                transfer_mode=config.data.factorized_transfer_mode)
+        return panel
     if active_strategy != "distributed_data_parallel" or _distributed_world_size() <= 1:
-        return build_panel(config.data.parquet_root, **kwargs)
+        return attach_features(build_panel(config.data.parquet_root, **kwargs))
 
     rank = _distributed_rank()
     world_size = _distributed_world_size()
@@ -844,7 +853,7 @@ def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
             flush=True,
         )
         try:
-            panel = build_panel(config.data.parquet_root, **kwargs)
+            panel = attach_features(build_panel(config.data.parquet_root, **kwargs))
             if panel is None:
                 raise RuntimeError("rank0 panel builder returned None")
         except Exception as exc:  # synchronize failure before any rank advances
@@ -856,7 +865,7 @@ def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
     if rank != 0:
         print(f"[panel-ddp] rank{rank} loading panel after rank0 cache barrier", flush=True)
         try:
-            panel = build_panel(config.data.parquet_root, **kwargs)
+            panel = attach_features(build_panel(config.data.parquet_root, **kwargs))
             if panel is None:
                 raise RuntimeError(f"rank{rank} panel loader returned None")
         except Exception as exc:  # every rank reports before the shared decision
@@ -1689,7 +1698,8 @@ def main() -> None:
         config.training.backtest_compile_stateful = bool(args.backtest_compile_stateful)
     if args.backtest_compile_dynamic is not None:
         config.training.backtest_compile_dynamic = bool(args.backtest_compile_dynamic)
-    _configure_cuda_runtime(cudnn_benchmark=bool(config.environment.cudnn_benchmark))
+    _configure_cuda_runtime(cudnn_benchmark=bool(config.environment.cudnn_benchmark),
+        use_tensor_cores=bool(config.environment.use_tensor_cores))
     _maybe_init_distributed_for_panel(active_strategy, config)
     # DDP model parameters are synchronized by the DDP constructor later, but
     # rank-local dropout/augmentation streams must not be identical. Seed only

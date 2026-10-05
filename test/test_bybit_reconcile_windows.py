@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import polars as pl
@@ -335,4 +336,67 @@ def test_invalid_head_value_never_commits_valid_tail(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         bybit._download_symbol_1m(Client(), record, tmp_path, START, START + 42 * MINUTE, "incremental", False)
+    assert writes == []
+
+
+def test_large_empty_head_uses_one_probe_not_empty_minute_pages(tmp_path, monkeypatch):
+    record, old, reads, writes = setup_source(tmp_path, monkeypatch, first=4000, last=4040)
+    monkeypatch.setattr(bybit, "_latest_closed_candle_start_ms", lambda: START + 4042 * MINUTE)
+    calls, observations = [], []
+
+    class Client:
+        def get(self, _endpoint, params):
+            low, high = int(params['start']), int(params['end'])
+            calls.append((low, high))
+            return {'result': {'list': [row(i) for i in range(4000, 4043)
+                                       if low <= START + i * MINUTE <= high]}}
+
+    result = bybit._download_symbol_1m(Client(), record, tmp_path, START, START + 4042 * MINUTE,
+        'incremental', False, page_progress_callback=observations.append)
+    assert calls == [(START, START + 3999 * MINUTE), (START + 4000 * MINUTE, START + 4000 * MINUTE),
+                     (START + 4039 * MINUTE, START + 4042 * MINUTE)]
+    assert len(observations) == len(calls) == 3
+    assert len(reads) == 1 and writes[0].height == old.height + 2
+    probe = json.loads(result.message)['source_head_probe']
+    assert probe['request_pages'] == 1 and probe['returned_rows'] == 0
+    assert probe['remaining_interval_empty'] and not probe['history_complete']
+
+
+def test_sparse_head_follows_returned_oldest_key_and_preserves_middle(tmp_path, monkeypatch):
+    record, old, _reads, writes = setup_source(tmp_path, monkeypatch, first=4000, last=4040)
+    monkeypatch.setattr(bybit, "_latest_closed_candle_start_ms", lambda: START + 4042 * MINUTE)
+    calls = []
+    truth = [row(i) for i in (13, 2999, *range(4000, 4043))]
+
+    class Client:
+        def get(self, _endpoint, params):
+            low, high = int(params['start']), int(params['end'])
+            calls.append((low, high))
+            selected = [value for value in truth if low <= int(value[0]) <= high]
+            return {'result': {'list': sorted(selected, key=lambda r: int(r[0]), reverse=True)[:1000]}}
+
+    result = bybit._download_symbol_1m(Client(), record, tmp_path, START, START + 4042 * MINUTE,
+        'incremental', False)
+    assert calls[:2] == [(START, START + 3999 * MINUTE), (START, START + 12 * MINUTE)]
+    assert len(calls) == 4
+    assert writes[0].equals(bybit._normalize_candles(truth))
+    probe = json.loads(result.message)['source_head_probe']
+    assert probe['returned_rows'] == 2 and not probe['history_complete']
+    assert writes[0].filter(pl.col('date').is_in(old['date'].to_list())).equals(old)
+
+
+@pytest.mark.parametrize('payload', [None, {}, {'result': {}}, {'result': {'list': {}}},
+    {'result': {'list': [row(4000)]}}, {'result': {'list': [row(-1)]}},
+    {'result': {'list': [[str(START), '100']]}}])
+def test_unverified_large_head_response_never_skips_or_commits(tmp_path, monkeypatch, payload):
+    record, _old, _reads, writes = setup_source(tmp_path, monkeypatch, first=4000, last=4040)
+    monkeypatch.setattr(bybit, "_latest_closed_candle_start_ms", lambda: START + 4042 * MINUTE)
+
+    class Client:
+        def get(self, _endpoint, params):
+            return payload
+
+    with pytest.raises(ValueError):
+        bybit._download_symbol_1m(Client(), record, tmp_path, START, START + 4042 * MINUTE,
+                                 'incremental', False)
     assert writes == []
