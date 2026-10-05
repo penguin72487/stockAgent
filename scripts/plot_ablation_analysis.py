@@ -506,7 +506,7 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(14, 7.5))
     image = ax.imshow(matrix, aspect="auto", cmap="RdBu", vmin=-limit, vmax=limit)
     ax.set_yticks(np.arange(len(order)), [display_label(n) for n in order])
-    ax.set_xticks(np.arange(fold_count), [str(i) for i in range(1, fold_count + 1)])
+    ax.set_xticks(np.arange(fold_count), [str(row["fold_id"]) for row in baseline_rows])
     ax.set_xlabel("Walk-forward fold")
     fig.suptitle(f"Paired {split_label}-Sharpe difference by fold", y=.985, fontweight="bold")
     fig.text(.5, .95, "Blue beats baseline; orange trails baseline; colors clipped at the 95th percentile",

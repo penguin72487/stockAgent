@@ -1,0 +1,16 @@
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_risk_interior_v9.yaml
+
+training:
+  # Pin the formal epoch cap and patience: 1000 * 0.1 = 100 validation checks.
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  val_interval_epochs: 1
+  # A rejected proposal rolls back, then training continues until patience/cap.
+  futures_training_stop_on_rejected_step: false
+  # Resolve from 2011..2024 benchmark returns only. Test metrics cannot enter
+  # optimizer acceptance; 2025 validation still selects the checkpoint.
+  futures_training_max_drawdown: benchmark
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_benchmark_risk_v10_patience100
+  start_fold: 14

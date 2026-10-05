@@ -88,6 +88,42 @@ def test_financial_transformer_forward_aux_and_mask() -> None:
     assert "stock_market_gate" in aux
 
 
+@pytest.mark.parametrize(
+    "output_mode", [
+        "score_entmax_global_cash", "score_entmax_cash_v2",
+        "score_entmax_bounded_cash",
+        "score_entmax_log_cash",
+        "score_entmax_scale_separated_cash",
+    ]
+)
+def test_financial_transformer_cash_outputs_learn_from_exact_zero_scores(
+    output_mode: str,
+) -> None:
+    device = _device()
+    model = _make_model(
+        portfolio_output_mode=output_mode,
+        center_long_short_logits=False,
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    assert model.cash_asset_token is None
+    assert model.learned_cash_score_head is None
+    last_linear = [
+        module for module in model.score_head.modules()
+        if isinstance(module, torch.nn.Linear)
+    ][-1]
+    torch.nn.init.zeros_(last_linear.weight)
+    torch.nn.init.zeros_(last_linear.bias)
+    x = torch.randn(1, 5, 7, 10, device=device)
+    mask = torch.ones(1, 7, dtype=torch.bool, device=device)
+
+    weights = model(x, mask)
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    weights[0, 0].backward()
+    assert last_linear.bias.grad is not None
+    assert last_linear.bias.grad.abs().sum().item() > 0.0
+
+
 def test_financial_transformer_last_pooling_panel_slab_forward() -> None:
     device = _device()
     model = _make_model(

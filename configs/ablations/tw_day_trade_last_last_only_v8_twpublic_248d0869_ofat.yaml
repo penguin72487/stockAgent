@@ -8,6 +8,19 @@ base_config: configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v
 output_root: artifacts/ablations/tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat
 expected_fold_count: 11
 
+# The direct ablation worker also refreshes these charts after each completed
+# experiment, including the fold-11-only stage and later 1-11-fold resume.
+postprocess_plots:
+  - split: val
+    prefix: val
+    scope_label: Validation tensor loss contract
+  - split: deployment
+    prefix: test
+    scope_label: "Owned stitched deployment test: new model starts at each year's first target"
+  - split: test
+    prefix: full_horizon_integer_audit
+    scope_label: "Diagnostic only: expanding full-future exact whole-lot horizon"
+
 runtime:
   parallel_jobs: 1
   cpu_threads: 112
@@ -109,3 +122,25 @@ matrix:
           experiment_name: no_pretrained_initialization
           description: Learn from random initialization under the same account and loss.
           value: null
+
+    - name: permitted_direction
+      enabled: true
+      variants:
+        - name: long_only
+          experiment_name: long_only
+          description: Allow long positions and cash under the original execution contract.
+          overrides:
+            trading:
+              long_only: true
+            training:
+              financial_transformer:
+                portfolio_mode: long_only
+        - name: short_only
+          experiment_name: short_only
+          description: Allow short positions and cash with the original short eligibility masks.
+          overrides:
+            trading:
+              long_only: false
+            training:
+              financial_transformer:
+                portfolio_mode: short_only

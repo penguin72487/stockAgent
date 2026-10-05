@@ -1,0 +1,8 @@
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_risk_step_v7.yaml
+
+training:
+  futures_training_risk_tangent: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_risk_tangent_v8
+  start_fold: 14

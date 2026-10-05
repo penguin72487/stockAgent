@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -11,6 +12,82 @@ from stockagent.training import trainer as trainer_module
 class _Fold:
     def __init__(self, fold_id: int) -> None:
         self.fold_id = fold_id
+
+
+def test_materialized_snapshot_discovery_requires_exact_release_path(
+    tmp_path, monkeypatch
+) -> None:
+    materialized_root = tmp_path / "materialized"
+    monkeypatch.setenv("STOCKAGENT_MATERIALIZED_ROOT", str(materialized_root))
+    exact = materialized_root / "tw-public" / "tw-public-release-123" / "stocks"
+    config = SimpleNamespace(
+        __dataclass_fields__={"data": object()},
+        data=SimpleNamespace(
+            __dataclass_fields__={"exact": object(), "current": object()},
+            exact=str(exact),
+            current=str(materialized_root / "current" / "tw-public" / "stocks"),
+        ),
+    )
+
+    assert train._configured_materialized_snapshots(config) == (
+        (
+            materialized_root,
+            "tw-public",
+            "tw-public-release-123",
+            exact.parent,
+        ),
+    )
+
+
+def test_training_holds_existing_materialized_release_for_proc_monitor(
+    tmp_path, monkeypatch
+) -> None:
+    train._release_materialized_dataset_holds()
+    materialized_root = tmp_path / "materialized"
+    monkeypatch.setenv("STOCKAGENT_MATERIALIZED_ROOT", str(materialized_root))
+    target = materialized_root / "tw-public" / "tw-public-release-123"
+    target.mkdir(parents=True)
+    (target.parent / ".tw-public-release-123.READY.json").write_text("{}")
+    config = SimpleNamespace(
+        __dataclass_fields__={"path": object()},
+        path=str(target / "features.parquet"),
+    )
+
+    def unexpected_restore(**kwargs):
+        raise AssertionError(f"unexpected restore: {kwargs}")
+
+    monkeypatch.setattr(train, "_restore_materialized_snapshot", unexpected_restore)
+    train._hold_configured_materialized_snapshots(config)
+
+    descriptor = train._MATERIALIZED_DATASET_HOLDS[target]
+    assert os.readlink(f"/proc/self/fd/{descriptor}") == str(target)
+    train._release_materialized_dataset_holds()
+
+
+def test_training_restores_missing_exact_release_before_holding(
+    tmp_path, monkeypatch
+) -> None:
+    train._release_materialized_dataset_holds()
+    materialized_root = tmp_path / "materialized"
+    monkeypatch.setenv("STOCKAGENT_MATERIALIZED_ROOT", str(materialized_root))
+    target = materialized_root / "tw-public" / "tw-public-release-123"
+    config = SimpleNamespace(
+        __dataclass_fields__={"path": object()},
+        path=str(target / "features.parquet"),
+    )
+    restored = []
+
+    def fake_restore(*, dataset, snapshot_id):
+        restored.append((dataset, snapshot_id))
+        target.mkdir(parents=True)
+        (target.parent / f".{snapshot_id}.READY.json").write_text("{}")
+
+    monkeypatch.setattr(train, "_restore_materialized_snapshot", fake_restore)
+    train._hold_configured_materialized_snapshots(config)
+
+    assert restored == [("tw-public", "tw-public-release-123")]
+    assert target in train._MATERIALIZED_DATASET_HOLDS
+    train._release_materialized_dataset_holds()
 
 
 def test_isolated_fold_command_appends_authoritative_single_fold_overrides() -> None:
@@ -111,6 +188,35 @@ def test_isolated_fold_runner_uses_sequential_children_and_stops_on_failure(
     )
 
 
+def test_isolated_fold_failure_replaces_stale_running_progress(
+    tmp_path, monkeypatch
+) -> None:
+    progress = tmp_path / "progress.json"
+    progress.write_text('{"state":"running","phase":"reporting"}\n')
+    monkeypatch.setattr(
+        train,
+        "_run_managed_subprocess",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 17),
+    )
+
+    try:
+        train._run_isolated_train_fold_processes(
+            [_Fold(8)],
+            argv=["--config", "experiment.yaml"],
+            output_dir=tmp_path,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected isolated child failure")
+
+    payload = train.json.loads(progress.read_text())
+    assert payload["state"] == "failed"
+    assert payload["phase"] == "failed"
+    assert payload["fold_id"] == 8
+    assert payload["failure"]["returncode"] == 17
+
+
 def test_ddp_relaunch_is_deferred_to_isolated_fold_child() -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(multi_gpu_strategy="distributed_data_parallel"),
@@ -208,3 +314,15 @@ def test_isolated_parent_rebuilds_complete_walkforward_with_panel_and_config() -
     ]
     assert len(finalizers) == 1
     assert finalizers[0].lineno > calls[-1].lineno
+
+
+def test_inference_does_not_relaunch_training_ddp(monkeypatch) -> None:
+    config = SimpleNamespace(
+        training=SimpleNamespace(multi_gpu_strategy="distributed_data_parallel"),
+        runner=SimpleNamespace(mode="infer", isolate_train_folds=False),
+    )
+    args = SimpleNamespace(mode=None, multi_gpu_strategy="distributed_data_parallel")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inference must not enter training DDP setup")
+    monkeypatch.setattr(train, "_resolve_multi_gpu_strategy", forbidden)
+    train._maybe_relaunch_for_ddp(config, args)

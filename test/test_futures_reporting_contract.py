@@ -30,6 +30,16 @@ def test_futures_reporting_uses_execution_benchmark_without_changing_stock_data(
     assert config.data.benchmark_name == "2330"
 
 
+def test_verified_margin_tx_roll_reports_its_actual_benchmark():
+    config = load_config(
+        "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_v2.yaml"
+    )
+    details = trainer._benchmark_reporting_details(config)
+    contract = trainer._mode_artifact_contract_for_config(config)
+    assert details["benchmark_name"] == "TX front-month rolling buy-and-hold, 1x gross"
+    assert contract["benchmark_contract"] == "tx_front_month_rolling_buy_hold_1x_gross_same_contract_close_v1"
+
+
 def _contracts(*, margin=False):
     return BacktestResult(
         strategy_returns=np.array([0.01, -0.02], dtype=np.float32),

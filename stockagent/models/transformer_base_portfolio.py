@@ -18,6 +18,9 @@ from stockagent.models.normalization import (
     masked_learned_cash_weights,
     masked_cash_entmax15_weights,
     masked_score_entmax_log_cash_weights,
+    masked_score_entmax_bounded_cash_weights,
+    masked_score_entmax_global_cash_weights,
+    masked_score_entmax_scale_separated_cash_weights,
     masked_l1_projection_weights,
     masked_cross_sectional_mean_finite,
     masked_signed_action_weights,
@@ -2203,11 +2206,22 @@ class TransformerBasePortfolioModel(nn.Module):
                 "shared raw-feature input projection"
             )
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode, allow_short_only=True)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.portfolio_output_mode = normalize_portfolio_output_mode(portfolio_output_mode)
+        if self.portfolio_mode == "short_only" and (
+            self.portfolio_output_mode not in {
+                "cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2",
+            } or self.num_action_channels != 1
+        ):
+            raise ValueError("short_only requires a single-target score_entmax_cash family output")
         if (
-            self.portfolio_output_mode in {"cash_l1", "learned_cash"}
+            self.portfolio_output_mode in {
+                "cash_l1", "learned_cash", "score_entmax_cash_v2",
+                "score_entmax_global_cash", "score_entmax_bounded_cash",
+                "score_entmax_log_cash",
+                "score_entmax_scale_separated_cash",
+            }
             and self.num_action_channels != 1
         ):
             raise ValueError(
@@ -3942,6 +3956,10 @@ class TransformerBasePortfolioModel(nn.Module):
         """Apply the existing single-portfolio transform to ``[N,S]`` logits."""
 
         resolved_mode = normalize_portfolio_output_mode(output_mode)
+        if self.portfolio_mode == "short_only" and resolved_mode not in {
+            "cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2",
+        }:
+            raise ValueError("short_only requires a score_entmax_cash family output")
         if resolved_mode == "logits":
             # This helper is the explicit logits -> executable-target boundary.
             # Callers that want raw logits do not call it.
@@ -3975,15 +3993,42 @@ class TransformerBasePortfolioModel(nn.Module):
                 weights, output_aux = action_output
             else:
                 weights = action_output
-        elif resolved_mode in {"cash_entmax15", "score_entmax_cash"}:
+        elif resolved_mode in {"cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2"}:
             cash_output = masked_cash_entmax15_weights(
                 target_logits,
                 mask_bool,
                 short_mask=(
                     torch.zeros_like(mask_bool) if long_only else mask_bool
                 ),
+                long_mask=(torch.zeros_like(mask_bool) if self.portfolio_mode == "short_only" else None),
                 return_parts=return_parts,
-                preserve_fp32_output=(resolved_mode == "score_entmax_cash"),
+                preserve_fp32_output=(resolved_mode != "cash_entmax15"),
+                preserve_zero_score_gradient=(resolved_mode == "score_entmax_cash_v2"),
+            )
+            if return_parts:
+                weights, output_aux = cash_output
+            else:
+                weights = cash_output
+        elif resolved_mode in {
+            "score_entmax_global_cash", "score_entmax_bounded_cash",
+            "score_entmax_log_cash",
+            "score_entmax_scale_separated_cash",
+        }:
+            allocator = {
+                "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
+                "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
+                "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
+                "score_entmax_scale_separated_cash": (
+                    masked_score_entmax_scale_separated_cash_weights
+                ),
+            }[resolved_mode]
+            cash_output = allocator(
+                target_logits,
+                mask_bool,
+                short_mask=(
+                    torch.zeros_like(mask_bool) if long_only else mask_bool
+                ),
+                return_parts=return_parts,
             )
             if return_parts:
                 weights, output_aux = cash_output
@@ -4443,7 +4488,7 @@ class TransformerBasePortfolioModel(nn.Module):
             cash_score_logits = self._cash_asset_score_logit(z_stock, mask_bool)
             cash_target_logits = cash_score_logits / temp
 
-        if self.portfolio_mode == "long_only":
+        if self.portfolio_mode in {"long_only", "short_only"}:
             centered_scores = scores
             if PROFILE_RANGES_ENABLED:
                 with profile_range("model.portfolio.target_logits"):
@@ -4513,13 +4558,38 @@ class TransformerBasePortfolioModel(nn.Module):
                     weights, output_aux = action_output
                 else:
                     weights = action_output
-            elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash"}:
+            elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2"}:
                 cash_output = masked_cash_entmax15_weights(
+                    target_logits,
+                    mask_bool,
+                    short_mask=(mask_bool if self.portfolio_mode == "short_only" else torch.zeros_like(mask_bool)),
+                    long_mask=(torch.zeros_like(mask_bool) if self.portfolio_mode == "short_only" else None),
+                    return_parts=include_action_aux,
+                    preserve_fp32_output=(self.portfolio_output_mode != "cash_entmax15"),
+                    preserve_zero_score_gradient=(self.portfolio_output_mode == "score_entmax_cash_v2"),
+                )
+                if include_action_aux:
+                    weights, output_aux = cash_output
+                else:
+                    weights = cash_output
+            elif self.portfolio_output_mode in {
+                "score_entmax_global_cash", "score_entmax_bounded_cash",
+                "score_entmax_log_cash",
+                "score_entmax_scale_separated_cash",
+            }:
+                allocator = {
+                    "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
+                    "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
+                    "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
+                    "score_entmax_scale_separated_cash": (
+                        masked_score_entmax_scale_separated_cash_weights
+                    ),
+                }[self.portfolio_output_mode]
+                cash_output = allocator(
                     target_logits,
                     mask_bool,
                     short_mask=torch.zeros_like(mask_bool),
                     return_parts=include_action_aux,
-                    preserve_fp32_output=(self.portfolio_output_mode == "score_entmax_cash"),
                 )
                 if include_action_aux:
                     weights, output_aux = cash_output
@@ -4633,13 +4703,37 @@ class TransformerBasePortfolioModel(nn.Module):
                     weights, output_aux = action_output
                 else:
                     weights = action_output
-            elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash"}:
+            elif self.portfolio_output_mode in {"cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2"}:
                 cash_output = masked_cash_entmax15_weights(
                     target_logits,
                     mask_bool,
                     short_mask=mask_bool,
                     return_parts=include_action_aux,
-                    preserve_fp32_output=(self.portfolio_output_mode == "score_entmax_cash"),
+                    preserve_fp32_output=(self.portfolio_output_mode != "cash_entmax15"),
+                    preserve_zero_score_gradient=(self.portfolio_output_mode == "score_entmax_cash_v2"),
+                )
+                if include_action_aux:
+                    weights, output_aux = cash_output
+                else:
+                    weights = cash_output
+            elif self.portfolio_output_mode in {
+                "score_entmax_global_cash", "score_entmax_bounded_cash",
+                "score_entmax_log_cash",
+                "score_entmax_scale_separated_cash",
+            }:
+                allocator = {
+                    "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
+                    "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
+                    "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
+                    "score_entmax_scale_separated_cash": (
+                        masked_score_entmax_scale_separated_cash_weights
+                    ),
+                }[self.portfolio_output_mode]
+                cash_output = allocator(
+                    target_logits,
+                    mask_bool,
+                    short_mask=mask_bool,
+                    return_parts=include_action_aux,
                 )
                 if include_action_aux:
                     weights, output_aux = cash_output

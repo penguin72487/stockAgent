@@ -10,10 +10,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
+from datetime import date
 import os
 from typing import Any, Callable
 import warnings
 
+import numpy as np
 import torch
 
 from stockagent.backtest.tw_day_trade_carry import (
@@ -232,6 +234,52 @@ class PackedDayTradeCarrySession:
             raise ValueError("invalid terminal liquidation price transport")
 
 
+def _stack_transport_tensors(
+    values: tuple[torch.Tensor, ...],
+    *,
+    padded_columns: int | None = None,
+    fill_value: float | int = 0,
+) -> torch.Tensor:
+    """Copy immutable CPU source bytes without per-session OpenMP launches.
+
+    These FP64/int64 transport tensors have no autograd history. Repeated
+    new_full/cat calls on the trainer's many-thread CPU pool dominate a whole
+    validation year; one NumPy allocation/copy also avoids retaining a second
+    list of padded rows. Keep the tensor path for other devices/dtypes/gradients.
+    No process-wide thread setting, source tensor or accounting value changes.
+    """
+    if values and all(
+        value.device.type == "cpu"
+        and value.dtype == values[0].dtype
+        and value.dtype in (torch.float64, torch.int64)
+        and not value.requires_grad
+        for value in values
+    ):
+        arrays = tuple(value.numpy() for value in values)
+        if padded_columns is None:
+            return torch.from_numpy(np.stack(arrays))
+        if any(array.ndim != 1 or array.size > padded_columns for array in arrays):
+            raise ValueError("transport padding requires bounded one-dimensional rows")
+        packed = np.full(
+            (len(arrays), padded_columns), fill_value, dtype=arrays[0].dtype
+        )
+        for row, array in zip(packed, arrays, strict=True):
+            row[:array.size] = array
+        return torch.from_numpy(packed)
+    if padded_columns is None:
+        return torch.stack(values)
+    rows = []
+    for value in values:
+        if value.ndim != 1 or value.numel() > padded_columns:
+            raise ValueError("transport padding requires bounded one-dimensional rows")
+        missing = padded_columns - int(value.numel())
+        rows.append(
+            torch.cat((value, value.new_full((missing,), fill_value)))
+            if missing else value
+        )
+    return torch.stack(rows)
+
+
 @dataclass(frozen=True)
 class PreparedDayTradeCarryBatch:
     """Field-major CPU staging so one batch needs O(fields), not O(days*fields), copies."""
@@ -367,7 +415,7 @@ class PreparedDayTradeCarryBatch:
             "unresolved_action_gap_mask",
             "daily_proxy_mask",
         ):
-            packed[name] = torch.stack(
+            packed[name] = _stack_transport_tensors(
                 tuple(getattr(session, name) for session in sessions)
             )
         terminal_prices = tuple(
@@ -387,7 +435,7 @@ class PreparedDayTradeCarryBatch:
                 "packed physical batch cannot mix terminal liquidation policies"
             )
         if all(isinstance(value, torch.Tensor) for value in terminal_prices):
-            packed["terminal_liquidation_price"] = torch.stack(
+            packed["terminal_liquidation_price"] = _stack_transport_tensors(
                 terminal_prices  # type: ignore[arg-type]
             )
         for name, fill in (
@@ -395,16 +443,11 @@ class PreparedDayTradeCarryBatch:
             ("exit_price", float("nan")),
             ("exit_capacity", 0.0),
         ):
-            rows = []
-            for session in sessions:
-                value = getattr(session, name)
-                missing = event_slots - int(value.numel())
-                rows.append(
-                    torch.cat((value, value.new_full((missing,), fill)))
-                    if missing
-                    else value
-                )
-            packed[f"_transport_{name}"] = torch.stack(rows)
+            packed[f"_transport_{name}"] = _stack_transport_tensors(
+                tuple(getattr(session, name) for session in sessions),
+                padded_columns=event_slots,
+                fill_value=fill,
+            )
         return cls(
             days=tuple(session.day for session in sessions),
             tensors=packed,
@@ -529,6 +572,19 @@ class PreparedDayTradeCarrySource:
     compact_session_loader: Callable[[int], DayTradeCarrySession] | None = None
     packed_session_loader: Callable[[int], PackedDayTradeCarrySession] | None = None
     audit_receipt: dict[str, Any] | None = None
+    # Train-only, process-local memoization of exogenous one-lot labels.  The
+    # authoritative physical sessions remain immutable and the cache is never
+    # serialized into a checkpoint or artifact contract.
+    _sub_lot_recovery_label_cache: dict[tuple[object, ...], object] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    _sub_lot_recovery_cache_stats: dict[str, int] = field(
+        default_factory=lambda: {"hits": 0, "misses": 0},
+        compare=False,
+        repr=False,
+    )
     runtime_cache_info: Callable[[], dict[str, Any]] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -815,11 +871,116 @@ def prefetch_physical_carry_batches(
             yield batch_index, staged
 
 
+def _require_flat_episode_boundary(state: DayTradeCarryState) -> None:
+    if (bool((state.inventory.shares != 0).any())
+            or bool((state.inventory.claims[..., 0] * (1 - state.inventory.claims[..., 2]) != 0).any())
+            or bool(state.inventory.failed != 0)):
+        raise ValueError("annual training episode boundary cannot discard holdings, unpaid claims or invalid state")
+
+
+def _loss_keyword_arguments(loss_fn: Callable) -> dict[str, Any]:
+    """Read explicit eager-loss keywords without executing or mutating them."""
+
+    candidates = (loss_fn, getattr(loss_fn, "_eager_fn", None))
+    for candidate in candidates:
+        keywords = getattr(candidate, "keywords", None)
+        if isinstance(keywords, dict):
+            return keywords
+    return {}
+
+
+def _tensor_cache_identity(value: torch.Tensor) -> tuple[object, ...]:
+    return (
+        str(value.device),
+        str(value.dtype),
+        tuple(int(size) for size in value.shape),
+        int(value.data_ptr()),
+        int(value._version),
+    )
+
+
+def _cached_sub_lot_recovery_labels(
+    loss_fn: Callable,
+    *,
+    source: PreparedDayTradeCarrySource,
+    split,
+    sessions: tuple[DayTradeCarrySession, ...],
+    days: tuple[int, ...],
+    device: torch.device,
+    event_compression: bool,
+):
+    """Memoize only source/fee labels; policy-dependent gates stay live."""
+
+    keywords = _loss_keyword_arguments(loss_fn)
+    if not bool(keywords.get("day_trade_sub_lot_recovery", False)):
+        return None
+    names = (
+        "buy_fee_rates",
+        "sell_fee_rates",
+        "normal_sell_fee_rates",
+        "commission_rebate_rates",
+    )
+    raw_rates = tuple(keywords.get(name) for name in names)
+    if not all(isinstance(value, torch.Tensor) for value in raw_rates):
+        # The normal project path owns per-symbol fee tensors. Keep the
+        # existing on-demand implementation for isolated callers using scalar
+        # defaults rather than guessing a cache identity.
+        return None
+    rates = tuple(raw_rates)  # type: ignore[assignment]
+    symbol_indices = split.symbol_indices
+    symbol_key: tuple[int, ...] | None = None
+    if symbol_indices is not None:
+        symbol_key = tuple(int(value) for value in symbol_indices.detach().cpu().tolist())
+    key_prefix = (
+        str(device),
+        bool(event_compression),
+        symbol_key,
+        tuple(_tensor_cache_identity(value) for value in rates),
+    )
+
+    # Cache one day at a time. Expanding walk-forward folds reuse most of their
+    # history, so a batch-level cache would retain the same large label tensors
+    # once per fold and could turn a compute optimization into a GPU-memory leak.
+    keys = tuple(key_prefix + (int(day),) for day in days)
+    resolved = [source._sub_lot_recovery_label_cache.get(key) for key in keys]
+    missing_indices = [index for index, value in enumerate(resolved) if value is None]
+    source._sub_lot_recovery_cache_stats["hits"] += len(resolved) - len(missing_indices)
+    if not missing_indices:
+        return tuple(resolved)
+
+    selected_rates = []
+    for value in rates:
+        selected = value
+        if symbol_indices is not None:
+            selected = selected.index_select(
+                0,
+                symbol_indices.to(device=selected.device, dtype=torch.long),
+            )
+        selected_rates.append(selected.to(device=device, dtype=torch.float64))
+    from stockagent.training.day_trade_lot_recovery import (
+        build_sub_lot_recovery_labels,
+    )
+
+    missing_labels = build_sub_lot_recovery_labels(
+        tuple(sessions[index] for index in missing_indices),
+        buy=selected_rates[0],
+        sell=selected_rates[1],
+        normal=selected_rates[2],
+        rebate=selected_rates[3],
+    )
+    for index, label in zip(missing_indices, missing_labels, strict=True):
+        source._sub_lot_recovery_label_cache[keys[index]] = label
+        resolved[index] = label
+    source._sub_lot_recovery_cache_stats["misses"] += len(missing_indices)
+    return tuple(resolved)
+
+
 def bind_physical_carry_loss(
     loss_fn: Callable, *, source: PreparedDayTradeCarrySource, split,
     start: int, end: int, device: torch.device, previous: DayTradeCarryState | None,
     prepared_batch: PreparedDayTradeCarryBatch | None = None,
     event_compression: bool = True,
+    reset_calendar_year: bool = False,
 ) -> Callable:
     """Bind an exact batch; model padding never advances inventory or interest."""
     staged = (
@@ -844,12 +1005,69 @@ def bind_physical_carry_loss(
         or tuple(source.day_at(row) for row in expected_rows) != staged.days
     ):
         raise ValueError("prefetched physical batch differs from the requested interval")
+    year_cuts = [0]
+    if reset_calendar_year:
+        years = [date.fromordinal(day).year for day in staged.days]
+        if start == 0:
+            # The rolling feature window is context, not part of the account
+            # horizon. A calendar-year account must therefore begin on that
+            # year's first physical session. Without this guard a panel that
+            # begins at the first target year silently labels
+            # ``year + lookback`` as a complete annual episode.
+            first_row = int(expected_rows[0])
+            if (
+                first_row > 0
+                and date.fromordinal(source.day_at(first_row - 1)).year
+                == years[0]
+            ):
+                raise ValueError(
+                    "annual training episode begins after the calendar year's "
+                    "first physical session; lookback rows may provide feature "
+                    "context but may not shift the account boundary"
+                )
+        year_cuts.extend(i for i in range(1, count) if years[i] != years[i - 1])
+        first_row = int(expected_rows[0])
+        starts_new_year = first_row > 0 and date.fromordinal(source.day_at(first_row - 1)).year != years[0]
+        if starts_new_year and previous is not None:
+            _require_flat_episode_boundary(previous)
+            previous = None
+    year_cuts.append(count)
     if previous is not None:
         first_row = int(split._valid_indices_cpu[start])
         if first_row <= 0 or previous.last_session_day != source.day_at(first_row - 1):
             raise ValueError("physical batch skipped or repeated a source session")
 
     def call(weights, returns, mask, **kwargs):
+        if reset_calendar_year and len(year_cuts) > 2:
+            # Keep the common trainer, fixed policy and date-weighted epoch
+            # objective. Split only this boundary-crossing physical batch.
+            row_fields = {
+                "benchmark_returns", "can_buy_mask", "can_sell_mask", "can_short_open_mask",
+                "can_short_open_open_mask", "day_trade_eligible_mask", "day_trade_can_buy_open_mask",
+                "day_trade_can_sell_open_mask", "session_month_ids", "commission_rebate_payment_eligible_mask",
+                "force_exit_mask", "unresolved_corporate_action_mask", "force_short_cover_mask",
+                "overnight_log_returns", "cash_dividend_yield", "cash_dividend_payment_delay_sessions",
+                "state_advance_mask", "volume_limit_weights", "short_capacity_weights", "sample_mask",
+            }
+            total = weights.sum() * 0.0
+            segment_previous = previous
+            for offset, stop in zip(year_cuts[:-1], year_cuts[1:]):
+                if offset:
+                    _require_flat_episode_boundary(segment_previous)
+                    segment_previous = None
+                local_aux = dict(kwargs.get("aux_outputs", {}))
+                supplied = {name: (value[offset:stop] if name in row_fields and isinstance(value, torch.Tensor) else value)
+                            for name, value in kwargs.items()}
+                supplied["aux_outputs"] = local_aux
+                bound = bind_physical_carry_loss(
+                    loss_fn, source=source, split=split, start=start + offset, end=start + stop,
+                    device=device, previous=segment_previous, event_compression=event_compression,
+                )
+                value = bound(weights[offset:stop], returns[offset:stop], mask[offset:stop], **supplied)
+                total = total + value * ((stop - offset) / count)
+                segment_previous = local_aux["_final_day_trade_carry_state"]
+                kwargs["aux_outputs"].update(local_aux)
+            return total
         if not bool(torch.isfinite(weights[:count]).all()):
             raise FloatingPointError("physical training model actions are nonfinite")
         supplied = dict(kwargs)
@@ -914,6 +1132,18 @@ def bind_physical_carry_loss(
         # Legacy initial_* entries are the trainer's old account buffers, not
         # a physical FIFO state. The caller retains only the explicit state.
         physical_aux: dict[str, Any] = {}
+
+        recovery_labels = _cached_sub_lot_recovery_labels(
+            loss_fn,
+            source=source,
+            split=split,
+            sessions=sessions,
+            days=staged.days,
+            device=device,
+            event_compression=compression_enabled,
+        )
+        if recovery_labels is not None:
+            supplied["day_trade_sub_lot_recovery_labels"] = recovery_labels
 
         def run_bound_loss() -> tuple[torch.Tensor, DayTradeCarryState]:
             physical_aux.clear()

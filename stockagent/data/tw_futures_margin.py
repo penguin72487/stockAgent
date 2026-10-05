@@ -27,7 +27,7 @@ MARGIN_RULE_VERSIONS = (MARGIN_CONTRACT_VERSION, MARGIN_CORPORATE_CONTRACT_VERSI
 # Executor policy version is independent of the immutable source-tape schema.
 MARGIN_ACCOUNTING_CONTRACT_VERSION = 7
 # Training-only: exact quantities, marks, fees and forward returns are unchanged.
-MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION = 11
+MARGIN_TRAINING_GRADIENT_CONTRACT_VERSION = 12
 # The first eleven channels retain the canonical integer account ABI.
 INITIAL, MAINTENANCE, END_INITIAL, END_MAINTENANCE = range(11, 15)
 PREVIOUS_MARK, PREVIOUS_INITIAL, PREVIOUS_MAINTENANCE = range(15, 18)

@@ -1,0 +1,14 @@
+# Local receipt-backed repair; no source snapshot or full data copy.
+# Prepare with scripts/prepare_bybit_daily_repairs.py before preflight/training.
+# Daily announcement policy starts only on the next UTC day and requests a
+# constrained exit. Residual inventory lacking valuation still fails closed.
+base_config: bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v5.yaml
+
+experiment_name: bybit-perpetual-daily-0005-historical-public-pit-learned-cash-trajectory-v6
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v6
+
+data:
+  parquet_root: artifacts/cache/bybit_perpetual_daily_repaired/perpetual_daily
+  panel_cache_root: artifacts/cache/bybit_perpetual_daily_repaired/panel

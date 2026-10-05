@@ -43,6 +43,7 @@ from stockagent.data.tw_stock_context_futures_portfolio import (
     TaiwanStockContextFuturesPortfolioDaily,
     attach_stock_context_futures_portfolio_daily,
     fixed_futures_slot_symbols,
+    load_tx_front_rolling_benchmark,
 )
 from stockagent.models.cross_sectional_all_futures import (
     CrossSectionalAllFuturesModel,
@@ -57,6 +58,36 @@ from stockagent.training.trainer import (
     _split_recurrent_symbol_count,
     _split_uses_recurrent_futures_equity_scale,
 )
+
+
+def test_tx_front_roll_uses_new_contract_own_previous_close(tmp_path: Path) -> None:
+    path = tmp_path / "tx.parquet"
+    rows = [
+        (date(2026, 1, 2), "202601", 1, 100.0),
+        (date(2026, 1, 2), "202602", 2, 120.0),
+        (date(2026, 1, 5), "202601", 1, 102.0),
+        (date(2026, 1, 5), "202602", 2, 121.0),
+        (date(2026, 1, 6), "202601", 2, 103.0),
+        (date(2026, 1, 6), "202602", 1, 123.0),
+    ]
+    pq.write_table(pa.Table.from_pylist([
+        {"date": day, "product": "TX", "contract": contract,
+         "tenor_rank": rank, "close": close, "source_row_observed": True}
+        for day, contract, rank, close in rows
+    ]), path)
+    dates = np.asarray(["2026-01-02", "2026-01-05", "2026-01-06"], dtype="datetime64[D]")
+    payload = load_tx_front_rolling_benchmark(path, dates)
+    np.testing.assert_allclose(
+        payload["benchmark_log_returns"],
+        [0.0, np.log(102 / 100), np.log(123 / 121)],
+        atol=1e-8,
+    )
+    assert payload["front_month_roll_mask"].tolist() == [False, False, True]
+    assert payload["prior_same_contract_close"][-1] == 121.0
+    with pytest.raises(ValueError, match="source ends"):
+        load_tx_front_rolling_benchmark(
+            path, np.append(dates, np.datetime64("2026-01-07"))
+        )
 
 
 def _stock_panel(rows: int = 3, symbols: int = 2) -> PanelData:
@@ -1886,3 +1917,18 @@ def test_integer_0845_pretrained_guard_uses_fold_matched_source_and_exact_loss()
         "tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_"
         "recoverable_pretrained_guard_stock_tminus1_cash_capital10m_v3"
     )
+
+
+@pytest.mark.parametrize('slots,version',[(2560,5),(2816,6)])
+def test_wide_futures_action_layout_invalidates_model_and_resume_fingerprints(slots,version):
+    import copy
+    config=load_config('configs/markets/tw_stock_context_all_futures_portfolio_multi_basis_projection_l1.yaml')
+    legacy=build_checkpoint_manifest(_stock_panel(),config,include_data_content=False)
+    wide=copy.deepcopy(config);wide.data.tw_futures_portfolio_slot_count=slots
+    manifest=build_checkpoint_manifest(_stock_panel(),wide,include_data_content=False)
+    values=manifest['contracts']['trading']['taiwan_stock_context_futures_portfolio']
+    assert values['fixed_model_output_slots']==slots and values['data_contract_version']==version
+    for scope in ('model','resume'):
+        with pytest.raises(RuntimeError,match='fingerprint mismatch'):
+            validate_checkpoint_manifest({'experiment_manifest':legacy},manifest,
+                checkpoint_path=Path('legacy-1936.pt'),scope=scope)

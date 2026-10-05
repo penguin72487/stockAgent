@@ -1,0 +1,35 @@
+# Run with artifacts/runtime/tw_futures_margin_repaired_v2/source/train.py.
+# A fresh experiment: corrected dated caps, gradient v12, pinned TX comparator.
+base_config: tw_futures_v8_margin_components_capital100m_20261003.yaml
+experiment_name: tw-futures-margin-components-repaired-capital100m-fold14-v2
+
+trading:
+  tw_futures_portfolio_data_path: artifacts/markets/tw_futures_v8_margin_preparation/margin_components_position_review_20261003/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/markets/tw_futures_v8_margin_preparation/margin_components_position_review_20261003/release/rules/rules.parquet
+  tw_futures_portfolio_integer_initial_capital: 100000000
+  tw_futures_portfolio_benchmark_mode: tx_front_rolling_1x_gross
+  # Separate reference data; TX is not silently added to the action universe.
+  tw_futures_portfolio_benchmark_data_path: artifacts/markets/tw_futures_v8_margin_preparation/verified_scope_2011_20260928/daily/continuous_daily.parquet
+  tw_futures_portfolio_benchmark_sha256: 8f3f62da483b6b7ee1652b9c615be8f7b41b4305cfca84a459fa3aeb8e5ed551
+
+training:
+  epochs: 1000
+  val_interval_epochs: 1
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0001
+  learning_rate: 0.00001
+  lr_scheduler: plateau
+  lr_scheduler_patience: 10
+  lr_scheduler_threshold: 0.0001
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_eta_min: 0.000001
+  batch_size_train: 128
+  batch_size_eval: 16
+  futures_portfolio_optimizer_step_per_trajectory: true
+  # Keep the original runtime's ordinary random initialization; no warm start
+  # or zero/cash initialization is added.
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_components_repaired_capital100m_fold14_v2
+  start_fold: 14
+  resume: false

@@ -1,0 +1,25 @@
+# Ordinary training in the same dated-margin environment as v14.
+# Change optimization coordinates, not feasible actions or exact accounting.
+# Fresh model/scheduler contract: do not resume v14's optimizer or checkpoint.
+base_config: tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_feasible_gradient_v14.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital10m-tx-front-roll-notional-coordinates-v15
+
+training:
+  epochs: 1000
+  val_interval_epochs: 1
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0001
+  learning_rate: 0.0001
+  enable_lr_scheduler: true
+  lr_scheduler: plateau
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_patience: 10
+  lr_scheduler_threshold: 0.0001
+  lr_scheduler_eta_min: 0.000001
+  financial_transformer:
+    futures_flat_action_initialization: false
+    futures_notional_score_coordinates: true
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital10m_tx_front_roll_notional_coordinates_v15
+  start_fold: 14

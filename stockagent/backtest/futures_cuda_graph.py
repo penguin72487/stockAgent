@@ -6,7 +6,9 @@ equations remain in the existing daily and minute executors.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import fields
+import gc
 import os
 from typing import Callable, TypeVar
 import warnings
@@ -17,6 +19,25 @@ Result = TypeVar("Result")
 _CACHE: OrderedDict[tuple, object] = OrderedDict()
 _STATS = {"constructors": 0, "calls": 0, "busy_eager_calls": 0, "evictions": 0}
 _MAX_ENTRIES = 8
+
+
+@contextmanager
+def _capture_gc_guard():
+    """Keep cyclic CUDA-graph destruction outside another graph's capture.
+
+    A retired callable can own a Python cycle. Collect it before capture and
+    suspend automatic cyclic GC until capture finishes: CUDA graph reset/free
+    is illegal on the capturing stream. Preserve an already disabled caller.
+    """
+    enabled = gc.isenabled()
+    if enabled:
+        gc.collect()
+        gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
 
 
 def futures_cuda_graph_enabled(weights: torch.Tensor) -> bool:
@@ -69,7 +90,7 @@ class _Runner:
             return outputs
 
         # Same AMP dtype, without an unstable autocast weight-cache pointer.
-        with warnings.catch_warnings(), torch.autocast(
+        with _capture_gc_guard(), warnings.catch_warnings(), torch.autocast(
             "cuda", dtype=torch.get_autocast_dtype("cuda"),
             enabled=torch.is_autocast_enabled("cuda"), cache_enabled=False,
         ):
@@ -137,6 +158,7 @@ def run_futures_cuda_graph(function: Callable[..., Result], *args: torch.Tensor,
     key = (function, torch.is_grad_enabled(), torch.is_inference_mode_enabled(),
            torch.are_deterministic_algorithms_enabled(),
            os.environ.get("STOCKAGENT_FUTURES_FUNDING_COMPILE", "0"),
+           os.environ.get("STOCKAGENT_FUTURES_POSITION_COMPILE", "1"),
            torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"),
            tuple((tuple(x.shape), tuple(x.stride()), x.dtype, x.device, x.requires_grad) for x in tensors),
            tuple((k, None if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()))

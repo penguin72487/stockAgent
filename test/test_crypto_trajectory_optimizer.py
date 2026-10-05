@@ -136,6 +136,7 @@ def test_crypto_trajectory_preserves_account_and_valid_date_weighted_truncated_g
         previous = {
             "initial_weights": aux["_final_weights"].detach().clone(),
             "initial_alive": aux["_final_alive"].detach().clone(),
+            "initial_equity_scale": aux["_final_equity_scale"].detach().clone(),
         }
     expected_scale = reference_scale.detach() - 0.1 * reference_scale.grad
     observed_states = []
@@ -171,6 +172,9 @@ def test_crypto_trajectory_ddp_routing_keeps_one_policy_and_tail_mask(monkeypatc
     monkeypatch.setattr(trainer, "_distributed_rank", lambda: 0)
     monkeypatch.setattr(trainer, "_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(trainer, "_distributed_is_rank0", lambda: False)
+    # This test fakes model collectives; it does not create a process group.
+    # Real synchronized data errors are covered separately.
+    monkeypatch.setattr(trainer, "_synchronize_carry_data_error", lambda error, *a, **k: error)
     gather_calls = 0
 
     def gather(local):

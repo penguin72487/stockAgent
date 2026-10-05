@@ -13,6 +13,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import unicodedata
 
@@ -620,7 +621,7 @@ def _bind_named_securities_position_groups(direct: pl.DataFrame,
         pl.col('known_at').max().alias('_named_known_at'),
         pl.col('effective_date').max().alias('_named_effective_date'),
         pl.col('valid_until_date_exclusive').min().alias('_named_valid_until_date_exclusive'),
-        *[pl.col(c).explode().drop_nulls().unique().sort().alias('_named_'+c)
+        *[pl.col(c).explode(empty_as_null=True, keep_nulls=True).drop_nulls().unique().sort().alias('_named_'+c)
           for c in ['source_content_sha256s','source_urls']])
     frame=direct.join(grouped,left_on=keys,right_on=['date','_group_root'],how='left',validate='1:1')
     frame=frame.join(universe.select('product','asset_class'),on='product',how='left',validate='m:1')
@@ -691,7 +692,7 @@ def bind_equity_position_families(days: pl.DataFrame, intervals: pl.DataFrame,
     # for legal grouping only; this does not borrow its prices or own units.
     named_edges=intervals.filter(pl.col('event_type')=='corporate_securities_unit_limit').select(
         pl.col('product').alias('_member'),pl.col('combined_products').cast(pl.List(pl.String)).alias('product'))
-    named_edges=named_edges.explode('product').drop_nulls().unique()
+    named_edges=named_edges.explode('product', empty_as_null=True, keep_nulls=True).drop_nulls().unique()
     if not named_edges.is_empty():
         peers=query.join(named_edges,on='product',how='inner').select('date',pl.col('_member').alias('product'))
         query=pl.concat([query,peers]).unique()
@@ -967,8 +968,9 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
         # Source-specific caps need the original month's declaration. A dated
         # base-law inheritance/formula has a separate proof and remains valid.
         declared=corporate_unit_intervals.select('product','contract','source_content_sha256s').explode(
-            'source_content_sha256s').drop_nulls('source_content_sha256s').unique()
-        matches=frame.select(*keys,'source_content_sha256s').explode('source_content_sha256s').join(
+            'source_content_sha256s', empty_as_null=True, keep_nulls=True).drop_nulls('source_content_sha256s').unique()
+        matches=frame.select(*keys,'source_content_sha256s').explode(
+            'source_content_sha256s', empty_as_null=True, keep_nulls=True).join(
             declared,on=['product','contract','source_content_sha256s'],how='semi').select(keys).unique().with_columns(
                 pl.lit(True).alias('_corporate_month_declared'))
         frame=frame.join(matches,on=keys,how='left',validate='1:1')
@@ -979,7 +981,8 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
         if frame.select(securities_formula.any()).item():
             if 'position_member_source_sha256' not in frame.columns:
                 raise ValueError('securities member formula lacks its own source identity')
-            own=frame.select(*keys,'_term_sources','position_member_source_sha256').explode('_term_sources')
+            own=frame.select(*keys,'_term_sources','position_member_source_sha256').explode(
+                '_term_sources', empty_as_null=True, keep_nulls=True)
             matches=own.filter(pl.col('_term_sources')==pl.col('position_member_source_sha256')).join(
                 declared.rename({'source_content_sha256s':'_term_sources'}),
                 on=['product','contract','_term_sources'],how='semi').select(keys).unique().with_columns(
@@ -1002,7 +1005,7 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
                         or row['unit_effective_date']>=row['effective_date']):
                     raise ValueError('incumbent member proof requires previously known monthly terms')
             joined=frame.select(*keys,'_term_sources','_units','_unit_known_at','source_content_sha256s','combined_products').explode(
-                '_term_sources').join(proof.rename({'unit_source_sha256':'_term_sources'}),
+                '_term_sources', empty_as_null=True, keep_nulls=True).join(proof.rename({'unit_source_sha256':'_term_sources'}),
                     on=['product','contract','_term_sources'],how='inner')
             matched=joined.filter(
                 (pl.col('standard_product')==pl.col('product').str.slice(0,2)+pl.lit('F'))
@@ -1058,7 +1061,7 @@ def bind_physical_position_inputs(days: pl.DataFrame, positions: pl.DataFrame,
                 if clock is None or datetime.fromisoformat(clock).tzinfo is None:
                     raise ValueError('unchanged member proof requires a zoned publication clock')
             joined=frame.select(*keys,'standard_product','_term_sources','_units',
-                'source_content_sha256s').explode('_term_sources').join(
+                'source_content_sha256s').explode('_term_sources', empty_as_null=True, keep_nulls=True).join(
                     proof.rename({'source_content_sha256':'_term_sources',
                         'effective_date':'_member_effective','known_at':'_member_known',
                         'valid_until_date_exclusive':'_member_until','contract_multiplier':'_member_units'}),

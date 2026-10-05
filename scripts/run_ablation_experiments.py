@@ -43,6 +43,10 @@ _SOURCE_INTEGRITY_FAILURE_PATTERNS = (
     "indentationerror:",
     "taberror:",
 )
+_TEMPORAL_BASIS_CONFIGURATION_FAILURE_PATTERNS = (
+    "temporal basis overrides are not enabled in the configured families",
+    "temporal basis metadata component limits are not enabled",
+)
 
 
 @dataclass
@@ -151,6 +155,11 @@ def _failure_kind(returncode: int, log_text: str) -> str:
         return "source_integrity_failure"
     if any(pattern in lowered for pattern in _CHECKPOINT_CONTRACT_FAILURE_PATTERNS):
         return "checkpoint_contract_mismatch"
+    if any(
+        pattern in lowered
+        for pattern in _TEMPORAL_BASIS_CONFIGURATION_FAILURE_PATTERNS
+    ):
+        return "temporal_basis_configuration_failure"
     if "outofmemoryerror" in lowered or "cuda out of memory" in lowered:
         return "cuda_oom"
     if any(
@@ -328,6 +337,59 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = deepcopy(value)
     return merged
+
+
+def _postprocess_plot_specs(spec: dict[str, Any]) -> list[dict[str, str]]:
+    raw = spec.get("postprocess_plots", [])
+    if not isinstance(raw, list):
+        raise ValueError("postprocess_plots must be a list")
+    plots: list[dict[str, str]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"postprocess_plots[{index}] must be a mapping")
+        split = str(entry.get("split", "")).strip()
+        prefix = str(entry.get("prefix", "")).strip()
+        if split not in {"val", "test", "deployment"}:
+            raise ValueError(f"postprocess_plots[{index}] has invalid split")
+        if not _SAFE_NAME.fullmatch(prefix):
+            raise ValueError(f"postprocess_plots[{index}] has invalid prefix")
+        plots.append(
+            {
+                "split": split,
+                "prefix": prefix,
+                "scope_label": str(entry.get("scope_label", "")).strip(),
+            }
+        )
+    if len({plot["prefix"] for plot in plots}) != len(plots):
+        raise ValueError("postprocess_plots prefixes must be unique")
+    return plots
+
+
+def _render_postprocess_plots(
+    output_root: Path,
+    plots: list[dict[str, str]],
+    *,
+    baseline_root: Path | None,
+) -> None:
+    plotter = REPO_ROOT / "scripts/plot_ablation_analysis.py"
+    for plot in plots:
+        command = [
+            sys.executable,
+            str(plotter),
+            "--root",
+            str(output_root),
+            "--output-dir",
+            str(output_root),
+            "--split",
+            plot["split"],
+            "--prefix",
+            plot["prefix"],
+        ]
+        if plot["scope_label"]:
+            command.extend(["--scope-label", plot["scope_label"]])
+        if baseline_root is not None:
+            command.extend(["--baseline-root", str(baseline_root)])
+        subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 
 def _resolve_path(raw: str | Path, *, relative_to: Path) -> Path:
@@ -893,6 +955,42 @@ def main() -> None:
     )
     if expected_fold_count is not None and expected_fold_count <= 0:
         raise ValueError("ablation spec expected_fold_count must be positive")
+    postprocess_plots = _postprocess_plot_specs(spec)
+    baseline_root_raw = spec.get("baseline_artifact_root")
+    baseline_root = (
+        _resolve_path(str(baseline_root_raw), relative_to=REPO_ROOT)
+        if baseline_root_raw
+        else None
+    )
+    plots_refreshed = False
+
+    def refresh_plots(completed_name: str) -> None:
+        nonlocal plots_refreshed
+        if not postprocess_plots:
+            return
+        if baseline_root is None and not (
+            output_root / "baseline" / "summary.json"
+        ).is_file():
+            print(
+                "[ablation] charts deferred until baseline/summary.json exists",
+                flush=True,
+            )
+            return
+        try:
+            _render_postprocess_plots(
+                output_root,
+                postprocess_plots,
+                baseline_root=baseline_root,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"ablation charts failed after completed experiment {completed_name}"
+            ) from exc
+        plots_refreshed = True
+        print(
+            f"[ablation] charts refreshed after completed experiment: {completed_name}",
+            flush=True,
+        )
 
     summary_by_order: dict[int, dict[str, Any]] = {}
     total_runs = len(runs)
@@ -963,6 +1061,13 @@ def main() -> None:
             f"elapsed={elapsed_s:.1f}s",
             flush=True,
         )
+        if (
+            status == "succeeded"
+            and requested_after is not None
+            and requested_after > 0
+            and complete_after == requested_after
+        ):
+            refresh_plots(str(run["name"]))
 
     pending: list[dict[str, Any]] = []
     for run_index, run in enumerate(runs, start=1):
@@ -1200,6 +1305,7 @@ def main() -> None:
                     non_retryable_failure = failure_kind in {
                         "checkpoint_contract_mismatch",
                         "source_integrity_failure",
+                        "temporal_basis_configuration_failure",
                     }
                     if infrastructure_wait:
                         # A host driver/UVM outage is not evidence that this
@@ -1333,6 +1439,10 @@ def main() -> None:
     summary_rows = [summary_by_order[index] for index in sorted(summary_by_order)]
     if any(row["returncode"] not in (None, 0) for row in summary_rows):
         raise SystemExit(1)
+    if not args.collect_only and not plots_refreshed:
+        # A fully resumed invocation may skip every already-complete worker.
+        # Refresh its chart set once without retraining or touching checkpoints.
+        refresh_plots("already-complete suite")
 
 
 if __name__ == "__main__":

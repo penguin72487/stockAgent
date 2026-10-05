@@ -17,6 +17,84 @@ REGISTERED_EXTERNAL_TABLES = {
         "data_bybit/public_features/bybit_crypto_public_daily.parquet"
     ),
 }
+# Explicit node-local research view, not a new producer or publication alias.
+# Its preflight proves every unchanged link and changed daily table against
+# the receipt written by scripts/prepare_bybit_daily_repairs.py.
+BYBIT_REPAIR_VIEW = "artifacts/cache/bybit_perpetual_daily_repaired/perpetual_daily"
+BYBIT_MIDNIGHT_VIEW = "artifacts/cache/bybit_perpetual_daily_0000_repaired/perpetual_daily"
+BYBIT_MIDNIGHT_SYMBOL_COUNT = 397
+
+
+def validate_bybit_midnight_view(path: Path, *, venue_root: Path) -> None:
+    """Verify all new midnight labels and their full retained-source evidence."""
+    receipt = json.loads((path.parent / "midnight_manifest.json").read_text())
+    if (receipt.get("schema_version") != 1 or receipt.get("contract_version") != 7
+            or receipt.get("decision_cutoff_utc") != "00:00" or receipt.get("execution_boundary_utc") != "00:00"
+            or Path(receipt["base_root"]).resolve() != venue_root):
+        raise ValueError("Bybit midnight receipt does not pin the active base release/clock")
+    originals = sorted((venue_root / "perpetual_daily").glob("*_features.parquet"))
+    symbols = [file.stem.removesuffix("_features") for file in originals]
+    universe_hash = hashlib.sha256(json.dumps(symbols, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if (len(symbols) != BYBIT_MIDNIGHT_SYMBOL_COUNT or receipt.get("reference_symbols") != symbols
+            or receipt.get("reference_universe_sha256") != universe_hash
+            or {file.name for file in path.glob("*_features.parquet")} != {file.name for file in originals}
+            or set(receipt.get("symbols", {})) != set(symbols)):
+        raise ValueError("Bybit midnight view changed the reference universe")
+    if set(receipt.get("announced_symbols", [])) != {"HFTUSDT", "VINEUSDT", "ICXUSDT"}:
+        raise ValueError("unexpected midnight announcement scope")
+    expected_derived = {f"perpetual_daily/{file.name}" for file in originals}
+    if set(receipt["derived_sha256"]) != expected_derived:
+        raise ValueError("unexpected midnight derived files")
+    expected_sources = {str(file) for file in originals}
+    expected_sources.update({str(venue_root / "funding/funding_coverage.csv"), receipt["source_probe"]})
+    for symbol in symbols:
+        expected_sources.update({str(venue_root / "1m" / f"{symbol}_features.parquet"),
+                                 str(venue_root / "funding" / f"{symbol}_funding.parquet")})
+        tail = venue_root / "1m/_hot_tail" / f"{symbol}_features.parquet"
+        if tail.is_file():
+            expected_sources.add(str(tail))
+    if set(receipt["sources_sha256"]) != expected_sources:
+        raise ValueError("midnight receipt lacks full input evidence")
+    def digest(file: Path) -> str:
+        with file.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    for name, expected in receipt["derived_sha256"].items():
+        target = path.parent / name
+        if target.is_symlink() or digest(target) != expected:
+            raise ValueError(f"midnight derived file changed: {name}")
+    for name, expected in receipt["sources_sha256"].items():
+        if digest(Path(name)) != expected:
+            raise ValueError(f"midnight input evidence changed: {name}")
+
+
+def validate_bybit_repair_view(path: Path, *, venue_root: Path) -> None:
+    receipt = json.loads((path.parent / "repair_manifest.json").read_text())
+    if receipt.get("schema_version") != 1 or Path(receipt["base_root"]).resolve() != venue_root:
+        raise ValueError("Bybit repair receipt does not pin the active base release")
+    originals = {file.name: file for file in (venue_root / "perpetual_daily").glob("*_features.parquet")}
+    if not originals or {file.name for file in path.glob("*_features.parquet")} != originals.keys():
+        raise ValueError("Bybit repair view changed the base universe")
+    if set(receipt["symbols"]) != {"HFTUSDT", "VINEUSDT", "ICXUSDT"}:
+        raise ValueError("unexpected Bybit repair symbol scope")
+    derived_expected = {f"perpetual_daily/{symbol}_features.parquet" for symbol in receipt["symbols"]}
+    if set(receipt["derived_sha256"]) != derived_expected:
+        raise ValueError("unexpected derived Bybit files")
+    def digest(file: Path) -> str:
+        with file.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    for source, expected in receipt["sources_sha256"].items():
+        if digest(Path(source)) != expected:
+            raise ValueError(f"Bybit repair input evidence changed: {source}")
+    for name, original in originals.items():
+        if str(original) not in receipt["sources_sha256"]:
+            raise ValueError(f"Bybit base daily source missing from receipt: {name}")
+        local = path / name
+        key = f"perpetual_daily/{name}"
+        if key in derived_expected:
+            if local.is_symlink() or digest(local) != receipt["derived_sha256"][key]:
+                raise ValueError(f"Bybit derived repair changed: {name}")
+        elif not local.is_symlink() or local.resolve() != original:
+            raise ValueError(f"Bybit unchanged source link changed: {name}")
 PANEL_FEATURES = frozenset({
     "open_logret_1d", "max_logret_1d", "min_logret_1d",
     "close_logret_1d", "trading_volume_logret_1d", "signed_vol",
@@ -59,7 +137,17 @@ def validate_crypto_exchange_scope(
             raise ValueError(f"{label} must be inside {venue_root}, got {resolved}")
         return resolved
 
-    scoped_path(get("parquet_root"), "data.parquet_root")
+    raw_panel = Path(str(get("parquet_root"))).expanduser()
+    panel_path = (raw_panel if raw_panel.is_absolute() else repo_root / raw_panel).resolve()
+    registered_view = (repo_root / BYBIT_REPAIR_VIEW).absolute()
+    if venue == "bybit" and panel_path == registered_view:
+        if check_schema:
+            validate_bybit_repair_view(panel_path, venue_root=venue_root)
+    elif venue == "bybit" and panel_path == (repo_root / BYBIT_MIDNIGHT_VIEW).absolute():
+        if check_schema:
+            validate_bybit_midnight_view(panel_path, venue_root=venue_root)
+    else:
+        scoped_path(get("parquet_root"), "data.parquet_root")
     external = bool(get("use_external_features"))
     external_path = None
     if external:
@@ -126,6 +214,10 @@ def validate_crypto_exchange_scope(
             raise ValueError(f"external feature table is missing selected columns: {missing}")
         summary_path = external_path.with_name(f"{external_path.stem}_summary.json")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (panel_path == (repo_root / BYBIT_MIDNIGHT_VIEW).absolute()
+                and information_scope == "historical_public_pit"
+                and summary.get("decision_boundary_utc") != "00:00"):
+            raise ValueError("midnight execution requires a midnight-cutoff public feature receipt")
         if summary.get("output_columns") != columns:
             raise ValueError("external feature receipt does not match the table schema")
         if information_scope == "venue_only":

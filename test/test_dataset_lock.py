@@ -215,4 +215,3 @@ def test_collector_holds_lock_through_work_and_releases_on_every_exit(
     assert called == [True]
     with (tmp_path / ".download.lock").open("a+") as probe:
         fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-

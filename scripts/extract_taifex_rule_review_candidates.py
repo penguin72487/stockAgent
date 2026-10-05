@@ -673,6 +673,7 @@ def main():
     items=review_documents(c,categories,args.pending_only)
     c.close()
     if args.document_sha256_file:
+        import re
         selected=set(args.document_sha256_file.read_text().split())
         if not selected or any(not re.fullmatch('[0-9a-f]{64}',s) for s in selected):
             raise ValueError('non-empty exact SHA-256 selection required')

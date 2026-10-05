@@ -1,0 +1,11 @@
+# Ordinary training with an absorbing-default physical-account gradient.
+# Accounting contract 2 reduces excess position units without requiring cash;
+# backward contract 5 removes post-default phantom profits. Preserve dated
+# limits, fills/capacity rules, fees, margins and all v11 optimizer settings.
+# Start fresh: v11 accounting and Adam state are incompatible with this fix.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_ordinary_v11.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-absorbing-gradient-v12
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_absorbing_gradient_v12
+  start_fold: 14

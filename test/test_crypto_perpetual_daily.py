@@ -11,7 +11,7 @@ import polars as pl
 import pytest
 import torch
 
-from stockagent.backtest.crypto_perpetual import run_crypto_perpetual_torch
+from stockagent.backtest.crypto_perpetual import CryptoPerpetualDataError, run_crypto_perpetual_torch
 from stockagent.backtest.report import compute_metrics
 from stockagent.backtest.simulator import (
     BacktestResult,
@@ -346,6 +346,7 @@ def test_chunk_boundary_carries_marked_position_and_alive_state_exactly() -> Non
         price[3:],
         initial_weights=first.final_weights,
         initial_alive=first.final_alive,
+        initial_equity_scale=first.final_equity_scale,
     )
     assert torch.cat(
         [first.strategy_simple_returns, second.strategy_simple_returns]
@@ -417,31 +418,20 @@ def test_interior_nonadvancing_crypto_row_cannot_change_next_real_trade():
     assert target.grad[1].item() == 0.0
 
 
-def test_nontradable_row_does_not_manufacture_a_close_but_missing_active_mark_ruins() -> (
+def test_nontradable_row_does_not_manufacture_a_close_or_missing_mark_loss() -> (
     None
 ):
     target = torch.tensor([[0.5], [0.0]])
     effective = torch.tensor([[0.0], [float("nan")]])
     price = torch.tensor([[0.0], [float("nan")]])
     tradable = torch.tensor([[True], [False]])
-    result = run_crypto_perpetual_torch(
-        target,
-        torch.log1p(effective),
-        torch.log1p(price),
-        tradable,
-        tradable,
-        tradable,
-        tradable,
-        torch.zeros_like(tradable),
-        buy_fee_rate=0.00055,
-        sell_fee_rate=0.00055,
-        long_only=False,
-        maximum_gross=1.0,
-    )
-    assert result.turnovers[1].item() == 0.0
-    assert result.strategy_simple_returns[1].item() == pytest.approx(-0.999999)
-    assert result.final_alive.item() is False
-    assert result.final_weights.item() == 0.0
+    with pytest.raises(CryptoPerpetualDataError, match="row=1, symbol_index=0"):
+        run_crypto_perpetual_torch(
+            target, torch.log1p(effective), torch.log1p(price),
+            tradable, tradable, tradable, tradable, torch.zeros_like(tradable),
+            buy_fee_rate=0.00055, sell_fee_rate=0.00055,
+            long_only=False, maximum_gross=1.0,
+        )
 
 
 def test_crypto_simulator_dispatch_preserves_gradients() -> None:
@@ -1274,7 +1264,7 @@ def test_crypto_feature_gap_blocks_new_policy_but_keeps_close_execution() -> Non
     assert dataset.can_sell_mask_t[0, 0].item() is True
 
 
-def test_crypto_dataset_closes_at_last_mark_before_an_unvalued_interior_day() -> None:
+def test_crypto_dataset_never_exits_using_missing_future_label() -> None:
     rows = 4
     current = np.ones((rows, 1), dtype=bool)
     panel = PanelData(
@@ -1298,25 +1288,17 @@ def test_crypto_dataset_closes_at_last_mark_before_an_unvalued_interior_day() ->
     )
     assert dataset.valid_indices.tolist() == [0, 1, 2]
     assert torch.isnan(dataset.future_log_returns_t[1, 0])
-    assert dataset.force_exit_mask_t[:, 0].tolist() == [False, True, False, False]
+    assert dataset.force_exit_mask_t[:, 0].tolist() == [False, False, False, False]
 
-    result = run_crypto_perpetual_torch(
-        torch.full((3, 1), 0.5),
-        dataset.future_log_returns_t[:3],
-        dataset.overnight_log_returns_t[:3],
-        dataset.tradable_mask_t[:3],
-        dataset.can_buy_mask_t[:3],
-        dataset.can_sell_mask_t[:3],
-        dataset.can_short_open_mask_t[:3],
-        dataset.force_exit_mask_t[:3],
-        buy_fee_rate=0.00055,
-        sell_fee_rate=0.00055,
-        long_only=False,
-        maximum_gross=1.0,
-    )
-    assert result.final_alive.item() is True
-    assert result.executed_weights[1, 0].item() == 0.0
-    assert result.turnovers[1].item() > 0.0
+    with pytest.raises(CryptoPerpetualDataError, match="row=1"):
+        run_crypto_perpetual_torch(
+            torch.full((3, 1), 0.5), dataset.future_log_returns_t[:3],
+            dataset.overnight_log_returns_t[:3], dataset.tradable_mask_t[:3],
+            dataset.can_buy_mask_t[:3], dataset.can_sell_mask_t[:3],
+            dataset.can_short_open_mask_t[:3], dataset.force_exit_mask_t[:3],
+            buy_fee_rate=0.00055, sell_fee_rate=0.00055,
+            long_only=False, maximum_gross=1.0,
+        )
 
 
 def test_crypto_lifecycle_never_treats_the_open_research_horizon_as_delisting() -> None:
@@ -1325,7 +1307,7 @@ def test_crypto_lifecycle_never_treats_the_open_research_horizon_as_delisting() 
     force_exit = _crypto_lifecycle_force_exit_mask(alive, finite)
     assert force_exit.tolist() == [
         [False, False],
-        [True, False],
+        [False, False],
         [False, False],
     ]
 

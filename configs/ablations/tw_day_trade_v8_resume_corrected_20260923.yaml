@@ -1,0 +1,38 @@
+# Exploratory follow-up, not a promoted strategy or a blind 2026 test.
+# The old no_temporal_basis run resumed with a changed RMS buffer. Re-run the
+# matched control before attributing its advantage to basis removal.
+base_config: configs/deployments/tw_day_trade_v8_ofat_resume_corrected_control.yaml
+output_root: artifacts/ablations/tw_day_trade_v8_resume_corrected_20260923
+expected_fold_count: 11
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+postprocess_plots:
+  - split: val
+    prefix: val
+    scope_label: Validation exact account
+  - split: deployment
+    prefix: test
+    scope_label: Exploratory previously inspected deployment test
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  dimensions:
+    - name: temporal_basis
+      enabled: true
+      path: training.financial_transformer.temporal_basis_families
+      values:
+        - name: disabled
+          experiment_name: no_temporal_basis
+          value: []
+    - name: learning_rate_horizon
+      enabled: true
+      path: training.lr_scheduler_t_max
+      values:
+        - name: cosine_256
+          experiment_name: cosine_256
+          # One optimizer step per complete training trajectory. Keep warmup
+          # at 32 and the epoch ceiling at 1000; decay to eta_min by step 256.
+          # This tests whether useful annealing happens before early stopping.
+          value: 256

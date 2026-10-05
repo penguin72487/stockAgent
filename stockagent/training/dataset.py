@@ -39,16 +39,11 @@ def _crypto_lifecycle_force_exit_mask(
     alive_mask: np.ndarray,
     finite_forward_return: np.ndarray,
 ) -> np.ndarray:
-    """Close a disappearing contract at its final observable execution mark.
+    """Missing forward labels never establish a causal liquidation event.
 
-    A crypto row owns the execution mark at ``t`` and the return label from
-    that mark to ``t+1``.  If the mark exists but the forward label does not,
-    carrying an existing position would require inventing an unobservable
-    liquidation value.  Force the position to cash at the real ``t`` mark and
-    prohibit a same-row re-entry through the executor's force-exit gate.
-
-    The final panel row is intentionally excluded: its missing forward label
-    is the research horizon, not evidence that the contract disappeared.
+    Keep this shape-validated helper for callers, but do not infer an exit from
+    future coverage. A genuine dated settlement belongs to the explicit panel
+    force-exit contract. An unvalued held interval must fail in the ledger.
     """
 
     alive = np.asarray(alive_mask, dtype=bool)
@@ -57,10 +52,7 @@ def _crypto_lifecycle_force_exit_mask(
         raise ValueError(
             "crypto lifecycle masks must be matching two-dimensional [T,S] arrays"
         )
-    force_exit = np.zeros_like(alive, dtype=bool)
-    if alive.shape[0] > 1:
-        force_exit[:-1] = alive[:-1] & ~finite[:-1]
-    return force_exit
+    return np.zeros_like(alive, dtype=bool)
 
 
 def _dual_session_return_components(

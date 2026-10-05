@@ -1,0 +1,32 @@
+# Exploratory controls for two distinct training mechanisms, not a promotion.
+base_config: configs/deployments/tw_day_trade_v8_ofat_resume_corrected_control.yaml
+output_root: artifacts/ablations/tw_day_trade_v8_learning_mechanisms_20260923
+baseline_artifact_root: artifacts/ablations/tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat/baseline
+expected_fold_count: 11
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  dimensions:
+    - name: capital_horizon
+      enabled: true
+      variants:
+        - name: annual
+          experiment_name: annual_accounts
+          overrides:
+            training:
+              day_trade_training_annual_episodes: true
+              backtest_compile_dynamic: true
+    - name: sub_lot_learning
+      enabled: true
+      variants:
+        - name: one_lot_utility
+          experiment_name: sub_lot_recovery
+          overrides:
+            training:
+              day_trade_sub_lot_recovery: true
+              financial_transformer:
+                portfolio_output_mode: score_entmax_cash_v2

@@ -1,0 +1,22 @@
+# Ordinary optimizer updates in the same exact futures environment as v10.
+# Reuse physical backward, causal RMS and the trainable cash initialization.
+# Training semantics change: keep a fresh artifact root, without v10 resume.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_cash_init_v6.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-ordinary-v11
+
+training:
+  epochs: 1000
+  val_interval_epochs: 1
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0001
+  best_checkpoint_max_epoch: 0
+  # Disable the entire candidate acceptance layer, including loss rollback.
+  # Whole contracts, fees, capacity, margin and default stay in the executor.
+  futures_training_max_drawdown: null
+  futures_training_risk_tangent: false
+  futures_training_risk_interior: false
+  futures_training_stop_on_rejected_step: false
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_ordinary_v11
+  start_fold: 14

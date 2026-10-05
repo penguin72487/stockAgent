@@ -57,6 +57,9 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         futures_current_open_feature: bool = False,
         futures_margin_budget_output: bool = False,
         futures_feature_rms_normalization: bool = False,
+        futures_flat_action_initialization: bool = False,
+        futures_notional_score_coordinates: bool = False,
+        futures_margin_amount_context: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
     ) -> None:
@@ -104,12 +107,22 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             )
         self.futures_current_open_feature = bool(futures_current_open_feature)
         self.futures_margin_budget_output = bool(futures_margin_budget_output)
+        self.futures_margin_amount_context = bool(futures_margin_amount_context)
+        if self.futures_margin_amount_context and not self.futures_margin_budget_output:
+            raise ValueError("margin amount context requires a dated-margin policy")
+        self.futures_notional_score_coordinates = bool(futures_notional_score_coordinates)
+        if self.futures_notional_score_coordinates and (
+            not self.futures_margin_budget_output
+            or self.portfolio_output_mode != "score_entmax_log_cash"
+            or self.center_long_short_logits
+        ):
+            raise ValueError("notional score coordinates require the uncentered margin score_entmax_log_cash policy")
         if self.futures_margin_budget_output and (
             self.futures_current_open_feature or self.futures_denomination_aware_output
         ):
             raise ValueError("margin budgeting uses only its prior-observable margin context")
         self.futures_margin_encoder = (
-            nn.Linear(2, self.d_model, bias=False)
+            nn.Linear(2 + int(self.futures_margin_amount_context), self.d_model, bias=False)
             if self.futures_margin_budget_output else None
         )
         if (
@@ -172,6 +185,15 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             nn.Linear(self.d_model * 2, self.d_model),
         )
         self.futures_action_head = nn.Linear(self.d_model, 1)
+        if futures_flat_action_initialization:
+            if not self.futures_margin_budget_output or self.portfolio_output_mode != "score_entmax_log_cash":
+                raise ValueError("flat futures initialization requires the margin score_entmax_log_cash policy")
+            # Zero scores map to cash with a nonzero action derivative. Only
+            # this last affine map is zeroed: its random upstream features
+            # break symmetry, and the backbone receives gradients after the
+            # first head update. Checkpoint loads still restore trained values.
+            nn.init.zeros_(self.futures_action_head.weight)
+            nn.init.zeros_(self.futures_action_head.bias)
         if self.futures_denomination_aware_output:
             self.futures_denomination_encoder = nn.Sequential(
                 nn.Linear(2, self.d_model),
@@ -253,7 +275,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         current_open_features = len(
             TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
         )
-        margin_features = expected_features + 2
+        margin_features = expected_features + 2 + int(self.futures_margin_amount_context)
         if features is None or mask is None:
             raise ValueError(
                 "all-futures candidate_features and candidate_mask must be paired"
@@ -274,8 +296,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             raise ValueError(
                 "all-futures candidate_features must have shape "
                 f"[B,{self.futures_slot_count},"
-                f"{base_features}, {prior_features}, {expected_features}, or "
-                f"{current_open_features}], "
+                f"{base_features}, {prior_features}, {expected_features}, "
+                f"{current_open_features}, or {margin_features}], "
                 f"got {tuple(features.shape)}"
             )
         if tuple(mask.shape) != tuple(features.shape[:2]):
@@ -457,6 +479,9 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         )
         if self.futures_margin_encoder is not None:
             margin_context = candidate_features[..., -2:].float()
+            if self.futures_margin_amount_context:
+                amount_fraction = candidate_features[..., -3:-2].float() / self.futures_denomination_reference_capital
+                margin_context = torch.cat((margin_context, amount_fraction), dim=-1)
             margin_context = torch.log(margin_context.clamp_min(1.0e-8)).clamp(-18.0, 4.0)
             futures_tokens = futures_tokens + self.futures_margin_encoder(
                 margin_context.to(dtype=z_stock.dtype)
@@ -601,6 +626,16 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         target_logits = (centered_scores / temp).masked_fill(
             ~candidate_mask, 0.0
         )
+        if self.futures_notional_score_coordinates:
+            # q*=w*E/IM amplifies an unscaled score's local derivative by N/IM.
+            # r=known_IM/prior_notional makes that derivative proportional to
+            # E/prior_notional near zero. r>0 is invertible, so reachable margin
+            # budgets remain unchanged. Current OPEN and future returns never
+            # enter this coordinate transform; masked slots contribute zero.
+            margin_to_notional = candidate_features[..., -2].float().masked_fill(
+                ~candidate_mask, 0.0
+            )
+            target_logits = target_logits * margin_to_notional
         action_aux: dict[str, torch.Tensor] = {}
         if self.portfolio_output_mode == "logits":
             weights = target_logits

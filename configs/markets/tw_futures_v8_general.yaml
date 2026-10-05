@@ -75,6 +75,6 @@ training:
 
 runner:
   output_dir: artifacts/markets/tw_futures_v8_general
-  start_fold: 1
+  start_fold: 10
   resume: true
   post_train_infer: false

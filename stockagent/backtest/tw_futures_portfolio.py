@@ -756,8 +756,12 @@ def _margin_physical_backward(
                     x[:,margin.SECOND_POSITION_GRANDFATHER] if dated_hold else None)
                 position_slack=torch.minimum(position_slack,second_slack)
             wealth = torch.where(position_failed, position_slack, wealth)
-            terminal_failed = ((x[:, 2] > .5) & (chosen != closed)).any()
-            residual = held - closing
+            terminal_obligation = (x[:, 2] > .5) & do_row
+            terminal_failed = (terminal_obligation & (chosen != closed)).any()
+            # Only the unfulfilled terminal contracts own this boundary.
+            # Ordinary overnight inventory is neither delivery debt nor an
+            # extra penalty when a different physical contract cannot close.
+            residual = torch.where(terminal_obligation, held - closing, 0.)
             wealth = torch.where(terminal_failed, -(residual.abs() * im).sum() / denominator, wealth)
             soft_wealth = F.softplus(torch.nan_to_num(wealth, nan=-1., posinf=3., neginf=-1.) / .10) * .10 + 1.0e-7
             log_return = soft_wealth.log()

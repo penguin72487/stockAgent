@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "visual_position_cap_transcription",
+  "source_url": "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/2231_20151008.pdf",
+  "pdf_sha256": "3252731787fcd7aa35cd424a153f7539747cb179265dfdc37144839fa87ae8e3",
+  "page": 2,
+  "page_image_sha256": "d9171d263ee7e43b3d219349a2abcba92fac1b0d50f59a863b3050c3e74b822a",
+  "parent_rules_sha256": "8ea1a44aaea2ee67f9ee42800298ae4a88215db736a06bbe4fa66b528ff1c341",
+  "known_at": "2015-09-24T23:59:59+08:00",
+  "start": "2015-10-08",
+  "end": "2015-11-18",
+  "products": ["OD1", "ODF"],
+  "position_group": "ODF",
+  "unit": "shares",
+  "position_units": {"OD1": 2299.6612, "ODF": 2000.0},
+  "incorrect_cap": 4599.323,
+  "official_natural_person_cap": "4,599,323",
+  "expected_rows": 177,
+  "review_note": "Verified page 2 natural-person cap, first period column. OCR read its second thousands comma as a decimal point. From 2015-11-19 the separate 4,000,000-share cap is unchanged. HOF/HO1 2011-06-29 genuinely has fractional 720,958.42 shares and must retain its decimal."
+}
