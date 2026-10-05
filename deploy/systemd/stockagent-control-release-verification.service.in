@@ -1,0 +1,21 @@
+[Unit]
+Description=Verify registered frozen code releases through PostgreSQL work claims
+After=postgresql@18-main.service
+Wants=postgresql@18-main.service
+ConditionPathExists=/etc/stockagent/control-release-verification.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment="STOCKAGENT_CONTROL_ENV_FILE=__CONTROL_ENV_FILE__"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_control_release_queue.sh cycle
+Slice=stockagent-control.slice
+Nice=10
+CPUWeight=20
+CPUQuota=100%
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=32
+TimeoutStartSec=180
+UMask=0077
+SuccessExitStatus=75

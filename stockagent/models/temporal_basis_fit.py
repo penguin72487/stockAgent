@@ -38,6 +38,7 @@ def training_temporal_covariance(
     lookback: int,
     feature_lag: int,
     feature_chunk_columns: int = 4_096,
+    lag_batch_size: int = 1,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Estimate ``[L,L]`` covariance from training windows and nothing else."""
 
@@ -47,7 +48,11 @@ def training_temporal_covariance(
         raise ValueError("PCA/KLT temporal basis requires lookback >= 2")
     if feature_lag < 0:
         raise ValueError("feature_lag must be non-negative")
-    values = torch.as_tensor(features).detach().to(device="cpu")
+    lag_batch_size = int(lag_batch_size)
+    if lag_batch_size < 1:
+        raise ValueError("lag_batch_size must be positive")
+    factorized = bool(getattr(features, "_stockagent_factorized_features", False))
+    values = features if factorized else torch.as_tensor(features).detach().to(device="cpu")
     if values.ndim != 3:
         raise ValueError("features must have shape [T,S,F]")
     indices = torch.as_tensor(training_target_indices, dtype=torch.long).reshape(-1)
@@ -57,7 +62,7 @@ def training_temporal_covariance(
     feature_ends = indices + 1 - feature_lag
     starts = feature_ends - lookback
     if int(starts.min().item()) < 0 or int(feature_ends.max().item()) > int(
-        values.size(0)
+        values.shape[0]
     ):
         raise ValueError("training target indices cannot form the configured lookback")
 
@@ -68,30 +73,79 @@ def training_temporal_covariance(
     # passes over the large symbol-feature axis.
     source_min = int(starts.min().item())
     source_max = int(feature_ends.max().item())
-    source = values[source_min:source_max].reshape(source_max - source_min, -1)
-    source_rows = int(source.size(0))
-    flattened_features = int(source.size(1))
+    source_rows = source_max - source_min
+    flattened_features = int(values.shape[1]) * int(values.shape[2])
     if flattened_features <= 0:
         raise ValueError("PCA/KLT temporal covariance has no feature observations")
-    accumulation_dtype = (
-        torch.float64 if source.dtype == torch.float64 else torch.float32
-    )
+    accumulation_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
     daily_sum = torch.zeros(source_rows, dtype=torch.float64)
     lag_products = torch.zeros((lookback, source_rows), dtype=torch.float64)
     column_chunk = max(1, int(feature_chunk_columns))
-    for column_start in range(0, flattened_features, column_chunk):
-        block = source[:, column_start : column_start + column_chunk].to(
+    def input_blocks():
+        if not factorized:
+            source = values[source_min:source_max].reshape(source_rows, -1)
+            # The opt-in batched lag schedule bounds its product workspace.
+            # Source rows and per-row feature reduction order stay unchanged.
+            date_rows = 32 if lag_batch_size > 1 else source_rows
+            for row_start in range(0, source_rows, date_rows):
+                owned = min(date_rows, source_rows - row_start)
+                stop = min(source_rows, row_start + owned + lookback - 1)
+                for column_start in range(0, flattened_features, column_chunk):
+                    yield row_start, owned, source[row_start:stop, column_start:column_start + column_chunk]
+            return
+        # A date tile owns only its leading rows. The future halo supplies lag
+        # products without counting any row twice; stock tiles retain all
+        # logical common-feature replicas in the original covariance contract.
+        adapter = getattr(values, "source", values)
+        date_rows = 32
+        budget = 256 * 1024**2
+        symbol_rows = max(1, min(128, budget // max(1, (date_rows + lookback - 1) * int(values.shape[2]) * 4)))
+        for row_start in range(0, source_rows, date_rows):
+            owned = min(date_rows, source_rows - row_start)
+            stop = min(source_rows, row_start + owned + lookback - 1)
+            for stock_start in range(0, int(values.shape[1]), symbol_rows):
+                subset = adapter.subset_symbols(np.arange(stock_start, min(int(values.shape[1]), stock_start + symbol_rows)))
+                _, compact = subset.compact_statistics_rows(np.arange(source_min + row_start, source_min + stop))
+                tile = torch.from_numpy(compact).reshape(stop - row_start, -1)
+                for column_start in range(0, int(tile.size(1)), column_chunk):
+                    yield row_start, owned, tile[:, column_start:column_start + column_chunk]
+
+    for row_start, owned, source_block in input_blocks():
+        block = source_block.to(
             dtype=accumulation_dtype
         )
         block = torch.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0)
-        daily_sum += block.sum(dim=1, dtype=torch.float64)
+        daily_sum[row_start:row_start + owned] += block[:owned].sum(dim=1, dtype=torch.float64)
+        if lag_batch_size > 1:
+            # unfold is a view, not a [windows,L,features] copy. Computational
+            # zero halos exist only beyond the last owned source row; those
+            # invalid lag/row pairs are never accumulated. This does not fill
+            # any raw observation or expand the fold-training time scope.
+            halo_rows = owned + lookback - 1 - int(block.size(0))
+            if halo_rows > 0:
+                block = torch.cat((block, block.new_zeros((halo_rows, block.size(1)))))
+            right_windows = block.unfold(0, owned, 1).permute(0, 2, 1)
+            # Bound temporary FP32/FP64 products to 64 MiB even if callers
+            # select a different column chunk or lookback.
+            batch = min(lag_batch_size, lookback, max(1, (64 * 1024**2) // max(1, owned * int(block.size(1)) * block.element_size())))
+            left = block[:owned].unsqueeze(0)
+            for first_lag in range(0, lookback, batch):
+                stop_lag = min(lookback, first_lag + batch)
+                products = (left * right_windows[first_lag:stop_lag]).sum(
+                    dim=2, dtype=torch.float64,
+                )
+                for offset, lag in enumerate(range(first_lag, stop_lag)):
+                    width = min(owned, int(source_block.size(0)) - lag)
+                    if width > 0:
+                        lag_products[lag, row_start:row_start + width] += products[offset, :width]
+            continue
         for lag in range(lookback):
-            width = source_rows - lag
+            width = min(owned, int(block.size(0)) - lag)
             if width <= 0:
                 break
             left = block[:width]
             right = block[lag : lag + width]
-            lag_products[lag, :width] += (left * right).sum(
+            lag_products[lag, row_start:row_start + width] += (left * right).sum(
                 dim=1,
                 dtype=torch.float64,
             )
@@ -147,6 +201,7 @@ def fit_training_only_pca_klt(
     lookback: int,
     feature_lag: int,
     components: int,
+    lag_batch_size: int = 1,
 ) -> TemporalPCAFit:
     """Fit a non-DC KLT bank, ordered by fold-training eigenvalue."""
 
@@ -159,6 +214,7 @@ def fit_training_only_pca_klt(
         training_target_indices,
         lookback=lookback,
         feature_lag=feature_lag,
+        lag_batch_size=lag_batch_size,
     )
     _eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     ordered_vectors = [

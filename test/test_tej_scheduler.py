@@ -108,6 +108,20 @@ def test_foreground_availability_is_waited_without_spin_or_unknown_retry(queue):
     assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks'] == 1
 
 
+def test_restored_interactive_relay_wakes_wait_without_another_source_probe(queue, monkeypatch):
+    from downloader.tej_startup import CONTRACT as STARTUP_CONTRACT
+    root, config = queue
+    config['automation']['desktop_startup'] = dict(enabled=True,contract=STARTUP_CONTRACT,
+        authorization_basis='explicit_user_request_automatic_tej_restart_after_boot',
+        owned_workbook_windows='%LOCALAPPDATA%\\StockAgent\\TEJSmartWizard\\StockAgent-TEJ-Acquisition.xlsx')
+    readiness=iter([False,True,True])
+    monkeypatch.setattr('downloader.tej_startup.desktop_ready',lambda *a,**k:next(readiness))
+    stop=InstantWait();calls=[]
+    watch_queue(root,None,config,stop=stop,runner=lambda *_:calls.append('source') or 'completed_task',max_cycles=1,emit=emit)
+    assert calls==['source'] and stop.waits==[5,2]
+    assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks']==1
+
+
 def test_metadata_contention_waits_locally_and_never_resets_unknown_source_action(queue):
     import sqlite3
     root,config=queue;calls=[]

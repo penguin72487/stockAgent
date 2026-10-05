@@ -1,0 +1,16 @@
+[Unit]
+Description=Traditional backup of DuckLake and Temporal control databases
+Requires=postgresql@18-main.service stockagent-backup-transport-mount.service
+After=postgresql@18-main.service stockagent-backup-transport-mount.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_lakehouse_control.sh python scripts/backup_lakehouse_control.py
+TimeoutStartSec=15min
+UMask=0077
+CPUQuota=100%
+MemoryHigh=384M
+MemoryMax=512M
+Nice=10
+Environment=PYTHONDONTWRITEBYTECODE=1

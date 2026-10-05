@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic encrypted backup of lakehouse lifecycle controls
+
+[Timer]
+OnBootSec=90s
+OnActiveSec=15s
+OnUnitInactiveSec=15min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

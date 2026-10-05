@@ -258,6 +258,13 @@ def plan_candle_reconcile_windows(
             hi = min(upper, right // 1_000_000)
             if lo <= hi:
                 windows.append((lo, hi))
+    # Valid dates do not imply valid prices. Re-fetch only the exact offending
+    # observations; signed financial features outside OHLCV are not examined.
+    if all(name in frame.columns for name in ("open", "max", "min", "close", "Trading_Volume")):
+        bad_dates = frame.filter(invalid_candle_values()).select(
+            _timestamp_expr(frame).dt.epoch("ms").alias("ms"))
+        windows.extend((value, value) for value in bad_dates["ms"].to_list()
+                       if value is not None and lower <= value <= upper)
     tail_start = max(lower, last - interval_ms)
     if tail_start <= upper:
         windows.append((tail_start, upper))
@@ -268,3 +275,21 @@ def plan_candle_reconcile_windows(
         else:
             merged.append((lo, hi))
     return merged
+
+
+def invalid_candle_values() -> pl.Expr:
+    """Exchange OHLCV only: finite positive prices, coherent bounds/quantity.
+
+    This must not be applied to financial statements, interest rates, spreads,
+    or normal broker no-trade placeholder rows.
+    """
+    prices = ("open", "max", "min", "close")
+    invalid = pl.any_horizontal(*(
+        (~pl.col(name).cast(pl.Float64, strict=False).is_finite()
+         | (pl.col(name).cast(pl.Float64, strict=False) <= 0)).fill_null(True)
+        for name in prices))
+    invalid |= (pl.col("max") < pl.max_horizontal("open", "min", "close")) | (
+        pl.col("min") > pl.min_horizontal("open", "max", "close"))
+    # All canonical exchange candle writers supply Trading_Volume.
+    quantity = pl.col("Trading_Volume").cast(pl.Float64, strict=False)
+    return invalid | (~quantity.is_finite() | (quantity < 0)).fill_null(True)

@@ -588,7 +588,7 @@ def test_bridge_safe_retry_requires_exact_private_prequery_proof(registry,monkey
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',fail)
     expected = BeforeDataQueryError if mutation is None else RuntimeError
     with pytest.raises(expected) as caught:
-        DesktopBridge(root,session).execute(root,task)
+        DesktopBridge(Path(__file__).resolve().parents[1],session).execute(root,task)
     assert 'SECRET' not in str(caught.value)
     if mutation is not None:assert not isinstance(caught.value,BeforeDataQueryError)
     diagnostic = next((root/'diagnostics').glob('*.txt'))
@@ -659,7 +659,7 @@ def test_bridge_timeout_never_exposes_command_or_retries(registry,monkeypatch):
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',timeout)
     session = dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='test',ExpectedWorkbook='Book2',ExpectedExcelWindow=3)
     with pytest.raises(RuntimeError,match='requires_recovery') as caught:
-        DesktopBridge(root,session).execute(root,task)
+        DesktopBridge(Path(__file__).resolve().parents[1],session).execute(root,task)
     assert 'SECRET' not in str(caught.value)
     assert caught.value.__suppress_context__
 

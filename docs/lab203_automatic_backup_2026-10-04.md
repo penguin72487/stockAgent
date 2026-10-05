@@ -4,16 +4,52 @@
 負責，不需要 Codex 常駐對話。USB 金鑰保管已由使用者確認完成；不再詢問。
 Windows 登出驗收已取消。
 
+## 全自動流程已接通（2026-10-04）
+
+lab203 已完成 v7 一次性安裝。penguin 直接驗證回傳的固定三項 NAS 語義驗收：
+CFTC／TAIFEX canonical 重建通過，PostgreSQL 50 表／60 列與 logical identity
+吻合；完整流程 52.331828 秒，11 個 Restic 命令皆退出 0。接收端持續更新
+heartbeat，來源目前為 `receiver_polling`／`named_nas_semantic_recovery_verified`，
+不再等待安裝或人工回報。lab203 回報其安裝副本修正了 PowerShell 中文輸出
+解碼；固定同步套件保持原樣。來源沒有遠端讀取其 private 安裝檔，接收端
+持續運作與實際 NAS 還原依配對通道上的機器收據確認。
+
+2026-10-04 來源端接通檢查另確認：
+
+- 正向批次與反向收據兩個 Syncthing folder 皆 idle、completion 100%、
+  need bytes/items/deletes 與錯誤為 0；來源備份、Syncthing、control backup
+  與必要 mount 排程／服務已啟用。
+- 26 份 managed file ACK 與來源 dispatch 相符；最新程式／控制庫批次
+  7 檔／12,597,504 bytes 已自動在 NAS 固定還原並逐檔驗證。
+- 清單自動納入新 release，現為 17,579 檔／684,109,237,219 bytes；
+  冷資料已有 9,208 檔／53,632,816,703 bytes 的 NAS 覆蓋，剩餘自動補傳。
+  未送檔最大 5,707,388,416 bytes，小於實際單批 8 GiB；沒有缺件、metadata
+  錯誤或超過單批上限的檔案。容量 readiness 已核對，保留 64 GiB reserve。
+
+實際檢查收據為
+`artifacts/operations/two-node-lab-nas-backup-20261003/automatic-sync-live-acceptance-20261004.json`。
+這是自動流程接通及當時的部分覆蓋；全量 backlog 與其他 release 的完整 packed
+重建不能據此標為完成。來源 status 在長批次執行期間可能落後反向收據，
+下一輪會由既有 owner 接手更新，不能為刷新畫面另啟第二個 writer。
+
 ## 已持續運作的資料流程
 
 penguin 的 `stockagent-backup-stream.timer` 自動盤點已允許發布的冷檔、程式
 快照及既有一致性 PostgreSQL dump，產生有 READY 與完整 SHA 的封閉批次。
 Syncthing 傳到 lab203 後，既有 `lab203-backup.timer`／worker 自動驗證、寫入
 guarded NAS Restic repository、獨立還原固定完整 snapshot、核對所有檔案，
-再由回傳 Syncthing folder 送回機器收據。來源依收據繼續下一批。
+再由回傳 Syncthing folder 送回機器收據。
 
-上述流程已接通，不必每批傳話。五分鐘是排程間隔；8 GiB 批次與 NAS 驗收可能
-超過五分鐘，單一 owner 會序列執行，不宣稱所有資料五分鐘內備份完成。
+上述 v7 流程已接通，不必每批傳話。使用者後續要求整條鏈並行；來源現已改成
+最多四批／32 GiB 同時在途、四工封裝與 SHA，沿用同一 owner，完成後 30 秒接續。
+來源在前批等待 NAS 收據時繼續封裝、傳輸其他批次，失敗批次個別重排。
+lab203 已完成固定 v10 升級，penguin 實際驗證其新 `pipeline-status.json`，
+`upgrade_pending=false`，同一 owner／runtime 通過；NAS 實測選定四批、兩工
+backup、兩工 restore、四工 verify，完成後 15 秒接續。新 v10 包含中斷後不完整
+snapshot 的重排修正、每輪新實驗庫的 NAS 量測與 v8 相容升級，保留已完成計畫
+及語意還原 post-hook，不需重新安裝或逐批轉貼。
+完整實作、量測及恢復安裝參考見 [並行管線](lab203_parallel_backup_2026-10-04.md)。
+下方五分鐘 post-hook／v7 安裝介面保留為既有部署與恢復紀錄。
 
 ## 新增的自動語義驗收
 
@@ -53,11 +89,11 @@ hardlink／程序引用後只回收它自己建立且已成功驗收的 private 
 `assemble_restored_backup.py` 已可重建，但這一版不宣稱已對全目錄排程重建。
 每個新增冷檔的 NAS 全檔案還原／SHA 驗證仍由既有 worker 自動持續進行。
 
-## lab203 一次性安裝
+## lab203 首次安裝程序（已完成，供恢復參考）
 
-這台 penguin 只有 Syncthing 通道，無 SSH 或接收端 systemd 控制權。需由 lab203
-本機 Codex **安裝一次**固定 v7；之後任務、重試與結果都走現有同步通道。
-不需要逐批人工操作，也不必把收據貼回聊天。
+這台 penguin 只有 Syncthing 通道，無 SSH 或接收端 systemd 控制權。lab203
+本機 Codex 已完成固定 v7 的一次性安裝；任務、重試與結果走現有同步通道。
+下列保留首次安裝介面供恢復參考，現有正常部署不需重新安裝或逐批轉貼。
 
 新 package：`/srv/lab203-backup/ingress/tools/continuous-backup-20261004-v7/`。
 用**原本已驗收的** source verifier，按 penguin 的 publication receipt 核對

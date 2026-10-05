@@ -71,3 +71,28 @@ def test_context_only_product_is_not_advertised_as_a_trainable_account():
         start=date(2020, 1, 1), end=date(2020, 1, 7))
     assert set(selected["product"]) == {"A", "B"}
     assert not scope.filter(pl.col("product") == "C")["selected"].any()
+
+
+def test_early_cpf_gap_excludes_whole_lifetime_but_keeps_verified_later_cpf():
+    frame, rules, flags = fixture()
+    frame = frame.with_columns(pl.lit('CPF').alias('product'))
+    flags = flags.with_columns((pl.col('physical_contract') == 'A').alias('has_blocker'))
+    selected, chosen, scope = select_complete_margin_components(frame,rules,flags,
+        start=date(2020,1,1),end=date(2020,1,7))
+    # The failed early owner and its transferred successor stay together;
+    # a separate complete later month of the SAME product remains admitted.
+    assert set(selected['physical_contract']) == {'C'}
+    assert set(chosen['physical_contract']) == {'C'}
+    assert set(selected['product']) == {'CPF'}
+    assert not scope.filter(pl.col('physical_contract').is_in(['A','B']))['selected'].any()
+
+
+def test_empty_context_keeps_all_predecessors_without_admitting_unrelated_early_cpf():
+    from scripts.prepare_tw_futures_margin_training import _selected_empty_context_keys
+    day=date(2020,1,2)
+    selected=pl.DataFrame([dict(date=day,physical_contract='CURRENT')])
+    suppressed=pl.DataFrame([dict(date=day,physical_contract='CURRENT',carry_from_physical_contract='PREVIOUS')])
+    empty=pl.DataFrame([dict(date=day,physical_contract=p,carry_from_physical_contract=origin)
+        for p,origin in [('PREVIOUS','GRANDPARENT'),('GRANDPARENT','ROOT'),('ROOT',''),('EARLY_CPF','')]])
+    keys=_selected_empty_context_keys(selected,empty,suppressed)
+    assert set(keys['physical_contract'])=={'PREVIOUS','GRANDPARENT','ROOT'}

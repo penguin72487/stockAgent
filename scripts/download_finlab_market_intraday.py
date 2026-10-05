@@ -319,6 +319,31 @@ def _bootstrap_derived(db: sqlite3.Connection, root: Path) -> None:
             continue
 
 
+def _repair_derived_errors(db: sqlite3.Connection, root: Path, *, now: datetime) -> int:
+    """Retry a bounded local derivation queue, not the already stored API data.
+
+    Malformed partitions remain explicit errors and do not block the batch.
+    An hourly local retry protects CPU; new source receipts are also repaired
+    by the ordinary cached/new-partition path without that delay.
+    """
+    rows = db.execute("""SELECT symbol,trade_date FROM partitions
+                         WHERE kind=? AND status='derivation_error' AND checked_at_utc < ?
+                         ORDER BY checked_at_utc LIMIT 8""",
+                      (DERIVED_INDEX_KIND, (now-timedelta(hours=1)).isoformat())).fetchall()
+    repaired = 0
+    for symbol, day_text in rows:
+        day = date.fromisoformat(day_text)
+        key = f"tw_tick:{symbol}"
+        receipt = _stored_receipt(_partition_paths(root, key, day)[0], root, key, day)
+        if receipt is None:
+            continue
+        _record_tick_and_minute(db, root, symbol, day, receipt)
+        current = db.execute("SELECT status FROM partitions WHERE kind=? AND symbol=? AND trade_date=?",
+                             (DERIVED_INDEX_KIND, symbol, day_text)).fetchone()
+        repaired += bool(current and current[0] != "derivation_error")
+    return repaired
+
+
 def _candidate(flat: int, days: list[date], universe: list[dict],
                *, newest_first: bool) -> tuple[str, dict, date]:
     width = len(universe) * len(KINDS)
@@ -518,6 +543,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     if not cursor.get("derived_bootstrapped"):
         _bootstrap_derived(index, root)
         cursor["derived_bootstrapped"] = True
+    _repair_derived_errors(index, root, now=now)
     slots = len(days) * width
     former_tasks = _former_probe_tasks(universe, days)
     started = datetime.now(UTC)
@@ -529,6 +555,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     started_clock = time.monotonic()
     deadline = started_clock + max_run_seconds if max_run_seconds is not None else None
     active_key = active_day = None
+    last_success_at = None
     durations: list[float] = []
     quota_checks = cached_skips = 0
     last_status_clock = started_clock
@@ -553,6 +580,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             "scanned_candidates": scanned, "cached_skips": cached_skips,
             "quota_checks": quota_checks, "elapsed_seconds": round(time.monotonic() - started_clock, 3),
             "sample_count": len(durations), "seconds_per_attempt_estimate": median,
+            "last_success_at_utc": last_success_at,
             "remaining_batch_seconds_estimate": batch_seconds,
             "estimated_batch_finish_at_utc": (boundary + timedelta(seconds=batch_seconds)).isoformat()
                 if batch_seconds is not None and state == "batch_limit" else None,
@@ -601,7 +629,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         return True
 
     def acquire(kind: str, symbol: str, day: date, *, retry=False):
-        nonlocal attempts, successes, active_key, active_day, state
+        nonlocal attempts, successes, active_key, active_day, state, last_success_at
         active_key, active_day = f"{kind}:{symbol}", day.isoformat()
         attempts += 1
         checkpoint()
@@ -610,6 +638,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             receipt = fetch(root, active_key, day, now=datetime.now(UTC))
             _record_tick_and_minute(index, root, symbol, day, receipt)
             successes += 1
+            last_success_at = datetime.now(UTC).isoformat()
             print(f"[finlab-market] {'retry ' if retry else ''}{active_key} {day}: {receipt['status']}", flush=True)
         except Exception as exc:
             from scripts.download_finlab_intraday import record_failed_partition

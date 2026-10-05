@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume exact code verification and refresh PostgreSQL node readiness
+
+[Timer]
+OnBootSec=90s
+OnActiveSec=10s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=stockagent-control-release-verification.service
+
+[Install]
+WantedBy=timers.target

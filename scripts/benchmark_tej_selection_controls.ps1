@@ -51,16 +51,17 @@ $samples=[Collections.Generic.List[object]]::new();$checks=[Collections.Generic.
 function Check([string]$name,[bool]$ok) {$checks.Add(@{name=$name;accepted=$ok});if(-not $ok){throw ('Operation benchmark failed: '+$name)}}
 try {
     $owns=$mutex.WaitOne(0);if(-not $owns){throw 'Another desktop owner prevents benchmarking'}
-    foreach($name in @('Assert-Scope','Find-QueryGroup','Native-Controls','Control','Message','Items','Lists','Company-SelectButton')) {
+    $definitions=@('Assert-Scope','Find-QueryGroup','Native-Controls','Control','Message','Items','Lists','Company-SelectButton')
+    foreach($name in $definitions) {
         Invoke-Expression (Definition $current $name)
     }
     Invoke-Expression (GuardDefinition (Definition $current 'Click-ResolvedButton') '[void](Message $h 0xF5)')
     Invoke-Expression (Definition $current 'Select-Company')
-    $old=GuardDefinition (Definition $baseline 'Select-Company') '[void](Message $buttons[0].Current.NativeWindowHandle 0xF5)'
-    Invoke-Expression ($old.Replace('function Select-Company','function Resolve-CompanyBaseline'))
     Assert-Scope $ExpectedWindow
     Check 'original_owned_root_enabled' ($root.Current.IsEnabled -and [TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0)
     $source=Find-QueryGroup 'Data Source';$company=Find-QueryGroup 'Company Setting';$dates=Find-QueryGroup 'Date Setting'
+    $dated=$dates.Current.IsEnabled
+    $controlsPerIteration=$(if($dated){3}else{2})
     $companyLists=Lists $company
     if($companyLists.Count -ne 4){throw 'Original four-list company layout required'}
     foreach($pair in @(@('Type',$request.type),@('SmartID',$request.smart_id),@('Data',$request.table))) {
@@ -87,31 +88,35 @@ try {
     Check 'simultaneous_second_windows_worker_refused_before_ui' ($competing.owner_acquired -eq $false -and $competing.ui_operations_sent -eq 0)
     foreach($order in @(@('baseline','resolved'),@('resolved','baseline'))) {
         foreach($mode in $order) {
-            # Baseline/current native control enumeration is identical; use
-            # each exact root-identity implementation for the full comparison.
-            if($mode -eq 'baseline'){Invoke-Expression (Definition $baseline 'Assert-Scope')}
-            else{Invoke-Expression (Definition $current 'Assert-Scope')}
+            # Compare the complete canonical guarded-resolution path from
+            # each revision, even when both already support resolved buttons.
+            $selectedAst=$(if($mode -eq 'baseline'){$baseline}else{$current})
+            foreach($name in $definitions){Invoke-Expression (Definition $selectedAst $name)}
+            Invoke-Expression (GuardDefinition (Definition $selectedAst 'Click-ResolvedButton') '[void](Message $h 0xF5)')
+            Invoke-Expression (Definition $selectedAst 'Select-Company')
             $clock=[Diagnostics.Stopwatch]::StartNew()
-            if($mode -eq 'resolved') {
-                $companyButton=Company-SelectButton;$fieldButton=Control $source 'Select' '*BUTTON*';$dateButton=Control $dates 'Select' '*BUTTON*'
-            }
+            $companyButton=Company-SelectButton;$fieldButton=Control $source 'Select' '*BUTTON*'
+            if($dated){$dateButton=Control $dates 'Select' '*BUTTON*'}
             for($i=0;$i -lt $Iterations;$i++) {
-                if($mode -eq 'baseline') {
-                    Resolve-CompanyBaseline
-                    [void](Control $source 'Select' '*BUTTON*');[void](Control $dates 'Select' '*BUTTON*')
-                }else {
-                    Select-Company $companyButton
-                    Click-ResolvedButton $source $fieldButton 'Select';Click-ResolvedButton $dates $dateButton 'Select'
-                }
+                Select-Company $companyButton
+                Click-ResolvedButton $source $fieldButton 'Select'
+                if($dated){Click-ResolvedButton $dates $dateButton 'Select'}
+                # Acquisition also re-resolves these identities at batch
+                # boundaries. Measure the same work in both revisions.
+                [void](Company-SelectButton);[void](Control $source 'Select' '*BUTTON*')
+                if($dated){[void](Control $dates 'Select' '*BUTTON*')}
             }
             if($mode -eq 'resolved') {
                 Check 'company_button_stable' ((Company-SelectButton) -eq $companyButton)
                 Check 'field_button_stable' ((Control $source 'Select' '*BUTTON*') -eq $fieldButton)
-                Check 'date_button_stable' ((Control $dates 'Select' '*BUTTON*') -eq $dateButton)
+                if($dated){Check 'date_button_stable' ((Control $dates 'Select' '*BUTTON*') -eq $dateButton)}
             }
-            $clock.Stop();$samples.Add(@{mode=$mode;seconds=$clock.Elapsed.TotalSeconds;iterations=$Iterations;controls_per_iteration=3})
+            $clock.Stop();$samples.Add(@{mode=$mode;seconds=$clock.Elapsed.TotalSeconds;iterations=$Iterations;controls_per_iteration=$controlsPerIteration})
         }
     }
+    foreach($name in $definitions){Invoke-Expression (Definition $current $name)}
+    Invoke-Expression (GuardDefinition (Definition $current 'Click-ResolvedButton') '[void](Message $h 0xF5)')
+    Invoke-Expression (Definition $current 'Select-Company')
     $wrongGroupRejected=$false;try{Click-ResolvedButton $dates $fieldButton 'Select'}catch{$wrongGroupRejected=$true}
     Check 'resolved_button_wrong_parent_refused' $wrongGroupRejected
     $wrongNameRejected=$false;try{Click-ResolvedButton $source $fieldButton 'Different'}catch{$wrongNameRejected=$true}
@@ -138,7 +143,7 @@ try {
     }
     $dateLists=Lists $dates
     $allCompanies=$request.company_labels.Count -eq (Message $companyLists[2].Current.NativeWindowHandle 0x18B)
-    $allDates=$request.date_labels.Count -eq (Message $dateLists[0].Current.NativeWindowHandle 0x18B)
+    $allDates=$dated -and $dateLists.Count -gt 0 -and $request.date_labels.Count -eq (Message $dateLists[0].Current.NativeWindowHandle 0x18B)
     if($allCompanies -and $allDates) {
         foreach($order in @(@('redundant_all_lookup','verified_all_shortcut'),@('verified_all_shortcut','redundant_all_lookup'))) {
             foreach($mode in $order) {

@@ -37,6 +37,7 @@ from common import (  # noqa: E402
 )
 from artifact_io import archive_run_reports  # noqa: E402
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from quality_priority import collect_with_quality_priority, prioritize_records  # noqa: E402
 from http_transport import RETRYABLE_NETWORK_ERRORS  # noqa: E402
 from dataset_lock import (  # noqa: E402
     DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -162,6 +163,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit", type=int, default=None, help="Optional symbol limit for quick tests"
     )
+    parser.add_argument('--symbols', nargs='+', default=None,
+                        help='Exact quality-repair subset; preserve global catalog and reports.')
     parser.add_argument(
         "--refresh", action="store_true", help="Re-download even if parquet exists"
     )
@@ -817,6 +820,8 @@ def _download_symbol_1m(
         # The merge needs this logical frame anyway. Inspect actual dates,
         # rather than trusting footer counts or ignoring internal minute gaps.
         existing_frame = read_logical_parquet(output_path)
+        if existing_info.earliest_ms is not None:
+            requested_start_ms = max(start_ms, min(requested_start_ms, existing_info.earliest_ms))
         planned = plan_candle_reconcile_windows(
             existing_frame, earliest_ms=existing_info.earliest_ms,
             latest_ms=existing_info.latest_ms, start_ms=requested_start_ms,
@@ -1026,17 +1031,28 @@ def _run_locked_download(
         retry_base=args.retry_base,
     )
 
-    symbols = _fetch_swap_symbols(client, limit=args.limit)
+    symbols = _fetch_swap_symbols(client, limit=None if args.symbols else args.limit)
+    report_root = output_dir
+    if args.symbols:
+        if not args.skip_historical_features:
+            raise ValueError('--symbols quality repair requires --skip-historical-features')
+        wanted = set(args.symbols)
+        symbols = [row for row in symbols if row.code in wanted or row.okx_symbol in wanted]
+        if wanted - {value for row in symbols for value in (row.code, row.okx_symbol)}:
+            raise ValueError('requested OKX symbols unavailable in live source catalog')
+        report_root = output_dir / 'quality_repair_runs' / started_at.strftime('%Y%m%dT%H%M%S%fZ')
+        report_root.mkdir(parents=True, exist_ok=False)
     if not symbols:
         raise RuntimeError("No live OKX SWAP symbols found.")
+    symbols = prioritize_records(symbols, output_dir, tail_only=args.tail_only)
 
-    symbols_path = output_dir / "symbols.csv"
+    symbols_path = report_root / "symbols.csv"
     atomic_write_text(
         symbols_path,
         pl.DataFrame([asdict(s) for s in symbols]).write_csv(),
     )
     pipeline_progress = PersistentProgress(
-        output_dir / "progress.json",
+        report_root / "progress.json",
         label="OKX 永續合約 1 分鐘 K線與歷史特徵",
         total=len(symbols)
         + len(symbols)
@@ -1050,7 +1066,7 @@ def _run_locked_download(
     )
 
     def _worker(record: SymbolRecord) -> DownloadResult:
-        result = _download_symbol_1m(
+        result = collect_with_quality_priority(lambda page: _download_symbol_1m(
             client,
             record,
             output_dir,
@@ -1059,10 +1075,9 @@ def _run_locked_download(
             args.mode,
             args.refresh,
             tail_only=args.tail_only,
-            page_progress_callback=lambda _code: pipeline_progress.observe(
-                "candles", "request_pages"
-            ),
-        )
+            page_progress_callback=page,
+        ), root=output_dir, code=record.code, tail_only=args.tail_only,
+            page_observer=lambda _code: pipeline_progress.observe('candles', 'request_pages'))
         pipeline_progress.update("candles", result.status)
         return result
 
@@ -1089,7 +1104,7 @@ def _run_locked_download(
         on_error=_on_error,
     )
 
-    feature_catalog_path = output_dir / "okx_historical_feature_catalog.json"
+    feature_catalog_path = report_root / "okx_historical_feature_catalog.json"
     atomic_write_text(
         feature_catalog_path,
         json.dumps(feature_catalog_payload(), ensure_ascii=False, indent=2) + "\n",
@@ -1128,7 +1143,7 @@ def _run_locked_download(
             ),
         )
 
-    historical_feature_report_path = output_dir / "historical_feature_report.csv"
+    historical_feature_report_path = report_root / "historical_feature_report.csv"
     feature_rows = historical_feature_result_rows(historical_feature_results)
     feature_report = (
         pl.DataFrame(feature_rows, infer_schema_length=None)
@@ -1156,8 +1171,8 @@ def _run_locked_download(
             feature_report.write_csv(),
         )
 
-    report_path = output_dir / "download_report.csv"
-    summary_path = output_dir / "download_summary.json"
+    report_path = report_root / "download_report.csv"
+    summary_path = report_root / "download_summary.json"
 
     historical_by_code = {result.code: result for result in historical_feature_results}
     result_rows = []
@@ -1207,6 +1222,8 @@ def _run_locked_download(
         "asset_class": "crypto_okx_perp",
         "interval": KLINE_BAR,
         "volume_units": VOLUME_UNIT_CONTRACT,
+        "requested_symbol_filter": args.symbols,
+        "provider_scope_is_complete": not bool(args.symbols),
         "symbol_count": len(symbols),
         "row_count": row_count,
         "status_counts": status_counts,
@@ -1234,7 +1251,7 @@ def _run_locked_download(
     summary_text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     atomic_write_text(
         feature_run_summary_path(
-            output_dir, features_enabled=not args.skip_historical_features
+            report_root, features_enabled=not args.skip_historical_features
         ),
         summary_text,
     )

@@ -1,0 +1,13 @@
+# Same fixed source and completed nullable panel; do not rebuild the data view.
+# Explicit temporal FP32 island fixes stock-chunk BF16 rounding amplification.
+# Global AMP remains BF16; old model/optimizer trajectories are incompatible.
+base_config: tw_day_trade_factorized_native_20261005_gaprepair_v4.yaml
+experiment_name: tw-day-trade-native-nullable-gaprepair-v4-temporal-fp32-v1
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/training-bf16-temporal-fp32-v1
+  resume: false
+
+training:
+  financial_transformer:
+    temporal_blocks_fp32: true

@@ -260,6 +260,27 @@ def _opening_signal_latency_record(
         "signal_other_compute_ms": signal_other_ms,
         "artifact_publish_ms": live_latency.get("artifact_publish_ms"),
     }
+    quote_transport = live_latency.get("quote_transport")
+    if isinstance(quote_transport, dict):
+        for stage, transport_key in (
+            ("quote_usage_before_ms", "snapshot_usage_before_ms"),
+            ("quote_request_body_ms", "snapshot_request_body_ms"),
+            ("quote_usage_after_ms", "snapshot_usage_after_ms"),
+            ("quote_traffic_record_ms", "snapshot_ledger_record_ms"),
+            ("quote_broker_queue_ms", "server_request_queue_ms"),
+            ("quote_response_encode_ms", "server_snapshot_serialize_ms"),
+            ("quote_lock_queue_ms", "snapshot_lock_queue_ms"),
+            ("quote_contract_prepare_ms", "snapshot_contract_prepare_ms"),
+            ("quote_submit_ms", "snapshot_submit_ms"),
+            ("quote_callback_wait_ms", "snapshot_callback_wait_ms"),
+            ("quote_callback_parse_ms", "snapshot_callback_parse_ms"),
+            ("quote_output_assemble_ms", "snapshot_output_assemble_ms"),
+            ("quote_limit_resolve_ms", "snapshot_limit_resolve_ms"),
+        ):
+            # Nested spans explain the quote total; they must not be summed
+            # into it or invented for legacy receipts that lack the fields.
+            if quote_transport.get(transport_key) is not None:
+                stages[stage] = quote_transport[transport_key]
     return {
         "schema_version": 2,
         "recorded_at": datetime.now().astimezone().isoformat(

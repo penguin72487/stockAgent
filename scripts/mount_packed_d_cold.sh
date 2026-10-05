@@ -16,14 +16,11 @@ case "$1" in
   *) usage ;;
 esac
 
-check_volume() {
+check_volume_identity() {
   [[ "$(findmnt -n -o TARGET -T "$volume")" == "$volume" &&
      "$(findmnt -n -o SOURCE -T "$volume")" == 'D:' &&
      "$(findmnt -n -o FSTYPE -T "$volume")" == 9p ]] || {
     printf 'enrolled D: DrvFs volume is not mounted\n' >&2; exit 2;
-  }
-  findmnt -n -o OPTIONS -T "$volume" | tr ',' '\n' | rg -qx 'msize=8192' || {
-    printf 'D: DrvFs request size is not 8192 bytes\n' >&2; exit 2;
   }
   [[ -f "$volume_marker" && ! -L "$volume_marker" ]] || {
     printf 'D primary volume marker is missing or redirected\n' >&2; exit 2;
@@ -42,6 +39,13 @@ assert marker == {
 }
 PY
     printf 'D primary volume identity mismatch\n' >&2; exit 2;
+  }
+}
+
+check_volume() {
+  check_volume_identity
+  findmnt -n -o OPTIONS -T "$volume" | tr ',' '\n' | rg -qx 'msize=8192' || {
+    printf 'D: DrvFs request size is not 8192 bytes\n' >&2; exit 2;
   }
 }
 
@@ -81,6 +85,23 @@ check_canonical() {
   }
 }
 
+if [[ "$1" == --unmount ]]; then
+  # Stopping the owner must also work after WSL restores a custom DrvFs
+  # mount with default options. Performance drift cannot strand old binds.
+  # Native umount still refuses busy mounts; never use force or lazy detach.
+  if [[ "$(findmnt -n -o TARGET -T "$canonical")" == "$canonical" ]]; then
+    [[ "$(findmnt -n -o SOURCE -T "$canonical")" == 'D:[/stockagent-cold-primary/packed]' &&
+       "$(findmnt -n -o FSTYPE -T "$canonical")" == 9p &&
+       ! -L "$canonical" ]] || { printf 'unexpected canonical mount; refusing detach\n' >&2; exit 2; }
+    umount "$canonical"
+  fi
+  if [[ "$(findmnt -n -o TARGET -T "$volume")" == "$volume" ]]; then
+    check_volume_identity
+    umount "$volume"
+  fi
+  exit 0
+fi
+
 if [[ "$1" == --mount && "$(findmnt -n -o TARGET -T "$volume")" != "$volume" ]]; then
   [[ -d "$volume" && ! -L "$volume" ]] || {
     printf 'D primary mountpoint missing or redirected\n' >&2; exit 2;
@@ -102,8 +123,3 @@ if [[ "$1" == --mount && "$(findmnt -n -o TARGET -T "$canonical")" != "$canonica
   mount --bind "$primary" "$canonical"
 fi
 check_canonical
-
-if [[ "$1" == --unmount ]]; then
-  umount "$canonical"
-  umount "$volume"
-fi

@@ -8,12 +8,14 @@ source objects, code/SQL batches and NAS snapshots are preserved.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import time
 import uuid
 
@@ -371,6 +373,8 @@ class BackupStream:
         self.config = configuration
         if type(configuration.get("include_unreferenced_cold_objects", False)) is not bool:
             raise SnapshotError("unreferenced cold inclusion must be an explicit boolean")
+        if type(configuration.get("cold_object_replication_enabled", True)) is not bool:
+            raise SnapshotError("cold object replication must be an explicit boolean")
         cache = configuration.get("cold_transport_cache", {})
         if cache.get("enabled") is True and configuration.get("automatic_batch_deletion") is not True:
             raise SnapshotError("cold cache retirement must be reported as automatic batch deletion")
@@ -401,6 +405,16 @@ class BackupStream:
         if "maximum_staging_bytes" in configuration and (type(configuration["maximum_staging_bytes"]) is not int
                                                        or configuration["maximum_staging_bytes"] <= 0):
             raise SnapshotError("staging capacity must be a positive integer")
+        self.pipeline = configuration.get("pipeline", {})
+        if self.pipeline:
+            if set(self.pipeline) != {"maximum_waves_per_cycle", "copy_workers", "verify_workers", "retry_delays_seconds"}:
+                raise SnapshotError("source pipeline needs an exact bounded policy")
+            for key in ("maximum_waves_per_cycle", "copy_workers", "verify_workers"):
+                if type(self.pipeline[key]) is not int or not 1 <= self.pipeline[key] <= 16:
+                    raise SnapshotError("source pipeline workers and waves must be between 1 and 16")
+            if not isinstance(self.pipeline["retry_delays_seconds"], list) or not self.pipeline["retry_delays_seconds"] or any(
+                    type(n) is not int or not 1 <= n <= 86400 for n in self.pipeline["retry_delays_seconds"]):
+                raise SnapshotError("source pipeline retry delays must be bounded")
 
     def storage_guard(self) -> None:
         for mount_name, expected_source in self.config.get("required_mounts", {}).items():
@@ -477,16 +491,35 @@ class BackupStream:
         # Include old pilots, orphaned failed copies and quarantined staging.
         # Journal counters alone would miss those retained physical bytes.
         total = staging = 0
-        for parent, directories, names in os.walk(self.transport, followlinks=False):
+        if any(p.is_symlink() for p in (self.transport,*self.transport.parents)):
+            raise SnapshotError("transport capacity root is redirected")
+        before = self.transport.stat()
+        def walk_error(error):
+            raise error
+        # A directory FD pins each traversed parent. One no-follow stat per
+        # entry replaces repeatedly walking every ancestor on slow DrvFs/9p.
+        for parent, directories, names, directory_fd in os.fwalk(
+                self.transport, follow_symlinks=False, onerror=walk_error):
             root = Path(parent)
-            if any((root / n).is_symlink() for n in directories):
-                raise SnapshotError("transport contains a redirected directory")
+            opened = os.fstat(directory_fd)
+            if opened.st_dev != before.st_dev or (root == self.transport and opened.st_ino != before.st_ino):
+                raise SnapshotError("transport contains another mounted volume")
+            for name in directories:
+                observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != before.st_dev:
+                    raise SnapshotError("transport contains a redirected directory")
             for name in names:
-                path = _regular(root / name)
-                size = path.stat().st_size
+                path = root / name
+                observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISREG(observed.st_mode) or observed.st_dev != before.st_dev:
+                    raise SnapshotError("transport contains a redirected or nonregular file")
+                size = observed.st_size
                 total += size
                 if path.is_relative_to(self.transport / ".staging"):
                     staging += size
+        after = self.transport.stat()
+        if (before.st_dev,before.st_ino) != (after.st_dev,after.st_ino):
+            raise SnapshotError("transport authority changed during capacity inventory")
         return {"retained_transport_bytes": total, "retained_staging_bytes": staging}
 
     def staging_room(self, usage: dict) -> int:
@@ -554,65 +587,118 @@ class BackupStream:
             private_json(self.state / "catalog.json", catalog)
             covered = coverage(catalog, ledger)
             state = "inspected"
-            selection = []
-            auxiliary_selected = False
             readiness_error = None
-            limit = self.config["maximum_batch_bytes"]
-            if publish:
-                state = "waiting_receiver_readiness"
-                try:
-                    ready = read_json(self.receipts / "readiness.json")
-                    validate_readiness(ready, self.config)
-                    reserve = max(self.config["reserve_bytes"], ready["reserve_bytes"])
-                    limit = min(limit, ready["maximum_batch_bytes"],
-                                ready["ingress_free_bytes"] - reserve - covered["pending_bytes"],
-                                ready["nas_free_bytes"] - reserve - covered["pending_bytes"])
-                except (OSError, ValueError, KeyError, TypeError) as error:
-                    readiness_error = type(error).__name__
-                    limit = 0
-                if limit > 1024 * 1024:
-                    state = "backpressure"
-                    usage = self.transport_usage()
-                    limit = min(limit, self.config["maximum_pending_bytes"] - covered["pending_bytes"],
-                                self.staging_room(usage))
-                    if covered["pending_delivery_count"] < self.config["maximum_pending_deliveries"] and limit > 1024 * 1024:
-                        auxiliary = ledger.get("auxiliary_pending")
-                        if auxiliary and auxiliary["complete_bytes"] <= limit:
-                            auxiliary_selected = True
-                            state = "publishing_auxiliary"
-                        else:
-                            selection = select_wave(catalog, covered["published_file_keys"] | covered["accepted_file_keys"],
-                                                    maximum_bytes=limit, maximum_files=self.config["maximum_batch_files"])
+            published_waves, export_errors = [], []
+            scan_errors = []
+            retries = ledger.setdefault("export_retries", {})
+            # Hashing/indexing batch N runs while the source exports batch N+1.
+            # The single controller still owns every ledger mutation.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="backup-scan") as scanner:
+                scans = []
+                for _ in range(self.pipeline.get("maximum_waves_per_cycle", 1) if publish else 0):
+                    # NAS ACKs can arrive while the preceding wave is copied.
+                    # Reconcile on this controller before applying admission.
+                    if published_waves:
+                        receipt_errors.extend(self.ingest(ledger))
+                    covered = coverage(catalog, ledger)
+                    try:
+                        ready = read_json(self.receipts / "readiness.json")
+                        validate_readiness(ready, self.config)
+                        reserve = max(self.config["reserve_bytes"], ready["reserve_bytes"])
+                        limit = min(self.config["maximum_batch_bytes"], ready["maximum_batch_bytes"],
+                            ready["ingress_free_bytes"] - reserve - covered["pending_bytes"],
+                            ready["nas_free_bytes"] - reserve - covered["pending_bytes"],
+                            self.config["maximum_pending_bytes"] - covered["pending_bytes"],
+                            self.staging_room(self.transport_usage()))
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        readiness_error = type(error).__name__
+                        state = "waiting_receiver_readiness"
+                        break
+                    if covered["pending_delivery_count"] >= self.config["maximum_pending_deliveries"] or limit <= 1024**2:
+                        state = "backpressure"
+                        break
+                    deferred = {key for key, item in retries.items() if item["next_attempt_epoch"] > time.time()}
+                    auxiliary = ledger.get("auxiliary_pending")
+                    selection = [] if (not self.config.get("cold_object_replication_enabled", True)
+                        or auxiliary and auxiliary["complete_bytes"] <= limit) else select_wave(
+                        catalog, covered["published_file_keys"] | covered["accepted_file_keys"] | deferred,
+                        maximum_bytes=limit, maximum_files=self.config["maximum_batch_files"])
+                    if auxiliary and auxiliary["complete_bytes"] <= limit:
+                        staging = safe_path(self.transport, auxiliary["staging_relative"])
+                        key = auxiliary["export"]["envelope_identity_sha256"]
+                        self.publish_closed(ledger, auxiliary["files"], staging, key,
+                                            catalog["identity_sha256"], "code_and_control_backup")
+                        ledger["last_auxiliary_delivery"] = key
+                        ledger.pop("auxiliary_pending", None)
+                    elif selection:
+                        staging = self.transport / ".staging" / uuid.uuid4().hex
+                        try:
+                            result = export_incremental_delivery(self.backup_read_root(), selection, staging,
+                                catalog_identity=catalog["identity_sha256"],
+                                copy_workers=self.pipeline.get("copy_workers", 1),
+                                verify_workers=self.pipeline.get("verify_workers", 1))
+                        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                            if not self.pipeline:
+                                raise  # Preserve the existing diagnostic interface.
+                            delays = self.pipeline["retry_delays_seconds"]
+                            for row in selection:
+                                key = file_key(row)
+                                attempt = retries.get(key, {}).get("attempts", 0) + 1
+                                retries[key] = {"attempts": attempt,
+                                    "next_attempt_epoch": time.time() + delays[min(attempt - 1, len(delays) - 1)],
+                                    "error_type": type(error).__name__,
+                                    "staging_relative": staging.relative_to(self.transport).as_posix()}
+                            export_errors.append({"error_type": type(error).__name__, "files": len(selection),
+                                "staging_relative": staging.relative_to(self.transport).as_posix()})
+                            private_json(self.ledger_path, ledger)
+                            state = "export_requeued"
+                            continue
+                        key = result["envelope_identity_sha256"]
+                        self.publish_closed(ledger, selection, staging, key,
+                                            catalog["identity_sha256"], "incremental_cold_objects")
+                        for row in selection:
+                            retries.pop(file_key(row), None)
+                    else:
+                        if not self.config.get("cold_object_replication_enabled", True):
+                            state = "cold_replication_delegated_to_immutable_lake"
+                            break
                         unsent = [r for r in catalog["files"] if file_key(r) not in (
                             covered["published_file_keys"] | covered["accepted_file_keys"])]
-                        state = ("publishing" if selection else "waiting_object_exceeds_batch_budget" if unsent
-                                 else "available_cold_files_complete_with_history_gaps" if catalog["missing_objects"]
-                                 else "caught_up_with_available_cold_files")
-            if auxiliary_selected:
-                pending = ledger["auxiliary_pending"]
-                staging = safe_path(self.transport, pending["staging_relative"])
-                self.publish_closed(ledger, pending["files"], staging, pending["export"]["envelope_identity_sha256"],
-                                    catalog["identity_sha256"], "code_and_control_backup")
-                ledger["last_auxiliary_delivery"] = pending["export"]["envelope_identity_sha256"]
-                del ledger["auxiliary_pending"]
-                state = "published_waiting_nas_receipt"
-            elif selection:
-                staging_parent = self.transport / ".staging"
-                staging_parent.mkdir(mode=0o700, exist_ok=True)
-                staging = staging_parent / uuid.uuid4().hex
-                result = export_incremental_delivery(self.backup_read_root(), selection, staging,
-                                                     catalog_identity=catalog["identity_sha256"])
-                self.publish_closed(ledger, selection, staging, result["envelope_identity_sha256"],
-                                    catalog["identity_sha256"], "incremental_cold_objects")
+                        state = ("waiting_export_retry" if any(file_key(r) in deferred for r in unsent)
+                            else "waiting_object_exceeds_batch_budget" if unsent
+                            else "available_cold_files_complete_with_history_gaps" if catalog["missing_objects"]
+                            else "caught_up_with_available_cold_files")
+                        break
+                    self.recover_publications(ledger)
+                    private_json(self.ledger_path, ledger)
+                    # Snapshot the controller-owned ledger before handing it to
+                    # the scan thread; worker threads never touch that journal.
+                    one = {"deliveries": {key: json.loads(json.dumps(ledger["deliveries"][key]))}}
+                    scans.append(scanner.submit(self.scan_transport, one))
+                    published_waves.append(key)
+                    state = "published_waiting_nas_receipt"
+                for future in scans:
+                    try:
+                        future.result()
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                        scan_errors.append(type(error).__name__)
+            if published_waves:
                 state = "published_waiting_nas_receipt"
             self.recover_publications(ledger)
             private_json(self.ledger_path, ledger)
             covered = coverage(catalog, ledger)
             result = {"state": state, "catalog_identity_sha256": catalog["identity_sha256"],
+                "cold_object_replication_enabled": self.config.get("cold_object_replication_enabled", True),
                 **self.transport_usage(),
                 **{k: v for k, v in covered.items() if not k.endswith("file_keys")},
                 "receipt_errors": receipt_errors, "readiness_error": readiness_error,
                 "auxiliary_error": auxiliary_error,
+                "pipeline": {"published_waves": published_waves, "export_errors": export_errors,
+                    "scan_errors": scan_errors, "deferred_files": sum(
+                        item["next_attempt_epoch"] > time.time() for item in retries.values()),
+                    "maximum_in_flight": self.config["maximum_pending_deliveries"],
+                    "copy_workers": self.pipeline.get("copy_workers", 1),
+                    "verify_workers": self.pipeline.get("verify_workers", 1)},
                 "automatic_recovery_requests": automatic_recovery,
                 "last_auxiliary_delivery": ledger.get("last_auxiliary_delivery"),
                 "auxiliary_pending": bool(ledger.get("auxiliary_pending")),
@@ -637,6 +723,12 @@ class BackupStream:
                     result["automatic_recovery"] = queue_status(self.config, self.transport, self.receipts)
                 except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
                     result["automatic_recovery"] = {"state": "invalid_queue_evidence", "error_type": type(error).__name__}
+            if self.pipeline:
+                from stockagent.data_sync.backup_relay_pipeline import receiver_status
+                try:
+                    result["parallel_receiver"] = receiver_status(self.config, self.transport, self.receipts)
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                    result["parallel_receiver"] = {"state": "invalid_pipeline_evidence", "error_type": type(error).__name__}
             private_json(self.state / "status.json", result)
             atomic_write_bytes(self.transport / "tools/source-status.json",
                                json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2).encode(), mode=0o600)
@@ -645,7 +737,8 @@ class BackupStream:
                                    ensure_ascii=False, sort_keys=True, indent=2).encode()
             if not index_path.exists() or index_path.read_bytes() != raw_index:
                 atomic_write_bytes(index_path, raw_index, mode=0o600)
-            self.scan_transport(ledger)
+            if not published_waves or scan_errors:
+                self.scan_transport(ledger)
             return result
 
     def publish_recovery_requests(self, *, wait_for_owner: bool = False) -> dict:
@@ -733,7 +826,8 @@ class BackupStream:
     def publish_closed(self, ledger: dict, rows: list[dict], staging: Path, envelope_id: str,
                        catalog_identity: str, kind: str) -> None:
         from scripts.verify_backup_delivery import verify
-        verified = verify(staging, envelope_id, include_file_signatures=kind == "incremental_cold_objects")
+        verified = verify(staging, envelope_id, include_file_signatures=kind == "incremental_cold_objects",
+                          workers=self.pipeline.get("verify_workers", 1))
         batch = self.transport / ("batch-" + envelope_id)
         if batch.exists():
             raise SnapshotError("unrecorded existing batch needs explicit recovery")
@@ -773,13 +867,13 @@ class BackupStream:
             del ledger["auxiliary_pending"]
             ledger["auxiliary_last_capture_epoch"] = 0
         config = self.config["auxiliary"]
-        if self.staging_room(self.transport_usage()) < config["maximum_bytes"] + 1024**2:
-            raise SnapshotError("retain failed staging; auxiliary capacity budget reached")
         latest = Path(config["control_receipt"])
         receipt_sha = hashlib.sha256(_regular(latest).read_bytes()).hexdigest()
         if (time.time() - ledger.get("auxiliary_last_capture_epoch", 0) < config["interval_seconds"]
                 and receipt_sha == ledger.get("auxiliary_source_control_receipt_sha256")):
             return
+        if self.staging_room(self.transport_usage()) < config["maximum_bytes"] + 1024**2:
+            raise SnapshotError("retain failed staging; auxiliary capacity budget reached")
         tree = working_tree_inventory(Path(config["repository_root"]), documentation=config["include_documentation"],
                                       configs=config["include_configs"])
         control, _, _ = control_input(latest)

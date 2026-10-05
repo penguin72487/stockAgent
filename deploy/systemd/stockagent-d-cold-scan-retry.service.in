@@ -10,7 +10,7 @@ User=root
 Group=root
 WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
-ExecStart=/usr/bin/bash -c 'source "__REPO_ROOT__/scripts/runtime_env.sh" && run_fintech_python "__REPO_ROOT__/scripts/retry_packed_syncthing_scans.py"'
+ExecStart=/usr/bin/bash -c 'source "__REPO_ROOT__/scripts/runtime_env.sh" && run_fintech_python "__REPO_ROOT__/scripts/retry_packed_syncthing_scans.py" --batch-object-paths'
 UMask=0077
 Nice=19
 CPUWeight=1
@@ -21,4 +21,3 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=no
-

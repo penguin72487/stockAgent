@@ -30,14 +30,18 @@ class CacheFile:
     allocated_bytes: int
     atime_ns: int
     mtime_ns: int
+    ctime_ns: int
+    mode: int
+    link_count: int
 
     @property
     def last_used_ns(self) -> int:
         return max(self.atime_ns, self.mtime_ns)
 
     @property
-    def signature(self) -> tuple[int, int, int, int, int]:
-        return self.device, self.inode, self.size, self.atime_ns, self.mtime_ns
+    def signature(self) -> tuple[int, ...]:
+        return (self.device, self.inode, self.size, self.atime_ns, self.mtime_ns,
+                self.ctime_ns, self.mode, self.link_count)
 
 
 def _is_below(path: Path, root: Path) -> bool:
@@ -196,6 +200,9 @@ def _scan_cache_files(
                     allocated_bytes=info.st_blocks * 512,
                     atime_ns=info.st_atime_ns,
                     mtime_ns=info.st_mtime_ns,
+                    ctime_ns=info.st_ctime_ns,
+                    mode=info.st_mode,
+                    link_count=info.st_nlink,
                 )
                 candidates.append(item)
                 row["eligible_files"] += 1
@@ -229,7 +236,7 @@ def _selection_fingerprint(files: Iterable[CacheFile]) -> str:
             (
                 f"{item.root}\0{relative}\0{item.device}\0{item.inode}\0"
                 f"{item.size}\0{item.allocated_bytes}\0{item.atime_ns}\0"
-                f"{item.mtime_ns}\n"
+                f"{item.mtime_ns}\0{item.ctime_ns}\0{item.mode}\0{item.link_count}\n"
             ).encode("utf-8", errors="surrogateescape")
         )
     return digest.hexdigest()
@@ -314,6 +321,8 @@ def maintain_rebuildable_caches(
                     deferred_reason = "protected-process-started"
                     skipped_protected_start = len(selected) - index
                     break
+            if index % 128 == 0:
+                open_paths = _open_cache_files()
             if item.path in open_paths:
                 skipped_open += 1
                 continue
@@ -325,8 +334,12 @@ def maintain_rebuildable_caches(
                     current.st_size,
                     current.st_atime_ns,
                     current.st_mtime_ns,
+                    current.st_ctime_ns,
+                    current.st_mode,
+                    current.st_nlink,
                 )
-                if not stat.S_ISREG(current.st_mode) or signature != item.signature:
+                if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or signature != item.signature):
                     skipped_changed += 1
                     continue
                 item.path.unlink()

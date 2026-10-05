@@ -42,6 +42,8 @@ def main(argv=None):
                    help='Explicit one-shot operator replay may consume additional provider usage; never automatic')
     p.add_argument('--allow-unstaged-interop-replay', action='store_true',
                    help='Explicit replay of one exact WSL launch failure without a query stage; unknown cost retained')
+    p.add_argument('--allow-unstaged-script-prepare-replay', action='store_true',
+                   help='Explicit one-shot replay of an exact pre-entry script copy failure; unknown evidence and cost retained')
     p.add_argument('--allow-discard-query-settings',action='store_true',
                    help='Explicitly allow closing ONLY the scratch Wizard, retaining Excel and all workbooks')
     p.add_argument('--allow-restart-addin',action='store_true',
@@ -55,6 +57,9 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.allow_unstaged_interop_replay and (a.action != 'retry-unknown' or not a.acknowledge_unknown_usage):
         p.error('--allow-unstaged-interop-replay requires explicit retry-unknown and usage acknowledgement')
+    if a.allow_unstaged_script_prepare_replay and (a.action != 'retry-unknown' or not a.acknowledge_unknown_usage
+            or a.allow_unstaged_interop_replay):
+        p.error('--allow-unstaged-script-prepare-replay requires a separate explicit retry-unknown and usage acknowledgement')
     if not 1 <= a.max_tasks <= 1000:
         p.error("max-tasks must be between 1 and 1000; finite desktop ownership only")
     if (a.discover_only or a.download_only) and a.action != "run":
@@ -81,7 +86,7 @@ def main(argv=None):
                 or a.acknowledge_unknown_usage or a.allow_discard_query_settings
                 or a.allow_restart_addin or a.recovery_run is not None or a.response is not None
                 or a.error_window is not None or a.max_tasks != 1):
-            p.error("watch supervises the canonical queue; operator recovery/replay is never automatic")
+            p.error("watch uses reviewed configured grants; one-shot CLI recovery selectors are not accepted")
         from downloader.tej_scheduler import WatchPolicy, watch_queue
         WatchPolicy.from_config(config)
         stop = Event()
@@ -90,7 +95,10 @@ def main(argv=None):
             signal.signal(sig, lambda _signum, _frame: stop.set())
         try:
             with exclusive_dataset_lock(root / ".scheduler.lock", provider="tej_smart_wizard_automatic", timeout_seconds=0):
-                with exclusive_dataset_lock(root / ".download.lock", provider="tej_smart_wizard", timeout_seconds=0):
+                # The interactive boot task may still be establishing the
+                # owned workbook. Wait for that bounded metadata/GUI lease
+                # instead of exhausting systemd's rapid restart budget.
+                with exclusive_dataset_lock(root / ".download.lock", provider="tej_smart_wizard", timeout_seconds=180):
                     refresh_axis_profiles(root)
                     configure_runtime_policy(root, config)
                     if config.get("download_planning_contract"):
@@ -135,7 +143,8 @@ def main(argv=None):
             configure_runtime_policy(root,config)
             bridge=DesktopBridge(Path(__file__).resolve().parents[1],json.loads(a.session.read_text()))
             result=retry_unknown_download(root,a.task_id,bridge,a.evidence,
-                allow_unstaged_interop=a.allow_unstaged_interop_replay)
+                allow_unstaged_interop=a.allow_unstaged_interop_replay,
+                allow_unstaged_script_preparation=a.allow_unstaged_script_prepare_replay)
             print(json.dumps(result))
             return 0 if result['state']=='completed_task' else 1
         elif a.action=='restart-addin':

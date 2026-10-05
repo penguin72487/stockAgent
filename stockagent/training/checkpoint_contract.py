@@ -153,7 +153,7 @@ def _panel_array_content_fingerprint(
             if cached_value.get("present") is False:
                 return dict(cached_value)
         else:
-            array = np.asarray(value)
+            array = value if getattr(value, "_stockagent_factorized_features", False) else np.asarray(value)
             if (
                 cached_value.get("present") is True
                 and cached_value.get("shape") == [int(size) for size in array.shape]
@@ -208,11 +208,33 @@ def _project_temporal_basis_model_config(
         # post-feature field so old checkpoints keep their fingerprint; an
         # enabled contraction remains explicit and owns a fresh trajectory.
         projected.pop("temporal_basis_algebraic_contraction", None)
+    if not bool(projected.get("temporal_basis_fp32_contraction",False)):
+        projected.pop("temporal_basis_fp32_contraction",None)
+    else:
+        projected["factorized_compiled_precision_contract"] = "fp32_basis_operation_dtype_v2"
+    if not bool(projected.get("temporal_blocks_fp32", False)):
+        projected.pop("temporal_blocks_fp32", None)
+    else:
+        projected["temporal_block_precision_contract"] = "fp32_temporal_blocks_v1"
+    if not bool(projected.get("portfolio_blocks_fp32", False)):
+        projected.pop("portfolio_blocks_fp32", None)
+    else:
+        projected["portfolio_block_precision_contract"] = "fp32_compact_attention_allocation_v1"
+    if not bool(projected.get("candle_projection_fp32", False)):
+        projected.pop("candle_projection_fp32", None)
+    else:
+        projected["candle_projection_precision_contract"] = "fp32_full_feature_joint_stem_v1"
     if int(projected.get("feature_bottleneck_dim", 0) or 0) == 0:
         # Zero is the historical direct-input architecture.  Omit the disabled
         # post-schema field so merely upgrading the runtime cannot invalidate
         # an otherwise identical model/checkpoint contract.
         projected.pop("feature_bottleneck_dim", None)
+    if int(projected.get("feature_svd_components", 0) or 0) == 0:
+        for name in ("feature_svd_components", "feature_svd_analysis_components",
+                     "feature_svd_oversampling", "feature_svd_power_iterations", "feature_svd_seed"):
+            projected.pop(name, None)
+    else:
+        projected["feature_svd_contract"] = "training_only_rms_uncentered_feature_svd_v1"
     if not bool(projected.get("causal_feature_rms_normalization", False)):
         # The disabled branch is the exact historical forward: no scale or
         # active-mask buffers are consulted. Keep the shared threshold/epsilon
@@ -278,10 +300,32 @@ def _project_temporal_basis_model_config(
     return projected
 
 
+def _factorized_input_graph_contract(config: ExperimentConfig) -> str:
+    model = config.training.financial_transformer
+    if (config.training.model_name == "financial_transformer"
+            and not model.temporal_basis_families
+            and not model.feature_svd_components
+            and (model.temporal_blocks_fp32 or model.portfolio_blocks_fp32)):
+        return "compiled_partition_direct_precision_casts_v2"
+    return "compiled_partition_no_ddp_resplit_v1"
+
+
 def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, Any]:
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    # Bit-preserving CPU/CUDA reconstruction changes transport scheduling,
+    # not observations, shapes, graph arithmetic or the optimizer trajectory.
+    # Exact runtime/config/source receipts still record the selected mode.
+    snapshot["data"].pop("factorized_transfer_mode", None)
+    if not getattr(config.data, "factorized_feature_manifest", ""):
+        snapshot["data"].pop("factorized_feature_manifest", None)
+    elif config.training.enable_torch_compile:
+        # The inner encoder/effective-kernel/head graph must not be split by
+        # DDP only during forward: checkpoint recomputation runs outside that
+        # wrapper context. Preserve ordinary DDP collectives, and version this
+        # compiled reduction/activation schedule for new optimizer runs only.
+        snapshot["training"]["factorized_input_graph_contract"] = _factorized_input_graph_contract(config)
     if config.data.tw_futures_denomination_context_basis == "current_open":
         snapshot["data"].pop("tw_futures_denomination_context_basis", None)
     if not config.data.tw_futures_require_prior_capacity:
@@ -745,6 +789,21 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         },
     }
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
+    covariance_lag_batch_size = min(
+        int(training.lookback),
+        int(getattr(training, "temporal_basis_covariance_lag_batch_size", 1)),
+    )
+    if covariance_lag_batch_size > 1:
+        # Batched reductions preserve the estimator and FP64 accumulation but
+        # may select a different floating-point reduction schedule. Do not
+        # silently resume a trajectory under that opted-in PCA schedule.
+        model_contract = _active_model_config(config)
+        families = model_contract.get("values", {}).get("temporal_basis_families", [])
+        if any(str(name).lower().replace("-", "_") in {"pca", "klt", "pca_klt", "pca/klt"} for name in families):
+            contract["temporal_basis_covariance_schedule"] = {
+                "version": 1, "lag_batch_size": covariance_lag_batch_size,
+                "product_dtype": "source_fp32_or_fp64", "reduction_dtype": "float64",
+            }
     if execution_mode == "tw_index_futures_day":
         contract["integer_gradient_contract_version"] = int(
             TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION
@@ -762,6 +821,13 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         # executor. Keep default=false schema-4 checkpoints backward compatible,
         # but never resume an opted-in trajectory under a different precision path.
         contract["precision"]["cache_train_features_in_amp_dtype"] = True
+    if getattr(config.data, "factorized_feature_manifest", "") and training.enable_torch_compile:
+        # Unlike ordinary whole-model compile tuning, this graph cut changes
+        # the schedule of bounded checkpointed stock partitions. Make its
+        # version a strict resume/artifact control, not configuration-only
+        # metadata: older inner-DDP-split optimizer trajectories must not be
+        # continued under the new compiled graph ownership.
+        contract["factorized_input_graph_contract"] = _factorized_input_graph_contract(config)
     # These rank objectives return before portfolio post-processing/backtest in
     # risk_aware_loss, so changing the loss activation cannot change gradients.
     if objective not in {"pure_rank", "rank_ic"}:

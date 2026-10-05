@@ -1179,7 +1179,20 @@ function renderOperations(data) {
     signal_post_inference_format_ms: "推論後格式化",
     signal_other_compute_ms: "其他訊號計算",
     artifact_publish_ms: "原子發布",
-    artifact_discovery_ms: "消費端發現",
+    artifact_discovery_ms: "發布至註冊（含等待／回補）",
+    quote_usage_before_ms: "取價前流量查詢",
+    quote_request_body_ms: "快照回傳與批次整理",
+    quote_usage_after_ms: "取價後流量查詢",
+    quote_traffic_record_ms: "流量紀錄寫入",
+    quote_broker_queue_ms: "行情服務排隊",
+    quote_response_encode_ms: "行情回應編碼",
+    quote_lock_queue_ms: "行情連線鎖排隊",
+    quote_contract_prepare_ms: "合約／批次準備",
+    quote_submit_ms: "快照請求送出",
+    quote_callback_wait_ms: "等待快照回傳",
+    quote_callback_parse_ms: "快照解析",
+    quote_output_assemble_ms: "行情向量組裝",
+    quote_limit_resolve_ms: "合法價格界線整理",
     opening_signal_batch_wait_ms: "等待其他開盤模式",
     eligibility_load_ms: "資格載入",
     executor_quote_fetch_ms: "執行行情",
@@ -1237,12 +1250,12 @@ function renderOperations(data) {
     ? `${latencyStageLabels[slowestOpeningMode.bottleneck_stage] || slowestOpeningMode.bottleneck_stage} · ${latencyValue(slowestOpeningMode.bottleneck_ms)}`
     : noLatency ? "—" : `${latestBottleneck} · ${latencyValue(latency.latest_bottleneck_ms)}`;
   setHtml("latency-kpis", [
-    ["09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : duration(Number(openingLatency.first_ready_ms) / 1000), firstOpeningMode ? `${strategyLabel(firstOpeningMode)} · 目標 ≤ ${number(openingGoalMs)} ms · ${openingLatency.first_signal_goal_met ? "達標" : "未達標"}` : "等待實測"],
+    ["09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : latencyValue(openingLatency.first_ready_ms), firstOpeningMode ? `${strategyLabel(firstOpeningMode)} · 目標 ≤ ${number(openingGoalMs)} ms · ${openingLatency.first_signal_goal_met ? "達標" : "未達標"}` : "等待實測"],
     ["09:00 → 行情覆蓋", Number.isFinite(sourceReadyMs) ? latencyValue(sourceReadyMs) : "—", Number.isFinite(sourceReadyMs) ? "本機收到足夠 callback；不是交易所 RTT" : "舊樣本未記錄逐筆到達時間"],
     ["行情就緒 → 訊號", Number.isFinite(controllableP50Ms) ? `${latencyValue(controllableP50Ms)} / ${latencyValue(controllableMaxMs)}` : "—", "逐模式 P50 / 最慢；這是主要可控區段"],
-    ["09:00 → 全部模式", noOpeningLatency ? "—" : duration(Number(openingLatency.final_ready_ms) / 1000), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式有測速紀錄${openingLatency.all_modes_goal_met ? "，全數達標" : openingLatency.complete ? "，完成但未達 1 秒" : openingLatency.replay_without_live_measurement?.length ? `；${number(openingLatency.replay_without_live_measurement.length)} 個回補模式無當時即時測速` : "；仍缺測速紀錄"}`],
+    ["09:00 → 全部模式", noOpeningLatency ? "—" : latencyValue(openingLatency.final_ready_ms), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式有測速紀錄${openingLatency.all_modes_goal_met ? "，全數達標" : openingLatency.complete ? "，完成但未達 1 秒" : openingLatency.replay_without_live_measurement?.length ? `；${number(openingLatency.replay_without_live_measurement.length)} 個回補模式無當時即時測速` : "；仍缺測速紀錄"}`],
     ["相較前次開盤", openingChange, openingLatency.previous_session_date ? `${openingLatency.previous_session_date} 最後訊號 ${duration(Number(openingLatency.previous_final_ready_ms) / 1000)}` : "只比較 09:00 自動樣本"],
-    ["輸入 → 帳本落盤", noLatency ? "—" : `${latencyValue(latency.p50_ms)} / ${latencyValue(latency.p95_ms)}`, `${number(latency.sample_count || 0)} 個成功樣本 · P50 / P95`],
+    ["09:00 → 全模式帳本落盤", openingLatency.final_ledger_ms == null ? "尚未完整觀測" : latencyValue(openingLatency.final_ledger_ms), `${number(openingLatency.ledger_observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式；含等待／回補，不是券商成交。輸入至帳本 P50/P95：${latencyValue(latency.p50_ms)} / ${latencyValue(latency.p95_ms)}`],
     ["開盤最大階段", openingBottleneck, slowestOpeningMode ? strategyLabel(slowestOpeningMode) : noLatency ? "等待實測" : "來自執行帳本樣本"],
     ["失敗嘗試", number(openingLatency.failure_count || 0), openingLatency.failure_count ? "錯誤類型已寫入測速帳本" : "所選日沒有測速失敗紀錄"],
   ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join(""));
@@ -1271,21 +1284,27 @@ function renderOperations(data) {
 
   const openingStageHtml = openingModes.map((row) => {
     const stageEntries = Object.entries(row.stages || {})
+      .filter(([, value]) => value != null)
       .map(([name, value]) => [name, Number(value)])
       .filter(([, value]) => Number.isFinite(value) && value >= 0)
       .sort((left, right) => right[1] - left[1]);
     const transport = row.quote_transport || {};
     const brokerParts = [
-      ["broker queue", transport.server_request_queue_ms],
-      ["provider", transport.server_provider_fetch_ms],
-      ["encode", transport.server_snapshot_serialize_ms],
-      ["client RTT", transport.client_round_trip_ms],
+      ["服務排隊", transport.server_request_queue_ms],
+      ["來源取價", transport.server_provider_fetch_ms],
+      ["回應編碼", transport.server_snapshot_serialize_ms],
+      ["呼叫往返", transport.client_round_trip_ms],
+      ["首批回傳", transport.snapshot_first_callback_ms],
+      ["末批回傳", transport.snapshot_last_callback_ms],
     ].filter(([, value]) => value != null && Number.isFinite(Number(value)));
     const stagesText = stageEntries.length
       ? stageEntries.map(([name, value]) => `${latencyStageLabels[name] || name} ${latencyValue(value)}`).join(" · ")
       : "舊樣本只有總延遲，明日開盤起提供完整分段";
     const brokerText = brokerParts.length
-      ? `；報價通道 ${brokerParts.map(([name, value]) => `${name} ${latencyValue(value)}`).join(" · ")}`
+      ? `；報價通道（取價內含分段，不可相加）${brokerParts.map(([name, value]) => `${name} ${latencyValue(value)}`).join(" · ")}`
+      : "";
+    const accountingNote = transport.snapshot_usage_observation === "not_sampled_latency_critical"
+      ? "；即時取價不查流量；配額由獨立觀測更新，此筆流量未知，非免費／零流量"
       : "";
     const historyGuard = row.previous_signal_history_disabled === true
       ? "；歷史回補已禁止"
@@ -1294,13 +1313,13 @@ function renderOperations(data) {
         : "";
     const ledgerText = row.input_to_ledger_ms == null
       ? ""
-      : `；訊號輸入到帳本 ${latencyValue(row.input_to_ledger_ms)}（ready 後 ${latencyValue(row.ready_to_ledger_ms)}）`;
+      : `；09:00 到帳本 ${latencyValue(row.ledger_from_0900_ms)}；訊號輸入到帳本 ${latencyValue(row.input_to_ledger_ms)}（ready 後 ${latencyValue(row.ready_to_ledger_ms)}）`;
     const ratio = Math.min(1, Number(row.ready_from_0900_ms || 0) / Math.max(1, openingGoalMs));
     const kind = Number(row.ready_from_0900_ms) <= openingGoalMs ? "good" : "bad";
     return `<div class="progress-row opening-latency-row">
       <div class="progress-title"><strong>${esc(strategyLabel(row))}</strong>${badge(`${latencyValue(row.ready_from_0900_ms)} / ${latencyValue(openingGoalMs)}`, kind)}</div>
       ${progress(ratio, kind)}
-      <small>${esc(`行情覆蓋 ${latencyValue(row.source_ready_from_0900_ms)} · 行情就緒到訊號 ${latencyValue(row.source_ready_to_signal_ms)} · ${stagesText}${brokerText}${ledgerText}${historyGuard}`)}</small>
+      <small>${esc(`行情覆蓋 ${latencyValue(row.source_ready_from_0900_ms)} · 行情就緒到訊號 ${latencyValue(row.source_ready_to_signal_ms)} · ${stagesText}${brokerText}${ledgerText}${historyGuard}${accountingNote}`)}</small>
     </div>`;
   }).join("") || `<div class="empty-inline">所選日尚無 09:00 自動訊號測速；不以手動或回放資料冒充。</div>`;
   setHtml("opening-stage-progress", openingStageHtml);
@@ -1832,6 +1851,8 @@ function revisionOf(data) {
     counts.signals, counts.orders, counts.fills, counts.marks, counts.benchmark_marks, counts.events,
     data.opening_signal_latency?.observed_mode_count,
     data.opening_signal_latency?.final_ready_ms,
+    data.opening_signal_latency?.final_ledger_ms,
+    data.opening_signal_latency?.ledger_observed_mode_count,
     data.opening_signal_latency?.first_source_ready_ms,
     data.opening_signal_latency?.source_ready_to_signal_p50_ms,
     data.opening_signal_latency?.failure_count,

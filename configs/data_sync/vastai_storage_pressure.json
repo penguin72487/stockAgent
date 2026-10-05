@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "scope": "compiler-home-and-root-tmp",
+  "min_age_days": 14,
+  "high_watermark_percent": 89,
+  "target_percent": 88
+}

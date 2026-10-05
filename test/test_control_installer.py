@@ -5,13 +5,29 @@ import sys
 import pytest
 
 from scripts.install_control_plane import (activate_control_role, control_environment_body,
-    control_role_specification, install_control_role)
+    control_role_specification, install_control_role, install_verification_units)
 
 
 def test_role_install_refuses_the_selected_native_interpreter_prefix(tmp_path):
     with pytest.raises(ValueError, match='selected native runtime'):
         install_control_role(Path(sys.prefix), tmp_path/'evidence')
     assert not (tmp_path/'evidence').exists()
+
+
+def test_verification_install_refuses_untrusted_role_before_any_deployment(tmp_path):
+    env = tmp_path / 'private.env'
+    env.write_text('CONTROL_PLANE_DSN=private\nCONTROL_PLANE_ENV_PATH=/unknown\n')
+    env.chmod(0o644)
+    evidence = tmp_path / 'evidence'
+    with pytest.raises(ValueError, match='private owned'):
+        install_verification_units(env, tmp_path / 'accepted-lock.json', evidence)
+    assert not evidence.exists()
+    env.chmod(0o600)
+    alias = tmp_path / 'redirect.env'
+    alias.symlink_to(env)
+    with pytest.raises(ValueError, match='private owned'):
+        install_verification_units(alias, tmp_path / 'accepted-lock.json', evidence)
+    assert not evidence.exists()
 
 
 def test_control_pointer_change_preserves_credentials_comments_and_other_roles(tmp_path):

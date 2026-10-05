@@ -1292,6 +1292,8 @@ def _load_external_feature_arrays(
                 official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
             )
 
+    model_feature_names = set(feature_names)
+
     def prepare_frame(source: Any, columns: list[str]) -> Any:
         return (
             source.with_columns(
@@ -1303,7 +1305,17 @@ def _load_external_feature_arrays(
                     .str.to_uppercase()
                     .alias("symbol"),
                     *[
-                        pl.col(name).cast(pl.Float64, strict=False).alias(name)
+                        # A prepared Float32 model view has already fixed its
+                        # precision. Widening all of it to Float64 before a
+                        # last-value grouping doubles the live working set
+                        # without changing the final Float32 tensor. Rules and
+                        # original higher-precision sources remain Float64.
+                        pl.col(name).cast(
+                            pl.Float32
+                            if name in model_feature_names and source.schema[name] == pl.Float32
+                            else pl.Float64,
+                            strict=False,
+                        ).alias(name)
                         for name in columns
                     ],
                 ]
@@ -1450,7 +1462,12 @@ def _external_frame_to_arrays(
         values = (
             frame.select(
                 [
-                    pl.col(name).cast(pl.Float64, strict=False).fill_null(float("nan"))
+                    pl.col(name).cast(
+                        pl.Float32
+                        if np.dtype(dtype) == np.dtype(np.float32) and frame.schema[name] == pl.Float32
+                        else pl.Float64,
+                        strict=False,
+                    ).fill_null(float("nan"))
                     for name in feature_names
                 ]
             )

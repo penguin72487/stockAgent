@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "authority_node_id": "penguin",
+  "origin_node_id": "vastai1T",
+  "scopes": ["markets", "ablations"],
+  "stable_hours": 0.16666666666666666,
+  "maximum_run_bytes": 34359738368,
+  "maximum_run_files": 100000,
+  "reserve_bytes": 68719476736,
+  "retire_verified_source": true,
+  "shared_file_policy": "unlink_returned_names_only"
+}

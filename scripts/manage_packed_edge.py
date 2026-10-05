@@ -157,6 +157,34 @@ def _write_edge_ignore_if_changed(
     return True
 
 
+def _prepare_ignored_payload_prune(
+    sync_root: Path, allowed_relpaths: set[str], *, base_url: str,
+    api_key: str, folder: str, peer_name: str,
+) -> dict[str, Any]:
+    """Prove local-only unlink before a payload leaves an expired edge lease.
+
+    Removing an expired allowlist entry in memory is not enough: Syncthing may
+    still include the object, so unlink could become a fleet deletion. Install
+    the exact ignore rules, complete a scan and reconverge before any eviction.
+    This function never deletes bytes. Call under the edge operation lock.
+    """
+    if process_references(sync_root / "objects"):
+        raise SnapshotError("packed objects are referenced by a running process")
+    if _write_edge_ignore_if_changed(sync_root, allowed_relpaths):
+        _scan(base_url, api_key, folder)
+        def converged():
+            value = _convergence(base_url, api_key, folder, peer_name)
+            return value if value.get("ok") else None
+        peer = _wait_for(converged, timeout_seconds=300)
+    else:
+        peer = _convergence(base_url, api_key, folder, peer_name)
+    if not peer.get("ok"):
+        raise SnapshotError("durable Syncthing peer is not fully converged before payload prune")
+    if process_references(sync_root / "objects"):
+        raise SnapshotError("packed objects became referenced before payload prune")
+    return peer
+
+
 def _wait_for(
     predicate,
     *,
@@ -373,6 +401,11 @@ def main() -> int:
             if references:
                 raise SnapshotError("packed objects are referenced by a running process")
             allowed = _allowed_relpaths(sync_root, state)
+            if args.apply:
+                peer = _prepare_ignored_payload_prune(
+                    sync_root, allowed, base_url=args.syncthing_url,
+                    api_key=api_key, folder=args.folder, peer_name=args.peer_name,
+                )
             result = prune_local_payloads(
                 sync_root, allowed_relpaths=allowed, apply=args.apply
             )
@@ -390,6 +423,12 @@ def main() -> int:
         if args.command in {"gc", "evict"}:
             if not peer["ok"]:
                 raise SnapshotError("durable Syncthing peer is not fully converged")
+            allowed = _allowed_relpaths(sync_root, state)
+            if not args.dry_run:
+                peer = _prepare_ignored_payload_prune(
+                    sync_root, allowed, base_url=args.syncthing_url,
+                    api_key=api_key, folder=args.folder, peer_name=args.peer_name,
+                )
             proof = {
                 "kind": "syncthing-durable-peer",
                 "validated": True,
@@ -414,7 +453,7 @@ def main() -> int:
             )
             payload_prune = prune_local_payloads(
                 sync_root,
-                allowed_relpaths=_allowed_relpaths(sync_root, state),
+                allowed_relpaths=allowed,
                 apply=not args.dry_run,
             )
             payload = {
@@ -489,8 +528,10 @@ def main() -> int:
             state["retained_payloads"] = retained
             atomic_write_json(state_path, state)
             remaining = _allowed_relpaths(sync_root, state)
-            if _write_edge_ignore_if_changed(sync_root, remaining):
-                _scan(args.syncthing_url, api_key, args.folder)
+            _prepare_ignored_payload_prune(
+                sync_root, remaining, base_url=args.syncthing_url,
+                api_key=api_key, folder=args.folder, peer_name=args.peer_name,
+            )
             prune = prune_local_payloads(
                 sync_root, allowed_relpaths=remaining, apply=True
             )
@@ -509,6 +550,9 @@ def main() -> int:
     except (OSError, SnapshotError, ValueError, urllib.error.URLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if _operation_lock_handle is not None:
+            _operation_lock_handle.close()
     raise AssertionError(f"unhandled command: {args.command}")
 
 

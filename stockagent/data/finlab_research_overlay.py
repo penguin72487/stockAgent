@@ -146,6 +146,7 @@ def _wide_stock(
 def _wide_market(
     path: Path, feature: str, calendar: list[date], *,
     date_lookup: pl.DataFrame | None = None,
+    keep_invalid_barriers: bool = False,
 ) -> pl.DataFrame:
     frame = pl.read_parquet(path)
     values = [name for name in frame.columns if name != "source_index" and name.strip()]
@@ -153,14 +154,17 @@ def _wide_market(
         raise ValueError(f"expected one market value for {feature}")
     lookup = (date_lookup if date_lookup is not None else
               _date_lookup(frame.get_column("source_index").to_list(), calendar))
-    return (
+    result = (
         frame.join(lookup, on="source_index", how="inner")
         .sort("source_index")
         .select("date", pl.lit(MARKET_SYMBOL).alias("symbol"),
                 pl.col(values[0]).cast(pl.Float64, strict=False).alias(feature))
-        .filter(pl.col(feature).is_finite())
         .group_by("date", "symbol", maintain_order=True).agg(pl.col(feature).last())
     )
+    if keep_invalid_barriers:
+        return result.with_columns(pl.when(pl.col(feature).is_finite()).then(pl.col(feature))
+                                   .otherwise(None).alias(feature))
+    return result.filter(pl.col(feature).is_finite())
 
 
 def _futures_market(path: Path, calendar: list[date]) -> tuple[pl.DataFrame, dict[str, str]]:

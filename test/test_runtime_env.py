@@ -11,6 +11,16 @@ import pytest
 from stockagent.runtime_env import normalize_cuda_env, normalize_python_env
 
 
+def test_supervised_python_replaces_shell_and_preserves_runtime_discovery():
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, 'PYTHON_BIN': sys.executable, 'FINTECH_ENV_PATH': sys.prefix}
+    result = subprocess.run(['bash', '-c', 'source scripts/runtime_env.sh; printf "%s\\n" "$$"; '
+        'exec_fintech_python -c "import os; print(os.getpid())"; exit 99'],
+        cwd=root, env=env, capture_output=True, text=True, check=True)
+    pids = result.stdout.strip().splitlines()
+    assert len(pids) == 2 and pids[0] == pids[1]
+
+
 def test_coda_runner_shell_and_config_attribute_contract() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     runner = repo_root / "coda_runner.sh"

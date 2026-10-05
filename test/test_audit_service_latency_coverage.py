@@ -201,6 +201,51 @@ def test_windows_wsl_vm_evidence_is_bounded_and_omits_process_commandline(monkey
     assert "vm_id" not in result
 
 
+def test_wsl_holder_evidence_keeps_unknown_owner_and_omits_argv(monkeypatch) -> None:
+    def run(command, **_kwargs):
+        assert command[-1] == audit.WINDOWS_WSL_RUNTIME_QUERY
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({
+            "available": True,
+            "holders": [{"pid": 12, "parent_pid": 11,
+                         "parent_is_public_supervisor": None,
+                         "CommandLine": "editor --private-token=secret"}],
+            "unreadable_command_lines": 3,
+        }))
+
+    monkeypatch.setattr(audit.subprocess, "run", run)
+    result = audit._windows_wsl_runtime_evidence()
+    assert result["holders"] == [{
+        "pid": 12, "parent_pid": 11, "parent_is_public_supervisor": None,
+    }]
+    assert result["unreadable_command_lines"] == 3
+    assert "secret" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("returncode,stdout", [
+    (1, ""), (0, "{"), (0, "null"), (0, '{"available":true}'),
+    (0, '{"available":false,"holders":[]}'),
+])
+def test_wsl_holder_failed_queries_do_not_claim_absence(monkeypatch, returncode, stdout) -> None:
+    monkeypatch.setattr(audit.subprocess, "run", lambda command, **_: (
+        subprocess.CompletedProcess(command, returncode, stdout=stdout)
+    ))
+    assert audit._windows_wsl_runtime_evidence() is None
+
+
+def test_wsl_launcher_and_worker_are_one_foreground_owner(monkeypatch) -> None:
+    payload = {"available": True, "holders": [
+        {"pid": 12, "parent_pid": 11, "parent_is_public_supervisor": True},
+        {"pid": 13, "parent_pid": 12, "parent_is_public_supervisor": False},
+        {"pid": 20, "parent_pid": 19, "parent_is_public_supervisor": True},
+    ], "unreadable_command_lines": 0}
+    monkeypatch.setattr(audit.subprocess, "run", lambda command, **_: (
+        subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload))
+    ))
+    result = audit._windows_wsl_runtime_evidence()
+    assert {row['pid'] for row in result['holders']} == {12, 20}
+    assert result['matching_process_count'] == 3
+
+
 def test_repository_process_inventory_finds_unmanaged_without_exposing_argv(
     tmp_path: Path,
 ) -> None:

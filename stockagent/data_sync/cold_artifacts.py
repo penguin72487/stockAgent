@@ -204,6 +204,7 @@ def publish_cold_artifact(
     node_id: str | None = None,
     repo_root: Path | None = None,
     metadata: Mapping[str, str] | None = None,
+    defer_scan: bool = False,
 ) -> ResolvedSnapshot:
     status = validate_cold_artifact_source(artifact_root, spec)
     source = Path(str(status["source"]))
@@ -236,6 +237,7 @@ def publish_cold_artifact(
         maximum_file_bytes=spec.maximum_file_bytes,
         metadata=release_metadata,
         repo_root=repo_root,
+        defer_scan=defer_scan,
     )
 
 

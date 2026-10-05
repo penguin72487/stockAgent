@@ -1,0 +1,38 @@
+# Fresh, owner-private research view from the fixed gaprepair-v4 source release.
+# Preserve the selected v10 architecture/execution contract; do not resume old
+# feature views or optimizer state. Data delivery does not imply PIT or GPU
+# acceptance. The existing BF16 oracle gate must pass before formal training.
+base_config: tw_day_trade_last_last_only_training_vastai1t_v10_research_143_no_bottleneck.yaml
+experiment_name: tw-day-trade-native-nullable-factorized-20261005-gaprepair-v4
+
+environment:
+  use_tensor_cores: false
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/training-bf16
+  resume: false
+  post_train_infer: false
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-daytrade-panel-sources-20261004-gaprepair-v4/tw-daytrade-panel-sources-20261004-gapre-20261004T163754531166169Z-l0-penguin-6160c54fa6faa702/stocks
+  tw_public_feature_path: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/prepared/execution_rules.parquet
+  day_trade_physical_public_feature_path: /srv/stockagent-packed-materialized/tw-daytrade-physical-20261004-v1/tw-daytrade-physical-20261004-v1-20261004T121443923061282Z-l0-penguin-f34b9ce2dc82eb29/features/tw_public_stock_daily.parquet
+  day_trade_minute_execution_root: /srv/stockagent-packed-materialized/tw-minute-train/tw-minute-train-20260910T121601063496311Z-l0-penguin-09bedd96a2f68c39
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/runtime-cache/physical-source
+  panel_cache_root: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/prepared/base_panel_cache
+  factorized_feature_manifest: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/prepared/factorized_manifest.json
+  feature_include: [open_raw, high_raw, low_raw, close_raw, trading_volume_raw, next_session_open_gap_logret]
+  feature_exclude: []
+  feature_zero_fill: []
+  feature_shift_next_session: []
+  feature_availability_indicators: []
+
+training:
+  pretrained_initialization_root: null
+  day_trade_sparse_events: false
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  curve_plot_async: false
+  financial_transformer:
+    feature_bottleneck_dim: 0
+    temporal_basis_fp32_contraction: true

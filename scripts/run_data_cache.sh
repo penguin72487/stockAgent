@@ -6,6 +6,18 @@ script_dir="$(cd -- "$(dirname -- "${script_path}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
 edge_state="${STOCKAGENT_PACKED_EDGE_STATE:-/var/lib/stockagent-packed-edge/state.json}"
+# Observe the authoritative cold mount in its owner's namespace. Checking a
+# different namespace and then reading from this one would give a false guard
+# failure (or an unrelated tree) in WSL IDE shells.
+case "${1:-}" in
+  status|automation-status)
+    if [[ ! -f "$edge_state" && -d /run/systemd/system \
+          && "${STOCKAGENT_PACKED_SYNC_ROOT:-/srv/stockagent-packed}" == /srv/stockagent-packed \
+          && "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]; then
+      exec nsenter --mount=/proc/1/ns/mnt -- /usr/bin/bash "$script_path" "$@"
+    fi
+    ;;
+esac
 if [ -f "${edge_state}" ]; then
   case "${1:-}" in
     use|gc|evict)

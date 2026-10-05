@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import re
 import socket
+import shutil
 import sys
 import tempfile
 import threading
@@ -31,7 +32,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from tqdm import tqdm
 
-from downloader.artifact_io import atomic_write_json, atomic_write_text
+from downloader.artifact_io import atomic_write_json, atomic_write_text, sha256_file
+from downloader.quality_priority import pending_requests, prioritize_records, quality_attempt
 from downloader.common import (
     SharedRateLimiter,
     describe_rate_limit,
@@ -3302,6 +3304,7 @@ def _download_symbol(
     request_rate_limiter: RequestRateLimiter | None = None,
     yfinance_session: object | None = None,
     symbol_timeout_seconds: float | None = None,
+    source_page_observer: Callable[[], None] | None = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     deadline = (
@@ -3505,6 +3508,8 @@ def _download_symbol(
                         remaining_budget(),
                     ),
                 )
+                if source_page_observer is not None:
+                    source_page_observer()
                 require_budget()
                 normalized = _normalize_download_frame(
                     frame,
@@ -3874,6 +3879,7 @@ def _resolve_repair_plan(
     blacklist_symbols = _load_blacklist(blacklist_path)
     blacklist_lock = threading.Lock()
     retry_blacklisted = bool(getattr(args, "retry_blacklisted_repair_symbols", False))
+    quality_by_code = {row['code']: row for row in pending_requests(output_dir)}
 
     def _unavailable_skip(
         record: SymbolRecord,
@@ -3983,6 +3989,19 @@ def _resolve_repair_plan(
             error = info.error
             columns = info.columns
             checked_through_date = info.checked_through_date
+            if record.code in quality_by_code:
+                intent = quality_by_code[record.code]
+                repair_start = intent.get('repair_start_date') or first_date or args.start_date
+                try:
+                    repair_start = date.fromisoformat(repair_start[:10]).isoformat()
+                except (ValueError, TypeError):
+                    repair_start = args.start_date
+                checks.append(RepairCheck(record=record,
+                    status='broken' if error not in {None, 'missing'} else 'quality_recheck',
+                    output_path=output_path, first_date=first_date, last_date=last_date,
+                    repair_start_date=repair_start, merge_existing=error is None,
+                    message='Stable audited anomaly; finite original-source recheck, not a claimed gap fill'))
+                continue
             if error == "missing":
                 if _is_delisted_record(record) and not verify_tw_delisted:
                     checks.append(_delisted_no_history(record, output_path, "confirmed delisted with no local history"))
@@ -4258,27 +4277,35 @@ def _run_parallel_symbol_downloads(
     )
     yfinance_session = _build_yfinance_rate_limited_session(request_rate_limiter)
     _warm_yfinance_session(yfinance_session, request_rate_limiter)
+    quality_codes = {row['code'] for row in pending_requests(output_dir)}
+
+    def worker(record, start_date, refresh, merge_existing):
+        def download(observer=None):
+            kwargs = {'source_page_observer': observer} if observer is not None else {}
+            return _download_symbol(
+                asset_class, record, output_dir, start_date, args.end_date, args.retries,
+                refresh, merge_existing, blacklist_symbols, blacklist_path, blacklist_lock,
+                whitelist_symbols, whitelist_path, whitelist_lock, request_rate_limiter,
+                yfinance_session, symbol_timeout_seconds, **kwargs)
+        if record.code not in quality_codes:
+            return download()  # No repeated JSON reads for the healthy universe.
+        with quality_attempt(output_dir, record.code, tail_only=False) as attempt:
+            original = output_dir / f'{record.code}_features.parquet'
+            try:
+                _preserve_quality_original(original, output_dir)
+            except (OSError, RuntimeError) as exc:
+                attempt.failed = True
+                return DownloadResult(asset_class, record.code, record.yahoo_symbol,
+                    record.market, 'failed_preservation', 0, str(original),
+                    message=f'Original evidence preservation failed: {type(exc).__name__}')
+            result = download(attempt.observe_page)
+            attempt.failed = str(result.status).startswith('failed')
+            return result
+
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
             executor.submit(
-                _download_symbol,
-                asset_class,
-                record,
-                output_dir,
-                start_date,
-                args.end_date,
-                args.retries,
-                refresh,
-                merge_existing,
-                blacklist_symbols,
-                blacklist_path,
-                blacklist_lock,
-                whitelist_symbols,
-                whitelist_path,
-                whitelist_lock,
-                request_rate_limiter,
-                yfinance_session,
-                symbol_timeout_seconds,
+                worker, record, start_date, refresh, merge_existing,
             ): (record, meta)
             for record, start_date, refresh, merge_existing, meta in tasks
         }
@@ -4317,6 +4344,25 @@ def _run_parallel_symbol_downloads(
             progress.close()
 
     return results
+
+
+def _preserve_quality_original(original: Path, output_dir: Path) -> None:
+    if original.is_file():
+        # Preserve exact damaged/legacy bytes before a repair can rebuild an
+        # incompatible grain. A repeated attempt reuses the same hash object.
+        digest = sha256_file(original)
+        evidence_dir = output_dir / '_quality_evidence' / digest
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        archived = evidence_dir / original.name
+        if not archived.exists():
+            shutil.copyfile(original, archived)
+        if sha256_file(archived) != digest:
+            raise RuntimeError('quality source preservation failed; no source overwrite allowed')
+        atomic_write_json(evidence_dir / 'receipt.json', {
+            'contract': 'yahoo_quality_original_preservation_v1',
+            'original_name': original.name, 'sha256': digest,
+            'bytes': archived.stat().st_size,
+            'observation_is_not_valid_price_proof': True})
 
 
 def _transform_repair_result(
@@ -4409,7 +4455,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     whitelist_lock = threading.Lock()
 
     resolution = _resolve_symbol_resolution(asset_class, args)
-    records = resolution.scheduled_records
+    records = prioritize_records(resolution.scheduled_records, output_dir, tail_only=False)
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
@@ -4463,13 +4509,20 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
 
     status_counts: dict[str, int] = {}
     pending = [check for check in checks if check.repair_start_date is not None]
+    if _is_incremental_mode(args):
+        # Due tail refresh is time-sensitive. Audited historical rechecks stay
+        # ahead of other backfills, but must not delay ordinary stale symbols.
+        pending.sort(key=lambda check: check.status not in {'stale', 'new_symbol'})
     for check in checks:
         status_counts[check.status] = status_counts.get(check.status, 0) + 1
 
-    if getattr(args, "retry_blacklisted_repair_symbols", False):
+    quality_codes = {row['code'] for row in pending_requests(output_dir)}
+    if getattr(args, "retry_blacklisted_repair_symbols", False) or quality_codes:
         retry_candidates: set[str] = set()
         for check in checks:
             if check.repair_start_date is not None:
+                if not getattr(args, 'retry_blacklisted_repair_symbols', False) and check.record.code not in quality_codes:
+                    continue
                 for cand in _candidate_symbols_for_record(asset_class, check.record):
                     if cand:
                         retry_candidates.add(cand.upper())
@@ -4491,6 +4544,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
             "schema_mismatch",
             "metadata_invalid",
             "historical_start_unverified",
+            "quality_recheck",
         )
     )
     print(

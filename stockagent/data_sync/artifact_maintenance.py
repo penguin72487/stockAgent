@@ -57,17 +57,27 @@ def discover_completed_runs(artifact_root: Path, scope: str) -> list[Path]:
     if not scope_root.is_dir() or scope_root.is_symlink():
         raise SnapshotError(f"automatic artifact scope is not a real directory: {scope_root}")
     result: list[Path] = []
-    for progress_path in sorted(scope_root.rglob("progress.json")):
-        source = progress_path.parent
-        if source.is_symlink() or not source.is_dir():
+    # A canonical run is a terminal discovery root. Walking its tensor caches,
+    # every fold and preparation source just to find another progress envelope
+    # makes routine polling proportional to the entire training dataset.
+    for directory, names, files in os.walk(scope_root, followlinks=False):
+        source = Path(directory)
+        names[:] = sorted(name for name in names if not name.startswith(".")
+                           and not (source / name).is_symlink())
+        if "progress.json" not in files:
             continue
+        progress_path = source / "progress.json"
+        if progress_path.is_symlink():
+            continue
+        if "run_manifest.json" in files:
+            names[:] = []
         try:
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if progress.get("state") == "complete" and progress.get("phase") == "complete":
+        if isinstance(progress, dict) and progress.get("state") == "complete" and progress.get("phase") == "complete":
             result.append(source)
-    return result
+    return sorted(result)
 
 
 def newest_activity_ns(root: Path) -> int:
@@ -118,10 +128,21 @@ def _ancestor_process_references(sources, scope_root: Path, references: list[str
         except (OSError, ValueError):
             continue
         for raw_arg in raw.split(b"\0"):
-            if not raw_arg.startswith(b"/"):
+            if not raw_arg:
                 continue
             try:
-                argument = Path(os.fsdecode(raw_arg)).resolve(strict=False)
+                text = os.fsdecode(raw_arg)
+                if text.startswith("-"):
+                    if "=" not in text:
+                        continue
+                    text = text.split("=", 1)[1]
+                argument = Path(text)
+                if not argument.is_absolute():
+                    argument = (process / "cwd").resolve(strict=True) / argument
+                argument = argument.resolve(strict=False)
+                # An orchestrator naming this artifact scope is a consumer.
+                # A generic Jupyter/server root such as '/' is not proof that
+                # it consumes every completed artifact on the machine.
                 argument.relative_to(scope_root)
             except (OSError, ValueError):
                 continue

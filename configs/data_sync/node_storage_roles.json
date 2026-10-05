@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "authority_node_id": "penguin",
+  "nodes": {
+    "penguin": {
+      "roles": ["control_plane", "source_authority", "execution", "web", "cold_publisher"],
+      "source_retention": "canonical_observations_and_provenance",
+      "derived_retention": "active_service_dependencies_only",
+      "completed_outputs": "verified_packed_cold",
+      "cold_root": "/srv/stockagent-packed"
+    },
+    "vastai1T": {
+      "roles": ["ephemeral_training"],
+      "source_retention": "exact_current_job_releases_only",
+      "derived_retention": "active_job_and_verified_rebuild_only",
+      "completed_outputs": "return_to_penguin_then_verified_retirement",
+      "cold_root": "/srv/stockagent-packed"
+    },
+    "lab203": {
+      "roles": ["backup_relay"],
+      "source_retention": "bounded_sealed_ingress",
+      "derived_retention": "bounded_independent_restore_scratch",
+      "completed_outputs": "fixed_immutable_archive_and_restic_restore_receipts",
+      "cold_root": null
+    },
+    "nas": {
+      "roles": ["disaster_recovery_archive", "encrypted_backup"],
+      "source_retention": "immutable_lake_archive_and_restic_snapshots",
+      "derived_retention": "none",
+      "completed_outputs": "retained_immutable_versions_and_encrypted_snapshots",
+      "cold_root": null
+    }
+  }
+}

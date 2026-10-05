@@ -93,7 +93,7 @@ def test_metadata_failure_before_attempt_commit_never_launches_powershell(regist
         pytest.fail('PowerShell must not launch before the desktop attempt is committed')
     monkeypatch.setattr(attempts, 'begin_attempt', busy)
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows', forbidden)
-    bridge = DesktopBridge(root.parent, {'TejProcessId': 1, 'ExpectedWindow': 2, 'ExpectedTitle': 'x',
+    bridge = DesktopBridge(Path(__file__).resolve().parents[1], {'TejProcessId': 1, 'ExpectedWindow': 2, 'ExpectedTitle': 'x',
                                       'ExpectedWorkbook': 'y', 'ExpectedExcelWindow': 3})
     with pytest.raises(sqlite3.OperationalError):
         bridge.execute(root, task)
@@ -140,7 +140,7 @@ def test_canonical_desktop_attempt_publishes_live_readback_then_only_committed_t
         return SimpleNamespace(returncode=0, stderr=b'', stdout=b'')
 
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows', desktop_call)
-    bridge = DesktopBridge(repo, dict(TejProcessId=1, ExpectedWindow=2, ExpectedTitle='fixture',
+    bridge = DesktopBridge(Path(__file__).resolve().parents[1], dict(TejProcessId=1, ExpectedWindow=2, ExpectedTitle='fixture',
                                      ExpectedWorkbook='fixture', ExpectedExcelWindow=3))
     assert run_one(root, bridge) == 'completed_task'
     assert len(calls) == 1

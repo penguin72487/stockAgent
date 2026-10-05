@@ -1,0 +1,13 @@
+# Preserve source, full feature set, model topology, batch and execution rules.
+# Precision v1 alone passed the first AMP step but not the next Adam step.
+# Stabilize the shared compact attention and allocation; do not resume v1.
+base_config: tw_day_trade_factorized_native_20261005_gaprepair_v4_precision_v1.yaml
+experiment_name: tw-day-trade-native-nullable-gaprepair-v4-fp32-islands-v2
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261005_gaprepair_v4/training-bf16-fp32-islands-v2
+  resume: false
+
+training:
+  financial_transformer:
+    portfolio_blocks_fp32: true

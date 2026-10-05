@@ -174,7 +174,7 @@ def _scan_request_groups(
 
     paths = (
         ["objects"]
-        if full_objects_scan or len(new_object_paths) > 256
+        if full_objects_scan or (len(new_object_paths) > 256 and not batch_object_paths)
         else sorted(set(new_object_paths))
     )
     metadata = [f"manifests/{dataset}", f"heads/{dataset}"]

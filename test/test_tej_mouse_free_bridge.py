@@ -148,18 +148,28 @@ def test_preview_normal_owned_action_does_not_require_foreground():
 
 def test_resolved_selection_controls_are_guarded_per_click_and_rechecked_per_batch():
     resolved = BRIDGE.split('function Click-ResolvedButton',1)[1].split('function Select-FieldList',1)[0]
-    for proof in ('Assert-Scope $parent', 'Assert-Scope $h', 'IsChild', 'WindowsForms10.BUTTON.',
-                  'Current.Name', 'Dialogs($ExpectedWindow)', 'IsWindowEnabled', 'IsWindowVisible'):
-        assert proof in resolved
+    native = BRIDGE.split('public static void VerifyResolvedButton',1)[1].split('public static void VerifyPreviewAction',1)[0]
+    assert 'VerifyResolvedButton($ExpectedWindow,$parent,$h,$TejProcessId,$ExpectedTitle,$name)' in resolved
+    for proof in ('AssertControlScope(root,parent,expectedPid,title)', 'AssertControlScope(root,button,expectedPid,title)',
+                  'IsChild', 'WindowsForms10.BUTTON.', 'Text(button).Trim()', 'Dialogs(root)', 'IsWindowEnabled', 'IsWindowVisible'):
+        assert proof in native
     assert resolved.count('Message $h 0xF5') == 1
     companies = BRIDGE.split('$companySelectButton=Company-SelectButton',1)[1].split('$dateSelectButton=',1)[0]
-    assert 'Select-Company $companySelectButton' in companies
+    assert 'SelectListBatch($ExpectedWindow,$company.Current.NativeWindowHandle' in companies
     assert '(Company-SelectButton) -ne $companySelectButton' in companies
     assert 'WaitSelectedList' in companies
     for group, variable in (('source','fieldSelectButton'),('dates','dateSelectButton')):
         assert f"${variable}=Control ${group} 'Select' '*BUTTON*'" in BRIDGE
-        assert f"Click-ResolvedButton ${group} ${variable} 'Select'" in BRIDGE
+        assert f'SelectListBatch($ExpectedWindow,${group}.Current.NativeWindowHandle' in BRIDGE
         assert f"(Control ${group} 'Select' '*BUTTON*') -ne ${variable}" in BRIDGE
+    batch = BRIDGE.split('public static void SelectListBatch', 1)[1].split('public static void WaitSelectedList', 1)[0]
+    for proof in ('AssertControlScope(root,source,expectedPid,title)', 'AssertControlScope(root,target,expectedPid,title)',
+                  'VerifyResolvedButton(root,parent,button,expectedPid,title,"Select")',
+                  'SelectListItem(root,source,indices[i],labels[i])', 'GetWindowRect', 'buttonRect.Top<listRect.Bottom',
+                  'WaitSelectedList(root,target,i+1,labels[i])', 'SameItems(Items(target,false),labels)'):
+        assert proof in batch
+    assert batch.count('Message(button,0xF5u,0,0)') == 1
+    assert 'Activate(' not in batch and 'PostMessageW(' not in batch
 
 
 def test_native_scope_guard_is_fresh_per_operation_not_cached_owner_authorization():
@@ -171,6 +181,24 @@ def test_native_scope_guard_is_fresh_per_operation_not_cached_owner_authorizatio
     powershell = BRIDGE.split('function Assert-Scope',1)[1].split("if($root.Current.Name",1)[0]
     assert 'AssertControlScope($ExpectedWindow,$h,$TejProcessId,$ExpectedTitle)' in powershell
     assert '$root.Current' not in powershell
+
+
+def test_query_group_search_uses_native_group_caption_not_all_uia_descendants():
+    function=BRIDGE.split('function Find-QueryGroup',1)[1].split('function Verify-EditableScope',1)[0]
+    assert 'ExactQueryGroup($ExpectedWindow,$name,$TejProcessId,$ExpectedTitle)' in function
+    assert '$node.Current.Name -cne $name' in function and 'foreach(' not in function
+    native=BRIDGE.split('public static long ExactQueryGroup',1)[1].split('public static void VerifyPreviewAction',1)[0]
+    for proof in ('AssertControlScope(root,h,expectedPid,title)', 'WindowsForms10.BUTTON.', 'WindowsForms10.Window.',
+                  'AccessibleState(h)[0]!=20',
+                  'Text(h)!=name', 'found!=0', 'AssertControlScope(root,found,expectedPid,title)'):
+        assert proof in native
+
+
+def test_numeric_scale_resolution_rejects_large_catalogs_before_enumeration():
+    function=BRIDGE.split('function NumericScale-Control',1)[1].split('function Read-NumericScale',1)[0]
+    assert function.index('(Message $handle 0x146) -eq 5') < function.index('(Items $handle $true)')
+    assert 'Assert-Scope $handle' in function and '$matches.Count -gt 1' in function
+    assert 'Native-Controls' not in function and 'Current.Name' not in function
 
 
 def test_current_binding_readback_reads_selected_combo_not_the_entire_menu():
@@ -197,16 +225,25 @@ def test_native_combo_lookup_keeps_case_sensitive_unicode_and_duplicate_safety()
 
 
 def test_all_axis_shortcut_still_requires_exact_source_names_before_preview():
-    company=BRIDGE.split('$companyIndices=@{}',1)[1].split('$availableDates=@()',1)[0]
-    dates=BRIDGE.split('$dateIndices=@{}',1)[1].split("if($requestDoc.action -in @('plan','recover_plan'",1)[0]
+    company=BRIDGE.split('$companyIndices=@()',1)[1].split('$availableDates=@()',1)[0]
+    dates=BRIDGE.split('$dateIndices=@()',1)[1].split("if($requestDoc.action -in @('plan','recover_plan'",1)[0]
     assert '$requestDoc.company_labels.Count -ne $availableCompanyCount' in company
     assert '$requestDoc.date_labels.Count -ne $availableDateCount' in dates
-    assert 'ExactListIndex' in company and 'ExactListIndex' in dates
+    assert 'ExactListIndices' in company and 'ExactListIndices' in dates
     submission=BRIDGE.split("if($requestDoc.company_labels.Count -lt 1",1)[1].split('$querySubmissionPossible=$true',1)[0]
     for proof in ('SameItems([string[]]$selectedCompanies,[string[]]$requestDoc.company_labels)',
                   'SameItems([string[]]$selectedDates,[string[]]$requestDoc.date_labels)', 'Verify-EditableScope -BindingReadback'):
         assert proof in submission
     assert "scope_preparation_timings_contract='monotonic_complete_scope_stages_v1'" in submission
+
+
+def test_lookup_batch_is_read_only_and_does_not_cache_action_authorization():
+    lookup=BRIDGE.split('public static int[] ExactListIndices',1)[1].split('public static void SelectListBatch',1)[0]
+    assert lookup.count('AssertControlScope(root,control,expectedPid,title)') == 2
+    assert lookup.count('VerifyLookupList(root,control)') == 2
+    assert 'StringComparer.Ordinal' in lookup and 'ExactListIndexCore(control,labels[i],count)' in lookup
+    for forbidden in ('SelectListItem(', 'Message(button', 'NotifyBinding(', 'Activate('):
+        assert forbidden not in lookup
 
 
 def test_date_foreground_and_keyboard_telemetry_match_the_actual_message_contract():

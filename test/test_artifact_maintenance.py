@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
+
+import pytest
 
 import stockagent.data_sync.artifact_maintenance as maintenance
 from stockagent.data_sync.artifact_maintenance import (
@@ -36,6 +40,55 @@ def test_discover_completed_runs_excludes_running_and_symlink(tmp_path: Path) ->
     link.symlink_to(complete, target_is_directory=True)
 
     assert discover_completed_runs(artifact_root, "ablations") == [complete]
+
+
+def test_discovery_stops_at_run_boundary_and_never_walks_running_caches(tmp_path, monkeypatch):
+    root = tmp_path / "artifacts"
+    run = root / "markets" / "running"
+    cache = run / "cache" / "nested"
+    cache.mkdir(parents=True)
+    (run / "run_manifest.json").write_text("{}")
+    (run / "progress.json").write_text(json.dumps({"state": "running", "phase": "training"}))
+    (cache / "progress.json").write_text(json.dumps({"state": "complete", "phase": "complete"}))
+    assert discover_completed_runs(root, "markets") == []
+
+
+def test_malformed_progress_does_not_abort_other_complete_runs(tmp_path):
+    root = tmp_path / "artifacts"
+    for name, content in (("broken", "[]"), ("complete", '{"state":"complete","phase":"complete"}')):
+        run = root / "markets" / name
+        run.mkdir(parents=True)
+        (run / "progress.json").write_text(content)
+    assert discover_completed_runs(root, "markets") == [root / "markets/complete"]
+
+
+@pytest.mark.parametrize("argument", ["artifacts/markets/suite", "--output=artifacts/markets/suite", "artifacts/markets"])
+def test_relative_or_option_ancestor_keeps_a_live_process_reference(tmp_path, argument):
+    scope = tmp_path / "artifacts/markets"
+    source = scope / "suite/run"
+    source.mkdir(parents=True)
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", argument], cwd=tmp_path)
+    try:
+        references = maintenance.artifact_process_references(source, scope)
+        assert any(f"pid={process.pid}:cmdline:" in row for row in references)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("argument", ["artifacts/markets/other", "--root=/"])
+def test_sibling_or_generic_server_root_does_not_block_the_selected_run(tmp_path, argument):
+    scope = tmp_path / "artifacts/markets"
+    source = scope / "selected"
+    source.mkdir(parents=True)
+    sibling = scope / "other"
+    sibling.mkdir()
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", argument], cwd=tmp_path)
+    try:
+        assert not any(f"pid={process.pid}:" in row for row in maintenance.artifact_process_references(source, scope))
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
 
 
 class _Resolved:

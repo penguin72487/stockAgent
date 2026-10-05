@@ -15,12 +15,13 @@
 | 來源取得 | acquisition | canonical collector、SQLite／receipts／配額續傳；來源仍由 catalog 管理 |
 | 盤中與命令服務 | services | Discord／Shioaji，保持獨立程序與 existing unit |
 | 監控／分析 | analytics | DuckDB 與 msgspec 私有快取解碼；公網 JSON 寫入格式維持 canonical owner |
-| 跨節點工程控制 | control | psycopg／專用 PostgreSQL；唯讀 code-verification trial，collector／GPU／帳本保留原 owner |
+| 跨節點工程控制 | control | psycopg／專用 PostgreSQL；penguin 正式固定 code-verification queue，collector／GPU／帳本保留原 owner；見 [Control workflow](control_plane_workflow.md) |
 
 FlashAttention、xFormers、Transformer Engine 和 OCR 原生套件維持既有硬體環境
 與獨立 requirements。它們會出現在節點 runtime identity，沒有被卸載或改成
-portable lock 的假相容輪子。新建一般環境可使用 `uv sync --locked
---no-default-groups`；不要以 `uv sync --active` 修剪現有 fintech 的受驗依賴。
+portable lock 的假相容輪子。新環境使用 Miniforge／Mamba 的角色宣告與該平台
+已驗收 explicit lock；保留 CUDA／control／backup 的環境隔離。uv 是現有離線
+wheel 建置工具，不取代這個環境管理流程；不修剪現有 fintech 的受驗依賴。
 
 ## 建置與驗證
 

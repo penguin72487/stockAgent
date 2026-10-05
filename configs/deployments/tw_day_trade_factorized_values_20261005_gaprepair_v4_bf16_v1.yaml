@@ -1,0 +1,11 @@
+# Owner-requested value-only input ABI: no availability/age/update features.
+# Reuse the exact source/execution caches, not previous model/optimizer state.
+base_config: tw_day_trade_factorized_native_20261005_gaprepair_v4_precision_v2.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-bf16-v1
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_gaprepair_v4/training-bf16-v1
+  resume: false
+
+data:
+  factorized_feature_manifest: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_gaprepair_v4/prepared/factorized_manifest.json

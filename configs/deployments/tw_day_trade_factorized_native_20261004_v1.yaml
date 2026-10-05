@@ -1,0 +1,33 @@
+base_config: tw_day_trade_last_last_only_training_vastai1t_v10_research_143_no_bottleneck.yaml
+experiment_name: tw-day-trade-native-nullable-factorized-20261004-v4-coordinate-nulls
+environment:
+  # Strict FP32 basis parity rejected TF32. BF16 AMP remains enabled and its
+  # Tensor Core kernels are unaffected by this FP32-only switch.
+  use_tensor_cores: false
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261004_v1/training-operation-dtype-v4
+  resume: false
+  post_train_infer: false
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-daytrade-panel-sources-20261004-v3/tw-daytrade-panel-sources-20261004-v3-20261004T095518325247256Z-l0-penguin-695ffc0c14ffe3e0/stocks
+  tw_public_feature_path: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261004_v1/prepared-v4/execution_rules.parquet
+  # Separate exact execution companion release; the numerical feature view and
+  # original source release remain unchanged. Never resolve this path as latest.
+  day_trade_physical_public_feature_path: /srv/stockagent-packed-materialized/tw-daytrade-physical-20261004-v1/tw-daytrade-physical-20261004-v1-20261004T121443923061282Z-l0-penguin-f34b9ce2dc82eb29/features/tw_public_stock_daily.parquet
+  day_trade_minute_execution_root: /srv/stockagent-packed-materialized/tw-minute-train/tw-minute-train-20260910T121601063496311Z-l0-penguin-09bedd96a2f68c39
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261004_v1/runtime-cache/physical-source
+  panel_cache_root: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261004_v1/prepared-v3/base_panel_cache
+  factorized_feature_manifest: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_panel_20261004_v1/prepared-v5/factorized_manifest.json
+  feature_include: [open_raw, high_raw, low_raw, close_raw, trading_volume_raw, next_session_open_gap_logret]
+  feature_exclude: []
+  feature_zero_fill: []
+  feature_shift_next_session: []
+  feature_availability_indicators: []
+training:
+  pretrained_initialization_root: null
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  curve_plot_async: false
+  financial_transformer:
+    feature_bottleneck_dim: 0
+    temporal_basis_fp32_contraction: true

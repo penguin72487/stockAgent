@@ -9,17 +9,24 @@
 使用者要求四個不在當前服務使用的研究目錄先完整保存在 D 冷庫，再立即回收
 原目錄與已退役的 mirror，不等七天；不可把只收小檔的舊冷版視為完整備份。
 
-| 原目錄（相對 `artifacts/`） | 完整封存 dataset | 清理前 allocated GB | 狀態 |
+| 原目錄（相對 `artifacts/`） | 完整封存 dataset | 實際回收 allocated GB | 狀態（2026-10-04 更新） |
 | --- | --- | ---: | --- |
-| `markets/tw_public_lantent` | `legacy-markets-tw-public-lantent` | 10.623 | 完整冷 head 已提交，回收待驗收 |
+| `markets/tw_public_lantent` | `legacy-markets-tw-public-lantent` | 10.623 | 10/04 11:35 完整驗收；source／mirror／C 暫存均回收，D 原值可恢復 |
 | `markets/forex` | `legacy-markets-forex` | 4.262 | 11:58 完整驗收；原檔已回收 4.261622 GB，可從 D 恢復 |
-| `markets/tw_public_candles_multi_basis_online_complete_lookback32_v2` | `legacy-markets-online-lookback32-v2` | 3.814 | 完整冷 head 已提交，回收待驗收 |
-| `markets/tw_public_candles_multi_basis_online_complete_feature_input_lookback32_v4` | `legacy-markets-feature-input-lookback32-v4-full` | 3.702 | 完整冷／源本比對通過，排程回收中 |
+| `markets/tw_public_candles_multi_basis_online_complete_lookback32_v2` | `legacy-markets-online-lookback32-v2` | 3.798 | 10/03 完整驗收；source／mirror／C 暫存均回收，D 原值可恢復 |
+| `markets/tw_public_candles_multi_basis_online_complete_feature_input_lookback32_v4` | `legacy-markets-feature-input-lookback32-v4-full` | 3.702 | 10/03 完整驗收；source／mirror／C 暫存均回收，D 原值可恢復 |
 
-上表是原檔 allocated bytes 除以 10⁹ 的盤點值，不是已回收量。
-實際回收量以每項 `acceptance.json` 的
+上表是已驗收原檔 allocated bytes 除以 10⁹，合計 **22,384,287,744 bytes**
+（四項約 22.38 GB；不含 forex 的三項約 18.12 GB）。精確回收量以每項 `acceptance.json` 的
 `original_reclaimed_allocated_file_bytes` 為準，不另加 mirror 的 hard-link 名稱，
 也不把本次建立再清除的壓縮工作暫存重複算入原空間節省。
+
+最新三項收據：
+[lantent](../artifacts/operations/market_safe_retirement_20261003/legacy-markets-tw-public-lantent/acceptance.json)、
+[lookback32 v2](../artifacts/operations/market_safe_retirement_20261003/legacy-markets-online-lookback32-v2/acceptance.json)、
+[feature-input v4](../artifacts/operations/market_safe_retirement_20261003/legacy-markets-feature-input-lookback32-v4-full/acceptance.json)。
+2026-10-04 另驗證這四份精確冷索引已抵達 vastai1T；該節點是 index-only，
+不是第二份完整冷物件備份，見 [遠端整理紀錄](vastai_storage_cleanup_2026-10-04.md)。
 
 `forex` 的 [完整驗收收據](../artifacts/operations/market_safe_retirement_20261003/legacy-markets-forex/acceptance.json)
 確認回收 **4,261,621,760 allocated file bytes**：source／mirror／C 編碼暫存

@@ -85,6 +85,9 @@ def immutable_array_path(relative: str, selected: list[Path], root: Path) -> boo
 
 
 def current_service_blockers(selected: list[Path], repo: Path) -> list[str]:
+    from stockagent.data_sync.node_roles import training_only_node
+    if training_only_node():
+        return []
     import dataclasses
     import yaml
     from stockagent.config import load_config
@@ -232,6 +235,131 @@ def compact(*, names, apply, receipt_dir, repo=REPO, min_age_hours=168.0):
         flush=True,
     )
     return result
+
+
+def compact_current_inventory(inventory, *, apply, receipt_dir, repo=REPO):
+    """One-shot exact compaction of the currently audited, unused cache cohort.
+
+    Keep every logical path; do not evict unique arrays, NPZs, source tables or
+    service caches. The complete inventory must still match before acquiring
+    the canonical generation-writer locks. This never changes automatic GC.
+    """
+    from dataclasses import replace
+    import time
+    from stockagent.data_sync.remote_legacy_return import (
+        active_configuration_references, artifact_process_references,
+        identity, metadata_tree, real,
+    )
+
+    if (inventory.get("schema_version") != 1
+        or not 0 <= time.time() - inventory.get("observed_at_epoch", 0) <= 7200
+        or inventory.get("direct_process_references")):
+        raise ValueError("fresh, complete, process-free cache inventory required")
+    root = real(repo / "artifacts/cache")
+    panels, selected, protected_roots = [], [], []
+    for row in inventory["caches"]:
+        if row["service_error"] is not None:
+            raise ValueError("cache consumer audit incomplete")
+        if row["service_references"] or row["process_references"]:
+            continue
+        name = row["name"]
+        if not name or Path(name).name != name or name in {".", ".."}:
+            raise ValueError("invalid inventoried cache name")
+        path = real(root / name)
+        if str(path) != row["path"] or metadata_tree(path)["fingerprint"] != row["fingerprint"]:
+            raise ValueError("cache inventory changed; rescan instead of forcing")
+        references = (current_service_blockers([path], repo)
+                      + process_references_many([path])
+                      + artifact_process_references(path, repo / "artifacts")
+                      + active_configuration_references(path, repo))
+        if references:
+            protected_roots.append({"name": name, "reason": "current-consumer", "references": references})
+            continue
+        current_panels = []
+        for meta in row["metadata"]:
+            if (Path(meta["path"]).name != "meta.json"
+                or Path(meta["path"]).parent.name != "panel_cache_v2"):
+                continue
+            panel = real(path / Path(meta["path"]).parent)
+            value = json.loads((panel / "meta.json").read_text())
+            if not isinstance(value.get("arrays"), dict) or "features" not in value["arrays"]:
+                raise ValueError("unrecognized panel generation metadata")
+            current_panels.append(panel)
+        if current_panels:
+            if any(r["kind"] == "unsupported" or r["cross_filesystem"] for r in row["rows"]):
+                protected_roots.append({"name": name, "reason": "unsupported-or-mounted-content"})
+                continue
+            if any(not (p / ".write.lock").is_file() or (p / ".write.lock").is_symlink()
+                   for p in current_panels):
+                protected_roots.append({"name": name, "reason": "canonical-writer-lock-unavailable"})
+                continue
+            selected.append(path)
+            panels.extend(current_panels)
+    if not panels:
+        raise ValueError("no unused immutable generation caches")
+
+    def blockers():
+        result = current_service_blockers(selected, repo) + process_references_many(selected)
+        for path in selected:
+            result += artifact_process_references(path, repo / "artifacts")
+            result += active_configuration_references(path, repo)
+        return sorted(set(result))
+
+    initial_blockers = blockers()
+    if initial_blockers:
+        raise ValueError("cache became a current consumer: " + "; ".join(initial_blockers[:10]))
+    with ExitStack() as locks:
+        for panel in sorted(set(panels)):
+            writer = panel / ".write.lock"
+            if not writer.is_file() or writer.is_symlink():
+                raise ValueError("canonical panel writer lock missing or redirected")
+            lock = locks.enter_context(writer.open("a+b"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if blockers():
+            raise ValueError("cache became protected under writer locks")
+        all_names = {p.name for p in root.iterdir() if p.is_dir()}
+        groups, counters = find_duplicate_groups(
+            root, min_age_hours=12,
+            excluded_top=frozenset(all_names - {p.name for p in selected}),
+            excluded_suffixes=DEFAULT_EXCLUDED_SUFFIXES | {".json", ".parquet", ".npz"},
+        )
+        groups = [replace(g, duplicates=tuple(
+            d for d in g.duplicates
+            if immutable_array_path(d.relative, panels, root)
+            and (root / d.relative).stat().st_nlink == 1
+        )) for g in groups if immutable_array_path(g.canonical.relative, panels, root)]
+        groups = [g for g in groups if g.duplicates]
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+        receipt_dir = real(receipt_dir)
+        receipt_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        audit = {"contract": "audited_unused_immutable_generation_dedup_v1",
+                 "inventory_sha256": identity(inventory), "apply": False,
+                 "selected_roots": [str(p) for p in selected],
+                 "protected_roots": protected_roots,
+                 "observed_at_epoch": time.time(), "counters": counters,
+                 "groups": groups_as_json(groups), "logical_paths_removed": 0,
+                 "unique_payloads_removed": 0,
+                 "would_free_allocated_bytes": sum(g.reclaimable_allocated_bytes for g in groups)}
+        audit_path = receipt_dir / ("current-panel-dedup-plan-" + stamp + ".json")
+        atomic_write_json(audit_path, audit)
+        replaced, skipped = [], []
+        if apply:
+            if blockers():
+                raise ValueError("cache became protected before apply")
+            replaced, skipped = apply_duplicate_groups(root, groups)
+        blocks = {d.relative: d.blocks * 512 for g in groups for d in g.duplicates}
+        result = {**audit, "apply": apply, "audit_receipt": str(audit_path),
+                  "replaced": replaced, "skipped": skipped,
+                  "completed_at_epoch": time.time(),
+                  "reclaimed_allocated_bytes": sum(blocks[r["path"]] for r in replaced)}
+        result_path = receipt_dir / ("current-panel-dedup-result-" + stamp + ".json")
+        atomic_write_json(result_path, result)
+        return {"receipt": str(result_path), "apply": apply,
+                "would_free_allocated_bytes": audit["would_free_allocated_bytes"],
+                "reclaimed_allocated_bytes": result["reclaimed_allocated_bytes"],
+                "replaced_files": len(replaced), "skipped_files": len(skipped),
+                "protected_roots": protected_roots,
+                "logical_paths_removed": 0, "unique_payloads_removed": 0}
 
 
 if __name__ == "__main__":

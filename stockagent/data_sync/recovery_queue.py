@@ -163,10 +163,12 @@ $drive=[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($base))
 }""" + " '" + distro + "'"
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
     result = subprocess.run([configuration["powershell"], "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                             encoded], capture_output=True, text=True, timeout=30)
+                             encoded], capture_output=True, timeout=30)
     if result.returncode:
         raise ValueError("actual Windows backing-drive capacity is unavailable")
-    value = json.loads(result.stdout)
+    # JSON is UTF-8/ASCII; localized PowerShell stderr may use another Windows
+    # code page. Do not decode irrelevant stderr before inspecting exit status.
+    value = json.loads(result.stdout.decode("utf-8-sig"))
     if value["distribution"] != distro or type(value["free_bytes"]) is not int or value["free_bytes"] < 0:
         raise ValueError("Windows backing-drive telemetry differs")
     return value["free_bytes"]

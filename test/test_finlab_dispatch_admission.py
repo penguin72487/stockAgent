@@ -5,6 +5,7 @@ import subprocess
 
 from scripts.check_finlab_refresh_due import refresh_due
 from stockagent.data.finlab_acquisition_contract import WORKLOAD_CONTRACT_VERSION
+from stockagent.data.finlab_acquisition_contract import intraday_progress, process_owner, process_owner_alive
 
 NOW = datetime(2026, 10, 4, 3, tzinfo=UTC)  # Sunday, not the account reset slot.
 
@@ -72,3 +73,45 @@ def test_deployed_timer_contract_has_real_runtime_entrypoint():
     assert 'ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_due.sh"' in service
     assert "OnUnitInactiveSec=1min" in timer
     subprocess.run(["bash", "-n", str(root / "scripts/run_finlab_refresh_due.sh")], check=True)
+
+
+def test_dead_owner_and_overrun_are_not_fake_running_or_eta(tmp_path):
+    progress = {"contract_version": 1, "state": "running", "owner": process_owner(),
+                "observed_at_utc": (NOW-timedelta(seconds=10)).isoformat(), "active_key": "tw_tick:2330",
+                "estimated_batch_finish_at_utc": (NOW-timedelta(seconds=1)).isoformat()}
+    write(tmp_path / "intraday/active_run.json", progress)
+    live = intraday_progress(tmp_path, now=NOW)
+    assert live["owner_alive"] and live["state"] == "running" and live["batch_eta_state"] == "sample_overrun"
+    assert live["estimated_batch_finish_at_utc"] is None
+    write(tmp_path / "intraday/active_run.json", {**progress, "owner": {**progress["owner"], "start_ticks": "wrong-pid-generation"}})
+    dead = intraday_progress(tmp_path, now=NOW)
+    assert dead["state"] == "interrupted" and not dead["owner_alive"] and dead["active_key"] is None
+
+
+def test_proc_subset_hides_boot_uuid_not_the_live_pid_generation(monkeypatch):
+    owner = process_owner()
+    real_read = Path.read_text
+
+    def sandbox_read(path, *args, **kwargs):
+        if str(path) == "/proc/sys/kernel/random/boot_id":
+            raise FileNotFoundError("ProcSubset=pid")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", sandbox_read)
+    assert process_owner_alive(owner, started_at_utc=NOW.isoformat(), now=NOW)
+    assert not process_owner_alive(owner, now=NOW)  # no boot/run proof
+    assert not process_owner_alive(owner, started_at_utc=(NOW-timedelta(days=365)).isoformat(), now=NOW)
+    assert not process_owner_alive(owner, started_at_utc=(NOW+timedelta(seconds=1)).isoformat(), now=NOW)
+    assert not process_owner_alive({**owner, "start_ticks": "another-generation"},
+                                   started_at_utc=NOW.isoformat(), now=NOW)
+
+
+def test_checkpoint_during_projection_is_not_discarded_as_future(tmp_path):
+    progress = {"contract_version": 1, "state": "running", "owner": process_owner(),
+                "run_started_at_utc": (NOW-timedelta(minutes=1)).isoformat(),
+                "observed_at_utc": (NOW+timedelta(seconds=3)).isoformat()}
+    write(tmp_path / "intraday/active_run.json", progress)
+    assert intraday_progress(tmp_path, now=NOW)["owner_alive"]
+    assert intraday_progress(tmp_path, now=NOW)["age_seconds"] == 0
+    write(tmp_path / "intraday/active_run.json", {**progress, "observed_at_utc": (NOW+timedelta(seconds=6)).isoformat()})
+    assert intraday_progress(tmp_path, now=NOW) == {}

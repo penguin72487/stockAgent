@@ -250,7 +250,7 @@ def test_windows_capacity_uses_encoded_fixed_registry_query(queue_configuration,
         program = base64.b64decode(argv[-1]).decode("utf-16-le")
         assert "ext4.vhdx" in program and "AvailableFreeSpace" in program and "HKCU:" in program
         assert program.endswith(" 'Ubuntu'")
-        return subprocess.CompletedProcess(argv, 0, stdout='{"free_bytes":99999999,"distribution":"Ubuntu"}')
+        return subprocess.CompletedProcess(argv, 0, stdout=b'{"free_bytes":99999999,"distribution":"Ubuntu"}', stderr="無關的中文診斷".encode("cp950"))
     monkeypatch.setattr(module.subprocess, "run", execute)
     assert module.physical_free_bytes(c) == 99999999
     monkeypatch.setenv("WSL_DISTRO_NAME", "DifferentDistro")

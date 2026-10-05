@@ -23,6 +23,8 @@ $probeInterval = [math]::Max(1, $ProbeIntervalSeconds)
 $wslRetry = [math]::Max(5, $WslRetrySeconds)
 $gatewayHealthUri = "http://127.0.0.1:8770/healthz"
 $escapedConfig = [Regex]::Escape($config)
+$wslRuntimeProcess = $null
+$lastWslRuntimeAttempt = [DateTime]::MinValue
 $wslBootstrapProcess = $null
 $lastWslAttempt = [DateTime]::MinValue
 $lastWslVerb = ""
@@ -105,6 +107,68 @@ function Test-GatewayListener {
     }
 }
 
+function Ensure-WslRuntime {
+    # systemd services alone do not keep a WSL instance alive.  Hold one
+    # foreground WSL invocation independently of the short gateway commands.
+    # Losing this child must not block gateway recovery or require an editor.
+    if ($wslRuntimeProcess) {
+        try {
+            $exited = $wslRuntimeProcess.HasExited
+        } catch {
+            $exited = $true
+        }
+        if (-not $exited) {
+            return
+        }
+        try {
+            $exitAt = $wslRuntimeProcess.ExitTime
+            $elapsed = [math]::Round(
+                ($exitAt - $wslRuntimeProcess.StartTime).TotalSeconds, 3
+            )
+            Write-StartupLog (
+                "WSL runtime holder exited pid=$($wslRuntimeProcess.Id) " +
+                "exit_code=$($wslRuntimeProcess.ExitCode) " +
+                "elapsed_seconds=$elapsed"
+            )
+        } catch {
+            Write-StartupLog (
+                "WSL runtime holder observation failed " +
+                "error=$($_.Exception.GetType().Name)"
+            )
+        } finally {
+            $wslRuntimeProcess.Dispose()
+            $script:wslRuntimeProcess = $null
+        }
+    }
+    $now = Get-Date
+    if (($now - $lastWslRuntimeAttempt).TotalSeconds -lt $wslRetry) {
+        return
+    }
+    $script:lastWslRuntimeAttempt = $now
+    $arguments = if ($DistroName) {
+        "--distribution $DistroName --exec /bin/sh -c `"exec sleep infinity`" stockagent-public-runtime"
+    } else {
+        "--exec /bin/sh -c `"exec sleep infinity`" stockagent-public-runtime"
+    }
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $WslPath
+        $startInfo.Arguments = $arguments
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $script:wslRuntimeProcess = [System.Diagnostics.Process]::Start($startInfo)
+        Write-StartupLog (
+            "WSL runtime holder start dispatched pid=$($wslRuntimeProcess.Id) " +
+            "distro=$DistroName"
+        )
+    } catch {
+        Write-StartupLog (
+            "WSL runtime holder start failed distro=$DistroName " +
+            "error=$($_.Exception.GetType().Name); retrying"
+        )
+    }
+}
+
 function Record-WslGatewayCompletion {
     if (-not $wslBootstrapProcess) {
         return
@@ -180,8 +244,10 @@ function Request-WslGateway(
 }
 
 Set-Location $InstallRoot
+Ensure-WslRuntime
 $null = Request-WslGateway "supervisor_start"
 while ($true) {
+    Ensure-WslRuntime
     Record-WslGatewayCompletion
     try {
         Start-CaddyIfNeeded

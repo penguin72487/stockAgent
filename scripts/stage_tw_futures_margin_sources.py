@@ -125,10 +125,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preparation", type=Path,
         default=ROOT / "artifacts/markets/tw_futures_v8_margin_preparation")
-    parser.add_argument("--output", type=Path, default=ROOT / "data_tw_futures/margin_sources")
+    parser.add_argument("--output", type=Path,
+        default=ROOT / "data_tw_index_futures/preparation_sources/margin_sources")
     parser.add_argument("--refresh-current", action="store_true",
         help="Atomically refresh source evidence; retain the exact prior bundle.")
     args = parser.parse_args()
+    # Follow only the explicitly requested live producer alias, never create
+    # a second bundle beside it during a refresh of an older CLI path.
+    args.output = args.output.resolve()
     if args.refresh_current:
         from scripts.promote_tw_day_trade_replay import _exchange_directories
         pending=args.output.parent/'.margin-sources-pending'

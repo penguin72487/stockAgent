@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from zoneinfo import ZoneInfo
 
 
@@ -28,6 +29,32 @@ WHOLE_TABLE_KEYS = frozenset({
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def read_receipt_bound_source(root: Path, key: str, receipt_path: Path) -> tuple[Path, dict]:
+    """Capture one current receipt and its immutable object, not a stale catalog path.
+
+    A later atomic head update does not invalidate the captured old object;
+    callers retain this receipt body and rehash that same object after reading.
+    This avoids locking out the normal acquisition owner during publication.
+    """
+    root = root.resolve()
+    if not receipt_path.resolve().is_relative_to(root / 'receipts'):
+        raise ValueError('FinLab receipt escapes canonical receipt root')
+    receipt = json.loads(receipt_path.read_text())
+    if not isinstance(receipt, dict) or receipt.get('dataset') != key:
+        raise ValueError('FinLab receipt identity mismatch')
+    relative = Path(str(receipt.get('parquet_path') or ''))
+    if relative.is_absolute() or '..' in relative.parts or relative.parts[:1] != ('datasets',):
+        raise ValueError('FinLab source escapes immutable dataset root')
+    source = root / relative
+    if not source.resolve().is_relative_to(root / 'datasets'):
+        raise ValueError('FinLab immutable source escapes dataset root')
+    with source.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if digest != receipt.get('sha256'):
+        raise ValueError('FinLab captured receipt/source hash mismatch')
+    return source, receipt
+
+
 def process_owner(pid: int | None = None) -> dict | None:
     """Local Linux identity prevents a killed/reused PID remaining 'running'."""
     pid = os.getpid() if pid is None else pid
@@ -37,10 +64,42 @@ def process_owner(pid: int | None = None) -> dict | None:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         if fields[0] in {"Z", "X"}:
             return None
-        return {"pid": pid, "start_ticks": fields[19],
-                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+        # ProcSubset=pid deliberately hides kernel sysctls in the public
+        # gateway. A readable PID generation is not a dead process merely
+        # because the boot UUID is unavailable in that mount namespace.
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            boot_id = None
+        return {"pid": pid, "start_ticks": fields[19], "boot_id": boot_id}
     except (OSError, IndexError):
         return None
+
+
+def process_owner_alive(owner: object, *, started_at_utc=None, now: datetime) -> bool:
+    """Verify the PID generation without weakening the gateway's proc policy.
+
+    Prefer the kernel boot UUID. If a sandbox hides it, require the exact PID
+    start ticks AND a recorded run start after the current boot. CLOCK_BOOTTIME
+    is available without exposing kernel sysctls or host credentials; old
+    receipts from a previous boot cannot establish current liveness.
+    """
+    if not isinstance(owner, dict):
+        return False
+    current = process_owner(owner.get("pid"))
+    if (not current or current["pid"] != owner.get("pid")
+            or current["start_ticks"] != owner.get("start_ticks")):
+        return False
+    if current["boot_id"] is not None and owner.get("boot_id") is not None:
+        return current["boot_id"] == owner["boot_id"]
+    started = utc_time(started_at_utc)
+    if started is None or started > now:
+        return False
+    try:
+        since_boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return False  # Unverifiable is never promoted to running.
+    return started >= now - timedelta(seconds=since_boot)
 
 
 def intraday_progress(source_root: Path, *, now: datetime) -> dict:
@@ -52,11 +111,14 @@ def intraday_progress(source_root: Path, *, now: datetime) -> dict:
     if not isinstance(raw, dict) or raw.get("contract_version") != INTRADAY_PROGRESS_VERSION:
         return {}
     observed = utc_time(raw.get("observed_at_utc"))
-    if not observed or observed > now:
+    # The public DTO captures its clock before reading multiple local files;
+    # a worker may atomically checkpoint during that short projection. Allow
+    # that bounded read race, not genuinely future-dated evidence.
+    if not observed or observed > now + timedelta(seconds=5):
         return {}
     owner = raw.get("owner")
-    live = isinstance(owner, dict) and process_owner(owner.get("pid")) == owner
-    result = {**raw, "owner_alive": live, "age_seconds": round((now - observed).total_seconds(), 1)}
+    live = process_owner_alive(owner, started_at_utc=raw.get("run_started_at_utc"), now=max(now, observed))
+    result = {**raw, "owner_alive": live, "age_seconds": round(max(0, (now - observed).total_seconds()), 1)}
     if raw.get("state") == "running" and not live:
         result.update(state="interrupted", active_key=None, active_trade_date=None,
                       estimated_batch_finish_at_utc=None)
