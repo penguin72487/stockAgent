@@ -114,6 +114,55 @@ Guidelines:
 - Rank-only loss can over-concentrate positions. If using rank objectives, keep turnover/concentration/backtest regularization in mind.
 - If the user switches back to only-long behavior, change both the model direction mode and the loss/backtest direction assumptions deliberately and report the change.
 
+## Crypto perpetual accounting
+
+- Crypto ledger contract v5 denominates volume limits in initial reference
+  capital and divides by carried live NAV. Preserve FP64 equity scale across
+  train/eval chunks, tensor-to-NumPy conversion and all backtest artifacts.
+  Gross-risk reduction orders remain subject to side permissions and capacity;
+  a blocked carried breach cannot manufacture a fill or admit new expansion.
+- A missing future price/funding label is not a dated delisting event. Never
+  use it to force an exit at the preceding mark. Unknown nonzero held valuation
+  raises `CryptoPerpetualDataError` before loss/backward, coordinated across
+  DDP ranks; only economic insolvency is an absorbing account default.
+  New crypto accounting requires a fresh optimizer root. Preserve old artifacts
+  and distinguish overlapping latest-year experiments from held-out folds.
+  In crypto contract v5, `force_exit_mask` means a dated announcement's zero-
+  target request, not unlimited exchange settlement. Preserve the current
+  inventory until real side permissions/capacity permit a fill; missing held
+  valuations still fail closed. Date-only announcements become policy-known
+  no earlier than the following UTC day.
+  See `docs/bybit_v4_training_audit.md` for measured v4 evidence and
+  `docs/bybit_source_repairs.md` for the ICX funding repair, HFT/VINE announced
+  exit policy, hash-verified local derived view, and fresh v6 training root.
+  This view reuses unchanged source files and is not a publisher or producer.
+- Crypto continuous capacity must retain the true local signed-clamp derivative
+  at zero order delta when capacity and permissions allow trading. A collapsed
+  zero-capacity/forbidden interval has zero derivative; do not use sign/abs
+  clipping that kills a valid cash-entry gradient. Backward contract 1 is a
+  training-only fingerprint change, while forward account contract remains 5.
+  Single-active-name learned_cash unit-L1 direction has zero score derivative;
+  preserve it for replay and use an explicitly separate output-mode candidate
+  when changing this behavior. See `docs/bybit_v6_training_audit.md` for the
+  all-fold audit and the user-requested 00:00 zero-latency v7 research contract.
+  Clock changes require actual 1m/funding rematerialization, not relabeling a
+  00:05 table; source/public data and prior artifacts remain untouched.
+- The user's v8 Bybit follow-up authorizes
+  `trading.crypto_announced_exit_unlimited_volume: true`. Only a dated
+  announcement's zero-target reduction may waive the ordinary volume cap;
+  side permissions, real execution-price evidence, turnover limits, ordinary
+  buy/sell fees, padding/default state and missing-held-valuation failures stay
+  unchanged. It cannot open or reverse inventory or use future NaNs as events.
+  This is a research fill assumption, not exchange delisting settlement.
+  Opt-in crypto forward contract 6 uses a fresh optimizer/artifact root and
+  reuses v7's source and panel cache without duplication; disabled configs keep
+  contract 5 and their old fingerprints. See `docs/bybit_v8_announced_exit.md`.
+  The user's subsequent correction sets ordinary v8 participation to
+  `max_volume_participation: 0.5` of prior completed daily USDT turnover, not
+  the legacy 1%. Keep this explicit in v8; preserve v7's replay contract and
+  reject optimizer resumes across participation values. Announcement exits
+  remain the only volume-exempt reductions.
+
 ## Canonical Tensor Backtest And Loss
 
 ### Full-stock-context single-stock-futures day trade

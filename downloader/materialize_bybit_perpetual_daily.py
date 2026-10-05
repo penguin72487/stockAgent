@@ -21,6 +21,7 @@ from common import PersistentProgress, atomic_write_text
 from artifact_io import atomic_write_parquet, sha256_file
 from feature_stage_timing import stage_latency_summary
 from ohlcv_hot_tail import hot_tail_path, logical_mtime_ns, read_logical_parquet
+from download_bybit_funding_history import _historical_instrument_records
 
 
 LEGACY_CONTRACT_VERSION = 6
@@ -114,6 +115,10 @@ def parse_args() -> argparse.Namespace:
         "--workers", type=int, default=max(1, min(12, os.cpu_count() or 1))
     )
     parser.add_argument("--symbols", nargs="*", default=None)
+    parser.add_argument(
+        "--historical-instruments", type=Path,
+        help="Explicit retained instrument CSV for requested historical symbols; funding coverage is still required.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument(
@@ -126,7 +131,12 @@ def parse_args() -> argparse.Namespace:
             "0 is the zero-latency research contract and 5 preserves v6"
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.historical_instruments is not None and not any(
+        str(value).strip() for value in (args.symbols or [])
+    ):
+        parser.error("--historical-instruments requires explicit nonempty --symbols")
+    return args
 
 
 def _contract_version(execution_minutes_utc: int) -> int:
@@ -205,6 +215,37 @@ def _standard_instruments(path: Path) -> pl.DataFrame:
         & pl.col("symbol_type").fill_null("").cast(pl.String).str.strip_chars().eq("")
         & ~pl.col("is_pre_listing").cast(pl.Boolean, strict=False).fill_null(False)
     ).sort("code")
+
+
+def _select_materialize_instruments(
+    current_path: Path, requested: set[str], historical_path: Path | None
+) -> pl.DataFrame:
+    if historical_path is not None and not requested:
+        raise ValueError("historical instruments require explicit nonempty symbols")
+    if historical_path is not None and not historical_path.is_file():
+        raise FileNotFoundError(f"missing historical instrument CSV: {historical_path}")
+    instruments = _standard_instruments(current_path)
+    if not requested:
+        return instruments
+    instruments = instruments.filter(pl.col("code").str.to_uppercase().is_in(requested))
+    missing = requested - set(instruments["code"].str.to_uppercase().to_list())
+    if historical_path is not None and missing:
+        current = pl.read_csv(current_path, infer_schema_length=10_000)
+        conflicts = current.filter(pl.col("code").str.to_uppercase().is_in(missing))
+        for row in conflicts.to_dicts():
+            if (
+                row["category"] != "linear" or row["quote_coin"] != "USDT"
+                or row["settle_coin"] != "USDT"
+                or "LinearPerpetual" not in str(row["contract_type"] or "")
+                or str(row["symbol_type"] or "").strip() or bool(row["is_pre_listing"])
+            ):
+                raise ValueError(f"current instrument identity conflicts with historical request: {row['code']}")
+        historical = pl.DataFrame([asdict(record) for record in _historical_instrument_records(historical_path, missing)])
+        instruments = pl.concat([instruments, historical], how="diagonal_relaxed").sort("code")
+        missing = requested - set(instruments["code"].str.to_uppercase().to_list())
+    if missing:
+        raise ValueError(f"symbols outside standard linear-USDT universe: {sorted(missing)}")
+    return instruments
 
 
 def _daily_bars(
@@ -539,7 +580,7 @@ def _incremental_daily_bars(
 
 def _attach_funding_total_return(
     daily: pl.DataFrame,
-    funding_path: Path,
+    funding_path: Path | pl.DataFrame,
     coverage_row: dict[str, object],
     *,
     execution_minutes_utc: int = DEFAULT_EXECUTION_MINUTES_UTC,
@@ -562,7 +603,9 @@ def _attach_funding_total_return(
     head_complete_value = str(coverage_row.get("head_complete", "")).strip().lower()
     if head_complete_value not in {"1", "true", "yes"}:
         raise ValueError("funding coverage is not head-complete")
-    funding = pl.read_parquet(funding_path)
+    # Bounded repair callers may merge verified old events and an official
+    # API tail in memory, without duplicating a complete funding source file.
+    funding = funding_path if isinstance(funding_path, pl.DataFrame) else pl.read_parquet(funding_path)
     required = {
         "funding_time_utc",
         "funding_rate",
@@ -786,21 +829,15 @@ def main() -> None:
     receipt_identity_before = (
         _file_identity(instruments_path), _file_identity(coverage_path)
     )
-    instruments = _standard_instruments(instruments_path)
     requested = {
         str(value).strip().upper()
         for value in (args.symbols or [])
         if str(value).strip()
     }
-    if requested:
-        instruments = instruments.filter(
-            pl.col("code").str.to_uppercase().is_in(requested)
-        )
-        missing = requested - set(instruments["code"].str.to_uppercase().to_list())
-        if missing:
-            raise ValueError(
-                f"symbols outside standard linear-USDT universe: {sorted(missing)}"
-            )
+    historical_path = getattr(args, "historical_instruments", None)
+    instruments = _select_materialize_instruments(
+        funding_dir / "instruments.csv", requested, historical_path
+    )
     if args.limit is not None:
         instruments = instruments.head(max(0, int(args.limit)))
     if not coverage_path.is_file():
@@ -985,6 +1022,11 @@ def main() -> None:
     summary = {
         "contract_version": contract_version,
         "product": "bybit_standard_linear_usdt_perpetual",
+        "historical_instruments": (
+            {"path": str(historical_path), "sha256": _sha256(historical_path),
+             "role": "historical_product_identity_only_not_current_trading_eligibility"}
+            if historical_path is not None else None
+        ),
         "decision_cutoff_utc": "00:00",
         "execution_boundary_utc": execution_clock,
         "decision_to_execution_lag_minutes": execution_minutes_utc,

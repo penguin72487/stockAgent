@@ -16,6 +16,31 @@ Use when changing neural runners, distributed execution, resume, checkpoint iden
   ordered symbols are authoritative; `symbol_position` is only a capacity hint
   and `daily_weights` is a legacy fallback. A model/data symbol-contract
   disagreement must fail closed.
+- An exact optimizer resume must restore persistent input-normalization buffers
+  from the checkpoint together with model weights. Same-feature pretrained
+  transfer may intentionally retain source RMS scales; never overwrite those
+  buffers with a newly fitted target RMS during resume. Record fitted and
+  effective scales separately. A historical resumed ablation with changed RMS
+  is a confounded trajectory, not a clean architecture-only comparison. See
+  `docs/tw_day_trade_v8_ofat_analysis_2026-09-23.md`.
+- `day_trade_training_annual_episodes` and `day_trade_sub_lot_recovery` are
+  opt-in research training contracts, each requiring a new artifact root and
+  checkpoint fingerprint. Annual accounts may reset only at a calendar-year
+  boundary with no held inventory or unpaid claims; validation/test retain
+  their original account lifecycle. Sub-lot recovery changes backward only
+  and must reuse source-backed FIFO opportunity/fee math, preserve all exact
+  forward values, and remain disabled during evaluation. Never silently add
+  either mechanism to an existing directional or architecture ablation. See
+  `docs/tw_day_trade_v8_training_mechanisms_2026-09-23.md`.
+- A temporal-basis OFAT with an empty target family list is an incompatible
+  basis ABI when its pretrained source has any basis encoder, PCA/KLT bank, or
+  nonempty family metadata. Do not reuse source basis overrides merely because
+  the target has no fitting work. Fit/record the empty target selection and
+  allow only explicitly reported compatible pretrained tensors to transfer;
+  an epoch-zero account guard still decides whether that initialization is
+  acceptable. A failed attempt may have left source-basis metadata in the
+  target artifact, so the corrected run must overwrite it with an empty-basis
+  receipt. Treat deterministic basis-configuration exceptions as non-retryable.
 - Neural training has one lazy `WindowedSplitTensors` executor per process. The
   single-device and torchrun DDP variants share the same canonical model, loss,
   side masks, fees, and stateful backtest semantics.
@@ -54,4 +79,3 @@ Use when changing neural runners, distributed execution, resume, checkpoint iden
   relaunch torchrun/DDP with two or more visible GPUs. GPU visibility and
   assignment belong to `scripts/manage_gpu_jobs.py`; `tw_parallel` means
   within-fold DDP and should remain semantically aligned with `tw.yaml`.
-

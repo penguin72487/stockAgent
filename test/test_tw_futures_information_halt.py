@@ -173,7 +173,9 @@ def test_incremental_migration_rejects_other_kernel_changes(tmp_path, monkeypatc
     import scripts.prepare_tw_futures_margin_training as builder
     source = inspect.getsource(builder._compile_accounting)
     node = ast.parse(source).body[0]
-    node.args.kwonlyargs.pop(); node.args.kw_defaults.pop()
+    hook_index = next(i for i, argument in enumerate(node.args.kwonlyargs)
+                      if argument.arg == "information_halt_reviews")
+    node.args.kwonlyargs.pop(hook_index); node.args.kw_defaults.pop(hook_index)
     node.body = [n for n in node.body if not (isinstance(n, ast.If)
         and isinstance(n.test, ast.Name) and n.test.id == "information_halt_reviews")]
     original = ast.unparse(node) + "\n"
@@ -187,6 +189,13 @@ def test_incremental_migration_rejects_other_kernel_changes(tmp_path, monkeypatc
         builder._verify_information_halt_kernel_extension(previous, changed, (baseline, sha256_file(baseline)))
     monkeypatch.setattr(builder.inspect, "getsource", lambda _: source.replace("rule_source = source /", "rule_source = other /"))
     with pytest.raises(ValueError):
+        builder._verify_information_halt_kernel_extension(previous, current, (baseline, sha256_file(baseline)))
+    # Naming the allowed hook must not permit changes to an unrelated optional
+    # input, even when it is declared after the hook parameter.
+    changed_source = source.replace("valuation_research_policy=None", "valuation_research_policy='changed'")
+    assert changed_source != source
+    monkeypatch.setattr(builder.inspect, "getsource", lambda _: changed_source)
+    with pytest.raises(ValueError, match="retained accounting calculation"):
         builder._verify_information_halt_kernel_extension(previous, current, (baseline, sha256_file(baseline)))
 
 

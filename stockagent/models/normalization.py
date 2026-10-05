@@ -378,11 +378,17 @@ def masked_signed_action_weights(
             weights = weights.masked_fill(~mask_bool, 0.0)
         if not return_parts:
             return weights
+        implicit_cash = (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0)
         parts = {
             "action_long_alloc": long_alloc,
             "action_short_alloc": short_alloc,
             "action_cash_alloc": cash_alloc,
-            "implicit_cash_weight": (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0),
+            # In signed action modes, uninvested net gross also includes
+            # simultaneous long/short actions that cancel within one stock.
+            # Keep the historical implicit-cash field and expose that portion
+            # separately so it cannot be mistaken for chosen cash allocation.
+            "action_cancellation_cash": (implicit_cash - cash_alloc).clamp_min(0.0),
+            "implicit_cash_weight": implicit_cash,
         }
         return weights, parts
 
@@ -392,10 +398,12 @@ def masked_cash_entmax15_weights(
     mask: torch.Tensor | None,
     *,
     short_mask: torch.Tensor | None = None,
+    long_mask: torch.Tensor | None = None,
     radius: float = 1.0,
     eps: float = PORTFOLIO_L1_EPS,
     return_parts: bool = False,
     preserve_fp32_output: bool = False,
+    preserve_zero_score_gradient: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sparse signed allocation with dimension-invariant residual cash.
 
@@ -438,11 +446,35 @@ def masked_cash_entmax15_weights(
         clean.sign(),
         torch.ones_like(clean),
     )
+    if long_mask is not None:
+        long_mask_bool = long_mask.to(device=logits.device, dtype=torch.bool)
+        if tuple(long_mask_bool.shape) != tuple(logits.shape):
+            raise ValueError("long_mask must match logits")
+        long_mask_bool = long_mask_bool & mask_bool
+        # Restrict directions before selection; positive scores never become
+        # short conviction. Omitted long_mask retains the historical graph.
+        legal_evidence = torch.where(
+            long_mask_bool, legal_evidence,
+            torch.where(short_mask_bool, (-clean).clamp_min(0.0), 0.0),
+        )
+        direction = torch.where(long_mask_bool, direction, -torch.ones_like(clean))
+        mask_bool = mask_bool & (long_mask_bool | short_mask_bool)
     relative = _masked_entmax15(legal_evidence, mask_bool, eps=eps).float()
     conviction = legal_evidence / (1.0 + legal_evidence)
-    weights = (
-        relative * direction * conviction * radius_value
-    ).masked_fill(~mask_bool, 0.0)
+    if preserve_zero_score_gradient:
+        # Algebraically identical to direction * conviction, but the direct
+        # signed expression has derivative 1 at zero. The historical expression
+        # has zero derivative there because sign(0) * abs(0) hides both paths.
+        legal_scores = torch.where(
+            short_mask_bool, clean, clean.clamp_min(0.0)
+        ).masked_fill(~mask_bool, 0.0)
+        if long_mask is not None:
+            legal_scores = torch.where(long_mask_bool, legal_scores, clean.clamp_max(0.0))
+            legal_scores = legal_scores.masked_fill(~mask_bool, 0.0)
+        weights = relative * (legal_scores / (1.0 + legal_evidence)) * radius_value
+    else:
+        weights = relative * direction * conviction * radius_value
+    weights = weights.masked_fill(~mask_bool, 0.0)
     # The historical cash_entmax15 contract returns the input dtype.  Exact
     # whole-lot ledgers need the new score_entmax_cash contract to retain the
     # FP32 allocation computed above under BF16 autocast; casting it back can
@@ -462,6 +494,145 @@ def masked_cash_entmax15_weights(
     }
 
 
+def masked_score_entmax_global_cash_weights(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    short_mask: torch.Tensor | None = None,
+    return_parts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Learn one sparse signed portfolio and a shared cash budget from stock scores.
+
+    Entmax-1.5 allocates relative evidence over legal stocks. Its weighted mean
+    score magnitude ``q`` sets risky gross to ``q / (1 + q)``. Computing final
+    weights as ``p_i * legal_score_i / (1 + q)`` is essential: it preserves a
+    nonzero stock-score gradient at the exact all-cash, zero-score state. No
+    additional cash head or trainable parameter is needed. The new mode is
+    separate from historical per-stock ``score_entmax_cash`` checkpoints.
+    """
+    if logits.ndim != 2:
+        raise ValueError("score-entmax-global-cash logits must have shape [B,S]")
+    mask_bool = (
+        torch.ones_like(logits, dtype=torch.bool)
+        if mask is None
+        else mask.to(device=logits.device, dtype=torch.bool)
+    )
+    if tuple(mask_bool.shape) != tuple(logits.shape):
+        raise ValueError("score-entmax-global-cash mask must match logits")
+    if short_mask is None:
+        short_mask_bool = mask_bool
+    else:
+        short_mask_bool = short_mask.to(device=logits.device, dtype=torch.bool)
+        if tuple(short_mask_bool.shape) != tuple(logits.shape):
+            raise ValueError("score-entmax-global-cash short mask must match logits")
+        short_mask_bool = short_mask_bool & mask_bool
+
+    clean = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    legal_scores = torch.where(
+        short_mask_bool, clean, clean.clamp_min(0.0)
+    ).masked_fill(~mask_bool, 0.0)
+    evidence = legal_scores.abs()
+    # Entmax is translation invariant. Centering before bisection keeps the
+    # threshold resolvable when one finite score is much larger than the rest.
+    centered_evidence = evidence - evidence.max(dim=1, keepdim=True).values
+    relative = _masked_entmax15(centered_evidence, mask_bool).float()
+    # Divide numerator and denominator by the row maximum. This avoids an
+    # overflowing score sum while preserving the exact q/(1+q) allocation.
+    scale = evidence.max(dim=1, keepdim=True).values.clamp_min(1.0)
+    scaled_scores = legal_scores / scale
+    scaled_evidence = evidence / scale
+    scaled_q = (relative * scaled_evidence).sum(dim=1, keepdim=True)
+    weights = (relative * scaled_scores) / (scale.reciprocal() + scaled_q)
+    weights = weights.masked_fill(~mask_bool, 0.0)
+    gross = weights.abs().sum(dim=1, keepdim=True)
+    # Rounding of thousands of FP32 positions must not exceed the unit L1 cap.
+    weights = weights * torch.minimum(torch.ones_like(gross), gross.clamp_min(1.0).reciprocal())
+    if not return_parts:
+        return weights
+    gross = weights.abs().sum(dim=1)
+    return weights, {
+        "score_entmax_global_relative_alloc": relative,
+        "score_entmax_global_evidence": scaled_q.squeeze(1) * scale.squeeze(1),
+        "score_entmax_global_risk_fraction": gross,
+        "score_entmax_global_cash_fraction": (1.0 - gross).clamp_min(0.0),
+        "implicit_cash_weight": (1.0 - gross).clamp_min(0.0),
+    }
+
+
+def masked_score_entmax_bounded_cash_weights(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    short_mask: torch.Tensor | None = None,
+    return_parts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Allocate signed conviction without letting raw scale collapse selection.
+
+    The historical score-entmax cash output feeds ``abs(score)`` to entmax and
+    then multiplies its allocation by a second function of the same magnitude.
+    A large outlier therefore wins twice: it sharpens the selector and receives
+    a larger per-leg conviction.  Exact board-lot recovery can amplify that
+    feedback into a nearly single-name portfolio.
+
+    This map first bounds every legal magnitude as ``c = a / (1 + a)``.  It
+    uses ``entmax15(c)`` for relative allocation and emits
+    ``w_i = p_i * score_i / (1 + a_i)``.  Score sign still chooses direction,
+    common score scale still changes risky gross and residual cash, and the
+    existing score head remains the only trainable output.  Since ``c`` lies in
+    ``[0, 1)``, raw score scale alone cannot create an unbounded selector gap.
+    At the all-zero state the output is all cash and has a finite nonzero score
+    gradient through the uniform legal entmax allocation.
+    """
+
+    if logits.ndim != 2:
+        raise ValueError("score-entmax-bounded-cash logits must have shape [B,S]")
+    mask_bool = (
+        torch.ones_like(logits, dtype=torch.bool)
+        if mask is None
+        else mask.to(device=logits.device, dtype=torch.bool)
+    )
+    if tuple(mask_bool.shape) != tuple(logits.shape):
+        raise ValueError("score-entmax-bounded-cash mask must match logits")
+    if short_mask is None:
+        short_mask_bool = mask_bool
+    else:
+        short_mask_bool = short_mask.to(device=logits.device, dtype=torch.bool)
+        if tuple(short_mask_bool.shape) != tuple(logits.shape):
+            raise ValueError(
+                "score-entmax-bounded-cash short mask must match logits"
+            )
+        short_mask_bool = short_mask_bool & mask_bool
+
+    clean = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    legal_scores = torch.where(
+        short_mask_bool, clean, clean.clamp_min(0.0)
+    ).masked_fill(~mask_bool, 0.0)
+    evidence = legal_scores.abs()
+    conviction = evidence / (1.0 + evidence)
+    # Entmax is translation invariant. Centering keeps its threshold solver
+    # well conditioned while retaining the bounded selector geometry.
+    selector_logits = conviction - conviction.max(dim=1, keepdim=True).values
+    relative = _masked_entmax15(selector_logits, mask_bool).float()
+    signed_conviction = legal_scores / (1.0 + evidence)
+    weights = (relative * signed_conviction).masked_fill(~mask_bool, 0.0)
+    gross = weights.abs().sum(dim=1, keepdim=True)
+    # The analytical map is already inside the unit L1 ball. Keep a final
+    # floating-point guard for very wide rows.
+    weights = weights * torch.minimum(
+        torch.ones_like(gross), gross.clamp_min(1.0).reciprocal()
+    )
+    if not return_parts:
+        return weights
+    gross = weights.abs().sum(dim=1)
+    return weights, {
+        "score_entmax_bounded_relative_alloc": relative,
+        "score_entmax_bounded_conviction": conviction,
+        "score_entmax_bounded_risk_fraction": gross,
+        "score_entmax_bounded_cash_fraction": (1.0 - gross).clamp_min(0.0),
+        "implicit_cash_weight": (1.0 - gross).clamp_min(0.0),
+    }
+
+
 def masked_score_entmax_log_cash_weights(
     logits: torch.Tensor,
     mask: torch.Tensor | None,
@@ -469,11 +640,21 @@ def masked_score_entmax_log_cash_weights(
     short_mask: torch.Tensor | None = None,
     return_parts: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Map signed scores to sparse stock weights and residual cash.
+    """Allocate cash-aware scores with sublinear, unbounded stock selection.
 
-    The selector uses log1p of score magnitude, while conviction retains the
-    signed score / (1 + magnitude). Keep weights in FP32 at the whole-lot
-    execution boundary, including under BF16 autocast.
+    ``score_entmax_cash_v2`` lets raw magnitude control both selection and
+    conviction, so an outlier can dominate twice.  The bounded variant removes
+    that failure mode but caps every selector gap below one; in a universe with
+    thousands of names this can leave too many sub-lot requests and suppress
+    risky gross.  This map uses ``log1p(abs(score))`` as the entmax selector:
+    it has unit slope at zero, grows only logarithmically for large evidence,
+    and remains unbounded so genuinely separated names can leave the support.
+
+    Final signed conviction remains ``score / (1 + abs(score))``.  The existing
+    stock score therefore learns direction, sparse relative allocation, total
+    gross, and residual cash without a cash token, trainable scalar, top-k, or
+    exposure target.  At all-zero scores the portfolio is all cash with a
+    finite nonzero score gradient through uniform legal allocation.
     """
 
     if logits.ndim != 2:
@@ -499,7 +680,9 @@ def masked_score_entmax_log_cash_weights(
     ).masked_fill(~mask_bool, 0.0)
     evidence = legal_scores.abs()
     selector_evidence = torch.log1p(evidence)
-    selector_logits = selector_evidence - selector_evidence.max(dim=1, keepdim=True).values
+    selector_logits = (
+        selector_evidence - selector_evidence.max(dim=1, keepdim=True).values
+    )
     relative = _masked_entmax15(selector_logits, mask_bool).float()
     signed_conviction = legal_scores / (1.0 + evidence)
     weights = (relative * signed_conviction).masked_fill(~mask_bool, 0.0)
@@ -515,6 +698,84 @@ def masked_score_entmax_log_cash_weights(
         "score_entmax_log_selector_evidence": selector_evidence,
         "score_entmax_log_risk_fraction": gross,
         "score_entmax_log_cash_fraction": (1.0 - gross).clamp_min(0.0),
+        "implicit_cash_weight": (1.0 - gross).clamp_min(0.0),
+    }
+
+
+def masked_score_entmax_scale_separated_cash_weights(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    short_mask: torch.Tensor | None = None,
+    return_parts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Choose sparse stock legs by score shape and cash by raw score strength.
+
+    Let ``a_i`` be the magnitude of each legally signed score and ``r`` its
+    cross-sectional RMS over active stocks. Entmax-1.5 sees only ``a_i / r``;
+    consequently a common positive rescaling of every stock score changes the
+    risky budget without changing which stocks receive relative allocation.
+    If ``p = entmax15(a/r)`` and ``q = sum(p_i*a_i)``, the signed target is
+    ``w_i = p_i*z_i/(1+q)``. Thus gross is ``q/(1+q)``, zero scores request all
+    cash yet retain a score gradient, and no trainable cash parameter is added.
+    RMS is calculated after the legal/short mask and with max scaling to avoid
+    overflow; the numerical floor matters only near the all-zero state.
+    """
+    if logits.ndim != 2:
+        raise ValueError("score-entmax-scale-separated-cash logits must have shape [B,S]")
+    mask_bool = (
+        torch.ones_like(logits, dtype=torch.bool)
+        if mask is None
+        else mask.to(device=logits.device, dtype=torch.bool)
+    )
+    if tuple(mask_bool.shape) != tuple(logits.shape):
+        raise ValueError("score-entmax-scale-separated-cash mask must match logits")
+    if short_mask is None:
+        short_mask_bool = mask_bool
+    else:
+        short_mask_bool = short_mask.to(device=logits.device, dtype=torch.bool)
+        if tuple(short_mask_bool.shape) != tuple(logits.shape):
+            raise ValueError("score-entmax-scale-separated-cash short mask must match logits")
+        short_mask_bool = short_mask_bool & mask_bool
+
+    clean = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    legal_scores = torch.where(
+        short_mask_bool, clean, clean.clamp_min(0.0)
+    ).masked_fill(~mask_bool, 0.0)
+    evidence = legal_scores.abs()
+    scale = evidence.max(dim=1, keepdim=True).values.clamp_min(1.0)
+    scaled_evidence = evidence / scale
+    active_count = mask_bool.sum(dim=1, keepdim=True).clamp_min(1).float()
+    shape_rms_sq_scaled = scaled_evidence.square().sum(dim=1, keepdim=True) / active_count
+    numerical_floor = torch.finfo(torch.float32).eps
+    # Clamping before sqrt is required: sqrt(0) followed by a denominator
+    # clamp still leaves an infinite derivative in the zero-score backward.
+    shape_rms_scaled = shape_rms_sq_scaled.clamp_min(numerical_floor**2).sqrt()
+    shape = scaled_evidence / shape_rms_scaled
+    relative = _masked_entmax15(
+        shape - shape.max(dim=1, keepdim=True).values, mask_bool
+    ).float()
+
+    scaled_q = (relative * scaled_evidence).sum(dim=1, keepdim=True)
+    weights = (relative * (legal_scores / scale)) / (scale.reciprocal() + scaled_q)
+    weights = weights.masked_fill(~mask_bool, 0.0)
+    gross = weights.abs().sum(dim=1, keepdim=True)
+    weights = weights * torch.minimum(torch.ones_like(gross), gross.clamp_min(1.0).reciprocal())
+    if not return_parts:
+        return weights
+    gross = weights.abs().sum(dim=1)
+    return weights, {
+        "score_entmax_scale_separated_relative_alloc": relative,
+        "score_entmax_scale_separated_shape_rms": (
+            torch.where(
+                shape_rms_sq_scaled > 0.0,
+                shape_rms_scaled,
+                torch.zeros_like(shape_rms_scaled),
+            ) * scale
+        ).squeeze(1),
+        "score_entmax_scale_separated_evidence": (scaled_q * scale).squeeze(1),
+        "score_entmax_scale_separated_risk_fraction": gross,
+        "score_entmax_scale_separated_cash_fraction": (1.0 - gross).clamp_min(0.0),
         "implicit_cash_weight": (1.0 - gross).clamp_min(0.0),
     }
 

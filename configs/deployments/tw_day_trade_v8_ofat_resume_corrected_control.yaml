@@ -1,0 +1,21 @@
+# Historical 99-feature v8 control for the resume-correctness follow-up.
+# Keep the frozen experiment contract; do not inherit a newer research dataset.
+base_config: tw_day_trade_last_last_only_v8_twpublic_248d0869_ofat_baseline_snapshot.yaml
+experiment_name: tw-day-trade-v8-ofat-resume-corrected-control
+runner:
+  output_dir: artifacts/ablations/tw_day_trade_v8_resume_corrected_20260923/control
+  resume: false
+environment:
+  cpu_threads: 112
+  torch_compile_threads: 16
+training:
+  epochs: 1000
+  batch_size_train: 32
+  early_stopping_no_improve_ratio: 0.1
+  lr_scheduler: warmup_cosine
+  lr_scheduler_t_max: 0
+  lr_scheduler_warmup_steps: 32
+  financial_transformer:
+    portfolio_output_mode: score_entmax_cash
+    center_long_short_logits: false
+    qk_norm: true

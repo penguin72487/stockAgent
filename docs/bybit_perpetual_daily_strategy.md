@@ -1,5 +1,14 @@
 # Bybit USDT 永續合約日頻多基底策略
 
+> 目前使用者指定每日 00:00 決策／零延遲執行；
+> 新入口為 [v8 公告日全額減倉](bybit_v8_announced_exit.md)，普通交易上限已依
+> 使用者更正為前一個已完成日成交額的 50%，公告退出豁免此上限；保留
+> [v6 全折診斷與 v7 候選](bybit_v6_training_audit.md) 作為歷史對照。
+> 先前 00:05 historical-public-PIT learned-cash v4 診斷與 v5 修正見
+> [Bybit v4 訓練診斷](bybit_v4_training_audit.md) 與
+> [官方來源修復／v6 入口](bybit_source_repairs.md)。下文的 00:00 deterministic／
+> trajectory 與 141 欄／外部特徵歸零描述屬歷史控制，不代表 v4–v8。
+
 ## 可執行契約
 
 - 宇宙只含 Bybit V5 instrument snapshot 中仍為 `Trading`、

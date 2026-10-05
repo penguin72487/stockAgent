@@ -41,7 +41,12 @@ from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.backtest.futures_data_validity import FuturesCarryDataError
 from stockagent.data.tw_futures_margin import MARGIN_EXECUTION_WIDTHS
 
-from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION
+from stockagent.backtest.crypto_perpetual import (
+    CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION,
+    CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
+    CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION,
+    CryptoPerpetualDataError,
+)
 from stockagent.backtest.return_metrics import (
     RETURN_METRICS_CONTRACT_VERSION,
     clean_log_returns_torch,
@@ -1141,10 +1146,15 @@ def _reset_pretrained_exact_account_action_head_to_flat_(
     output_mode = normalize_portfolio_output_mode(
         str(getattr(raw_model, "portfolio_output_mode", ""))
     )
-    # score_entmax_cash multiplies its relative allocation by
-    # abs(score) / (1 + abs(score)); a zero final score is therefore exactly
-    # flat even when entmax assigns nonzero relative allocation.
-    if output_mode not in {"projection_l1", "learned_cash", "score_entmax_cash"}:
+    # The score-entmax cash modes all emit zero requested weights at exactly
+    # zero stock scores, even when entmax assigns nonzero relative allocation.
+    if output_mode not in {
+        "projection_l1", "learned_cash", "score_entmax_cash",
+        "score_entmax_cash_v2", "score_entmax_global_cash",
+        "score_entmax_bounded_cash",
+        "score_entmax_log_cash",
+        "score_entmax_scale_separated_cash",
+    }:
         raise RuntimeError(
             "pretrained exact-account stock fallback requires a proven "
             "zero-score output mode"
@@ -1180,6 +1190,11 @@ def _reset_pretrained_exact_account_action_head_to_flat_(
         "projection_l1": (1, "zero_score_head_final_linear_flat_projection_l1_v1"),
         "learned_cash": (2, "zero_score_head_final_linear_flat_learned_cash_v2"),
         "score_entmax_cash": (3, "zero_score_head_final_linear_flat_score_entmax_cash_v3"),
+        "score_entmax_cash_v2": (4, "zero_score_head_final_linear_flat_score_entmax_cash_zero_grad_v4"),
+        "score_entmax_global_cash": (5, "zero_score_head_final_linear_flat_score_entmax_global_cash_v5"),
+        "score_entmax_scale_separated_cash": (6, "zero_score_head_final_linear_flat_score_entmax_scale_separated_cash_v6"),
+        "score_entmax_bounded_cash": (7, "zero_score_head_final_linear_flat_score_entmax_bounded_cash_v7"),
+        "score_entmax_log_cash": (8, "zero_score_head_final_linear_flat_score_entmax_log_cash_v8"),
     }
     schema_version, method = fallback_versions[output_mode]
     return {
@@ -1329,6 +1344,51 @@ def _checkpoint_file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _normalize_pretrained_initialization_fold_policy(value: object) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {
+        "matching_train_and_validation_years",
+        "matching_train_val_years",
+    }:
+        return "matching_train_and_validation_years"
+    if normalized == "matching_validation_and_causal_train_superset":
+        return normalized
+    raise ValueError(
+        "pretrained_initialization_fold_policy must be "
+        "'matching_train_and_validation_years' or "
+        "'matching_validation_and_causal_train_superset'"
+    )
+
+
+def _pretrained_fold_years_match(
+    *,
+    policy: str,
+    source_train_years: Sequence[int],
+    source_val_years: Sequence[int],
+    target_train_years: Sequence[int],
+    target_val_years: Sequence[int],
+) -> bool:
+    source_train = [int(value) for value in source_train_years]
+    source_val = [int(value) for value in source_val_years]
+    target_train = [int(value) for value in target_train_years]
+    target_val = [int(value) for value in target_val_years]
+    if source_val != target_val:
+        return False
+    if policy == "matching_train_and_validation_years":
+        return source_train == target_train
+    if policy != "matching_validation_and_causal_train_superset":
+        raise ValueError(f"unsupported pretrained fold policy: {policy!r}")
+    if not target_train or len(source_train) <= len(target_train):
+        return False
+    prefix_count = len(source_train) - len(target_train)
+    prefix = source_train[:prefix_count]
+    return (
+        source_train[prefix_count:] == target_train
+        and bool(prefix)
+        and all(year < target_train[0] for year in prefix)
+    )
+
+
 def _resolve_pretrained_initialization(
     config: ExperimentConfig,
     group_folds: Sequence[WalkForwardFold],
@@ -1336,10 +1396,11 @@ def _resolve_pretrained_initialization(
     """Resolve one causally matching source fold for a fresh train group.
 
     The source may have a different execution objective, so this is never a
-    resume and never imports optimizer state.  Exact train/validation-year
-    matching prevents a later source fold from leaking into an earlier target
-    fold and gives the target's epoch-zero validation guard the same temporal
-    information boundary as the source checkpoint selection.
+    resume and never imports optimizer state. Exact matching is the default.
+    The explicit causal-superset policy additionally permits only earlier
+    source training years while requiring the target train years to be an exact
+    suffix and validation years to match. A later source fold can therefore
+    never initialize an earlier target fold.
     """
 
     raw_root = config.training.pretrained_initialization_root
@@ -1358,20 +1419,9 @@ def _resolve_pretrained_initialization(
     if not group_folds:
         raise ValueError("pretrained initialization requires at least one fold")
 
-    policy = (
-        str(config.training.pretrained_initialization_fold_policy)
-        .strip()
-        .lower()
-        .replace("-", "_")
+    policy = _normalize_pretrained_initialization_fold_policy(
+        config.training.pretrained_initialization_fold_policy
     )
-    if policy not in {
-        "matching_train_and_validation_years",
-        "matching_train_val_years",
-    }:
-        raise ValueError(
-            "pretrained_initialization_fold_policy must be "
-            "'matching_train_and_validation_years'"
-        )
 
     reference = group_folds[0]
     target_train_years = [int(value) for value in reference.train_years]
@@ -1490,15 +1540,18 @@ def _resolve_pretrained_initialization(
         row
         for row in source_summary
         if isinstance(row, Mapping)
-        and [int(value) for value in row.get("train_years", [])]
-        == target_train_years
-        and [int(value) for value in row.get("val_years", [])]
-        == target_val_years
+        and _pretrained_fold_years_match(
+            policy=policy,
+            source_train_years=row.get("train_years", []),
+            source_val_years=row.get("val_years", []),
+            target_train_years=target_train_years,
+            target_val_years=target_val_years,
+        )
     ]
     if len(matching_rows) != 1:
         raise RuntimeError(
             "pretrained initialization requires exactly one source checkpoint "
-            "with identical train/validation years; "
+            f"under fold_policy={policy!r}; "
             f"train={target_train_years} val={target_val_years} "
             f"matches={len(matching_rows)} "
             f"root={source_root}"
@@ -1513,11 +1566,18 @@ def _resolve_pretrained_initialization(
             f"pretrained source checkpoint is unreadable: {checkpoint_path}: "
             f"{read_error}"
         )
-    if (
-        [int(value) for value in checkpoint.get("train_years", [])]
-        != target_train_years
-        or [int(value) for value in checkpoint.get("val_years", [])]
-        != target_val_years
+    source_train_years = [
+        int(value) for value in checkpoint.get("train_years", [])
+    ]
+    source_val_years = [
+        int(value) for value in checkpoint.get("val_years", [])
+    ]
+    if not _pretrained_fold_years_match(
+        policy=policy,
+        source_train_years=source_train_years,
+        source_val_years=source_val_years,
+        target_train_years=target_train_years,
+        target_val_years=target_val_years,
     ):
         raise RuntimeError(
             "pretrained summary/checkpoint year mismatch: "
@@ -1546,7 +1606,12 @@ def _resolve_pretrained_initialization(
         "target_fold_ids": [int(fold.fold_id) for fold in group_folds],
         "target_train_years": target_train_years,
         "target_validation_years": target_val_years,
-        "fold_policy": "matching_train_and_validation_years",
+        "source_train_years": source_train_years,
+        "source_validation_years": source_val_years,
+        "source_causal_prefix_train_years": source_train_years[
+            : len(source_train_years) - len(target_train_years)
+        ],
+        "fold_policy": policy,
         "optimizer_state_imported": False,
         "source_test_metrics_used": False,
     }
@@ -1701,7 +1766,23 @@ def _pretrained_temporal_basis_matches_target(
 
     model_config = _temporal_basis_runtime_config(config)
     if model_config is None:
-        return True
+        # A target with no temporal basis cannot reuse a source PCA/KLT bank
+        # (or its feature encoder).  The source may itself have no basis, in
+        # which case ordinary pretrained weights remain ABI-compatible.
+        source_state = initialization.checkpoint["model_state_dict"]
+        if any(
+            str(name).startswith("temporal_basis_feature_encoder.")
+            or str(name).endswith("pca_klt_basis")
+            for name in source_state
+        ):
+            return False
+        source_metadata = initialization.checkpoint.get(
+            "temporal_basis_selection"
+        )
+        return not (
+            isinstance(source_metadata, Mapping)
+            and bool(source_metadata.get("families"))
+        )
     metadata = initialization.checkpoint.get("temporal_basis_selection")
     if not isinstance(metadata, Mapping):
         return False
@@ -1770,6 +1851,24 @@ def _pretrained_temporal_basis_matches_target(
     )
 
 
+def _expand_pretrained_margin_amount_column(key, source, target, model):
+    """Preserve the old policy when adding one explicitly named observation.
+
+    The old encoder's columns are margin/notional and maintenance/initial.
+    The new last encoder column is known initial margin/reference capital;
+    zero initialization preserves the old function, while allowing it to learn.
+    Every other incompatible shape must still fail the exact-backbone check.
+    """
+    if (key == "futures_margin_encoder.weight"
+            and bool(getattr(model, "futures_margin_amount_context", False))
+            and torch.is_tensor(source) and source.ndim == target.ndim == 2
+            and source.shape == (target.shape[0], 2) and target.shape[1] == 3):
+        expanded = target.detach().new_zeros(target.shape)
+        expanded[:, :2] = source.detach().to(device=target.device, dtype=target.dtype)
+        return expanded
+    return source
+
+
 def _transfer_pretrained_feature_identity(
     model: nn.Module,
     initialization: _PretrainedInitialization,
@@ -1835,6 +1934,7 @@ def _transfer_pretrained_feature_identity(
         copied_keys: list[str] = []
         for key, target_value in target_state.items():
             source_value = source_state.get(key)
+            source_value = _expand_pretrained_margin_amount_column(key, source_value, target_value, raw_model)
             if not torch.is_tensor(source_value):
                 mismatches.append(f"{key}:missing")
                 continue
@@ -1903,6 +2003,10 @@ def _transfer_pretrained_feature_identity(
                 "trainable_parameters": int(trainable_parameters),
                 "total_parameters": int(total_parameters),
                 "epoch_zero_validation_guard": True,
+                "margin_amount_column_zero_initialized": bool(
+                    getattr(raw_model, "futures_margin_amount_context", False)
+                    and source_state.get("futures_margin_encoder.weight", torch.empty(0, 0)).shape[-1] == 2
+                ),
             }
         )
         setattr(
@@ -1933,6 +2037,8 @@ def _transfer_pretrained_feature_identity(
     copied_keys: list[str] = []
     for key, source_value in source_state.items():
         target_value = target_state.get(key)
+        if target_value is not None:
+            source_value = _expand_pretrained_margin_amount_column(key, source_value, target_value, raw_model)
         if not torch.is_tensor(source_value) or target_value is None:
             mismatches.append(f"{key}:missing")
             continue
@@ -2304,6 +2410,7 @@ class _ExecutionRuntime:
     settlement_lag_sessions: int
     crypto_stateful_proximal_allocator: bool = False
     crypto_proximal_cost_multiplier: float = 1.0
+    crypto_announced_exit_unlimited_volume: bool = False
     normal_sell_fee_rates: torch.Tensor | None = None
     day_trade_unlimited_margin_conversion: bool = False
     day_trade_margin_financing_ratio: float = 0.60
@@ -2338,6 +2445,10 @@ class _ExecutionRuntime:
     option_day_cost_schedule: OptionDayCostSchedule | None = None
     derivatives_maximum_capital_fraction: float = 0.98
     day_trade_carry_source: PreparedDayTradeCarrySource | None = None
+    day_trade_training_annual_episodes: bool = False
+    # CPU identity references only; resolved exclusively after a crypto error.
+    diagnostic_panel_dates: np.ndarray | None = None
+    diagnostic_panel_symbols: Sequence[str] | None = None
 
 
 def _is_stateful_security_carry(
@@ -2368,7 +2479,7 @@ def _split_uses_recurrent_futures_equity_scale(split: object) -> bool:
 
     mode = normalize_execution_mode(str(getattr(split, "execution_mode", "naive")))
     if (
-        mode == "tw_index_futures_day"
+        mode in {"tw_index_futures_day", "crypto_perpetual"}
         or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     ):
         return True
@@ -2473,6 +2584,12 @@ def _build_execution_runtime(
             crypto_proximal_cost_multiplier=float(
                 config.trading.crypto_proximal_cost_multiplier
             ),
+            crypto_announced_exit_unlimited_volume=(
+                bool(config.trading.crypto_announced_exit_unlimited_volume)
+                if mode == "crypto_perpetual" else False
+            ),
+            diagnostic_panel_dates=panel.dates if mode == "crypto_perpetual" else None,
+            diagnostic_panel_symbols=panel.symbols if mode == "crypto_perpetual" else None,
         )
     if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         market = getattr(panel, "index_futures_day_session", None)
@@ -2745,6 +2862,7 @@ def _build_execution_runtime(
             and config.trading.tw_day_trade_unlimited_margin_conversion
             else None
         ),
+        day_trade_training_annual_episodes=bool(config.training.day_trade_training_annual_episodes),
     )
 
 
@@ -3034,7 +3152,11 @@ def _mode_artifact_contract_for_config(
             recurrent_state_scope="whole_contracts_and_settled_equity",
             terminal_policy="expiry_cash_settlement_or_capacity_limited_close_proxy",
             weight_snapshot_contract="signed_entry_contract_quantities",
-            benchmark_contract="flat_cash_nominal_twd_no_interest",
+            benchmark_contract=(
+                "tx_front_month_rolling_buy_hold_1x_gross_same_contract_close_v1"
+                if config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"
+                else "flat_cash_nominal_twd_no_interest"
+            ),
             mode_details={"capital_basis": "learned_signed_initial_margin_budget",
                           **_benchmark_reporting_details(config),
                           "settlement_ledger_unit": "contract_quantity",
@@ -3181,13 +3303,28 @@ def _mode_artifact_contract_for_config(
                 ),
                 "mode_details": {
                     "crypto_backtest_contract_version": CRYPTO_PERPETUAL_BACKTEST_CONTRACT_VERSION,
+                    "crypto_backward_contract_version": CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION,
                     "crypto_execution_minute_utc": execution_minute,
                     "funding_boundary_order": (
                         "boundary_funding_settles_before_new_target"
                     ),
+                    "volume_capacity_denominator": "live_nav_over_reference_capital",
+                    "missing_held_valuation": "raise_data_error_no_retrospective_exit",
+                    "announced_exit_policy": "zero_target_request_obeys_side_capacity_turnover_not_exchange_settlement",
+                    "gross_breach_policy": "capacity_and_permission_constrained_reduction_no_new_expansion",
+                    "cross_fold_inventory_transfer": "not_implemented_independent_fold_accounts",
                 },
             }
         )
+        if bool(getattr(config.trading, "crypto_announced_exit_unlimited_volume", False)):
+            payload["mode_details"].update(
+                crypto_backtest_contract_version=CRYPTO_PERPETUAL_ANNOUNCED_EXIT_BACKTEST_CONTRACT_VERSION,
+                crypto_announced_exit_unlimited_volume=True,
+                announced_exit_policy=(
+                    "user_authorized_volume_unlimited_announced_reduction_only_"
+                    "side_permissions_turnover_prices_fees_unchanged_not_exchange_settlement"
+                ),
+            )
         return payload
     if mode != "tw_day_trade" or config.data.day_trade_minute_execution_root is None:
         return payload
@@ -3635,6 +3772,28 @@ class TimingBreakdown:
     cuda_events: list[tuple[str, torch.device, torch.cuda.Event, torch.cuda.Event]] = field(
         default_factory=list
     )
+
+
+def _max_rank_epoch_timing(
+    *, epoch_wall_s: float, train_total_s: float, device: torch.device
+) -> dict[str, float | int]:
+    """Report the slowest worker, without averaging away a DDP bottleneck.
+
+    Every rank must call this after the epoch's CUDA work has synchronized.
+    Keep local stage timings intact; their maxima need not belong to one rank
+    and must not be summed into a fictitious critical path.
+    """
+    values = [float(epoch_wall_s), float(train_total_s)]
+    world_size = _distributed_world_size() if _distributed_is_initialized() else 1
+    if world_size > 1:
+        payload = torch.tensor(values, dtype=torch.float64, device=device)
+        dist.all_reduce(payload, op=dist.ReduceOp.MAX)
+        values = payload.cpu().tolist()
+    return {
+        "epoch_wall_s_max_rank": values[0],
+        "train_total_s_max_rank": values[1],
+        "timing_rank_count": world_size,
+    }
 
 
 def _broadcast_epoch_eval_tensor(
@@ -4617,6 +4776,9 @@ def _evaluated_backtest_loss(
         crypto_proximal_cost_multiplier=(
             config.trading.crypto_proximal_cost_multiplier
         ),
+        crypto_announced_exit_unlimited_volume=(
+            config.trading.crypto_announced_exit_unlimited_volume
+        ),
         gross_leverage=1.0,
         min_trade_weight=config.trading.min_trade_weight,
         portfolio_activation=config.trading.portfolio_activation,
@@ -5089,6 +5251,10 @@ def _evaluate_windowed_aux_objective_loss(
         sell_fee_rate=sell_fee_rate,
         max_turnover_ratio=max_turnover_ratio,
         volume_limit_weights=volume_limit_weights,
+        crypto_announced_exit_unlimited_volume=(
+            False if execution_runtime is None
+            else execution_runtime.crypto_announced_exit_unlimited_volume
+        ),
         short_capacity_weights=_short_capacity_weights_from_notional(
             short_capacity_notional,
             volume_participation_equity=volume_participation_equity,
@@ -5707,7 +5873,48 @@ def _fit_group_temporal_basis(
 
     model_config = _temporal_basis_runtime_config(config)
     if model_config is None:
-        return {}, None
+        active_name = str(_active_model_config(config)["config_name"])
+        active_config = getattr(config.training, active_name, None)
+        if active_config is None or not hasattr(
+            active_config, "temporal_basis_families"
+        ):
+            return {}, None
+        # Record the disabled basis explicitly.  A failed pretrained attempt
+        # may already have written its source selection into this artifact;
+        # leaving that file in place would misdescribe a successful rerun.
+        metadata = build_temporal_basis_metadata(
+            (),
+            lookback=int(config.training.lookback),
+            components=int(active_config.temporal_basis_components),
+            components_by_family=(
+                active_config.temporal_basis_components_by_family
+            ),
+            novelty_threshold=float(
+                active_config.temporal_basis_novelty_threshold
+            ),
+        )
+        metadata.update(
+            {
+                "train_years": [int(year) for year in train_years],
+                "fold_ids": [int(fold.fold_id) for fold in group_folds],
+                "pca_klt_training_only": False,
+            }
+        )
+        metadata["selection_fingerprint"] = _stable_fingerprint(metadata)
+        if _distributed_should_write():
+            _write_temporal_basis_metadata(
+                _group_dir(output_path, list(train_years))
+                / "temporal_basis_selection.json",
+                metadata,
+            )
+            for fold in group_folds:
+                _write_temporal_basis_metadata(
+                    _fold_dir(output_path, fold.fold_id)
+                    / "temporal_basis_selection.json",
+                    metadata,
+                    fold_id=fold.fold_id,
+                )
+        return {}, metadata
     families = list(getattr(model_config, "temporal_basis_families"))
     components = int(getattr(model_config, "temporal_basis_components"))
     components_by_family = dict(
@@ -6382,6 +6589,56 @@ def _apply_futures_feature_rms_to_model(
     setattr(model, "futures_feature_rms_metadata", deepcopy(metadata))
 
 
+def _restore_resume_model_state(
+    model: nn.Module,
+    checkpoint: Mapping[str, Any],
+) -> None:
+    """Restore the learned function, including its persistent input buffers.
+
+    Same-feature pretrained transfer can intentionally import the source RMS
+    along with its learned projection. Reapplying the target fold's fitted RMS
+    here changes that function without transforming the weights or Adam state.
+    Fitting belongs to fresh initialization; an exact resume owns all buffers.
+    """
+    _load_state_dict(model, checkpoint["model_state_dict"])
+    provenance = checkpoint.get("pretrained_initialization")
+    if isinstance(provenance, Mapping):
+        setattr(
+            _unwrap_model(model),
+            "pretrained_initialization_provenance",
+            deepcopy(dict(provenance)),
+        )
+
+
+def _effective_causal_feature_rms_report(
+    model: nn.Module,
+    fitted: tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Distinguish fitted target statistics from the buffers actually used."""
+    if fitted is None:
+        return None
+    encoder = getattr(_unwrap_model(model), "candle_encoder", None)
+    scale = getattr(encoder, "causal_feature_rms_scale", None)
+    active = getattr(encoder, "causal_feature_active_mask", None)
+    if not torch.is_tensor(scale) or not torch.is_tensor(active):
+        raise TypeError("causal RMS report requires model normalization buffers")
+    scale = scale.detach().cpu()
+    active = active.detach().cpu()
+    fitted_scale, fitted_active, metadata = fitted
+    fitted_scale = fitted_scale.detach().cpu().to(scale.dtype)
+    fitted_active = fitted_active.detach().cpu().to(active.dtype)
+    return {
+        "schema_version": 1,
+        "authority": "model_state_dict",
+        "fitted_normalizer_fingerprint": metadata.get("normalizer_fingerprint"),
+        "matches_fitted_scale": bool(torch.equal(scale, fitted_scale)),
+        "matches_fitted_active_mask": bool(torch.equal(active, fitted_active)),
+        "max_abs_scale_difference": float((scale - fitted_scale).abs().max()),
+        "effective_scale": scale.tolist(),
+        "effective_active_mask": active.tolist(),
+    }
+
+
 def _write_loss_contract_metadata(
     path: Path,
     *,
@@ -6390,6 +6647,8 @@ def _write_loss_contract_metadata(
     direction_weight: float,
     volatility_regime_weight: float,
     factor_aug_kwargs: Mapping[str, float] | None,
+    day_trade_training_annual_episodes: bool = False,
+    day_trade_sub_lot_recovery: bool = False,
 ) -> None:
     """Persist which loss components are shared with evaluation versus train-only."""
     if not _distributed_should_write():
@@ -6412,6 +6671,24 @@ def _write_loss_contract_metadata(
             "parameters": dict(factor_aug_kwargs or {}),
         },
     }
+    if day_trade_training_annual_episodes or day_trade_sub_lot_recovery:
+        payload["day_trade_training_contract"] = {
+            "annual_independent_accounts": bool(day_trade_training_annual_episodes),
+            "annual_episode_boundary": (
+                "calendar_year_first_session_fresh_capital_v2"
+                if day_trade_training_annual_episodes
+                else None
+            ),
+            "lookback_role": (
+                "causal_feature_context_only"
+                if day_trade_training_annual_episodes
+                else None
+            ),
+            "sub_lot_backward_only": bool(day_trade_sub_lot_recovery),
+            "validation_test_unchanged": True,
+            "optimizer_steps_per_complete_epoch": 1,
+            "training_loss_comparable_to_continuous_account": not day_trade_training_annual_episodes,
+        }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -7315,6 +7592,19 @@ def _write_fold_complete_marker(
     if not _distributed_should_write():
         return
 
+    required_artifacts = {
+        "metrics": _metrics_path(fold_dir),
+        "backtest": _backtest_path(fold_dir),
+    }
+    if str(source) != "artifact_scope_v2_migration":
+        required_artifacts["model"] = _model_path(fold_dir)
+    missing = [name for name, path in required_artifacts.items() if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "refusing to mark fold complete before required artifacts exist: "
+            + ", ".join(missing)
+        )
+
     def _date_coverage(path: Path) -> dict[str, int | str | None]:
         if not path.exists():
             return {"rows": 0, "date_start": None, "date_end": None}
@@ -7338,7 +7628,9 @@ def _write_fold_complete_marker(
         "val_years": [int(year) for year in fold_result.val_years],
         "test_years": [int(year) for year in fold_result.test_years],
         "metrics_json": _metrics_path(fold_dir).name,
-        "model_path": _model_path(fold_dir).name,
+        "model_path": (
+            _model_path(fold_dir).name if _model_path(fold_dir).is_file() else None
+        ),
         "checkpoint_path": (
             _best_checkpoint_path(fold_dir).name
             if _best_checkpoint_path(fold_dir).exists()
@@ -7503,6 +7795,52 @@ def _trajectory_valid_row_count(split: WindowedSplitTensors) -> int:
     return int(mask.detach().to(device="cpu", dtype=torch.int64).sum().item())
 
 
+def _enrich_crypto_data_error(
+    exc: CryptoPerpetualDataError,
+    *,
+    scope: str,
+    row_offset: int,
+    panel_row_indices=None,
+    symbol_indices=None,
+    execution_runtime: _ExecutionRuntime | None = None,
+    chunk_end: int | None = None,
+    progress_label: str | None = None,
+) -> CryptoPerpetualDataError:
+    """Resolve existing CPU identities only on failure, never in model inputs."""
+    evidence = dict(exc.evidence)
+    evidence.update(scope=scope, chunk_start=int(row_offset))
+    if chunk_end is not None:
+        evidence["chunk_end"] = int(chunk_end)
+    if progress_label is not None:
+        evidence["progress_label"] = progress_label
+    if "row" in evidence:
+        split_row = int(row_offset) + int(evidence["row"])
+        evidence["split_row"] = split_row
+        if panel_row_indices is not None and 0 <= split_row < len(panel_row_indices):
+            panel_row = int(panel_row_indices[split_row])
+            evidence["panel_row"] = panel_row
+            dates = getattr(execution_runtime, "diagnostic_panel_dates", None)
+            if dates is not None and 0 <= panel_row < len(dates):
+                evidence["date"] = str(np.datetime64(dates[panel_row], "D"))
+    if "symbol_index" in evidence:
+        symbol_index = int(evidence["symbol_index"])
+        global_index = symbol_index
+        if symbol_indices is not None:
+            global_index = (
+                int(symbol_indices[symbol_index])
+                if 0 <= symbol_index < len(symbol_indices) else -1
+            )
+        evidence["global_symbol_index"] = global_index
+        symbols = getattr(execution_runtime, "diagnostic_panel_symbols", None)
+        if symbols is not None and 0 <= global_index < len(symbols):
+            evidence["symbol"] = str(symbols[global_index])
+    prefix = (
+        f"train chunk starting at split row {row_offset}: "
+        if scope == "train" else f"evaluation chunk rows=[{row_offset},{chunk_end}): "
+    )
+    return CryptoPerpetualDataError(prefix + exc.message, evidence=evidence)
+
+
 @contextmanager
 def _capture_carry_data_error(errors):
     """Defer only a data error until independent eval ranks can rendezvous."""
@@ -7510,6 +7848,16 @@ def _capture_carry_data_error(errors):
         yield
     except FuturesCarryDataError as exc:
         errors.append(exc.evidence)
+    except CryptoPerpetualDataError as exc:
+        errors.append({"data_error_type": "crypto_perpetual", "message": exc.message,
+                       "evidence": exc.evidence})
+
+
+def _raise_carry_data_error(error):
+    """Restore the product-specific failure after a shared rank rendezvous."""
+    if error.get("data_error_type") == "crypto_perpetual":
+        raise CryptoPerpetualDataError(error["message"], evidence=error.get("evidence"))
+    raise FuturesCarryDataError(error)
 
 
 def _synchronize_carry_data_error(error, device, *, distributed):
@@ -7527,7 +7875,8 @@ def _synchronize_carry_data_error(error, device, *, distributed):
 
 
 @contextmanager
-def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=False):
+def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=False,
+                           execution_runtime=None):
     """Reject the complete trajectory on all ranks before backward/AdamW.
 
     The ledger cannot own a collective: validation can run on one rank only.
@@ -7538,7 +7887,7 @@ def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=
     carrying = (split.execution_mode == "tw_stock_futures_day_trade_0845_minute"
                 and tape is not None and tape.ndim == 4
                 and tape.shape[-1] in CARRY_SUPPORTED_TAPE_FIELDS)
-    if not carrying:
+    if not carrying and split.execution_mode != "crypto_perpetual":
         yield
         return
     from stockagent.backtest.futures_data_validity import FuturesCarryDataError
@@ -7552,10 +7901,19 @@ def _carry_loss_data_guard(split, optimizer, device, row_offset, *, distributed=
         evidence.update(scope='train', split_row=row,
                         panel_row=int(split._valid_indices_cpu[row]))
         error = evidence
+    except CryptoPerpetualDataError as exc:
+        enriched = _enrich_crypto_data_error(
+            exc, scope="train", row_offset=row_offset,
+            panel_row_indices=getattr(split, "_valid_indices_cpu", None),
+            symbol_indices=getattr(split, "symbol_indices", None),
+            execution_runtime=execution_runtime,
+        )
+        error = {"data_error_type": "crypto_perpetual",
+                 "message": enriched.message, "evidence": enriched.evidence}
     error = _synchronize_carry_data_error(error, device, distributed=distributed)
     if error is not None:
         optimizer.zero_grad(set_to_none=True)
-        raise FuturesCarryDataError(error)
+        _raise_carry_data_error(error)
 
 
 def _finalize_trajectory_optimizer_step(
@@ -8917,6 +9275,10 @@ def _create_lr_scheduler(
             factor=float(config.training.lr_scheduler_gamma),
             patience=max(1, int(config.training.lr_scheduler_patience)),
             threshold=float(config.training.lr_scheduler_threshold),
+            # Log-utility losses may be negative: relative thresholds can
+            # incorrectly count a worsening negative loss as an improvement.
+            threshold_mode="abs",
+            min_lr=max(0.0, float(config.training.lr_scheduler_eta_min)),
         )
         return scheduler, "plateau", True, "epoch"
 
@@ -9529,6 +9891,7 @@ def _save_backtest_artifact(
     has_equity_scale_contract = (
         ledger_unit == "nav_ratio"
         or ledger_unit == "contract_quantity"
+        or (mode == "crypto_perpetual" and result.equity_scale_history is not None)
         or mode == "tw_index_futures_day"
         or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     )
@@ -9992,6 +10355,13 @@ def _benchmark_reporting_details(config: object) -> dict[str, str]:
     trading = getattr(config, "trading", None)
     mode = str(getattr(trading, "execution_mode", "")).strip().lower()
     if mode == "tw_stock_context_futures_portfolio":
+        if getattr(trading, "tw_futures_portfolio_benchmark_mode", "legacy_front_holding_return") == "tx_front_rolling_1x_gross":
+            return {
+                "benchmark_name": "TX front-month rolling buy-and-hold, 1x gross",
+                "benchmark_cost_treatment": "gross_no_fees_or_tax",
+                "benchmark_exposure": "continuous_1x_long_not_integer_account",
+                "benchmark_return_clock": "same_contract_close_to_close_roll_at_prior_close",
+            }
         if (getattr(trading, "tw_futures_portfolio_holding_policy", "carry") == "intraday"
                 or getattr(trading, "tw_futures_portfolio_capital_basis", "notional") == "initial_margin"):
             return {
@@ -10102,13 +10472,21 @@ def _save_best_val_backtest_snapshot(
         num_symbols = int(val_backtest.weights_history.size(1)) if val_backtest.weights_history.dim() == 2 else 0
         weights_history = np.empty((0, num_symbols), dtype=np.float32)
 
-    def sliced_optional_float32(value: torch.Tensor | None) -> np.ndarray | None:
+    equity_scale_dtype = (
+        torch.float64
+        if normalize_execution_mode(val_backtest.execution_mode) == "crypto_perpetual"
+        else torch.float32
+    )
+
+    def sliced_optional_float32(
+        value: torch.Tensor | None, *, dtype: torch.dtype = torch.float32,
+    ) -> np.ndarray | None:
         if value is None:
             return None
         if value.dim() == 0 or int(value.size(0)) < row_end:
             raise ValueError("best-val settlement history is shorter than its core returns")
         return value[row_start:row_end].detach().to(
-            device="cpu", dtype=torch.float32
+            device="cpu", dtype=dtype
         ).numpy()
 
     def sliced_optional_bool(value: torch.Tensor | None) -> np.ndarray | None:
@@ -10122,10 +10500,12 @@ def _save_best_val_backtest_snapshot(
 
     preserves_terminal_state = row_end == int(val_backtest.strategy_returns.size(0))
 
-    def terminal_optional_float32(value: torch.Tensor | None) -> np.ndarray | None:
+    def terminal_optional_float32(
+        value: torch.Tensor | None, *, dtype: torch.dtype = torch.float32,
+    ) -> np.ndarray | None:
         if value is None or not preserves_terminal_state:
             return None
-        return value.detach().to(device="cpu", dtype=torch.float32).numpy()
+        return value.detach().to(device="cpu", dtype=dtype).numpy()
 
     def terminal_optional_bool(value: torch.Tensor | None) -> np.ndarray | None:
         if value is None or not preserves_terminal_state:
@@ -10198,7 +10578,7 @@ def _save_best_val_backtest_snapshot(
         ),
         settlement_default=sliced_optional_bool(val_backtest.settlement_default),
         equity_scale_history=sliced_optional_float32(
-            val_backtest.equity_scale_history
+            val_backtest.equity_scale_history, dtype=equity_scale_dtype,
         ),
         short_sale_collateral_history=sliced_optional_float32(
             val_backtest.short_sale_collateral_history
@@ -10234,7 +10614,7 @@ def _save_best_val_backtest_snapshot(
         ),
         final_alive=terminal_optional_bool(val_backtest.final_alive),
         final_equity_scale=terminal_optional_float32(
-            val_backtest.final_equity_scale
+            val_backtest.final_equity_scale, dtype=equity_scale_dtype,
         ),
         final_short_sale_collateral=terminal_optional_float32(
             val_backtest.final_short_sale_collateral
@@ -10467,6 +10847,44 @@ def _save_tw_index_futures_benchmark_audit(
     )
 
 
+def _save_stock_context_tx_rolling_benchmark_audit(
+    output_path: Path,
+    *,
+    dates: np.ndarray,
+    benchmark_returns: np.ndarray,
+    config: ExperimentConfig,
+) -> None:
+    """Prove that the reported comparator matches the verified TX roll path."""
+
+    from stockagent.data.tw_futures_benchmark import (
+        load_tx_front_rolling_benchmark, resolve_tx_benchmark_path,
+    )
+
+    payload = load_tx_front_rolling_benchmark(
+        resolve_tx_benchmark_path(config.trading),
+        np.asarray(dates, dtype="datetime64[D]"),
+    )
+    if not bool(payload["source_covered"].all()):
+        raise ValueError("reported TX benchmark includes dates before verified TX inception")
+    expected = np.asarray(payload["benchmark_log_returns"], dtype=np.float64)
+    reported = np.asarray(benchmark_returns, dtype=np.float64)
+    if expected.shape != reported.shape or not np.allclose(expected, reported, rtol=1e-6, atol=1e-8):
+        raise ValueError("reported TX benchmark differs from verified front-month roll path")
+    np.savez_compressed(
+        output_path,
+        artifact_schema_version=np.asarray(1, dtype=np.int64),
+        benchmark_name=np.asarray("TX front-month rolling buy-and-hold", dtype="U64"),
+        benchmark_contract=np.asarray(
+            "1x_long_front_month_gross_roll_at_preceding_close_v1", dtype="U96"
+        ),
+        roll_gap_treatment=np.asarray("same_contract_close_to_close", dtype="U64"),
+        cost_treatment=np.asarray("gross_no_fees_or_tax", dtype="U32"),
+        reference_product=np.asarray("TX", dtype="U8"),
+        **payload,
+        benchmark_simple_returns=np.expm1(expected),
+    )
+
+
 def _save_fold_output_artifacts(
     *,
     fold_dir: Path,
@@ -10683,6 +11101,18 @@ def _save_fold_output_artifacts(
     if requested_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         benchmark_audit_start = time.perf_counter()
         _save_tw_index_futures_benchmark_audit(
+            fold_dir / "futures_benchmark_audit.npz",
+            dates=test_dates,
+            benchmark_returns=test_backtest.benchmark_returns,
+            config=config,
+        )
+        save_timing["futures_benchmark_audit_s"] = float(
+            time.perf_counter() - benchmark_audit_start
+        )
+    elif (requested_mode == "tw_stock_context_futures_portfolio"
+          and config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"):
+        benchmark_audit_start = time.perf_counter()
+        _save_stock_context_tx_rolling_benchmark_audit(
             fold_dir / "futures_benchmark_audit.npz",
             dates=test_dates,
             benchmark_returns=test_backtest.benchmark_returns,
@@ -12588,6 +13018,7 @@ def _load_backtest_artifact(
     has_equity_scale_contract = (
         ledger_unit == "nav_ratio"
         or ledger_unit == "contract_quantity"
+        or (execution_mode == "crypto_perpetual" and result.equity_scale_history is not None)
         or execution_mode == "tw_index_futures_day"
         or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     )
@@ -13055,6 +13486,91 @@ def _split_valid_indices(
             | force_exit[valid_indices].any(axis=1)
         ]
     return valid_indices
+
+
+def _validate_annual_day_trade_training_boundaries(
+    panel: PanelData,
+    folds: Sequence[WalkForwardFold],
+    config: ExperimentConfig,
+) -> dict[str, Any] | None:
+    """Prove that lookback is context and never shifts an annual account.
+
+    The annual objective claims one fresh-capital account for every complete
+    target calendar year. Its authoritative rows are therefore the fold's
+    owned training sessions, while the rolling window may read older panel
+    rows. Comparing the two index sets catches both a delayed first decision
+    and an accidental spill into the following year before optimizer state is
+    created.
+    """
+
+    if not bool(config.training.day_trade_training_annual_episodes):
+        return None
+    if normalize_execution_mode(config.trading.execution_mode) != "tw_day_trade":
+        raise ValueError("annual day-trade boundary validation requires tw_day_trade")
+
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+    panel_years = panel_dates.astype("datetime64[Y]").astype(np.int64) + 1970
+    groups: list[dict[str, Any]] = []
+    seen: set[tuple[int, ...]] = set()
+    for fold in folds:
+        train_years = tuple(int(year) for year in fold.train_years)
+        if train_years in seen:
+            continue
+        seen.add(train_years)
+        owned = np.sort(np.asarray(fold.train_indices, dtype=np.int64))
+        decisions = _split_valid_indices(
+            panel,
+            owned,
+            int(config.training.lookback),
+            config.trading.execution_mode,
+            config.walk_forward.lookback_context,
+        )
+        year_reports: list[dict[str, Any]] = []
+        for year in train_years:
+            expected = owned[panel_years[owned] == year]
+            actual = decisions[panel_years[decisions] == year]
+            if expected.size == 0:
+                raise ValueError(f"annual training year {year} owns no panel sessions")
+            if not np.array_equal(actual, expected):
+                actual_start = "none" if actual.size == 0 else str(panel_dates[actual[0]])
+                actual_end = "none" if actual.size == 0 else str(panel_dates[actual[-1]])
+                raise ValueError(
+                    "annual training episode must cover every owned session from "
+                    "the calendar year's first trading day through its last: "
+                    f"year={year} expected={panel_dates[expected[0]]}.."
+                    f"{panel_dates[expected[-1]]} ({expected.size} rows), "
+                    f"actual={actual_start}..{actual_end} ({actual.size} rows). "
+                    "Use causal rows before the first target year as panel_history "
+                    "lookback context, or extend the validated panel; do not shift "
+                    "the account by lookback rows."
+                )
+            year_reports.append(
+                {
+                    "year": int(year),
+                    "first_session": str(panel_dates[actual[0]]),
+                    "last_session": str(panel_dates[actual[-1]]),
+                    "sessions": int(actual.size),
+                }
+            )
+        groups.append(
+            {
+                "fold_ids": [
+                    int(candidate.fold_id)
+                    for candidate in folds
+                    if tuple(int(year) for year in candidate.train_years) == train_years
+                ],
+                "train_years": list(train_years),
+                "years": year_reports,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "contract": "calendar_year_first_session_fresh_capital_v2",
+        "lookback": int(config.training.lookback),
+        "lookback_context": str(config.walk_forward.lookback_context),
+        "lookback_role": "causal_feature_context_only",
+        "groups": groups,
+    }
 
 
 def _next_fold_by_id(folds: Iterable[WalkForwardFold]) -> dict[int, WalkForwardFold | None]:
@@ -13534,6 +14050,26 @@ def _physical_source_cache_snapshot(runtime: _ExecutionRuntime) -> dict[str, Any
     )
 
 
+@contextmanager
+def _physical_carry_cpu_replay_threads():
+    """Bound intra-op dispatch for the serial, CPU-only artifact oracle.
+
+    These two replay callers run outside training and do not launch concurrent
+    model work in this process. A large training thread pool makes their many
+    small FIFO operations slower. Restore it even when source validation fails;
+    other DDP processes and subsequent GPU work retain their original settings.
+    """
+    previous = torch.get_num_threads()
+    if previous != 1:
+        torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        if previous != 1:
+            torch.set_num_threads(previous)
+
+
+@_physical_carry_cpu_replay_threads()
 def _replay_physical_carry_split_prefix(
     result: BacktestResult,
     split: WindowedSplitTensors,
@@ -13654,6 +14190,7 @@ def _replay_physical_carry_split_prefix(
     return replay.to_numpy()
 
 
+@_physical_carry_cpu_replay_threads()
 def _replay_physical_carry_panel_segment(
     requests: np.ndarray,
     panel_rows: np.ndarray,
@@ -15535,6 +16072,7 @@ def _run_eval_backtest_from_weight_buffers(
                        if physical_source is not None else None)
     equity_scaled_execution = bool(
         execution_mode in TW_STOCK_EXECUTION_MODES
+        or execution_mode == "crypto_perpetual"
         or execution_mode == "tw_index_futures_day"
         or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
         or integer_stock_context_execution
@@ -15545,7 +16083,8 @@ def _run_eval_backtest_from_weight_buffers(
     )
     if equity_scaled_execution:
         equity_scale_history_out = torch.empty(
-            (total_rows,), device=device, dtype=output_dtype
+            (total_rows,), device=device,
+            dtype=torch.float64 if execution_mode == "crypto_perpetual" else output_dtype,
         )
     if execution_mode == "tw_stock_futures_day_trade_0845_minute" or stock_context_minute_execution:
         settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
@@ -16023,6 +16562,13 @@ def _run_eval_backtest_from_weight_buffers(
                         source=physical_source, split=physical_split, start=start, end=end,
                         device=device, previous=physical_previous,
                         event_compression=compact_physical_eval))
+                # Binding the physical source decodes, pads, stacks and moves
+                # the minute tape. Attribute that work to preparation, not to
+                # the canonical account kernel (it can dominate CPU wall time).
+                _maybe_sync_cuda(device, profile_timing)
+                prepared_at = time.perf_counter()
+                timing.backtest_prepare_s += prepared_at - backtest_runner_start
+                backtest_runner_start = prepared_at
                 backtest_chunk = backtest_runner(
                     weights_chunk,
                     returns_chunk,
@@ -16041,6 +16587,10 @@ def _run_eval_backtest_from_weight_buffers(
                         1.0
                         if execution_runtime is None
                         else execution_runtime.crypto_proximal_cost_multiplier
+                    ),
+                    crypto_announced_exit_unlimited_volume=(
+                        False if execution_runtime is None
+                        else execution_runtime.crypto_announced_exit_unlimited_volume
                     ),
                     gross_leverage=gross_leverage,
                     min_trade_weight=min_trade_weight,
@@ -16179,6 +16729,12 @@ def _run_eval_backtest_from_weight_buffers(
             if panel_row_indices is not None:
                 evidence['panel_row'] = int(panel_row_indices[split_row])
             raise FuturesCarryDataError(evidence) from exc
+        except CryptoPerpetualDataError as exc:
+            raise _enrich_crypto_data_error(
+                exc, scope="evaluation", row_offset=start, chunk_end=end,
+                panel_row_indices=panel_row_indices, symbol_indices=symbol_indices,
+                execution_runtime=execution_runtime, progress_label=progress_label,
+            ) from exc
         except RuntimeError as exc:
             raise RuntimeError(
                 f"evaluation backtest chunk rows=[{start},{end}) failed: {exc}"
@@ -18349,6 +18905,9 @@ def _replay_taiwan_stitched_deployment(
                 crypto_proximal_cost_multiplier=(
                     config.trading.crypto_proximal_cost_multiplier
                 ),
+                crypto_announced_exit_unlimited_volume=(
+                    config.trading.crypto_announced_exit_unlimited_volume
+                ),
                 gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
@@ -19725,6 +20284,7 @@ def _probe_compiled_loss_forward_backward(
                 end=int(batch_size),
                 device=device,
                 previous=None,
+                reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             )
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = probed_loss_fn(
@@ -20419,6 +20979,7 @@ def _train_epoch_windowed_tensor(
     settlement_lag_sessions: int = 2,
     execution_runtime: _ExecutionRuntime | None = None,
     optimizer_step_per_trajectory: bool = False,
+    log_return_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     if panel_slab_model is not None:
@@ -20557,7 +21118,11 @@ def _train_epoch_windowed_tensor(
         batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
             loss_fn, source=physical_source, split=split, start=start, end=end,
             device=device, previous=physical_previous,
+            reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             prepared_batch=prepared_physical_batch))
+        if log_return_weights is not None:
+            from stockagent.training.exact_policy_step import bind_return_weighted_loss
+            batch_loss_fn = bind_return_weighted_loss(batch_loss_fn, log_return_weights, start, end - start)
         if progress_label:
             _progress(f"{progress_label}: batch {step_idx}/{num_batches} gather rows=[{start},{end})")
         _maybe_sync_cuda(device, profile_timing)
@@ -20827,7 +21392,7 @@ def _train_epoch_windowed_tensor(
             with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
                 loss_context = profile_range("train.forward.loss") if PROFILE_RANGES_ENABLED else nullcontext()
                 with loss_context, _carry_loss_data_guard(
-                    split, optimizer, device, start
+                    split, optimizer, device, start, execution_runtime=execution_runtime
                 ):
                     loss = batch_loss_fn(
                         weights,
@@ -21290,6 +21855,7 @@ def _train_epoch_windowed_tensor_ddp(
     symbol_sharded_ledger: bool = False,
     replicated_ledger_local_metadata: bool = False,
     optimizer_step_per_trajectory: bool = False,
+    log_return_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -21464,7 +22030,11 @@ def _train_epoch_windowed_tensor_ddp(
             loss_fn, source=physical_source, split=split, start=global_start,
             end=global_start + int(batch_size), device=device,
             previous=physical_previous,
+            reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             prepared_batch=prepared_physical_batch))
+        if log_return_weights is not None:
+            from stockagent.training.exact_policy_step import bind_return_weighted_loss
+            batch_loss_fn = bind_return_weighted_loss(batch_loss_fn, log_return_weights, global_start, int(batch_size))
         if progress_label and _distributed_is_rank0():
             _progress(
                 f"{progress_label}: batch {step_idx}/{num_batches} "
@@ -21674,7 +22244,8 @@ def _train_epoch_windowed_tensor_ddp(
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing), \
-                    _carry_loss_data_guard(split, optimizer, device, global_start, distributed=True):
+                    _carry_loss_data_guard(split, optimizer, device, global_start, distributed=True,
+                                           execution_runtime=execution_runtime):
                 aux_outputs: dict[str, torch.Tensor] | None = None
                 aux_outputs = {
                     "initial_weights": portfolio_prev_weights,
@@ -23454,6 +24025,10 @@ def _run_inference_tree_models(
         )
         results_by_fold[fold.fold_id] = fold_result
 
+        day_trade_carry_context = _physical_carry_artifact_context(
+            runtime=execution_runtime, symbols=test_symbols, config=config,
+            initial_nav=float(config.trading.volume_participation_equity),
+        )
         _save_fold_output_artifacts(
             fold_dir=fold_dir, fold_result=fold_result, model=None,
             test_backtest=test_bt, test_dates=test_dates, symbols=test_symbols,
@@ -23461,6 +24036,7 @@ def _run_inference_tree_models(
             test_integer_backtest=test_integer_bt, holdings_records=holdings_records,
             deployment_backtest=deployment_test_bt, deployment_dates=deployment_test_dates,
             print_report=False, write_plots=True, write_model_checkpoint=False,
+            day_trade_carry_context=day_trade_carry_context,
             source_cache_snapshot=_physical_source_cache_snapshot(execution_runtime),
         )
         _write_fold_complete_marker(fold_dir, fold_result, source="tree_inference_final")
@@ -24067,13 +24643,13 @@ def _run_inference_neural_models(
             test_integer_backtest=test_integer_bt, holdings_records=holdings_records,
             deployment_backtest=deployment_test_bt, deployment_dates=deployment_test_dates,
             print_report=False, write_plots=True, write_model_checkpoint=False,
+            mark_complete=True,
             day_trade_carry_context=_physical_carry_artifact_context(
                 runtime=fold_execution_runtime, symbols=test_symbols, config=config,
                 initial_nav=float(config.trading.volume_participation_equity),
             ),
             source_cache_snapshot=_physical_source_cache_snapshot(fold_execution_runtime),
         )
-        _write_fold_complete_marker(fold_dir, fold_result, source="neural_inference_final")
 
     if results_by_fold:
         _refresh_walkforward_artifacts(
@@ -24306,6 +24882,7 @@ def _run_training_impl(
     loss_portfolio_activation = _training_loss_portfolio_activation(config)
     loss_min_trade_weight = _training_loss_min_trade_weight(config)
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
+    risk_loss_kwargs["day_trade_sub_lot_recovery"] = bool(config.training.day_trade_sub_lot_recovery)
     risk_loss_kwargs["min_trade_weight"] = loss_min_trade_weight
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
     risk_loss_kwargs["day_trade_execution_initial_capital"] = float(
@@ -24477,6 +25054,9 @@ def _run_training_impl(
             "crypto_proximal_cost_multiplier": (
                 execution_runtime.crypto_proximal_cost_multiplier
             ),
+            "crypto_announced_exit_unlimited_volume": (
+                execution_runtime.crypto_announced_exit_unlimited_volume
+            ),
         }
     )
     deterministic_algorithms = bool(
@@ -24555,6 +25135,12 @@ def _run_training_impl(
         "device_precision_and_compile_runtime_setup",
         device=str(device),
         amp_dtype=str(amp_dtype),
+        torch_threads=int(torch.get_num_threads()),
+        torch_interop_threads=int(torch.get_num_interop_threads()),
+        cpu_affinity=(
+            sorted(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity") else None
+        ),
     )
 
     output_path = Path(output_dir)
@@ -24578,6 +25164,24 @@ def _run_training_impl(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
+    annual_boundary_report = _validate_annual_day_trade_training_boundaries(
+        panel,
+        fold_list,
+        config,
+    )
+    if annual_boundary_report is not None and _distributed_should_write():
+        boundary_path = output_path / "annual_episode_boundaries.json"
+        boundary_path.parent.mkdir(parents=True, exist_ok=True)
+        with boundary_path.open("w", encoding="utf-8") as handle:
+            json.dump(annual_boundary_report, handle, indent=2, sort_keys=True)
+        covered_years = sum(
+            len(group["years"])
+            for group in annual_boundary_report["groups"]
+        )
+        print(
+            "[annual episodes] verified first-session through last-session "
+            f"coverage for {covered_years} calendar-year account(s)"
+        )
     deployment_fold_list = (
         fold_list if deployment_folds is None else list(deployment_folds)
     )
@@ -24765,6 +25369,8 @@ def _run_training_impl(
                     direction_weight=config.training.multitask_loss.direction_weight,
                     volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    day_trade_training_annual_episodes=config.training.day_trade_training_annual_episodes,
+                    day_trade_sub_lot_recovery=config.training.day_trade_sub_lot_recovery,
                 )
         except BaseException as exc:
             loss_contract_error = exc
@@ -25412,6 +26018,7 @@ def _run_training_impl(
         resume_no_improve_epochs = 0
         resume_no_improve_source: str | None = None
         resume_rng_state: Mapping[str, Any] | None = None
+        resumed_model_state = False
         resume_checkpoint_path = group_checkpoint_path
         if (
             resume
@@ -25447,12 +26054,8 @@ def _run_training_impl(
                     checkpoint_path=resume_checkpoint_path,
                 )
                 if list(checkpoint.get("train_years", [])) == train_years:
-                    _load_state_dict(model, checkpoint["model_state_dict"])
-                    _apply_causal_feature_rms_to_model(
-                        model,
-                        causal_feature_rms,
-                    )
-                    _apply_feature_svd_to_model(model, feature_svd)
+                    _restore_resume_model_state(model, checkpoint)
+                    resumed_model_state = True
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                     scaler_state = checkpoint.get("scaler_state_dict")
                     if scaler_state:
@@ -25477,6 +26080,18 @@ def _run_training_impl(
                     )
 
         will_train_epochs = start_epoch <= config.training.epochs
+        effective_rms_report = _effective_causal_feature_rms_report(
+            model, causal_feature_rms
+        )
+        if effective_rms_report is not None and _distributed_should_write():
+            effective_rms_report["start_epoch"] = int(start_epoch)
+            effective_rms_report["resumed"] = resumed_model_state
+            effective_rms_path = (
+                _group_dir(output_path, train_years)
+                / "effective_causal_feature_rms_normalization.json"
+            )
+            with effective_rms_path.open("w", encoding="utf-8") as handle:
+                json.dump(effective_rms_report, handle, indent=2, sort_keys=True)
         if not will_train_epochs:
             print(f"[Train {train_years}] checkpoint already reached epoch {config.training.epochs}; evaluating only")
 
@@ -25769,6 +26384,7 @@ def _run_training_impl(
         # Recovery is a backward-only training mechanism. Validation/test have
         # gradients disabled and always report the exact absorbing account.
         eval_risk_loss_kwargs["futures_portfolio_recoverable_backward"] = False
+        eval_risk_loss_kwargs["day_trade_sub_lot_recovery"] = False
         eval_risk_loss_kwargs["futures_minute_saturation_recovery"] = False
         eval_risk_loss_kwargs["futures_minute_recovery_objective"] = "residual_notional"
         if factor_aug_kwargs:
@@ -27194,14 +27810,18 @@ def _run_training_impl(
                 epoch_zero_error,
             )
 
-        def _run_one_train_epoch(train_model: nn.Module) -> tuple[torch.Tensor, TimingBreakdown]:
+        def _run_one_train_epoch(train_model: nn.Module, *, log_return_weights=None) -> tuple[torch.Tensor, TimingBreakdown]:
+            # The risk VJP traverses the same account and DDP batches with a
+            # zero-step stateless optimizer. It never updates Adam or its clock.
+            active_optimizer = optimizer if log_return_weights is None else torch.optim.SGD(model.parameters(), lr=0.)
+            active_scheduler = scheduler if log_return_weights is None else None
             if train_windowed is not None:
                 if ddp_enabled:
                     return _train_epoch_windowed_tensor_ddp(
                         train_model,
                         compiled_loss_fn,
                         train_windowed,
-                        optimizer,
+                        active_optimizer,
                         scaler,
                         batch_size=train_batch_size,
                         device=device,
@@ -27237,7 +27857,7 @@ def _run_training_impl(
                         concentration_weight=config.training.multitask_loss.concentration_weight,
                         regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                         regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
-                        lr_scheduler=scheduler,
+                        lr_scheduler=active_scheduler,
                         lr_scheduler_interval=scheduler_step_interval,
                         profile_timing=profile_timing,
                         debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
@@ -27253,6 +27873,7 @@ def _run_training_impl(
                             config.training.distributed_replicated_ledger_local_metadata
                         ),
                         optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+                        log_return_weights=log_return_weights,
                         progress_label=(
                             f"[Train {train_years}]" if profile_timing else None
                         ),
@@ -27262,7 +27883,7 @@ def _run_training_impl(
                     panel_slab_model,
                     compiled_loss_fn,
                     train_windowed,
-                    optimizer,
+                    active_optimizer,
                     scaler,
                     batch_size=train_batch_size,
                     device=device,
@@ -27299,7 +27920,7 @@ def _run_training_impl(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
-                    lr_scheduler=scheduler,
+                    lr_scheduler=active_scheduler,
                     lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
                     debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
@@ -27308,6 +27929,7 @@ def _run_training_impl(
                     settlement_lag_sessions=execution_runtime.settlement_lag_sessions,
                     execution_runtime=execution_runtime,
                     optimizer_step_per_trajectory=optimizer_step_per_trajectory,
+                    log_return_weights=log_return_weights,
                 )
 
         def _save_best_val_complete_fold_artifacts(
@@ -27606,6 +28228,63 @@ def _run_training_impl(
         deferred_val_loss_tensors: torch.Tensor | None = None
         deferred_test_loss_tensors: torch.Tensor | None = None
         train_loss_t: torch.Tensor | None = None
+        policy_step_baseline = None
+
+        def _evaluate_training_policy_step():
+            from stockagent.training.exact_policy_step import PolicyEvaluation, maximum_drawdown_span
+            measured = None
+            error = None
+            if _distributed_is_rank0():
+                try:
+                    with torch.inference_mode():
+                        bt, _, metrics = _evaluate_windowed_tensor_batch(
+                            eval_model, eval_panel_slab_model, train_windowed,
+                            device, amp_dtype, non_blocking,
+                            config.trading.long_only, config.trading.buy_fee_rate,
+                            config.trading.sell_fee_rate, config.trading.max_turnover_ratio, 1.0,
+                            min_trade_weight=config.trading.min_trade_weight,
+                            chunk_rows=eval_chunk_rows,
+                            backtest_chunk_rows=eval_backtest_chunk_rows,
+                            portfolio_activation=config.trading.portfolio_activation,
+                            compute_ic=False, compute_metrics_summary=True,
+                            return_weights_history=False,
+                            max_volume_participation=config.trading.max_volume_participation,
+                            volume_participation_equity=config.trading.volume_participation_equity,
+                            execution_runtime=execution_runtime,
+                        )
+                    if bt.settlement_default is None:
+                        raise RuntimeError("exact policy step requires authoritative default history")
+                    defaulted = bool(bt.settlement_default.any().item())
+                    span = maximum_drawdown_span(bt.strategy_returns) if not defaulted else (0, 0)
+                    benchmark_span = maximum_drawdown_span(bt.benchmark_returns)
+                    benchmark_drawdown = float(torch.expm1(
+                        bt.benchmark_returns.double()[benchmark_span[0]:benchmark_span[1]].sum()).item())
+                    measured = PolicyEvaluation(
+                        loss=float(-bt.strategy_returns.double().mean().item()
+                                   * config.evaluation.eval_log_utility_periods_per_year
+                                   * config.evaluation.gamma_sharpe),
+                        max_drawdown=float(metrics["max_drawdown"]),
+                        defaulted=defaulted, drawdown_start=span[0], drawdown_end=span[1],
+                        benchmark_max_drawdown=benchmark_drawdown,
+                    )
+                except BaseException as exc:
+                    error = exc
+            _raise_if_distributed_phase_failed("exact_training_policy_step", error)
+            if ddp_enabled:
+                payload = [measured]
+                dist.broadcast_object_list(payload, src=0)
+                measured = payload[0]
+            if measured is None:
+                raise RuntimeError("missing exact training policy evaluation")
+            return measured
+
+        def _training_drawdown_gradient(baseline):
+            row_weights = torch.zeros(len(train_windowed), device=device, dtype=torch.float32)
+            row_weights[baseline.drawdown_start:baseline.drawdown_end] = 1.
+            _run_one_train_epoch(compiled_train_model, log_return_weights=row_weights)
+            return [torch.zeros_like(p) if p.grad is None else p.grad.detach().clone()
+                    for p in model.parameters() if p.requires_grad]
+
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
             epoch_compile_before = _dynamo_compile_counter_snapshot()
@@ -27628,6 +28307,18 @@ def _run_training_impl(
             get_backtest_prep_compile_stats(reset=True)
             get_backtest_runtime_stats(reset=True)
             get_loss_runtime_stats(reset=True)
+            policy_step = None
+            policy_step_payload = {}
+            policy_step_started = time.perf_counter()
+            if config.training.futures_training_max_drawdown is not None:
+                from stockagent.training.exact_policy_step import ExactPolicyStep, resolve_training_drawdown_budget
+                if policy_step_baseline is None:
+                    policy_step_baseline = _evaluate_training_policy_step()
+                policy_step = ExactPolicyStep(
+                    model, optimizer, scheduler, policy_step_baseline,
+                    resolve_training_drawdown_budget(config.training.futures_training_max_drawdown, policy_step_baseline),
+                )
+            policy_step_prepare_s = time.perf_counter() - policy_step_started
             carry_compile_before = get_day_trade_carry_compile_stats()
             train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
             train_bt_runtime_after = get_backtest_runtime_stats()
@@ -27636,6 +28327,33 @@ def _run_training_impl(
                 key: value - carry_compile_before.get(key, 0)
                 for key, value in get_day_trade_carry_compile_stats().items()
             }
+            if policy_step is not None:
+                policy_step_started = time.perf_counter()
+                before_loss = policy_step_baseline.loss
+                policy_step_baseline, decision = policy_step.resolve(
+                    _evaluate_training_policy_step,
+                    _training_drawdown_gradient if config.training.futures_training_risk_tangent else None,
+                    risk_interior=config.training.futures_training_risk_interior,
+                )
+                if not decision["accepted"]:
+                    train_timing.optimizer_steps = 0
+                policy_step_payload = {
+                    "train_policy_loss_before": before_loss,
+                    "train_policy_loss_after": policy_step_baseline.loss,
+                    "train_policy_max_drawdown": policy_step_baseline.max_drawdown,
+                    "train_policy_drawdown_budget": policy_step.budget,
+                    "train_benchmark_max_drawdown": policy_step_baseline.benchmark_max_drawdown,
+                    "train_policy_update_accepted": decision["accepted"],
+                    "train_policy_step_fraction": decision["fraction"],
+                    "train_policy_direction": decision["direction"],
+                    "train_policy_candidate_evaluations": len(decision["trials"]),
+                    "train_policy_step_s": policy_step_prepare_s + time.perf_counter() - policy_step_started,
+                }
+                if _distributed_should_write():
+                    receipt = {"epoch": int(epoch), **policy_step_payload, "trials": decision["trials"]}
+                    with (_group_dir(output_path, train_years) / "policy_step_trials.jsonl").open("a") as handle:
+                        handle.write(json.dumps(receipt, allow_nan=False) + "\n")
+                del policy_step
 
             should_validate = (
                 epoch == start_epoch
@@ -27722,6 +28440,11 @@ def _run_training_impl(
                 curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
+                        **_max_rank_epoch_timing(
+                            epoch_wall_s=time.perf_counter() - epoch_start,
+                            train_total_s=train_timing.total_s,
+                            device=device,
+                        ),
                         "train_loss": float(train_loss),
                         "val_mean": None,
                         "test_mean": test_mean_best_by_val,
@@ -27731,6 +28454,10 @@ def _run_training_impl(
                         "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
+                        "best_val_loss": min((c.best_val_loss for c in fold_contexts.values()
+                                              if math.isfinite(c.best_val_loss)), default=None),
+                        "improved": None,
+                        **policy_step_payload,
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -28102,14 +28829,15 @@ def _run_training_impl(
                         test_loss_total = time.perf_counter() - test_loss_start
                     curve_test_total = time.perf_counter() - curve_test_start
 
-            if config.trading.tw_stock_futures_day_trade_residual_policy == 'carry':
+            if (config.trading.tw_stock_futures_day_trade_residual_policy == 'carry'
+                    or execution_runtime.mode == "crypto_perpetual"):
                 carry_eval_error = _synchronize_carry_data_error(
                     carry_eval_errors[0] if carry_eval_errors else None, device,
                     distributed=parallel_ddp_epoch_eval)
                 if carry_eval_error is not None:
-                    raise FuturesCarryDataError(carry_eval_error)
+                    _raise_carry_data_error(carry_eval_error)
             elif carry_eval_errors:
-                raise FuturesCarryDataError(carry_eval_errors[0])
+                _raise_carry_data_error(carry_eval_errors[0])
 
             parallel_eval_overlap_s = 0.0
             if parallel_ddp_epoch_eval:
@@ -28374,6 +29102,11 @@ def _run_training_impl(
                 curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
+                        **_max_rank_epoch_timing(
+                            epoch_wall_s=time.perf_counter() - epoch_start,
+                            train_total_s=train_timing.total_s,
+                            device=device,
+                        ),
                         "train_loss": float(train_loss),
                         "val_mean": val_mean_loss,
                         "test_mean": test_mean_best_by_val,
@@ -28383,6 +29116,10 @@ def _run_training_impl(
                         "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
+                        "best_val_loss": min((c.best_val_loss for c in fold_contexts.values()
+                                              if math.isfinite(c.best_val_loss)), default=None),
+                        "improved": bool(any_fold_improved),
+                        **policy_step_payload,
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -28464,6 +29201,19 @@ def _run_training_impl(
                         f"{no_improve_epochs} validation check(s) "
                         f"(patience={early_stop_patience})"
                     )
+                    break
+                if (config.training.futures_training_stop_on_rejected_step
+                        and config.training.futures_training_risk_tangent
+                        and policy_step_payload and not policy_step_payload["train_policy_update_accepted"]):
+                    # Optional historical stop. With it disabled, rejection
+                    # still restores model/Adam/scheduler; validation patience
+                    # and the epoch cap alone govern normal completion.
+                    print(f"[Train {train_years}] optimizer stop at epoch {epoch}: "
+                          "Adam and risk-tangent directions exhausted exact feasible step search")
+                    if _distributed_should_write():
+                        (_group_dir(output_path, train_years) / "optimizer_stop.json").write_text(
+                            json.dumps({"epoch": int(epoch), "reason": "no_feasible_policy_step",
+                                        "training_only": True, **policy_step_payload}, allow_nan=False, indent=2))
                     break
 
         _distributed_barrier()

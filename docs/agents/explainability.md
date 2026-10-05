@@ -126,4 +126,3 @@ Walk-forward summary visualization rules:
 - Top-level walk-forward summary plots should include multiple first-test-year views, not only one equity curve.
 - First-test-year summary visuals should use only each fold's first test year, even when the fold's test split contains all future years.
 - Keep fold-level first-test-year return/risk, turnover, and concentration views visible so strategy behavior can be judged before later test years dominate the picture.
-

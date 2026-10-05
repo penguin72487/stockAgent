@@ -81,4 +81,3 @@ def test_relocated_receipt_cannot_bypass_missing_local_book_or_hash(tmp_path, da
     write_receipt(root, receipt)
     with pytest.raises(RuntimeError, match="entry.book"):
         read_replay(root)
-

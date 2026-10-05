@@ -1525,6 +1525,16 @@ def test_crypto_ledger_revision_and_execution_settings_are_checkpoint_contracts(
                 {"experiment_manifest": legacy}, current,
                 checkpoint_path=tmp_path / "old.pt", scope=scope,
             )
+    for old_revision in (2, 3, 4):
+        legacy_revision = copy.deepcopy(current)
+        legacy_revision["contracts"]["trading"]["crypto_perpetual"]["backtest_contract_version"] = old_revision
+        legacy_revision["fingerprints"]["trading"] = _stable_fingerprint(legacy_revision["contracts"]["trading"])
+        for scope in ("resume", "artifact"):
+            with pytest.raises(RuntimeError, match="trading"):
+                _validate_checkpoint_manifest(
+                    {"experiment_manifest": legacy_revision}, current,
+                    checkpoint_path=tmp_path / "old.pt", scope=scope,
+                )
     for name, value in (
         ("crypto_execution_minute_utc", 5),
         ("crypto_stateful_proximal_allocator", False),
@@ -1534,6 +1544,103 @@ def test_crypto_ledger_revision_and_execution_settings_are_checkpoint_contracts(
         setattr(changed.trading, name, value)
         manifest = _checkpoint_manifest(_panel(), changed)
         assert manifest["fingerprints"]["trading"] != current["fingerprints"]["trading"]
+
+
+def test_futures_rejection_stop_change_rejects_old_resume_but_preserves_inference(tmp_path: Path) -> None:
+    config = load_config(
+        "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_benchmark_risk_v10.yaml"
+    )
+    # Only the stopping contract changes; this fixture needs no physical tape.
+    current = _checkpoint_manifest(_panel(), config, include_data_content=False)
+    config.training.futures_training_stop_on_rejected_step = True
+    historical = _checkpoint_manifest(_panel(), config, include_data_content=False)
+    assert current["fingerprints"]["training"] != historical["fingerprints"]["training"]
+    for domain in ("data", "data_schema", "model", "trading", "evaluation", "walk_forward"):
+        assert current["fingerprints"][domain] == historical["fingerprints"][domain]
+    for saved, expected in ((historical, current), (current, historical)):
+        for scope in ("resume", "artifact"):
+            with pytest.raises(RuntimeError, match="training"):
+                _validate_checkpoint_manifest(
+                    {"experiment_manifest": saved}, expected,
+                    checkpoint_path=tmp_path / "model.pt", scope=scope,
+                )
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": saved}, expected,
+            checkpoint_path=tmp_path / "model.pt", scope="inference",
+        )
+
+
+def test_crypto_zero_delta_gradient_contract_rejects_old_optimizer_only(tmp_path: Path) -> None:
+    from stockagent.training.checkpoint_contract import _stable_fingerprint
+    from stockagent.backtest.crypto_perpetual import CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION
+
+    config = load_config("configs/markets/bybit_perpetual_daily_0000_deterministic.yaml")
+    current = _checkpoint_manifest(_panel(), config)
+    assert current["contracts"]["training"]["crypto_backward_contract_version"] == CRYPTO_PERPETUAL_BACKWARD_CONTRACT_VERSION
+    legacy = copy.deepcopy(current)
+    legacy["contracts"]["training"].pop("crypto_backward_contract_version")
+    legacy["fingerprints"]["training"] = _stable_fingerprint(legacy["contracts"]["training"])
+    assert legacy["contracts"]["trading"] == current["contracts"]["trading"]
+    for scope in ("resume", "artifact"):
+        with pytest.raises(RuntimeError, match="training"):
+            _validate_checkpoint_manifest(
+                {"experiment_manifest": legacy}, current,
+                checkpoint_path=tmp_path / "old.pt", scope=scope,
+            )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": legacy}, current,
+        checkpoint_path=tmp_path / "old.pt", scope="inference",
+    )
+
+
+def test_crypto_announced_exit_volume_exemption_rejects_cross_contract_resume(tmp_path: Path) -> None:
+    config = load_config("configs/markets/bybit_perpetual_daily_0000_deterministic.yaml")
+    old = _checkpoint_manifest(_panel(), config)
+    candidate = copy.deepcopy(config)
+    candidate.trading.crypto_announced_exit_unlimited_volume = True
+    new = _checkpoint_manifest(_panel(), candidate)
+    assert old["contracts"]["trading"]["crypto_perpetual"]["backtest_contract_version"] == 5
+    assert new["contracts"]["trading"]["crypto_perpetual"]["backtest_contract_version"] == 6
+    assert old["fingerprints"]["trading"] != new["fingerprints"]["trading"]
+    for domain in ("data", "data_schema", "model", "training", "evaluation", "walk_forward"):
+        assert old["fingerprints"][domain] == new["fingerprints"][domain]
+    for saved, expected in ((old, new), (new, old)):
+        for scope in ("resume", "artifact"):
+            with pytest.raises(RuntimeError, match="trading"):
+                _validate_checkpoint_manifest(
+                    {"experiment_manifest": saved}, expected,
+                    checkpoint_path=tmp_path / "different_exit.pt", scope=scope,
+                )
+    # Same v8 contract can resume itself; no blanket disable of resume.
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": new}, new,
+        checkpoint_path=tmp_path / "same_exit.pt", scope="resume",
+    )
+
+
+def test_crypto_v8_participation_change_rejects_old_optimizer_and_artifacts(tmp_path: Path) -> None:
+    config = load_config(
+        "configs/markets/bybit_perpetual_daily_0000_historical_public_pit_score_cash_trajectory_v8.yaml"
+    )
+    assert config.trading.max_volume_participation == 0.5
+    current = _checkpoint_manifest(_panel(), config)
+    old_config = copy.deepcopy(config)
+    old_config.trading.max_volume_participation = 0.01
+    old = _checkpoint_manifest(_panel(), old_config)
+    assert old["fingerprints"]["trading"] != current["fingerprints"]["trading"]
+    assert old["fingerprints"]["data"] == current["fingerprints"]["data"]
+    assert old["contracts"]["trading"]["crypto_perpetual"] == current["contracts"]["trading"]["crypto_perpetual"]
+    for saved, expected in ((old, current), (current, old)):
+        for scope in ("resume", "artifact"):
+            with pytest.raises(RuntimeError, match="trading"):
+                _validate_checkpoint_manifest(
+                    {"experiment_manifest": saved}, expected,
+                    checkpoint_path=tmp_path / "different_participation.pt", scope=scope,
+                )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": current}, current,
+        checkpoint_path=tmp_path / "same_participation.pt", scope="resume",
+    )
 
 
 def test_checkpoint_validation_scopes_resume_and_future_inference_data(tmp_path: Path) -> None:
@@ -1930,6 +2037,64 @@ def test_window_rms_changes_model_checkpoint_contract() -> None:
     assert transformed["contracts"]["model"]["model"]["causal_feature_window_rms_normalization"] is True
 
 
+def test_score_entmax_global_cash_has_a_distinct_versioned_model_contract() -> None:
+    panel = _panel()
+    baseline = _config()
+    baseline.training.model_name = "financial_transformer"
+    baseline.training.financial_transformer.portfolio_output_mode = "score_entmax_cash"
+    original = _checkpoint_manifest(panel, baseline)
+
+    global_cash = copy.deepcopy(baseline)
+    global_cash.training.financial_transformer.portfolio_output_mode = (
+        "score_entmax_global_cash"
+    )
+    transformed = _checkpoint_manifest(panel, global_cash)
+    assert original["fingerprints"]["model"] != transformed["fingerprints"]["model"]
+    assert transformed["contracts"]["model"]["model"]["portfolio_output_contract"] == (
+        "score_entmax_global_cash_v1"
+    )
+
+    repaired = copy.deepcopy(baseline)
+    repaired.training.financial_transformer.portfolio_output_mode = (
+        "score_entmax_cash_v2"
+    )
+    repaired_manifest = _checkpoint_manifest(panel, repaired)
+    assert original["fingerprints"]["model"] != repaired_manifest["fingerprints"]["model"]
+    assert repaired_manifest["contracts"]["model"]["model"]["portfolio_output_contract"] == (
+        "score_entmax_cash_zero_gradient_v2"
+    )
+
+    separated = copy.deepcopy(baseline)
+    separated.training.financial_transformer.portfolio_output_mode = (
+        "score_entmax_scale_separated_cash"
+    )
+    separated_manifest = _checkpoint_manifest(panel, separated)
+    assert transformed["fingerprints"]["model"] != separated_manifest["fingerprints"]["model"]
+    assert separated_manifest["contracts"]["model"]["model"]["portfolio_output_contract"] == (
+        "score_entmax_scale_separated_cash_v1"
+    )
+
+    bounded = copy.deepcopy(baseline)
+    bounded.training.financial_transformer.portfolio_output_mode = (
+        "score_entmax_bounded_cash"
+    )
+    bounded_manifest = _checkpoint_manifest(panel, bounded)
+    assert original["fingerprints"]["model"] != bounded_manifest["fingerprints"]["model"]
+    assert bounded_manifest["contracts"]["model"]["model"]["portfolio_output_contract"] == (
+        "score_entmax_bounded_cash_v1"
+    )
+
+    logarithmic = copy.deepcopy(baseline)
+    logarithmic.training.financial_transformer.portfolio_output_mode = (
+        "score_entmax_log_cash"
+    )
+    logarithmic_manifest = _checkpoint_manifest(panel, logarithmic)
+    assert original["fingerprints"]["model"] != logarithmic_manifest["fingerprints"]["model"]
+    assert logarithmic_manifest["contracts"]["model"]["model"]["portfolio_output_contract"] == (
+        "score_entmax_log_cash_v1"
+    )
+
+
 def test_schema_v1_removed_scheduler_interval_spellings_remain_loadable(tmp_path: Path) -> None:
     manifest = _checkpoint_manifest(_panel(), _config())
     for settings_fingerprint in manifest[
@@ -2037,6 +2202,27 @@ def test_historical_schema_remains_compatible_when_amp_feature_cache_is_default_
             checkpoint_path=tmp_path / f"schema_{schema_version}_default_amp_cache.pt",
             scope=scope,
         )
+
+
+@pytest.mark.parametrize("schema_version", [None, 1, 2, 3])
+@pytest.mark.parametrize("flag", ["day_trade_training_annual_episodes", "day_trade_sub_lot_recovery"])
+def test_legacy_checkpoint_cannot_resume_new_day_trade_training(
+    tmp_path: Path, schema_version: int | None, flag: str,
+) -> None:
+    panel, config = _panel(), _config()
+    historical = _checkpoint_manifest(panel, config)
+    checkpoint = {} if schema_version is None else {
+        "experiment_manifest": _historical_schema_manifest(historical, schema_version)
+    }
+    setattr(config.training, flag, True)
+    expected = _checkpoint_manifest(panel, config)
+    for scope in ("resume", "artifact"):
+        with pytest.raises(RuntimeError, match="new day-trade training"):
+            _validate_checkpoint_manifest(checkpoint, expected,
+                checkpoint_path=tmp_path / "legacy.pt", scope=scope)
+    for scope in ("model", "inference"):
+        _validate_checkpoint_manifest(checkpoint, expected,
+            checkpoint_path=tmp_path / "legacy.pt", scope=scope)
 
 
 @pytest.mark.parametrize("scope", ["resume", "artifact"])

@@ -627,6 +627,9 @@ def build_model(
                 futures_denomination_hard_projection=fin_cfg.futures_denomination_hard_projection,
                 futures_current_open_feature=fin_cfg.futures_current_open_feature,
                 futures_feature_rms_normalization=fin_cfg.futures_feature_rms_normalization,
+                futures_flat_action_initialization=fin_cfg.futures_flat_action_initialization,
+                futures_notional_score_coordinates=fin_cfg.futures_notional_score_coordinates,
+                futures_margin_amount_context=fin_cfg.futures_margin_amount_context,
                 futures_denomination_reference_capital=(
                     config.trading.tw_futures_portfolio_integer_initial_capital
                 ),

@@ -1,0 +1,17 @@
+# Fold-11 projection-L1 successor to the completed v4 score-entmax-cash run.
+# Keep its pinned data, exact minute/FIFO execution, model backbone, CPU panel
+# cache, DDP compute shapes, objective, and validation contract. The output
+# rule changes the action/checkpoint contract, so train in a fresh artifact root.
+base_config: tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_v4.yaml
+experiment_name: tw-public-all-observed-v8-ofat-fold11-data-cpu-cache-projection-l1-v5
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_public_all_observed_v8_ofat_fold11_data_cpu_cache_projection_l1_v5
+
+training:
+  transformer_base_portfolio:
+    portfolio_output_mode: projection_l1
+    projection_l1_scale_by_active_count: true
+  financial_transformer:
+    portfolio_output_mode: projection_l1
+    projection_l1_scale_by_active_count: true

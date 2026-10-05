@@ -67,6 +67,21 @@ Rules:
 
 - Use `epoch_curve.jsonl` when optimizing epoch-level speed.
 - Break down "other" time before optimizing blindly.
+- Initialize/mask Numba's parallel pool before setting the resolved per-rank
+  Torch thread count. On a shared OpenMP runtime, Numba's first parallel panel
+  operation can overwrite Torch's budget with the host-wide maximum. Preserve
+  a smaller explicit Numba maximum, and verify actual trainer counts after
+  panel loading rather than relying on the launcher's earlier thread message.
+- Attribute physical-source decoding, padding, stacking, and device transfer to
+  backtest preparation separately from the account runner. Large CPU thread
+  budgets can make per-session tensor padding much slower than one batched
+  allocation/copy. For immutable FP64/int64 CPU transport, preserve source bytes
+  (including NaNs and signed zero), padding, ownership, and CUDA reconstruction;
+  keep the tensor/autograd path for other inputs. Limit CPU-only final replay
+  threads within its own scope and restore the previous count on exceptions.
+  Validate exact metrics/checkpoint states and complete artifacts; report any
+  control restart or changed reporting runtime explicitly. See
+  `docs/no_qk_norm_cpu_staging_2026-09-22.md`.
 - For long-year runs, re-check the latest artifact before optimizing. The run under
   `artifacts/train_2000-2001-...-2024/epoch_curve.jsonl` showed train time
   dominating epoch wall time, with CPU-to-GPU train tensor transfer larger than

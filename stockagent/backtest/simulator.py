@@ -1594,6 +1594,15 @@ class BacktestResultTensor:
         def optional_float(tensor: torch.Tensor | None) -> np.ndarray | None:
             return None if tensor is None else as_float(tensor)
 
+        def optional_equity_scale(tensor: torch.Tensor | None) -> np.ndarray | None:
+            if tensor is None:
+                return None
+            # Crypto NAV compounds in FP64 even while actions/returns use FP32.
+            # Narrowing it can overflow and changes the next absolute capacity.
+            if self.execution_mode == "crypto_perpetual":
+                return tensor.detach().to(device="cpu", dtype=torch.float64).numpy()
+            return as_float(tensor)
+
         def optional_bool(tensor: torch.Tensor | None) -> np.ndarray | None:
             return (
                 None
@@ -1640,7 +1649,7 @@ class BacktestResultTensor:
             payables_history=optional_float(self.payables_history),
             receivables_history=optional_float(self.receivables_history),
             settlement_default=optional_bool(self.settlement_default),
-            equity_scale_history=optional_float(self.equity_scale_history),
+            equity_scale_history=optional_equity_scale(self.equity_scale_history),
             final_weights=optional_float(self.final_weights),
             final_cash=optional_float(self.final_cash),
             final_payables=optional_float(self.final_payables),
@@ -1670,7 +1679,7 @@ class BacktestResultTensor:
                 .to(device="cpu", dtype=torch.int64)
                 .numpy()
             ),
-            final_equity_scale=optional_float(self.final_equity_scale),
+            final_equity_scale=optional_equity_scale(self.final_equity_scale),
             short_sale_collateral_history=optional_float(
                 self.short_sale_collateral_history
             ),
@@ -3122,9 +3131,12 @@ def run_backtest(
     overnight_returns: np.ndarray | None = None,
     can_short_open_open_mask: np.ndarray | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
+    crypto_announced_exit_unlimited_volume: bool = False,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     mode = normalize_execution_mode(execution_mode)
+    if crypto_announced_exit_unlimited_volume and mode != "crypto_perpetual":
+        raise ValueError("crypto_announced_exit_unlimited_volume requires crypto_perpetual")
     if mode != "naive":
 
         def tensor(value: np.ndarray | float | bool | None) -> torch.Tensor | None:
@@ -3143,6 +3155,7 @@ def run_backtest(
                 crypto_stateful_proximal_allocator
             ),
             crypto_proximal_cost_multiplier=crypto_proximal_cost_multiplier,
+            crypto_announced_exit_unlimited_volume=crypto_announced_exit_unlimited_volume,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -3298,12 +3311,16 @@ def run_backtest_torch(
     futures_minute_saturation_recovery: bool = False,
     futures_minute_recovery_objective: str = "residual_notional",
     return_turnovers: bool = True,
+    return_futures_margin_audit: bool = True,
     day_trade_carry_sessions: tuple[DayTradeCarrySession, ...] | None = None,
     initial_day_trade_carry_state: DayTradeCarryState | None = None,
     day_trade_carry_event_compression: bool = False,
+    crypto_announced_exit_unlimited_volume: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if crypto_announced_exit_unlimited_volume and mode != "crypto_perpetual":
+        raise ValueError("crypto_announced_exit_unlimited_volume requires crypto_perpetual")
     if day_trade_carry_sessions is not None:
         if weights.ndim != 2 or future_returns.shape != weights.shape or benchmark_returns.shape != weights.shape[:1]:
             raise ValueError("physical FIFO inputs require aligned [T,S] actions and [T] benchmark")
@@ -3391,6 +3408,11 @@ def run_backtest_torch(
                 gross_leverage,
                 min_trade_weight,
                 portfolio_activation,
+                # A dated exit request may reduce an existing position after
+                # policy eligibility ends. The crypto ledger re-applies the
+                # policy gate to every unflagged row, preserving raw observed
+                # side permissions only for flagged reduction requests.
+                side_masks_require_tradable=False,
             )
         )
         prepped_short = (
@@ -3422,11 +3444,13 @@ def run_backtest_torch(
                 crypto_stateful_proximal_allocator
             ),
             proximal_cost_multiplier=float(crypto_proximal_cost_multiplier),
+            announced_exit_unlimited_volume=bool(crypto_announced_exit_unlimited_volume),
             volume_limit_weights=volume_limit_weights,
             state_advance_mask=state_advance_mask,
             initial_weights=initial_weights,
             initial_alive=initial_alive,
             return_weights_history=return_weights_history,
+            initial_equity_scale=initial_equity_scale,
         )
         return BacktestResultTensor(
             strategy_returns=_portfolio_simple_returns_to_log_torch(
@@ -3442,6 +3466,8 @@ def run_backtest_torch(
             ),
             final_weights=crypto.final_weights,
             final_alive=crypto.final_alive,
+            equity_scale_history=crypto.equity_scale_history,
+            final_equity_scale=crypto.final_equity_scale,
             execution_mode=mode,
             settlement_ledger_unit="notional_weight",
         )
@@ -3542,6 +3568,7 @@ def run_backtest_torch(
                     initial_alive=initial_alive,
                     return_weights_history=return_weights_history,
                     return_turnovers=return_turnovers,
+                    return_margin_audit=return_futures_margin_audit,
                     recoverable_backward=futures_portfolio_recoverable_backward,
                 )
             return BacktestResultTensor(
@@ -3574,7 +3601,10 @@ def run_backtest_torch(
                 settlement_default=result.default_history,
                 default_reason_history=result.default_reason_history,
                 futures_margin_audit=result.margin_audit_history,
-                futures_contract_quantities_history=result.contract_quantities_history if result.margin_audit_history is not None else None,
+                futures_contract_quantities_history=(
+                    result.contract_quantities_history
+                    if result.margin_audit_history is not None else None
+                ),
                 futures_residual_contract_quantities_history=result.residual_contract_quantities_history,
                 execution_mode=mode,
                 settlement_ledger_unit=(

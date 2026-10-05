@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -72,20 +72,95 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-base", type=float, default=0.6)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--symbols", nargs="*", default=None)
+    parser.add_argument(
+        "--historical-instruments", type=Path,
+        help="Explicit retained instrument CSV for requested historical symbols; not current trading eligibility.",
+    )
     parser.add_argument("--refresh", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.historical_instruments is not None and not any(
+        str(value).strip() for value in (args.symbols or [])
+    ):
+        parser.error("--historical-instruments requires explicit nonempty --symbols")
+    return args
 
 
 def _standard_linear_usdt(record: SymbolRecord) -> bool:
+    return _standard_linear_usdt_identity(record) and str(record.status or "") == "Trading"
+
+
+def _standard_linear_usdt_identity(record: SymbolRecord) -> bool:
+    """Product identity only: an old status must never establish current trading."""
     return bool(
         record.category == "linear"
         and record.quote_coin == "USDT"
         and record.settle_coin == "USDT"
         and "LinearPerpetual" in str(record.contract_type or "")
-        and str(record.status or "") == "Trading"
         and not str(record.symbol_type or "").strip()
         and not bool(record.is_pre_listing)
     )
+
+
+def _historical_instrument_records(
+    path: Path, requested_symbols: set[str]
+) -> list[SymbolRecord]:
+    """Read explicit identities without manufacturing launch/interval metadata."""
+    if not requested_symbols:
+        raise ValueError("historical instruments require explicit nonempty symbols")
+    frame = pl.read_csv(path, infer_schema_length=10_000)
+    required = {field.name for field in fields(SymbolRecord)}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"historical instrument CSV missing columns: {sorted(missing)}")
+    frame = frame.filter(pl.col("code").cast(pl.String).str.to_uppercase().is_in(requested_symbols))
+    records: list[SymbolRecord] = []
+    seen: set[str] = set()
+    for row in frame.select(sorted(required)).to_dicts():
+        record = SymbolRecord(**row)
+        code = str(record.code).strip().upper()
+        if code in seen:
+            raise ValueError(f"duplicate historical instrument: {code}")
+        seen.add(code)
+        if (
+            record.code != code or not code.isascii() or not code.isalnum()
+            or record.bybit_symbol != code or not _standard_linear_usdt_identity(record)
+            or record.is_pre_listing is not False
+            or not record.launch_time
+            or not isinstance(record.funding_interval_minutes, int)
+            or isinstance(record.funding_interval_minutes, bool)
+            or record.funding_interval_minutes <= 0
+        ):
+            raise ValueError(f"incompatible or incomplete historical linear-USDT instrument: {code}")
+        _utc_text_to_ms(str(record.launch_time))
+        records.append(record)
+    missing = requested_symbols - seen
+    if missing:
+        raise ValueError(f"requested symbols absent from historical instrument CSV: {sorted(missing)}")
+    return sorted(records, key=lambda record: record.code)
+
+
+def _select_funding_instruments(
+    current: list[SymbolRecord], requested_symbols: set[str], historical_path: Path | None
+) -> list[SymbolRecord]:
+    if historical_path is not None and not requested_symbols:
+        raise ValueError("historical instruments require explicit nonempty symbols")
+    if historical_path is not None and not historical_path.is_file():
+        raise FileNotFoundError(f"missing historical instrument CSV: {historical_path}")
+    selected = [record for record in current if _standard_linear_usdt(record)]
+    if not requested_symbols:
+        return selected
+    selected = [record for record in selected if record.code.upper() in requested_symbols]
+    missing = requested_symbols - {record.code.upper() for record in selected}
+    if historical_path is not None and missing:
+        # A live identity conflict cannot be overridden with an old same-name CSV.
+        for record in current:
+            if record.code.upper() in missing and not _standard_linear_usdt_identity(record):
+                raise ValueError(f"current instrument identity conflicts with historical request: {record.code}")
+        selected.extend(_historical_instrument_records(historical_path, missing))
+        missing = requested_symbols - {record.code.upper() for record in selected}
+    if missing:
+        raise ValueError(f"requested symbols are not standard linear USDT perps: {sorted(missing)}")
+    return selected
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
@@ -390,27 +465,22 @@ def main() -> None:
     client = BybitClient(args.request_interval, args.max_retries, args.retry_base)
     all_instruments = _fetch_perp_symbols(client, categories=["linear"])
     instrument_discovery_seconds = round(time.perf_counter() - run_started, 6)
-    atomic_write_text(
-        output_dir / "instruments.csv",
-        pl.DataFrame([asdict(item) for item in all_instruments]).write_csv(),
-    )
-    selected = [item for item in all_instruments if _standard_linear_usdt(item)]
     requested_symbols = {
         str(value).strip().upper()
         for value in (args.symbols or [])
         if str(value).strip()
     }
-    if requested_symbols:
-        selected = [item for item in selected if item.code.upper() in requested_symbols]
-        missing = requested_symbols - {item.code.upper() for item in selected}
-        if missing:
-            raise ValueError(
-                f"requested symbols are not standard linear USDT perps: {sorted(missing)}"
-            )
+    historical_path = getattr(args, "historical_instruments", None)
+    selected = _select_funding_instruments(all_instruments, requested_symbols, historical_path)
     if args.limit is not None:
         selected = selected[: max(0, int(args.limit))]
     if not selected:
         raise RuntimeError("no standard linear USDT perpetual instruments selected")
+    # Keep this file an actual current API snapshot, never a merged historical list.
+    atomic_write_text(
+        output_dir / "instruments.csv",
+        pl.DataFrame([asdict(item) for item in all_instruments]).write_csv(),
+    )
 
     progress = PersistentProgress(
         output_dir / "progress.json",
@@ -468,7 +538,15 @@ def main() -> None:
     summary = {
         "contract_version": FUNDING_CONTRACT_VERSION,
         "source": "bybit_v5_market_funding_history",
-        "universe": "current_standard_linear_usdt_perpetual",
+        "universe": (
+            "explicit_symbols_with_historical_identity_fallback"
+            if historical_path is not None else "current_standard_linear_usdt_perpetual"
+        ),
+        "historical_instruments": (
+            {"path": str(historical_path), "sha256": _sha256(historical_path),
+             "role": "historical_product_identity_only_not_current_trading_eligibility"}
+            if historical_path is not None else None
+        ),
         "selected_symbols": len(selected),
         "completed_symbols": len(selected) - len(failed),
         "failed_symbols": len(failed),

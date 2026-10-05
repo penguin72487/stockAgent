@@ -63,4 +63,3 @@ Use for split ownership, model horizons, benchmark returns and stitched reportin
   mode-specific row eligibility inside the report helper: in particular, the
   crypto dataset removes a globally unfinished trailing research period, and
   that removed row must not reappear in deployment artifacts.
-

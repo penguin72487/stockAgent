@@ -1,0 +1,12 @@
+# One combined training: flat initial head, training-only futures RMS, corrected
+# physical backward, and exact full-training-account step acceptance.
+# The 20% limit is the user's training risk target, not a future-performance guarantee.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_cash_init_v6.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-risk-step-v7
+
+training:
+  futures_training_max_drawdown: 0.2
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_risk_step_v7
+  start_fold: 14

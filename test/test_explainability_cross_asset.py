@@ -176,6 +176,52 @@ def test_score_reallocation_preserves_fp32_score_entmax_cash_contract() -> None:
     assert float(actual.abs().sum()) < 1.0
 
 
+@pytest.mark.parametrize("output_mode", [
+    "score_entmax_global_cash", "score_entmax_cash_v2",
+    "score_entmax_bounded_cash",
+    "score_entmax_log_cash",
+    "score_entmax_scale_separated_cash",
+])
+@pytest.mark.parametrize("portfolio_mode", ["long_short", "long_only"])
+def test_score_reallocation_matches_new_cash_output_contracts(
+    output_mode: str, portfolio_mode: str,
+) -> None:
+    model = SimpleNamespace(
+        default_temperature=1.0,
+        portfolio_activation="pre_normalized",
+        portfolio_mode=portfolio_mode,
+        portfolio_output_mode=output_mode,
+        center_long_short_logits=False,
+    )
+    scores = torch.tensor([[3.0, -1.0, 0.0]], dtype=torch.bfloat16)
+    mask = torch.tensor([[True, True, False]])
+    actual = cross_asset_module._portfolio_weights_from_scores(model, scores, mask)
+    short_mask = mask if portfolio_mode == "long_short" else torch.zeros_like(mask)
+    if output_mode == "score_entmax_global_cash":
+        expected = cross_asset_module.masked_score_entmax_global_cash_weights(
+            scores, mask, short_mask=short_mask
+        )
+    elif output_mode == "score_entmax_bounded_cash":
+        expected = cross_asset_module.masked_score_entmax_bounded_cash_weights(
+            scores, mask, short_mask=short_mask
+        )
+    elif output_mode == "score_entmax_log_cash":
+        expected = cross_asset_module.masked_score_entmax_log_cash_weights(
+            scores, mask, short_mask=short_mask
+        )
+    elif output_mode == "score_entmax_scale_separated_cash":
+        expected = cross_asset_module.masked_score_entmax_scale_separated_cash_weights(
+            scores, mask, short_mask=short_mask
+        )
+    else:
+        expected = cross_asset_module.masked_cash_entmax15_weights(
+            scores, mask, short_mask=short_mask,
+            preserve_fp32_output=True, preserve_zero_score_gradient=True,
+        )
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
+
+
 def _matrix_csv(path: Path) -> tuple[list[str], list[str], np.ndarray]:
     frame = pl.read_csv(path)
     source_symbols = frame["source_symbol"].cast(pl.String).to_list()
@@ -230,10 +276,14 @@ def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None
 
 
 def test_cross_asset_graph_cugraph_matches_polars_when_available() -> None:
-    pytest.importorskip("cudf")
+    cudf = pytest.importorskip("cudf")
     pytest.importorskip("cugraph")
     if not torch.cuda.is_available():
         pytest.skip("cuGraph graph processing requires CUDA in this environment.")
+    try:
+        cudf.DataFrame({"runtime_probe": [1]})
+    except Exception as exc:
+        pytest.skip(f"cuGraph CUDA runtime is unavailable: {type(exc).__name__}: {exc}")
 
     edges = _graph_edge_frame(symbols=5)
     result = _process_cross_asset_graph_edges(
@@ -256,10 +306,14 @@ def test_cross_asset_graph_cugraph_matches_polars_when_available() -> None:
 
 
 def test_cross_asset_full_graph_cugraph_explainability_when_available() -> None:
-    pytest.importorskip("cudf")
+    cudf = pytest.importorskip("cudf")
     pytest.importorskip("cugraph")
     if not torch.cuda.is_available():
         pytest.skip("cuGraph graph explainability requires CUDA in this environment.")
+    try:
+        cudf.DataFrame({"runtime_probe": [1]})
+    except Exception as exc:
+        pytest.skip(f"cuGraph CUDA runtime is unavailable: {type(exc).__name__}: {exc}")
 
     edges = _graph_edge_frame(symbols=6)
     result = _build_graph_explainability(
@@ -302,6 +356,7 @@ def test_independent_model_off_diagonal_score_influence_near_zero(tmp_path: Path
         dates=_dates(),
         output_dir=tmp_path,
         settings=CrossAssetTransmissionSettings(
+            graph_backend="polars",
             max_sources=5,
             max_targets=5,
             source_chunk_size=2,
@@ -330,6 +385,7 @@ def test_cross_stock_toy_detects_injected_source_to_target_dependency(tmp_path: 
         dates=_dates(),
         output_dir=tmp_path,
         settings=CrossAssetTransmissionSettings(
+            graph_backend="polars",
             max_sources=5,
             max_targets=5,
             source_chunk_size=2,
@@ -360,6 +416,7 @@ def test_cross_asset_shape_nan_safety_and_missing_shocks(tmp_path: Path) -> None
         dates=_dates(3),
         output_dir=tmp_path,
         settings=CrossAssetTransmissionSettings(
+            graph_backend="polars",
             max_sources=3,
             max_targets=3,
             source_chunk_size=2,

@@ -264,7 +264,8 @@ def operand_query_requests(operands):
             requests.append(dict(requested_fields="equity_capital_reduction_event", product=underlying, contract="",
                 exact_dates=dates, operand="corporate_event_operands"))
     return pl.DataFrame(requests).group_by("requested_fields", "product", "contract").agg(
-        pl.col("exact_dates").str.split(";").explode().unique().sort().str.join(";").alias("exact_dates"),
+        pl.col("exact_dates").str.split(";").explode(empty_as_null=True, keep_nulls=True)
+        .unique().sort().str.join(";").alias("exact_dates"),
         pl.col("operand").unique().sort().str.join(";").alias("operands"))
 
 

@@ -55,6 +55,7 @@ TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION: Final[
 ] = 7
 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION: Final[int] = 8
 TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION: Final[int] = 1
+TX_FRONT_ROLLING_BENCHMARK_MODE: Final[str] = "tx_front_rolling_1x_gross"
 TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *FUTURES_MODEL_FEATURE_COLUMNS,
     "cash_stock_underlying_panel_index",
@@ -201,6 +202,11 @@ def _require_dependencies() -> None:
         )
 
 
+from stockagent.data.tw_futures_benchmark import (
+    load_tx_front_rolling_benchmark, tx_front_benchmark_source_end,
+)
+
+
 def attach_stock_context_futures_portfolio_daily(
     panel: PanelData,
     data_path: str | Path,
@@ -218,6 +224,8 @@ def attach_stock_context_futures_portfolio_daily(
     margin_rules_path: str | Path | None = None,
     valuation_research_contract: str | None = None,
     futures_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+    benchmark_mode: str = "legacy_front_holding_return",
+    benchmark_data_path: str | Path | None = None,
 ) -> PanelData:
     """Attach prior-session futures tokens and current execution facts.
 
@@ -276,6 +284,7 @@ def attach_stock_context_futures_portfolio_daily(
             "carry valuation quarantine currently requires the 08:45 current-OPEN "
             "integer contract"
         )
+    from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
     source_path = Path(data_path)
     manifest_path = source_path.parent / "manifest.json"
     if not source_path.exists() or not manifest_path.exists():
@@ -315,15 +324,17 @@ def attach_stock_context_futures_portfolio_daily(
             raise ValueError("all-TWD materialization requires its admitted margin rule tape")
         if manifest.get("execution_rules_sha256") != _sha256_file(Path(margin_rules_path)):
             raise ValueError("all-TWD daily release and execution rule tape differ")
-    from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
-    data_version=futures_slot_layout_version(futures_slot_count)
-    if int(manifest.get("contract_version", -1)) != data_version:
+    if int(manifest.get("contract_version", -1)) != int(
+        futures_slot_layout_version(futures_slot_count)
+    ):
         raise ValueError("TAIFEX futures portfolio contract version mismatch")
     if int(manifest.get("feature_contract_version", -1)) != int(
         TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION
     ):
         raise ValueError("TAIFEX futures portfolio feature contract mismatch")
-    if int(manifest.get("fixed_model_output_slots", -1)) != futures_slot_count:
+    if int(manifest.get("fixed_model_output_slots", -1)) != int(
+        futures_slot_count
+    ):
         raise ValueError("TAIFEX futures portfolio fixed-slot count mismatch")
     expected_sha = (
         manifest.get("outputs", {})
@@ -1035,23 +1046,37 @@ def attach_stock_context_futures_portfolio_daily(
     if bool((active & (~np.isfinite(fee_rates) | (fee_rates < 0.0))).any()):
         raise ValueError("active TAIFEX rows require finite non-negative fee rates")
 
-    benchmark = np.zeros(dates.size, dtype=np.float32)
-    benchmark_assigned = np.zeros(dates.size, dtype=bool)
-    products = frame["product"].to_numpy()
-    tenors = frame["tenor_rank"].to_numpy().astype(np.int64)
-    benchmark_rows = (products == "TX") & (tenors == 1)
-    benchmark_dates = date_indices[benchmark_rows]
-    if np.unique(benchmark_dates).size != benchmark_dates.size:
-        raise ValueError("TAIFEX TX front-month benchmark is not unique by date")
-    benchmark_values = holding_values[benchmark_rows]
-    benchmark[benchmark_dates] = np.nan_to_num(
-        benchmark_values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
-    )
-    benchmark_assigned[benchmark_dates] = True
-    # The dated-margin adapter owns its cash comparator. A scoped margin
-    # release need not trade TX just to supply an unused legacy benchmark.
-    if not bool(benchmark_assigned.any()) and margin_rules_path is None:
-        raise ValueError("TAIFEX TX front-month benchmark rows are missing")
+    if benchmark_mode == TX_FRONT_ROLLING_BENCHMARK_MODE:
+        benchmark = load_tx_front_rolling_benchmark(benchmark_data_path or source_path, dates)[
+            "benchmark_log_returns"
+        ]
+    elif benchmark_mode == "legacy_front_holding_return":
+        benchmark = np.zeros(dates.size, dtype=np.float32)
+        benchmark_assigned = np.zeros(dates.size, dtype=bool)
+        products = frame["product"].to_numpy()
+        tenors = frame["tenor_rank"].to_numpy().astype(np.int64)
+        benchmark_rows = (products == "TX") & (tenors == 1)
+        benchmark_dates = date_indices[benchmark_rows]
+        if np.unique(benchmark_dates).size != benchmark_dates.size:
+            raise ValueError("TAIFEX TX front-month benchmark is not unique by date")
+        benchmark_values = holding_values[benchmark_rows]
+        benchmark[benchmark_dates] = np.nan_to_num(
+            benchmark_values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        benchmark_assigned[benchmark_dates] = True
+        # The margin adapter owns the cash comparator; TX need not be tradable.
+        if not bool(benchmark_assigned.any()) and margin_rules_path is None:
+            raise ValueError("TAIFEX TX front-month benchmark rows are missing")
+    else:
+        raise ValueError(f"unsupported futures portfolio benchmark mode: {benchmark_mode}")
+
+    # Apply this action eligibility only after constructing all ledger facts.
+    # Channel 8 is floor(previous same-contract volume * participation), never
+    # current-session volume or eventual realized fill. A zero action must not
+    # erase valuation or liquidation metadata for an existing position.
+    if require_prior_capacity:
+        assert integer_execution is not None
+        candidate_mask &= integer_execution[..., 8] >= 1.0
 
     # Apply this action eligibility only after constructing all ledger facts.
     # Channel 8 is floor(previous same-contract volume * participation), never
@@ -1107,7 +1132,7 @@ def attach_stock_context_futures_portfolio_daily(
             ),
             source_path=str(source_path),
             manifest_path=str(manifest_path),
-            futures_data_contract_version=data_version,
+            futures_data_contract_version=futures_slot_layout_version(futures_slot_count),
         )
     )
     return panel

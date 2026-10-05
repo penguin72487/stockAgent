@@ -1,0 +1,16 @@
+# Follow-up to the completed v1 run. It preserves the same validated data,
+# annual exact-account episodes, sub-lot recovery and formal 1,000-epoch
+# lifecycle. Only the parameter-free stock-to-cash output geometry changes.
+base_config: tw_day_trade_v8_combined_annual_output_v2_sub_lot_fold11_v1.yaml
+experiment_name: tw-day-trade-v8-combined-annual-bounded-cash-sub-lot-fold11-v2
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_bounded_cash_sub_lot_fold11_v2
+  start_fold: 11
+  resume: true
+  post_train_infer: false
+
+training:
+  financial_transformer:
+    portfolio_output_mode: score_entmax_bounded_cash
+    center_long_short_logits: false

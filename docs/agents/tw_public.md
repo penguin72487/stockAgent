@@ -356,4 +356,3 @@ Use for Taiwan official downloaders, parsers, price precision, listing lifecycle
 - Panel cache validation fingerprints every source byte (including the external
   rule parquet), so a same-size replacement with preserved timestamps cannot
   silently reuse stale execution masks.
-

@@ -1,6 +1,11 @@
+import ast
 import json
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+from stockagent.config import load_config
 from stockagent.training.trainer import (
     _EpochCurveLifecycle,
     _epoch_curve_plot_command,
@@ -9,6 +14,73 @@ from stockagent.training.trainer import (
     _trim_group_curve,
 )
 from stockagent.training import trainer
+
+
+@pytest.fixture(scope="module")
+def epoch_stopping_code():
+    """Execute the trainer's real counter/stop blocks without building a panel.
+
+    Keep the production branches, prints and stop receipts intact; supply only
+    validation-improvement events and candidate receipts from a bounded fixture.
+    """
+    tree = ast.parse(Path(trainer.__file__).read_text(encoding="utf-8"))
+    impl = next(node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_run_training_impl")
+    epoch_loop, = [node for node in ast.walk(impl)
+                  if isinstance(node, ast.For) and isinstance(node.iter, ast.Name)
+                  and node.iter.id == "epoch_pbar"]
+    stops = [node for node in ast.walk(epoch_loop) if isinstance(node, ast.If)
+             and any(isinstance(child, ast.Break) for child in node.body)]
+    assert len(stops) == 2  # validation patience and optional proposal exhaustion
+    counter, = [node for node in ast.walk(epoch_loop)
+                if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+                and node.test.id == "any_fold_improved"]
+    patience, = [node for node in ast.walk(impl) if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "early_stop_patience"
+                         for target in node.targets)]
+    epoch_loop.body = [
+        *ast.parse("any_fold_improved = epoch in improvement_epochs").body,
+        counter, *sorted(stops, key=lambda node: node.lineno),
+    ]
+    return compile(ast.fix_missing_locations(ast.Module(body=[patience, epoch_loop], type_ignores=[])),
+                   trainer.__file__, "exec")
+
+
+@pytest.mark.parametrize("stop_on_rejection,improvements,resume_count,expected_epoch", [
+    (False, {1}, 0, 101),  # 1 initial best, then exactly 100 unchanged validations
+    (False, {1, 51}, 0, 151),  # an improvement resets the consecutive count
+    (False, set(range(1, 1001)), 0, 1000),  # still improving: reach the epoch cap
+    (False, set(), 99, 1),  # resume carries patience; it must not reset
+    (True, {1}, 0, 1),  # old configs preserve their explicit exhaustion stop
+])
+def test_rejected_candidates_follow_configured_patience_and_epoch_cap(
+    epoch_stopping_code, tmp_path, stop_on_rejection, improvements, resume_count, expected_epoch,
+):
+    config = load_config(
+        "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_benchmark_risk_v10.yaml"
+    )
+    config.training.futures_training_stop_on_rejected_step = stop_on_rejection
+    namespace = {
+        "config": config, "np": np, "json": json,
+        "early_stop_ratio": config.training.early_stopping_no_improve_ratio,
+        "no_improve_epochs": resume_count,
+        "epoch_pbar": range(1, config.training.epochs + 1),
+        "improvement_epochs": improvements,
+        "early_stop_improvement_label": "improvement",
+        "train_years": [2011, 2024], "output_path": tmp_path,
+        "_group_dir": lambda *_: tmp_path,
+        "_distributed_should_write": lambda: True,
+        "policy_step_payload": {"train_policy_update_accepted": False},
+    }
+    exec(epoch_stopping_code, namespace)
+    assert namespace["epoch"] == expected_epoch
+    assert namespace["early_stop_patience"] == 100
+    if not stop_on_rejection:
+        assert namespace["no_improve_epochs"] == (0 if expected_epoch == 1000 else 100)
+        assert not (tmp_path / "optimizer_stop.json").exists()
+    else:
+        receipt = json.loads((tmp_path / "optimizer_stop.json").read_text())
+        assert receipt["epoch"] == 1 and receipt["reason"] == "no_feasible_policy_step"
 
 
 def _write_curve_rows(path: Path, rows: list[dict[str, object]]) -> None:

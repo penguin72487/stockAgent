@@ -171,4 +171,3 @@ do not scale capacity to the daily total or weaken strict Tick equality checks.
 The other 12 days exactly reconcile to official outright volume and OHLC.
 No quarantine or calendar scope was added; 206 other potential corporate events
 remain unsupported. See `docs/FUTURES_MKF_TRANSITION_REPAIR_2026-09-10.md`.
-

@@ -1,0 +1,19 @@
+# Fresh optimizer/account trajectory after the crypto ledger corrections.
+# Keep the v4 data source, feature ABI, panel cache, execution clock and costs.
+# Only the training-window column RMS normalizer is a new model experiment:
+# units are scaled without centering, and train-unseen columns remain inactive.
+# Its fitted scales/mask are persisted in the checkpoint for exact resumes.
+base_config: bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v4.yaml
+
+experiment_name: bybit-perpetual-daily-0005-historical-public-pit-learned-cash-trajectory-v5
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_0005_historical_public_pit_learned_cash_trajectory_v5
+
+training:
+  financial_transformer:
+    causal_feature_rms_normalization: true
+  # The loader inherits FinancialTransformer defaults into this unused model.
+  # Keep its old setting so the resolved config changes only the active model.
+  executable_portfolio_transformer:
+    causal_feature_rms_normalization: false

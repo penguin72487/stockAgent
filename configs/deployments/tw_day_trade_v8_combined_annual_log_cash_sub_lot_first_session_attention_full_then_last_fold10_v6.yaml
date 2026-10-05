@@ -1,0 +1,30 @@
+# Standalone Fold-10 architecture successor to the completed v5 walk-forward
+# run. It preserves the validated data, first-session annual accounts, exact
+# minute/FIFO execution, sub-lot training signal, score-entmax log-cash output,
+# LayerNorm, learned time positions, temporal RoPE, and guarded pretrained
+# model-weight transfer. Only the temporal readout changes from last/last_only
+# to attention/full_then_last. That adds trainable pooling parameters, so this
+# experiment uses a fresh artifact root and never resumes v5 optimizer state.
+base_config: tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_all_folds_v5.yaml
+experiment_name: tw-day-trade-v8-combined-annual-log-cash-sub-lot-first-session-attention-full-then-last-fold10-v6
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_v8_combined_annual_log_cash_sub_lot_first_session_attention_full_then_last_fold10_v6
+  start_fold: 10
+  resume: true
+  post_train_infer: false
+
+training:
+  # full_then_last retains the full temporal activation path. The established
+  # dual-5090 attention configuration uses 16/16 rather than v5's 32/16.
+  batch_size_train: 16
+  batch_size_eval: 16
+
+  # Keep both model sections synchronized so this architecture contract stays
+  # explicit if the active model selector changes during later replay.
+  transformer_base_portfolio:
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+  financial_transformer:
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last

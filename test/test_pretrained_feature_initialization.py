@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
 from stockagent.config import load_config
+from stockagent.models.factory import build_model
 from stockagent.models.financial_transformer import CandleEncoder, FinancialTransformerModel
 from stockagent.training.trainer import (
     _PretrainedEpochZeroUnderperformsFlatCash,
     _PretrainedInitialization,
+    _normalize_pretrained_initialization_fold_policy,
+    _pretrained_fold_years_match,
+    _fit_group_temporal_basis,
+    _effective_causal_feature_rms_report,
+    _restore_resume_model_state,
     _pretrained_temporal_basis_matches_target,
     _reset_pretrained_exact_account_action_head_to_flat_,
     _reset_pretrained_futures_action_head_to_flat_,
@@ -22,6 +31,59 @@ from stockagent.training.trainer import (
 )
 
 
+def test_causal_train_superset_policy_accepts_only_earlier_prefix_years() -> None:
+    policy = _normalize_pretrained_initialization_fold_policy(
+        "matching_validation_and_causal_train_superset"
+    )
+    common = {
+        "policy": policy,
+        "target_train_years": [2015, 2016],
+        "target_val_years": [2017],
+    }
+
+    assert _pretrained_fold_years_match(
+        source_train_years=[2014, 2015, 2016],
+        source_val_years=[2017],
+        **common,
+    )
+    assert not _pretrained_fold_years_match(
+        source_train_years=[2015, 2016],
+        source_val_years=[2017],
+        **common,
+    )
+    assert not _pretrained_fold_years_match(
+        source_train_years=[2014, 2015, 2016],
+        source_val_years=[2018],
+        **common,
+    )
+    assert not _pretrained_fold_years_match(
+        source_train_years=[2015, 2016, 2017],
+        source_val_years=[2017],
+        **common,
+    )
+
+
+def test_exact_pretrained_fold_policy_remains_exact() -> None:
+    policy = _normalize_pretrained_initialization_fold_policy(
+        "matching_train_and_validation_years"
+    )
+    common = {
+        "policy": policy,
+        "target_train_years": [2015],
+        "target_val_years": [2016],
+    }
+    assert _pretrained_fold_years_match(
+        source_train_years=[2015],
+        source_val_years=[2016],
+        **common,
+    )
+    assert not _pretrained_fold_years_match(
+        source_train_years=[2014, 2015],
+        source_val_years=[2016],
+        **common,
+    )
+
+
 class _TinyFinancialStem(nn.Module):
     def __init__(
         self,
@@ -29,6 +91,7 @@ class _TinyFinancialStem(nn.Module):
         num_features: int,
         feature_bottleneck_dim: int,
         causal_rms: bool,
+        feature_svd_components: int = 0,
     ) -> None:
         super().__init__()
         self.candle_encoder = CandleEncoder(
@@ -40,6 +103,7 @@ class _TinyFinancialStem(nn.Module):
             sanitize_inputs=True,
             feature_bottleneck_dim=feature_bottleneck_dim,
             causal_feature_rms_normalization=causal_rms,
+            feature_svd_components=feature_svd_components,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -193,8 +257,22 @@ def test_learned_cash_stock_policy_has_an_exact_flat_checkpoint_floor() -> None:
 
 
 @pytest.mark.parametrize("portfolio_mode", ["long_short", "long_only"])
+@pytest.mark.parametrize(
+    ("output_mode", "schema_version", "method"),
+    [
+        ("score_entmax_cash", 3, "zero_score_head_final_linear_flat_score_entmax_cash_v3"),
+        ("score_entmax_cash_v2", 4, "zero_score_head_final_linear_flat_score_entmax_cash_zero_grad_v4"),
+        ("score_entmax_global_cash", 5, "zero_score_head_final_linear_flat_score_entmax_global_cash_v5"),
+        ("score_entmax_scale_separated_cash", 6, "zero_score_head_final_linear_flat_score_entmax_scale_separated_cash_v6"),
+        ("score_entmax_bounded_cash", 7, "zero_score_head_final_linear_flat_score_entmax_bounded_cash_v7"),
+        ("score_entmax_log_cash", 8, "zero_score_head_final_linear_flat_score_entmax_log_cash_v8"),
+    ],
+)
 def test_score_entmax_cash_flat_checkpoint_restores_financial_transformer(
     portfolio_mode: str,
+    output_mode: str,
+    schema_version: int,
+    method: str,
 ) -> None:
     torch.manual_seed(31)
     model = FinancialTransformerModel(
@@ -211,7 +289,7 @@ def test_score_entmax_cash_flat_checkpoint_restores_financial_transformer(
         head_layers=1,
         dropout=0.0,
         portfolio_mode=portfolio_mode,
-        portfolio_output_mode="score_entmax_cash",
+        portfolio_output_mode=output_mode,
         center_long_short_logits=False,
         return_aux=False,
         execution_mode="tw_day_trade",
@@ -231,11 +309,9 @@ def test_score_entmax_cash_flat_checkpoint_restores_financial_transformer(
     assert torch.count_nonzero(expected).item() > 0
 
     with _temporary_pretrained_exact_account_flat_checkpoint(model) as receipt:
-        assert receipt["schema_version"] == 3
-        assert receipt["method"] == (
-            "zero_score_head_final_linear_flat_score_entmax_cash_v3"
-        )
-        assert receipt["portfolio_output_mode"] == "score_entmax_cash"
+        assert receipt["schema_version"] == schema_version
+        assert receipt["method"] == method
+        assert receipt["portfolio_output_mode"] == output_mode
         assert receipt["trainable_parameter_count"] > 0
         assert torch.count_nonzero(model(features, mask)).item() == 0
 
@@ -383,6 +459,84 @@ def test_same_feature_abi_preserves_learned_bottleneck_checkpoint_exactly() -> N
         == name.startswith("candle_encoder.continuous_feature_bottleneck.")
         for name, parameter in target.named_parameters()
     )
+
+
+@pytest.mark.parametrize("training_continues", [False, True])
+@pytest.mark.parametrize("feature_svd", [False, True])
+def test_resume_preserves_pretrained_rms_and_optimizer_trajectory(
+    training_continues: bool,
+    feature_svd: bool,
+) -> None:
+    torch.manual_seed(317)
+    uninterrupted = _TinyFinancialStem(
+        num_features=4, feature_bottleneck_dim=0 if feature_svd else 2,
+        causal_rms=True, feature_svd_components=2 if feature_svd else 0,
+    )
+    uninterrupted.candle_encoder.set_causal_feature_rms_normalizer(
+        torch.tensor([2.0, 3.0, 5.0, 7.0]),
+        torch.tensor([True, False, True, True]),
+    )
+    if feature_svd:
+        uninterrupted.candle_encoder.set_feature_svd_projection(torch.eye(4)[:2])
+    inputs, target = torch.randn(3, 4), torch.randn(3, 4)
+    optimizer = torch.optim.AdamW(uninterrupted.parameters(), lr=1e-3)
+
+    def update(model, opt):
+        opt.zero_grad(set_to_none=True)
+        (model(inputs) - target).square().mean().backward()
+        opt.step()
+
+    update(uninterrupted, optimizer)
+    checkpoint = deepcopy({
+        "model_state_dict": uninterrupted.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "pretrained_initialization": {"source_checkpoint": "source.pt"},
+    })
+    resumed = _TinyFinancialStem(
+        num_features=4, feature_bottleneck_dim=0 if feature_svd else 2,
+        causal_rms=True, feature_svd_components=2 if feature_svd else 0,
+    )
+    fitted = (torch.ones(4), torch.ones(4, dtype=torch.bool), {
+        "normalizer_fingerprint": "target-fit",
+    })
+    resumed.candle_encoder.set_causal_feature_rms_normalizer(*fitted[:2])
+    if feature_svd:
+        # The newly fitted projection is not the checkpoint's input contract.
+        resumed.candle_encoder.set_feature_svd_projection(torch.eye(4)[2:])
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-3)
+    _restore_resume_model_state(resumed, checkpoint)
+    resumed_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if feature_svd:
+        assert resumed.candle_encoder._feature_svd_fitted
+        assert torch.equal(resumed.candle_encoder.feature_svd_directions, torch.eye(4)[:2])
+    assert torch.equal(resumed(inputs), uninterrupted(inputs))
+    assert resumed.pretrained_initialization_provenance == checkpoint["pretrained_initialization"]
+    report = _effective_causal_feature_rms_report(resumed, fitted)
+    assert report["matches_fitted_scale"] is False
+    assert report["matches_fitted_active_mask"] is False
+    assert report["max_abs_scale_difference"] == 6.0
+    assert report["effective_scale"] == [2.0, 3.0, 5.0, 7.0]
+    assert report["effective_active_mask"] == [True, False, True, True]
+    if training_continues:
+        update(uninterrupted, optimizer)
+        update(resumed, resumed_optimizer)
+    for key, value in uninterrupted.state_dict().items():
+        assert torch.equal(resumed.state_dict()[key], value), key
+    for key, value in optimizer.state_dict()["state"].items():
+        for field, expected in value.items():
+            assert torch.equal(resumed_optimizer.state_dict()["state"][key][field], expected)
+
+
+def test_effective_rms_report_distinguishes_fitted_and_disabled_models() -> None:
+    model = _TinyFinancialStem(
+        num_features=4, feature_bottleneck_dim=2, causal_rms=True
+    )
+    fitted = (torch.ones(4), torch.ones(4, dtype=torch.bool), {})
+    model.candle_encoder.set_causal_feature_rms_normalizer(*fitted[:2])
+    report = _effective_causal_feature_rms_report(model, fitted)
+    assert report["matches_fitted_scale"] is True
+    assert report["matches_fitted_active_mask"] is True
+    assert _effective_causal_feature_rms_report(model, None) is None
 
 
 def test_non_strict_transfer_preserves_new_zero_initialized_cash_gate() -> None:
@@ -698,6 +852,81 @@ def test_pretrained_basis_reuse_fails_closed_for_expanded_target_abi() -> None:
     )
     assert not _pretrained_temporal_basis_matches_target(
         initialization,
+        config=config,
+        target_feature_count=99,
+    )
+
+
+def test_pretrained_basis_is_not_reused_when_target_disables_all_families(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        "configs/deployments/"
+        "tw_day_trade_last_last_only_training_vastai1t_v8_twpublic_248d0869_full.yaml"
+    )
+    model_config = config.training.financial_transformer
+    model_config.temporal_basis_families = []
+    model_config.temporal_basis_components_by_family = {}
+    model_config.temporal_basis_disabled_families = []
+    source = _PretrainedInitialization(
+        checkpoint_path=Path("source.pt"),
+        checkpoint={
+            "model_state_dict": {
+                "temporal_basis_feature_encoder.pca_klt_basis": torch.ones(1, 32),
+            },
+            "temporal_basis_selection": {"families": ["pca_klt"]},
+        },
+        source_feature_names=["feature"],
+        provenance={},
+    )
+    assert not _pretrained_temporal_basis_matches_target(
+        source,
+        config=config,
+        target_feature_count=99,
+    )
+
+    fold = SimpleNamespace(fold_id=11)
+    stale_group_path = (
+        tmp_path
+        / "train_2014-2015"
+        / "temporal_basis_selection.json"
+    )
+    stale_group_path.parent.mkdir(parents=True)
+    stale_group_path.write_text('{"families": ["pca_klt"]}', encoding="utf-8")
+    overrides, metadata = _fit_group_temporal_basis(
+        config=config,
+        train_ds=None,
+        train_years=[2014, 2015],
+        group_folds=[fold],
+        output_path=tmp_path,
+    )
+    assert overrides == {}
+    assert metadata is not None
+    assert metadata["families"] == []
+    assert metadata["selected_counts"] == {}
+    model = build_model(
+        config=config,
+        lookback=config.training.lookback,
+        num_features=99,
+        num_symbols=3,
+        temporal_basis_overrides=overrides,
+    )
+    assert model.temporal_basis_families == ()
+    assert json.loads(stale_group_path.read_text(encoding="utf-8"))["families"] == []
+    fold_path = tmp_path / "fold_11" / "temporal_basis_selection.json"
+    assert json.loads(fold_path.read_text(encoding="utf-8"))["families"] == []
+
+    no_basis_source = _PretrainedInitialization(
+        checkpoint_path=Path("no_basis.pt"),
+        checkpoint={
+            "model_state_dict": {},
+            "temporal_basis_selection": metadata,
+        },
+        source_feature_names=["feature"],
+        provenance={},
+    )
+    assert _pretrained_temporal_basis_matches_target(
+        no_basis_source,
         config=config,
         target_feature_count=99,
     )

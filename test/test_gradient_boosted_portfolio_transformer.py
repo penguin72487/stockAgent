@@ -4,12 +4,20 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from stockagent.config import load_config
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.gradient_boosted_portfolio_transformer import GradientBoostedPortfolioTransformer
+from stockagent.models.normalization import (
+    masked_cash_entmax15_weights,
+    masked_score_entmax_log_cash_weights,
+    masked_score_entmax_bounded_cash_weights,
+    masked_score_entmax_global_cash_weights,
+    masked_score_entmax_scale_separated_cash_weights,
+)
 from stockagent.training.trainer import _extract_weights_and_aux, _save_fold_checkpoint
 
 
@@ -78,6 +86,48 @@ def test_gradient_boosted_transformer_forward_masks_and_projects() -> None:
     assert torch.isfinite(weights).all()
     assert weights[1, 8:].abs().max().item() < 1e-6
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
+
+
+@pytest.mark.parametrize("output_mode", [
+    "score_entmax_global_cash", "score_entmax_cash_v2",
+    "score_entmax_bounded_cash",
+    "score_entmax_log_cash",
+    "score_entmax_scale_separated_cash",
+])
+def test_gradient_boosted_cash_output_uses_requested_mode(output_mode: str) -> None:
+    device = _device()
+    model = _make_model(
+        portfolio_output_mode=output_mode, center_final_logits=False
+    ).eval()
+    x = torch.randn(1, 5, 11, 7, device=device)
+    mask = torch.ones(1, 11, dtype=torch.bool, device=device)
+    mask[0, 9:] = False
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+    if output_mode == "score_entmax_global_cash":
+        expected = masked_score_entmax_global_cash_weights(
+            aux["centered_score_logits"], mask
+        )
+    elif output_mode == "score_entmax_bounded_cash":
+        expected = masked_score_entmax_bounded_cash_weights(
+            aux["centered_score_logits"], mask
+        )
+    elif output_mode == "score_entmax_log_cash":
+        expected = masked_score_entmax_log_cash_weights(
+            aux["centered_score_logits"], mask
+        )
+    elif output_mode == "score_entmax_scale_separated_cash":
+        expected = masked_score_entmax_scale_separated_cash_weights(
+            aux["centered_score_logits"], mask
+        )
+    else:
+        expected = masked_cash_entmax15_weights(
+            aux["centered_score_logits"], mask,
+            preserve_fp32_output=True, preserve_zero_score_gradient=True,
+        )
+    torch.testing.assert_close(weights, expected)
+    assert weights.dtype == torch.float32
+    assert weights[0, 9:].abs().sum().item() == 0.0
 
 
 def test_residual_stage_deltas_are_zero_initialized() -> None:

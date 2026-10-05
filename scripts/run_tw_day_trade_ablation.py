@@ -269,6 +269,7 @@ def main() -> None:
     )
     spec_path = args.spec.resolve()
     spec, experiment_rows = _load_effective_spec(spec_path, selected)
+    worker_refreshes_plots = bool(spec.get("postprocess_plots"))
     folds = int(spec["expected_fold_count"])
     root = (args.output_root or (REPO_ROOT / spec["output_root"])).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -426,7 +427,8 @@ def main() -> None:
             # Plotting is deliberately synchronous: a later experiment may
             # start only after the just-completed experiment is visible in all
             # validation, owned-test, and diagnostic analysis surfaces.
-            _plot_completed_experiments(root, baseline_root=baseline_root)
+            if not worker_refreshes_plots:
+                _plot_completed_experiments(root, baseline_root=baseline_root)
             generated_any_plots = True
             print(
                 f"[ablation] charts refreshed after completed experiment: {name}",
@@ -452,7 +454,7 @@ def main() -> None:
     if selected:
         collect_command.extend(["--only", ",".join(sorted(selected))])
     _run_checked(collect_command)
-    if not generated_any_plots:
+    if not generated_any_plots and not worker_refreshes_plots:
         # A fully resumed suite may have no newly trained experiment in this
         # invocation. Ensure its aggregate outputs still exist and are current.
         _plot_completed_experiments(root, baseline_root=baseline_root)

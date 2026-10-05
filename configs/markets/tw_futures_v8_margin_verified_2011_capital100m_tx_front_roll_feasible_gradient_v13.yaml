@@ -1,0 +1,14 @@
+# Exact v12 account; backward contract 6 respects executable capacity and
+# position limits instead of differentiating unavailable exposure. Use a
+# normally initialized, trainable head, without forcing an all-cash policy.
+# Changed initialization/backward require a fresh optimizer and artifact root.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_absorbing_gradient_v12.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-feasible-gradient-v13
+
+training:
+  financial_transformer:
+    futures_flat_action_initialization: false
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_feasible_gradient_v13
+  start_fold: 14

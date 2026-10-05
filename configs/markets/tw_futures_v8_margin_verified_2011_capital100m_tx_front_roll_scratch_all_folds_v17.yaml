@@ -1,0 +1,15 @@
+# Ordinary training from fold 1 with an independently initialized policy per fold.
+# Preserve v16 accounting/model improvements without importing the fold-14 v10
+# policy into earlier years. This changes initialization, not the trading rules.
+base_config: tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_warm_policy_v16.yaml
+experiment_name: tw-futures-v8-margin-verified-2011-capital100m-tx-front-roll-scratch-all-folds-v17
+
+training:
+  pretrained_initialization_root: null
+  warm_start_from_previous_fold: false
+  financial_transformer:
+    futures_flat_action_initialization: false
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_scratch_all_folds_v17
+  start_fold: 1

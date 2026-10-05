@@ -153,4 +153,3 @@ Rules:
 - Use `max_full_tokens` as an OOM guard for `full` mode.
 - Prefer `latent`, `latent_only`, or `market_token` for full market universes.
 - Use `d_model`, layer counts, heads, latent factors, market tokens, and `attention_mode` as the main knobs for scaling small to complete.
-
