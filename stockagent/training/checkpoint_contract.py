@@ -239,6 +239,7 @@ def _project_temporal_basis_model_config(
         "futures_flat_action_initialization",
         "futures_notional_score_coordinates",
         "futures_margin_amount_context",
+        "futures_causal_account_policy",
     ):
         if not bool(projected.get(field_name, False)):
             # These futures-only branches were added after the cash-equity
@@ -1394,6 +1395,22 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 "denomination_clock": "prior_settlement_margin_ratios_model_current_open_executor_only",
                 "unfilled_notional": "unused_margin_budget_no_cross_group_redistribution",
             })
+            if config.training.financial_transformer.futures_causal_account_policy:
+                from stockagent.models.futures_account_policy import (
+                    FUTURES_ACCOUNT_POLICY_VERSION, FUTURES_ACCOUNT_PACKET_WIDTH,
+                    FUTURES_ACCOUNT_STATE_COLUMNS, FUTURES_ACCOUNT_OBSERVATION_COLUMNS,
+                )
+                section = contract["taiwan_stock_context_futures_portfolio"]
+                section["candidate_feature_columns"] += list(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
+                section["causal_account_policy"] = {
+                    "version": FUTURES_ACCOUNT_POLICY_VERSION,
+                    "packet_width": FUTURES_ACCOUNT_PACKET_WIDTH,
+                    "state_columns": list(FUTURES_ACCOUNT_STATE_COLUMNS),
+                    "risk_lookback": config.training.lookback,
+                    "decision_clock": "actual_carried_contracts_previous_settled_nav_before_current_gap_pnl",
+                    "gradient": "exact_state_forward_recurrent_anchored_shadow_feedback_backward_v1_batch_boundary_detached",
+                    "initialization": "ordinary_market_policy_zero_feedback_residual",
+                }
     if execution_mode in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",

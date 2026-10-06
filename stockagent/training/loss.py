@@ -1299,6 +1299,13 @@ def risk_aware_loss(
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    from stockagent.models.futures_account_policy import is_futures_account_policy_packet
+    account_policy = None
+    if is_futures_account_policy_packet(weights):
+        if normalize_execution_mode(execution_mode) != "tw_stock_context_futures_portfolio":
+            raise ValueError("account policy packets require exact futures execution")
+        account_policy = weights
+        weights = weights[..., 0]
     _loss_timer_stop("normalize_weights", normalize_start)
 
     prepare_start = _loss_timer_start()
@@ -1778,7 +1785,7 @@ def risk_aware_loss(
     backtest_start = _loss_timer_start()
     needs_penalty_weights = float(concentration_weight) > 0.0 or float(net_exposure_weight) > 0.0
     backtest = run_backtest_torch(
-        weights,
+        account_policy if account_policy is not None else weights,
         execution_returns,
         tradable,
         benchmark,

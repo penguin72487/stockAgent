@@ -1502,6 +1502,9 @@ class BacktestResult:
     # gates, settlement, turnover, or participation constraints.  Integer-share
     # audit must replay these requests, not renormalize already-executed weights.
     requested_weights_history: np.ndarray | None = None
+    # State-independent market coefficients/known observations. A closed-loop
+    # policy must be resolved again when deployment carries a different book.
+    futures_account_policy_packet: np.ndarray | None = None
     # Dual-session audit fields.  Event axes are ordered [OPEN, CLOSE].
     open_weights_history: np.ndarray | None = None
     close_weights_history: np.ndarray | None = None
@@ -1563,6 +1566,7 @@ class BacktestResultTensor:
     long_margin_debt_history: torch.Tensor | None = None
     final_long_margin_debt: torch.Tensor | None = None
     requested_weights_history: torch.Tensor | None = None
+    futures_account_policy_packet: torch.Tensor | None = None
     # Dual-session audit fields.  Event axes are ordered [OPEN, CLOSE].
     open_weights_history: torch.Tensor | None = None
     close_weights_history: torch.Tensor | None = None
@@ -1626,6 +1630,7 @@ class BacktestResultTensor:
             turnovers=as_float(self.turnovers),
             weights_history=as_float(self.weights_history),
             requested_weights_history=optional_float(self.requested_weights_history),
+            futures_account_policy_packet=optional_float(self.futures_account_policy_packet),
             open_weights_history=optional_float(self.open_weights_history),
             close_weights_history=optional_float(self.close_weights_history),
             event_turnovers=optional_float(self.event_turnovers),
@@ -3319,6 +3324,16 @@ def run_backtest_torch(
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    from stockagent.models.futures_account_policy import is_futures_account_policy_packet
+    account_policy = None
+    if is_futures_account_policy_packet(weights):
+        if (mode != "tw_stock_context_futures_portfolio" or long_only
+                or float(min_trade_weight) != 0 or float(gross_leverage) != 1
+                or normalize_portfolio_activation(portfolio_activation) != "pre_normalized"
+                or futures_portfolio_training_surrogate_only):
+            raise ValueError("causal account policy requires the unmodified exact margin log-cash executor")
+        account_policy = weights
+        weights = weights[..., 0]
     if crypto_announced_exit_unlimited_volume and mode != "crypto_perpetual":
         raise ValueError("crypto_announced_exit_unlimited_volume requires crypto_perpetual")
     if day_trade_carry_sessions is not None:
@@ -3529,6 +3544,8 @@ def run_backtest_torch(
                 "tw_stock_context_futures_portfolio fixed commission is "
                 "mutually exclusive with proportional buy/sell fees"
             )
+        if account_policy is not None and int(execution.size(-1)) not in MARGIN_EXECUTION_WIDTHS:
+            raise ValueError("causal account policy cannot fall back to a market-only or non-margin account")
         gross_budget = _resolve_exposure_budget(gross_leverage)
         prepped_weights = _normalize_target_weights_torch(
             weights.to(dtype=torch.float32),
@@ -3559,7 +3576,7 @@ def run_backtest_torch(
                 )
             else:
                 result = run_tw_futures_portfolio_integer_torch(
-                    prepped_weights,
+                    account_policy if account_policy is not None else prepped_weights,
                     execution,
                     initial_capital=float(day_trade_execution_initial_capital),
                     state_advance_mask=state_advance_mask,
@@ -3592,7 +3609,12 @@ def run_backtest_torch(
                     )
                 ),
                 requested_weights_history=(
-                    prepped_weights if return_weights_history else None
+                    (result.requested_weights_history if account_policy is not None else prepped_weights)
+                    if return_weights_history else None
+                ),
+                futures_account_policy_packet=(
+                    account_policy.detach()
+                    if account_policy is not None and return_weights_history else None
                 ),
                 final_weights=result.final_weights,
                 final_alive=result.final_alive,

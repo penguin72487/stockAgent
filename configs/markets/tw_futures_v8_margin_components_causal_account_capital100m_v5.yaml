@@ -1,0 +1,37 @@
+# Same selected research data/account as margin-components 20261003; new actor ABI.
+# Start from Fold 1 with a fresh output root. Never resume an older actor here.
+base_config: tw_futures_v8_margin_components_repaired_year_shift32_capital100m_fold14_v3.yaml
+experiment_name: tw-futures-margin-components-causal-account-capital100m-v5
+
+trading:
+  tw_futures_portfolio_data_path: artifacts/markets/tw_futures_v8_margin_preparation/margin_components_current/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/markets/tw_futures_v8_margin_preparation/margin_components_current/release/rules/rules.parquet
+  tw_futures_portfolio_valuation_research_contract: frozen_contract_value_research_v1
+  # Retained official observations after the source-directory migration.
+  # Identical daily TX returns/roll marks to the old verified reference through
+  # 2026-09-04. New source identity: do not resume a checkpoint with the old pin.
+  tw_futures_portfolio_benchmark_mode: tx_front_rolling_1x_gross
+  tw_futures_portfolio_benchmark_data_path: data_tw_index_futures/benchmarks/tx_front_rolling_1x_gross_2011_20260904_v1/continuous_daily.parquet
+  tw_futures_portfolio_benchmark_sha256: 5285fd33e54977cddf34b730324871ed16d0ea3b225df43e883f7ba7dae1cabb
+
+training:
+  epochs: 1000
+  val_interval_epochs: 1
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0001
+  financial_transformer:
+    futures_causal_account_policy: true
+    futures_margin_amount_context: true
+    futures_flat_action_initialization: false
+    futures_current_open_feature: false
+    futures_denomination_hard_projection: false
+    center_long_short_logits: false
+    portfolio_output_mode: score_entmax_log_cash
+
+runner:
+  output_dir: artifacts/markets/tw_futures_v8_margin_components_causal_account_capital100m_v5
+  start_fold: 1
+  resume: false
+  # Reuse the canonical sequential fold launcher: retired CUDA graphs/model
+  # wrappers cannot consume the next fold's compile workspace after exit.
+  isolate_train_folds: true

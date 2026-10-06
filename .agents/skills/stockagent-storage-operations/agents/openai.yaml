@@ -1,0 +1,4 @@
+interface:
+  display_name: "StockAgent 四節點儲存維運"
+  short_description: "操作四節點儲存、DuckLake／Temporal、NAS 備份與 Vast 回傳"
+  default_prompt: "請使用 $stockagent-storage-operations，依目前節點、設定與驗收收據完成這次儲存、同步備份或訓練資料生命週期工作。"
