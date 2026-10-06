@@ -1,5 +1,6 @@
 """Fixed pending delivery survives a history-bounded NAS outage continuation."""
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +17,17 @@ class Continued(BaseException):
 
 def continue_request(request):
     raise Continued(request)
+
+
+def test_catalog_ack_is_checkpointed_without_waiting_for_transport_gc(tmp_path):
+    proof = {'state':'nas_archive_file_recovery_verified','delivery_identity_sha256':'a'*64}
+    with patch.object(sw,'configuration',lambda:{'state_root':str(tmp_path)}), \
+         patch.object(sw,'activity_lease',lambda:nullcontext()), \
+         patch.object(sw,'acceptance',lambda *args:dict(proof)), \
+         patch.object(sw,'retire_accepted_transport',side_effect=AssertionError('inline GC blocks publication')):
+        result=sw.check_nas_acceptance('a'*64)
+    assert result['transport_retirement']['state']=='delegated_to_transport_gc'
+    assert (tmp_path/('catalog-acceptance-'+'a'*64+'.json')).is_file()
 
 
 def test_nas_outage_continuation_keeps_exact_unaccepted_delivery():

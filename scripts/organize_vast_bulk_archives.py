@@ -46,24 +46,25 @@ def received_batches():
                   if BATCH_NAME.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
 
 
-def private_remote(args, ack, *, apply):
+def _private_control_body():
     body = "import sys,types\n"
     for name, relative in (
         ("stockagent.data_sync.node_roles", "stockagent/data_sync/node_roles.py"),
         ("stockagent.data_sync.artifact_consumers", "stockagent/data_sync/artifact_consumers.py"),
         ("stockagent.data_sync.legacy_artifact_archive", "stockagent/data_sync/legacy_artifact_archive.py"),
+        ("stockagent.data_sync.training_return", "stockagent/data_sync/training_return.py"),
         ("stockagent.data_sync.remote_legacy_return", "stockagent/data_sync/remote_legacy_return.py"),
         ("stockagent.data_sync.windows_cold_io", "stockagent/data_sync/windows_cold_io.py"),
         ("stockagent.data_sync.bulk_archive", "stockagent/data_sync/bulk_archive.py"),
         ("scripts.deduplicate_inactive_panel_caches", "scripts/deduplicate_inactive_panel_caches.py"),
-        ("stockagent.data_sync.training_return", "stockagent/data_sync/training_return.py"),
         ("stockagent.data_sync.bulk_archive_retirement", "stockagent/data_sync/bulk_archive_retirement.py"),
     ):
         body += f"m=types.ModuleType({name!r});m.__file__={'/root/stockAgent/' + relative!r};sys.modules[{name!r}]=m\n"
         body += f"exec({(ROOT / relative).read_text()!r},m.__dict__)\n"
-    body += "import json\nfrom pathlib import Path\nfrom stockagent.data_sync.bulk_archive_retirement import retire\n"
-    body += f"ack=json.loads({json.dumps(ack)!r})\n"
-    body += f"result=retire(Path('/root/stockAgent'),ack,apply={apply!r})\nprint(json.dumps(result),flush=True)\n"
+    return body
+
+
+def _private_request(args, body, request_identity):
     command = [*_ssh_base(args.identity_file, args.ssh_port), _validate_ssh_target(args.ssh_target),
                "cd /root/stockAgent && source scripts/runtime_env.sh && run_fintech_python -"]
     process = subprocess.run(command, input=body, text=True, capture_output=True, timeout=1800)
@@ -71,11 +72,27 @@ def private_remote(args, ack, *, apply):
         # Configuration parser messages can contain private source fragments.
         # Keep them out of stdout and the published/member-index metadata.
         error_path = ROOT / "artifacts/operations/vast_bulk_return_20261004/retirement-errors" / (
-            ack["identity_sha256"] + "-" + str(time.time_ns()) + ".json")
+            request_identity + "-" + str(time.time_ns()) + ".json")
         atomic_write_json(error_path, {"stderr": process.stderr, "returncode": process.returncode,
-                                      "ack_identity_sha256": ack["identity_sha256"], "observed_at_epoch": time.time()})
+                                      "ack_identity_sha256": request_identity, "observed_at_epoch": time.time()})
         raise SnapshotError("remote preservation retirement rejected; private receipt " + str(error_path))
     return json.loads(process.stdout.splitlines()[-1])
+
+
+def private_remote(args, ack, *, apply):
+    body = _private_control_body()
+    body += "import json\nfrom pathlib import Path\nfrom stockagent.data_sync.bulk_archive_retirement import retire\n"
+    body += f"ack=json.loads({json.dumps(ack)!r})\n"
+    body += f"result=retire(Path('/root/stockAgent'),ack,apply={apply!r})\nprint(json.dumps(result),flush=True)\n"
+    return _private_request(args, body, ack["identity_sha256"])
+
+
+def private_observe_roots(args, records):
+    body = _private_control_body()
+    body += "import json\nfrom pathlib import Path\nfrom stockagent.data_sync.bulk_archive_retirement import observe_preserved_roots\n"
+    body += f"records=json.loads({json.dumps(records)!r})\n"
+    body += "result=observe_preserved_roots(Path('/root/stockAgent'),records)\nprint(json.dumps(result),flush=True)\n"
+    return _private_request(args, body, digest({"candidate_records": records}))
 
 
 def verify_retained_proof(proof):
@@ -89,12 +106,37 @@ def retire_roots(args, directory, receipt, index, proof, state):
         approved = [name for name in approved if name in receipt.get("approved_cache_roots", [])]
     file_names = [r["path"] for r in index["rows"] if r["kind"] == "file"] if receipt["scope"] == "cache" else []
     results = state.setdefault("roots", {})
-    for record in sorted(records, key=lambda r: (r["logical_bytes"], r["relative_root"])):
+    candidates = [r for r in records if r["relative_root"] in approved
+                  and results.get(r["relative_root"], {}).get("deleted") is not True]
+    observation_started = time.perf_counter()
+    observations = private_observe_roots(args, candidates) if candidates else {}
+    if set(observations) != {r["relative_root"] for r in candidates}:
+        raise SnapshotError("candidate observation omitted or added an approved root")
+    observation_receipt = {"candidate_only": True, "source_deleted": False,
+                           "observed_at_epoch": time.time(),
+                           "seconds": time.perf_counter() - observation_started,
+                           "dataset": proof.get("dataset"), "snapshot_id": proof.get("snapshot_id"),
+                           "roots": observations}
+    atomic_write_json(directory / (receipt["scope"] + ".candidate-observation.json"), observation_receipt)
+    print(json.dumps({"scope": receipt["scope"], "phase": "read_only_candidate_observation",
+                      "roots": len(observations), "eligible_roots": sum(
+                          r.get("state") == "metadata-candidate-requires-exact-proof" for r in observations.values()),
+                      "seconds": observation_receipt["seconds"]}), flush=True)
+    for record in sorted(records, key=lambda r: (-r["logical_bytes"], r["relative_root"])):
         relative = record["relative_root"]
         if results.get(relative, {}).get("deleted") is True:
             continue
         if relative not in approved:
             results[relative] = {"state": "unsupported-or-unapproved-source-preserved", "deleted": False}
+            continue
+        observed = observations[relative]
+        if (observed.get("state") != "metadata-candidate-requires-exact-proof"
+                or observed.get("candidate_only") is not True
+                or observed.get("deleted") is not False):
+            if observed.get("deleted") is not False:
+                raise SnapshotError("a read-only candidate observation cannot report deletion")
+            results[relative] = observed
+            atomic_write_json(directory / (receipt["scope"] + ".organization.json"), state)
             continue
         # Full original decode, anchored to immutable object signatures, remains
         # bounded to thirty minutes. Never refresh its timestamp from stat alone.

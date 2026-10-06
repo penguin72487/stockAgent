@@ -25,13 +25,24 @@ def main():
         ledger_path = base / 'source-replication-ledger.json'
         ledger = json.loads(ledger_path.read_bytes()) if ledger_path.exists() else {'deliveries': {}}
         result = {'state': 'no_accepted_transport_candidates', 'observed_at_utc': datetime.now(timezone.utc).isoformat()}
-        for identity, row in ledger['deliveries'].items():
-            if row.get('nas_acceptance', {}).get('state') != 'nas_archive_file_recovery_verified':
-                continue
+        candidates = [(identity, 'source') for identity,row in ledger['deliveries'].items()
+                      if row.get('nas_acceptance', {}).get('state') == 'nas_archive_file_recovery_verified']
+        for path in sorted(base.glob('catalog-acceptance-*.json')):
+            if path.is_symlink():
+                raise ValueError('catalog acceptance checkpoint is redirected')
+            value = json.loads(path.read_bytes())
+            identity = value['delivery_identity_sha256']
+            if path.name != 'catalog-acceptance-'+identity+'.json' or value['state'] != 'nas_archive_file_recovery_verified':
+                raise ValueError('catalog acceptance checkpoint identity differs')
+            candidates.append((identity, 'catalog'))
+        status_path = base/'transport-gc-status.json'
+        previous_kind = json.loads(status_path.read_bytes()).get('delivery_kind') if status_path.exists() else None
+        candidates.sort(key=lambda item:item[1] == previous_kind)
+        for identity, kind in candidates:
             path = base / ('cache-retirement-' + identity + '.json')
             if path.exists() and json.loads(path.read_bytes()).get('state') == 'retired':
                 continue
-            result.update(state='retiring_exact_accepted_transport', delivery_identity_sha256=identity)
+            result.update(state='retiring_exact_accepted_transport', delivery_identity_sha256=identity, delivery_kind=kind)
             atomic_write_json(base / 'transport-gc-status.json', result)
             proof = acceptance(c, identity)
             result['retirement'] = retire_accepted_transport(c, identity, proof)

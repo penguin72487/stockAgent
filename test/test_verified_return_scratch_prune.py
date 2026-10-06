@@ -245,6 +245,46 @@ def test_verified_cold_reuse_routes_to_existing_acknowledgement_without_copy(sav
     assert not (cohort/'staging'/spec.dataset).exists()
 
 
+@pytest.mark.parametrize('changed_portable', [False, True])
+def test_v2_cold_reuse_reobserves_inode_changes_but_preserves_portable_changes(saved,monkeypatch,changed_portable):
+    from scripts import return_remote_legacy_archives as returns
+    from types import SimpleNamespace
+    from stockagent.data_sync.packed_snapshots import resolve_latest_packed
+    from stockagent.data_sync.remote_legacy_return import metadata_tree
+    import shutil
+    spec,cohort,source,packed=saved
+    proof=verify_cold_archive(spec,packed)
+    original=metadata_tree(source)
+    (cohort/'inventory.json').write_text(json.dumps({'items':[{'relative_root':spec.relative_root,**original}]}))
+    observed=json.loads(json.dumps(original))
+    observed['fingerprint']='new-inode-metadata'
+    observed['process_references']=[]
+    file=next(r for r in observed['rows'] if r['kind']=='file')
+    file['signature'][4]+=1
+    file['signature'][6]+=1
+    if changed_portable:file['signature'][3]+=1
+    row={'relative_root':spec.relative_root,'fingerprint':original['fingerprint'],'private_scratch_removed':True,
+         'cold_verified':True,'snapshot_id':proof['snapshot_id'],'manifest_sha256':proof['manifest_sha256']}
+    shutil.rmtree(cohort/'staging'/spec.dataset);shutil.rmtree(spec.stage_root/spec.dataset)
+    monkeypatch.setattr(returns,'remote',lambda *a:observed)
+    monkeypatch.setattr(returns,'_check_d_primary_mount',lambda *a:None)
+    calls=[]
+    monkeypatch.setattr(returns,'verify_cold_archive',lambda *a,**kw:calls.append('full-D-recovery') or proof)
+    monkeypatch.setattr(returns,'resolve_latest_packed',lambda *a:resolve_latest_packed(packed,spec.dataset))
+    monkeypatch.setattr(returns,'_rsync_candidate',lambda *a,**kw:pytest.fail('must not rehydrate removed scratch'))
+    monkeypatch.setattr(returns,'commit_prepared_archive',lambda *a,**kw:calls.append('exact-source-SHA-retirement'))
+    args=SimpleNamespace(state_root=cohort,sync_root=packed)
+    if changed_portable:
+        with pytest.raises(SnapshotError,match='portable metadata'):
+            returns.archive_one(args,{'schema_version':2},row,spec)
+        assert not calls
+    else:
+        returns.archive_one(args,{'schema_version':2},row,spec)
+        assert calls==['full-D-recovery','exact-source-SHA-retirement']
+        assert row['source_reobservation_requires_exact_cold_and_source_sha']
+        assert json.loads((cohort/'inventory.json').read_text())['items'][0]['fingerprint']==original['fingerprint']
+
+
 @pytest.mark.parametrize('failure',[None,'expired','local-mutation','cold-mutation'])
 def test_owned_full_plan_reuse_keeps_every_final_generation_gate(saved,tmp_path,monkeypatch,failure):
     spec,cohort,source,packed=saved

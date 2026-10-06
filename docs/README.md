@@ -32,6 +32,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 - [`ducklake_temporal_replication_2026-10-05.md`](ducklake_temporal_replication_2026-10-05.md)：最新正式四節點 lakehouse、PostgreSQL-backed Temporal、rclone 按需複寫、自動 NAS archive 與恢復證據。
 - [`lab203_immutable_lake_relay_install_2026-10-05.md`](lab203_immutable_lake_relay_install_2026-10-05.md)：已完成的一次性固定 relay 安裝；日常不需逐批轉貼。
+- [`nas_send_verify_parallel_2026-10-06.md`](nas_send_verify_parallel_2026-10-06.md)：來源持續發布、lab203 同時驗收、個別失敗固定重傳及實際暫存容量控制。
 
 - [`all_services_boot_recovery_2026-10-05.md`](all_services_boot_recovery_2026-10-05.md)：Windows／WSL 持續存活、正式 owner 退避與依賴接續、命名空間一致的自動稽核及跨節點驗收界線。
 - [`four_node_storage_architecture_2026-10-04.md`](four_node_storage_architecture_2026-10-04.md)：

@@ -371,6 +371,8 @@ def recovery_index(catalog: dict, ledger: dict, repository_id: str) -> dict:
 class BackupStream:
     def __init__(self, configuration: dict):
         self.config = configuration
+        if type(configuration.get('publication_requires_receiver_ready', True)) is not bool:
+            raise SnapshotError('receiver admission must be an explicit boolean')
         if type(configuration.get("include_unreferenced_cold_objects", False)) is not bool:
             raise SnapshotError("unreferenced cold inclusion must be an explicit boolean")
         if type(configuration.get("cold_object_replication_enabled", True)) is not bool:
@@ -605,18 +607,21 @@ class BackupStream:
                     covered = coverage(catalog, ledger)
                     try:
                         ready = read_json(self.receipts / "readiness.json")
-                        validate_readiness(ready, self.config)
+                        independent = not self.config.get('publication_requires_receiver_ready', True)
+                        validate_readiness(ready, self.config, admission_only=independent)
                         reserve = max(self.config["reserve_bytes"], ready["reserve_bytes"])
-                        limit = min(self.config["maximum_batch_bytes"], ready["maximum_batch_bytes"],
-                            ready["ingress_free_bytes"] - reserve - covered["pending_bytes"],
-                            ready["nas_free_bytes"] - reserve - covered["pending_bytes"],
-                            self.config["maximum_pending_bytes"] - covered["pending_bytes"],
-                            self.staging_room(self.transport_usage()))
+                        limits = [self.config["maximum_batch_bytes"], ready["maximum_batch_bytes"],
+                                  self.staging_room(self.transport_usage())]
+                        if not independent:
+                            limits.extend([ready["ingress_free_bytes"] - reserve - covered["pending_bytes"],
+                                ready["nas_free_bytes"] - reserve - covered["pending_bytes"],
+                                self.config["maximum_pending_bytes"] - covered["pending_bytes"]])
+                        limit = min(limits)
                     except (OSError, ValueError, KeyError, TypeError) as error:
                         readiness_error = type(error).__name__
                         state = "waiting_receiver_readiness"
                         break
-                    if covered["pending_delivery_count"] >= self.config["maximum_pending_deliveries"] or limit <= 1024**2:
+                    if (not independent and covered["pending_delivery_count"] >= self.config["maximum_pending_deliveries"]) or limit <= 1024**2:
                         state = "backpressure"
                         break
                     deferred = {key for key, item in retries.items() if item["next_attempt_epoch"] > time.time()}
@@ -723,7 +728,7 @@ class BackupStream:
                 "pipeline": {"published_waves": published_waves, "export_errors": export_errors,
                     "scan_errors": scan_errors, "deferred_files": sum(
                         item["next_attempt_epoch"] > time.time() for item in retries.values()),
-                    "maximum_in_flight": self.config["maximum_pending_deliveries"],
+                    "maximum_in_flight": self.config["maximum_pending_deliveries"] if self.config.get('publication_requires_receiver_ready', True) else None,
                     "copy_workers": self.pipeline.get("copy_workers", 1),
                     "verify_workers": self.pipeline.get("verify_workers", 1)},
                 "automatic_recovery_requests": automatic_recovery,

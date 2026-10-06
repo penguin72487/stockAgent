@@ -12,7 +12,7 @@ import stat
 
 from downloader.artifact_io import atomic_write_json
 from stockagent.data_sync.backup_transport_cache import process_roots, same_ntfs_signature
-from stockagent.data_sync.immutable_replication import ACK, digest, HASH, inventory, safe, verify
+from stockagent.data_sync.immutable_replication import ACK, digest, HASH, inventory, NATIVE_HASH_MIN_BYTES, safe, verify
 from stockagent.data_sync.materialized_cache import process_references_many
 from stockagent.data_sync.packed_backup import signature
 from stockagent.runtime_identity import identity_sha256
@@ -59,8 +59,10 @@ def primary_root(c, identity, manifest):
 
 
 def validate_sources(c, identity, manifest, recorded=None):
+    from stockagent.data_sync.windows_cold_io import hash_many, windows_path
     root = primary_root(c, identity, manifest)
     proofs = {}
+    entries = []
     for relative, row in manifest['files'].items():
         original = manifest['context'].get('source_object_paths', {}).get(relative, relative)
         if manifest['context'].get('kind') == 'immutable_source_objects':
@@ -69,10 +71,18 @@ def validate_sources(c, identity, manifest, recorded=None):
                 raise ValueError('flat transport source mapping differs from its canonical object')
         path = safe(root, original)
         before = signature(path)
+        entries.append((relative, row, path, before))
+    native = list(dict.fromkeys(path for relative, row, path, before in entries
+        if not (recorded and relative in recorded)
+        and NATIVE_HASH_MIN_BYTES <= row['bytes'] <= 8*1024**3 and windows_path(path) is not None))
+    hashes = {}
+    for offset in range(0, len(native), 16):
+        hashes.update(hash_many(native[offset:offset+16]))
+    for relative, row, path, before in entries:
         if recorded and relative in recorded:
             if not same_ntfs_signature(before, recorded[relative]):
                 raise ValueError('primary source changed since the full SHA recovery gate')
-        elif path.stat().st_size != row['bytes'] or digest(path) != row['sha256'] or signature(path) != before:
+        elif path.stat().st_size != row['bytes'] or (hashes[path] if path in hashes else digest(path)) != row['sha256'] or signature(path) != before:
             raise ValueError('primary source cannot reconstruct its immutable transport bytes')
         proofs[relative] = list(before)
     return proofs

@@ -316,6 +316,9 @@ def export_delivery(plan: dict, destination: Path) -> dict:
             "durable_off_host_backup_verified": False}
 
 
+NATIVE_COPY_MIN_BYTES = 8 * 1024**2  # Penguin full copy/flush/SHA comparison, 2026-10-06.
+
+
 def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha256: str,
                         expected_bytes: int, payload: bytes | None = None) -> None:
     """One source read/hash while copying, then stable inode proof and fsync.
@@ -324,7 +327,7 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
     additional complete source passes merely to establish the same copy proof.
     """
     before = signature(_regular(source)) if source is not None else None
-    if source is not None and expected_bytes >= 128 * 1024**2:
+    if source is not None and NATIVE_COPY_MIN_BYTES <= expected_bytes <= 8*1024**3:
         from stockagent.data_sync.windows_cold_io import windows_path, copy_verified
         origin, target = windows_path(source), windows_path(destination)
         if (origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
@@ -356,7 +359,7 @@ def copy_verified_many(members):
     native = []
     for source, destination, sha, count in members:
         origin, target = windows_path(source), windows_path(destination)
-        if (count >= 16 * 1024**2 and origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
+        if (NATIVE_COPY_MIN_BYTES <= count <= 8*1024**3 and origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
                 and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
             native.append((source, destination, sha, count))
         else:

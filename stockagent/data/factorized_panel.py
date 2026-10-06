@@ -664,4 +664,16 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
         max_slab_bytes=int(manifest.get("max_slab_bytes",2*1024**3)),transfer_mode=transfer_mode)
     panel.features, panel.feature_names = features, names
     panel.content_fingerprints = {**(panel.content_fingerprints or {}), "features": features.content_fingerprint}
+    # build_panel prints the executable base columns before this adapter runs.
+    # Report the actual input width here, after all attachment checks succeed,
+    # without dumping thousands of names or expanding the bounded storage.
+    print(
+        f"[panel-model] features ({len(names)}): "
+        f"base={len(manifest['base_feature_names'])}, "
+        f"individual={len(manifest['individual_channels'])}, "
+        f"common={len(manifest['common_channels'])}; "
+        f"factorized attachment complete, transfer={transfer_mode}, "
+        f"research_only=True, historical_point_in_time=False",
+        flush=True,
+    )
     return panel
