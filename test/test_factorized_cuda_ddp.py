@@ -154,6 +154,9 @@ def worker(work: Path):
             feature_names=[f"feature_{i}" for i in range(features)],
             temporal_basis_overrides=overrides)
         model.factorized_input_compile=True
+        model.factorized_encoder_checkpoint=config.training.factorized_encoder_checkpoint
+        model.factorized_encoder_vram_safety_margin_bytes=int(
+            config.training.vram_safety_margin_gb * 1024**3)
     else:
         model = FinancialTransformerModel(**kwargs)
     model = model.to(device).train()
@@ -288,9 +291,11 @@ def worker(work: Path):
     assert _dynamo_compile_counter_snapshot()["unique_graphs"] >= len(compiled_keys)
     for name, parameter in model.named_parameters():
         assert torch.isfinite(parameter).all(), name
-    if transfer_mode == "compact_cuda_cached":
+    if transfer_mode == "compact_cuda_cached" and config.training.factorized_encoder_checkpoint:
         assert source.transfer_stats["payload_cache_hits"] > 0
         assert source.transfer_stats["payload_cache_peak_bytes"] <= source.max_slab_bytes
+    elif transfer_mode == "compact_cuda_cached":
+        assert source.transfer_stats["payload_cache_hits"] == 0
     result = {"rank": rank, "world_size": 2, "state": "accepted_engineering_oracle_only",
         "global_batch_rows":2*batch_rows,"distinct_rank_date_rows":True,
         "portfolio_output_mode":kwargs["portfolio_output_mode"], "float32_matmul_precision": precision,
@@ -315,6 +320,7 @@ def worker(work: Path):
         "resolved_attention_mode": model.attention_mode,
         "configured_amp_dtype": config.environment.amp_dtype,
         "transfer_mode":transfer_mode,"transfer_stats":dict(source.transfer_stats),
+        "factorized_encoder_checkpoint":config.training.factorized_encoder_checkpoint,
         "zero_stress_fixture":zero_stress,
         "optimizer_steps": len(timings),
         "max_allocated_bytes": torch.cuda.max_memory_allocated(), "cache_misses": source._cache.misses}

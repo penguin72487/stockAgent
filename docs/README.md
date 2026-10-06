@@ -124,6 +124,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## Review 與歷史工程快照
 
+- [`prompt_audit_2026-10-06.md`](prompt_audit_2026-10-06.md) 納入 penguin／Vastai1T 主對話、後續偏好修正及既有技能整理；7 個自訂 skills 已合併同步並驗證兩邊實際載入。
 - [`prompt_audit_2026-10-05.md`](prompt_audit_2026-10-05.md) 是新增儲存 skill 與偏好的增量稽核，釐清低頻 NULL／訓練視圖、正式服務恢復、可攜交接及 dry run 的實際副作用。
 - [`prompt_audit_2026-10-04.md`](prompt_audit_2026-10-04.md) 是後續指令與偏好的增量稽核，涵蓋自動化／並行、重試、特徵 panel 與具名研究修正。
 - [`prompt_audit_2026-10-03.md`](prompt_audit_2026-10-03.md) 是提示規則與個人偏好的增量稽核，包含來源、適用範圍與本輪驗證。

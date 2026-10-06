@@ -484,6 +484,7 @@ class FactorizedPanelSlab:
         self._gpu_packets = {}
         self._gpu_packet_bytes = 0
         self._gpu_packet_budget = None
+        self._retain_gpu_packets = True
 
     def _remember_gpu_packet(self, key, packet, layout, queued):
         if self._gpu_packet_budget is None:
@@ -553,7 +554,8 @@ class FactorizedPanelSlab:
                     budget_bytes=self.source.max_slab_bytes)
                 payload_bytes=packet.numel()
                 packet=packet.to(device=self.device,non_blocking=self.pin_slabs)
-                if self.source.transfer_mode == "compact_cuda_cached" and torch.is_grad_enabled():
+                if (self.source.transfer_mode == "compact_cuda_cached"
+                        and self._retain_gpu_packets and torch.is_grad_enabled()):
                     self._remember_gpu_packet(key, packet, layout, queued)
                 _reconstruct_transfer_packet(result, packet, layout, queued, base_width, common_start)
                 self.source.transfer_stats["chunks"]+=1

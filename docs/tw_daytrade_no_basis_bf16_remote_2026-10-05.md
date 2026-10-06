@@ -2,7 +2,9 @@
 
 ## 1. 執行進度
 
-- 依最新指示修正前景入口：預設 canonical resume、關閉 profiling／debug timing sync，完成 fold 不重訓；移除「正式目錄已存在即拒絕」的錯誤限制。遠端正式 checkpoint 已保存 epoch1／AdamW step1，第2輪中斷退出130；重新執行同一入口會從第2輪接續，而非清空重算。
+- **2026-10-06 最新 handoff**：同一`train_vast_no_basis_fold11_v3.sh`已改用通過完整雙卡三轮驗收的 runtime source `2147fccf74daf9b7740c92723baca9996f47666165e3183494c1f97d8fc304e5`、`tw_day_trade_factorized_values_20261006_no_basis_runtime_optimized_v1.yaml`。沒有重開正式optimizer，產物仍在原`...no_basis_v3/training-bf16`；resume預設開啟，profiling／debug timing sync關閉。完整工程wall1396.809→721.961秒、epoch3 MAX325.936→194.183秒。下方9491來源與原設定是歷史首次接受證據，不是目前入口。
+- 已另外用正式epoch3的隔離複本真實DDP續至epoch4、存檔後受控中斷，optimizer step3→4、四轮curve／圖正常、child tree／GPU清空；原正式last SHA未變。比對的金融結果相同，但學習模型／Adam有約1e-7／1e-8浮點差，不宣稱全位元相同。詳見[完整工作流報告](tw_daytrade_no_basis_pipeline_optimization_2026-10-05.md)。
+- 前景入口預設 canonical resume、關閉 profiling／debug timing sync，完成 fold 不重訓。最新唯讀核對正式 checkpoint 已保存 epoch3；使用者停止 epoch4，因此同一入口從最後持久化 checkpoint 接續，不會清空重算。舊 epoch1 恢復收據保留其歷史時點；[本次完整工作流測速](tw_daytrade_no_basis_pipeline_optimization_2026-10-05.md)另記錄候選驗收與 promotion。
 - 最新指示已回到「不分解」，但仍要求分析完整 0%–100% 的維度／能量關係。新版 v2 明確 `feature_svd_components: 0`；SVD32 不再是選定訓練模型。完整 FP64 光譜另行計算，沒有模型投影或 optimizer。
 - v2 保留逐運算 rounding 後，原 BF16 首步仍被拒絕，證據保留。最新 v3 明確把 joint feature stem 納入 FP32 precision island，沒有增減特徵／參數／成交公式；原 oracle 門檻不變。雙卡六步 oracle 已通過、最大梯度差 `4.7684e-7`；實際完整 fold11 三輪、全部 canonical 產物與獨立嚴格 checkpoint 驗收均已通過。
 - 獨立工程驗收時間為 `2026-10-05T14:31:33Z`，狀態 `accepted_actual_fold11_dual_gpu_direct_no_basis_engineering`、`training_ready=true`。當時前景入口 `--check-only` 亦退出0：三份 exact source full-SHA／7日 lease與 long-training pins 通過，CUDA strict檢查零 failures／warnings、兩張 RTX5090可用。該歷史收據的 `formal_training_started=false` 僅描述工程驗收時未啟動正式訓練，不能拿來否認後續使用者已保存的正式 checkpoint；沒有使用工程 optimizer。
@@ -10,7 +12,7 @@
 - 最新 v3 本機相關測試 199 項通過（23.54 秒）；stateful／precision 相關測試 55 項通過、3 項環境條件跳過（16.54 秒）。兩組分別列示，不和舊版重疊測試相加。
 - v3 全新程式與設定位於 Vast 的 `/root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v3/code`。精確 source SHA：`9491d7928737f21ba38cb1960fd84416ff2c495327fb37e7a5883baa9e7e2c51`。
 
-目前選定設定是 `configs/deployments/tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v3.yaml`；新 root 是 `/root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v3`。v1、v2 與 SVD32 的失敗／數值證據保留，不續接 optimizer。
+目前選定設定是 `configs/deployments/tw_day_trade_factorized_values_20261006_no_basis_runtime_optimized_v1.yaml`，原v3模型／精度／資料／execution contract不變。新程式／receipts root為 `/root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261006_no_basis_runtime_optimized_v1`；正式輸出仍在原no_basis_v3。v1、v2與SVD32的失敗／數值證據保留，不續接它們或工程驗收的optimizer。
 
 [完整 0%–100% 光譜與每一維明細](tw_daytrade_full_feature_spectrum_2026-10-05.md)已另行完成、獨立核對。該分析沒有訓練 optimizer，也不把固定 SVD 接入模型。
 
@@ -32,7 +34,7 @@
 | 產物 | 每輪 validation／test／同步圖／checkpoint，final best 全 270 分鐘曲線與報告保留 |
 | 新正式 root | `/root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v3/training-bf16` |
 
-`factorized panel` 是共同／個別特徵的儲存方式，不是模型基底分解；本次保留這個有界儲存 adapter，使用已逐 raw 位元驗證的 `compact_cuda` 搬移後完整 dense GPU 模型計算。新 `compact_cuda_packed` 尚未在此實驗啟用。
+`factorized panel` 是共同／個別特徵的儲存方式，不是模型基底分解；本次保留這個有界儲存adapter，現在選用經raw bit／梯度／完整金融驗收的`compact_cuda_cached`，搬移後仍是完整dense GPU模型計算。VRAM足夠時保留encoder activations、不要另外保存raw packets；不足回到checkpoint＋bounded raw packets。不是稀疏event模式。
 
 ## 3. 驗收與限制
 
@@ -65,9 +67,9 @@ cd /root/stockAgent
 bash artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v3/train_vast_no_basis_fold11_v3.sh
 ```
 
-入口固定已驗收的 source release／config／14,726 通道 manifest，續租三份 exact input source並核對 long-training pins，檢查CUDA與GPU 0/1 owner，然後在 frozen code 中呼叫原 `train.py --start-fold 11 --max-folds 1 --torch-compile-threads 16 --resume --no-retrain-completed-folds --no-profile-timing --no-debug-timing-sync`。上限1,000epochs／原早停規則、DDP global batch32、不分解／不開稀疏，產物仍在 `artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v3/training-bf16`。
+入口固定已驗收的新source release／runtime config／14,726通道manifest，續租三份exact input source並核對long-training pins，唯讀驗證當前正式checkpoint，檢查CUDA與GPU 0/1 owner，然後在新frozen code中呼叫原`train.py --start-fold 11 --max-folds 1 --torch-compile-threads 16 --resume --no-retrain-completed-folds --no-profile-timing --no-debug-timing-sync --no-isolate-train-folds`。上限1,000epochs／原早停規則、DDP global32、不分解／不開稀疏，正式產物仍在原`...no_basis_v3/training-bf16`。
 
-預設有相容正式 checkpoint 就續跑，沒有才新建；已完成 fold 由 canonical artifact gate 確認後跳過。入口用 CLI 覆蓋 frozen config 的首次訓練開關，沒有修改固定 source／config SHA 或模型／資料／optimizer contract，也不續接其他實驗或工程 run 的 optimizer。續跑沿用 canonical model、optimizer、scheduler、RNG、早停與曲線修剪流程，仍拒絕不相容 checkpoint。
+預設有相容正式checkpoint就續跑，沒有才新建；已完成fold由canonical artifact gate確認後跳過。新source／config各自有精確SHA收據，模型／資料／execution／optimizer semantic contract沿用正式v3，不續接其他實驗或工程run的optimizer。續跑沿用canonical model、optimizer、scheduler、RNG、早停與curve trimming流程，仍拒絕不相容checkpoint。
 
 停止後再執行同一指令即可；續跑粒度是最近已保存的 epoch checkpoint，不是尚未存檔的半輪。`torch.compile` 加速、每輪 validation／test／圖表／checkpoint 保留，關閉的是額外 profiling 與 debug CUDA 同步。
 

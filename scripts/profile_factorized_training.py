@@ -52,7 +52,7 @@ def main():
         _dynamo_compile_counter_snapshot,
     )
     from stockagent.training.windowed import dataset_to_windowed_tensors
-    from train import _build_panel_kwargs
+    from train import _build_panel_kwargs, _configure_cpu_parallelism
 
     rank = int(os.environ["LOCAL_RANK"])
     assert torch.cuda.is_available() and torch.cuda.device_count() == 2
@@ -60,7 +60,7 @@ def main():
     torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=15))
     assert torch.distributed.get_world_size() == 2
     assert args.warmup >= 2 and args.repeats >= 3
-    torch.set_num_threads(args.cpu_threads)
+    _configure_cpu_parallelism(cpu_threads=args.cpu_threads, compile_threads=8, local_world_size=1)
     torch.set_float32_matmul_precision("highest")
     device = torch.device("cuda", rank)
     output = args.output / f"rank_{rank}"
@@ -109,6 +109,9 @@ def main():
     )
     load_model_state_dict(model, state, strict_no_fallback=True)
     model.factorized_input_compile = True
+    model.factorized_encoder_checkpoint = config.training.factorized_encoder_checkpoint
+    model.factorized_encoder_vram_safety_margin_bytes = int(
+        config.training.vram_safety_margin_gb * 1024**3)
     model = model.to(device).train()
     del state, checkpoint
     gc.collect()
@@ -116,6 +119,7 @@ def main():
         _PanelSlabForwardWrapper(model), config=config, device=device,
     )
     coefficients = torch.linspace(-.01, .01, 16 * panel.num_symbols, device=device).reshape(16, -1)
+    assert torch.get_num_threads() == args.cpu_threads
     metrics = {}
     last_output = None
 
@@ -168,7 +172,7 @@ def main():
         record = {"wall_s": elapsed, "maximum_rank_wall_s": float(maximum),
             "forward_cuda_interval_ms": events[0].elapsed_time(events[1]),
             "backward_cuda_interval_ms": events[1].elapsed_time(events[2]),
-            "nested_host_intervals": dict(metrics),
+            "nested_host_intervals": {key: dict(value) for key, value in metrics.items()},
             "cache_delta": {k: getattr(cache, k) - cache_before[k] for k in cache_before},
             "transfer_delta": {k: panel.features.transfer_stats[k]-v for k,v in transfer_before.items()},
             "compile_before": graphs_before, "compile_after": _dynamo_compile_counter_snapshot(),
@@ -203,6 +207,7 @@ def main():
     if args.compare_transport:
         source=panel.features;slab=batch["feature_slab"]
         selected_mode=source.transfer_mode
+        selected_checkpoint=model.factorized_encoder_checkpoint
         chunk=max(1,min(128,int(source.manifest.get("stream_chunk_bytes",512*1024**2))//
             (3*slab.size(0)*slab.size(2)*4)))
         raw_chunks=0
@@ -214,6 +219,7 @@ def main():
             raw_chunks+=1
             del expected,actual
         source.transfer_mode="dense_cpu"
+        model.factorized_encoder_checkpoint=True
         run_once()
         expected_output=last_output
         expected_gradients={name:None if p.grad is None else p.grad.detach().clone()
@@ -234,7 +240,9 @@ def main():
             return {"comparison":name,"output_max_abs_error":float((last_output-expected_output).abs().max()),
                 "parameters":rows,"all_gradients_pass_existing_bf16_oracle":True}
         run_once();control=compare("dense_cpu_repeat_control")
-        source.transfer_mode=selected_mode;run_once();candidate=compare(selected_mode+"_vs_same_dense_model")
+        source.transfer_mode=selected_mode
+        model.factorized_encoder_checkpoint=selected_checkpoint
+        run_once();candidate=compare(selected_mode+"_vs_same_dense_model")
         source.transfer_mode=selected_mode
         comparison={"all_actual_raw_chunk_bits_equal":True,"raw_chunks":raw_chunks,
             "raw_logical_values_checked":slab.size(0)*slab.size(1)*slab.size(2),
@@ -250,7 +258,9 @@ def main():
         "config_sha256": file_sha256(args.config),
         "feature_manifest_sha256": file_sha256(Path(config.data.factorized_feature_manifest)),
         "checkpoint_sha256": file_sha256(args.checkpoint), "cpu_threads": args.cpu_threads,
+        "actual_cpu_threads": torch.get_num_threads(),
         "transfer_mode": getattr(panel.features,"transfer_mode","dense_cpu"),
+        "factorized_encoder_checkpoint": config.training.factorized_encoder_checkpoint,
         "parameter_grad_sha256":gradients.hexdigest(),
         "paired_comparison":comparison,
         "process_affinity": sorted(os.sched_getaffinity(0)), "warmup": warm,

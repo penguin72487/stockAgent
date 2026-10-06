@@ -12,6 +12,37 @@ from torch.utils.checkpoint import checkpoint
 from stockagent.models.transformer_base_portfolio import _safe_attention_mask
 
 
+def _use_encoder_checkpoint(model, slab, device):
+    """Keep the historical policy unless direct encoding safely fits on CUDA.
+
+    The admitted no-basis path projects each unique source row before rolling
+    the narrow embeddings, rather than retaining overlapping wide windows.
+    Reserve two full-width FP32 slabs, narrow temporal activations and the
+    configured VRAM margin. Basis/window-normalization paths are not admitted.
+    """
+    if bool(getattr(model, "factorized_encoder_checkpoint", True)):
+        return True
+    candle = model.candle_encoder
+    if (device.type != "cuda" or model.temporal_basis_feature_encoder is not None
+            or model._input_basis_enabled()
+            or bool(getattr(candle, "feature_svd_components", 0))
+            or bool(getattr(candle, "causal_feature_window_rms_normalization", False))):
+        return True
+    rows, stocks, features = slab.shape
+    wide_bytes = rows * stocks * features * 4
+    narrow_bytes = (max(1, rows - model.lookback + 1) * model.lookback
+                    * stocks * model.d_model * 4)
+    required = (2 * wide_bytes + 16 * narrow_bytes
+                + max(0, int(getattr(model, "factorized_encoder_vram_safety_margin_bytes",
+                                    1536 * 1024**2))))
+    free, _ = torch.cuda.mem_get_info(device)
+    # Freed activations stay in PyTorch's allocator; those inactive blocks
+    # remain reusable. Driver-free bytes alone would incorrectly switch back
+    # to recomputation after the first warm batch.
+    reusable = max(0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+    return required > free + reusable
+
+
 def _partition_compile_options(model):
     options = {"triton.cudagraphs": False}
     if (bool(getattr(model.temporal_basis_feature_encoder, "fp32_contraction", False))
@@ -62,6 +93,11 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         raise ValueError("chunked encoding is only admitted for zero-dropout experiments")
     device=model.candle_encoder.candle_query.device
     slab=slab.to(device=device)
+    checkpoint_encoder = (model.training and torch.is_grad_enabled()
+                          and _use_encoder_checkpoint(model, slab, device))
+    # Retained activations need no source reread on backward. Do not also keep
+    # redundant compact GPU packets in that case (or during no-grad evaluation).
+    slab._retain_gpu_packets = checkpoint_encoder
     mask=mask.to(device=device,dtype=torch.bool)
     safe_mask=_safe_attention_mask(mask)
     if symbol_indices is None:
@@ -115,7 +151,7 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         # chunk's rows, security IDs or masks for an earlier chunk.
         def read_and_encode(m,ids,k,begin=begin,end=end):
             return _call_partition(model,encode_fn,slab.stock_chunk(begin,end),m,ids,k)
-        if model.training and torch.is_grad_enabled():
+        if checkpoint_encoder:
             output=checkpoint(read_and_encode,stock_mask,stock_ids,kernels,use_reentrant=False)
         else:output=read_and_encode(stock_mask,stock_ids,kernels)
         outputs.append(output)

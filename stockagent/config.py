@@ -2448,6 +2448,10 @@ class TrainingConfig:
     distributed_symbol_sharded_pack_scalars: bool = True
     distributed_symbol_sharded_skip_noop_collectives: bool = True
     enable_torch_compile: bool = True
+    # Runtime-only activation storage. False retains the selected direct
+    # encoder's activations only when its bounded CUDA memory guard admits it;
+    # otherwise the ordinary non-reentrant checkpoint path remains in use.
+    factorized_encoder_checkpoint: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
     torchinductor_cache_dir: str = "~/.cache/torchinductor"
@@ -5498,6 +5502,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 "distributed_symbol_sharded_skip_noop_collectives"
             ],
             enable_torch_compile=training_raw["enable_torch_compile"],
+            factorized_encoder_checkpoint=training_raw["factorized_encoder_checkpoint"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],
             torchinductor_cache_dir=training_raw["torchinductor_cache_dir"],

@@ -22,6 +22,10 @@ ENTRY = (
     / "artifacts/data_quality/tw_feature_expected_gaps_20261004"
     / "train_vast_no_basis_fold11_v3.sh"
 )
+FORMAL_OUTPUT = Path(
+    "/root/stockAgent/artifacts/markets/"
+    "tw_day_trade_factorized_values_20261005_no_basis_v3/training-bf16"
+)
 
 
 def _entry_python_blocks():
@@ -58,6 +62,10 @@ def test_entry_uses_canonical_resume_without_profiling(monkeypatch):
     assert args.start_fold == 11 and args.max_folds == 1
     assert args.torch_compile_threads == 16
     assert args.output_dir is None  # Keep the existing formal output/checkpoints.
+    assert args.isolate_train_folds is False
+    assert Path(args.config).name == (
+        "tw_day_trade_factorized_values_20261006_no_basis_runtime_optimized_v1.yaml"
+    )
 
 
 def test_entry_rejects_busy_gpu_without_starting_training(monkeypatch):
@@ -72,13 +80,19 @@ def test_entry_rejects_busy_gpu_without_starting_training(monkeypatch):
 
 
 @pytest.mark.parametrize("raw_resume", [False, True])
-def test_preflight_accepts_existing_formal_output(monkeypatch, tmp_path, raw_resume):
+@pytest.mark.parametrize("failed_gate", [None, "lifecycle", "source", "gradient", "finance"])
+def test_preflight_accepts_existing_formal_output(
+    monkeypatch, tmp_path, raw_resume, failed_gate
+):
     output = tmp_path / "training-bf16"
     output.mkdir()
     (output / "checkpoint_last.pt").write_bytes(b"existing formal checkpoint")
     config = SimpleNamespace(
-        environment=SimpleNamespace(amp_dtype="bf16"),
-        runner=SimpleNamespace(require_cuda=True, resume=raw_resume, output_dir=output),
+        environment=SimpleNamespace(amp_dtype="bf16", cpu_threads=8),
+        runner=SimpleNamespace(
+            require_cuda=True, resume=raw_resume, output_dir=FORMAL_OUTPUT,
+            isolate_train_folds=False,
+        ),
         training=SimpleNamespace(
             epochs=1000,
             batch_size_train=32,
@@ -90,28 +104,34 @@ def test_preflight_accepts_existing_formal_output(monkeypatch, tmp_path, raw_res
                 candle_projection_fp32=True,
             ),
             pretrained_initialization_root=None,
+            factorized_encoder_checkpoint=False,
+            eval_backtest_chunk_rows=32,
         ),
     )
     proof = {
-        "state": "accepted_actual_fold11_dual_gpu_direct_no_basis_engineering",
+        "state": "accepted_actual_fold11_dual_gpu_runtime_optimization",
         "training_ready": True,
         "formal_training_started": False,  # Historical engineering receipt only.
         "formal_optimizer_reused": False,
         "model_decomposition": "none",
         "code_source_sha256": "verified-source",
         "config_sha256": "verified-config",
+        "complete_fold_lifecycle_verified": failed_gate != "lifecycle",
+        "source_raw_bits_exact": failed_gate != "source",
+        "existing_bf16_gradient_oracle_passed": failed_gate != "gradient",
+        "artifact_agreement": {"financial_fields_bit_exact": failed_gate != "finance"},
     }
     original_is_file = Path.is_file
     original_read_text = Path.read_text
     monkeypatch.setattr(
         Path, "is_file",
-        lambda path: True if path.name == "fold11-acceptance-no-basis-v3.json"
+        lambda path: True if path.name == "fold11-runtime-optimization-acceptance.json"
         else original_is_file(path),
     )
     monkeypatch.setattr(
         Path, "read_text",
         lambda path, *args, **kwargs: json.dumps(proof)
-        if path.name == "fold11-acceptance-no-basis-v3.json"
+        if path.name == "fold11-runtime-optimization-acceptance.json"
         else original_read_text(path, *args, **kwargs),
     )
     monkeypatch.setattr(config_module, "load_config", lambda path: config)
@@ -128,6 +148,10 @@ def test_preflight_accepts_existing_formal_output(monkeypatch, tmp_path, raw_res
         and any(isinstance(target, ast.Name) and target.id == "manifest"
                 for target in node.targets)
     )
-    exec(compile(ast.Module(body=tree.body[:boundary], type_ignores=[]), str(ENTRY), "exec"), {})
+    code = compile(ast.Module(body=tree.body[:boundary], type_ignores=[]), str(ENTRY), "exec")
+    if failed_gate is None:
+        exec(code, {})
+    else:
+        with pytest.raises(AssertionError):
+            exec(code, {})
     assert (output / "checkpoint_last.pt").read_bytes() == b"existing formal checkpoint"
-
