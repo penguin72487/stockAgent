@@ -22,6 +22,11 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean_finite,
 )
+from stockagent.models.futures_account_policy import (
+    FUTURES_ACCOUNT_OBSERVATION_COLUMNS,
+    FUTURES_ACCOUNT_STATE_COLUMNS,
+    pack_futures_account_policy,
+)
 from stockagent.models.transformer_base_portfolio import (
     PortfolioRMSNorm,
     TransformerBasePortfolioModel,
@@ -60,6 +65,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         futures_flat_action_initialization: bool = False,
         futures_notional_score_coordinates: bool = False,
         futures_margin_amount_context: bool = False,
+        futures_causal_account_policy: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
     ) -> None:
@@ -108,6 +114,14 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self.futures_current_open_feature = bool(futures_current_open_feature)
         self.futures_margin_budget_output = bool(futures_margin_budget_output)
         self.futures_margin_amount_context = bool(futures_margin_amount_context)
+        self.futures_causal_account_policy = bool(futures_causal_account_policy)
+        if self.futures_causal_account_policy and (
+            not self.futures_margin_budget_output or not self.futures_margin_amount_context
+            or self.futures_current_open_feature or self.futures_denomination_hard_projection
+            or self.portfolio_output_mode != "score_entmax_log_cash"
+            or self.center_long_short_logits or futures_flat_action_initialization
+        ):
+            raise ValueError("causal account policy requires prior-only, uncentered margin log-cash output with margin amounts and ordinary initialization")
         if self.futures_margin_amount_context and not self.futures_margin_budget_output:
             raise ValueError("margin amount context requires a dated-margin policy")
         self.futures_notional_score_coordinates = bool(futures_notional_score_coordinates)
@@ -215,6 +229,20 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             torch.arange(self.futures_slot_count),
             persistent=False,
         )
+        # Allocate last: enabling feedback preserves the original seed's base
+        # policy parameters. Zero only the new residual, never the action head.
+        self.futures_account_response_head = None
+        if self.futures_causal_account_policy:
+            head_device = self.futures_action_head.weight.device
+            devices = [head_device.index] if head_device.type == "cuda" else []
+            # The zero residual also preserves the subsequent dropout RNG.
+            with torch.random.fork_rng(devices=devices):
+                self.futures_account_response_head = nn.Linear(
+                    self.d_model, len(FUTURES_ACCOUNT_STATE_COLUMNS),
+                    device=head_device, dtype=self.futures_action_head.weight.dtype,
+                )
+                nn.init.zeros_(self.futures_account_response_head.weight)
+                nn.init.zeros_(self.futures_account_response_head.bias)
 
     def set_futures_feature_rms_normalizer(
         self,
@@ -276,6 +304,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
         )
         margin_features = expected_features + 2 + int(self.futures_margin_amount_context)
+        if self.futures_causal_account_policy:
+            margin_features += len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
         if features is None or mask is None:
             raise ValueError(
                 "all-futures candidate_features and candidate_mask must be paired"
@@ -310,6 +340,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             raise ValueError(
                 "current futures OPEN model requires its current OPEN gap context"
             )
+        if self.futures_causal_account_policy and feature_width != margin_features:
+            raise ValueError("causal account policy requires its prior-observation sidecar")
         if (
             self.futures_denomination_aware_output
             and not self.futures_current_open_feature
@@ -478,9 +510,11 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             + self.futures_slot_embedding(self.futures_slot_indices)[None, :, :]
         )
         if self.futures_margin_encoder is not None:
-            margin_context = candidate_features[..., -2:].float()
+            margin_start = len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+            ratio_start = margin_start + int(self.futures_margin_amount_context)
+            margin_context = candidate_features[..., ratio_start:ratio_start + 2].float()
             if self.futures_margin_amount_context:
-                amount_fraction = candidate_features[..., -3:-2].float() / self.futures_denomination_reference_capital
+                amount_fraction = candidate_features[..., margin_start:margin_start + 1].float() / self.futures_denomination_reference_capital
                 margin_context = torch.cat((margin_context, amount_fraction), dim=-1)
             margin_context = torch.log(margin_context.clamp_min(1.0e-8)).clamp(-18.0, 4.0)
             futures_tokens = futures_tokens + self.futures_margin_encoder(
@@ -632,7 +666,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             # E/prior_notional near zero. r>0 is invertible, so reachable margin
             # budgets remain unchanged. Current OPEN and future returns never
             # enter this coordinate transform; masked slots contribute zero.
-            margin_to_notional = candidate_features[..., -2].float().masked_fill(
+            margin_to_notional = candidate_features[..., ratio_start].float().masked_fill(
                 ~candidate_mask, 0.0
             )
             target_logits = target_logits * margin_to_notional
@@ -671,6 +705,25 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                 "futures_pre_denomination_actions": raw_projected_weights,
             }
         weights = weights.masked_fill(~candidate_mask, 0.0)
+        market_weights = weights
+        if self.futures_causal_account_policy:
+            coefficient_temperature = temp if temp.ndim == 0 else temp.unsqueeze(-1)
+            coefficients = self.futures_account_response_head(futures_joint).float() / coefficient_temperature
+            if self.futures_notional_score_coordinates:
+                coefficients = coefficients * margin_to_notional.unsqueeze(-1)
+            known_initial = candidate_features[..., margin_start].float()
+            ratio = candidate_features[..., ratio_start].float()
+            known_notional = torch.where(ratio > 0, known_initial / ratio.clamp_min(1e-12), 0.0)
+            known_maintenance = known_initial * candidate_features[..., ratio_start + 1].float()
+            # Prior one-contract cash = notional + roundtrip commission/tax.
+            cash_requirement = denomination_features[..., 2].float()
+            known_side_cost = ((cash_requirement - known_notional) / 2).clamp_min(0)
+            observation_start = ratio_start + 2
+            weights = pack_futures_account_policy(
+                market_weights, target_logits, coefficients, candidate_mask,
+                known_notional, known_initial, known_maintenance, known_side_cost,
+                candidate_features[..., observation_start], candidate_features[..., observation_start + 1],
+            )
         reported_scores = scores.masked_fill(
             ~candidate_mask,
             finite_mask_fill_value(scores),
@@ -690,15 +743,15 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                     "futures_token_embedding": futures_joint,
                     "futures_candidate_mask": candidate_mask,
                     "futures_action_scores": scores,
-                    "futures_actions": weights,
+                    "futures_actions": market_weights,
                     "futures_underlying_link_mask": valid_underlying,
                     "futures_underlying_gate": underlying_gate.masked_fill(
                         ~valid_underlying.unsqueeze(-1),
                         0.0,
                     ),
-                    "gross_exposure": weights.abs().sum(dim=-1),
+                    "gross_exposure": market_weights.abs().sum(dim=-1),
                     "implicit_cash_weight": (
-                        1.0 - weights.abs().sum(dim=-1)
+                        1.0 - market_weights.abs().sum(dim=-1)
                     ).clamp_min(0.0),
                 }
             )

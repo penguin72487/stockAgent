@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import warnings
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from stockagent.backtest.return_metrics import (
     ZERO_NAV_LOG as _ZERO_NAV_LOG,
     clean_log_returns as _clean_log_returns,
 )
+from stockagent.data.walkforward import period_labels_from_contract
 
 
 _PLOT_LOG_MIN = -60.0
@@ -446,6 +448,8 @@ def _aligned_dated_backtest_rows(
 def compute_metrics_by_year(
     result: BacktestResult,
     dates: np.ndarray,
+    *,
+    period_contract: Mapping[str, Any] | None = None,
 ) -> dict[int, dict[str, float]]:
     """Compute annual performance metrics.
 
@@ -458,7 +462,11 @@ def compute_metrics_by_year(
     date_values, r, b, turnover = _aligned_dated_backtest_rows(result, dates)
     if date_values.size == 0:
         return {}
-    years = date_values.astype("datetime64[Y]").astype(np.int64) + 1970
+    years = (
+        period_labels_from_contract(date_values, period_contract)
+        if period_contract is not None
+        else date_values.astype("datetime64[Y]").astype(np.int64) + 1970
+    )
 
     annual_metrics = {}
     periods = _periods_per_year(result)
@@ -512,6 +520,8 @@ def generate_annual_report(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | None = None,
+    *,
+    period_contract: Mapping[str, Any] | None = None,
 ) -> str:
     """Generate a text report of annual performance.
 
@@ -522,12 +532,17 @@ def generate_annual_report(
     Returns:
         formatted report string
     """
-    annual_metrics = compute_metrics_by_year(result, dates)
+    annual_metrics = compute_metrics_by_year(result, dates, period_contract=period_contract)
     _, r_all, b_all, turnover_all = _aligned_dated_backtest_rows(result, dates)
 
     # Column widths: Year(8) Strategy(12) Benchmark(12) Excess(12) Sharpe(10) BenchSharpe(11) MaxDD(10) Turnover(10)
     width = 109
     lines = ["Annual Performance Report", "=" * width]
+    if period_contract is not None and period_contract.get("mode") == "lookback_shifted":
+        lines.append(
+            f"Annual period: first trading session + {period_contract['offset_sessions']} sessions "
+            "through the next annual boundary (exclusive)."
+        )
     header = (
         f"{'Year':<8} {'Strategy':>12} {'Benchmark':>12} {'Excess':>12} "
         f"{'Sharpe':>10} {'BenchShrp':>11} {'Max DD':>10} {'Turnover':>10}"
@@ -595,6 +610,7 @@ def plot_annual_performance(
     *,
     scope_label: str = "",
     benchmark_label: str = "Benchmark",
+    period_contract: Mapping[str, Any] | None = None,
 ) -> None:
     """Plot annual performance comparison: strategy vs benchmark.
     
@@ -603,7 +619,7 @@ def plot_annual_performance(
         dates: datetime64 array [T]
         output_path: optional file path to save figure
     """
-    annual_metrics = compute_metrics_by_year(result, dates)
+    annual_metrics = compute_metrics_by_year(result, dates, period_contract=period_contract)
     risk_text = _format_risk_metrics_text(result)
     years = sorted(annual_metrics.keys())
     

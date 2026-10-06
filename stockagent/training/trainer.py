@@ -147,7 +147,10 @@ from stockagent.data.tw_index_derivatives_day import (
 from stockagent.data.tw_index_options_daily import (
     TaiwanIndexOptionChainDaySession,
 )
-from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
+from stockagent.data.walkforward import (
+    WalkForwardFold, normalize_lookback_context, period_labels_from_contract,
+    normalize_year_boundary_mode, year_boundary_offset_sessions,
+)
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import (
     build_model,
@@ -3166,8 +3169,16 @@ def _mode_artifact_contract_for_config(
                           "sample_boundary_policy": "official_settlement_mark_keep_open_positions",
                           "risk_clock": "daily_open_and_settlement_not_intraday_broker_replay",
                           "margin_call_policy": "next_open_flat_no_external_topups",
+                          "annual_report_period_contract_version": 1,
+                          "annual_report_period_mode": normalize_year_boundary_mode(config.walk_forward.year_boundary_mode),
+                          "annual_report_offset_sessions": year_boundary_offset_sessions(config),
                           "margin_audit_columns": list(MARGIN_AUDIT_COLUMNS)},
         )
+        if bool(getattr(getattr(config.training, "financial_transformer", None), "futures_causal_account_policy", False)):
+            payload["mode_details"].update(
+                causal_account_policy_replay_version=1,
+                deployment_action_source="owned_market_policy_packets_resolved_from_continuously_carried_book_and_nav",
+            )
         return payload
     if (mode == "tw_stock_context_futures_portfolio"
             and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
@@ -7697,6 +7708,22 @@ def _fold_needs_artifact_scope_migration(fold_dir: Path) -> bool:
     )
 
 
+def _load_annual_period_contract(output_path: Path) -> dict[str, Any] | None:
+    """Use the full panel's recorded boundaries for root or fold reports.
+
+    A report subset cannot reconstruct first-session offsets on its own.
+    Legacy artifacts without a boundary proof retain calendar reporting.
+    """
+    for directory in (output_path, output_path.parent):
+        path = directory / "walkforward_period_boundaries.json"
+        if path.exists():
+            contract = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+                raise ValueError("unknown annual report period contract")
+            return contract
+    return None
+
+
 def _write_summary(results: list[FoldResult], output_path: Path) -> None:
     if not _distributed_should_write():
         return
@@ -9410,6 +9437,7 @@ def _save_backtest_artifact(
     *,
     compression: str = "none",
     day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
+    persist_futures_account_policy: bool = True,
 ) -> None:
     if not _distributed_should_write():
         return
@@ -10163,6 +10191,17 @@ def _save_backtest_artifact(
             payload[name] = np.asarray(value)
 
     add_optional("requested_weights_history", result.requested_weights_history)
+    if persist_futures_account_policy and result.futures_account_policy_packet is not None:
+        from stockagent.models.futures_account_policy import (
+            FUTURES_ACCOUNT_POLICY_VERSION, FUTURES_ACCOUNT_PACKET_WIDTH,
+        )
+        packet = np.asarray(result.futures_account_policy_packet)
+        if (mode != "tw_stock_context_futures_portfolio"
+                or packet.shape != (rows, symbol_count, FUTURES_ACCOUNT_PACKET_WIDTH)
+                or not np.isfinite(packet).all()):
+            raise ValueError("invalid futures account policy packet artifact")
+        payload["futures_account_policy_packet"] = packet
+        payload["futures_account_policy_version"] = np.asarray(FUTURES_ACCOUNT_POLICY_VERSION, dtype=np.int64)
     add_optional("futures_contract_quantities_history", result.futures_contract_quantities_history)
     add_optional("futures_residual_contract_quantities_history", result.futures_residual_contract_quantities_history)
     add_optional("final_futures_carry_state", result.final_futures_carry_state)
@@ -10439,9 +10478,10 @@ def _write_reporting_leverage_artifacts(
         fold_dir / "leverage_annual_performance.png",
         scope_label=scope_label,
         benchmark_label=benchmark_label,
+        period_contract=_load_annual_period_contract(fold_dir),
     )
     (fold_dir / "leverage_annual_report.txt").write_text(
-        generate_annual_report(leverage_result, dates),
+        generate_annual_report(leverage_result, dates, period_contract=_load_annual_period_contract(fold_dir)),
         encoding="utf-8",
     )
     return leverage_result
@@ -10736,7 +10776,7 @@ def _save_deployment_test_artifacts(
 
     stage_start = time.perf_counter()
     if rows > 0:
-        report = generate_annual_report(result, date_values).replace(
+        report = generate_annual_report(result, date_values, period_contract=_load_annual_period_contract(fold_dir)).replace(
             "Annual Performance Report",
             "Annual Performance Report (Stitched Deployment)",
             1,
@@ -10915,6 +10955,11 @@ def _save_fold_output_artifacts(
     requested_mode = normalize_execution_mode(
         getattr(trading_config, "execution_mode", "naive")
     )
+    if (requested_mode == "tw_stock_context_futures_portfolio"
+            and bool(getattr(getattr(config.training, "financial_transformer", None), "futures_causal_account_policy", False))
+            and (deployment_backtest is None
+                 or deployment_backtest.futures_account_policy_packet is None)):
+        raise RuntimeError("closed-loop futures fold artifacts require their owned policy packet")
     # Continuous-weight research modes deliberately have no point-in-time
     # integer contract specification.  The generic evaluator may still return
     # a compatibility share replay, but publishing it would falsely label a
@@ -11075,6 +11120,9 @@ def _save_fold_output_artifacts(
         test_dates,
         compression=compression,
         day_trade_carry_context=day_trade_carry_context,
+        # Only owned deployment rows need the packet for continuous replay.
+        # Avoid saving years of overlapping, reset-account coefficients.
+        persist_futures_account_policy=False,
     )
     save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
     save_timing["backtest_artifact_compression"] = compression
@@ -11174,7 +11222,7 @@ def _save_fold_output_artifacts(
     save_timing["table_output_format"] = table_output_format
 
     stage_start = time.perf_counter()
-    report = generate_annual_report(test_backtest, test_dates)
+    report = generate_annual_report(test_backtest, test_dates, period_contract=_load_annual_period_contract(fold_dir))
     save_timing["annual_report_compute_s"] = float(time.perf_counter() - stage_start)
     stage_start = time.perf_counter()
     with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
@@ -11250,6 +11298,7 @@ def _save_fold_output_artifacts(
             fold_dir / "annual_performance.png",
             scope_label=test_scope_label,
             benchmark_label=benchmark_label,
+            period_contract=_load_annual_period_contract(fold_dir),
         )
         leverage_multiplier = float(getattr(config.trading, "reporting_leverage", 1.0))
         plot_timing["leverage_multiplier"] = float(leverage_multiplier)
@@ -11313,6 +11362,7 @@ def _save_fold_output_artifacts(
                 fold_dir / "leverage_annual_performance.png",
                 scope_label=test_scope_label,
                 benchmark_label=benchmark_label,
+                period_contract=_load_annual_period_contract(fold_dir),
             )
         else:
             _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
@@ -12102,7 +12152,7 @@ def _save_integer_share_audit_artifacts(
         _unlink_table_variants(daily_weights_base)
     stage_start = time.perf_counter()
     with (fold_dir / "integer_share_annual_report.txt").open("w", encoding="utf-8") as f:
-        f.write(generate_annual_report(result, dates))
+        f.write(generate_annual_report(result, dates, period_contract=_load_annual_period_contract(fold_dir)))
     timing["annual_report_s"] = float(time.perf_counter() - stage_start)
     holdings_base = fold_dir / "holdings"
     if write_holdings_table:
@@ -12401,6 +12451,7 @@ def _load_backtest_artifact(
             execution_mode=execution_mode,
             settlement_ledger_unit=ledger_unit,
             requested_weights_history=optional("requested_weights_history"),
+            futures_account_policy_packet=optional("futures_account_policy_packet", None),
             futures_contract_quantities_history=optional("futures_contract_quantities_history", None),
             futures_residual_contract_quantities_history=optional("futures_residual_contract_quantities_history", None),
             final_futures_carry_state=optional("final_futures_carry_state", None),
@@ -12473,6 +12524,17 @@ def _load_backtest_artifact(
             final_integer_state=integer_state,
         )
         dates = copied("dates")
+        if result.futures_account_policy_packet is not None:
+            from stockagent.models.futures_account_policy import (
+                FUTURES_ACCOUNT_POLICY_VERSION, FUTURES_ACCOUNT_PACKET_WIDTH,
+            )
+            packet = result.futures_account_policy_packet
+            if ("futures_account_policy_version" not in keys
+                    or int(np.asarray(data["futures_account_policy_version"]).item()) != FUTURES_ACCOUNT_POLICY_VERSION
+                    or execution_mode != "tw_stock_context_futures_portfolio"
+                    or packet.shape != (len(dates), result.weights_history.shape[1], FUTURES_ACCOUNT_PACKET_WIDTH)
+                    or not np.isfinite(packet).all()):
+                raise ValueError("invalid futures account policy packet artifact")
 
     rows = int(dates.size)
     if dates.ndim != 1:
@@ -13885,6 +13947,10 @@ def _prefix_backtest_result(
             if result.requested_weights_history is None
             else np.asarray(result.requested_weights_history[:rows]).copy()
         ),
+        futures_account_policy_packet=(
+            None if result.futures_account_policy_packet is None
+            else np.asarray(result.futures_account_policy_packet[:rows]).copy()
+        ),
         open_weights_history=(
             None
             if result.open_weights_history is None
@@ -14408,7 +14474,7 @@ def _upgrade_full_horizon_artifacts_without_inference(
         ),
     )
     (fold_dir / "annual_report.txt").write_text(
-        generate_annual_report(full_backtest, dates),
+        generate_annual_report(full_backtest, dates, period_contract=_load_annual_period_contract(fold_dir)),
         encoding="utf-8",
     )
     fold_result = _load_fold_result(metrics_path)
@@ -15975,10 +16041,12 @@ def _run_eval_backtest_from_weight_buffers(
         and overnight_log_returns_all.dim() == 3
         and int(overnight_log_returns_all.size(-1)) in {11, *MARGIN_EXECUTION_WIDTHS}
     )
+    from stockagent.models.futures_account_policy import is_futures_account_policy_packet
+    account_policy_output = is_futures_account_policy_packet(weights_all)
     num_symbols = int(
         future_log_returns_all.size(-1)
         if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}
-        else weights_all.size(-1)
+        else weights_all.size(1)
     )
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
@@ -16008,7 +16076,8 @@ def _run_eval_backtest_from_weight_buffers(
     if return_weights_history:
         weights_history_out = torch.empty((total_rows, num_symbols), device=device, dtype=output_dtype)
         requested_weights_history_out: torch.Tensor | None = torch.empty(
-            (total_rows, *tuple(weights_all.shape[1:])),
+            ((total_rows, num_symbols) if account_policy_output
+             else (total_rows, *tuple(weights_all.shape[1:]))),
             device=device,
             dtype=output_dtype,
         )
@@ -16788,7 +16857,11 @@ def _run_eval_backtest_from_weight_buffers(
             weights_history_out[start:end].copy_(backtest_chunk.weights_history[:valid_rows])
             if requested_weights_history_out is None:
                 raise RuntimeError("requested weight history output was not allocated")
-            requested_weights_history_out[start:end].copy_(weights_chunk[:valid_rows])
+            resolved_requests = (backtest_chunk.requested_weights_history
+                                 if account_policy_output else weights_chunk)
+            if resolved_requests is None:
+                raise RuntimeError("account policy replay did not return resolved requests")
+            requested_weights_history_out[start:end].copy_(resolved_requests[:valid_rows])
             if open_weights_history_out is not None:
                 phase_histories = (
                     backtest_chunk.open_weights_history,
@@ -16948,6 +17021,7 @@ def _run_eval_backtest_from_weight_buffers(
         turnovers=turnovers_out,
         weights_history=weights_history_out,
         requested_weights_history=requested_weights_history_out,
+        futures_account_policy_packet=(weights_all.detach() if account_policy_output else None),
         open_weights_history=open_weights_history_out,
         close_weights_history=close_weights_history_out,
         event_turnovers=event_turnovers_out,
@@ -18342,6 +18416,7 @@ def _slice_backtest_rows(
         execution_mode=result.execution_mode,
         settlement_ledger_unit=result.settlement_ledger_unit,
         requested_weights_history=rows(result.requested_weights_history),
+        futures_account_policy_packet=rows(result.futures_account_policy_packet),
         futures_contract_quantities_history=rows(result.futures_contract_quantities_history),
         futures_residual_contract_quantities_history=rows(result.futures_residual_contract_quantities_history),
         futures_carry_state_history=rows(result.futures_carry_state_history),
@@ -18582,6 +18657,10 @@ def _replay_taiwan_stitched_deployment(
     )
 
     request_parts: list[np.ndarray] = []
+    causal_account_policy = bool(
+        mode == "tw_stock_context_futures_portfolio"
+        and bool(getattr(getattr(config.training, "financial_transformer", None), "futures_causal_account_policy", False))
+    )
     date_parts: list[np.ndarray] = []
     fold_segments: list[tuple[Path, int, int]] = []
     cursor = 0
@@ -18668,6 +18747,16 @@ def _replay_taiwan_stitched_deployment(
                     f"{mode} deployment requests must use direct width "
                     f"{expected_width}"
                 )
+            if causal_account_policy:
+                from stockagent.models.futures_account_policy import FUTURES_ACCOUNT_PACKET_WIDTH
+                packet = fold_backtest.futures_account_policy_packet
+                if (packet is None
+                        or np.asarray(packet).shape != (rows, expected_width, FUTURES_ACCOUNT_PACKET_WIDTH)):
+                    raise RuntimeError(
+                        "closed-loop futures deployment requires its owned policy packet; "
+                        "reset-account requests cannot substitute for carried-state decisions"
+                    )
+                requests_array = np.asarray(packet, dtype=np.float32)
             request_parts.append(requests_array)
             date_parts.append(fold_dates)
             fold_segments.append((fold_dir, cursor, cursor + rows))
@@ -19103,7 +19192,7 @@ def _replay_taiwan_stitched_deployment(
         encoding="utf-8",
     )
     (output_path / "walkforward_deployment_annual_report.txt").write_text(
-        generate_annual_report(stitched, stitched_dates).replace(
+        generate_annual_report(stitched, stitched_dates, period_contract=_load_annual_period_contract(output_path)).replace(
             "Annual Performance Report",
             "Annual Performance Report (Canonical Stitched Deployment)",
             1,
@@ -19130,6 +19219,7 @@ def _replay_taiwan_stitched_deployment(
         output_path / "walkforward_annual_performance.png",
         scope_label="Canonical Stitched Walk-Forward Deployment",
         benchmark_label=_benchmark_plot_label(config),
+        period_contract=_load_annual_period_contract(output_path),
     )
 
     for segment_index, (fold_dir, start, end) in enumerate(fold_segments):
@@ -19230,6 +19320,7 @@ def _refresh_walkforward_artifacts(
         if physical_source is not None and config is not None
         else None
     )
+    annual_period_contract = _load_annual_period_contract(output_path)
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
@@ -19258,8 +19349,11 @@ def _refresh_walkforward_artifacts(
         all_weights.append(fold_backtest.weights_history)
         all_dates.append(fold_dates)
 
-        years = np.asarray(fold_dates, dtype="datetime64[D]").astype(object)
-        years = np.array([d.year for d in years])
+        years = (
+            period_labels_from_contract(fold_dates, annual_period_contract)
+            if annual_period_contract is not None
+            else np.asarray(fold_dates, dtype="datetime64[Y]").astype(np.int64) + 1970
+        )
         if years.size > 0:
             first_year = int(np.min(years))
             if first_year in seen_first_test_years:
@@ -19860,7 +19954,12 @@ def _probe_compiled_train_forward(
                         direction_weight=direction_weight,
                         volatility_regime_weight=volatility_regime_weight,
                     )
-                probe_loss = weights.float().square().mean()
+                from stockagent.models.futures_account_policy import (
+                    is_futures_account_policy_packet, ACCOUNT_COEFFICIENT_END,
+                )
+                probe_values = (weights[..., :ACCOUNT_COEFFICIENT_END]
+                                if is_futures_account_policy_packet(weights) else weights)
+                probe_loss = probe_values.float().square().mean()
                 if factor_aug_kwargs and aux_outputs is not None:
                     probe_loss = probe_loss + aux_outputs["aug_score_logits"].float().square().mean()
             probe_loss.backward()
@@ -23308,7 +23407,7 @@ def _run_training_tree_models(
                 enabled=bool(config.training.save_daily_weights_table),
                 table_output_format=table_output_format,
             )
-            report = generate_annual_report(canonical_test_bt, test_dates)
+            report = generate_annual_report(canonical_test_bt, test_dates, period_contract=_load_annual_period_contract(fold_dir))
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
@@ -23344,6 +23443,7 @@ def _run_training_tree_models(
                 fold_dir / "annual_performance.png",
                 scope_label=test_scope_label,
                 benchmark_label=benchmark_label,
+                period_contract=_load_annual_period_contract(fold_dir),
             )
             _write_reporting_leverage_artifacts(
                 canonical_test_bt,

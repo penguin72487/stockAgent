@@ -387,8 +387,30 @@ def corporate_margin_base_values(frame, rules, final_settlement_path=None, *,
     return joined
 
 
+def prior_observed_return_risk(log_returns, observed, *, lookback):
+    """RMS and coverage of supplied *already prior-session* observed returns.
+
+    Missing/synthetic marks contribute neither a zero return nor an observation.
+    The denominator for coverage is the configured history window, exposing
+    short histories instead of pretending they contain a full window.
+    """
+    if int(lookback) < 1 or log_returns.shape != observed.shape or log_returns.ndim != 2:
+        raise ValueError("prior risk requires aligned [T,S] observations and positive lookback")
+    valid = observed & np.isfinite(log_returns)
+    sums = np.concatenate((np.zeros((1, log_returns.shape[1])),
+                           np.cumsum(np.where(valid, log_returns, 0).astype(np.float64) ** 2, axis=0)), axis=0)
+    counts = np.concatenate((np.zeros((1, log_returns.shape[1]), dtype=np.int64),
+                             np.cumsum(valid, axis=0, dtype=np.int64)), axis=0)
+    end = np.arange(1, len(log_returns) + 1)
+    begin = np.maximum(0, end - int(lookback))
+    count = counts[end] - counts[begin]
+    rms = np.sqrt(np.maximum(0, sums[end] - sums[begin]) / np.maximum(count, 1))
+    return np.stack((rms, count / int(lookback)), axis=-1).astype(np.float32)
+
+
 def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidation_ratio=0.25, participation=0.5,
-                                benchmark_mode="legacy_front_holding_return", include_margin_amount=False):
+                                benchmark_mode="legacy_front_holding_return", include_margin_amount=False,
+                                include_account_policy_observations=False, account_policy_lookback=32):
     """Attach executor-only marks and prior-observable margin model context."""
     if benchmark_mode not in {"legacy_front_holding_return", "tx_front_rolling_1x_gross"}:
         raise ValueError(f"unsupported futures margin benchmark mode: {benchmark_mode}")
@@ -400,10 +422,20 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
     multiple_limits = rule_manifest["schema_version"] >= MARGIN_MULTI_LIMIT_CONTRACT_VERSION
     separate_margin_bases = rule_manifest["schema_version"] >= MARGIN_VALUE_BASE_CONTRACT_VERSION
     grandfather = rule_manifest["schema_version"] >= MARGIN_GRANDFATHER_CONTRACT_VERSION
+    observation_columns = (["taifex_settlement_logret_1d", "source_row_observed",
+                            "same_contract_as_previous_session"]
+                           if include_account_policy_observations else [])
     frame = pl.read_parquet(daily.source_path, columns=[
         "date", "physical_contract", "symbol", "open", "close", "settlement",
         "previous_settlement", "contract_multiplier", "volume", "liquidation_reason",
-    ]).join(rules, on=["date", "physical_contract"], how="left", validate="1:1").sort("physical_contract", "date")
+    ] + observation_columns).join(rules, on=["date", "physical_contract"], how="left", validate="1:1").sort("physical_contract", "date")
+    if include_account_policy_observations:
+        if not include_margin_amount:
+            raise ValueError("account feedback requires observable margin amounts")
+        frame = frame.with_columns((pl.col("source_row_observed").fill_null(False)
+            & pl.col("source_row_observed").shift(1).over("physical_contract").fill_null(False)
+            & pl.col("same_contract_as_previous_session").fill_null(False)
+            & pl.col("taifex_settlement_logret_1d").is_finite()).alias("_risk_observed"))
     is_rate = pl.col("margin_kind") == "notional_rate"
     for output, value, price in (
         ("_im", "initial", "open"), ("_mm", "maintenance", "open"),
@@ -560,9 +592,20 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
         extra_features[di[context_valid], si[context_valid], 0] = values("_known_im")[context_valid]
     candidate_mask = daily.candidate_mask.copy()
     candidate_mask[di, si] &= context_valid
+    model_features = np.concatenate((daily.candidate_features, extra_features), axis=-1)
+    if include_account_policy_observations:
+        # Source rows are today's settlements; model rows are the NEXT panel
+        # session. Do not use today's OPEN availability as a risk observation.
+        prior_returns = np.zeros(daily.candidate_mask.shape, dtype=np.float32)
+        prior_observed = np.zeros(daily.candidate_mask.shape, dtype=bool)
+        has_next = di + 1 < len(panel.dates)
+        prior_returns[di[has_next] + 1, si[has_next]] = values("taifex_settlement_logret_1d")[has_next]
+        prior_observed[di[has_next] + 1, si[has_next]] = frame["_risk_observed"].to_numpy()[has_next]
+        risk = prior_observed_return_risk(prior_returns, prior_observed, lookback=account_policy_lookback)
+        model_features = np.concatenate((model_features, risk), axis=-1)
     return replace(panel, stock_context_futures_portfolio_daily=replace(
         daily, integer_execution=ex,
-        candidate_features=np.concatenate((daily.candidate_features, extra_features), axis=-1),
+        candidate_features=model_features,
         candidate_mask=candidate_mask, holding_log_returns=ex[..., 0],
         margin_rules_path=str(path), margin_contract_version=rule_manifest["schema_version"],
         margin_session_mask=session_mask,

@@ -1,7 +1,22 @@
-"""Explicit source fixtures for tests that need a verified presentation clock."""
+"""Explicit source and node-role fixtures, independent of live enrollment."""
 from datetime import date
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_node_role(tmp_path_factory, monkeypatch):
+    """Default to an unenrolled test node; explicit role fixtures keep their gates."""
+    from stockagent.data_sync import node_roles
+
+    observe_role = node_roles.training_only_node
+    absent_role_file = tmp_path_factory.getbasetemp() / "unregistered-test-node-role.json"
+
+    def test_role(**kwargs):
+        kwargs.setdefault("role_file", absent_role_file)
+        return observe_role(**kwargs)
+
+    monkeypatch.setattr(node_roles, "training_only_node", test_role)
 
 
 @pytest.fixture

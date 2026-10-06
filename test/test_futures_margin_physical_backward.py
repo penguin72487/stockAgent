@@ -53,18 +53,27 @@ def test_gradient_prices_selected_physical_denomination(sign):
 
 
 @pytest.mark.parametrize('sign', [-1., 1.])
-def test_unfilled_margin_call_teaches_prior_exposure_not_unavailable_rebound(sign):
+@pytest.mark.parametrize('intraday_move', [0., 1000.])
+def test_unfilled_margin_call_keeps_actual_inventory_and_its_marked_pnl(sign, intraday_move):
     x = tape(2)
     x[0, :, 4] = 1000 - sign * 140
     x[1, :, 3] = x[0, :, 4] + sign * 10
     x[1, :, m.PREVIOUS_MARK] = x[0, :, 4]
-    x[1, :, 4] = x[1, :, 3] + sign * 1000  # Rebound cannot erase failed close.
+    x[1, :, 4] = x[1, :, 3] + sign * intraday_move
     x[1, :, m.CAN_SELL if sign > 0 else m.CAN_BUY] = 0
     w = torch.tensor([[sign * .5], [sign * .9]], requires_grad=True)
     r = run(w, x, initial_capital=1000., recoverable_backward=True)
     r.strategy_returns.sum().backward()
-    assert r.default_reason_history.tolist() == [0, 4]
-    assert w.grad[0].item() * sign < 0
+    # Gradient/account v12 retains unfilled physical risk. Failed liquidation
+    # alone is not insolvency and cannot suppress the retained book's PnL.
+    assert r.default_reason_history.tolist() == [0, 0]
+    assert r.final_alive
+    assert r.contract_quantities_history[:, 0].tolist() == [int(sign * 5)] * 2
+    assert r.final_equity_scale == pytest.approx((350 + 5 * intraday_move) / 1000)
+    if intraday_move == 0:
+        assert w.grad[0].item() * sign < 0
+    else:
+        assert w.grad[0].item() * sign > 0
     assert w.grad[1].item() == 0
     assert torch.isfinite(w.grad).all()
 
