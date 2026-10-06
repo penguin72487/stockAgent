@@ -208,6 +208,25 @@ def layout_path(root: Path, name: str) -> Path:
     return root / name
 
 
+def test_closed_loop_futures_completion_requires_owned_policy_packet(tmp_path: Path) -> None:
+    lifecycle = TrainingRunLifecycle(tmp_path,
+        execution_mode="tw_stock_context_futures_portfolio", run_mode="train",
+        strategy="none", model_name="financial_transformer")
+    lifecycle.start(fold_ids=[1], dataset_fingerprint="fixture", configuration_fingerprint="fixture",
+                    contract_versions={"execution": 1}, data_summary={"dates": 3, "symbols": 2})
+    _write_minimal_completed_artifacts(lifecycle.layout, group_name="train_2020-2021",
+        fold_id=1, execution_mode="tw_stock_context_futures_portfolio")
+    lifecycle.finish_fold(1)
+    lifecycle.complete(fold_ids=[1])
+    manifest = json.loads(lifecycle.layout.run_manifest_path.read_text())
+    manifest["configuration"] = {"training": {"financial_transformer": {"futures_causal_account_policy": True}}}
+    lifecycle.layout.run_manifest_path.write_text(json.dumps(manifest))
+    result = validate_completed_training_artifacts(tmp_path, fold_ids=[1], group_names=["train_2020-2021"])
+    assert not result.ok
+    assert any("policy replay contract" in item for item in result.invalid)
+    assert any("futures_account_policy_packet.npy" in item for item in result.invalid)
+
+
 def test_failed_lifecycle_preserves_the_same_progress_envelope(
     tmp_path: Path,
 ) -> None:

@@ -2215,6 +2215,9 @@ class TransformerBasePortfolioModelConfig:
     # Observe the dated, pre-open one-contract initial margin relative to the
     # experiment's initial capital. This is information, never a size rule.
     futures_margin_amount_context: bool = False
+    # Batch market coefficients, resolved against actual prior NAV/inventory
+    # inside the canonical exact margin account (distinct output/checkpoint ABI).
+    futures_causal_account_policy: bool = False
     # Historical models quantized group actions against one fixed reference
     # capital before the recurrent integer executor quantized them again against
     # live equity. New exact-account experiments may retain denomination context
@@ -4474,6 +4477,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or training["model_name"] != "financial_transformer"
     ):
         raise ValueError("margin amount context requires the financial-transformer dated-margin policy")
+    if phase_model_config["futures_causal_account_policy"] and (
+        trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+        or capital_basis != "initial_margin" or holding_policy != "carry"
+        or not trading["tw_futures_portfolio_integer_contracts"]
+        or training["model_name"] != "financial_transformer"
+        or phase_model_config["portfolio_output_mode"] != "score_entmax_log_cash"
+        or not phase_model_config["futures_margin_amount_context"]
+        or phase_model_config["center_long_short_logits"]
+        or phase_model_config["futures_current_open_feature"]
+        or phase_model_config["futures_flat_action_initialization"]
+        or phase_model_config["futures_denomination_hard_projection"]
+        or training["futures_portfolio_training_surrogate_only"]
+        or trading["portfolio_activation"] != "pre_normalized"
+        or trading["long_only"] or trading["min_trade_weight"] != 0
+    ):
+        raise ValueError("causal account policy requires ordinary, prior-only, uncentered exact margin log-cash training with margin amounts and no model size projection")
     step_drawdown = training["futures_training_max_drawdown"]
     if not isinstance(training["futures_training_stop_on_rejected_step"], bool):
         raise ValueError("futures_training_stop_on_rejected_step must be a boolean")
