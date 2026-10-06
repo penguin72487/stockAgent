@@ -48,6 +48,22 @@ def test_stages_are_disjoint_and_override_precedes_core():
     assert sum(x['summary']['unbatched_requests'] for x in stages) == 26200
 
 
+def test_broker_local_child_stays_in_broker_phase_without_extra_calls_or_core_gate():
+    work, telemetry = inputs()
+    work['datasets'].append(dict(dataset='TaiwanStockTradingDailyReportSecIdAgg', state='observed',
+                                local_derived_tasks=1, current_plan_requests=0, unbatched_requests=0))
+    stages = stage_workloads(work)
+    assert stages[1]['summary']['local_derived_tasks'] == 0
+    broker = next(stage for stage in stages if stage['dataset'] == 'TaiwanStockTradingDailyReport')
+    assert broker['summary']['local_derived_tasks'] == 1
+    assert sum(stage['summary']['current_plan_requests'] for stage in stages) == 26200
+    result = run(work, telemetry)
+    assert result['stages'][1]['scenarios']['central']['estimated_complete_at_utc'] is not None
+    # A zero-request local tail is still not completed, and gates later phases.
+    projected = next(stage for stage in result['stages'] if stage['dataset'] == broker['dataset'])
+    assert projected['scenarios']['central']['estimated_complete_at_utc'] is None
+
+
 def test_retry_work_and_cooldowns_follow_their_actual_stage_not_whole_dataset():
     work, telemetry = inputs()
     work['datasets'][0].update(incremental_requests=20, backfill_requests=5480,
@@ -169,6 +185,63 @@ def test_unknown_predecessor_cannot_give_later_absolute_dates():
         assert all(x['estimated_complete_at_utc'] is None for x in item['scenarios'].values())
 
 
+@pytest.mark.parametrize('measured', [True, False])
+def test_object_stage_eta_never_uses_legacy_api_rate_without_transfer_evidence(measured):
+    work, telemetry = inputs()
+    row = next(row for row in work['datasets'] if row['dataset'] == 'TaiwanFuturesKBar')
+    row['object_requests'] = row['current_plan_requests']
+    row.pop('priority_override')
+    if measured:
+        telemetry['object_transfer_statistics'] = {'TaiwanFuturesKBar': {
+            'samples': 3, 'fastest_seconds': 5, 'median_seconds': 10, 'p90_seconds': 20}}
+    out = ordered_estimate(work, telemetry, NOW, day_is_protected=lambda _: False,
+                           secondary_admission={'allowed': True})
+    stage = next(stage for stage in out['stages'] if stage['dataset'] == 'TaiwanFuturesKBar')
+    if measured:
+        assert stage['scenarios']['central']['effective_requests_per_hour'] <= 360
+        assert stage['scenarios']['fastest']['effective_requests_per_hour'] <= 720
+    else:
+        assert stage['scenarios']['central']['estimated_complete_at_utc'] is None
+        assert stage['scenarios']['slowest']['estimated_complete_at_utc'] is None
+    assert stage['rate_evidence']['request_processing']['samples'] == (3 if measured else 0)
+
+
+@pytest.mark.parametrize('pending_cost', [True, False])
+def test_broker_stage_waits_for_mandatory_local_processing_cost(pending_cost):
+    work, telemetry = inputs()
+    row = work['datasets'][1]
+    row.update(dataset='TaiwanStockTradingDailyReport', object_requests=row['current_plan_requests'])
+    row.pop('priority_override')
+    telemetry['object_transfer_statistics'] = {'TaiwanStockTradingDailyReport': {
+        'samples': 1, 'fastest_seconds': 2, 'median_seconds': 22, 'p90_seconds': 30,
+        'dependent_processing_unknown': pending_cost, 'dependent_processing_samples': 0 if pending_cost else 1}}
+    out = ordered_estimate(work, telemetry, NOW, day_is_protected=lambda _: False,
+                           secondary_admission={'allowed': True})
+    stage = next(stage for stage in out['stages'] if stage['dataset'] == 'TaiwanStockTradingDailyReport')
+    if pending_cost:
+        assert stage['scenarios']['central']['estimated_complete_at_utc'] is None
+        assert stage['scenarios']['slowest']['estimated_complete_at_utc'] is None
+    else:
+        assert stage['scenarios']['central']['effective_requests_per_hour'] <= 3600 / 22
+
+
+def test_object_eta_uses_json_priority_cost_not_object_cost_for_daily_bursts():
+    work, telemetry = independent_inputs(history_calls=100)
+    row = work['datasets'][1]
+    row.update(dataset='TaiwanStockTradingDailyReport', object_requests=100)
+    telemetry['object_transfer_statistics'] = {'TaiwanStockTradingDailyReport': {
+        'samples': 3, 'fastest_seconds': 36, 'median_seconds': 36, 'p90_seconds': 36}}
+    telemetry['quota']['recurring_forecast']['timed_incremental']['events'] = [{
+        'first_at_utc': (NOW + timedelta(minutes=30)).isoformat(), 'interval_seconds': 3600,
+        'requests': 200, 'session_only': False}]
+    result = run(work, telemetry)
+    broker = result['stages'][4]['scenarios']['central']
+    assert broker['state'] == 'estimated'
+    assert 3600 < broker['remaining_seconds'] < 3800
+    assert broker['request_count'] == 300
+    assert result['stages'][4]['rate_evidence']['priority_requests_per_hour'] == 5600
+
+
 def test_empty_stages_take_no_extra_capacity_or_service_time():
     work, telemetry = inputs()
     work['datasets'] = work['datasets'][:1]
@@ -249,3 +322,122 @@ def test_public_projection_reconciles_stages_rates_and_redacts_private_fields(tm
     for item in stale['stages']:
         assert item['state'] == 'stale'
         assert all(x['stage_start_at_utc'] is None for x in item['scenarios'].values())
+
+
+def independent_inputs(*, history_calls=10, clock_known=True):
+    work, telemetry = inputs()
+    work['datasets'] = [
+        dict(dataset='TaiwanVariousIndicators5Seconds', owner='free', state='observed',
+             current_plan_requests=2, required_requests=2, backfill_requests=2,
+             unbatched_requests=2, fastest_requests=2, retry_tasks=2,
+             independent_retry_tasks=2, independent_retry_requests=2,
+             independent_retry_clock_known=clock_known, max_retry_wait_seconds=900),
+        dict(dataset='TaiwanFuturesKBar', state='observed', current_plan_requests=history_calls,
+             required_requests=history_calls, backfill_requests=history_calls,
+             unbatched_requests=history_calls, fastest_requests=history_calls),
+    ]
+    work['summary'].update(current_plan_requests=2+history_calls, unbatched_requests=2+history_calls,
+                           required_requests=2+history_calls, validation_requests=0, retry_tasks=2,
+                           independent_retry_tasks=2, independent_retry_requests=2, max_retry_wait_seconds=900)
+    telemetry['quota']['recurring_forecast'] = {
+        'requests_per_hour_by_stage': {'incremental': 0, 'core': 0},
+        'new_partition_requests_per_hour_by_stage': {},
+        'timed_incremental': {'state': 'modeled', 'events': []},
+    }
+    return work, telemetry
+
+
+def test_free_retry_does_not_gate_independent_history_but_global_stays_unfinished(tmp_path):
+    work, telemetry = independent_inputs()
+    result = run(work, telemetry)
+    assert result['state'] == 'waiting_retry'
+    assert all(row['estimated_complete_at_utc'] is None for row in result['scenarios'].values())
+    core, futures = result['stages'][1], result['stages'][3]
+    assert core['workload']['retry_tasks'] == 2
+    assert core['state'] == 'waiting_retry'
+    assert futures['scenarios']['central']['stage_start_at_utc'] == NOW.isoformat()
+    assert futures['scenarios']['central']['remaining_seconds'] < 900
+    model = result['retry_condition']['scenarios']['central']
+    assert model['remaining_seconds'] >= 901
+    assert model['request_count'] == 12
+    assert result['milestones']['all']['retry_condition']['scenarios']['central']['remaining_seconds'] >= 901
+    (tmp_path / 'eta_status.json').write_text(json.dumps({'schema_version': 1, 'estimate': result}))
+    public = public_completion_estimate(tmp_path, NOW)
+    assert public['scenario_projection_contract'] == 1
+    assert public['scenarios']['central']['state'] == 'waiting_retry'
+    assert public['stages'][3]['scenarios']['central']['state'] == 'estimated'
+
+
+def test_existing_independent_retry_uses_shared_capacity_once_not_extra_backlog():
+    work, telemetry = independent_inputs(history_calls=6000)
+    result = run(work, telemetry)
+    futures = result['stages'][3]['scenarios']['central']
+    assert futures['forecast_refresh_requests'] == 2
+    assert sum(item['scenarios']['central'].get('forecast_refresh_requests', 0)
+               for item in result['stages']) == 2
+    model = result['retry_condition']['scenarios']['central']
+    assert model['request_count'] == 6002
+    assert abs(model['active_work_seconds'] - 6002 * 3600 / 5600) < 3
+
+
+def test_independent_retry_with_unknown_clock_has_no_made_up_full_completion():
+    work, telemetry = independent_inputs(clock_known=False)
+    result = run(work, telemetry)
+    assert all(row['estimated_complete_at_utc'] is None for row in result['retry_condition']['scenarios'].values())
+    assert all(row['estimated_complete_at_utc'] is None for row in result['milestones']['all']['retry_condition']['scenarios'].values())
+    assert result['stages'][3]['scenarios']['central']['state'] == 'estimated'
+
+
+def test_independent_retry_condition_reuses_the_same_capacity_projection(monkeypatch):
+    from copy import deepcopy
+    from downloader import finmind_eta_stages as module
+    work, telemetry = independent_inputs(history_calls=6000)
+    calls = []
+    original = module.estimate_completion
+    def observed(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, 'estimate_completion', observed)
+    result = run(work, telemetry)
+    assert len(calls) == 14  # Overall + 12 stages + one independent serial scope, not twice.
+    modeled = deepcopy(work)
+    modeled['summary']['retry_tasks'] = 0
+    for row in modeled['datasets']:
+        row['retry_tasks'] = 0
+        row['retry_tasks_by_class'] = {}
+    reference = module.ordered_estimate(modeled, telemetry, NOW, day_is_protected=lambda _: False,
+        secondary_admission={'allowed': True}, _retry_projection=True)
+    for name in ('fastest', 'central', 'slowest'):
+        for field in ('remaining_seconds', 'estimated_complete_at_utc', 'active_work_seconds', 'request_count'):
+            assert result['retry_condition']['scenarios'][name][field] == reference['scenarios'][name][field]
+
+
+@pytest.mark.parametrize('history_calls', [0, 10])
+def test_independent_inflight_is_not_a_history_gate_or_proof_of_global_completion(history_calls):
+    work, telemetry = independent_inputs(history_calls=history_calls)
+    work['datasets'][0].update(current_plan_requests=0, required_requests=0, backfill_requests=0,
+        unbatched_requests=0, fastest_requests=0, retry_tasks=0, independent_retry_tasks=0,
+        independent_retry_requests=0, independent_inflight_tasks=1, inflight_tasks=1, inflight_requests=1)
+    work['summary'].update(current_plan_requests=history_calls, required_requests=history_calls,
+        unbatched_requests=history_calls, retry_tasks=0, independent_retry_tasks=0,
+        independent_retry_requests=0, independent_inflight_tasks=1, inflight_tasks=1, inflight_requests=1)
+    result = run(work, telemetry)
+    if history_calls:
+        assert result['stages'][3]['scenarios']['central']['stage_start_at_utc'] == NOW.isoformat()
+    else:
+        assert result['state'] == 'warming_up'
+        assert all(row['estimated_complete_at_utc'] is None for row in result['scenarios'].values())
+        assert all(row['estimated_complete_at_utc'] is None for row in result['milestones']['all']['scenarios'].values())
+
+
+def test_unknown_predecessor_preserves_measured_standalone_cost_not_deadline():
+    work, telemetry = inputs()
+    work['datasets'][1]['object_requests'] = 16500  # No cost sample for preceding futures objects.
+    work['datasets'][1].pop('priority_override')
+    result = run(work, telemetry)
+    stage = result['stages'][6]['scenarios']['central']
+    assert stage['estimated_complete_at_utc'] is None
+    assert stage['active_work_seconds'] is None
+    assert stage['standalone_active_work_seconds'] > 0
+    assert all(row['standalone_active_work_seconds'] is None for row in result['scenarios'].values())
+    assert all(row['standalone_active_work_seconds'] is None for row in result['milestones']['all']['scenarios'].values())

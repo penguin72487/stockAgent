@@ -250,7 +250,7 @@ def test_windows_capacity_uses_encoded_fixed_registry_query(queue_configuration,
         program = base64.b64decode(argv[-1]).decode("utf-16-le")
         assert "ext4.vhdx" in program and "AvailableFreeSpace" in program and "HKCU:" in program
         assert program.endswith(" 'Ubuntu'")
-        return subprocess.CompletedProcess(argv, 0, stdout='{"free_bytes":99999999,"distribution":"Ubuntu"}')
+        return subprocess.CompletedProcess(argv, 0, stdout=b'{"free_bytes":99999999,"distribution":"Ubuntu"}', stderr="無關的中文診斷".encode("cp950"))
     monkeypatch.setattr(module.subprocess, "run", execute)
     assert module.physical_free_bytes(c) == 99999999
     monkeypatch.setenv("WSL_DISTRO_NAME", "DifferentDistro")
@@ -261,6 +261,29 @@ def test_dropin_uses_existing_service_fixed_installed_script_only():
     body = dropin(Path("/opt/lab203-backup/recovery-code-v6"))
     assert "ExecStartPost=-/bin/bash" in body and "ExecStart=" not in body and "ingress" not in body
     with pytest.raises(ValueError): dropin(Path("/opt/unsafe%systemd"))
+
+
+@pytest.mark.parametrize('failure',['startup-once','startup-exhausted','native-query'])
+def test_physical_capacity_retry_never_substitutes_virtual_space(queue_configuration,monkeypatch,failure):
+    c={**queue_configuration,'windows_distribution':'Ubuntu'}
+    monkeypatch.setattr(module,'physical_free_bytes',ACTUAL_PHYSICAL_FREE_BYTES)
+    original_read=Path.read_text
+    monkeypatch.setattr(Path,'read_text',lambda self,*a,**k:'microsoft-standard-WSL2' if str(self)=='/proc/sys/kernel/osrelease' else original_read(self,*a,**k))
+    monkeypatch.setenv('WSL_DISTRO_NAME','Ubuntu')
+    monkeypatch.setattr(module.time,'sleep',lambda n:None)
+    calls=[]
+    def execute(argv,**kwargs):
+        calls.append(argv)
+        if failure=='startup-once' and len(calls)>1:
+            return subprocess.CompletedProcess(argv,0,stdout=b'{"free_bytes":12345,"distribution":"Ubuntu"}',stderr=b'')
+        error=b'<3>WSL (123) ERROR: UtilAcceptVsock:273: accept4 failed 110' if failure!='native-query' else b'WSL backing volume not identified'
+        return subprocess.CompletedProcess(argv,1,stdout=b'',stderr=error)
+    monkeypatch.setattr(module.subprocess,'run',execute)
+    if failure=='startup-once':
+        assert module.physical_free_bytes(c)==12345 and len(calls)==2
+    else:
+        with pytest.raises(ValueError,match='unavailable'):module.physical_free_bytes(c)
+        assert len(calls)==(3 if failure=='startup-exhausted' else 1)
 
 
 def test_public_queue_status_rejects_secret_fields(queue_configuration, monkeypatch):

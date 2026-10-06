@@ -347,7 +347,8 @@ def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any
     This is a capacity model, not measured future traffic or full scope proof.
     """
     from downloader.finmind_history_refresh import DAILY_EQUITY
-    from downloader.finmind_supplemental import SOURCES as SUPPLEMENTAL
+    from downloader.finmind_supplemental import SOURCES as SUPPLEMENTAL_BASE
+    from downloader.finmind_storage_objects import effective_sources, forward_identity_clause
     from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, PERIODIC_RELEASE_CLOCKS
     from downloader.finmind_history_calendar import arrival_density, load_closures
     from scripts.audit_finmind_query_ranges import registry
@@ -376,6 +377,7 @@ def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any
             return {'requests_per_hour': None, 'state': 'missing_queue'}
         try:
             with _connect(path) as conn:
+                SUPPLEMENTAL = effective_sources(conn, SUPPLEMENTAL_BASE) if owner == 'complement' else SUPPLEMENTAL_BASE
                 if owner == 'complement':
                     for dataset, kind, priority, state, count in conn.execute("""
                         SELECT dataset,kind,priority,state,count(*) FROM tasks
@@ -413,7 +415,8 @@ def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any
                             if source and source.universe == 'market':
                                 # Superseded per-ID frontiers remain as evidence,
                                 # not future whole-market request multipliers.
-                                count = market_count
+                                count = (conn.execute('SELECT COUNT(*) FROM finmind_source_frontiers '
+                                                     'WHERE dataset=?' + forward_identity_clause(dataset), (dataset,)).fetchone()[0])
                             calendar = arrival_density(closures, dataset, now)
                             arrival_calendars[dataset] = calendar
                             load = count * calendar['factor'] / 24
@@ -459,7 +462,7 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
         "account_fresh": fresh,
         "provider_used_in_hour": account.get("provider_used_in_hour")
         if type(account.get("provider_used_in_hour")) is int and account["provider_used_in_hour"] >= 0 else None,
-        "paced_requests_per_hour": 3600 / (3600 / limit + 0.01) if limit else None,
+        "paced_requests_per_hour": limit,
         "fixed_incremental_demand": demand, "reserved_requests_per_hour": reserve,
         "backfill_capacity_requests_per_hour": max(0, limit - reserve) if limit and fresh else None,
         "current_budget": budget, "scope": "one_shared_account_not_per_worker",
@@ -475,6 +478,12 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
     quota['recurring_forecast'] = forecast
     traffic = _traffic(root, now)
     workers = {owner: _queue_worker(root / owner, owner, now) for owner in ("sponsor", "complement")}
+    from downloader.finmind_storage_objects import transfer_statistics
+    try:
+        with _connect(root / 'complement' / 'queue.sqlite3') as conn:
+            object_transfers = transfer_statistics(conn)
+    except (OSError, sqlite3.Error):
+        object_transfers = {}
     free = _read_json(root / "status.json")
     free_age = _age(free.get("observed_at_utc"), now)
     workers["free"] = {
@@ -488,6 +497,7 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
         "schema_version": 1, "observed_at_utc": now.isoformat(),
         "state": "observed" if fresh and limit and traffic["state"] == "observed" else "insufficient_evidence",
         "quota": quota, "traffic": traffic, "workers": workers,
+        "object_transfer_statistics": object_transfers,
         "limitations": [
             "request_starts_are_not_successful_completions",
             "queue_latest_outcomes_are_not_an_append_only_retry_history",

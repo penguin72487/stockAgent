@@ -79,3 +79,43 @@ def test_runtime_profile_admission_rejects_tampered_fingerprint_and_boolean_budg
         _checkpoint(), _checkpoint(threads=True), path="checkpoint",
         allow_runtime_profile_differences=True,
     )[0]
+
+
+def test_runtime_replay_schedule_admission_still_requires_exact_optimizer_and_finance():
+    left, right = _checkpoint(), _checkpoint(output="candidate")
+    for checkpoint, chunk in ((left, 32), (right, 8)):
+        manifest = checkpoint["experiment_manifest"]
+        manifest["configuration"]["training"] = {"eval_backtest_chunk_rows": chunk, "batch_size_train": 32}
+        manifest["configuration_fingerprint"] = _stable_fingerprint(manifest["configuration"])
+    differences, admitted = checkpoint_differences(
+        left, right, path="checkpoint", allow_runtime_profile_differences=True)
+    assert differences == []
+    assert any(row["field"] == "configuration.training.eval_backtest_chunk_rows" for row in admitted)
+    manifest = right["experiment_manifest"]
+    manifest["configuration"]["training"]["batch_size_train"] = 16
+    manifest["configuration_fingerprint"] = _stable_fingerprint(manifest["configuration"])
+    assert checkpoint_differences(
+        left, right, path="checkpoint", allow_runtime_profile_differences=True)[0]
+
+
+def test_runtime_replay_schedule_rejects_boolean_and_one_sided_knob():
+    left, right = _checkpoint(), _checkpoint()
+    manifest = right["experiment_manifest"]
+    manifest["configuration"]["training"] = {"eval_backtest_chunk_rows": True}
+    manifest["configuration_fingerprint"] = _stable_fingerprint(manifest["configuration"])
+    assert checkpoint_differences(
+        left, right, path="checkpoint", allow_runtime_profile_differences=True)[0]
+
+
+def test_single_fold_lifecycle_defaults_do_not_hide_checkpoint_state_changes():
+    left, right = _checkpoint(), _checkpoint()
+    for checkpoint, resume, isolate in ((left, False, True), (right, True, False)):
+        manifest = checkpoint["experiment_manifest"]
+        manifest["configuration"]["runner"].update(resume=resume, isolate_train_folds=isolate)
+        manifest["configuration_fingerprint"] = _stable_fingerprint(manifest["configuration"])
+        checkpoint["optimizer"] = {"step": torch.tensor(3)}
+    assert checkpoint_differences(
+        left, right, path="checkpoint", allow_runtime_profile_differences=True)[0] == []
+    right["optimizer"]["step"] = torch.tensor(4)
+    assert checkpoint_differences(
+        left, right, path="checkpoint", allow_runtime_profile_differences=True)[0]

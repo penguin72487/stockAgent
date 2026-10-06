@@ -54,14 +54,24 @@ def revenue_candidates(frame):
         .filter(pl.col("value").is_finite()) for k, v in expressions.items()}, audit
 
 
-def build(*, finmind, finlab, previous, out):
+def build(*, finmind, finlab, previous, out, source_manifest=None, dataset_prefixes=()):
     if out.exists():
         raise FileExistsError("use a new versioned output directory")
     out = out.resolve()
     code = {str(p): sha256(ROOT / p) for p in [
         "stockagent/data/tw_public_cross_source_fill.py", "scripts/build_tw_cross_source_fill_bundle.py"]}
-    definitions = pl.read_csv(previous / "research_feature_dictionary.csv").to_dicts()
-    symbols = pl.read_parquet(previous / "model_inputs.parquet", columns=["symbol"])["symbol"].unique().to_list()
+    if source_manifest is not None:
+        from scripts.prepare_tw_day_trade_mixed_frequency import verify_sources
+        fixed = verify_sources(source_manifest.parent)
+        definitions = [s for s in fixed['feature_specs'] if s.get('source') == 'FinLab']
+        symbols = sorted(p.name.removesuffix('_features.parquet') for p in (source_manifest.parent / 'stocks').glob('*_features.parquet'))
+    else:
+        definitions = pl.read_csv(previous / "research_feature_dictionary.csv").to_dicts()
+        symbols = pl.read_parquet(previous / "model_inputs.parquet", columns=["symbol"])["symbol"].unique().to_list()
+    if dataset_prefixes:
+        definitions = [d for d in definitions if d['dataset'].startswith(tuple(dataset_prefixes))]
+    if not definitions or not symbols:
+        raise ValueError('empty explicitly selected source/universe scope')
     out.mkdir(parents=True)
     (out / "wide").mkdir()
     (out / "fills").mkdir()
@@ -74,18 +84,22 @@ def build(*, finmind, finlab, previous, out):
         frame = frame.filter(pl.col("stock_id").is_in(symbols))
         frames[dataset] = frame
         sources[dataset] = receipt
-    revenues, revenue_audit = revenue_candidates(frames["TaiwanStockMonthRevenue"])
+    revenues, revenue_audit = ({}, {})
+    if 'TaiwanStockMonthRevenue' in frames:
+        revenues, revenue_audit = revenue_candidates(frames["TaiwanStockMonthRevenue"])
     # create_time is provider ingestion (NOT company publication), available
     # only since 2026-04-21. That day's bootstrap timestamps are not historical
     # release evidence. Use later genuine observations only as a lower bound;
     # old missing timestamps retain the explicitly approved schedule proxy.
-    rev_dates = frames["TaiwanStockMonthRevenue"].filter(pl.col("country") == "Taiwan").select(
-        pl.date(pl.col("revenue_year"), pl.col("revenue_month"), 1).dt.strftime("%Y-%m").alias("period"),
-        pl.col("stock_id").alias("symbol"),
-        pl.col("create_time").str.slice(0, 10).str.to_date(strict=False).alias("known_published_on")
-    ).with_columns(pl.when(pl.col("known_published_on") > pl.date(2026, 4, 21))
-        .then(pl.col("known_published_on")).otherwise(None).alias("known_published_on"))
-    rev_dates = rev_dates.group_by("period", "symbol").agg(pl.col("known_published_on").max())
+    rev_dates = None
+    if 'TaiwanStockMonthRevenue' in frames:
+        rev_dates = frames["TaiwanStockMonthRevenue"].filter(pl.col("country") == "Taiwan").select(
+            pl.date(pl.col("revenue_year"), pl.col("revenue_month"), 1).dt.strftime("%Y-%m").alias("period"),
+            pl.col("stock_id").alias("symbol"),
+            pl.col("create_time").str.slice(0, 10).str.to_date(strict=False).alias("known_published_on")
+        ).with_columns(pl.when(pl.col("known_published_on") > pl.date(2026, 4, 21))
+            .then(pl.col("known_published_on")).otherwise(None).alias("known_published_on"))
+        rev_dates = rev_dates.group_by("period", "symbol").agg(pl.col("known_published_on").max())
     for definition in definitions:
         key = definition["dataset"]
         spec = MAPPINGS.get(key)
@@ -185,6 +199,9 @@ def build(*, finmind, finlab, previous, out):
             "Missing/inapplicable/conflicting cells remain NULL, not invented zero",
             "ToAlpha bulk training needs separate written authorization; not used",
             "Unmapped feature families and original financial vintages remain unresolved"]}
+    result['selected_dataset_prefixes'] = list(dataset_prefixes)
+    if source_manifest is not None:
+        result['source_manifest_sha256'] = sha256(source_manifest)
     if code != {p: sha256(ROOT / p) for p in code}:
         raise ValueError("implementation changed during build")
     for item in overrides.values():
@@ -200,8 +217,11 @@ def main():
     p.add_argument("--finlab-root", type=Path, default=ROOT / "data_finlab")
     p.add_argument("--previous-dataset", type=Path, default=ROOT / "artifacts/datasets/tw_day_trade_release_schedule_research_20260928_v3")
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument('--source-manifest', type=Path, help='Fixed native source projection instead of a legacy model matrix')
+    p.add_argument('--dataset-prefix', action='append', default=[], help='Limit actual source reads to selected feature families')
     a = p.parse_args()
-    m = build(finmind=a.finmind_root, finlab=a.finlab_root, previous=a.previous_dataset, out=a.output_dir)
+    m = build(finmind=a.finmind_root, finlab=a.finlab_root, previous=a.previous_dataset, out=a.output_dir,
+              source_manifest=a.source_manifest, dataset_prefixes=a.dataset_prefix)
     print(json.dumps({k:v for k,v in m.items() if k != "overrides"}, ensure_ascii=False, indent=2))
 
 

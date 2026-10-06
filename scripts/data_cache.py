@@ -102,6 +102,10 @@ def build_parser() -> argparse.ArgumentParser:
     partial.add_argument("--snapshot-id", required=True)
     partial.add_argument("--partial-name", required=True)
     partial.add_argument("--apply", action="store_true")
+    partial.add_argument("--manual-immediate", action="store_true",
+                         help="One explicitly authorized partial-cache age bypass; every recovery gate remains")
+    partial.add_argument("--native-d-reads", action="store_true",
+                         help="Use guarded Windows I/O for the enrolled canonical D authority")
     partial.add_argument(
         "--receipt-dir",
         type=Path,
@@ -177,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.partial_name,
                 receipt_dir=args.receipt_dir,
                 apply=args.apply,
+                manual_immediate=args.manual_immediate,
+                d_primary_native_reads=args.native_d_reads,
             )
             _print(
                 {

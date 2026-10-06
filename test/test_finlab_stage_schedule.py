@@ -31,6 +31,25 @@ def test_future_wave_cannot_start_before_its_observed_expiry():
     assert forecast(rows, now=NOW, quota=account(1000), reserve_mb=50, next_run=NOW)["state"] == "complete"
 
 
+def test_future_wave_includes_dispatch_and_shared_worker_handoff():
+    due = NOW + timedelta(hours=1)
+    rows = [job("price:a", size=1, stage="priority_updates", pending=False, next_check=due.isoformat())]
+    wave = next_release_waves(rows, now=NOW, quota=account(1000), reserve_mb=50, next_run=NOW,
+                              handoff_seconds={"fast": 0, "reference": 32, "slow": 240})["priority_updates"]
+    assert wave["scenarios"]["reference"]["start_at_utc"] == (due+timedelta(seconds=30+32)).isoformat()
+    assert wave["scenarios"]["reference"]["finish_at_utc"] == (due+timedelta(seconds=30+32+10)).isoformat()
+
+
+def test_next_wave_does_not_reuse_an_earlier_pending_jobs_stage_start():
+    due = NOW + timedelta(hours=1)
+    rows = [job("feature:old", size=1),
+            job("feature:wave", size=1, pending=False, next_check=due.isoformat())]
+    wave = next_release_waves(rows, now=NOW, quota=account(1000), reserve_mb=50, next_run=NOW,
+                              dispatch_interval_seconds=0)["updates"]
+    assert wave["scenarios"]["reference"]["start_at_utc"] == due.isoformat()
+    assert wave["scenarios"]["reference"]["finish_at_utc"] == (due+timedelta(seconds=10)).isoformat()
+
+
 def test_stage_retains_retry_clock_without_promising_source_recovery():
     retry = NOW + timedelta(minutes=15)
     rows = [{**job("empty", stage="source_issues"), "blocked_reason": "provider_empty", "fetch_seconds": None,

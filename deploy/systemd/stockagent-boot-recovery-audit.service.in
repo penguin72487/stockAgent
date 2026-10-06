@@ -1,0 +1,17 @@
+[Unit]
+Description=Record StockAgent boot infrastructure and service recovery evidence
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_boot_recovery_audit.sh
+StateDirectory=stockagent/boot-recovery
+StateDirectoryMode=0700
+UMask=0077
+Nice=10
+CPUWeight=10
+IOWeight=10
+MemoryMax=512M
+TimeoutStartSec=180

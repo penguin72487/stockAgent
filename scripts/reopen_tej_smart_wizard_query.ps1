@@ -28,7 +28,10 @@ if(Test-Path -LiteralPath $Output){throw 'Refusing to overwrite operator recover
 if(Test-Path -LiteralPath ($Output+'.submission.json')){throw 'Existing launcher intent; no action repeated'}
 if(-not $AllowDiscardQuerySettings){throw 'Explicit scratch-query reset authorization required'}
 if($Action -in @('inspect-addin','stop-addin') -and -not $AllowRestartAddin){throw 'Separate exact-addin restart authorization required'}
-if($ExpectedTitle -cne ('TEJ Smart Wizard (Version 4.1.1.7) -- '+$ExpectedWorkbook)){throw 'Unreviewed wizard version/workbook'}
+$titlePrefix='TEJ Smart Wizard (Version 4.1.1.7) -- '
+if($ExpectedTitle -cne ($titlePrefix+$ExpectedWorkbook) -and
+   (-not $ExpectedTitle.StartsWith($titlePrefix,[StringComparison]::Ordinal) -or
+    -not $ExpectedTitle.EndsWith(('\'+$ExpectedWorkbook),[StringComparison]::Ordinal))){throw 'Unreviewed wizard version/workbook'}
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
@@ -46,6 +49,7 @@ try {
     $excel=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')
     $book=$excel.Workbooks.Item($ExpectedWorkbook)
     if($null -eq $book -or $book.Windows.Count -ne 1 -or $book.Windows.Item(1).Hwnd -ne $ExpectedExcelWindow){throw 'Original workbook/window unavailable; no rebind'}
+    if($ExpectedTitle -cne ($titlePrefix+$book.Name) -and $ExpectedTitle -cne ($titlePrefix+$book.FullName)){throw 'Exact saved workbook title changed'}
     # Excel may activate its other workbook when the independent add-in exits.
     # Restore ONLY the inspected original workbook view; no Save/Close/new file.
     $activatedOriginalWorkbook=$false

@@ -116,12 +116,19 @@ def verify_progress_binding(browser, url: str, baseline: dict, output: Path) -> 
         fixture['scheduler'].update(state='waiting_recovery',paused_reason='source_validation_failed')
         expect(page.locator('#active-stage')).to_have_text('等待安全恢復',timeout=12000)
         expect(page.locator('#table-search')).to_have_value('Price')
+        fixture['scheduler'].update(state='replaying_authorized', authorized_unknown_replay={
+            'enabled':True,'max_replays_per_task_hour':2,'max_replays_per_hour':6,
+            'state':'checking_authorized_replay','next_check_at_utc':None})
+        expect(page.locator('#active-stage')).to_contain_text('依使用者授權核對／重排',timeout=12000)
+        expect(page.locator('#tej-automation')).to_contain_text('已授權有界自動重排')
+        expect(page.locator('#exported-rows')).to_have_text(format(initial+4,','))
+        expect(page.locator('#active-readback-card')).to_be_hidden()
         page.locator('#activity').scroll_into_view_if_needed()
         page.screenshot(path=str(output/'isolated-polling-fixture.png'))
         assert not errors
         return {'basis':'isolated_browser_response_fixture_not_a_TEJ_download',
                 'production_queue_modified':False,'provider_queries_sent':0,
-                'automatic_poll_transitions':['awaiting_preview','reading_preview','committed','http_error','waiting_recovery'],
+                'automatic_poll_transitions':['awaiting_preview','reading_preview','committed','http_error','waiting_recovery','replaying_authorized'],
                 'preserved_filter_and_focus':True,'readback_not_counted_as_committed':True,
                 'requests':calls,'errors':errors,'accepted':True}
     finally:
@@ -144,7 +151,10 @@ def verify(url: str, output: Path) -> dict:
                 status_responses = []
                 def record_status_response(reply):
                     if urlsplit(reply.url).path=='/tej/api/status' and reply.status==200:
-                        status_responses.append(reply.json())
+                        # Event callbacks must not block for a body while a
+                        # different greenlet closes this page. Read completed
+                        # bodies explicitly below, before leaving its lifetime.
+                        status_responses.append(reply)
                 page.on('response',record_status_response)
                 page.on('pageerror',lambda exc: errors.append(type(exc).__name__))
                 page.on('request',lambda req: provider_requests.append(urlsplit(req.url).netloc)
@@ -170,7 +180,7 @@ def verify(url: str, output: Path) -> dict:
                     rowProgress:document.querySelector('#result-row-progress').getAttribute('value'),
                     byteProgress:document.querySelector('#byte-progress').getAttribute('value')})""")
                 status=rendered_sample['status'];forecast=status['eta']['forecast']
-                assert status in status_responses, 'Rendered state must match an actual source HTTP response'
+                assert status in [reply.json() for reply in tuple(status_responses)], 'Rendered state must match an actual source HTTP response'
                 assert status['schema_version']==SCHEMA_VERSION and forecast['contract']=='tej_staged_query_scenarios_v1'
                 activity=status['activity']
                 assert activity['contract']=='tej_download_activity_v1' and activity['refresh_seconds']==5
@@ -220,6 +230,14 @@ def verify(url: str, output: Path) -> dict:
                     '非保證完成日' if forecast['execution_state']=='automatic_running' else
                     '未排定' if forecast['execution_state']=='finite_batch_running' else '尚未排定')
                 expect(page.locator('#tej-automation')).to_contain_text('自動排程存活' if status.get('scheduler',{}).get('alive') else '自動排程未運行')
+                startup=status.get('desktop_startup',{})
+                if startup.get('enabled'):
+                    assert startup['requires_windows_user_logon'] is True and startup['windows_autologin_changed'] is False
+                    expect(page.locator('#tej-automation')).to_contain_text('Windows 登入後每 60 秒核對')
+                replay=status.get('scheduler',{}).get('authorized_unknown_replay',{})
+                if replay.get('enabled'):
+                    expect(page.locator('#tej-automation')).to_contain_text('已授權有界自動重排')
+                    expect(page.locator('#tej-automation')).to_contain_text('非官方配額')
                 predicted_value=page.locator('#forecast-progress').get_attribute('value')
                 assert predicted_value is not None and 0<=float(predicted_value)<1
                 stacks=page.locator('#phase-rows .tej-scenario-stack')
@@ -259,6 +277,7 @@ def verify(url: str, output: Path) -> dict:
                     active_stage:document.querySelector('#active-stage').textContent,
                     last_success:document.querySelector('#last-success').textContent,
                     completed_downloads:document.querySelector('#completed-downloads').textContent,
+                    automation:document.querySelector('#tej-automation').textContent,
                     activity_sync:document.querySelector('#activity-sync').textContent,
                     result_row_progress:document.querySelector('#result-row-progress').getAttribute('value'),
                     byte_progress:document.querySelector('#byte-progress').getAttribute('value'),
@@ -296,6 +315,7 @@ def verify(url: str, output: Path) -> dict:
                 results.append({'profile':name,'http_status':response.status,'errors':errors,
                                 'external_provider_requests':len(provider_requests),
                                 'eta_contract':forecast['contract'],'eta_input_sha256':forecast['input_sha256'],**facts})
+                page.remove_listener('response',record_status_response)
                 page.close()
             polling = verify_progress_binding(browser,url,status,output)
         finally:

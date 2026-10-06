@@ -7,6 +7,7 @@ hashes, conflicts and per-cell provenance stay outside numeric model inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -16,6 +17,7 @@ import polars as pl
 from downloader.parquet_integrity import parquet_receipt_error
 
 CONTRACT = "tw_cross_source_missing_only_v1"
+SNAPSHOT_RETENTION_CONTRACT = "tw_verified_same_provider_snapshot_missing_only_v1"
 
 
 @dataclass(frozen=True)
@@ -218,3 +220,145 @@ def missing_only(primary: pl.DataFrame, candidate: pl.DataFrame, *, min_overlap=
         "accepted": accepted, "candidate_missing_keys": missing.height, "filled_keys": fills.height,
         "reason": "verified_mapping_missing_only" if accepted else "mapping_or_vintage_disagreement_requires_review"}
     return fills, report, overlap.filter(~pl.col("_agrees"))
+
+
+def verify_wide_missing_only(primary: pl.DataFrame, repaired: pl.DataFrame, fills: pl.DataFrame):
+    """Independent source projection gate: unchanged finite values, only real fills."""
+    keys = ['source_index', 'symbol']
+    for frame in (primary, repaired):
+        if frame['source_index'].null_count() or frame['source_index'].n_unique() != frame.height:
+            raise ValueError('duplicate/null wide source axis')
+    old = primary.unpivot(index='source_index', variable_name='symbol', value_name='value').filter(pl.col('value').is_finite())
+    new = repaired.unpivot(index='source_index', variable_name='symbol', value_name='value').filter(pl.col('value').is_finite())
+    joined = old.join(new, on=keys, how='left', suffix='_new', validate='1:1')
+    if joined.filter((pl.col('value_new').is_null() | (pl.col('value') != pl.col('value_new'))).fill_null(True)).height:
+        raise ValueError('missing-only repair changed/dropped observed primary values')
+    additions = new.join(old.select(keys), on=keys, how='anti')
+    evidence = fills.select(*keys, 'value')
+    if evidence.select(pl.struct(keys).is_duplicated().any()).item():
+        raise ValueError('duplicate source repair evidence keys')
+    compared = additions.join(evidence, on=keys, how='full', suffix='_evidence', coalesce=True, validate='1:1')
+    if compared.filter((pl.col('value').is_null() | pl.col('value_evidence').is_null()
+                        | (pl.col('value') != pl.col('value_evidence'))).fill_null(True)).height:
+        raise ValueError('source repair additions differ from actual pinned fill evidence')
+    return additions.height
+
+
+def retain_verified_wide_snapshot(primary: pl.DataFrame, prior: pl.DataFrame):
+    """Latest finite wins; restore only independently observed missing native slots."""
+    for frame in (primary,prior):
+        if frame['source_index'].null_count() or frame['source_index'].n_unique()!=frame.height:
+            raise ValueError('duplicate/null provider snapshot axis')
+        if any(not (dtype.is_numeric() or dtype==pl.Null) for name,dtype in frame.schema.items() if name!='source_index'):
+            raise ValueError('nonnumeric provider snapshot measures')
+    if primary.schema['source_index']!=prior.schema['source_index']:
+        raise ValueError('provider snapshot native axis type changed; explicit adapter required')
+    current=primary.unpivot(index='source_index',variable_name='symbol',value_name='value')
+    previous=prior.unpivot(index='source_index',variable_name='symbol',value_name='value').filter(pl.col('value').is_finite())
+    fills,qa,conflicts=missing_only(current.rename({'source_index':'period'}),previous.rename({'source_index':'period'}))
+    fills=fills.rename({'period':'source_index'})
+    if not fills.height:return primary.clone(),fills,qa,conflicts
+    keys=['source_index','symbol']
+    merged=current.join(fills,on=keys,how='full',coalesce=True,suffix='_prior',validate='1:1')
+    merged=merged.with_columns(pl.when(pl.col('value').is_finite().fill_null(False)).then(pl.col('value'))
+        .otherwise(pl.col('value_prior')).alias('value')).select(*keys,'value')
+    repaired=merged.pivot(on='symbol',index='source_index',values='value').sort('source_index')
+    verify_wide_missing_only(primary,repaired,fills)
+    return repaired,fills,qa,conflicts
+
+
+def verify_staged_snapshot_retention(root: Path, manifest: dict) -> None:
+    declared=manifest.get('source_snapshot_retention')
+    if not declared:return
+    if declared.get('contract')!=SNAPSHOT_RETENTION_CONTRACT:
+        raise ValueError('unsupported snapshot retention contract')
+    pinned=[]
+    for name in ('latest','prior'):
+        relative='source_retention/'+name+'_source_manifest.json'
+        with (root/relative).open('rb') as stream:
+            digest=hashlib.file_digest(stream,'sha256').hexdigest()
+        if (relative not in manifest['files'] or digest!=declared[name+'_source_manifest_sha256']):
+            raise ValueError('snapshot retention original source manifest changed')
+        original=json.loads((root/relative).read_text())
+        if any(original.get(k)!=manifest.get(k) for k in ('contract','use_restriction','authorization_sha256')):
+            raise ValueError('snapshot retention original private scope changed')
+        pinned.append(original)
+    total=0
+    specs={s.get('dataset'):s for s in manifest['feature_specs'] if s.get('source')=='FinLab'}
+    if len({r['dataset'] for r in declared['datasets']})!=len(declared['datasets']):
+        raise ValueError('duplicate snapshot retention quantities')
+    for row in declared['datasets']:
+        for name in ('latest','prior','fills'):
+            if row[name] not in manifest['files']:
+                raise ValueError('snapshot retention evidence not receipt-bound')
+        spec=specs[row['dataset']]
+        for name,original in zip(('latest','prior'),pinned):
+            native=next(s for s in original['feature_specs'] if s.get('dataset')==row['dataset'])
+            if any(native.get(k)!=spec.get(k) for k in ('feature','rule','category')):
+                raise ValueError('snapshot retention economic identity changed')
+            if manifest['files'][row[name]]['sha256']!=original['files'][native['path']]['sha256']:
+                raise ValueError('retained snapshot observation differs from original pinned source')
+        primary,prior,repaired,fills=[pl.read_parquet(root/p) for p in
+            (row['latest'],row['prior'],spec['path'],row['fills'])]
+        count=verify_wide_missing_only(primary,repaired,fills)
+        observed=prior.unpivot(index='source_index',variable_name='symbol',value_name='value_prior')
+        checked=fills.join(observed,on=['source_index','symbol'],how='left',validate='1:1')
+        if checked.filter((pl.col('value_prior').is_null() | (pl.col('value')!=pl.col('value_prior'))).fill_null(True)).height:
+            raise ValueError('snapshot retained fill not an actual prior observation')
+        current=primary.unpivot(index='source_index',variable_name='symbol',value_name='value').rename({'source_index':'period'})
+        old=observed.rename({'source_index':'period','value_prior':'value'}).filter(pl.col('value').is_finite())
+        accepted,qa,_=missing_only(current,old)
+        if not qa['accepted'] or not accepted.height or count!=row['filled_observations'] or count!=accepted.height:
+            raise ValueError('snapshot retained fills failed agreement/count gate')
+        total+=count
+    if total!=declared['filled_observations']:
+        raise ValueError('snapshot retention total does not match actual writeback')
+
+
+def verify_staged_source_repairs(root: Path, manifest: dict) -> None:
+    """A bundle/count alone is not proof the model source contains its fills."""
+    declared = manifest.get('source_repairs')
+    if not declared:
+        return
+    if declared.get('contract') != CONTRACT:
+        raise ValueError('unsupported staged source repair contract')
+    bundle_path = declared.get('manifest')
+    if bundle_path not in manifest['files']:
+        raise ValueError('staged source repair bundle is not receipt-bound')
+    bundle = json.loads((root / bundle_path).read_text())
+    if bundle.get('contract') != CONTRACT:
+        raise ValueError('staged repair bundle contract mismatch')
+    applied = {}
+    for spec in manifest['feature_specs']:
+        proof = manifest['files'].get(spec['path'], {}) if 'path' in spec else {}
+        repair = proof.get('source_repair')
+        if not repair:
+            continue
+        relative = repair.get('relative_fills_path')
+        if relative not in manifest['files'] or manifest['files'][relative]['sha256'] != repair['fills_sha256']:
+            raise ValueError('actual fill evidence is not receipt-bound')
+        fills = pl.read_parquet(root / relative).select('source_index', 'symbol', 'value')
+        keys = ['source_index', 'symbol']
+        if (fills.select(pl.struct(keys).is_duplicated().any()).item()
+                or fills.select(pl.any_horizontal(pl.all().is_null()).any()).item()
+                or fills.filter(~pl.col('value').is_finite()).height):
+            raise ValueError('invalid staged fill keys or observations')
+        table = pl.read_parquet(root / spec['path'])
+        fields = fills['symbol'].unique().to_list()
+        if any(field not in table.columns for field in fields):
+            raise ValueError('actual fills missing from staged source columns')
+        actual = table.select('source_index', *fields).unpivot(index='source_index',
+            variable_name='symbol', value_name='value_actual')
+        compared = fills.join(actual, on=keys, how='left', validate='1:1')
+        if compared.filter((pl.col('value_actual').is_null()
+                             | (pl.col('value') != pl.col('value_actual'))).fill_null(True)).height:
+            raise ValueError('declared actual fill was not written into staged model source')
+        if fills.height != repair['filled_observations']:
+            raise ValueError('staged source repair count mismatch')
+        if spec.get('dataset') in applied:
+            raise ValueError('duplicate staged source repair quantity')
+        applied[spec.get('dataset')] = fills.height
+    if (set(applied) != set(bundle['overrides'])
+            or sum(applied.values()) != declared['filled_observations']
+            or sum(applied.values()) != bundle['filled_observations']):
+        raise ValueError('declared source repairs were not actually staged')

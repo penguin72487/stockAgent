@@ -1,0 +1,10 @@
+# Exact pinned byte packets; one H2D per raw stock chunk, full dense model math.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_bf16_v7.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-bf16-v8
+
+data:
+  factorized_transfer_mode: compact_cuda_packed
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_gaprepair_v4/training-bf16-v8
+  resume: false

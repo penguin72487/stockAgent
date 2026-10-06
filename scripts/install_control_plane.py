@@ -150,6 +150,78 @@ def install_backup_units(env_file: Path):
     execute(['systemctl', 'enable', '--now', 'stockagent-control-backup.timer'])
 
 
+def install_verification_units(env_file: Path, runtime_lock: Path, evidence: Path) -> dict:
+    from stockagent.control.release_queue import private_json
+    if (env_file.is_symlink() or not env_file.is_file() or env_file.stat().st_uid != 0
+            or env_file.stat().st_mode & 0o077):
+        raise ValueError('verification needs the existing private owned control environment')
+    body = env_file.read_text()
+    lines = [line for line in body.splitlines() if line.startswith('CONTROL_PLANE_ENV_PATH=')]
+    if len(lines) != 1:
+        raise ValueError('one accepted control role is required')
+    values = shlex.split(lines[0].split('=', 1)[1])
+    if len(values) != 1:
+        raise ValueError('ambiguous control role')
+    prefix = Path(values[0]).resolve(strict=True)
+    _, dsn = control_environment_body(body, prefix)
+    expected = json.loads(runtime_lock.read_bytes())
+    actual = json.loads(execute([str(prefix / 'bin/python'), '-c',
+        'import json; from stockagent.runtime_identity import runtime_identity; print(json.dumps(runtime_identity()))']))
+    if validate_runtime_lock(expected, actual):
+        raise ValueError('verification role differs from its accepted Mamba runtime lock')
+    # Validate existing DB admission through its existing restricted role. The
+    # secret is inherited privately, never placed in argv or installation proof.
+    execute([str(prefix / 'bin/python'), '-c',
+        'import os; from stockagent.control.postgres import ControlStore; '
+        's=ControlStore(os.environ["CONTROL_PLANE_DSN"]); s.snapshot(); s.connection.close()'],
+        env={**os.environ, 'CONTROL_PLANE_DSN': dsn})
+    if (not re.fullmatch(r'[A-Za-z0-9/._-]+', str(ROOT))
+            or any(c in str(env_file) for c in '\n\r"\\')):
+        raise ValueError('repository path cannot be safely rendered into systemd')
+    state_root = Path('/var/lib/stockagent/control-release-verification')
+    if state_root.exists() or state_root.is_symlink():
+        info = state_root.lstat()
+        if state_root.is_symlink() or not state_root.is_dir() or info.st_uid != 0 or info.st_mode & 0o077:
+            raise ValueError('preserve an unknown control verification state root')
+    else:
+        state_root.mkdir(parents=True, mode=0o700)
+    lock_path = state_root / 'runtime-lock.json'
+    if lock_path.exists() or lock_path.is_symlink():
+        if private_json(lock_path) != expected:
+            raise ValueError('preserve a different control verification runtime lock')
+    else:
+        atomic_write_json(lock_path, expected)
+        lock_path.chmod(0o600)
+    policy = {'schema_version': 1, 'node_id': 'penguin-code-verifier', 'state_root': str(state_root),
+              'runtime_lock': str(lock_path), 'lease_seconds': 120, 'maximum_jobs_per_cycle': 8}
+    policy_path = Path('/etc/stockagent/control-release-verification.json')
+    if policy_path.exists() or policy_path.is_symlink():
+        if private_json(policy_path) != policy:
+            raise ValueError('preserve a different control verification policy')
+    else:
+        atomic_write_json(policy_path, policy)
+        policy_path.chmod(0o600)
+    units = []
+    for suffix in ('service', 'timer'):
+        template = ROOT / f'deploy/systemd/stockagent-control-release-verification.{suffix}.in'
+        text = template.read_text().replace('__REPO_ROOT__', str(ROOT)).replace('__CONTROL_ENV_FILE__', str(env_file.resolve()))
+        target = Path(f'/etc/systemd/system/stockagent-control-release-verification.{suffix}')
+        atomic_write_text(target, text, durable=True)
+        units.append(str(target))
+    execute(['systemd-analyze', 'verify', *units])
+    execute(['systemctl', 'daemon-reload'])
+    execute(['systemctl', 'enable', '--now', 'stockagent-control-release-verification.timer'])
+    result = {'state': 'control_verification_timer_installed', 'database_restart': False,
+              'environment_changed': False, 'scope': 'registered immutable code releases only',
+              'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+              'runtime_sha256': actual['sha256'],
+              'timer': execute(['systemctl', 'show', 'stockagent-control-release-verification.timer',
+                               '-p', 'ActiveState', '-p', 'UnitFileState'])}
+    evidence.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(evidence / 'control-verification-installation.json', result)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cluster', default='18/main')
@@ -163,15 +235,23 @@ def main():
                         help='create a fresh isolated mamba control role without changing PostgreSQL or services')
     parser.add_argument('--activate-role-only', action='store_true',
                         help='validate an installed mamba role and publish its private pointer without restarting services')
+    parser.add_argument('--install-verification-only', action='store_true',
+                        help='install the registered code-release work timer using the accepted Mamba role and existing DB')
+    parser.add_argument('--verification-runtime-lock', type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0 or not re.fullmatch(r'\d+/[a-zA-Z0-9_-]+', args.cluster):
         raise ValueError('root and an explicit safe local PostgreSQL cluster are required')
     if not 1 <= args.port <= 65535:
         raise ValueError('invalid PostgreSQL port')
-    if sum((args.install_backup_only, args.install_role_only, args.activate_role_only)) > 1:
+    if sum((args.install_backup_only, args.install_role_only, args.activate_role_only, args.install_verification_only)) > 1:
         raise ValueError('select one bounded installation action')
-    if not args.install_backup_only and not args.activate_role_only:
+    if not args.install_backup_only and not args.activate_role_only and not args.install_verification_only:
         validate_control_role_root(args.env_root)
+    if args.install_verification_only:
+        if args.verification_runtime_lock is None:
+            raise ValueError('select the previously accepted exact control runtime lock')
+        print(json.dumps(install_verification_units(args.env_file, args.verification_runtime_lock, args.evidence)))
+        return
     if args.activate_role_only:
         print(json.dumps(activate_control_role(args.env_root, args.env_file, args.evidence)))
         return

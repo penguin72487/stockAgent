@@ -4,11 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-exec 9>/run/lock/stockagent-remote-cold-artifact-ingress.lock
-if ! flock -n 9; then
-  echo "Remote cold-artifact ingress is already running; skipping this invocation."
-  exit 0
-fi
+# The Python entrypoint owns one ingress cycle and takes the existing shared
+# owner only for publication and source retirement, after independent reads.
 
 if [[ -r /etc/stockagent/remote-cold-artifact-ingress.env ]]; then
   set -a
@@ -22,8 +19,14 @@ python_bin="$(resolve_fintech_python)" || {
   exit 2
 }
 
+extra_args=()
+if [[ -n "${COLD_ARTIFACT_RETURN_POLICY:-}" ]]; then
+  extra_args+=(--policy "$COLD_ARTIFACT_RETURN_POLICY")
+fi
+
 exec "$python_bin" scripts/ingest_remote_cold_artifacts.py \
   --scope "${COLD_ARTIFACT_INGRESS_SCOPE:-ablations}" \
   --stable-hours "${COLD_ARTIFACT_INGRESS_STABLE_HOURS:-0}" \
   --max-publish "${COLD_ARTIFACT_INGRESS_MAX_PUBLISH:-1}" \
-  --apply
+  --output /var/lib/stockagent-cold-artifacts/remote-ingress-status.json \
+  "${extra_args[@]}" --apply

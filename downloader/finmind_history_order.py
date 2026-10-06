@@ -33,6 +33,11 @@ HISTORY_STAGES = (
     HistoryStage('us_stock_minute', 'USStockPriceMinute', '美股分鐘 K', 'detail'),
 )
 BY_DATASET = {stage.dataset: stage for stage in HISTORY_STAGES}
+# Mandatory local children belong to their parent's phase, not to an earlier
+# network stage. This is grouping only; it never creates an additional call.
+LOCAL_DERIVED_STAGES = {
+    'TaiwanStockTradingDailyReportSecIdAgg': BY_DATASET['TaiwanStockTradingDailyReport'],
+}
 STAGES = (('priority', '到期追新／指定有限優先回補'),
           ('core', '主要歷史／日資料／財報／總經／新聞'),
           *((stage.key, stage.label) for stage in HISTORY_STAGES),
@@ -55,6 +60,8 @@ def first_unfinished_dataset(connection: sqlite3.Connection, now: datetime, *,
     same frontier. This read-only guard also applies to status previews.
     """
     from downloader.finmind_supplemental import SOURCES, _eligible_anchor
+    from downloader.finmind_storage_objects import effective_sources, identity_clause, forward_identity_clause
+    sources = effective_sources(connection, SOURCES)
 
     has_frontiers = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE name='finmind_source_frontiers'").fetchone()
@@ -66,14 +73,15 @@ def first_unfinished_dataset(connection: sqlite3.Connection, now: datetime, *,
                               "AND state IN ('pending','failed','inflight') LIMIT 1", (dataset,)).fetchone():
             return dataset
         if has_frontiers:
-            identity = " AND data_id=''" if SOURCES[dataset].universe == 'market' else ''
+            identity = identity_clause(dataset) if sources[dataset].universe == 'market' else ''
             # An old cursor may overlap accepted tasks or verified closures;
             # seeding advances it without calls. Do not silently skip it.
             if connection.execute('SELECT 1 FROM finmind_source_frontiers WHERE dataset=?'
                                   + identity + ' AND older_than IS NOT NULL LIMIT 1', (dataset,)).fetchone():
                 return dataset
-            anchor = _eligible_anchor(SOURCES[dataset], now).isoformat()
+            anchor = _eligible_anchor(sources[dataset], now).isoformat()
+            forward = forward_identity_clause(dataset) if sources[dataset].endpoint == 'storage_objects' else identity
             if connection.execute('SELECT 1 FROM finmind_source_frontiers WHERE dataset=?'
-                                  + identity + ' AND newer_than<? LIMIT 1', (dataset, anchor)).fetchone():
+                                  + forward + ' AND newer_than<? LIMIT 1', (dataset, anchor)).fetchone():
                 return dataset
     return None

@@ -258,6 +258,42 @@ def test_normalized_window_cache_rejects_reused_identity_from_other_schema() -> 
     signal_engine.clear_live_panel_memory_cache()
 
 
+def test_normalized_window_preserves_values_and_private_live_copy() -> None:
+    original = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    # Advanced feature indexing reproduces checkpoint-alignment strides.
+    features = original[:, :, [3, 1]]
+    features[0, 0, 0] = np.nan
+    features[1, 1, 0] = np.inf
+    assert not features.flags.c_contiguous
+    before = features.copy()
+    panel = PanelData(
+        dates=np.array(["2026-07-16", "2026-07-17"], dtype="datetime64[D]"),
+        symbols=["2330", "0050", "1101"],
+        feature_names=["base", "next_session_open_gap_logret"],
+        features=features,
+        returns_1d=np.zeros((2, 3), dtype=np.float32),
+        tradable_mask=np.ones((2, 3), dtype=bool),
+        alive_mask=np.ones((2, 3), dtype=bool),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.full((2, 3), 100.0, dtype=np.float32),
+    )
+    try:
+        expected = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        cached = signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2)
+        np.testing.assert_array_equal(cached, expected)
+        assert not np.shares_memory(cached, features)
+        assert signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2) is cached
+        window, *_ = _day_trade_live_model_window(
+            panel, panel_idx=1, lookback=2,
+            price_snapshot=PriceSnapshot(prices=np.full(3, 110.0), open_prices=np.full(3, 110.0), source="fixture"),
+            resolved_asof="2026-07-20 09:00:01", source_timezone="Asia/Taipei", base_model_window=cached,
+        )
+        assert window.flags.c_contiguous
+        assert not np.shares_memory(window, cached)
+        np.testing.assert_array_equal(cached, expected)
+        np.testing.assert_array_equal(features, before)
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
 def test_live_panel_cache_identity_ignores_worker_count(tmp_path) -> None:
     config = type(
         "ConfigStub",

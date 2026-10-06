@@ -1,0 +1,24 @@
+[Unit]
+Description=StockAgent durable DuckLake and replication lifecycle worker
+Requires=stockagent-d-cold-mount.service stockagent-backup-transport-mount.service
+Wants=stockagent-temporal.service
+After=stockagent-d-cold-mount.service stockagent-backup-transport-mount.service network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_lakehouse_control.sh worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90s
+UMask=0077
+CPUQuota=150%
+MemoryHigh=768M
+MemoryMax=1536M
+Nice=10
+TasksMax=128
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target

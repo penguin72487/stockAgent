@@ -178,3 +178,36 @@ def test_file_changed_after_cold_verification_is_preserved(tmp_path, monkeypatch
     assert result["deleted_files"] == 1
     assert (target / "good.txt").read_text() == "unique changed data"
     assert {row["reason"] for row in result["kept"]} == {"changed-before-unlink"}
+
+
+@pytest.mark.parametrize("immediate", [False, True])
+def test_young_partial_requires_explicit_manual_age_bypass_and_retains_unknowns(tmp_path, immediate):
+    cold, hot, sid, target, _ = staging_fixture(tmp_path)
+    for file in target.iterdir():
+        os.utime(file, None)
+    (target / "unknown-proof").write_bytes(b"unique evidence")
+    result = cache.prune_partial_materialization(cold, hot, "example", sid, target.name,
+        receipt_dir=hot / "receipts", apply=True, manual_immediate=immediate)
+    assert result["deleted_files"] == (2 if immediate else 0)
+    assert result["manual_immediate"] is immediate
+    assert result["configured_min_age_days"] == 7
+    assert result["effective_min_age_days"] == (0 if immediate else 7)
+    assert (target / "unknown-proof").read_bytes() == b"unique evidence"
+    assert (tmp_path / "source/good.txt").read_text() == "recoverable"
+
+
+@pytest.mark.parametrize("flag", [1, "true", None])
+def test_partial_manual_mode_requires_explicit_boolean(tmp_path, flag):
+    cold, hot, sid, target, _ = staging_fixture(tmp_path)
+    with pytest.raises(SnapshotError, match="explicit booleans"):
+        cache.prune_partial_materialization(cold, hot, "example", sid, target.name,
+            receipt_dir=hot / "receipts", apply=True, manual_immediate=flag)
+    assert (target / "good.txt").exists()
+
+
+def test_native_partial_reads_cannot_target_unenrolled_cold_namespace(tmp_path):
+    cold, hot, sid, target, _ = staging_fixture(tmp_path)
+    with pytest.raises(SnapshotError, match="canonical D authority"):
+        cache.prune_partial_materialization(cold, hot, "example", sid, target.name,
+            receipt_dir=hot / "receipts", apply=True, manual_immediate=True, d_primary_native_reads=True)
+    assert (target / "good.txt").exists()

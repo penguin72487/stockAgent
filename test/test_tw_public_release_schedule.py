@@ -50,6 +50,19 @@ def test_pmi_uses_third_session_and_calendar_holiday():
     assert lookup["date"].item() == date(2026, 9, 7)
 
 
+def test_pmi_boundary_window_is_deferred_without_inventing_future_sessions():
+    c = [date(2026,9,n) for n in (1,2,3,4)] + [date(2026,10,1),date(2026,10,2)]
+    lookup = schedule_lookup(["2026-08-01", "2026-09-01", "2026-10-01", "2026-11-01"], RULES["pmi"], c)
+    assert lookup["source_index"].to_list() == ["2026-09-01"]
+    assert lookup["date"].item() == date(2026,9,4)
+
+
+def test_pmi_hole_inside_calendar_is_not_silently_a_pending_release():
+    c = [date(2026,8,n) for n in (3,4,5,6)] + [date(2026,10,n) for n in (1,2,5,6)]
+    with pytest.raises(ValueError, match="calendar does not cover"):
+        schedule_lookup(["2026-09-01"], RULES["pmi"], c)
+
+
 def test_ndc_and_tdcc_have_no_blanket_week_or_month_end_padding():
     c = calendar()
     assert publication_proxy("2026-09-27", RULES["business"], c) == date(2026, 9, 27)

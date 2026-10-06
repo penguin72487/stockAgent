@@ -5710,7 +5710,7 @@ def _panel_training_transform_fingerprint(
 ) -> dict[str, Any]:
     """Use the immutable panel-cache digest, or hash a non-cached test panel."""
 
-    array = np.asarray(value)
+    array = value if getattr(value, "_stockagent_factorized_features", False) else np.asarray(value)
     cached = getattr(panel, "content_fingerprints", None)
     item = None if not isinstance(cached, Mapping) else cached.get(name)
     if (
@@ -5950,6 +5950,10 @@ def _fit_group_temporal_basis(
         str(name).strip().lower().replace("-", "_") in {"pca", "klt", "pca_klt", "pca/klt"}
         for name in families
     )
+    covariance_lag_batch_size = min(
+        lookback, int(config.training.temporal_basis_covariance_lag_batch_size)
+    )
+    covariance_cpu_threads = config.training.temporal_basis_covariance_cpu_threads
 
     payload: dict[str, Any] | None = None
     cache_key = _training_transform_cache_key(
@@ -5968,6 +5972,8 @@ def _fit_group_temporal_basis(
             "lookback": int(lookback),
             "feature_lag": int(execution_feature_lag(train_ds.execution_mode)),
             "uses_pca": bool(uses_pca),
+            **({"covariance_lag_batch_size": covariance_lag_batch_size}
+               if uses_pca and covariance_lag_batch_size > 1 else {}),
             "train_years": [int(year) for year in train_years],
             "fold_ids": [int(fold.fold_id) for fold in group_folds],
         },
@@ -5990,15 +5996,29 @@ def _fit_group_temporal_basis(
         covariance: torch.Tensor | None = None
         pca_metadata: dict[str, Any] | None = None
         if uses_pca:
-            pca_fit = fit_training_only_pca_klt(
-                train_ds.features_t,
-                train_ds.valid_indices,
-                lookback=lookback,
-                feature_lag=execution_feature_lag(train_ds.execution_mode),
-                components=int(
-                    components_by_family.get("pca_klt", components)
-                ),
-            )
+            previous_threads = torch.get_num_threads()
+            try:
+                if covariance_cpu_threads is not None:
+                    torch.set_num_threads(int(covariance_cpu_threads))
+                print(
+                    f"[training transform] temporal_basis fit start "
+                    f"targets={len(train_ds.valid_indices)} "
+                    f"cpu_threads={torch.get_num_threads()} "
+                    f"lag_batch_size={covariance_lag_batch_size}", flush=True,
+                )
+                pca_fit = fit_training_only_pca_klt(
+                    train_ds.features_t,
+                    train_ds.valid_indices,
+                    lookback=lookback,
+                    feature_lag=execution_feature_lag(train_ds.execution_mode),
+                    components=int(
+                        components_by_family.get("pca_klt", components)
+                    ),
+                    lag_batch_size=covariance_lag_batch_size,
+                )
+            finally:
+                if covariance_cpu_threads is not None:
+                    torch.set_num_threads(previous_threads)
             overrides["pca_klt"] = pca_fit.basis
             covariance = pca_fit.covariance
             pca_metadata = pca_fit.metadata
@@ -6094,21 +6114,31 @@ def _fit_masked_training_feature_rms(
     squared_sum = None if window_rms else np.zeros(feature_count, dtype=np.float64)
     active_date_count = np.zeros(feature_count, dtype=np.int64)
     alive_cell_count = 0
-    for start in range(0, len(row_indices), 32):
-        selected = row_indices[start:start + 32]
+    chunk_rows = 32
+    if getattr(features, "_stockagent_factorized_features", False):
+        slabs=features.iter_reduction_column_slabs(row_indices)
+    else:
+        slabs=((row_indices[start:start+chunk_rows],slice(None),np.arange(feature_count),features[row_indices[start:start+chunk_rows]])
+               for start in range(0,len(row_indices),chunk_rows))
+    pending_rows=None;date_flags=None
+    for selected,symbol_slice,columns,raw_values in slabs:
+        if pending_rows is None or not np.array_equal(selected,pending_rows):
+            if date_flags is not None:active_date_count+=date_flags.sum(axis=0,dtype=np.int64)
+            pending_rows=np.asarray(selected);date_flags=np.zeros((len(selected),feature_count),dtype=bool)
         values = np.nan_to_num(
-            np.asarray(features[selected], dtype=np.float32),
+            np.asarray(raw_values, dtype=np.float32),
             nan=0.0, posinf=0.0, neginf=0.0,
         )
-        alive = np.asarray(mask[selected], dtype=np.bool_)
+        alive = np.asarray(mask[selected,symbol_slice], dtype=np.bool_)
         alive_cell_count += int(alive.sum(dtype=np.int64))
         if squared_sum is not None:
-            squared_sum += np.einsum(
+            squared_sum[columns] += np.einsum(
                 "tsf,tsf,ts->f", values, values, alive,
                 dtype=np.float64, optimize=True,
             )
         observed = (np.abs(values) > epsilon) & alive[..., None]
-        active_date_count += np.any(observed, axis=1).sum(axis=0, dtype=np.int64)
+        date_flags[:,columns] |= np.any(observed, axis=1)
+    if date_flags is not None:active_date_count+=date_flags.sum(axis=0,dtype=np.int64)
     if alive_cell_count <= 0:
         raise ValueError("causal feature RMS normalization found no alive training cells")
     if squared_sum is None:
@@ -6342,6 +6372,123 @@ def _apply_causal_feature_rms_to_model(
         )
     setter(scale, active)
     setattr(model, "causal_feature_rms_metadata", deepcopy(metadata))
+
+
+def _fit_group_feature_svd(
+    *, config: ExperimentConfig, panel: PanelData,
+    train_ds: CrossSectionalDataset, train_years: Sequence[int],
+    group_folds: Sequence[WalkForwardFold], output_path: Path, device: torch.device,
+    causal_feature_rms,
+):
+    """Fit/cache the selected fixed feature projection through shared ownership."""
+    model_config = config.training.financial_transformer
+    if not int(model_config.feature_svd_components):
+        return None
+    active_name = str(_active_model_config(config)["config_name"])
+    if active_name != "financial_transformer" or causal_feature_rms is None:
+        raise ValueError("feature SVD requires the canonical FinancialTransformer RMS fit")
+    from stockagent.models.feature_svd import CONTRACT, fit_training_feature_svd
+
+    scale, active, rms_metadata = causal_feature_rms
+    contract = {
+        "contract": CONTRACT,
+        "components": int(model_config.feature_svd_components),
+        "analysis_components": int(model_config.feature_svd_analysis_components),
+        "oversampling": int(model_config.feature_svd_oversampling),
+        "power_iterations": int(model_config.feature_svd_power_iterations),
+        "seed": int(model_config.feature_svd_seed),
+        "normalizer_fingerprint": rms_metadata["normalizer_fingerprint"],
+        "train_years": list(train_years),
+        "fold_ids": [fold.fold_id for fold in group_folds],
+        "lookback": int(train_ds.lookback),
+        "feature_lag": int(execution_feature_lag(train_ds.execution_mode)),
+    }
+    cache_key = _training_transform_cache_key(kind="feature_svd", panel=panel,
+        train_ds=train_ds, contract=contract, include_alive_mask=True)
+    payload = None
+
+    def load_cache():
+        nonlocal payload
+        payload = _load_training_transform_cache(output_path, kind="feature_svd", cache_key=cache_key)
+
+    _run_rank0_store_synchronized_phase("feature_svd_cache_load", load_cache)
+    distributed = _distributed_is_initialized() and _distributed_world_size() > 1
+    if distributed:
+        objects = [payload]
+        dist.broadcast_object_list(objects, src=0)
+        payload = objects[0]
+    cache_status = "hit" if payload is not None else "miss"
+    if payload is None:
+        # Every rank owns a disjoint set of training input dates. Each operator
+        # pass reduces only a small F x sketch-width buffer, not the raw panel.
+        fitted = fit_training_feature_svd(panel.features, panel.alive_mask,
+            train_ds.valid_indices, lookback=train_ds.lookback,
+            feature_lag=contract["feature_lag"], scale=scale, active_mask=active,
+            components=contract["components"], analysis_components=contract["analysis_components"],
+            oversampling=contract["oversampling"], power_iterations=contract["power_iterations"],
+            seed=contract["seed"], device=device, distributed=distributed,
+            progress=lambda value: print(f"[feature SVD] {json.dumps(value)}", flush=True))
+        if _distributed_should_write():
+            metadata = {**fitted.metadata, **contract,
+                "feature_date_start": str(np.asarray(panel.dates[fitted.metadata["training_source_min"]], dtype="datetime64[D]")),
+                "feature_date_end": str(np.asarray(panel.dates[fitted.metadata["training_source_max"]], dtype="datetime64[D]")),
+                "feature_names": [str(name) for name in panel.feature_names],
+            }
+            metadata["projection_fingerprint"] = _stable_fingerprint({
+                "contract": contract, "directions": fitted.directions.tolist()})
+            payload = {"directions": fitted.directions.tolist(), "metadata": metadata}
+
+        def store_cache():
+            _store_training_transform_cache(output_path, kind="feature_svd",
+                                            cache_key=cache_key, payload=payload)
+
+        _run_rank0_store_synchronized_phase("feature_svd_cache_store", store_cache)
+        if distributed:
+            objects = [payload]
+            dist.broadcast_object_list(objects, src=0)
+            payload = objects[0]
+    if payload is None:
+        raise RuntimeError("feature SVD fit produced no distributed payload")
+    metadata = dict(payload["metadata"])
+    directions = torch.tensor(payload["directions"], dtype=torch.float32)
+    if _distributed_should_write():
+        destinations = [_group_dir(output_path, list(train_years)),
+                        *[_fold_dir(output_path, fold.fold_id) for fold in group_folds]]
+        cumulative = metadata["cumulative_squared_energy_ratio"]
+        spectrum = metadata["squared_singular_values"]
+        report = ["# 訓練期特徵軸 SVD", "", "## 1. 執行進度", "",
+            f"已完成所有訓練輸入掃描；保留 {contract['components']} 維。cache={cache_status}。", "",
+            "僅訓練期 RMS 後非中心化平方能量，不等於預測資訊或報酬。驗證／測試使用同一固定方向。", "",
+            f"日期：{metadata['feature_date_start']}～{metadata['feature_date_end']}；",
+            f"原始輸入 {metadata['features']} 維，alive 訓練細胞 {metadata['alive_training_cells']:,}。", "",
+            "| 保留方向 | 累積平方能量 | 單方向平方奇異值 | Ritz 相對殘差 |",
+            "| --- | ---: | ---: | ---: |",
+            *[f"| {i+1} | {ratio:.8%} | {spectrum[i]:.9g} | {metadata['relative_ritz_residual'][i]:.6g} |"
+              for i, ratio in enumerate(cumulative)], "",
+            f"尚未納入所列方向的能量：{max(0.,1-cumulative[-1]):.8%}。",
+            "寬矩陣為 oversampled Rayleigh-Ritz 截斷估計；比例分母為全量能量，沒有只對 top-k 歸一。",
+        ]
+        for directory in destinations:
+            _write_temporal_basis_metadata(directory / "feature_svd.json", metadata)
+            (directory / "feature_svd_spectrum.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+        print(f"[training transform] feature_svd cache={cache_status} dimensions="
+              f"{metadata['features']}->{contract['components']} "
+              f"energy={metadata['selected_energy_ratio']:.8%}", flush=True)
+    return directions, metadata
+
+
+def _apply_feature_svd_to_model(model: nn.Module, fitted) -> None:
+    if fitted is None:
+        return
+    directions, metadata = fitted
+    encoder = getattr(model, "candle_encoder", None)
+    if encoder is None or not callable(getattr(encoder, "set_feature_svd_projection", None)):
+        raise TypeError("feature SVD requires a compatible CandleEncoder")
+    if bool(getattr(encoder, "_feature_svd_fitted", False)):
+        if not torch.equal(encoder.feature_svd_directions.detach().cpu(), directions):
+            raise RuntimeError("checkpoint feature SVD directions differ from the exact fold fit")
+    encoder.set_feature_svd_projection(directions)
+    setattr(model, "feature_svd_metadata", deepcopy(metadata))
 
 
 def _fit_group_futures_feature_rms(
@@ -8148,7 +8295,9 @@ def _feature_slab_from_metadata(
     slab_rows = batch_rows + int(split.lookback) - 1
     if feature_start < 0 or feature_start + slab_rows > int(split.features.size(0)):
         return None
-    feature_slab = split.features.narrow(0, feature_start, slab_rows)
+    feature_slab = (split.features.slab(feature_start,slab_rows)
+                    if getattr(split.features,"_stockagent_factorized_features",False)
+                    else split.features.narrow(0, feature_start, slab_rows))
     if feature_slab.device != device:
         feature_slab = feature_slab.to(device=device, non_blocking=non_blocking)
     return feature_slab
@@ -15300,6 +15449,10 @@ def _maybe_cache_windowed_base_on_device(
     safety_margin_gb: float,
     feature_dtype: torch.dtype | None = None,
 ) -> WindowedSplitTensors:
+    if getattr(split.features, "_stockagent_factorized_features", False):
+        # The model still receives ordinary tensors; the immutable factorized
+        # source is deliberately not a whole-panel GPU-cache candidate.
+        return split
     base_tensors = _windowed_base_tensors(split)
     moved = _maybe_cache_tensors_on_device(
         name=f"{name} shared base",
@@ -15590,9 +15743,9 @@ def _pad_eval_panel_slab_first_dim(
         )
 
     pad_rows = target_rows - valid_rows
-    feature_pad = feature_slab[-1:].expand(
-        (pad_rows,) + tuple(feature_slab.shape[1:])
-    )
+    factorized_slab=getattr(feature_slab,"_stockagent_factorized_slab",False)
+    feature_pad = None if factorized_slab else feature_slab[-1:].expand(
+        (pad_rows,) + tuple(feature_slab.shape[1:]))
     returns_pad = returns.new_zeros((pad_rows,) + tuple(returns.shape[1:]))
     tradable_pad = tradable_mask[-1:].expand(
         (pad_rows,) + tuple(tradable_mask.shape[1:])
@@ -15607,7 +15760,7 @@ def _pad_eval_panel_slab_first_dim(
         (pad_rows,) + tuple(benchmark.shape[1:])
     )
     return (
-        torch.cat((feature_slab, feature_pad), dim=0),
+        feature_slab.pad_end(pad_rows) if factorized_slab else torch.cat((feature_slab, feature_pad), dim=0),
         torch.cat((returns, returns_pad), dim=0),
         torch.cat((tradable_mask, tradable_pad), dim=0),
         torch.cat((can_buy_mask, buy_pad), dim=0),
@@ -19644,6 +19797,19 @@ def _distributed_min_int(local_value: int, device: torch.device) -> int:
     return int(value.detach().cpu().item())
 
 
+def _epoch_max_rank_wall_times(payload: dict, device: torch.device) -> dict[str, float]:
+    """One phase-boundary reduction, not hot-path CUDA profiling/synchronization."""
+    elapsed = torch.tensor(
+        [float(payload.get("epoch_total_s", 0.0)),
+         float(payload.get("train_total_s", 0.0))],
+        dtype=torch.float64, device=device,
+    )
+    if _distributed_is_initialized():
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    max_epoch, max_train = elapsed.cpu().tolist()
+    return {"epoch_max_rank_s": max_epoch, "train_max_rank_s": max_train}
+
+
 def _distributed_rank0_decision(local_value: bool, device: torch.device) -> bool:
     """Use rank 0 as the single authority for a conditional collective branch."""
     if not _distributed_is_initialized() or _distributed_world_size() <= 1:
@@ -23323,6 +23489,8 @@ def _training_dataset_identity(panel: PanelData) -> dict[str, Any]:
         "symbol_names": [str(symbol) for symbol in panel.symbols],
         "feature_names": [str(name) for name in panel.feature_names],
     }
+    if getattr(panel.features,"_stockagent_factorized_features",False):
+        identity["factorized_features"] = dict(panel.features.content_fingerprint)
     if panel.overnight_1325_available is not None:
         source = panel.overnight_1325_source or {}
         decision_time = str(source.get("decision_time", "13:25"))
@@ -25013,6 +25181,12 @@ def _run_training_impl(
         )
         torch.backends.cudnn.deterministic = False
 
+    if device.type == "cuda" and not config.environment.use_tensor_cores:
+        # Reset a previous run's global TF32 state as well as the CLI default.
+        # BF16 autocast still uses its hardware Tensor Core kernels.
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     if config.environment.use_tensor_cores and device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -25388,6 +25562,9 @@ def _run_training_impl(
             group_folds=group_folds,
             output_path=output_path,
         )
+        feature_svd = _fit_group_feature_svd(config=config, panel=panel, train_ds=train_ds,
+            train_years=train_years, group_folds=group_folds, output_path=output_path,
+            device=device, causal_feature_rms=causal_feature_rms)
         futures_feature_rms = _fit_group_futures_feature_rms(
             config=config, panel=panel, train_ds=train_ds,
             train_years=train_years, group_folds=group_folds, output_path=output_path,
@@ -25711,6 +25888,7 @@ def _run_training_impl(
             temporal_basis_overrides=temporal_basis_overrides,
         ).to(device)
         _apply_causal_feature_rms_to_model(model, causal_feature_rms)
+        _apply_feature_svd_to_model(model, feature_svd)
         pretrained_initialization_report: dict[str, Any] | None = None
         pretrained_initialization_applied = False
         if temporal_basis_metadata is not None:
@@ -25848,6 +26026,7 @@ def _run_training_impl(
                         causal_feature_rms,
                     )
                     _apply_futures_feature_rms_to_model(model, futures_feature_rms)
+                    _apply_feature_svd_to_model(model, feature_svd)
                     print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
@@ -26055,17 +26234,9 @@ def _run_training_impl(
         def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
             if not record_epoch_curve:
                 return 0.0
-            if profile_timing:
-                elapsed = torch.tensor(
-                    [float(payload.get("epoch_total_s", 0.0)),
-                     float(payload.get("train_total_s", 0.0))],
-                    dtype=torch.float64, device=device,
-                )
-                if _distributed_is_initialized():
-                    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-                max_epoch, max_train = elapsed.cpu().tolist()
-                payload["epoch_max_rank_s"] = max_epoch
-                payload["train_max_rank_s"] = max_train
+            # Wall times are useful even with --no-profile-timing. Reduce two
+            # existing phase scalars once per epoch; do not fence every batch.
+            payload.update(_epoch_max_rank_wall_times(payload, device))
             start_t = time.perf_counter()
             curve_error: BaseException | None = None
             try:
@@ -26175,6 +26346,27 @@ def _run_training_impl(
             if model_compile_requested and not will_train_epochs
             else "off"
         )
+        if getattr(panel.features,"_stockagent_factorized_features",False):
+            # Host I/O is intentionally outside compiled tensor mathematics.
+            # The canonical model compiles its shared effective-kernel,
+            # individual encoder and market/head partitions instead of trying
+            # to capture filesystem reads in a monolithic fullgraph wrapper.
+            model.factorized_input_compile=model_compile_requested
+            model.factorized_encoder_checkpoint=config.training.factorized_encoder_checkpoint
+            model.factorized_encoder_vram_safety_margin_bytes=int(
+                config.training.vram_safety_margin_gb * 1024**3)
+            if model_compile_requested:
+                import torch._functorch.config as factorized_aot_config
+                if not hasattr(factorized_aot_config,"backward_pass_autocast"):
+                    raise RuntimeError("factorized AMP training requires an explicit compiled backward autocast contract")
+                # Dedicated training workers call backward outside autocast.
+                # Loss partitions must share the model's assumption as well.
+                factorized_aot_config.backward_pass_autocast="off"
+                print(f"[Train {train_years}] factorized AOT backward autocast=off (forward/loss AMP retained)")
+            should_enable_compile=False
+            model_compile_status=("partitioned:factorized_eager_io_compiled_math" if model_compile_requested else "off:factorized_eager_io_and_math")
+            panel_slab_compile_status=model_compile_status
+            eval_model_compile_status=model_compile_status
         model_compile_probe_status = "not_run"
         compile_setup_error: str | None = None
         loss_compile_status = "eager"

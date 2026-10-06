@@ -1,0 +1,12 @@
+# Same complete input and trading model; stabilize only the joint feature stem.
+# BF16 AMP remains configured, FP32 master/financial math remain unchanged.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v2.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-no-basis-bf16-v3
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v3/training-bf16
+  resume: false
+
+training:
+  financial_transformer:
+    candle_projection_fp32: true

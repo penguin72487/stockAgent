@@ -81,7 +81,8 @@ def audit_queue(connection: sqlite3.Connection, root: Path, *, after_rowid: int 
                          hashlib.sha256(raw).hexdigest() if raw is not None else None),
                     )
                     connection.execute(
-                        "UPDATE tasks SET state='pending',next_attempt_at_utc=NULL,error_code=? WHERE rowid=?",
+                        "UPDATE tasks SET state='pending',next_attempt_at_utc=NULL,error_code=?,"
+                        "priority=MIN(priority,1) WHERE rowid=?",
                         (f"local_integrity:{error}", task["integrity_rowid"]),
                     )
                     item.update(requeued=True, audit_id=record.lastrowid)

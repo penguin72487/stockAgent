@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import math
 import os
@@ -35,9 +36,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from stockagent.config import load_config
-
 
 DEFAULT_CONFIG = (
     ROOT
@@ -214,6 +212,7 @@ def _score_curve(
     max_peak_fraction: float,
     min_headroom_gib: float,
     strict_compiled_backtest: bool = True,
+    world_size: int = 1,
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -223,9 +222,18 @@ def _score_curve(
             f"found {len(steady)}"
         )
 
+    # Both names are emitted by canonical executors. The trajectory executor
+    # predates the generic executor's MAX-rank names; neither is rank-local.
     max_rank = any("epoch_wall_s_max_rank" in row for row in steady)
-    epoch_wall_key = "epoch_wall_s_max_rank" if max_rank else "epoch_wall_s"
-    train_wall_key = "train_total_s_max_rank" if max_rank else "train_total_s"
+    trajectory_max_rank = any("epoch_max_rank_s" in row for row in steady)
+    if max_rank:
+        epoch_wall_key, train_wall_key = "epoch_wall_s_max_rank", "train_total_s_max_rank"
+    elif trajectory_max_rank:
+        epoch_wall_key, train_wall_key = "epoch_max_rank_s", "train_max_rank_s"
+    else:
+        epoch_wall_key, train_wall_key = "epoch_wall_s", "train_total_s"
+        if world_size > 1:
+            reasons.append("DDP scoring requires canonical maximum-rank timing")
     required_finite = (epoch_wall_key, train_wall_key, "train_loss", "val_mean", "test_mean")
     for row in steady:
         epoch = int(row.get("epoch", 0) or 0)
@@ -240,6 +248,8 @@ def _score_curve(
             reasons.append(f"epoch {epoch} has non-positive/non-finite gradient norm")
         if int(row.get("dynamo_unique_graphs_epoch_delta", 0) or 0) != 0:
             reasons.append(f"epoch {epoch} compiled a new Dynamo graph after warmup")
+        if world_size > 1 and "dynamo_unique_graphs_epoch_delta" not in row:
+            reasons.append(f"epoch {epoch} lacks steady-state graph telemetry")
         failure_keys = _FALLBACK_KEYS if strict_compiled_backtest else _GENERIC_FAILURE_KEYS
         for key in failure_keys:
             if int(row.get(key, 0) or 0) != 0:
@@ -300,7 +310,8 @@ def _score_curve(
         "padded_slots": padded_slots,
         "padding_fraction": (padded_slots - train_rows) / padded_slots,
         "median_epoch_wall_s": median_epoch_wall,
-        "timing_scope": "maximum_rank" if max_rank else "legacy_reporting_rank",
+        "timing_scope": "maximum_rank" if max_rank or trajectory_max_rank else "legacy_reporting_rank",
+        "epoch_wall_field": epoch_wall_key,
         "epoch_wall_mad_s": _median_absolute_deviation(epoch_wall),
         "median_train_wall_s": median_train_wall,
         "train_wall_mad_s": _median_absolute_deviation(train_wall),
@@ -660,6 +671,9 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
     ]
     if getattr(args, "profile_timing", False):
         cmd.append("--profile-timing")
+    else:
+        cmd.append("--no-profile-timing")
+    cmd.append("--no-debug-timing-sync")
     print(
         f"[batch-benchmark] start strategy={args.multi_gpu_strategy} "
         f"global_batch={batch_size} local_batch={batch_size // args.world_size}",
@@ -690,6 +704,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
             status = "timeout"
             _terminate_process_group(process)
             return_code = process.returncode
+    complete_fold_wall_s = time.perf_counter() - started
     stop.set()
     sampler.join(timeout=5)
     elapsed_s = time.perf_counter() - started
@@ -702,6 +717,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         "local_batch_size": batch_size // args.world_size,
         "world_size": args.world_size,
         "elapsed_s": elapsed_s,
+        "complete_fold_wall_s": complete_fold_wall_s,
         "attempt_dir": str(attempt_dir),
         "command": cmd,
         "log_path": str(log_path),
@@ -737,9 +753,14 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 strict_compiled_backtest=(
                     args.expected_execution_mode == "tw_day_trade"
                 ),
+                world_size=args.world_size,
             )
             result.update(score)
             result["epoch_curve"] = str(curve_path)
+            # Retain lightweight telemetry even if admission rejects a run;
+            # completed-return may archive the full hot artifact afterwards.
+            result["curves"] = rows
+            result["complete_fold_real_rows_per_s"] = train_rows * len(rows) / complete_fold_wall_s
             if result.get("ok"):
                 result["local_batch_size"] = batch_size // args.world_size
         except Exception as exc:
@@ -773,7 +794,25 @@ def _default_output_root() -> Path:
     return ROOT / "artifacts/benchmarks" / f"tw_day_trade_daily_batch_power2_{timestamp}"
 
 
+def _resolved_source_config(config_path: Path, project_root: Path) -> dict[str, Any]:
+    # A helper can live outside a frozen release. Resolve its config and later
+    # lifecycle imports from the selected trainer, not the helper's checkout.
+    sys.path.insert(0, str(project_root))
+    module = importlib.import_module("stockagent.config")
+    expected = (project_root / "stockagent/config.py").resolve()
+    if Path(module.__file__).resolve() != expected:
+        raise ValueError(
+            "config library does not match --project-root; use a fresh process "
+            f"for the selected trainer: expected {expected}, loaded {module.__file__}"
+        )
+    base = _plain_config_value(asdict(module.load_config(config_path)))
+    if not isinstance(base, dict):
+        raise ValueError(f"resolved config root must be a mapping: {config_path}")
+    return base
+
+
 def main() -> None:
+    global ROOT
     parser = argparse.ArgumentParser(
         description=(
             "Find the highest-throughput power-of-two global batch for the canonical "
@@ -781,6 +820,8 @@ def main() -> None:
         )
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--project-root", type=Path, default=ROOT,
+                        help="run the canonical trainer from this verified frozen checkout")
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument(
         "--batch-sizes",
@@ -824,8 +865,13 @@ def main() -> None:
     parser.add_argument("--min-vram-headroom-gib", type=float, default=3.0)
     parser.add_argument("--wait-for-idle", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--idle-poll-s", type=float, default=30.0)
+    parser.add_argument("--stop-after-oom", action="store_true",
+                        help="end an increasing power-of-two sweep at its first observed CUDA OOM")
     args = parser.parse_args()
 
+    ROOT = args.project_root.expanduser().resolve(strict=True)
+    if not (ROOT / "train.py").is_file() or not (ROOT / "scripts/check_environment.py").is_file():
+        raise SystemExit(f"project root lacks the canonical trainer/preflight: {ROOT}")
     args.config = args.config.expanduser().resolve()
     if not args.config.is_file():
         raise SystemExit(f"config does not exist: {args.config}")
@@ -874,9 +920,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
     args.output_root.mkdir(parents=True, exist_ok=True)
     try:
-        base = _plain_config_value(asdict(load_config(args.config)))
-        if not isinstance(base, dict):
-            raise ValueError(f"resolved config root must be a mapping: {args.config}")
+        base = _resolved_source_config(args.config, ROOT)
         source_contract = _validate_source_contract(
             base, expected_execution_mode=args.expected_execution_mode
         )
@@ -890,6 +934,8 @@ def main() -> None:
     request = {
         "schema_version": 1,
         "source_config": str(args.config),
+        "project_root": str(ROOT),
+        "config_library": str(ROOT / "stockagent/config.py"),
         "source_contract": source_contract,
         "expected_execution_mode": args.expected_execution_mode,
         "output_root": str(args.output_root),
@@ -922,6 +968,12 @@ def main() -> None:
         (args.output_root / "summary.json").write_text(
             json.dumps(results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        if args.stop_after_oom and any(
+            pattern in result.get("failure_patterns", [])
+            for pattern in ("CUDA out of memory", "OutOfMemoryError")
+        ):
+            print(f"[batch-benchmark] observed OOM frontier at global batch={batch_size}; stopping", flush=True)
+            break
 
     winner = _select_winner(results)
     if winner is None:

@@ -5,10 +5,12 @@ import json
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -222,7 +224,7 @@ def _feature_path(root: Path, symbol: str | None) -> Path | None:
     if direct.exists():
         return direct
     normalized = str(symbol).replace(".", "").replace("-", "").replace("_", "")
-    for path in root.glob(f"*{FEATURE_SUFFIX}"):
+    for path in _feature_files(root):
         candidate = path.name.removesuffix(FEATURE_SUFFIX).replace(".", "").replace("-", "").replace("_", "")
         if candidate.upper() == normalized.upper():
             return path
@@ -243,7 +245,7 @@ def _date_to_text(value: Any, *, date_only: bool = True) -> str | None:
     return text[:19]
 
 
-def _max_date_from_parquet(path: Path, *, date_only: bool = True) -> str | None:
+def _max_date_from_parquet_uncached(path: Path, *, date_only: bool = True) -> str | None:
     if pq is not None:
         try:
             meta = pq.ParquetFile(path).metadata
@@ -272,6 +274,111 @@ def _max_date_from_parquet(path: Path, *, date_only: bool = True) -> str | None:
         return _date_to_text(value, date_only=date_only)
     except Exception:
         return None
+
+
+def _file_identity(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+class _UncacheableParquetDate(ValueError):
+    """A failed or concurrently changing read must not become a cache hit."""
+
+
+@lru_cache(maxsize=512)
+def _max_date_from_parquet_cached(
+    path_text: str, date_only: bool, identity: tuple[int, ...],
+) -> str:
+    path = Path(path_text)
+    value = _max_date_from_parquet_uncached(path, date_only=date_only)
+    if value is None or _file_identity(path) != identity:
+        raise _UncacheableParquetDate("parquet date unavailable or source changed during read")
+    return value
+
+
+def _max_date_from_parquet(path: Path, *, date_only: bool = True) -> str | None:
+    # Cache only an immutable scalar bound to the actual file identity. The
+    # expected session/market clock is still recomputed on every status check;
+    # this is not the display TTL cache and cannot make yesterday's file fresh.
+    path = Path(path)
+    for _ in range(2):
+        try:
+            identity = _file_identity(path)
+            value = _max_date_from_parquet_cached(str(path.absolute()), date_only, identity)
+            if _file_identity(path) == identity:
+                return value
+        except _UncacheableParquetDate:
+            continue
+        except OSError:
+            return None
+    return None
+
+
+@lru_cache(maxsize=64)
+def _feature_files_cached(root_text: str, identity: tuple[int, ...]) -> tuple[Path, ...]:
+    root = Path(root_text)
+    paths = tuple(root.glob(f"*{FEATURE_SUFFIX}"))
+    if _file_identity(root) != identity:
+        raise OSError("feature directory changed during inventory read")
+    return paths
+
+
+def _feature_files(root: Path) -> tuple[Path, ...]:
+    # The directory identity binds names only, never the contents/freshness of
+    # a feature file. Appends inside an existing file are checked by the
+    # per-file date identity; add/remove/rename invalidates this inventory.
+    for _ in range(2):
+        try:
+            identity = _file_identity(root)
+            paths = _feature_files_cached(str(root.absolute()), identity)
+            if _file_identity(root) == identity:
+                return paths
+        except OSError:
+            continue
+    raise OSError("feature inventory is unavailable or changing")
+
+
+_DATA_LOCATOR_CACHE: OrderedDict[str, tuple[dict[Path, tuple[int, ...]], tuple[Any, Any]]] = OrderedDict()
+_DATA_LOCATOR_LOCK = RLock()
+
+
+def _validated_data_locator(config_path: str | Path) -> tuple[Any, Any]:
+    """Reuse immutable data-location scalars, not a mutable/stale runtime status.
+
+    The canonical loader validates all values and records the entire inherited
+    source graph. Parent edits, replacements, deletions and invalid configs all
+    invalidate reuse. The decision clock and data files are checked separately
+    on every call; no display TTL participates in the opening gate.
+    """
+    from stockagent.config import load_config
+
+    path = Path(config_path).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    key = str(path)
+    with _DATA_LOCATOR_LOCK:
+        cached = _DATA_LOCATOR_CACHE.get(key)
+        if cached is not None:
+            sources, locator = cached
+            try:
+                unchanged = all(_file_identity(source) == signature for source, signature in sources.items())
+            except OSError:
+                unchanged = False
+            if unchanged:
+                _DATA_LOCATOR_CACHE.move_to_end(key)
+                return locator
+            del _DATA_LOCATOR_CACHE[key]
+    sources: dict[Path, tuple[int, ...]] = {}
+    config = load_config(path, source_signatures=sources)
+    if not sources or any(_file_identity(source) != signature for source, signature in sources.items()):
+        raise ValueError("config source changed during data-location validation")
+    locator = (config.data.parquet_root, config.data.benchmark_name)
+    with _DATA_LOCATOR_LOCK:
+        _DATA_LOCATOR_CACHE[key] = (sources, locator)
+        _DATA_LOCATOR_CACHE.move_to_end(key)
+        while len(_DATA_LOCATOR_CACHE) > 64:
+            _DATA_LOCATOR_CACHE.popitem(last=False)
+    return locator
 
 
 def _parse_datetime_text(value: str, tz: ZoneInfo) -> datetime | None:
@@ -711,15 +818,12 @@ def data_freshness(
     # Loading the training config pulls in the tensor backtest stack.  Keep that
     # dependency out of lightweight market-calendar/scheduler imports; boot and
     # historical collectors only pay the cost when freshness is actually read.
-    from stockagent.config import load_config
-
     config_path = resolve_repo_path(cfg.config_path, root=root)
     parquet_root: Path | None = None
     benchmark_name: str | None = None
     try:
-        train_config = load_config(config_path or cfg.config_path)
-        parquet_root = resolve_repo_path(train_config.data.parquet_root, root=root)
-        benchmark_name = train_config.data.benchmark_name
+        data_root, benchmark_name = _validated_data_locator(config_path or cfg.config_path)
+        parquet_root = resolve_repo_path(data_root, root=root)
     except Exception:
         return DataFreshness(None, None, None, None, None, False, "config load failed", 0, 0, False)
 
@@ -728,7 +832,10 @@ def data_freshness(
 
     market_type = infer_market_type(cfg, parquet_root)
     crypto_intraday = market_type.lower() == "crypto"
-    feature_files = list(parquet_root.glob(f"*{FEATURE_SUFFIX}"))
+    try:
+        feature_files = _feature_files(parquet_root)
+    except OSError:
+        return DataFreshness(parquet_root, None, None, None, None, False, "feature inventory unavailable", 0, 0, False)
     total_files = len(feature_files)
     benchmark_path = _feature_path(parquet_root, benchmark_name)
     # Daily canonical pipelines certify the whole data layer before promotion.
@@ -768,11 +875,8 @@ def data_freshness(
     for max_date in max_dates:
         if max_date and (last_data_date is None or max_date > last_data_date):
             last_data_date = max_date
-    benchmark_date = (
-        _max_date_from_parquet(benchmark_path, date_only=date_only)
-        if benchmark_path is not None
-        else None
-    )
+    dates_by_path = dict(zip(selected, max_dates))
+    benchmark_date = dates_by_path.get(benchmark_path) if benchmark_path is not None else None
     panel_date = last_data_date
     expected = expected_latest_data_date(
         cfg,

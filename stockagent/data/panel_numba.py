@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import FunctionType
 
 import numpy as np
 import numba as nb
@@ -215,10 +216,42 @@ def _as_float64_contiguous(values: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(values, dtype=np.float64))
 
 
+# Recompile the same scalar bodies without parallel launch for per-symbol
+# histories. Thousands of 3k-row kernels must not each wake a host-wide pool.
+# No arithmetic, date grid, rounding mode or NaN semantics are changed.
+SMALL_KERNEL_ELEMENTS = 16_384
+
+
+def _serial_kernel(parallel):
+    # Numba's disk cache key does not include parallel=True. Reusing the same
+    # Python function under two dispatchers can silently reload the other
+    # variant. Give identical bytecode a distinct qualified cache identity.
+    body = parallel.py_func
+    serial_body = FunctionType(body.__code__, body.__globals__,
+        body.__name__ + "__serial", body.__defaults__, body.__closure__)
+    serial_body.__qualname__ = body.__qualname__ + "__serial"
+    serial_body.__module__ = body.__module__
+    return nb.njit(cache=True)(serial_body)
+
+
+_round_half_up_serial = _serial_kernel(_round_half_up_flat)
+_tw_tick_size_serial = _serial_kernel(_tw_tick_size_flat)
+_tw_limit_price_serial = _serial_kernel(_tw_limit_price_flat)
+_shift_rows_serial = _serial_kernel(_shift_rows_flat)
+_safe_log_ratio_serial = _serial_kernel(_safe_log_ratio_flat)
+_sanitize_price_log_return_serial = _serial_kernel(_sanitize_price_log_return_flat)
+_tw_limit_masks_serial = _serial_kernel(_tw_limit_masks_kernel)
+
+
+def _kernel_for_size(size, parallel, serial):
+    return serial if size < SMALL_KERNEL_ELEMENTS else parallel
+
+
 def round_half_up(values: np.ndarray, decimals: int = 2) -> np.ndarray:
     arr = _as_float64_contiguous(values)
     factor = float(10**int(decimals))
-    return _round_half_up_flat(arr.reshape(-1), factor).reshape(arr.shape)
+    kernel = _kernel_for_size(arr.size, _round_half_up_flat, _round_half_up_serial)
+    return kernel(arr.reshape(-1), factor).reshape(arr.shape)
 
 
 def tw_tick_size(price: np.ndarray, dates: np.ndarray | None = None) -> np.ndarray:
@@ -226,7 +259,8 @@ def tw_tick_size(price: np.ndarray, dates: np.ndarray | None = None) -> np.ndarr
     ordinals = np.ascontiguousarray(
         trade_date_ordinals(dates, arr.shape), dtype=np.int64
     )
-    return _tw_tick_size_flat(arr.reshape(-1), ordinals.reshape(-1)).reshape(arr.shape)
+    kernel = _kernel_for_size(arr.size, _tw_tick_size_flat, _tw_tick_size_serial)
+    return kernel(arr.reshape(-1), ordinals.reshape(-1)).reshape(arr.shape)
 
 
 def tw_limit_price(
@@ -238,7 +272,8 @@ def tw_limit_price(
     ordinals = np.ascontiguousarray(
         trade_date_ordinals(dates, arr.shape), dtype=np.int64
     )
-    return _tw_limit_price_flat(
+    kernel = _kernel_for_size(arr.size, _tw_limit_price_flat, _tw_limit_price_serial)
+    return kernel(
         arr.reshape(-1), float(ratio), ordinals.reshape(-1)
     ).reshape(arr.shape)
 
@@ -249,7 +284,8 @@ def shift_array(values: np.ndarray, periods: int) -> np.ndarray:
         return arr.copy()
     rows = int(arr.shape[0])
     row_width = int(arr.size // max(rows, 1)) if rows > 0 else 0
-    return _shift_rows_flat(arr.reshape(-1), rows, row_width, int(periods)).reshape(arr.shape)
+    kernel = _kernel_for_size(arr.size, _shift_rows_flat, _shift_rows_serial)
+    return kernel(arr.reshape(-1), rows, row_width, int(periods)).reshape(arr.shape)
 
 
 def safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -259,12 +295,14 @@ def safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.n
         num, den = np.broadcast_arrays(num, den)
         num = _as_float64_contiguous(num)
         den = _as_float64_contiguous(den)
-    return _safe_log_ratio_flat(num.reshape(-1), den.reshape(-1)).reshape(num.shape)
+    kernel = _kernel_for_size(num.size, _safe_log_ratio_flat, _safe_log_ratio_serial)
+    return kernel(num.reshape(-1), den.reshape(-1)).reshape(num.shape)
 
 
 def sanitize_price_log_return_array(values: np.ndarray, max_abs: float) -> np.ndarray:
     arr = _as_float64_contiguous(values)
-    return _sanitize_price_log_return_flat(arr.reshape(-1), float(max_abs)).reshape(arr.shape)
+    kernel = _kernel_for_size(arr.size, _sanitize_price_log_return_flat, _sanitize_price_log_return_serial)
+    return kernel(arr.reshape(-1), float(max_abs)).reshape(arr.shape)
 
 
 def tw_limit_masks_from_arrays(
@@ -285,4 +323,5 @@ def tw_limit_masks_from_arrays(
         raise ValueError("TW limit mask inputs must have the same flattened length")
     if ordinals.size != close.size:
         raise ValueError("TW limit mask dates must match close prices")
-    return _tw_limit_masks_kernel(close, base, div, splits, ordinals)
+    kernel = _kernel_for_size(close.size, _tw_limit_masks_kernel, _tw_limit_masks_serial)
+    return kernel(close, base, div, splits, ordinals)

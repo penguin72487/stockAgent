@@ -44,11 +44,14 @@ class CandleEncoder(nn.Module):
         causal_feature_compression: str = "none",
         causal_feature_compression_indices: Sequence[int] | None = None,
         feature_bottleneck_dim: int = 0,
+        feature_svd_components: int = 0,
+        projection_fp32: bool = False,
     ) -> None:
         super().__init__()
         self.num_features = int(num_features)
         self.d_model = int(d_model)
         self.sanitize_inputs = bool(sanitize_inputs)
+        self.projection_fp32 = bool(projection_fp32)
         self.categorical_embedding_dim = max(1, int(categorical_embedding_dim))
         self.categorical_embedding_cardinality = max(
             2, int(categorical_embedding_cardinality)
@@ -67,6 +70,17 @@ class CandleEncoder(nn.Module):
                 "feature_bottleneck_dim requires at least one continuous feature"
             )
         self.feature_bottleneck_dim = requested_bottleneck
+        self.feature_svd_components = int(feature_svd_components)
+        self._feature_svd_fitted = False
+        if self.feature_svd_components:
+            if (not 1 <= self.feature_svd_components <= self.num_features
+                    or categorical_indices or requested_bottleneck
+                    or extra_continuous_features or not causal_feature_rms_normalization
+                    or causal_feature_window_rms_normalization or causal_feature_compression != "none"):
+                raise ValueError("feature SVD requires a fixed continuous train-RMS input without another bottleneck")
+            self.register_buffer("feature_svd_directions", torch.zeros(
+                self.feature_svd_components, self.num_features, dtype=torch.float32))
+            self.register_buffer("feature_svd_ready", torch.tensor(False))
         self.causal_feature_rms_normalization = bool(
             causal_feature_rms_normalization
         )
@@ -161,7 +175,8 @@ class CandleEncoder(nn.Module):
         )
 
         continuous_output_dim = (
-            self.feature_bottleneck_dim
+            self.feature_svd_components
+            if self.feature_svd_components > 0 else self.feature_bottleneck_dim
             if self.feature_bottleneck_dim > 0
             else len(continuous_indices)
         )
@@ -241,6 +256,33 @@ class CandleEncoder(nn.Module):
             raise ValueError("window RMS uses only the train-fitted active mask, not global scales")
         self.causal_feature_rms_scale.copy_(normalized_scale)
         self.causal_feature_active_mask.copy_(normalized_active)
+
+    def set_feature_svd_projection(self, directions: torch.Tensor) -> None:
+        if not self.feature_svd_components:
+            raise RuntimeError("feature SVD is disabled")
+        value = torch.as_tensor(directions, dtype=torch.float32,
+                                device=self.feature_svd_directions.device)
+        if (value.shape != self.feature_svd_directions.shape
+                or not bool(torch.isfinite(value).all())):
+            raise ValueError("feature SVD directions have invalid shape or values")
+        identity = torch.eye(self.feature_svd_components, device=value.device)
+        if not torch.allclose(value @ value.T, identity, rtol=0., atol=1e-4):
+            raise ValueError("feature SVD directions must be orthonormal")
+        self.feature_svd_directions.copy_(value)
+        self.feature_svd_ready.fill_(True)
+        self._feature_svd_fitted = True
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+        if self.feature_svd_components:
+            try:
+                if not bool(self.feature_svd_ready):
+                    raise ValueError("checkpoint feature SVD was never fitted")
+                self.set_feature_svd_projection(self.feature_svd_directions)
+            except (ValueError, RuntimeError) as error:
+                error_msgs.append(f"{prefix}feature SVD: {error}")
 
     def _normalize_raw_features(self, x: torch.Tensor) -> torch.Tensor:
         if not self.causal_feature_rms_normalization:
@@ -356,6 +398,13 @@ class CandleEncoder(nn.Module):
         continuous = normalized_raw.index_select(
             -1, self.continuous_feature_index_tensor
         ).to(dtype=model_dtype)
+        if self.feature_svd_components:
+            if not self._feature_svd_fitted:
+                raise RuntimeError("feature SVD must be fitted on training rows before model forward")
+            # Directions are frozen FP32 buffers, not trainable low-rank weights.
+            # Keep projection precision independent of the subsequent BF16 AMP.
+            with torch.autocast(continuous.device.type, enabled=False):
+                return F.linear(continuous.float(), self.feature_svd_directions.float())
         if self.continuous_feature_bottleneck is None:
             return continuous
         return self.continuous_feature_bottleneck(continuous)
@@ -386,6 +435,13 @@ class CandleEncoder(nn.Module):
 
     def _forward_base_with_zero_extra(self, base: torch.Tensor) -> torch.Tensor:
         """Project ``[base, zeros]`` without allocating the wide zero columns."""
+
+        if self.projection_fp32:
+            with torch.autocast(base.device.type, enabled=False):
+                return self._forward_base_with_zero_extra_native(base.float())
+        return self._forward_base_with_zero_extra_native(base)
+
+    def _forward_base_with_zero_extra_native(self, base: torch.Tensor) -> torch.Tensor:
 
         if self.extra_continuous_features <= 0:
             return self._finish_embedding(
@@ -934,7 +990,13 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         causal_feature_compression: str = "none",
         causal_feature_compression_indices: Sequence[int] | None = None,
         feature_bottleneck_dim: int = 0,
+        feature_svd_components: int = 0,
         temporal_basis_algebraic_contraction: bool = False,
+        temporal_basis_fp32_contraction: bool = False,
+        temporal_blocks_fp32: bool = False,
+        portfolio_blocks_fp32: bool = False,
+        candle_projection_fp32: bool = False,
+        factorized_input_compile: bool = True,
         daily_context_num_features: int = 0,
         daily_context_categorical_feature_indices: Sequence[int] | None = None,
         daily_context_lookback: int = 1,
@@ -943,6 +1005,15 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self.factorized_input_compile=bool(factorized_input_compile)
+        if feature_svd_components and self.temporal_basis_families:
+            raise ValueError("feature SVD does not append temporal basis banks")
+        self.temporal_blocks_fp32 = bool(temporal_blocks_fp32)
+        self.portfolio_blocks_fp32 = bool(portfolio_blocks_fp32)
+        if temporal_basis_fp32_contraction:
+            if not self._raw_temporal_basis_enabled():
+                raise ValueError("FP32 basis contraction requires the explicit raw_features basis experiment")
+            self.temporal_basis_feature_encoder.fp32_contraction=True
         self.temporal_basis_input_feature_builder = (
             TemporalBasisInputFeatureBuilder(
                 lookback=self.lookback,
@@ -1002,6 +1073,8 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             causal_feature_compression=causal_feature_compression,
             causal_feature_compression_indices=causal_feature_compression_indices,
             feature_bottleneck_dim=feature_bottleneck_dim,
+            feature_svd_components=feature_svd_components,
+            projection_fp32=candle_projection_fp32,
         )
         if basis_input_width > 0 and not isinstance(
             self.candle_encoder.input_norm,
@@ -1309,6 +1382,46 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
     def _project_features(self, x: torch.Tensor) -> torch.Tensor:
         projected, _aux = self._candle_project_features(x, return_token_aux=False)
         return projected
+
+    def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
+        # BF16 temporal GEMMs can round differently when an independent stock
+        # axis is split. A small upstream FP32 normalization difference may
+        # cross a BF16 rounding boundary and be amplified by allocation. Keep
+        # this opt-in island identical for dense and factorized callers; do not
+        # change the head AMP policy, parameter storage, or attention topology.
+        if self.temporal_blocks_fp32:
+            with torch.autocast(h.device.type, enabled=False):
+                return super()._apply_temporal_blocks(h.float(), keep_all_steps=keep_all_steps)
+        return super()._apply_temporal_blocks(h, keep_all_steps=keep_all_steps)
+
+    def _forward_latent_or_market_from_stock_embeddings(self, z_base, safe_mask, **kwargs):
+        if self.portfolio_blocks_fp32:
+            with torch.autocast(z_base.device.type, enabled=False):
+                return super()._forward_latent_or_market_from_stock_embeddings(
+                    z_base.float(), safe_mask, **kwargs)
+        return super()._forward_latent_or_market_from_stock_embeddings(z_base, safe_mask, **kwargs)
+
+    def _forward_market_token_from_stock_embeddings(self, z_base, safe_mask, **kwargs):
+        if self.portfolio_blocks_fp32:
+            with torch.autocast(z_base.device.type, enabled=False):
+                return super()._forward_market_token_from_stock_embeddings(z_base.float(), safe_mask, **kwargs)
+        return super()._forward_market_token_from_stock_embeddings(z_base, safe_mask, **kwargs)
+
+    def _portfolio_outputs_from_stock_embeddings(self, z_stock, mask_bool, aux, **kwargs):
+        if self.portfolio_blocks_fp32:
+            with torch.autocast(z_stock.device.type, enabled=False):
+                return super()._portfolio_outputs_from_stock_embeddings(z_stock.float(), mask_bool, aux, **kwargs)
+        return super()._portfolio_outputs_from_stock_embeddings(z_stock, mask_bool, aux, **kwargs)
+
+    def forward_from_panel_slab(self,feature_slab,mask=None,temperature=None,
+                               return_aux=None,symbol_indices=None,portfolio_context=None):
+        if getattr(feature_slab,"_stockagent_factorized_slab",False):
+            from stockagent.models.factorized_input import forward_factorized_slab
+            if mask is None:raise ValueError("factorized streaming requires the ordinary executable mask")
+            return forward_factorized_slab(self,feature_slab,mask,temperature=temperature,
+                return_aux=return_aux,symbol_indices=symbol_indices,portfolio_context=portfolio_context)
+        return super().forward_from_panel_slab(feature_slab,mask,temperature=temperature,
+            return_aux=return_aux,symbol_indices=symbol_indices,portfolio_context=portfolio_context)
 
     def _prepare_raw_temporal_basis_source(
         self,

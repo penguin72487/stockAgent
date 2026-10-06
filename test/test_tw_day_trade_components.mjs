@@ -190,3 +190,42 @@ test("overnight missing history cannot become a zero PnL", () => {
   context.rangeSummaryFor = () => ({cumulative_net_pnl_twd: 125});
   assert.equal(context.totalModeNetPnl({modes: [{market: "one"}]}), 125);
 });
+
+test("opening telemetry shows durable publication subphases without treating them as extra stages", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("function renderOperations(data)"), app.indexOf("function renderTwPublicMonitor(payload)"));
+  const nodes = new Map();
+  const byId = id => {
+    if (!nodes.has(id)) nodes.set(id, {textContent: "", html: ""});
+    return nodes.get(id);
+  };
+  const context = vm.createContext({
+    IS_OVERNIGHT: false, lastFetchMs: null, SERVICE_REVISION_REFRESH_MS: 1000, PRICE_REFRESH_MS: 60000,
+    clampRatio: value => Math.max(0, Math.min(1, Number(value || 0))),
+    number: (value, digits = 0) => Number(value || 0).toFixed(digits),
+    duration: String, sourceNumber: String, shortTime: String, countdown: () => "—",
+    esc: value => String(value ?? "—").replaceAll("<", "&lt;"),
+    strategyLabel: () => "unit", badge: String, progress: () => "",
+    $: byId, setHtml: (id, html) => { byId(id).html = html; },
+  });
+  vm.runInContext(source, context);
+  const row = {market: "unit", ready_from_0900_ms: 2000, stages: {},
+    state_publication: {total_ms: 12.3, projection_fingerprint_ms: 1.2, files: [
+      {json_encode_ms: 1, file_write_fsync_ms: 2, replace_directory_fsync_ms: 0.5},
+      {json_encode_ms: 2, file_write_fsync_ms: 3, replace_directory_fsync_ms: 1},
+    ]}};
+  const data = {modes: [], opening_signal_latency: {modes: [row]}};
+  context.renderOperations(data);
+  const html = byId("opening-stage-progress").html;
+  assert.match(html, /帳本發布（帳本落盤內含分段，不可再相加）/);
+  assert.match(html, /完整發布 12.3 ms/);
+  assert.match(html, /JSON 編碼 3.0 ms/);
+  assert.match(html, /檔案寫入／同步 5.0 ms/);
+  assert.match(html, /替換／目錄同步 1.5 ms/);
+  delete row.state_publication.files[1].json_encode_ms;
+  context.renderOperations(data);
+  assert.doesNotMatch(byId("opening-stage-progress").html, /JSON 編碼/);
+  delete row.state_publication;
+  context.renderOperations(data);
+  assert.doesNotMatch(byId("opening-stage-progress").html, /帳本發布|JSON 編碼/);
+});

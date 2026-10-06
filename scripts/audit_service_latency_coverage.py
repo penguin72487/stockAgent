@@ -162,6 +162,46 @@ $rows = @(Get-CimInstance Win32_Process -Filter "Name = 'caddy.exe'" |
   })
 ConvertTo-Json -InputObject $rows -Compress -Depth 3
 """
+WINDOWS_WSL_RUNTIME_QUERY = r"""
+$ErrorActionPreference = 'Stop'
+$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'wsl.exe'")
+$launcher = [regex]::Escape((Join-Path $env:LOCALAPPDATA 'StockAgentPublic\start-caddy.ps1'))
+$logPath = Join-Path $env:LOCALAPPDATA 'StockAgentPublic\logs\startup.log'
+$lastStart = if (Test-Path -LiteralPath $logPath) {
+  Get-Content -LiteralPath $logPath -Tail 500 | Where-Object {
+    $_ -match '^\S+ WSL runtime holder start dispatched pid=\d+'
+  } | Select-Object -Last 1
+} else { $null }
+$record = if ($lastStart) {
+  [regex]::Match($lastStart, '^(\S+) WSL runtime holder start dispatched pid=(\d+)')
+} else { $null }
+$loggedPid = if ($record -and $record.Success) { [int]$record.Groups[2].Value } else { 0 }
+$loggedStart = if ($loggedPid) { [DateTimeOffset]::Parse($record.Groups[1].Value) } else { $null }
+$holders = @($processes | Where-Object {
+  ([string]$_.CommandLine -match 'stockagent-public-runtime' -and
+   [string]$_.CommandLine -match 'exec sleep infinity') -or
+  (-not $_.CommandLine -and $loggedPid -and $_.ProcessId -eq $loggedPid -and
+   [math]::Abs(($_.CreationDate.ToUniversalTime() - $loggedStart.UtcDateTime).TotalSeconds) -lt 2)
+} | ForEach-Object {
+  $process = $_
+  $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)"
+  [pscustomobject]@{
+    pid = [int]$process.ProcessId
+    parent_pid = [int]$process.ParentProcessId
+    parent_name = if ($parent) { [string]$parent.Name } else { $null }
+    parent_is_public_supervisor = if ($parent -and $parent.CommandLine) {
+      [bool]($parent.Name -eq 'powershell.exe' -and $parent.CommandLine -match $launcher)
+    } else { $null }
+    started_at_utc = $process.CreationDate.ToUniversalTime().ToString('o')
+    identity_basis = if ($process.CommandLine) { 'argv_marker' } else { 'startup_log_and_creation_time' }
+  }
+})
+ConvertTo-Json -InputObject ([pscustomobject]@{
+  available = $true
+  holders = $holders
+  unreadable_command_lines = @($processes | Where-Object { -not $_.CommandLine }).Count
+}) -Compress -Depth 4
+"""
 WINDOWS_WSL_VM_QUERY = r"""
 $ErrorActionPreference = 'Stop'
 $hosts = @(Get-CimInstance Win32_Process -Filter "Name = 'wslhost.exe'" |
@@ -948,6 +988,44 @@ def _windows_caddy_processes() -> list[dict[str, object]] | None:
     return [row for row in parsed if isinstance(row, dict)] if isinstance(parsed, list) else None
 
 
+def _windows_wsl_runtime_evidence() -> dict[str, object] | None:
+    """Observe the foreground holder without publishing editor/session argv."""
+
+    try:
+        process = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_WSL_RUNTIME_QUERY],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if process.returncode != 0:
+            return None
+        parsed = json.loads(process.stdout.replace("\x00", ""))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("available") is not True:
+        return None
+    holders = parsed.get("holders")
+    if not isinstance(holders, list):
+        return None
+    fields = {"pid", "parent_pid", "parent_name", "parent_is_public_supervisor",
+              "started_at_utc", "identity_basis"}
+    rows = [{key: row[key] for key in fields if key in row}
+            for row in holders if isinstance(row, dict)]
+    # Windows' wsl.exe launcher may run another wsl.exe with the same argv.
+    # They are one foreground invocation, not two supervisor owners.
+    matching_pids = {row.get("pid") for row in rows if type(row.get("pid")) is int}
+    roots = [row for row in rows if row.get("parent_pid") not in matching_pids]
+    return {
+        "available": True,
+        "holders": roots,
+        "matching_process_count": len(rows),
+        "unreadable_command_lines": parsed.get("unreadable_command_lines"),
+        "claim_boundary": (
+            "Current foreground WSL child identities; no cold boot or "
+            "pre-login test. Unreadable argv leaves holder discovery incomplete."
+        ),
+    }
+
+
 def _windows_wsl_vm_evidence() -> dict[str, object] | None:
     """Observe the current VM's host process and matching vSwitch driver event."""
 
@@ -1077,6 +1155,7 @@ def startup_snapshot() -> dict[str, object]:
         "windows_task": None,
         "windows_tasks": [],
         "windows_caddy_processes": None,
+        "windows_wsl_runtime": None,
         "windows_wsl_vm_evidence": vm_evidence,
         "installed_caddy_files": _installed_caddy_files(installed_root),
         "gateway_recovery": _gateway_recovery_episodes(
@@ -1118,6 +1197,7 @@ def startup_snapshot() -> dict[str, object]:
         result["gateway_health_error"] = type(error).__name__
     if shutil.which("powershell.exe"):
         result["windows_caddy_processes"] = _windows_caddy_processes()
+        result["windows_wsl_runtime"] = _windows_wsl_runtime_evidence()
         task = subprocess.run(
             [
                 "powershell.exe",

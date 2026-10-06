@@ -7,6 +7,7 @@ file; canonical packed decoding and PostgreSQL restoration keep their owners.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -46,7 +47,9 @@ def regular(root: Path, relative: str) -> Path:
 
 
 def verify(root: Path, expected_identity: str, *, require_ready: bool = True,
-           include_file_signatures: bool = False) -> dict:
+           include_file_signatures: bool = False, workers: int = 1) -> dict:
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise ValueError("delivery verification needs 1 to 32 bounded workers")
     if not HASH.fullmatch(expected_identity):
         raise ValueError("a source-pinned full envelope identity is required")
     root = root.absolute()
@@ -59,13 +62,13 @@ def verify(root: Path, expected_identity: str, *, require_ready: bool = True,
             or (require_ready and regular(root, "READY").read_text().strip() != expected_identity)):
         raise ValueError("backup delivery contract, READY or pinned identity differs")
     expected = {"backup-envelope.json", *({"READY"} if require_ready else set())}
-    total = 0
-    signatures = {}
     for row in envelope["files"]:
         if (row["relative"] in expected or not HASH.fullmatch(row["sha256"])
                 or type(row["bytes"]) is not int or row["bytes"] < 0):
             raise ValueError("invalid or duplicate backup delivery member")
         expected.add(row["relative"])
+
+    def verify_member(row):
         path = regular(root, row["relative"])
         before = path.stat()
         digest = hashlib.sha256()
@@ -76,9 +79,15 @@ def verify(root: Path, expected_identity: str, *, require_ready: bool = True,
         signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
         if signature(before) != signature(after) or before.st_size != row["bytes"] or digest.hexdigest() != row["sha256"]:
             raise ValueError("backup delivery member changed or its content differs")
-        if include_file_signatures:
-            signatures[row["relative"]] = list(signature(after))
-        total += row["bytes"]
+        return row["relative"], row["bytes"], list(signature(after))
+
+    if workers == 1:
+        results = [verify_member(row) for row in envelope["files"]]
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="backup-sha") as pool:
+            results = list(pool.map(verify_member, envelope["files"]))
+    total = sum(row[1] for row in results)
+    signatures = {row[0]: row[2] for row in results} if include_file_signatures else {}
     observed = set()
     def walk_error(error):
         raise error
@@ -103,12 +112,13 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--expected-envelope-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
     output = args.output.absolute()
     if output.is_relative_to(args.root.absolute()) or output.exists():
         parser.error("save a fresh receipt outside the closed backup delivery")
     os.umask(0o077)
-    result = verify(args.root, args.expected_envelope_sha256)
+    result = verify(args.root, args.expected_envelope_sha256, workers=args.workers)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as stream:
         json.dump(result, stream, ensure_ascii=False, indent=2)

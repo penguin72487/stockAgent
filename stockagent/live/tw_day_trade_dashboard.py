@@ -2405,6 +2405,14 @@ def _opening_signal_latency_summary(
                 receipt.get("coverage_to_signal_ready_ms")
             )
         published_ms = _finite_float(row.get("published_from_open_ms"))
+        ledger_ms = _finite_float(row.get("opening_gate_to_ledger_ms"))
+        if ledger_ms is None and row.get("ledger_persisted_at"):
+            try:
+                ledger_ms = (_timestamp(row["ledger_persisted_at"]) - gate).total_seconds() * 1000.0
+            except (TypeError, ValueError):
+                pass
+        if ledger_ms is not None and ledger_ms < 0.0:
+            ledger_ms = None
         candidate = {
             "market": market,
             "signal_id": row.get("signal_id"),
@@ -2422,6 +2430,7 @@ def _opening_signal_latency_summary(
             "published_from_0900_ms": published_ms,
             "input_to_ledger_ms": _finite_float(row.get("input_to_ledger_ms")),
             "ready_to_ledger_ms": _finite_float(row.get("ready_to_ledger_ms")),
+            "ledger_from_0900_ms": round(ledger_ms, 3) if ledger_ms is not None else None,
             "source_ready_from_0900_ms": source_ready_ms,
             "source_ready_to_signal_ms": source_to_signal_ms,
             "stages": stages,
@@ -2431,6 +2440,9 @@ def _opening_signal_latency_summary(
             "quote_transport": row.get("quote_transport")
             if isinstance(row.get("quote_transport"), Mapping)
             else {},
+            "state_publication": row.get("state_publication")
+            if isinstance(row.get("state_publication"), Mapping)
+            else None,
             "previous_signal_history_disabled": row.get(
                 "previous_signal_history_disabled"
             ),
@@ -2468,6 +2480,7 @@ def _opening_signal_latency_summary(
                 "published_from_0900_ms",
                 "input_to_ledger_ms",
                 "ready_to_ledger_ms",
+                "ledger_from_0900_ms",
                 "source_ready_from_0900_ms",
                 "source_ready_to_signal_ms",
             ):
@@ -2477,6 +2490,8 @@ def _opening_signal_latency_summary(
                 existing["price_receipt_timing"] = candidate["price_receipt_timing"]
             if not existing.get("quote_transport"):
                 existing["quote_transport"] = candidate["quote_transport"]
+            if not existing.get("state_publication"):
+                existing["state_publication"] = candidate["state_publication"]
             if is_attempt:
                 existing["previous_signal_history_disabled"] = candidate[
                     "previous_signal_history_disabled"
@@ -2506,6 +2521,9 @@ def _opening_signal_latency_summary(
             if (value := _finite_float(row.get("source_ready_to_signal_ms")))
             is not None
         ]
+        ledger_markets = sorted(row["market"] for row in mode_rows if row.get("ledger_from_0900_ms") is not None)
+        ledger_values = [float(row["ledger_from_0900_ms"]) for row in mode_rows if row.get("ledger_from_0900_ms") is not None]
+        ledger_complete = bool(expected) and ledger_markets == expected
         observed = sorted(modes_by_market)
         first_ready_ms = round(min(ready_values), 3) if ready_values else None
         final_ready_ms = round(max(ready_values), 3) if ready_values else None
@@ -2522,6 +2540,13 @@ def _opening_signal_latency_summary(
                 "failures": failures_by_session.get(day, ()),
                 "first_ready_ms": first_ready_ms,
                 "final_ready_ms": final_ready_ms,
+                "ledger_observed_mode_count": len(ledger_markets),
+                "ledger_complete": ledger_complete,
+                "ledger_missing_markets": sorted(set(expected) - set(ledger_markets)),
+                "first_ledger_ms": round(min(ledger_values), 3) if ledger_values else None,
+                "latest_observed_ledger_ms": round(max(ledger_values), 3) if ledger_values else None,
+                "final_ledger_ms": round(max(ledger_values), 3) if ledger_complete else None,
+                "all_ledgers_goal_met": ledger_complete and max(ledger_values) <= goal_ms,
                 "first_source_ready_ms": round(min(source_values), 3)
                 if source_values
                 else None,
@@ -2553,6 +2578,13 @@ def _opening_signal_latency_summary(
             "failures": [],
             "first_ready_ms": None,
             "final_ready_ms": None,
+            "ledger_observed_mode_count": 0,
+            "ledger_complete": False,
+            "ledger_missing_markets": expected,
+            "first_ledger_ms": None,
+            "latest_observed_ledger_ms": None,
+            "final_ledger_ms": None,
+            "all_ledgers_goal_met": False,
             "first_source_ready_ms": None,
             "final_source_ready_ms": None,
             "source_ready_to_signal_p50_ms": None,
@@ -2598,6 +2630,7 @@ def _opening_signal_latency_summary(
                 "total": "09:00 market gate to immutable signal-ready timestamp",
                 "source": "09:00 market gate to required local callback-receipt coverage",
                 "controllable": "required local quote coverage to immutable signal ready",
+                "ledger": "09:00 gate to actual simulation-ledger persist time, including waiting/replay; not a broker fill or full-target-fill proof",
                 "clock": "timezone-aware wall clock across processes; monotonic clock within each process stage",
             },
             "simulation_only": True,

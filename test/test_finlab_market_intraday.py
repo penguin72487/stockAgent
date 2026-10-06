@@ -11,7 +11,7 @@ import pytest
 from finlab.exceptions import DataError
 
 from scripts.download_finlab_market_intraday import (
-    _account_sync_lock, _eligible, _open_index, _record, _summarize, _target_count,
+    _account_sync_lock, _eligible, _open_index, _record, _summarize, _target_count, _repair_derived_errors,
     annotate_daily_close_coverage, load_universe, session_days, sync_market,
 )
 from scripts.download_finlab_history import safe_stem
@@ -41,6 +41,24 @@ def test_cached_and_ineligible_candidates_never_call_account_quota(tmp_path):
     assert summary["attempted_this_run"] == 0
     assert summary["by_kind"]["tw_tick"]["receipted_partitions"] == 3
     assert quota.call_count == 0
+
+
+def test_derived_error_repair_is_bounded_local_work_not_an_api_retry(tmp_path, monkeypatch):
+    now = datetime.now(UTC)
+    db = _open_index(tmp_path / "index.sqlite3")
+    for i in range(10):
+        _record(db, "tw_minute_derived", str(2300+i), date(2026, 10, 2), "derivation_error")
+    db.execute("UPDATE partitions SET checked_at_utc=?", ((now-timedelta(hours=2)).isoformat(),))
+    db.commit()
+    monkeypatch.setattr("scripts.download_finlab_market_intraday._stored_receipt", lambda *args: {
+        "status": "downloaded_unverified_for_pit", "rows": 2})
+    monkeypatch.setattr("scripts.download_finlab_market_intraday.derive_partition", lambda *args: {
+        "status": "derived_unverified_for_pit", "rows": 1})
+    monkeypatch.setattr("scripts.download_finlab_market_intraday.fetch_partition",
+                        lambda *args, **kwargs: pytest.fail("must not refetch stored ticks"))
+    assert _repair_derived_errors(db, tmp_path, now=now) == 8
+    assert db.execute("SELECT count(*) FROM partitions WHERE status='derivation_error'").fetchone()[0] == 2
+    db.close()
 
 
 def test_inflight_progress_and_interruption_preserve_uncommitted_frontier(tmp_path):
@@ -77,6 +95,7 @@ def test_inflight_progress_and_interruption_preserve_uncommitted_frontier(tmp_pa
                               limit=1, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), fetch=resumed)
     assert calls[0] == calls[1]
     assert summary["successes_this_run"] == 1
+    assert json.loads((output / "intraday/active_run.json").read_text())["state"] == "batch_limit"
 
 
 def test_wall_clock_budget_exits_before_request_and_keeps_candidate(tmp_path):

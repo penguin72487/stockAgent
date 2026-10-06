@@ -1,0 +1,11 @@
+[Unit]
+Description=Bounded retirement of exact NAS-accepted immutable transport waves
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

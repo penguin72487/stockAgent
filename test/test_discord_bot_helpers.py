@@ -486,7 +486,15 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
                 "quote_fetch_ms": 250.0,
                 "model_inference_ms": 40.0,
                 "artifact_publish_ms": 25.0,
-                "quote_transport": {"server_provider_fetch_ms": 200.0},
+                "quote_transport": {
+                    "server_provider_fetch_ms": 200.0,
+                    "snapshot_request_body_ms": 150.0,
+                    "snapshot_usage_before_ms": 0.0,
+                    "snapshot_usage_after_ms": 0.0,
+                    "snapshot_ledger_record_ms": 3.0,
+                    "snapshot_callback_wait_ms": 135.0,
+                    "snapshot_callback_parse_ms": 2.0,
+                },
             },
         }
     )
@@ -515,6 +523,12 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
     assert payload["source_ready_from_open_ms"] == 300.0
     assert payload["source_ready_to_signal_ms"] == 500.0
     assert payload["stages"]["model_inference_ms"] == 40.0
+    assert payload["stages"]["quote_request_body_ms"] == 150.0
+    assert payload["stages"]["quote_usage_before_ms"] == 0.0
+    assert payload["stages"]["quote_traffic_record_ms"] == 3.0
+    assert payload["stages"]["quote_callback_wait_ms"] == 135.0
+    assert payload["stages"]["quote_callback_parse_ms"] == 2.0
+    assert "quote_broker_queue_ms" not in payload["stages"]
     assert payload["previous_signal_history_disabled"] is True
 
     path = tmp_path / "opening_signal_latency.jsonl"

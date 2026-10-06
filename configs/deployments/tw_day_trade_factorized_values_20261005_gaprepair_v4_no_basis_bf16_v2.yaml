@@ -1,0 +1,12 @@
+# Owner returns to the complete feature input; spectrum is a separate analysis.
+# A fresh root is required for corrected compiled rounding, not an old resume.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v1.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-no-basis-bf16-v2
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v2/training-bf16
+  resume: false
+
+training:
+  financial_transformer:
+    feature_svd_components: 0

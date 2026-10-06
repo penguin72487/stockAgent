@@ -6,7 +6,7 @@ no token or raw response body is included in diagnostic artifacts.
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import os
 import hashlib
 import json
@@ -37,6 +37,53 @@ PROBE_IDS = {
 }
 
 
+def _fingerprint(rows):
+    """Compare bags, including duplicate multiplicity, without logging values."""
+    canonical = sorted(json.dumps(row, sort_keys=True, separators=(',', ':')) for row in rows)
+    return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()
+
+
+def probe_us_date_range(fetch, start: date, days: int) -> dict:
+    """Finite diagnostic only; an ignored end_date must not become a new ABI.
+
+    Compare every requested physical date with its independent single-day
+    response. Empty references alone cannot prove a range is supported.
+    """
+    if not 2 <= days <= 7:
+        raise ValueError('range_probe_requires_two_to_seven_days')
+    dataset, identifier = 'USStockPriceMinute', PROBE_IDS['USStockPriceMinute']
+    end = start + timedelta(days=days - 1)
+    endpoint, params, metadata = request_contract(dataset, identifier, start.isoformat(), end)
+    params['end_date'] = end.isoformat()
+    rows = fetch(endpoint, params)
+    buckets = {}
+    for row in rows:
+        observed = date.fromisoformat(str(row.get('date', ''))[:10])
+        if not start <= observed <= end:
+            raise ValueError('range_probe_response_outside_range')
+        validate_response(dataset, identifier, observed.isoformat(), end, [row])
+        buckets.setdefault(observed, []).append(row)
+    comparisons = []
+    for offset in range(days):
+        day = start + timedelta(days=offset)
+        reference_params = {key: value for key, value in params.items() if key != 'end_date'}
+        reference_params['start_date'] = day.isoformat()
+        reference = fetch(endpoint, reference_params)
+        validate_response(dataset, identifier, day.isoformat(), day, reference)
+        subset = buckets.get(day, [])
+        comparisons.append({'date': day.isoformat(), 'range_rows': len(subset),
+                            'single_day_rows': len(reference),
+                            'equal': _fingerprint(subset) == _fingerprint(reference),
+                            'range_sha256': _fingerprint(subset), 'single_day_sha256': _fingerprint(reference)})
+    verified = (all(item['equal'] for item in comparisons)
+                and sum(item['single_day_rows'] > 0 for item in comparisons) >= 2)
+    return {'dataset': dataset, 'data_id': identifier, 'request_start_date': start.isoformat(),
+            'request_end_date': end.isoformat(), 'range_rows': len(rows), 'days': comparisons,
+            'provider_data_fetch_invocations': days + 1, 'queue_writes': 0,
+            'date_range_parity_verified': verified,
+            'status': 'range_parity_verified_not_admitted' if verified else 'range_not_proven_or_mismatch'}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path('data_finmind'))
@@ -44,11 +91,15 @@ def main() -> int:
     parser.add_argument('--dataset', choices=sorted(SOURCES), action='append')
     parser.add_argument('--probe-market-shape', action='store_true',
                         help='Bounded whole-market/per-ID parity probe; does not admit the shape into the worker.')
+    parser.add_argument('--probe-us-range-days', type=int, choices=range(2, 8),
+                        help='Finite US minute range-versus-each-day probe. No queue changes or shape admission.')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     market_probe_sources = {'TaiwanFuturesSpreadTick', 'TaiwanAssetSwapFixedIncomeDaily', 'TaiwanAssetSwapOptionDaily'}
     if args.probe_market_shape and (not args.dataset or not set(args.dataset) <= market_probe_sources):
         parser.error('--probe-market-shape requires explicit allowlisted sparse sources, never known per-ID-only tick/KBar')
+    if args.probe_us_range_days and (args.probe_market_shape or args.dataset != ['USStockPriceMinute']):
+        parser.error('--probe-us-range-days requires exactly --dataset USStockPriceMinute')
     load_env_file(Path('.env'), allowed_names=('FINMIND_TOKEN',))
     token = os.environ.get('FINMIND_TOKEN', '').strip()
     if not token:
@@ -57,6 +108,23 @@ def main() -> int:
     with requests.Session() as session:
         account = verified_account(session, token, args.root)
         limiter = rate_limiter(account)
+        if args.probe_us_range_days:
+            def fetch(endpoint, params):
+                if not backfill_budget(account, args.root, fixed_incremental_requests=32,
+                                       now=datetime.now(UTC))['allowed']:
+                    raise SourceError('probe_quota_not_available', retry_after=60)
+                return _fetch_rows(session, limiter, args.root, 'USStockPriceMinute', token, params,
+                                   endpoint=endpoint, max_response_bytes=BULK_MAX_RESPONSE_BYTES)
+            try:
+                report['probes'].append(probe_us_date_range(fetch, args.date, args.probe_us_range_days))
+            except SourceError as error:
+                report['probes'].append({'dataset': 'USStockPriceMinute', 'status': 'request_error',
+                                         'error_code': error.code})
+            except ValueError:
+                report['probes'].append({'dataset': 'USStockPriceMinute', 'status': 'validation_error'})
+            atomic_write_json(args.output, report)
+            print({'status': report['probes'][0]['status']}, flush=True)
+            return 0
         for dataset in args.dataset or SOURCES:
             if SOURCES[dataset].grain == 'derived':
                 report['probes'].append({'dataset': dataset, 'status': 'derived_no_api_parent_probe_required'})
@@ -101,14 +169,9 @@ def main() -> int:
                         if any(str(row[spec.identity_field]) != selected_id for row in reference):
                             raise ValueError('per_id_reference_identity_mismatch')
                         subset = [row for row in rows if str(row[spec.identity_field]) == selected_id]
-                        def fingerprint(values):
-                            # Preserve duplicate multiplicity; order alone may
-                            # differ between per-ID and whole-market responses.
-                            canonical = sorted(json.dumps(row, sort_keys=True, separators=(',', ':')) for row in values)
-                            return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()
                         item['parity'] = {'data_id': selected_id, 'market_subset_rows': len(subset),
-                                          'per_id_rows': len(reference), 'equal': fingerprint(subset) == fingerprint(reference),
-                                          'market_subset_sha256': fingerprint(subset), 'per_id_sha256': fingerprint(reference)}
+                                          'per_id_rows': len(reference), 'equal': _fingerprint(subset) == _fingerprint(reference),
+                                          'market_subset_sha256': _fingerprint(subset), 'per_id_sha256': _fingerprint(reference)}
                     item['market_shape_parity_verified'] = bool(item.get('parity', {}).get('equal'))
                 else:
                     validate_response(dataset, identifier, partition, args.date, rows)

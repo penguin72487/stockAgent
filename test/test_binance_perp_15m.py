@@ -460,6 +460,41 @@ def test_binance_funding_asof_never_uses_a_future_settlement() -> None:
     assert result["binance_funding_age_hours"].to_list() == [0.0, pytest.approx(1 / 60)]
 
 
+def test_targeted_quality_run_preserves_global_catalog_progress_and_receipts(tmp_path, monkeypatch):
+    output = tmp_path / 'candles'
+    output.mkdir()
+    global_names = ['symbols.csv', 'download_report.csv', 'download_summary.json',
+                    'download_receipt.json', 'progress.json', 'historical_feature_report.csv',
+                    'binance_historical_feature_catalog.json', 'historical_feature_summary.json']
+    for name in global_names:
+        (output / name).write_bytes(b'preserved existing global evidence')
+    records = [binance.SymbolRecord(code=code, name=code, market='binance_usdm_perp',
+        binance_symbol=code, pair=code, base_asset=code[:-4], quote_asset='USDT',
+        margin_asset='USDT', contract_type='PERPETUAL', status='TRADING', onboard_time=None)
+        for code in ('BTCUSDT', 'ETHUSDT')]
+    client = SimpleNamespace(weight_per_minute=2400,
+        limiter=SimpleNamespace(grant_activity=lambda: {}), endpoint_limiter_activity=lambda: {})
+    monkeypatch.setattr(binance, 'BinanceClient', lambda **_: client)
+    monkeypatch.setattr(binance, '_fetch_symbols', lambda *_a, **_k: (records, {}))
+    seen = []
+    def download(_client, record, path, **_kwargs):
+        seen.append(record.code)
+        return binance.DownloadResult('crypto_binance_usdm_perp', record.code,
+            record.binance_symbol, record.market, 'skipped_up_to_date', 100, str(path / record.code))
+    monkeypatch.setattr(binance, '_download_symbol', download)
+    monkeypatch.setattr(binance.sys, 'argv', ['collector', '--output-dir', str(output),
+        '--symbols', 'BTCUSDT', '--start-date', '2019-09-08', '--end-date', '2019-09-08',
+        '--workers', '1', '--skip-historical-features'])
+    binance.main()
+    assert seen == ['BTCUSDT']
+    assert all((output / name).read_bytes() == b'preserved existing global evidence' for name in global_names)
+    reports = list((output / 'quality_repair_runs').glob('*/download_summary.json'))
+    assert len(reports) == 1
+    summary = json.loads(reports[0].read_text())
+    assert summary['provider_scope_is_complete'] is False
+    assert summary['requested_symbol_filter'] == ['BTCUSDT']
+
+
 def test_binance_historical_features_join_every_public_family_causally(
     tmp_path: Path,
 ) -> None:

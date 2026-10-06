@@ -96,6 +96,41 @@ def test_traffic_ledger_groups_callback_batch_without_losing_request_count(
     assert summary["totals"]["observed_usage_delta_bytes"] == 30
 
 
+@pytest.mark.parametrize("error_class", [None, RuntimeError])
+def test_latency_critical_query_records_unknown_usage_without_blocking(
+    monkeypatch, error_class,
+) -> None:
+    calls, events, timing = [], [], {}
+
+    def usage():
+        calls.append("usage")
+        raise AssertionError("quota observation must not run on the quote path")
+
+    monkeypatch.setattr(ledger, "record_traffic_event", events.append)
+    error = error_class("quote failed") if error_class else None
+    try:
+        with shioaji_query(
+            SimpleNamespace(usage=usage), consumer="opening_quotes", method="snapshots",
+            asset_class="stock", request_count=5, timing=timing, observe_usage=False,
+        ) as set_result:
+            set_result([1, 2, 3])
+            if error is not None:
+                raise error
+    except RuntimeError as raised:
+        assert raised is error
+    assert calls == []
+    assert len(events) == 1
+    event = events[0]
+    assert event["request_count"] == 5 and event["rows"] == 3
+    assert event["usage_before"] is None and event["usage_after"] is None
+    assert event.get("usage_delta_bytes") is None
+    assert event["usage_observation"] == "not_sampled_latency_critical"
+    assert event["status"] == ("failed" if error else "success")
+    assert timing["usage_observation"] == "not_sampled_latency_critical"
+    assert timing["usage_before_ms"] == 0.0 and timing["usage_after_ms"] == 0.0
+    assert timing["total_context_ms"] >= timing["request_body_ms"]
+
+
 @pytest.mark.parametrize("error_class", [None, RuntimeError, KeyboardInterrupt])
 def test_query_phases_measure_usage_and_record_cost_without_changing_result(
     monkeypatch, error_class

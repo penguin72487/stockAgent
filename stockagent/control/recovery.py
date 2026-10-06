@@ -30,7 +30,7 @@ def private_socket_directory(scratch: Path, port: int) -> tuple[Path, bool]:
     return socket, True
 
 
-def restore_control(control_root: Path, scratch: Path, *, pg_bin: Path | None = None) -> dict:
+def restore_control(control_root: Path, scratch: Path, *, pg_bin: Path | None = None, validator=None) -> dict:
     """No TCP, production DB connection, production role or existing cluster."""
     receipt, archive, expected = verified_control(control_root)
     if scratch.exists() or any(p.is_symlink() for p in (scratch, *scratch.parents)):
@@ -85,11 +85,19 @@ def restore_control(control_root: Path, scratch: Path, *, pg_bin: Path | None = 
                 actual = logical_database_state(database)
         if actual != expected:
             raise ValueError("restored control columns/rows differ from the same-MVCC source state")
+        # A fixed locally installed validator can read another catalog's data
+        # before this private cluster stops. Never deserialize synced callbacks.
+        additional = validator({**connection_args, "dbname": "stockagent_restore"}) if validator else {}
+        protected = {"state", "source_archive_sha256", "logical_state_identity_sha256", "table_count", "row_count",
+                     "no_tcp_listener", "private_new_cluster", "production_database_modified", "complete_restore_seconds",
+                     "nas_provenance_verified_by_this_tool"}
+        if not isinstance(additional, dict) or protected.intersection(additional):
+            raise ValueError("restore validator cannot replace canonical recovery proof")
         result = {"state": "isolated_control_logical_restore_verified", "source_archive_sha256": receipt["sha256"],
             "logical_state_identity_sha256": actual["identity_sha256"], "table_count": actual["table_count"],
             "row_count": actual["row_count"], "no_tcp_listener": True, "private_new_cluster": True,
             "production_database_modified": False, "complete_restore_seconds": time.perf_counter() - started,
-            "nas_provenance_verified_by_this_tool": False}
+            "nas_provenance_verified_by_this_tool": False, **additional}
         private_json(scratch / "logical-restore.json", result)
         return result
     finally:

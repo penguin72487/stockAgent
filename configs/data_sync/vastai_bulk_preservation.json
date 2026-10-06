@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "one_shot": true,
+  "authority_node_id": "penguin",
+  "origin_node_id": "vastai1T",
+  "scopes": ["markets", "ablations", "cache"],
+  "transport_role": "legacy-compressed-preservation",
+  "minimum_stable_hours": 12,
+  "cold_root": "/srv/stockagent-packed",
+  "shared_file_policy": "unlink_preserved_names_only",
+  "protected_cache_roots": [
+    "tw_futures_v8_margin_components_20261003"
+  ]
+}

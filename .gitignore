@@ -247,4 +247,3 @@ data_bybit_daily_synced
 data_crypto_historical_public/*
 data_crypto_historical_public/raw/wikimedia/Blockchain.json.gz
 data_bybit_prepacked_20260926/*
-

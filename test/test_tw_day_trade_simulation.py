@@ -482,6 +482,8 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, veri
             opening_signal_batch_mode_count=3,
             opening_signal_batch_expected_mode_count=3,
             opening_signal_batch_complete=True,
+            state_publication={"schema_version": 1, "state_revision": 1, "total_ms": 3.0,
+                               "projection_fingerprint_ms": 0.5, "files": []},
         )
 
     payload = build_dashboard_snapshot(
@@ -503,6 +505,7 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, veri
     assert opening["observed_mode_count"] == 1
     assert opening["expected_mode_count"] == 1
     assert opening["complete"] is True
+    assert opening["modes"][0]["state_publication"]["total_ms"] == 3.0
     assert opening["first_ready_ms"] == pytest.approx(1_000.0)
     assert opening["final_ready_ms"] == pytest.approx(1_000.0)
     latest_receipt = json.loads(
@@ -631,9 +634,31 @@ def test_opening_latency_uses_dedicated_source_and_stage_telemetry() -> None:
     assert summary["failure_count"] == 1
     assert summary["modes"][0]["bottleneck_stage"] == "artifact_discovery_ms"
     assert summary["modes"][0]["input_to_ledger_ms"] == 1_350.0
+    assert summary["modes"][0]["ledger_from_0900_ms"] == 1_400.0
+    assert summary["ledger_observed_mode_count"] == 1
+    assert summary["ledger_complete"] is False
+    assert summary["final_ledger_ms"] is None
+    assert summary["latest_observed_ledger_ms"] == 1_400.0
+    assert summary["all_ledgers_goal_met"] is False
     assert summary["modes"][0]["telemetry_source"] == (
         "opening_attempt_v2+executor_latency_v1"
     )
+
+
+def test_opening_ledger_latency_uses_real_commit_not_reconstructed_fill_time() -> None:
+    row = {"result": "registered", "session_date": "2026-10-05", "market": "mode",
+           "signal_id": "late", "signal_started_at": "2026-10-05T09:00:00+08:00",
+           "signal_ready_at": "2026-10-05T09:00:14+08:00",
+           "ledger_persisted_at": "2026-10-05T09:04:52.500000+08:00",
+           "entry_completed_at": "2026-10-05T09:01:00+08:00"}
+    summary = dashboard_module._opening_signal_latency_summary([row], expected_markets=["mode"], session_date="2026-10-05")
+    assert summary["final_ready_ms"] == 14_000.0
+    assert summary["ledger_complete"] is True
+    assert summary["final_ledger_ms"] == 292_500.0
+    assert summary["all_ledgers_goal_met"] is False
+    missing = dashboard_module._opening_signal_latency_summary([], expected_markets=["mode"], session_date="2026-10-05")
+    assert missing["ledger_observed_mode_count"] == 0
+    assert missing["final_ledger_ms"] is None
 
 
 def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
@@ -5670,7 +5695,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert 'src="app.js?v=93"' in html
+    assert 'src="app.js?v=94"' in html
     assert 'src="chart-renderer.js?v=4"' in html
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript

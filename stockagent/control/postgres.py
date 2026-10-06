@@ -160,9 +160,16 @@ class ControlStore:
         with self._transaction():
             return self._expire()
 
-    def claim(self, node_id: str, worker_id: str, *, lease_seconds: int = 60) -> Claim | None:
+    def claim(self, node_id: str, worker_id: str, *, lease_seconds: int = 60,
+              job_keys: tuple[str, ...] | None = None) -> Claim | None:
         identifier(node_id); identifier(worker_id)
         integer(lease_seconds, 'lease', minimum=1, maximum=3600)
+        if job_keys is not None:
+            if (not isinstance(job_keys, tuple) or len(job_keys) > 1024
+                    or len(set(job_keys)) != len(job_keys)):
+                raise ValueError('claim scope must be a bounded unique tuple of exact work keys')
+            for key in job_keys:
+                identifier(key)
         with self._transaction():
             node = self.connection.execute('SELECT * FROM nodes WHERE node_id=%s FOR UPDATE', (node_id,)).fetchone()
             now = self.connection.execute('SELECT clock_timestamp() AS now').fetchone()['now']
@@ -174,12 +181,15 @@ class ControlStore:
                 FROM jobs WHERE state='running' AND node_id=%s AND lease_until>clock_timestamp()''', (node_id,)).fetchone()
             row = self.connection.execute('''SELECT j.* FROM jobs j WHERE j.state='pending'
                 AND j.ready_at<=clock_timestamp() AND j.kind=ANY(%s)
+                AND (%s::text[] IS NULL OR j.key=ANY(%s::text[]))
                 AND j.cpu_slots<=%s AND j.memory_bytes<=%s AND j.scratch_bytes<=%s
                 AND NOT EXISTS (SELECT 1 FROM dependencies d JOIN jobs p ON p.key=d.dependency_key
                                 WHERE d.job_key=j.key AND p.state<>'succeeded')
                 ORDER BY j.priority + EXTRACT(EPOCH FROM clock_timestamp()-j.ready_at)/60 DESC,
                          j.created_at,j.key FOR UPDATE OF j SKIP LOCKED LIMIT 1''',
-                (node['capabilities'], node['cpu_slots']-used['cpu'], node['memory_bytes']-used['memory'],
+                (node['capabilities'], list(job_keys) if job_keys is not None else None,
+                 list(job_keys) if job_keys is not None else None,
+                 node['cpu_slots']-used['cpu'], node['memory_bytes']-used['memory'],
                  node['scratch_bytes']-used['scratch'])).fetchone()
             if row is None:
                 return None

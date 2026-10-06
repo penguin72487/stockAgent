@@ -219,7 +219,7 @@ def test_finmind_ui_does_not_consume_legacy_partition_based_eta() -> None:
     assert "分割數不等於請求數" in javascript + html
     assert 'unbatched_task_projection' not in javascript
     assert 'id="download-global-eta-basis"' in html
-    assert 'app.js?v=21' in html
+    assert 'app.js?v=22' in html
 
 
 def test_finmind_ui_legacy_numeric_values_still_render_unknown() -> None:

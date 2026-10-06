@@ -896,6 +896,70 @@ def _read_research_replay_components(replay, source, delta, *, end, slots):
     return cached, receipts, policies
 
 
+def _integrated_rule_inputs(source: Path, delta: Path, policy_path: Path | None):
+    """Bind all accepted source overlays for one complete-universe rebuild."""
+    proof = json.loads((delta / 'manifest.json').read_text())
+    source_sha = sha256_file(source / 'source_manifest.json')
+    if (proof.get('status') != 'pending_source_bound_rule_delta'
+            or proof.get('parent_source_manifest_sha256') != source_sha
+            or proof.get('parent_manifest_sha256') != sha256_file(source / 'rules/manifest.json')):
+        raise ValueError('integrated rules differ from their exact source parent')
+    for item in proof.get('sources', []):
+        path = (delta / item['path']).resolve()
+        if not path.is_relative_to(delta.resolve()) or sha256_file(path) != item['sha256']:
+            raise ValueError('integrated rule source SHA/path mismatch')
+    rule_product_inputs(delta)
+    accounting_source, terminal = _accounting_terminal_source(source, delta)
+    accounting_source, loss, _ = _loss_reduction_halt_delta(source, delta, accounting_source)
+    information, information_proof, _ = _information_halt_delta(source, delta)
+    identity = dict(rule_delta_manifest_sha256=sha256_file(delta / 'manifest.json'),
+        terminal_source_overlay=terminal, loss_reduction_halt_source_overlay=loss,
+        information_halt_source_overlay=information_proof)
+    policy, originals = None, []
+    if policy_path is not None:
+        from stockagent.data.tw_futures_valuation_research import validate_valuation_research_policy
+        policy = validate_valuation_research_policy(json.loads(policy_path.read_text()))
+        if (policy['source_manifest_sha256'] != source_sha
+                or policy['rule_delta_manifest_sha256'] != identity['rule_delta_manifest_sha256']
+                or not policy.get('accepted_policy_inputs')):
+            raise ValueError('integrated valuation requires its accepted composed source-bound policy')
+        root = policy_path.parent.parent.resolve()
+        for item in policy['accepted_policy_inputs']:
+            path = (root / item['path']).resolve()
+            if not path.is_relative_to(root) or sha256_file(path) != item['sha256']:
+                raise ValueError('accepted valuation policy input SHA/path mismatch')
+            document = validate_valuation_research_policy(json.loads(path.read_text()))
+            if (document['source_manifest_sha256'] != source_sha
+                    or document['rule_delta_manifest_sha256'] != identity['rule_delta_manifest_sha256']):
+                raise ValueError('accepted valuation input belongs to different sources')
+            originals.append(dict(path=str(path), sha256=item['sha256'], document=document))
+        if (set(policy['products']) != {p for item in originals for p in item['document']['products']}
+                or set(policy['physical_instances']) != {p for item in originals for p in item['document']['physical_instances']}
+                or {json.dumps(r,sort_keys=True) for r in policy['continuation_transfers']}
+                   != {json.dumps(r,sort_keys=True) for item in originals for r in item['document']['continuation_transfers']}):
+            raise ValueError('integrated policy expands its accepted research scope')
+        identity.update(valuation_research_policy_sha256=sha256_file(policy_path),
+            valuation_research_implementation_sha256=sha256_file(ROOT/'stockagent/data/tw_futures_valuation_research.py'))
+    return accounting_source, information, policy, originals, identity
+
+
+def _selected_empty_context_keys(selected, empty, suppressed):
+    """Keep selected owners' empty ancestry, not unrelated historical prefixes."""
+    keys = ['date','physical_contract']
+    origins = suppressed.join(selected.select(keys),on=keys,how='semi')['carry_from_physical_contract']
+    context_ids = set(selected['physical_contract']) | set(origins)
+    edges = empty.filter((pl.col('carry_from_physical_contract') != '')
+        & (pl.col('carry_from_physical_contract') != pl.col('physical_contract'))).select(
+            'physical_contract','carry_from_physical_contract').unique()
+    while True:
+        ancestors = set(edges.filter(pl.col('physical_contract').is_in(sorted(context_ids)))[
+            'carry_from_physical_contract'])
+        if ancestors <= context_ids:
+            break
+        context_ids.update(ancestors)
+    return empty.filter(pl.col('physical_contract').is_in(sorted(context_ids))).select(keys)
+
+
 def build(source: Path, output: Path, *, start: date, end: date, slots: int = 2816,
           diagnostic_products: list[str] | None = None, reuse_accounting: bool = False,
           previous_sources: Path | None = None, omit_empty_account_prefixes: bool = False,
@@ -955,6 +1019,13 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     products = universe["product"].to_list()
     inputs = dict(source_manifest_sha256=sha256_file(source / "source_manifest.json"),
         end=str(end), slots=slots, products=products, calculation=_calculation_identity())
+    accounting_source, information_reviews, valuation_policy = source, [], None
+    if rule_delta is not None and replay_proof is None:
+        accounting_source, information_reviews, valuation_policy, replay_policies, integration = _integrated_rule_inputs(
+            source, rule_delta, valuation_research_policy)
+        if valuation_policy is not None and not set(valuation_policy['products']) <= set(products):
+            raise ValueError('integrated valuation policy exceeds the retained product universe')
+        inputs['integrated_source_inputs'] = integration
     if replay_proof is not None:
         inputs.update(replayed_accounting_manifest_sha256=sha256_file(replay_accounting / 'manifest.json'),
             rule_delta_manifest_sha256=sha256_file(rule_delta / 'manifest.json'),
@@ -1023,8 +1094,9 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         frame, rules, flags, dependencies = (cached[k] for k in ["frame", "rules", "flags", "dependencies"])
         log("verified_accounting_reused", rows=rules.height)
     else:
-        frame, rules, flags, dependencies = _compile_accounting(source, universe, output=output,
-            end=end, slots=slots, save=save, log=log)
+        frame, rules, flags, dependencies = _compile_accounting(accounting_source, universe, output=output,
+            end=end, slots=slots, save=save, log=log, rule_source=rule_delta,
+            information_halt_reviews=information_reviews, valuation_research_policy=valuation_policy)
         save("frame", frame); save("execution_dependencies", dependencies)
         atomic_write_json(checkpoint, dict(inputs=inputs,
             outputs={name:sha256_file(output/name) for name in cache_files.values()}))
@@ -1047,8 +1119,14 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     active = flags.filter(~pl.col("is_warmup"))
     keys = ["date", "physical_contract"]
     log("complete_universe_accounting", rows=rules.height, blocked=int(active["has_blocker"].sum()))
-    selected, chosen, coverage = select_complete_margin_components(frame, rules, flags, start=start, end=end,
-        context_only_keys=empty.select(keys) if omit_empty_account_prefixes else None)
+    selected, chosen, coverage = select_complete_margin_components(frame, rules, flags, start=start, end=end)
+    if omit_empty_account_prefixes:
+        # Preserve the prefix proof for selected components and their empty
+        # origins, without admitting unrelated warmup-only history before the
+        # requested stock-context calendar (notably early CPF).
+        context_keys = _selected_empty_context_keys(selected,empty,suppressed)
+        selected, chosen, coverage = select_complete_margin_components(frame,rules,flags,start=start,end=end,
+            context_only_keys=context_keys)
     save("lifetime_scope", coverage)
     save("blocked_financial_days", active.filter(pl.col("has_blocker")))
     counts = coverage.group_by("product").agg(pl.len().alias("lifetimes"),
@@ -1118,7 +1196,9 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             physical_instances=sorted(set(p for item in replay_policies for p in item['document']['physical_instances'])),
             continuation_transfers=list({(r['date'],r['physical_contract']):r
                 for item in replay_policies for r in item['document']['continuation_transfers']}.values()),
-            accepted_replay_manifest_sha256=sha256_file(replay_accounting/'manifest.json'))
+            **(dict(accepted_replay_manifest_sha256=sha256_file(replay_accounting/'manifest.json'))
+               if replay_accounting is not None else
+               dict(integrated_policy_sha256=sha256_file(valuation_research_policy))))
         combined_policy['accepted_policy_inputs'] = []
         for item in replay_policies:
             original_path = admitted/'sources/valuation_policy_inputs'/(item['sha256']+'.json')
@@ -1194,6 +1274,8 @@ if __name__ == "__main__":
     parser.add_argument("--repair-release-metadata", action="store_true")
     parser.add_argument("--diagnostic-product", action="append", default=[])
     parser.add_argument('--rule-delta', type=Path, help='Pending source-bound rules for connected-product replay only')
+    parser.add_argument('--integrate-rule-delta', type=Path,
+                        help='Integrate accepted source-bound rules in one complete retained-universe build')
     parser.add_argument('--gap-worklist', type=Path)
     parser.add_argument('--parent-slot-lifetimes', type=Path)
     parser.add_argument('--parent-slot-receipt', type=Path)
@@ -1216,10 +1298,20 @@ if __name__ == "__main__":
         if (not args.omit_empty_account_prefixes or (args.rule_delta and not args.publish_replay) or args.repair_release_metadata
                 or not 0 < args.empty_prefix_max_volume_participation <= 1):
             parser.error('whole-contract prefix bound requires --omit-empty-account-prefixes in the build mode')
-    if not args.rule_delta and (args.prior_affected_replay or args.prior_rule_input_receipt_sha256
+    if not (args.rule_delta or args.integrate_rule_delta) and (args.prior_affected_replay or args.prior_rule_input_receipt_sha256
                                or args.context_only_prefix_policy or args.valuation_research_policy):
         parser.error('incremental replay arguments require --rule-delta')
-    if args.publish_replay:
+    if args.integrate_rule_delta:
+        if (args.rule_delta or args.publish_replay or args.prior_affected_replay
+                or args.prior_rule_input_receipt_sha256 or args.context_only_prefix_policy
+                or args.previous_sources or args.repair_release_metadata or args.diagnostic_product
+                or not args.omit_empty_account_prefixes):
+            parser.error('full source integration requires retained-universe build and empty-prefix admission')
+        build(args.sources,args.output,start=args.start,end=args.end,slots=args.slots,
+            reuse_accounting=args.reuse_accounting,omit_empty_account_prefixes=True,
+            empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
+            rule_delta=args.integrate_rule_delta,valuation_research_policy=args.valuation_research_policy)
+    elif args.publish_replay:
         if (not args.rule_delta or not args.valuation_research_policy or not args.omit_empty_account_prefixes
                 or args.reuse_accounting or args.previous_sources or args.repair_release_metadata
                 or args.prior_affected_replay or args.diagnostic_product):

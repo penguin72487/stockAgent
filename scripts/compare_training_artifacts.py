@@ -82,7 +82,7 @@ def checkpoint_differences(
     left: Any, right: Any, *, path: str,
     allow_runtime_profile_differences: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Optionally admit only recorded CPU-budget/output-path manifest changes.
+    """Admit explicit CPU/output/fold lifecycle/eval schedules, never state.
 
     Both configuration checksums must be valid. All other configuration,
     semantic fingerprints and saved state remain subject to exact comparison.
@@ -103,14 +103,25 @@ def checkpoint_differences(
             return [f"{path}: configuration fingerprint invalid on side {index}"], []
     normalized = dict(configurations[1])
     admitted = []
-    for section, field in (("environment", "cpu_threads"), ("runner", "output_dir")):
+    for section, field in (("environment", "cpu_threads"), ("runner", "output_dir"),
+                           ("runner", "resume"), ("runner", "isolate_train_folds"),
+                           ("training", "eval_backtest_chunk_rows")):
+        if field in {"resume", "isolate_train_folds", "eval_backtest_chunk_rows"} and all(
+            not isinstance(configuration.get(section), Mapping)
+            or field not in configuration[section]
+            for configuration in configurations
+        ):
+            # Old lightweight checkpoints did not record this runtime knob.
+            continue
         values = []
         for configuration in configurations:
             fields = configuration.get(section)
             if not isinstance(fields, Mapping) or field not in fields:
                 return [f"{path}: runtime profile field missing: {section}.{field}"], []
             value = fields[field]
-            if ((field == "cpu_threads" and (type(value) is not int or value <= 0))
+            if ((field in {"cpu_threads", "eval_backtest_chunk_rows"} and
+                 (type(value) is not int or value <= 0))
+                    or (field in {"resume", "isolate_train_folds"} and type(value) is not bool)
                     or (field == "output_dir" and (not isinstance(value, str) or not value))):
                 return [f"{path}: runtime profile field invalid: {section}.{field}"], []
             values.append(value)
@@ -199,7 +210,7 @@ def compare_runs(
         "compared": compared, "npz_arrays_compared": array_count,
         "differences": differences, "performance": performance,
         "runtime_profile_difference_policy": (
-            "explicit_cpu_threads_and_output_dir_only" if allow_runtime_profile_differences else "strict"
+            "explicit_cpu_output_fold_lifecycle_and_eval_replay_only" if allow_runtime_profile_differences else "strict"
         ),
         "declared_runtime_profile_differences": runtime_profile_differences,
         "comparison_tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -214,7 +225,7 @@ def main() -> int:
     parser.add_argument("--folds", type=int, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-runtime-profile-differences", action="store_true",
-                        help="admit only CPU budget/output paths with verified configuration fingerprints")
+                        help="admit only CPU/output/fold-lifecycle/eval-replay with verified config fingerprints")
     args = parser.parse_args()
     result = compare_runs(args.left, args.right, folds=args.folds,
                           allow_runtime_profile_differences=args.allow_runtime_profile_differences)

@@ -3,8 +3,11 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -61,6 +64,83 @@ def readiness(queue, **changes):
     return value
 
 
+def test_delegated_cold_replication_ingests_old_ack_without_new_payload(stream):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    delivery = next(iter(ledger['deliveries'].values()))
+    acknowledge(queue, delivery)
+    queue.config['cold_object_replication_enabled'] = False
+    result = queue.cycle()
+    after = queue.load_ledger()
+    assert len(after['deliveries']) == len(ledger['deliveries'])
+    assert next(iter(after['deliveries'].values()))['acceptance']
+    assert result['state'] == 'cold_replication_delegated_to_immutable_lake'
+    assert result['cold_object_replication_enabled'] is False
+    assert queue.cold.exists()
+
+
+def test_cold_delegation_requires_explicit_boolean(stream):
+    with pytest.raises(SnapshotError, match='explicit boolean'):
+        BackupStream({**stream[0].config, 'cold_object_replication_enabled': 'false'})
+    with pytest.raises(SnapshotError, match='explicit boolean'):
+        BackupStream({**stream[0].config, 'cold_metadata_replication_enabled': 'true'})
+
+
+def test_delegated_objects_keep_exact_metadata_backup_on_the_existing_owner(stream):
+    queue = stream[0]
+    queue.config.update(cold_object_replication_enabled=False, cold_metadata_replication_enabled=True)
+    readiness(queue)
+    result = queue.cycle()
+    ledger = queue.load_ledger()
+    assert result['pipeline']['published_waves']
+    assert all(row['role'] == 'cold_metadata' for d in ledger['deliveries'].values() for row in d['files'])
+    assert queue.cold.exists()
+
+
+def test_frozen_metadata_backfill_retains_a_head_that_advanced_after_capture(stream, tmp_path):
+    queue, cold, source, first, second = stream
+    fixed = capture_catalog(cold, Path(queue.config['publication_catalog']))
+    prior = next(row for row in fixed['files'] if row['relative'].startswith('heads/'))
+    raw = json.dumps(fixed).encode()
+    path = tmp_path / 'fixed-catalog.json'
+    path.write_bytes(raw)
+    (source / '價格.txt').write_text('new head after the frozen cohort\n')
+    publish_packed_snapshot(cold, 'prices', source, loose_file_threshold_bytes=1024, pack_buckets=2)
+    queue.config.update(cold_object_replication_enabled=False, cold_metadata_replication_enabled=True,
+                        metadata_backfill_catalog=str(path), metadata_backfill_sha256=hashlib.sha256(raw).hexdigest())
+    readiness(queue)
+    for _ in range(10):
+        queue.cycle()
+        ledger = queue.load_ledger()
+        for delivery in ledger['deliveries'].values():
+            if not delivery.get('acceptance'):
+                acknowledge(queue, delivery)
+        if any(file_key(prior) == file_key(row) for delivery in ledger['deliveries'].values() for row in delivery['files']):
+            break
+    assert any(file_key(prior) == file_key(row) for delivery in queue.load_ledger()['deliveries'].values()
+               for row in delivery['files'])
+    assert (cold / prior['relative']).read_bytes() != prior['captured_bytes_utf8'].encode()
+
+
+def test_reported_pilot_metadata_is_sent_for_machine_restore_proof(stream):
+    queue = stream[0]
+    catalog = capture_catalog(queue.cold, Path(queue.config['publication_catalog']))
+    pilot = next(row for row in catalog['files'] if row['relative'].startswith('manifests/'))
+    ledger = empty_ledger()
+    ledger['reported_baseline'] = [{'files': [pilot],
+        **{key: 'a' * 64 for key in ('envelope_identity_sha256', 'envelope_file_sha256', 'snapshot_id', 'report_sha256')},
+        'batch_relative': 'batch-pilot', 'repository_id': queue.config['repository_id'],
+        'evidence_origin': 'user_relayed_acceptance'}]
+    module.private_json(queue.ledger_path, ledger)
+    queue.config.update(cold_object_replication_enabled=False, cold_metadata_replication_enabled=True,
+                        maximum_batch_files=100)
+    readiness(queue)
+    queue.cycle()
+    assert any(file_key(pilot) == file_key(row) for d in queue.load_ledger()['deliveries'].values() for row in d['files'])
+
+
 def acknowledge(queue, delivery, **changes):
     dispatch = delivery["dispatch"]
     proof = {"repository_id": dispatch["repository_id"], "snapshot_id": "b" * 64,
@@ -74,6 +154,108 @@ def acknowledge(queue, delivery, **changes):
     path = queue.state / "private-proof.json"
     path.write_text(json.dumps(proof))
     return publish(queue.transport / dispatch["batch_relative"], dispatch, path, queue.receipts)
+
+
+def enable_pipeline(queue, *, waves=4):
+    queue.config.update(maximum_pending_deliveries=4, maximum_pending_bytes=16 * 1024**2)
+    queue.config["pipeline"] = {"maximum_waves_per_cycle": waves, "copy_workers": 2,
+        "verify_workers": 2, "retry_delays_seconds": [30, 120, 600]}
+    return BackupStream(queue.config)
+
+
+def test_fd_capacity_inventory_counts_failed_staging_and_unjournaled_files(stream):
+    queue=stream[0]
+    (queue.transport/".staging/failed").mkdir(parents=True)
+    (queue.transport/".staging/failed/partial.bin").write_bytes(b"x"*91)
+    (queue.transport/"unknown.bin").write_bytes(b"y"*123)
+    measured=queue.transport_usage()
+    assert measured["retained_staging_bytes"] == 91
+    assert measured["retained_transport_bytes"] == 91+123+(queue.transport/".stignore").stat().st_size
+
+
+@pytest.mark.parametrize("kind",("file_link","directory_link","fifo"))
+def test_fd_capacity_inventory_rejects_redirected_and_special_entries(stream,kind):
+    queue=stream[0]
+    outside=queue.state/"outside"
+    outside.mkdir()
+    (outside/"data").write_text("must not follow this")
+    path=queue.transport/"unsafe"
+    if kind == "fifo":
+        os.mkfifo(path)
+    else:
+        path.symlink_to(outside if kind == "directory_link" else outside/"data")
+    with pytest.raises(SnapshotError):
+        queue.transport_usage()
+
+
+def test_pipeline_publishes_disjoint_waves_without_waiting_for_nas_ack(stream):
+    queue = enable_pipeline(stream[0])
+    readiness(queue)
+    result = queue.cycle()
+    ledger = queue.load_ledger()
+    assert 2 <= len(ledger["deliveries"]) <= 4
+    assert result["pending_delivery_count"] == len(ledger["deliveries"])
+    assert len(result["pipeline"]["published_waves"]) == len(ledger["deliveries"])
+    observed = []
+    for key, delivery in ledger["deliveries"].items():
+        assert not delivery.get("acceptance")
+        verify(queue.transport / delivery["dispatch"]["batch_relative"], key, workers=2)
+        observed.extend(file_key(row) for row in delivery["files"])
+    assert len(observed) == len(set(observed))
+
+
+def test_pipeline_indexes_first_batch_while_exporting_second(stream, monkeypatch):
+    queue = enable_pipeline(stream[0])
+    readiness(queue)
+    scan_started = threading.Event()
+    real_export = module.export_incremental_delivery
+    calls = []
+
+    def export(*args, **kwargs):
+        if calls:
+            assert scan_started.wait(timeout=2), "previous READY must be indexed while source keeps producing"
+        calls.append(1)
+        return real_export(*args, **kwargs)
+
+    def scan(ledger):
+        assert len(ledger["deliveries"]) == 1
+        scan_started.set()
+
+    monkeypatch.setattr(module, "export_incremental_delivery", export)
+    monkeypatch.setattr(queue, "scan_transport", scan)
+    result = queue.cycle()
+    assert len(calls) >= 2 and not result["pipeline"]["scan_errors"]
+
+
+def test_failed_wave_is_requeued_while_other_waves_continue(stream, monkeypatch):
+    queue = enable_pipeline(stream[0])
+    readiness(queue)
+    real_export = module.export_incremental_delivery
+    failed = []
+
+    def export(cold, rows, target, **kwargs):
+        if not failed:
+            failed.extend(file_key(row) for row in rows)
+            target.mkdir(parents=True)
+            (target / "failure-evidence.txt").write_text("simulated interrupted copy")
+            raise OSError("transient storage failure")
+        return real_export(cold, rows, target, **kwargs)
+
+    monkeypatch.setattr(module, "export_incremental_delivery", export)
+    result = queue.cycle()
+    ledger = queue.load_ledger()
+    assert result["pipeline"]["published_waves"] and len(result["pipeline"]["export_errors"]) == 1
+    assert set(failed) <= ledger["export_retries"].keys()
+    assert all(ledger["export_retries"][key]["next_attempt_epoch"] > time.time() for key in failed)
+    assert not any(file_key(row) in failed for d in ledger["deliveries"].values() for row in d["files"])
+    assert (queue.transport / result["pipeline"]["export_errors"][0]["staging_relative"] / "failure-evidence.txt").is_file()
+    for delivery in list(ledger["deliveries"].values()):
+        acknowledge(queue, delivery)
+    for item in ledger["export_retries"].values():
+        item["next_attempt_epoch"] = 0
+    module.private_json(queue.ledger_path, ledger)
+    queue.cycle()
+    assert set(failed) <= {file_key(row) for d in queue.load_ledger()["deliveries"].values() for row in d["files"]}
 
 
 def test_inventory_deduplicates_objects_across_retained_versions(stream):

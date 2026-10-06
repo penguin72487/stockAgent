@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from datetime import timedelta
 import json
 import threading
 from urllib.error import HTTPError
@@ -11,6 +12,41 @@ import pyarrow.parquet as pq
 import pytest
 
 from downloader import download_yahoo_ohlcv as yahoo
+
+
+def test_audited_current_file_gets_finite_interior_recheck_not_tail_skip(tmp_path, monkeypatch):
+    from downloader import quality_priority
+    info = yahoo.ExistingFileInfo('2000-01-01', '2026-06-11', None,
+        set(yahoo.REPAIR_REQUIRED_COLUMNS), checked_through_date='2026-06-11',
+        requested_start_date='2000-01-01', source='yahoo', asset_class='us_stocks')
+    monkeypatch.setattr(yahoo, '_load_existing_file_info', lambda *_: info)
+    path = tmp_path / 'quality_priority_requests.json'
+    payload = {'contract': quality_priority.CONTRACT, 'requests': [{
+        'code': 'AAPL', 'reason': 'invalid_values', 'request_id': 'a' * 64,
+        'evidence_sha256': 'b' * 64, 'state': 'pending', 'attempts': 0,
+        'repair_start_date': '2011-02-03',
+        'expires_at_utc': (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()}]}
+    path.write_text(json.dumps(payload))
+    args = _base_args(tmp_path, asset='us_stocks')
+    record = yahoo.SymbolRecord('AAPL', 'Apple Common Stock', 'us_stocks', 'AAPL')
+    check = yahoo._resolve_repair_plan('us_stocks', args, [record], tmp_path)[0]
+    assert (check.status, check.repair_start_date, check.merge_existing) == ('quality_recheck', '2011-02-03', True)
+    payload['requests'][0].update(state='retry_exhausted', attempts=3)
+    path.write_text(json.dumps(payload))
+    assert yahoo._resolve_repair_plan('us_stocks', args, [record], tmp_path)[0].status == 'current'
+
+
+def test_quality_original_is_preserved_with_exact_hash_before_replacement(tmp_path):
+    from downloader.artifact_io import sha256_file
+    original = tmp_path / 'DAMAGED_features.parquet'
+    original.write_bytes(b'original truncated source bytes')
+    digest = sha256_file(original)
+    yahoo._preserve_quality_original(original, tmp_path)
+    yahoo._preserve_quality_original(original, tmp_path)
+    archive = tmp_path / '_quality_evidence' / digest / original.name
+    original.write_bytes(b'subsequent repaired file')
+    assert archive.read_bytes() == b'original truncated source bytes'
+    assert json.loads((archive.parent / 'receipt.json').read_text())['sha256'] == digest
 
 
 def test_daily_asset_summary_survives_separate_asset_invocations(
