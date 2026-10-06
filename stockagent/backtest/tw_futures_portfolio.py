@@ -72,6 +72,7 @@ class FuturesPortfolioTensorResult:
     default_reason_history: torch.Tensor | None = None
     margin_audit_history: torch.Tensor | None = None
     residual_contract_quantities_history: torch.Tensor | None = None
+    requested_weights_history: torch.Tensor | None = None
     # Internal continuation state for fixed-block compilation.  Public exact
     # accounting continues to use ``final_weights`` (whole contracts),
     # ``final_equity_scale``, and ``final_alive``.  These shadow fields never
@@ -631,6 +632,7 @@ def _margin_physical_backward(
     recover: bool,
     return_weights_history: bool,
     return_turnovers: bool,
+    account_policy: torch.Tensor | None = None,
 ) -> FuturesPortfolioTensorResult:
     """Linearize the executed physical account, never a fungible group book.
 
@@ -685,10 +687,22 @@ def _margin_physical_backward(
             moved, transferred_cash, _ = _transfer_margin_inventory(q, x, whole_contracts=False)
             q = torch.where(do_row, moved, q)
             event_cash = torch.where(do_row, transferred_cash, event_cash)
+        row_weights = weights[row]
+        if account_policy is not None:
+            from stockagent.models.futures_account_policy import resolve_futures_account_policy
+            # Differentiate state feedback through the anchored physical
+            # shadow within this batch. Values remain the EXACT policy request;
+            # this is neither teacher-forced inventory nor an alternative PnL.
+            feedback = resolve_futures_account_policy(
+                account_policy[row], q, nav, initial_capital=capital,
+                alive=start_alive, advance=advance[row], detach_state=False,
+                previous_inventory_marks=x[:, margin.PREVIOUS_MARK:margin.PREVIOUS_MAINTENANCE + 1],
+            )
+            row_weights = feedback + (row_weights - feedback).detach()
         gap = (q * gaps[row]).sum()
         marked_nav = nav + event_cash + gap
         allocation_nav = torch.minimum(nav, marked_nav).clamp_min(0.)
-        requested = torch.zeros_like(q).scatter_add(0, group, torch.where(active, weights[row], 0.))
+        requested = torch.zeros_like(q).scatter_add(0, group, torch.where(active, row_weights, 0.))
         mandatory_failed = force_close | position_failed
         requested = torch.where(mandatory_failed, torch.zeros_like(requested), requested)
         capacity = torch.where(active & (x[:, 1] > .5) & do_row, capacities[row], 0.)
@@ -1387,6 +1401,14 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     continuous surrogate; reported quantities and cash are always exact.
     """
 
+    from stockagent.models.futures_account_policy import (
+        is_futures_account_policy_packet, resolve_futures_account_policy,
+    )
+    account_policy = target_weights if is_futures_account_policy_packet(target_weights) else None
+    if account_policy is not None:
+        if int(integer_execution.size(-1)) not in margin.MARGIN_EXECUTION_WIDTHS:
+            raise ValueError("causal account policy requires the exact margin ledger")
+        target_weights = account_policy[..., 0]
     if target_weights.ndim != 2 or target_weights.numel() == 0:
         raise ValueError("integer futures target_weights must have shape [T,S]")
     if (
@@ -1409,6 +1431,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     # basket scoring, argmin, or integer casts.  Its value/state is detached;
     # the explicit grouped relaxation below owns the complete backward path.
     weights = surrogate_weights.detach()
+    training_shadow = bool(surrogate_weights.requires_grad and torch.is_grad_enabled())
     execution = integer_execution.to(device=weights.device, dtype=torch.float32)
     margin_mode = int(execution.size(-1)) in margin.MARGIN_EXECUTION_WIDTHS
     rows, slots = tuple(weights.shape)
@@ -1556,6 +1579,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
     margin_backward_trace: list[tuple[torch.Tensor, ...]] = []
     margin_audit_rows: list[torch.Tensor] = []
     residual_rows: list[torch.Tensor] = []
+    requested_rows: list[torch.Tensor] = []
     for row in range(rows):
         must_liquidate = must_liquidate_all[row]
         opening_notional = opening_notional_all[row]
@@ -1572,6 +1596,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         gap_pnl = weights.new_zeros(())
         force_margin_close = torch.zeros_like(alive)
         margin_metadata_ok = torch.ones_like(alive)
+        row_requested_group = requested_group_all[row]
         if margin_mode:
             event_cash = weights.new_zeros(())
             if execution.shape[-1] >= margin.MARGIN_CORPORATE_EXECUTION_WIDTH:
@@ -1580,6 +1605,18 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 quantities = torch.where(advance[row], moved, quantities)
                 event_cash = torch.where(advance[row], transferred_cash, event_cash)
                 margin_metadata_ok &= ~advance[row] | transfer_ok
+            if account_policy is not None:
+                # Corporate quantity/identity conversion is preannounced. Its
+                # opening cash and current gap PnL have NOT entered settled NAV.
+                with torch.no_grad():
+                    requested = resolve_futures_account_policy(
+                        account_policy[row], quantities, row_start_equity,
+                        initial_capital=capital, alive=alive, advance=advance[row],
+                        previous_inventory_marks=execution[row, :, margin.PREVIOUS_MARK:margin.PREVIOUS_MAINTENANCE + 1],
+                    )
+                requested_rows.append(requested)
+                row_requested_group = torch.zeros_like(weights[row]).scatter_add(
+                    0, group_index, requested.detach())
             previous_mark = execution[row, :, margin.PREVIOUS_MARK]
             previous_mm = execution[row, :, margin.PREVIOUS_MAINTENANCE]
             carried = quantities != 0
@@ -1604,8 +1641,8 @@ def _run_tw_futures_portfolio_integer_torch_impl(
                 execution[row, :, margin.POSITION_LIMIT].nan_to_num(), reduce="amax")
         group_target_weight = torch.where(
             alive,
-            requested_group_all[row],
-            torch.zeros_like(requested_group_all[row]),
+            row_requested_group,
+            torch.zeros_like(row_requested_group),
         )
         group_target_weight = torch.where(force_margin_close, torch.zeros_like(group_target_weight), group_target_weight)
         target_cash = group_target_weight.abs() * allocation_equity.detach().clamp_min(0.0)
@@ -1950,7 +1987,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         quantities = torch.where(row_alive, quantities, torch.zeros_like(quantities))
         equity = torch.where(row_alive, next_equity, torch.zeros_like(next_equity))
         alive = alive & row_alive
-        if margin_mode and surrogate_weights.requires_grad and torch.is_grad_enabled():
+        if margin_mode and training_shadow:
             margin_backward_trace.append((row_start_equity, row_start_alive,
                 chosen_by_slot, closed_by_slot, quantities, equity, force_margin_close, position_limit_failed))
         return_rows.append(log_return)
@@ -1977,7 +2014,9 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         if return_weights_history
         else torch.empty((0, slots), device=weights.device, dtype=torch.int64)
     )
-    if margin_mode and surrogate_weights.requires_grad and torch.is_grad_enabled():
+    if account_policy is not None:
+        surrogate_weights = torch.stack(requested_rows)
+    if margin_mode and training_shadow:
         surrogate = _margin_physical_backward(
             surrogate_weights, execution, initial_capital=capital,
             initial_quantities=(torch.zeros(slots, device=weights.device)
@@ -1985,8 +2024,9 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             advance=advance, active_metadata=active_metadata_all,
             trace=margin_backward_trace, recover=recoverable_backward,
             return_weights_history=return_weights_history, return_turnovers=return_turnovers,
+            account_policy=account_policy,
         )
-    elif surrogate_weights.requires_grad and torch.is_grad_enabled():
+    elif training_shadow:
         surrogate = run_tw_futures_portfolio_integer_surrogate_torch(
             surrogate_weights,
             integer_execution,
@@ -2017,7 +2057,7 @@ def _run_tw_futures_portfolio_integer_torch_impl(
             # full-batch call.
             _detach_initial_weights=(_initial_surrogate_weights is None),
         )
-    if surrogate_weights.requires_grad and torch.is_grad_enabled():
+    if training_shadow:
         # Add an exactly zero forward tangent rather than subtracting the
         # differently sized exact/shadow values. This preserves the integer
         # account bit for bit under grad/no-grad while retaining the shadow
@@ -2054,19 +2094,21 @@ def _run_tw_futures_portfolio_integer_torch_impl(
         margin_audit_history=(torch.stack(margin_audit_rows)
                               if margin_mode and return_margin_audit else None),
         residual_contract_quantities_history=torch.stack(residual_rows) if residual_rows else None,
+        requested_weights_history=(surrogate_weights.detach()
+                                   if account_policy is not None and return_weights_history else None),
         _surrogate_final_weights=(
             surrogate.final_weights
-            if surrogate_weights.requires_grad and torch.is_grad_enabled()
+            if training_shadow
             else None
         ),
         _surrogate_final_equity_scale=(
             surrogate.final_equity_scale
-            if surrogate_weights.requires_grad and torch.is_grad_enabled()
+            if training_shadow
             else None
         ),
         _surrogate_final_alive=(
             surrogate.final_alive
-            if surrogate_weights.requires_grad and torch.is_grad_enabled()
+            if training_shadow
             else None
         ),
     )

@@ -252,7 +252,12 @@ def validate_completed_training_artifacts(
     manifest = read_json(layout.run_manifest_path)
     manifest_execution_mode: str | None = None
     manifest_metrics_version = None
+    causal_account_policy = False
     if isinstance(manifest, dict):
+        causal_account_policy = bool(
+            manifest.get("configuration", {}).get("training", {})
+            .get("financial_transformer", {}).get("futures_causal_account_policy", False)
+        )
         manifest_metrics_version = manifest.get("metrics_contract_version")
         if manifest_metrics_version is not None and (
             type(manifest_metrics_version) is not int or manifest_metrics_version < 1
@@ -345,7 +350,7 @@ def validate_completed_training_artifacts(
         "dates.npy",
     }
 
-    def validate_backtest_container(path: Path) -> None:
+    def validate_backtest_container(path: Path, *, require_account_policy: bool = False) -> None:
         if not has_content(path):
             return
         try:
@@ -355,6 +360,10 @@ def validate_completed_training_artifacts(
             invalid.append(f"{path}: invalid backtest container ({type(exc).__name__})")
             return
         missing_entries = sorted(required_backtest_entries - names)
+        if require_account_policy:
+            missing_entries.extend(sorted({
+                "futures_account_policy_packet.npy", "futures_account_policy_version.npy",
+            } - names))
         if missing_entries:
             invalid.append(f"{path}: missing backtest entries {missing_entries}")
 
@@ -374,6 +383,9 @@ def validate_completed_training_artifacts(
         contract_path = layout.fold_dir(fold_id) / "mode_artifact_contract.json"
         contract = read_json(contract_path)
         if isinstance(contract, dict):
+            if (causal_account_policy
+                    and contract.get("mode_details", {}).get("causal_account_policy_replay_version") != 1):
+                invalid.append(f"{contract_path}: closed-loop futures policy replay contract is missing")
             if manifest_metrics_version is not None and contract.get(
                 "metrics_contract_version"
             ) != manifest_metrics_version:
@@ -478,7 +490,8 @@ def validate_completed_training_artifacts(
 
         validate_backtest_container(layout.fold_dir(fold_id) / "test_backtest.npz")
         validate_backtest_container(
-            layout.fold_dir(fold_id) / "deployment_test_backtest.npz"
+            layout.fold_dir(fold_id) / "deployment_test_backtest.npz",
+            require_account_policy=causal_account_policy,
         )
         if require_plots:
             for name in (

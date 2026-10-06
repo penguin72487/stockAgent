@@ -2081,6 +2081,8 @@ def main() -> None:
                 participation=config.trading.max_volume_participation,
                 benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
                 include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
+                include_account_policy_observations=config.training.financial_transformer.futures_causal_account_policy,
+                account_policy_lookback=config.training.lookback,
             )
         if (
             _distributed_rank() == 0
