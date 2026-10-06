@@ -1,0 +1,26 @@
+[Unit]
+Description=Verify and retire the retained Vast compressed preservation cohorts
+Requires=stockagent-d-cold-mount.service
+Wants=network-online.target syncthing@root.service
+After=stockagent-d-cold-mount.service network-online.target syncthing@root.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/organize_vast_bulk_archives.py --apply --retire --capture-inactive-caches
+# 75 is deferred work, never a successful backup/retirement receipt.
+SuccessExitStatus=75
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+MemoryHigh=4G
+MemoryMax=8G
+TimeoutStartSec=infinity
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=no

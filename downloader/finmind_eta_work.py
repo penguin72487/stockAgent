@@ -24,7 +24,8 @@ from downloader.finmind_runtime import idle_heartbeat
 
 
 EXCLUDED_STATES = frozenset({"non_session", "not_observation_date", "deprecated_query_shape",
-                             "outside_documented_range", "disabled", "delegated", "calendar_wait", "identifier_alias"})
+                             "outside_documented_range", "disabled", "delegated", "calendar_wait", "identifier_alias",
+                             "object_tier_paused"})
 DONE_STATES = frozenset({"complete", "observed_empty"})
 PENDING_STATES = frozenset({"pending", "failed"})
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -34,7 +35,8 @@ COUNT_FIELDS = ("required_requests", "incremental_requests", "backfill_requests"
                 "unbatched_requests", "fastest_requests", "current_plan_requests", "batch_savings",
                 "completed_tasks", "pending_tasks", "blocked_tasks", "cooling_tasks", "inflight_tasks",
                 "inflight_requests", "local_derived_tasks", "excluded_tasks", "uncertain_requests",
-                "calendar_wait_tasks", "retry_tasks", "retry_exhausted_tasks", "candidate_requests")
+                "calendar_wait_tasks", "retry_tasks", "retry_exhausted_tasks", "candidate_requests",
+                "independent_retry_tasks", "independent_retry_requests", "independent_inflight_tasks")
 
 
 def _registry() -> dict[str, dict[str, Any]]:
@@ -176,6 +178,12 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                         item['blocked_tasks'] += count
             if owner == 'complement' and 'finmind_source_frontiers' in tables:
                 from downloader.finmind_supplemental import frontier_status
+                from downloader.finmind_storage_objects import active_datasets
+                for dataset in active_datasets(conn):
+                    if dataset in aggregate:
+                        aggregate[dataset]['object_pending_requests'] = conn.execute(
+                            "SELECT count(*) FROM tasks WHERE dataset=? AND data_id='' AND state IN ('pending','failed')",
+                            (dataset,)).fetchone()[0]
                 for dataset, frontier in frontier_status(conn, now).items():
                     if dataset in aggregate:
                         aggregate[dataset]['frontier'] = frontier
@@ -293,6 +301,10 @@ def _observed_row(dataset: str, owner: str, contract: dict[str, Any], item: dict
         row['historical_frontier'] = item['frontier']
         row['candidate_requests'] = item['frontier']['unseeded_partition_candidates']
         row['request_estimate_basis'] = 'disjoint_frontier_candidates_with_verified_cash_closures_not_verified_instrument_lifetimes'
+        if item['frontier'].get('query_shape') == 'whole_market_storage_object_day':
+            row['query_shape'] = 'whole_market_storage_object_day_with_separate_TAIEX_history' if dataset == 'TaiwanStockKBar' else 'whole_market_storage_object_day'
+            row['object_requests'] = (item['frontier'].get('object_unseeded_candidates', 0)
+                                      + item.get('object_pending_requests', 0))
     if item.get('priority_override'):
         row['priority_override'] = item['priority_override']
     latest = _stamp(item["retry_last"])
@@ -328,15 +340,21 @@ def _free_rows(root: Path, now: datetime, catalog: dict[str, dict[str, Any]]) ->
             row.update(required_requests=pending, backfill_requests=pending, current_plan_requests=pending,
                        fastest_requests=pending, unbatched_requests=pending, completed_tasks=complete,
                        pending_tasks=pending, cooling_tasks=deferred, inflight_requests=inflight,
-                       inflight_tasks=inflight, basis="fresh_worker_status_not_receipt_rescan")
+                       inflight_tasks=inflight, independent_inflight_tasks=inflight,
+                       basis="fresh_worker_status_not_receipt_rescan")
             # The worker already visited these receipt heads. Reuse its small
             # projection instead of rescanning every historical file for ETA.
             retries = item.get('retry_tasks')
             if type(retries) is int and 0 <= retries <= pending + inflight:
                 row['retry_tasks'] = retries
                 row['retry_tasks_by_class'] = {'backfill': retries}
+                # Free has its own worker. Its source retry does not stop the
+                # Complement history lane, though all calls still share quota.
+                row['independent_retry_tasks'] = retries
+                row['independent_retry_requests'] = min(retries, pending)
             earliest, latest = (_stamp(item.get(key)) for key in ('earliest_retry_at_utc', 'latest_retry_at_utc'))
             row['earliest_retry_at_utc'] = earliest.isoformat() if earliest else None
+            row['independent_retry_clock_known'] = latest is not None
             row['max_retry_wait_seconds'] = max(0, (latest - now).total_seconds()) if latest else 0
             row['retry_wait_seconds_by_class'] = {'backfill': row['max_retry_wait_seconds']}
             result[dataset] = row

@@ -27,6 +27,28 @@ def test_due_burst_uses_one_shared_lane_then_returns_to_history():
     assert calls == 200
 
 
+def test_large_object_cost_is_not_applied_to_small_priority_json_requests():
+    events = [event(NOW + timedelta(minutes=30), 2000, period=0)]
+    done, _, calls = release_aware_finish(NOW, 100, 100, events,
+        day_is_protected=lambda _: False, priority_rate=20000)
+    assert done == NOW + timedelta(hours=1, minutes=6)
+    assert calls == 2000  # Full shared-quota count, not fractional calls.
+
+
+def test_fast_refreshes_do_not_artificially_make_slow_object_lane_undrainable():
+    events = [event(NOW + timedelta(minutes=30), 200, period=3600)]
+    done, _, calls = release_aware_finish(NOW, 200, 100, events,
+        day_is_protected=lambda _: False, priority_rate=20000)
+    assert done == NOW + timedelta(hours=2, seconds=72)
+    assert calls == 400
+
+
+@pytest.mark.parametrize('rate', [0, float('inf'), float('nan')])
+def test_invalid_priority_rate_never_invents_capacity(rate):
+    with pytest.raises(ValueError, match='priority capacity'):
+        release_aware_finish(NOW, 100, 100, [], day_is_protected=lambda _: False, priority_rate=rate)
+
+
 def test_later_stages_do_not_recount_predecessor_releases():
     events = [event(NOW + timedelta(minutes=30), 50, 3600)]
     done, _, one = finish(100, events)

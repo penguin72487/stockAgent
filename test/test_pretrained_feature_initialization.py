@@ -91,6 +91,7 @@ class _TinyFinancialStem(nn.Module):
         num_features: int,
         feature_bottleneck_dim: int,
         causal_rms: bool,
+        feature_svd_components: int = 0,
     ) -> None:
         super().__init__()
         self.candle_encoder = CandleEncoder(
@@ -102,6 +103,7 @@ class _TinyFinancialStem(nn.Module):
             sanitize_inputs=True,
             feature_bottleneck_dim=feature_bottleneck_dim,
             causal_feature_rms_normalization=causal_rms,
+            feature_svd_components=feature_svd_components,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -460,17 +462,22 @@ def test_same_feature_abi_preserves_learned_bottleneck_checkpoint_exactly() -> N
 
 
 @pytest.mark.parametrize("training_continues", [False, True])
+@pytest.mark.parametrize("feature_svd", [False, True])
 def test_resume_preserves_pretrained_rms_and_optimizer_trajectory(
     training_continues: bool,
+    feature_svd: bool,
 ) -> None:
     torch.manual_seed(317)
     uninterrupted = _TinyFinancialStem(
-        num_features=4, feature_bottleneck_dim=2, causal_rms=True
+        num_features=4, feature_bottleneck_dim=0 if feature_svd else 2,
+        causal_rms=True, feature_svd_components=2 if feature_svd else 0,
     )
     uninterrupted.candle_encoder.set_causal_feature_rms_normalizer(
         torch.tensor([2.0, 3.0, 5.0, 7.0]),
         torch.tensor([True, False, True, True]),
     )
+    if feature_svd:
+        uninterrupted.candle_encoder.set_feature_svd_projection(torch.eye(4)[:2])
     inputs, target = torch.randn(3, 4), torch.randn(3, 4)
     optimizer = torch.optim.AdamW(uninterrupted.parameters(), lr=1e-3)
 
@@ -486,15 +493,22 @@ def test_resume_preserves_pretrained_rms_and_optimizer_trajectory(
         "pretrained_initialization": {"source_checkpoint": "source.pt"},
     })
     resumed = _TinyFinancialStem(
-        num_features=4, feature_bottleneck_dim=2, causal_rms=True
+        num_features=4, feature_bottleneck_dim=0 if feature_svd else 2,
+        causal_rms=True, feature_svd_components=2 if feature_svd else 0,
     )
     fitted = (torch.ones(4), torch.ones(4, dtype=torch.bool), {
         "normalizer_fingerprint": "target-fit",
     })
     resumed.candle_encoder.set_causal_feature_rms_normalizer(*fitted[:2])
+    if feature_svd:
+        # The newly fitted projection is not the checkpoint's input contract.
+        resumed.candle_encoder.set_feature_svd_projection(torch.eye(4)[2:])
     resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-3)
     _restore_resume_model_state(resumed, checkpoint)
     resumed_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if feature_svd:
+        assert resumed.candle_encoder._feature_svd_fitted
+        assert torch.equal(resumed.candle_encoder.feature_svd_directions, torch.eye(4)[:2])
     assert torch.equal(resumed(inputs), uninterrupted(inputs))
     assert resumed.pretrained_initialization_provenance == checkpoint["pretrained_initialization"]
     report = _effective_causal_feature_rms_report(resumed, fitted)

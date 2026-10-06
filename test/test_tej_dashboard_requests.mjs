@@ -6,9 +6,9 @@ import vm from "node:vm";
 function dashboard() {
   const nodes = new Map(), requests = [], rendered = [];
   const node = () => ({
-    value:"",textContent:"",children:[],dataset:{},attrs:{},
-    append(...children) { this.children.push(...children); },
-    replaceChildren(...children) { this.children = children; },
+    value:"",textContent:"",children:[],firstChild:null,dataset:{},attrs:{},
+    append(...children) { this.children.push(...children);this.firstChild=this.children[0]??null; },
+    replaceChildren(...children) { this.children = children;this.firstChild=children[0]??null; },
     setAttribute(k,v) { this.attrs[k]=v; },removeAttribute(k) { delete this.attrs[k];if(k==="value")this.value=""; },
   });
   const byId = (id) => {
@@ -70,6 +70,18 @@ function forecastFixture() {
 
 function descendantsText(n) { return [n.textContent,...n.children.map(descendantsText)].join(" "); }
 
+test("startup readiness and draining are visible without implying pre-logon GUI or completed downloads", () => {
+  const d=dashboard();d.context.data={read_only:true,raw_values_exposed:false,observed_at_utc:new Date().toISOString(),tables:[],
+    desktop_startup:{enabled:true,state:"desktop_ready",ready:true,check_interval_seconds:60},
+    scheduler:{alive:true,state:"waiting_desktop"}};
+  vm.runInContext("renderStatus(data)",d.context);
+  assert.match(d.byId("tej-automation").textContent,/Windows 登入後每 60 秒核對.*桌面已核對可用/);
+  d.context.data.desktop_startup.ready=false;
+  vm.runInContext("renderStatus(data)",d.context);
+  assert.match(d.byId("tej-automation").textContent,/桌面或互動通道尚待重新核對/);
+  assert.doesNotMatch(d.byId("tej-automation").textContent,/全歷史已完成|桌面已核對可用/);
+});
+
 test("bundled stages retain nonzero dependency time and conditional dates, not completed or scheduled", () => {
   const d=dashboard();d.context.eta={forecast:forecastFixture()};d.context.work={resolved_grid_rows:5};
   vm.runInContext("renderForecast(eta,work)",d.context);
@@ -105,6 +117,28 @@ test("automatic supervision and recovery waits are separate from query activity"
   d.context.eta.forecast.execution_state="automatic_waiting_recovery";
   vm.runInContext("renderForecast(eta,{})",d.context);
   assert.match(d.byId("forecast-execution").textContent,/正在等待安全恢復.*尚未排定/);
+});
+
+test("automatic retained-response recovery has no fake current task or completed data", () => {
+  const d=dashboard();d.context.data={scheduler:{alive:true,state:"recovering_response"},
+    activity:{contract:"tej_download_activity_v1",current_task:null,completed_download_tasks:12,
+      blocked_tasks:[],blocked_tasks_total:0}};
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.match(d.byId("active-stage").textContent,/自動核對原查詢結果.*不重送/);
+  assert.equal(d.byId("active-readback-card").hidden,true);
+  assert.equal(d.byId("completed-downloads").textContent,"12");
+  assert.doesNotMatch(d.byId("active-task").textContent,/正在下載|歷史回補/);
+});
+
+test("authorized replay is labelled separately and does not fabricate completed rows", () => {
+  const d=dashboard();d.context.data={scheduler:{alive:true,state:"replaying_authorized"},
+    activity:{contract:"tej_download_activity_v1",current_task:null,completed_download_tasks:12,
+      blocked_tasks:[],blocked_tasks_total:0}};
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.match(d.byId("active-stage").textContent,/使用者授權.*保留原紀錄/);
+  assert.equal(d.byId("active-readback-card").hidden,true);
+  assert.equal(d.byId("completed-downloads").textContent,"12");
+  assert.doesNotMatch(d.byId("active-task").textContent,/正在下載|歷史回補/);
 });
 
 test("same page refresh joins one request and disables pagination until completion", async () => {

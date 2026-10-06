@@ -7,6 +7,7 @@ active head is overwritten, and a local test is never called a NAS backup.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -315,8 +316,63 @@ def export_delivery(plan: dict, destination: Path) -> dict:
             "durable_off_host_backup_verified": False}
 
 
+def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha256: str,
+                        expected_bytes: int, payload: bytes | None = None) -> None:
+    """One source read/hash while copying, then stable inode proof and fsync.
+
+    The closed-delivery verifier independently hashes the destination. Avoid
+    additional complete source passes merely to establish the same copy proof.
+    """
+    before = signature(_regular(source)) if source is not None else None
+    if source is not None and expected_bytes >= 128 * 1024**2:
+        from stockagent.data_sync.windows_cold_io import windows_path, copy_verified
+        origin, target = windows_path(source), windows_path(destination)
+        if (origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
+                and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
+            copy_verified(source, destination, expected_sha256=expected_sha256, expected_bytes=expected_bytes)
+            if signature(source) != before:
+                raise SnapshotError('native incremental source changed during copy')
+            return
+    stream = source.open("rb") if source is not None else io.BytesIO(payload)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    hashed = hashlib.sha256()
+    count = 0
+    with stream as reader, destination.open("xb") as writer:
+        destination.chmod(0o600)
+        for block in iter(lambda: reader.read(8 * 1024**2), b""):
+            hashed.update(block)
+            count += len(block)
+            writer.write(block)
+        writer.flush()
+        os.fsync(writer.fileno())
+    if (hashed.hexdigest() != expected_sha256 or count != expected_bytes or destination.stat().st_size != expected_bytes
+            or (source is not None and signature(source) != before)):
+        raise SnapshotError("incremental source bytes differ from the canonical selection")
+
+
+def copy_verified_many(members):
+    """Amortize native process startup without weakening per-member proofs."""
+    from stockagent.data_sync.windows_cold_io import windows_path, copy_many
+    native = []
+    for source, destination, sha, count in members:
+        origin, target = windows_path(source), windows_path(destination)
+        if (count >= 16 * 1024**2 and origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
+                and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
+            native.append((source, destination, sha, count))
+        else:
+            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
+    for offset in range(0, len(native), 16):
+        group = native[offset:offset + 16]
+        if len(group) == 1:
+            source, destination, sha, count = group[0]
+            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
+        else:
+            copy_many(group)
+
+
 def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: Path, *,
-                                catalog_identity: str, read_root: Path | None = None) -> dict:
+                                catalog_identity: str, read_root: Path | None = None,
+                                copy_workers: int = 1, verify_workers: int = 1) -> dict:
     """Export bounded, deduplicated canonical objects or fixed metadata.
 
     A wave deliberately need not contain a whole release. Its envelope proves
@@ -324,6 +380,8 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
     Live downloader workspaces, credentials and node-local files are excluded.
     """
     from scripts.verify_backup_delivery import CONTRACT, verify
+    if any(type(n) is not int or not 1 <= n <= 16 for n in (copy_workers, verify_workers)):
+        raise SnapshotError("incremental export needs 1 to 16 bounded workers")
     if not _HASH.fullmatch(catalog_identity) or not rows:
         raise SnapshotError("incremental delivery requires a pinned nonempty catalog selection")
     cold = cold_root.absolute()
@@ -361,27 +419,26 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
             if list(observed) != list(row["signature"]):
                 raise SnapshotError("incremental source changed after its fixed capture")
 
+        # Pin every source directory before worker threads share the read-only
+        # scanner; workers cannot race to create or close its directory FDs.
         for row in rows:
             unchanged(row)
+
+        def copy_member(row):
+            unchanged(row)
             source = None if "captured_bytes_utf8" in row else _regular(safe_path(reader_root, row["relative"]))
-            reader_before = signature(source) if source else None
             relative = "cold/" + row["relative"]
             target = safe_path(destination, relative)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            digest = hashlib.sha256()
-            reader_stream = source.open("rb") if source else io.BytesIO(row["captured_bytes_utf8"].encode("utf-8"))
-            with reader_stream as reader, target.open("xb") as writer:
-                target.chmod(0o600)
-                for chunk in iter(lambda: reader.read(8 * 1024**2), b""):
-                    digest.update(chunk)
-                    writer.write(chunk)
-                writer.flush()
-                os.fsync(writer.fileno())
-            if (digest.hexdigest() != row["sha256"] or target.stat().st_size != row["bytes"]
-                    or (source is not None and signature(source) != reader_before)):
-                raise SnapshotError("incremental source bytes differ from the canonical selection")
+            copy_verified_bytes(source, target, expected_sha256=row["sha256"], expected_bytes=row["bytes"],
+                                payload=row["captured_bytes_utf8"].encode("utf-8") if source is None else None)
             unchanged(row)
-            members.append({"relative": relative, "sha256": row["sha256"], "bytes": row["bytes"]})
+            return {"relative": relative, "sha256": row["sha256"], "bytes": row["bytes"]}
+
+        if copy_workers == 1:
+            members = [copy_member(row) for row in rows]
+        else:
+            with ThreadPoolExecutor(max_workers=copy_workers, thread_name_prefix="backup-copy") as pool:
+                members = list(pool.map(copy_member, rows))
         pinned.recheck()
         body = {"contract": CONTRACT, "source_plan_identity_sha256": catalog_identity,
                 "files": sorted(members, key=lambda r: r["relative"]), "producer_node_id": "penguin",
@@ -390,7 +447,7 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
                 "unpublished_sources_included": False, "complete_release_in_this_delivery": False}
         envelope = {**body, "identity_sha256": identity_sha256(body)}
         private_json(destination / "backup-envelope.json", envelope)
-        transport = verify(destination, envelope["identity_sha256"], require_ready=False)
+        transport = verify(destination, envelope["identity_sha256"], require_ready=False, workers=verify_workers)
         for row in rows:
             unchanged(row)
         pinned.recheck()

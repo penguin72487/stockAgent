@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from datetime import date
 import fnmatch
+from functools import lru_cache
 import math
 from pathlib import Path
 from typing import Any, get_args, get_type_hints
@@ -1258,20 +1259,22 @@ def _is_strict_bool_annotation(annotation: Any) -> bool:
     return bool in args and args.issubset({bool, type(None)})
 
 
+@lru_cache(maxsize=128)
+def _strict_bool_config_fields(dataclass_type: type[Any]) -> tuple[str, ...]:
+    """Compile static schema once; validate current YAML values on every load."""
+    return tuple(key for key, annotation in get_type_hints(dataclass_type).items()
+                 if _is_strict_bool_annotation(annotation))
+
+
 def _validate_config_bool_values(
     payload: dict[str, Any],
     dataclass_type: type[Any],
     *,
     section: str,
 ) -> None:
-    hints = get_type_hints(dataclass_type)
     invalid: list[str] = []
-    for key, annotation in hints.items():
-        if (
-            key not in payload
-            or payload[key] is None
-            or not _is_strict_bool_annotation(annotation)
-        ):
+    for key in _strict_bool_config_fields(dataclass_type):
+        if key not in payload or payload[key] is None:
             continue
         value = payload[key]
         if type(value) is not bool:
@@ -1369,13 +1372,22 @@ def _normalize_base_config_refs(value: Any) -> list[str]:
     )
 
 
-def _load_raw_config(path: str | Path, stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+def _config_source_identity(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _load_raw_config(
+    path: str | Path, stack: tuple[Path, ...] = (), *,
+    source_signatures: dict[Path, tuple[int, ...]] | None = None,
+) -> dict[str, Any]:
     config_path = Path(path).expanduser()
     if not config_path.is_absolute():
         config_path = config_path.resolve()
     if config_path in stack:
         cycle = " -> ".join(str(item) for item in (*stack, config_path))
         raise ValueError(f"Config inheritance cycle detected: {cycle}")
+    signature = _config_source_identity(config_path) if source_signatures is not None else None
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.load(handle, Loader=_UniqueKeySafeLoader) or {}
     if not isinstance(raw, dict):
@@ -1384,17 +1396,25 @@ def _load_raw_config(path: str | Path, stack: tuple[Path, ...] = ()) -> dict[str
     base_refs: list[str] = []
     for key in _CONFIG_INHERITANCE_KEYS:
         base_refs.extend(_normalize_base_config_refs(raw.pop(key, None)))
-    if not base_refs:
-        return raw
-
     merged: dict[str, Any] = {}
     next_stack = (*stack, config_path)
     for ref in base_refs:
         base_path = Path(ref).expanduser()
         if not base_path.is_absolute():
             base_path = config_path.parent / base_path
-        merged = _deep_merge_config(merged, _load_raw_config(base_path, next_stack))
-    return _deep_merge_config(merged, raw)
+        base = (
+            _load_raw_config(base_path, next_stack)
+            if source_signatures is None
+            else _load_raw_config(base_path, next_stack, source_signatures=source_signatures)
+        )
+        merged = _deep_merge_config(merged, base)
+    if source_signatures is not None:
+        if _config_source_identity(config_path) != signature or (
+            config_path in source_signatures and source_signatures[config_path] != signature
+        ):
+            raise ValueError(f"Config source changed during load: {config_path}")
+        source_signatures[config_path] = signature
+    return _deep_merge_config(merged, raw) if base_refs else raw
 
 
 def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
@@ -1529,6 +1549,12 @@ class DataConfig:
     # Node-local, reproducible cache location.  When empty, retain the legacy
     # behavior of placing panel_cache_v2 below parquet_root.
     panel_cache_root: str = ""
+    # Model-only, immutable shared/individual feature blocks. Ordinary price,
+    # eligibility and execution caches retain their canonical owners.
+    factorized_feature_manifest: str = ""
+    # Lossless transport only: the compiled model still sees the complete
+    # contiguous Float32 feature tensor, with every original value/column.
+    factorized_transfer_mode: str = "dense_cpu"
     live_tail_panel_rows: int = 0
     # Product-neutral point-in-time feature table.  It uses the same canonical
     # panel join as TW public data, but cannot carry Taiwan execution rules.
@@ -2225,6 +2251,13 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     # F-times-basis dense projection whose parameter count grows linearly with
     # the raw feature ABI.
     feature_bottleneck_dim: int = 0
+    # Fixed feature-axis SVD over training-only RMS inputs. This is separate
+    # from the temporal PCA/KLT bank and from a learned feature bottleneck.
+    feature_svd_components: int = 0
+    feature_svd_analysis_components: int = 128
+    feature_svd_oversampling: int = 32
+    feature_svd_power_iterations: int = 2
+    feature_svd_seed: int = 7
     # Fit one non-centering RMS scale per raw feature from this fold's causal
     # training rows.  Zero remains zero (important because the panel uses zero
     # for unavailable point-in-time values), while large log-level features no
@@ -2246,6 +2279,18 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     # operation order. New experiments may opt into the algebraically
     # equivalent rank-lookback contraction explicitly.
     temporal_basis_algebraic_contraction: bool = False
+    # Explicit new-experiment precision contract. Shared basis reductions stay
+    # FP32 when independent stock chunks accumulate their backward contributions.
+    temporal_basis_fp32_contraction: bool = False
+    # Explicit precision island for chunk-shape-independent temporal encoding.
+    # The stock/market head may still use the configured BF16 AMP policy.
+    temporal_blocks_fp32: bool = False
+    # Optional stable wide feature stem: normalization/projection/activation
+    # stay FP32 when independent stock chunks change GEMM/reduction shapes.
+    candle_projection_fp32: bool = False
+    # Stabilize the compact stock/market attention and allocation head across
+    # partitioned compilation and multiple optimizer steps; opt-in only.
+    portfolio_blocks_fp32: bool = False
     # The minute path may fuse a separately encoded causal history of completed
     # daily features.  A value of one preserves the historical broadcast-only
     # checkpoint schema; values greater than one create a new model contract.
@@ -2423,6 +2468,10 @@ class TrainingConfig:
     distributed_symbol_sharded_pack_scalars: bool = True
     distributed_symbol_sharded_skip_noop_collectives: bool = True
     enable_torch_compile: bool = True
+    # Runtime-only activation storage. False retains the selected direct
+    # encoder's activations only when its bounded CUDA memory guard admits it;
+    # otherwise the ordinary non-reentrant checkpoint path remains in use.
+    factorized_encoder_checkpoint: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
     torchinductor_cache_dir: str = "~/.cache/torchinductor"
@@ -2548,6 +2597,10 @@ class TrainingConfig:
     runtime_shape_check: bool = False
     allow_dynamic_symbols: bool = True
     lookback: int = 1
+    # Fold-training-only PCA execution controls. Default keeps the historical
+    # lag schedule and ambient CPU pool; neither changes feature ownership.
+    temporal_basis_covariance_lag_batch_size: int = 1
+    temporal_basis_covariance_cpu_threads: int | None = None
     batch_size_train: int = 32
     batch_size_eval: int = 32
     # tw_minute interprets batch_size_train/eval as independent trading days.
@@ -2965,6 +3018,18 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
+    training["temporal_basis_covariance_lag_batch_size"] = int(
+        training["temporal_basis_covariance_lag_batch_size"]
+    )
+    if training["temporal_basis_covariance_lag_batch_size"] < 1:
+        raise ValueError("training.temporal_basis_covariance_lag_batch_size must be positive")
+    if (training["temporal_basis_covariance_cpu_threads"] is not None
+            and int(training["temporal_basis_covariance_cpu_threads"]) < 1):
+        raise ValueError("training.temporal_basis_covariance_cpu_threads must be positive or null")
+    training["temporal_basis_covariance_cpu_threads"] = _normalize_optional_positive_int(
+        training["temporal_basis_covariance_cpu_threads"],
+        field_name="training.temporal_basis_covariance_cpu_threads",
+    )
     training["tw_continuous_compile_chunk_rows"] = max(
         0,
         int(training["tw_continuous_compile_chunk_rows"]),
@@ -3424,6 +3489,18 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["temporal_basis_algebraic_contraction"] = bool(
         financial_transformer["temporal_basis_algebraic_contraction"]
     )
+    financial_transformer["temporal_basis_fp32_contraction"] = bool(
+        financial_transformer["temporal_basis_fp32_contraction"]
+    )
+    financial_transformer["temporal_blocks_fp32"] = bool(
+        financial_transformer["temporal_blocks_fp32"]
+    )
+    financial_transformer["candle_projection_fp32"] = bool(
+        financial_transformer["candle_projection_fp32"]
+    )
+    financial_transformer["portfolio_blocks_fp32"] = bool(
+        financial_transformer["portfolio_blocks_fp32"]
+    )
     financial_transformer["causal_feature_rms_normalization"] = bool(
         financial_transformer["causal_feature_rms_normalization"]
     )
@@ -3464,6 +3541,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["feature_bottleneck_dim"] = max(
         0, int(financial_transformer["feature_bottleneck_dim"])
     )
+    for name in ("feature_svd_components", "feature_svd_analysis_components",
+                 "feature_svd_oversampling", "feature_svd_power_iterations", "feature_svd_seed"):
+        financial_transformer[name] = int(financial_transformer[name])
+    if (financial_transformer["feature_svd_components"] < 0
+            or financial_transformer["feature_svd_oversampling"] < 0
+            or financial_transformer["feature_svd_power_iterations"] < 0
+            or financial_transformer["feature_svd_analysis_components"] < max(
+                1, financial_transformer["feature_svd_components"])):
+        raise ValueError("training.financial_transformer feature_svd dimensions/iterations are invalid")
+    if financial_transformer["feature_svd_components"] and (
+            not financial_transformer["causal_feature_rms_normalization"]
+            or financial_transformer["causal_feature_window_rms_normalization"]
+            or financial_transformer["feature_bottleneck_dim"]
+            or financial_transformer["temporal_basis_families"]
+            or financial_transformer["categorical_feature_names"]
+            or financial_transformer["causal_feature_compression"] != "none"
+            or int(financial_transformer["daily_context_layers"]) > 0):
+        raise ValueError("feature_svd requires plain continuous train-only RMS inputs, no temporal bank or learned bottleneck")
     financial_transformer["categorical_embedding_dim"] = max(
         1, int(financial_transformer["categorical_embedding_dim"])
     )
@@ -3922,6 +4017,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()
+    data["factorized_feature_manifest"] = str(data["factorized_feature_manifest"] or "").strip()
+    data["factorized_transfer_mode"] = str(data["factorized_transfer_mode"]).strip().lower()
+    if data["factorized_transfer_mode"] not in {"dense_cpu", "compact_cuda", "compact_cuda_packed", "compact_cuda_cached"}:
+        raise ValueError("factorized_transfer_mode must be dense_cpu, compact_cuda, compact_cuda_packed or compact_cuda_cached")
+    if data["factorized_transfer_mode"] != "dense_cpu" and not data["factorized_feature_manifest"]:
+        raise ValueError("compact CUDA transport requires a factorized feature manifest")
     raw_physical_public_path = data["day_trade_physical_public_feature_path"]
     data["day_trade_physical_public_feature_path"] = (
         None
@@ -5386,8 +5487,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
-def load_config(path: str | Path) -> ExperimentConfig:
-    raw = _load_raw_config(path)
+def load_config(
+    path: str | Path, *, source_signatures: dict[Path, tuple[int, ...]] | None = None,
+) -> ExperimentConfig:
+    raw = (_load_raw_config(path) if source_signatures is None
+           else _load_raw_config(path, source_signatures=source_signatures))
     _validate_raw_config_bool_types(raw)
     raw = _merge_defaults(raw)
     training_raw = raw["training"]
@@ -5437,6 +5541,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 "distributed_symbol_sharded_skip_noop_collectives"
             ],
             enable_torch_compile=training_raw["enable_torch_compile"],
+            factorized_encoder_checkpoint=training_raw["factorized_encoder_checkpoint"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],
             torchinductor_cache_dir=training_raw["torchinductor_cache_dir"],
@@ -5553,6 +5658,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             runtime_shape_check=training_raw["runtime_shape_check"],
             allow_dynamic_symbols=training_raw["allow_dynamic_symbols"],
             lookback=training_raw["lookback"],
+            temporal_basis_covariance_lag_batch_size=training_raw["temporal_basis_covariance_lag_batch_size"],
+            temporal_basis_covariance_cpu_threads=training_raw["temporal_basis_covariance_cpu_threads"],
             batch_size_train=training_raw["batch_size_train"],
             batch_size_eval=training_raw["batch_size_eval"],
             minute_decision_chunk_rows=training_raw["minute_decision_chunk_rows"],

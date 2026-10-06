@@ -1,0 +1,8 @@
+# Fixed independent compiled partitions for forward/checkpoint/DDP parity.
+# Retain source, PCA/RMS, model topology, BF16 islands, loss and execution.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_bf16_v2.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-bf16-v3
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_gaprepair_v4/training-bf16-v3
+  resume: false

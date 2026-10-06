@@ -80,8 +80,12 @@ envelope／READY、每檔 SHA、精確集合與第二次讀回驗證。沒有清
 
 小樣本的速度優勢未能通過較大批次可靠性驗收。正式 D mount／transport 已回到
 原始 8 KiB，失敗候選不會由安裝器重新啟用。保留原始失敗日誌與每輪證據。
-正式每批至多 8 GiB／512 檔、最多一批未有 NAS ACK，來源單輪 timeout 延長至 8 小時；
+初始設定每批至多 8 GiB／512 檔、最多一批未有 NAS ACK，來源單輪 timeout 延長至 8 小時；
 這是容量與可靠性設定，不是已證實全量吞吐的宣稱。
+使用者後续要求全鏈並行，來源改為四批／32 GiB 在途、四工封裝與雜湊；
+兩組真實封裝完整流程的四工中位數分別比單工快 2.92／2.35 倍。
+NAS 端已以固定 v10 driver 完成該機量測並啟用四批／backup 2／restore 2／verify 4；
+固定新版部署收據已由 penguin 核對，詳見[並行管線](lab203_parallel_backup_2026-10-04.md)。
 
 ## 收據與啟用的工作流
 
@@ -100,8 +104,9 @@ Repository：`c717a3d315e20a5a3314c595e66607fcb7d6646cb73ad4412cc2cccb22abb798`�
 機器收據。第一波是部分 metadata，不能稱為完整 release 重建。
 兩個先前 pilot 收據仍標為使用者轉交，不升格為此次直接取得的機器收據。
 
-來源：`stockagent-backup-stream.service`／五分鐘 timer、原 source owner／ledger。
-接收：沿用 `lab203-backup.service`／五分鐘 timer、現有 worker／NAS mount guard。
+來源：`stockagent-backup-stream.service`／原 timer 完成後 30 秒接續、原 source owner／ledger。
+接收：固定 v10 沿用 `lab203-backup.service`／現有 owner／NAS mount guard，
+本機安裝與實測已完成，同一 timer 完成後 15 秒接續。
 回傳：`stockagent-backup-receipts-lab203`，lab203 Send Only、penguin Receive Only。
 最新全自動要求改用[資料任務／既有 owner post-hook](lab203_automatic_backup_2026-10-04.md)，
 初始 packed／SQL 與後續新 DB 邏輯狀態自動驗收，不再逐批轉貼。
@@ -129,9 +134,12 @@ lab203 私有部署設定。原已驗收 v1／v2 保留其固定 bytes。
 
 ## 剩餘驗收
 
-全量 684 GB 尚需逐批到達並取得 NAS ACK；不能把排程啟用或 Syncthing idle
-當成已完成。packed canonical 重建與 NAS PostgreSQL logical restore 需由 lab203
-本機沿用已交付的 verifier 與固定還原 snapshot 實際執行；一般檔案 ACK 沒有宣稱這兩項。
+全量冷資料尚需逐批到達並取得 NAS ACK；不能把排程啟用或 Syncthing idle
+當成已完成。2026-10-04 v7 已在 lab203 安裝，來源已直接核對固定 CFTC／TAIFEX
+canonical 重建與 NAS PostgreSQL logical restore 的三項成功收據，並持續收到
+heartbeat。日常批次、失敗重試與結果回傳全自動；詳見
+[接通驗收與目前覆蓋](lab203_automatic_backup_2026-10-04.md)。一般檔案 ACK
+仍不能宣稱其他 release 的完整 packed 重建。
 USB 金鑰保管已於 2026-10-04 由使用者明確確認完成，不再詢問或安排媒體操作。
 Windows 登出驗收依使用者決定取消。packed 與 SQL 驗收已有來源固定的三項工作，
 沿用 lab203 同一 owner，詳見[獨立 NAS 還原驗收](lab203_nas_recovery_acceptance_2026-10-04.md)

@@ -16,6 +16,7 @@
   "minimum_export_interval_seconds": 2,
   "query_interval_contract": "minimum_query_start_interval_v1",
   "download_burst_between_discoveries": 4,
+  "download_table_locality_burst": 4,
   "metadata_failure_isolation": true,
   "source_validation_isolation": true,
   "prequery_failure_isolation": true,
@@ -29,7 +30,24 @@
     "enabled": true,
     "idle_poll_seconds": 60,
     "blocked_poll_seconds": 60,
-    "heartbeat_seconds": 30
+    "heartbeat_seconds": 30,
+    "response_recovery_contract": "exact_retained_preview_no_resubmission_recovery_v1",
+    "desktop_startup": {
+      "enabled": true,
+      "contract": "owned_interactive_tej_desktop_startup_v1",
+      "authorization_basis": "explicit_user_request_automatic_tej_restart_after_boot",
+      "owned_workbook_windows": "%LOCALAPPDATA%\\StockAgent\\TEJSmartWizard\\StockAgent-TEJ-Acquisition.xlsx"
+    },
+    "authorized_unknown_replay": {
+      "enabled": true,
+      "contract": "exact_unknown_download_user_authorized_replay_v1",
+      "authorization_basis": "explicit_user_permission_to_requeue_unfinished_tej",
+      "authorized_at_utc": "2026-10-04T04:51:28+00:00",
+      "cooldown_base_seconds": 60,
+      "cooldown_max_seconds": 300,
+      "max_replays_per_task_hour": 2,
+      "max_replays_per_hour": 6
+    }
   },
   "auto_key3_replanning": true,
   "auto_snapshot_replanning": true,

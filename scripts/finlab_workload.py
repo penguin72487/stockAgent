@@ -32,7 +32,7 @@ from scripts.finlab_arrow_history import STREAMING_KEYS, whole_table_reserve_byt
 from scripts.finlab_stage_schedule import forecast, stage_summary, next_release_waves  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     QUOTA_POLICY_VERSION, UPSTREAM_CHECK_MODES, attempt_retry_at, incremental_quota_exempt,
-    next_source_check, queue_stage, source_check_due, intraday_progress, WORKLOAD_CONTRACT_VERSION,
+    next_source_check, queue_stage, source_check_due, intraday_progress, WORKLOAD_CONTRACT_VERSION, process_owner_alive,
 )
 
 CONTRACT = WORKLOAD_CONTRACT_VERSION
@@ -378,10 +378,12 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
     simulation_rows = [dict(r, source_weight_bytes=r["transfer_bytes"],
                             transfer_bytes=r["expected_payload_bytes"]) for r in rows]
     active_started = timestamp(run.get("active_started_at_utc"))
+    owner = run.get("owner")
+    general_live = process_owner_alive(owner, started_at_utc=run.get("started_at_utc"), now=now)
     for job in simulation_rows:
         if job["fetch_seconds"] is not None and overhead is not None:
             job["fetch_seconds"] += overhead
-        if (run.get("state") == "running" and job["key"] == run.get("active_key")
+        if (general_live and run.get("state") == "running" and job["key"] == run.get("active_key")
                 and active_started and active_started <= now and job["needs_refresh"]):
             elapsed = (now - active_started).total_seconds()
             expected = job["fetch_seconds"]
@@ -392,13 +394,18 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
             job["time_basis"] = "active_remaining_sample" if job["fetch_seconds"] else "active_sample_overrun"
     active_tick = intraday_progress(source, now=now)
     next_run = now if acq.get("service_active") else timestamp(acq.get("next_run_at_utc"))
-    if active_tick.get("state") == "running" and active_tick.get("owner_alive"):
-        # The residual Tick worker yields to general debt at request boundaries
-        # with a minute-local recheck; do not promise immediate lock ownership.
-        next_run = now + timedelta(seconds=60)
+    tick_running = active_tick.get("state") == "running" and active_tick.get("owner_alive")
+    # Preemption rechecks at minute boundaries, then the existing one-minute
+    # inactive timer hands the account lock back to the general sweep. Model
+    # both clocks, not merely 'systemd active => can fetch immediately'. The
+    # slow request component is our 180-second runway scenario, not an SLA.
+    handoff = ({"fast": 0, "reference": 30 + (number(active_tick.get("seconds_per_attempt_estimate")) or 0),
+                "slow": 60 + 180} if tick_running else {})
     unscheduled = [r["key"] for r in pending if r["key"] not in order]
     scenarios = {}
     for name, factor, share in [("fast", .75, 1.0), ("reference", 1.0, 1.0), ("slow", 1.5, .5)]:
+        dispatch_delay = {"fast": 0, "reference": 30, "slow": 60}[name]
+        scenario_next_run = (now+timedelta(seconds=handoff[name]+dispatch_delay)) if tick_running else next_run
         if not catalog_fresh:
             scenario = {"state": "catalog_unverified", "finish_at_utc": None}
         elif not monitor_fresh or (acq.get("timer_active") is not True and acq.get("service_active") is not True):
@@ -409,7 +416,7 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
             scenario = {"state": "blocked", "finish_at_utc": None}
         else:
             scenario = forecast(simulation_rows, now=now, quota=quota, reserve_mb=reserve,
-                                next_run=next_run,
+                                next_run=scenario_next_run,
                                 duration_factor=factor, quota_share=share,
                                 opening_policy=_opening_policy(root), refresh_days=refresh_days)
         completions = scenario.pop("key_finish_at_utc", {})
@@ -464,14 +471,17 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
     if catalog_fresh and monitor_fresh and (acq.get("service_active") or acq.get("timer_active")):
         waves = next_release_waves(simulation_rows, now=now, quota=quota, reserve_mb=reserve,
                                    next_run=next_run, opening_policy=_opening_policy(root),
-                                   refresh_days=refresh_days)
+                                   refresh_days=refresh_days, handoff_seconds=handoff)
         for stage in payload["stages"]:
             if stage["id"] in waves:
                 stage["next_wave"] = waves[stage["id"]]
     payload["actionable_complete"] = not pending
+    if tick_running:
+        payload["eta_basis"] += " Tick共用帳號鎖；另計每分鐘交接檢查與下一次派工，參考加入半分鐘交接及單次樣本，慢速加入一分鐘交接及本機180秒請求runway情境。不是官方SLA。"
     payload["blocked_count"] = len(blocked_keys)
     payload["intraday_progress"] = {k: v for k, v in active_tick.items() if k != "owner"}
     for scenario in scenarios.values():
+        scenario.pop("key_start_at_utc", None)
         scenario.pop("stage_finish_at_utc", None)
         scenario.pop("stage_start_at_utc", None)
     return payload, {"contract_version": CONTRACT, "files": next_cache}

@@ -77,3 +77,29 @@ def test_tw_limit_mask_kernel_handles_dividends_and_splits() -> None:
     )
     assert can_buy_split.tolist() == [True, False]
     assert can_sell_split.tolist() == [True, True]
+def test_small_serial_dispatch_matches_original_parallel_price_kernels():
+    import stockagent.data.panel_numba as kernels
+    assert (kernels._safe_log_ratio_flat._cache._impl._filename_base !=
+            kernels._safe_log_ratio_serial._cache._impl._filename_base)
+    assert (kernels._shift_rows_flat.py_func.__code__.co_code ==
+            kernels._shift_rows_serial.py_func.__code__.co_code)
+    import numba
+    previous=numba.get_num_threads()
+    try:
+        numba.set_num_threads(min(4,previous))
+        values=np.array([0.,1.,-1.,np.nan,np.inf,4.999,5.,9.999,10.,50.,99.95,100.,500.,1000.])
+        dates=np.array([730000,740000]*7,dtype=np.int64)
+        cases=[(kernels._round_half_up_flat,kernels._round_half_up_serial,(values,100.)),
+            (kernels._tw_tick_size_flat,kernels._tw_tick_size_serial,(values,dates)),
+            (kernels._tw_limit_price_flat,kernels._tw_limit_price_serial,(values,1.10,dates)),
+            (kernels._tw_limit_price_flat,kernels._tw_limit_price_serial,(values,.90,dates)),
+            (kernels._shift_rows_flat,kernels._shift_rows_serial,(values,len(values),1,2)),
+            (kernels._safe_log_ratio_flat,kernels._safe_log_ratio_serial,(values,values+1)),
+            (kernels._sanitize_price_log_return_flat,kernels._sanitize_price_log_return_serial,(values,.5)),
+            (kernels._tw_limit_masks_kernel,kernels._tw_limit_masks_serial,(values,np.ones(len(values),dtype=bool),np.zeros(len(values)),np.ones(len(values)),dates))]
+        for parallel,serial,args in cases:
+            left,right=parallel(*args),serial(*args)
+            if isinstance(left,tuple):
+                for a,b in zip(left,right):np.testing.assert_array_equal(a,b)
+            else:np.testing.assert_array_equal(left,right)
+    finally:numba.set_num_threads(previous)

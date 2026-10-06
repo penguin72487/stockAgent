@@ -24,7 +24,7 @@ from stockagent.runtime_identity import identity_sha256, source_identity, stable
 
 CONTROL = "portable_same_mvcc_control_backup_v1"
 CODE = "frozen_public_working_tree_backup_v1"
-PRIVACY_FILTER_VERSION = 3
+PRIVACY_FILTER_VERSION = 4
 SENSITIVE_PATH = re.compile(r"(?:^|[/._-])(?:credentials?|password|secrets?|private|id_rsa|id_ed25519)(?:$|[/._-])", re.I)
 SENSITIVE_SETTING = re.compile(
     r'''(?im)^\s*["']?(?:password|passwd|api[_-]?key|api[_-]?token|access[_-]?token|client[_-]?secret|secret[_-]?key|account_id)["']?\s*[:=]\s*([^\r\n,}]+)''')
@@ -69,7 +69,7 @@ def working_tree_inventory(root: Path, *, documentation: bool, configs: bool) ->
     base = source_identity(root, allow_tracked_deletions=True)
     patterns = ["AGENTS.md", ".gitignore", "test"]
     if documentation:
-        patterns.append("docs")
+        patterns.extend(("docs", ".agents/skills"))
     if configs:
         patterns.append("configs")
     names = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", *patterns],
@@ -82,8 +82,10 @@ def working_tree_inventory(root: Path, *, documentation: bool, configs: bool) ->
         # Credential documentation/tests are source code. Private runtime
         # config stays excluded; public example configs still undergo the
         # value-based check below before they can enter a frozen snapshot.
-        example_config = name.startswith("configs/") and ".example." in path.name
-        if (name.startswith("configs/") and SENSITIVE_PATH.search(name) and not example_config) or path.name.startswith(".env"):
+        skill_file = name.startswith(".agents/skills/")
+        configuration = name.startswith("configs/") or (skill_file and path.suffix.lower() in {".json", ".yml", ".yaml", ".toml"})
+        example_config = configuration and ".example." in path.name
+        if (configuration and SENSITIVE_PATH.search(name) and not example_config) or path.name.startswith(".env"):
             excluded.append(name)
             continue
         if not path.exists():
@@ -92,7 +94,7 @@ def working_tree_inventory(root: Path, *, documentation: bool, configs: bool) ->
             deleted.append(name)
             continue
         digest = stable_source_sha256(root, name)
-        if name.startswith("configs/") and path.suffix.lower() in {".json", ".yml", ".yaml", ".toml"}:
+        if configuration and path.suffix.lower() in {".json", ".yml", ".yaml", ".toml"}:
             raw = path.read_bytes()
             if hashlib.sha256(raw).hexdigest() != digest:
                 raise SnapshotError("configuration changed during privacy classification")
@@ -103,7 +105,7 @@ def working_tree_inventory(root: Path, *, documentation: bool, configs: bool) ->
     body = {"contract": CODE, "git_head": base["git_head"], "files": dict(sorted(files.items())),
         "privacy_filter_version": PRIVACY_FILTER_VERSION,
         "deleted_tracked_paths": sorted(set(deleted)), "excluded_private_paths": excluded,
-        "scope": "current code/public configs/docs, including uncommitted Git-visible work; no Git object database",
+        "scope": "current code/public configs/docs/repository skills, including uncommitted Git-visible work; no Git object database",
         "loaded_service_revision_verified": False, "ignored_private_files_included": False}
     return {**body, "identity_sha256": identity_sha256(body)}
 

@@ -249,6 +249,15 @@ run_fintech_python() {
   "$selected_python" "$@"
 }
 
+# Supervised daemons use the same discovery/activation as interactive commands,
+# while replacing the shell so systemd observes Python's actual lifetime.
+exec_fintech_python() {
+  activate_fintech_runtime || return 2
+  local selected_python
+  selected_python="$(resolve_fintech_python)" || return 2
+  exec "$selected_python" "$@"
+}
+
 FINTECH_ENV_PATH="${FINTECH_ENV_PATH:-$(detect_fintech_env_path 2>/dev/null || true)}"
 FINTECH_MAMBA_BIN="${FINTECH_MAMBA_BIN:-$(detect_mamba_or_conda_bin 2>/dev/null || true)}"
 

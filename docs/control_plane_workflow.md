@@ -1,6 +1,8 @@
 # 跨節點工程工作控制
 
-這是 `target-architecture-20261003` 的可選控制角色。第一個 handler 是
+這是隔離於 acquisition／CUDA／盤中程序的工程控制角色。2026-10-05 penguin
+已將固定 code-release 驗證接上正式 PostgreSQL queue／systemd timer；部署與
+實測見[正式架構驗收](architecture_production_completion_2026-10-05.md)。第一個 handler 是
 `verify-code-release`，實際工作交給既有
 `stockagent.runtime_identity.verify_source_release`。程式核對沒有 provider
 配額、GPU、訂單或來源發布副作用。正式 collectors、GPU manager、盤中
@@ -53,6 +55,65 @@ run_fintech_python scripts/install_control_plane.py --activate-role-only \
 
 ## 日常入口
 
+### 正式固定版本驗證
+
+`stockagent-control-release-verification.timer` 在開機後 90 秒、timer 啟用後
+10 秒啟動，之後於同一 service 完成後 60 秒接續。它只取得已登錄 receipt
+對應的 exact work key，重用 canonical bundle／source verifier；不消耗另一
+版本的 attempt。binding registry 是本機固定檔案位置，工作／attempt 狀態仍
+由 PostgreSQL 持有，不建立另一份 scheduler。
+
+既有 control role 部署此有界服務，不重啟 DB、不變更環境套件：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/install_control_plane.py --install-verification-only \
+  --verification-runtime-lock ACCEPTED_CONTROL_RUNTIME_LOCK.json \
+  --evidence artifacts/operations/NEW_CONTROL_VERIFIER_INSTALL
+```
+
+runtime lock 必須是該節點已驗收 Mamba control role 的實際收據，不能使用
+fintech／CUDA lock 或把另一台的環境路徑套進來。現行 private policy 是
+`/etc/stockagent/control-release-verification.json`（0600）；state、binding、
+attempt 收據與 owner lock 在 `/var/lib/stockagent/control-release-verification`
+（0700）。installer 保留不同的既有設定，拒絕 symlink／過寬權限。
+
+新程式版本先用原 builder 固定，再登錄它回傳的精確 receipt／build-source：
+
+```bash
+run_fintech_python scripts/build_project_release.py \
+  --output-dir artifacts/operations/code-releases
+bash scripts/run_control_release_queue.sh enroll RELEASE/release.json \
+  --root RELEASE/build-source
+```
+
+登錄後由同一 timer 自動 claim、驗證、保存結果並持續重驗目前固定檔案。
+需要提前執行時使用同一 service：
+
+```bash
+systemctl start stockagent-control-release-verification.service
+bash scripts/run_control_release_queue.sh status
+stockagent-agent work status
+```
+
+`status` 不執行工作。退出 0 的 `ready` 需要登錄版本全部成功且目前 bytes 仍
+相符；退出 75 表示 owner busy／尚未登錄／工作仍待完成，不代表驗證成功。
+錯誤退出 1，DB attempts 與原檔保留。timer 重啟不新增已成功工作的 attempt。
+開機 observer 核對 timer、最近 service 退出碼、五分鐘內的收據與完整版本數；
+不能用舊成功或空 queue 宣稱這個已選定角色 ready。
+
+此正式服務只處理 code admission。其他工作仍按原 owner 的 journal／lease／
+資料或副作用契約執行；沒有把 collectors、GPU 或交易 queue 全數遷進 PostgreSQL。
+
+NAS working-tree／SQL 還原不會自動重建 `artifacts/operations` 下的舊凍結版本
+或 private binding registry。災難後先核對固定 NAS snapshot、code 全檔 SHA
+和 SQL logical identity，重建該節點的 Mamba／private role 設定，再登錄已獨立
+驗證的固定來源。若舊 release bundle 已不存在，從已還原 working tree 建立
+新 receipt／新 work key，保留舊 DB work／attempt 歷史，不偽造舊 receipt 身分。
+空 registry 仍退出 75；正式 code role 不會自動重送 collector、GPU 或交易工作。
+
+### 底層工程工作介面
+
 ```bash
 source scripts/runtime_env.sh
 stockagent-agent work status
@@ -79,6 +140,7 @@ PY
 stockagent-agent work submit artifacts/work-spec.json
 stockagent-agent work worker-once \
   --node penguin --worker selected-code-verifier \
+  --work-key selected-code-validation \
   --receipt RELEASE/release.json --root FROZEN_CODE_ROOT \
   --output artifacts/operations/CONTROL_ATTEMPTS
 ```
@@ -87,6 +149,7 @@ stockagent-agent work worker-once \
 仍由現有 `stockagent-agent run`／systemd 負責。CLI 不接受任意 command 作為
 共享 work kind。每份 spec 的 key、kind、inputs、dependencies、priority、
 重試上限與 CPU／RAM／scratch 預算共同構成不可變身分。
+多版本固定 worker 必須指定 `--work-key`；省略時維持原通用 pool claim 行為。
 
 相同 key／身分重送是 no-op；相同 key 改輸入會拒絕。依賴必須已提交且真正
 成功才可 claim；不能用 worker 已開始或來源可連線取代 completion proof。

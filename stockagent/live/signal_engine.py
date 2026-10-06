@@ -444,12 +444,13 @@ def _live_panel_disk_backend_key(
     return f"live-tail-v1:{digest}"
 
 
-def _live_panel_disk_cache_root() -> Path:
+def _live_panel_disk_cache_root(*, repo_root: Path | None = None) -> Path:
     configured = str(os.getenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", "")).strip()
     if configured:
         path = Path(configured).expanduser()
         return path if path.is_absolute() else Path.cwd() / path
-    return Path(__file__).resolve().parents[2] / "artifacts" / "cache" / "live_signal_panels"
+    root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
+    return root / "artifacts" / "cache" / "live_signal_panels"
 
 
 def _cached_live_panel(key: str) -> PanelData | None:

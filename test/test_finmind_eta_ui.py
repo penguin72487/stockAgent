@@ -116,15 +116,63 @@ def test_expired_snapshot_is_not_presented_as_a_current_countdown() -> None:
     assert "2026/09/27 12:00" in " ".join(view["observed"].split())
 
 
-def test_nine_stage_contract_preserves_valid_scenarios_when_one_rate_is_unknown():
+@pytest.mark.parametrize('version', [6, 9, 10, 11, 12])
+def test_nine_stage_contract_preserves_valid_scenarios_when_one_rate_is_unknown(version):
     payload = _estimate()
-    payload.update(schema_version=6, state='warming_up')
+    payload.update(schema_version=version, state='warming_up')
     payload['scenarios']['slowest'].update(state='unknown', remaining_seconds=None,
                                           estimated_complete_at_utc=None)
     view = _view(payload)
     assert view['scenarios'][0]['value'] == '約 1 小時'
     assert view['scenarios'][1]['value'] == '約 24 小時'
     assert view['scenarios'][2]['value'] == '未知'
+
+
+def test_projection_capability_does_not_require_a_frontend_version_bump():
+    payload = _estimate()
+    payload.update(schema_version=99, scenario_projection_contract=1, state='warming_up')
+    assert _view(payload)['scenarios'][0]['value'] == '約 1 小時'
+    payload['scenario_projection_contract'] = None
+    assert _view(payload)['scenarios'][0]['value'] == '未知'
+
+
+def test_own_stage_work_is_not_an_absolute_deadline_or_global_countdown():
+    payload = _estimate()
+    payload.update(schema_version=12, state='warming_up')
+    for scenario in payload['scenarios'].values():
+        scenario.update(state='unknown', remaining_seconds=None, estimated_complete_at_utc=None,
+                        active_work_seconds=None, standalone_active_work_seconds=3600)
+    view = _view(payload)
+    assert all(row['value'] == '本階段工時 約 1 小時' for row in view['scenarios'])
+    assert all(row['complete'] == '完成日期尚無法估算' for row in view['scenarios'])
+    assert all('前置等待' in row['detail'] for row in view['scenarios'])
+
+
+def test_actual_history_schedule_is_independent_of_eta_and_rejects_stale_task():
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node runtime not installed')
+    script = r"""
+const fs = require('fs'), vm = require('vm');
+const source = fs.readFileSync(process.argv[1], 'utf8').split('function svgNode')[0];
+const context = {window: {StockAgentDashboard: {createJsonFetcher: () => () => {}, byId: () => {}}}};
+vm.createContext(context);
+vm.runInContext(source + '\nglobalThis.schedule = historyScheduleLabel;', context);
+const now = Date.parse('2026-09-27T04:00:00+00:00');
+const item = {dataset:'TaiwanFuturesKBar', state:'warming_up', workload:{planned_requests:100}};
+const info = {complement_observed_at_utc:'2026-09-27T04:00:00+00:00', complement_state:'running',
+  complement_active_task:{dataset:item.dataset}};
+process.stdout.write(JSON.stringify([
+ context.schedule(item, {acquisition:info}, now),
+ context.schedule(item, {acquisition:info}, now+180001),
+ context.schedule(item, {acquisition:{...info, complement_state:'waiting_retry'}}, now),
+ context.schedule(item, {acquisition:{...info, complement_active_task:null, complement_next_task:{dataset:item.dataset}}}, now)
+]));
+"""
+    result = subprocess.run([node, '-e', script, str(ROOT / 'services/finmind_dashboard/app.js')],
+                            check=True, capture_output=True, text=True, timeout=10)
+    assert json.loads(result.stdout) == ['正在下載（工作取樣）', '實際排程觀測待更新',
+                                       '接續待抓；依歷史順序／追新插隊', '下一筆已排程（尚非完成）']
 
 
 def test_candidate_requests_are_separate_from_materialized_work():
@@ -161,12 +209,13 @@ const outputs = [context.clearStage(item, raw, now),
   context.clearStage({...item, state:'stale'}, raw, now),
   context.clearStage({...item, valid_until_utc:null}, raw, now),
   ...['retry_tasks','blocked_tasks','unknown_datasets','unscheduled_datasets','inflight_tasks']
-    .map(key => context.clearStage({...item, workload:{planned_requests:0, [key]:1}}, raw, now))];
+    .map(key => context.clearStage({...item, workload:{planned_requests:0, [key]:1}}, raw, now)),
+  context.clearStage({...item, dataset:'TaiwanStockKBar'}, {forecast_arrival_requests:1}, now)];
 process.stdout.write(JSON.stringify(outputs));
 """
     result = subprocess.run([node, '-e', script, str(ROOT / 'services/finmind_dashboard/app.js')],
                             check=True, capture_output=True, text=True, timeout=10)
-    assert json.loads(result.stdout) == [True] + [False] * 8
+    assert json.loads(result.stdout) == [True] + [False] * 8 + [True]
 
 
 def test_deadline_passes_before_snapshot_expiry_and_stops_one_minute_display():
@@ -341,7 +390,7 @@ def test_scenario_card_and_important_caveats_are_visible_in_markup() -> None:
     assert "不是保證完成期限或統計信賴區間" in html
     assert 'id="download-eta-exclusions" class="estimate-exclusions"' in html
     assert 'styles.css?v=3' in html
-    assert 'app.js?v=21' in html
+    assert 'app.js?v=22' in html
     assert 'href="styles.css?v=10"' in html
     assert '流量與估時對帳' in html
     assert '階段／已知剩餘請求' in html

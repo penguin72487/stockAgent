@@ -47,6 +47,10 @@ SESSION_DATASETS = (
     "TaiwanStockStatisticsOfOrderBookAndTrade",
     "TaiwanVariousIndicators5Seconds",
 )
+
+# ``provider_empty`` is the native session validator's empty response. It is
+# retry debt, not a completed session or a fresh task with zero waiting time.
+SESSION_RETRY_STATES = frozenset({'failed', 'partial', 'observed_empty', 'provider_empty'})
 HISTORY_START = date(2005, 1, 1)
 SCHEMA_VERSION = 1
 SESSION_GRID_CONTRACT_VERSION = 2
@@ -392,7 +396,7 @@ def _candidate_days(dates: list[date], root: Path, *, now: datetime) -> tuple[li
                 if grain in SESSION_GRAINS:
                     item["observed_grains"][grain] = item["observed_grains"].get(grain, 0) + 1
                 continue
-            if receipt.get('status') in {'failed', 'partial', 'observed_empty'}:
+            if receipt.get('status') in SESSION_RETRY_STATES:
                 item = counts['series'][dataset]
                 item['retry_tasks'] += 1
                 retry = _retry_at(receipt)
@@ -1017,8 +1021,8 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
                 if grain in SESSION_GRAINS:
                     item["observed_grains"][grain] = item["observed_grains"].get(grain, 0) + 1
             item = counts['series'][dataset]
-            was_retry = previous_receipt.get('status') in {'failed', 'partial', 'observed_empty'}
-            is_retry = result.get('status') in {'failed', 'partial', 'observed_empty'}
+            was_retry = previous_receipt.get('status') in SESSION_RETRY_STATES
+            is_retry = result.get('status') in SESSION_RETRY_STATES
             item['retry_tasks'] = max(0, item.get('retry_tasks', 0) + int(is_retry) - int(was_retry))
             retry = _retry_at(result) if is_retry else None
             if retry is not None:

@@ -58,6 +58,7 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
         bid_prices=np.array([100.5, 201.5]),
         ask_prices=np.array([101.5, 202.5]),
         timestamps_ms=np.array([1_800_000_000_000, 1_800_000_000_001]),
+        transport_timing={"snapshot_request_body_ms": 12.5, "snapshot_usage_before_ms": 0.0},
     )
     monkeypatch.setattr(
         quote_provider,
@@ -109,6 +110,8 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
     assert timing["server_snapshot_serialize_ms"] >= 0.0
     assert timing["client_round_trip_ms"] >= 0.0
     assert timing["client_total_ms"] >= timing["client_round_trip_ms"]
+    assert timing["snapshot_request_body_ms"] == 12.5
+    assert timing["snapshot_usage_before_ms"] == 0.0
 
 
 def test_price_snapshot_payload_preserves_exchange_time_and_simtrade() -> None:

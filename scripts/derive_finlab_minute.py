@@ -23,6 +23,10 @@ from scripts.download_finlab_intraday import (
 )
 from scripts.finlab_volume_units import volume_reconciliation_due
 
+DERIVATION_CONTRACT_VERSION = 2
+DERIVED_RECEIPT_SCHEMA_VERSION = 4
+DELAYED_CLOSE_RULE_START = date(2012, 2, 20)
+
 
 def derived_receipt_path(root: Path, symbol: str, day: date) -> Path:
     return (root / "intraday/derived_minute/receipts"
@@ -46,7 +50,8 @@ def stored_derived_receipt(root: Path, symbol: str, day: date,
                 or receipt.get("trade_date") != day.isoformat()
                 or receipt.get("source_tick_sha256") != source_sha256
                 or receipt.get("source_kind") != "derived_from_tw_tick"
-                or int(receipt.get("schema_version") or 0) < 3):
+                or int(receipt.get("schema_version") or 0) < DERIVED_RECEIPT_SCHEMA_VERSION
+                or receipt.get("minute_derivation_contract_version") != DERIVATION_CONTRACT_VERSION):
             return None
         if receipt.get("status") in {"verified_closed_date", "verified_no_trade",
                                      "derived_no_regular_trades"}:
@@ -65,11 +70,13 @@ def stored_derived_receipt(root: Path, symbol: str, day: date,
 
 
 def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFrame:
-    """Regular-session trades only; 13:30 auction stays its own minute.
+    """Regular trades only; actual closing auctions retain their own minute.
 
     Do not fill zero-trade minutes. ``volume`` remains provider-native;
     ``volume_shares`` is nullable unless the whole-day source unit is proved.
     Identical timestamps retain source sequence.
+    The dated TWSE/TPEx delayed-close rule permits an observed 13:33 auction
+    from 2012-02-20; it is never moved back to 13:30 or treated as its price.
     """
     _validate_frame(ticks, f"tw_tick:{symbol}", day)
     required = {"close", "volume", "session", "sequence"}
@@ -94,9 +101,12 @@ def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFram
             or not np.isfinite(regular["close"].to_numpy(dtype=float)).all()
             or (regular["close"] <= 0).any()):
         raise ValueError("invalid regular trade price")
-    clock = regular["timestamp"].dt.tz_convert("Asia/Taipei").dt.time
-    if not clock.between(time(9), time(13, 30)).all():
-        raise ValueError("regular tick outside 09:00-13:30")
+    clock = regular["timestamp"].dt.tz_convert("Asia/Taipei").dt.floor("min").dt.time
+    allowed = clock.between(time(9), time(13, 30))
+    if day >= DELAYED_CLOSE_RULE_START:
+        allowed |= clock.eq(time(13, 33))
+    if not allowed.all():
+        raise ValueError("regular tick outside 09:00-13:30 or dated 13:33 closing auction")
     regular = regular.sort_values(["timestamp", "sequence"], kind="stable")
     regular["minute"] = regular["timestamp"].dt.floor("min")
     regular["notional"] = regular["close"] * regular["volume"]
@@ -168,7 +178,9 @@ def derive_partition(root: Path, symbol: str, day: date,
                            "canonical_volume_unit": "unresolved",
                            "canonical_volume_scope": "regular_session_only"}
     payload = {
-        "schema_version": 3, "dataset": f"tw_minute:{symbol}",
+        "schema_version": DERIVED_RECEIPT_SCHEMA_VERSION,
+        "minute_derivation_contract_version": DERIVATION_CONTRACT_VERSION,
+        "dataset": f"tw_minute:{symbol}",
         "trade_date": day.isoformat(), "status": status,
         "source_kind": "derived_from_tw_tick", "source_dataset": key,
         "source_tick_sha256": source_sha,
@@ -183,6 +195,8 @@ def derive_partition(root: Path, symbol: str, day: date,
         "volume_unit": "provider_native",
         **volume_evidence,
         "publication_time_status": "not_verified_for_training",
+        "delayed_close_observed": bool(bars is not None and len(bars)
+            and bars["timestamp"].dt.tz_convert("Asia/Taipei").dt.time.eq(time(13, 33)).any()),
     }
     if bars is not None and len(bars):
         objects = root / "intraday/objects"
@@ -207,7 +221,8 @@ def derive_partition(root: Path, symbol: str, day: date,
     receipt_path = derived_receipt_path(root, symbol, day)
     if receipt_path.is_file():
         previous = json.loads(receipt_path.read_text(encoding="utf-8"))
-        if previous.get("source_tick_sha256") != source_sha:
+        if (previous.get("source_tick_sha256") != source_sha
+                or previous.get("minute_derivation_contract_version") != DERIVATION_CONTRACT_VERSION):
             old_sha = previous.get("sha256") or previous.get("source_tick_sha256")
             if isinstance(old_sha, str) and len(old_sha) == 64:
                 archive = (root / "intraday/derived_minute/versions"

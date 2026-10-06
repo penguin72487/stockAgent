@@ -189,6 +189,25 @@ def test_public_projection_rejects_untrusted_monitor(tmp_path):
         build_finlab_public_status(tmp_path, now=datetime.now(UTC))
 
 
+def test_live_tick_receipts_do_not_inherit_stale_general_receipt_warning(tmp_path):
+    from stockagent.data.finlab_acquisition_contract import process_owner
+    now = datetime.now(UTC)
+    _write(tmp_path / "artifacts/live/data_monitor/public_status.json", {
+        "read_only": True, "production_control_possible": False, "generated_at_utc": now.isoformat(),
+        "finlab_acquisition": {"service_active": True,
+            "last_receipt_at_utc": (now-timedelta(hours=2)).isoformat()}, "sources": []})
+    _write(tmp_path / "artifacts/live/finlab/quota_latest.json", {
+        "schema_version": 1, "observed_at_utc": now.isoformat()})
+    _write(tmp_path / "data_finlab/intraday/active_run.json", {
+        "contract_version": 1, "owner": process_owner(), "state": "running", "successful": 2,
+        "observed_at_utc": now.isoformat(), "run_started_at_utc": (now-timedelta(minutes=1)).isoformat(),
+        "last_success_at_utc": (now-timedelta(seconds=10)).isoformat(), "active_key": "tw_tick:2330"})
+    payload = build_finlab_public_status(tmp_path, now=now)
+    assert payload["health"] == "active" and payload["execution"]["phase"] == "tick"
+    assert payload["execution"]["tick"]["last_success_at_utc"] == (now-timedelta(seconds=10)).isoformat()
+    assert "boot_id" not in json.dumps(payload) and "start_ticks" not in json.dumps(payload)
+
+
 def test_training_cold_badge_requires_exact_current_staged_receipt(tmp_path):
     at = datetime.fromisoformat("2026-09-23T12:00:00+00:00")
     stage = tmp_path / "stage"

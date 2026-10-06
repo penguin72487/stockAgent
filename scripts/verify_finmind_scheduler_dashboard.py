@@ -71,6 +71,40 @@ def main():
                         expected_ratio = dataset['checked_partitions'] / dataset['target_partitions'] if dataset['target_partitions'] else None
                         assert value is None if expected_ratio is None else abs(value - expected_ratio) < 1e-9
                 estimate = info['completion_estimate']
+                now = datetime.now(UTC)
+                verified_scenarios = []
+                # A successful fetch and 12 rows do not prove forecasts were
+                # rendered. Regress the version/capability integration itself.
+                for key, scenario in estimate['scenarios'].items():
+                    modeled = estimate.get('retry_condition', {}).get('scenarios', {}).get(key, {})
+                    selected = modeled if scenario['state'] != 'estimated' and modeled.get('state') == 'estimated' else scenario
+                    if selected.get('state') != 'estimated' or not selected.get('estimated_complete_at_utc'):
+                        continue
+                    if datetime.fromisoformat(selected['estimated_complete_at_utc']) <= now:
+                        continue
+                    if estimate['state'] in ('stale', 'unavailable'):
+                        continue
+                    value = page.locator(f'#download-eta-{key}').text_content()
+                    assert '約 ' in value and '未知' not in value, (key, estimate['schema_version'], value)
+                    assert '預計 ' in page.locator(f'#download-eta-{key}-complete').text_content()
+                    verified_scenarios.append(key)
+                own_work_verified = 0
+                schedule_labels = page.locator('.estimate-stage-schedule').all_text_contents()
+                if ordered:
+                    assert len(schedule_labels) == len(HISTORY_STAGES)
+                    for index, stage in enumerate(estimate['stages']):
+                        central = stage['scenarios']['central']
+                        cell = page.locator('#download-eta-milestones tr').nth(index).locator('td').nth(2)
+                        current = stage['workload']['planned_requests'] == 0 and not any(
+                            stage['workload'].get(key) for key in ('inflight_tasks', 'local_derived_tasks', 'blocked_tasks',
+                            'unknown_datasets', 'unscheduled_datasets', 'retry_tasks', 'retry_exhausted_tasks'))
+                        if stage.get('dataset') and current and stage['state'] in ('current', 'estimated', 'conditional'):
+                            assert '目前候選已查驗' in cell.text_content()
+                            assert '已超過估計' not in cell.text_content()
+                        if (central.get('standalone_active_work_seconds', 0) or 0) > 0 and central['state'] == 'unknown':
+                            assert '本階段工時' in cell.text_content(), (stage['key'], cell.text_content())
+                            assert '完成日期尚無法估算' in cell.text_content()
+                            own_work_verified += 1
                 condition = estimate.get('retry_condition')
                 conditional_verified = False
                 if estimate['state'] == 'waiting_retry' and condition:
@@ -87,7 +121,7 @@ def main():
                         if modeled.get('state') != 'estimated' or stage['scenarios']['central']['state'] == 'estimated':
                             continue
                         cell = page.locator('#download-eta-milestones tr').nth(index).locator('td').nth(2)
-                        no_work = stage['workload']['planned_requests'] == 0 and modeled.get('forecast_arrival_requests') == 0
+                        no_work = stage['workload']['planned_requests'] == 0 and (stage.get('dataset') or modeled.get('forecast_arrival_requests') == 0)
                         no_work = no_work and not any(stage['workload'].get(key) for key in (
                             'inflight_tasks', 'local_derived_tasks', 'blocked_tasks', 'unknown_datasets',
                             'unscheduled_datasets', 'retry_tasks', 'retry_exhausted_tasks'))
@@ -128,6 +162,9 @@ def main():
                                  'checked_tasks': info['checked_tasks'], 'materialized_tasks': info['materialized_tasks'],
                                  'unseeded_candidate_tasks': info['unseeded_candidate_tasks'],
                                  'eta_state': info['completion_estimate']['state'],
+                                 'numeric_scenarios_verified': verified_scenarios,
+                                 'standalone_stage_work_verified': own_work_verified,
+                                 'history_schedule_labels': schedule_labels,
                                  'retry_exhausted_tasks': exhausted, 'retained_rows': info.get('retained_rows'),
                                  'retry_condition_verified': conditional_verified,
                                  'central_estimate_text': page.locator('#download-eta-central').text_content(),

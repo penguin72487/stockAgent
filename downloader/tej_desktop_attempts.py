@@ -1,4 +1,4 @@
-"""Attempt-scoped desktop evidence; explicit replay never means safe auto retry.
+"""Attempt-scoped evidence; authorized replay never proves an unsent query.
 
 The canonical task/source ABI is unchanged. Each actual Preview has its own
 private prepared request/stage, including a failed attempt retained by an
@@ -17,6 +17,81 @@ from downloader.artifact_io import atomic_write_json
 
 ATTEMPT_CONTRACT = 'attempt_scoped_preview_v1'
 OPERATOR_REPLAY_CONTRACT = 'exact_unknown_download_operator_replay_v1'
+AUTHORIZED_REPLAY_CONTRACT = 'exact_unknown_download_user_authorized_replay_v1'
+
+
+def authorized_replay_policy(config: dict) -> dict | None:
+    """Resolve a separate, explicit standing grant, not unconditional retry.
+
+    Limits are local recovery guardrails, NOT an assertion about TEJ quotas.
+    Revocation/absence disables this path without changing source receipts.
+    """
+    value = config.get('automation', {}).get('authorized_unknown_replay')
+    if value is None:
+        return None
+    if not isinstance(value, dict) or type(value.get('enabled')) is not bool:
+        raise ValueError('Explicit authorized replay enablement required')
+    if not value['enabled']:
+        return None
+    required = {'enabled', 'contract', 'authorization_basis', 'authorized_at_utc',
+                'cooldown_base_seconds', 'cooldown_max_seconds',
+                'max_replays_per_task_hour', 'max_replays_per_hour'}
+    if (set(value) != required or value.get('contract') != AUTHORIZED_REPLAY_CONTRACT
+            or value.get('authorization_basis') != 'explicit_user_permission_to_requeue_unfinished_tej'):
+        raise ValueError('Unreviewed standing replay authorization')
+    try:
+        granted = datetime.fromisoformat(value['authorized_at_utc'].replace('Z', '+00:00'))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError('Explicit replay authorization clock required') from exc
+    if granted.tzinfo is None or granted > datetime.now(UTC) + timedelta(seconds=5):
+        raise ValueError('Replay authorization must be an observed aware clock')
+    integer_keys = ('cooldown_base_seconds', 'cooldown_max_seconds',
+                    'max_replays_per_task_hour', 'max_replays_per_hour')
+    if (any(type(value[k]) is not int for k in integer_keys)
+            or not 5 <= value['cooldown_base_seconds'] <= value['cooldown_max_seconds'] <= 300
+            or not 1 <= value['max_replays_per_task_hour'] <= value['max_replays_per_hour'] <= 30):
+        raise ValueError('Invalid bounded authorized replay limits')
+    return {**value, 'authorized_at_utc': granted.astimezone(UTC).isoformat()}
+
+
+def authorized_replay_window(con, task: dict, policy: dict, observed: datetime) -> dict:
+    """Indexed, persistent rolling budget, including manual consumed grants.
+
+    No source request, historical request blobs or reset-on-restart counter.
+    Unknown attempts that finished recently get time for retained readback.
+    """
+    cutoff = (observed - timedelta(hours=1)).isoformat()
+    rows = con.execute('SELECT task_id,consumed_at_utc FROM desktop_replays '
+                       'WHERE consumed_at_utc>? ORDER BY consumed_at_utc', (cutoff,)).fetchall()
+    stamps = []
+    own = []
+    for row in rows:
+        stamp = datetime.fromisoformat(row['consumed_at_utc'].replace('Z', '+00:00'))
+        if stamp.tzinfo is None or stamp > observed:
+            raise ValueError('Invalid durable replay budget clock')
+        stamps.append(stamp)
+        if row['task_id'] == task['task_id']:
+            own.append(stamp)
+    attempt = con.execute('SELECT task_id,state,started_at_utc,finished_at_utc FROM desktop_attempts WHERE attempt_id=?',
+                          (task['active_attempt_id'],)).fetchone()
+    if (attempt is None or attempt['task_id'] != task['task_id'] or attempt['state'] != 'unknown_outcome'
+            or not attempt['finished_at_utc']):
+        raise ValueError('Finished original attempt required for authorized replay')
+    finished = datetime.fromisoformat(attempt['finished_at_utc'].replace('Z', '+00:00'))
+    started = datetime.fromisoformat(attempt['started_at_utc'].replace('Z', '+00:00'))
+    if finished.tzinfo is None or started.tzinfo is None or not started <= finished <= observed:
+        raise ValueError('Invalid original attempt completion clock')
+    cooldown = min(policy['cooldown_max_seconds'], policy['cooldown_base_seconds'] * 2**min(len(own), 6))
+    due = max(finished, own[-1] if own else finished) + timedelta(seconds=cooldown)
+    reason = 'authorized_replay_cooldown'
+    if len(own) >= policy['max_replays_per_task_hour']:
+        due = max(due, own[-policy['max_replays_per_task_hour']] + timedelta(hours=1))
+        reason = 'authorized_replay_task_budget'
+    if len(stamps) >= policy['max_replays_per_hour']:
+        due = max(due, stamps[-policy['max_replays_per_hour']] + timedelta(hours=1))
+        reason = 'authorized_replay_global_budget'
+    return {'allowed': observed >= due, 'next_check_at_utc': due.isoformat(),
+            'reason': reason, 'task_replays_in_hour': len(own), 'replays_in_hour': len(stamps)}
 
 
 def recover_unlaunched_metadata_claim(root: Path, task_id: str, prepared: Path | None = None) -> bool:
@@ -312,7 +387,8 @@ def recover_prequery_outcome(root: Path, task_id: str) -> bool:
 PREQUERY_RETRY_CONTRACT='exact_unsent_table_retry_window_v1'
 PREQUERY_DEFERRED='prequery_failure_deferred'
 EXHAUSTED_PREQUERY_ERRORS=frozenset({'date_input_prequery_needs_review',
-    'list_selection_prequery_needs_review','query_activation_prequery_needs_review'})
+    'list_selection_prequery_needs_review','query_activation_prequery_needs_review',
+    'source_binding_prequery_needs_review','query_preparation_prequery_needs_review'})
 
 
 def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int = 60,
@@ -320,7 +396,9 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
     """Retry one proved-unsent fragment after a durable per-table backoff.
 
     Caller holds .download.lock. Only a finished exact negative proof and a
-    fresh normal read-only interface check authorize this state transition.
+    fresh normal interface check authorize this state transition. An empty
+    source catalog may be repaired with one bounded metadata binding action;
+    never submit Preview or adopt the failed query's axes during that repair.
     The two immediate retries stay exhausted; subsequent probes are bounded
     by this one shared table window, including after service/host restarts.
     """
@@ -346,7 +424,8 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
 
     with closing(_connect(root)) as con:
         task,verified=verified_task(con)
-    request={**verified['request'],'action':'confirm_metadata_error_cleared'}
+    request={**verified['request'],'action':('repair_source_binding'
+        if task['last_error_code']=='source_binding_prequery_needs_review' else 'confirm_metadata_error_cleared')}
     check_started=datetime.now(UTC)
     payload,readback,_=bridge.execute(root,{**task,'request_json':json.dumps(request)})
     try:
@@ -361,6 +440,7 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
             or any(payload.get(k) is not True for k in
                 ('source_binding_stable','vendor_notices_absent','source_selectors_enabled','company_group_enabled'))
             or any(payload.get(k) is not False for k in ('market_data_query_submitted','source_axes_adopted','credentials_read'))
+            or (request['action']=='repair_source_binding' and payload.get('binding_matches_failed_plan') is not True)
             or readback.resolve().parent!=(root/'raw').resolve() or not readback.name.startswith(task_id+'-')
             or not readback.is_file() or readback.stat().st_size>2*1024**2
             or json.loads(readback.read_text(encoding='utf-8-sig'))!=payload):
@@ -434,11 +514,12 @@ def receipt_attempt_evidence(root: Path, task: dict, request: dict, payload: dic
             'query_stage_sha256': hashlib.sha256(stage_path.read_bytes()).hexdigest()}
 
 
-def unstaged_interop_diagnostic(root: Path, task: dict, request: dict, prepared: Path) -> Path:
+def unstaged_interop_diagnostic(root: Path, task: dict, request: dict, prepared: Path, *,
+                               script_preparation: bool = False) -> Path:
     """Bind a known WSL launch diagnostic; NOT evidence the query was unsent.
 
-    Only the explicit operator replay path uses this. Missing stage/response
-    never enables automatic recovery or lets us adopt an old Preview.
+    Only an explicit one-shot or standing user grant uses this. Missing
+    stage/response alone never licenses a replay or adopting an old Preview.
     """
     active = task.get('active_attempt_id')
     if (not isinstance(active, str) or not re.fullmatch(re.escape(task['task_id']) + r'-[0-9a-f]{32}', active)
@@ -454,8 +535,15 @@ def unstaged_interop_diagnostic(root: Path, task: dict, request: dict, prepared:
     diagnostic = root / 'diagnostics' / (active + '.txt')
     if diagnostic.is_symlink() or not diagnostic.is_file() or diagnostic.stat().st_size > 4096:
         raise ValueError('Bounded original WSL diagnostic required')
-    if not re.fullmatch(r'<3>WSL \([0-9]+ - \) ERROR: UtilAcceptVsock:[0-9]+: accept4 failed 110\s*',
-                        diagnostic.read_text(encoding='utf-8-sig')):
+    text=diagnostic.read_text(encoding='utf-8-sig')
+    lines=text.splitlines()
+    known=(len(lines)>=5 and lines[0]=='Script copy mismatch'
+           and re.fullmatch(r'At line:1 char:[1-9][0-9]*',lines[1])
+           and "throw 'Script copy mismatch'" in lines[2]
+           and sum('FullyQualifiedErrorId' in line for line in lines)==1
+           and any(re.fullmatch(r'\s*\+ FullyQualifiedErrorId : Script copy mismatch\s*',line) for line in lines)) if script_preparation else bool(
+           re.fullmatch(r'<3>WSL \([0-9]+ - \) ERROR: UtilAcceptVsock:[0-9]+: accept4 failed 110\s*',text))
+    if not known:
         raise ValueError('Unreviewed unstaged error; operator replay refused')
     with closing(_connect(root)) as con:
         attempt = con.execute('SELECT * FROM desktop_attempts WHERE attempt_id=?', (active,)).fetchone()
@@ -467,12 +555,15 @@ def unstaged_interop_diagnostic(root: Path, task: dict, request: dict, prepared:
 
 
 def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
-                           allow_unstaged_interop: bool = False) -> dict:
-    """Explicit one-shot operator replay. Preserves unknown evidence and cost risk.
+                           allow_unstaged_interop: bool = False,
+                           allow_unstaged_script_preparation: bool = False,
+                           allow_orphaned_desktop_loss: bool = False,
+                           standing_authorization: dict | None = None) -> dict:
+    """Canonical one-shot replay, with manual or bounded standing user authority.
 
-    Called ONLY by the operator CLI, under its canonical dataset lock; not by
-    the scheduler or automatic recovery. A stable UI does not prove that the
-    original request was never charged. The new outcome requires new evidence.
+    Caller owns the canonical dataset lock. Standing authority must match the
+    installed runtime policy and persistent budget. A stable UI never proves
+    that the original request was uncharged. New results require new receipts.
     """
     from downloader.tej_history import connect, run_one, task_request
     with closing(connect(root)) as con:
@@ -485,16 +576,48 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
             raise ValueError('One exact quiescent unknown download required')
     task = dict(row)
     request = task_request(root, task)
-    if type(allow_unstaged_interop) is not bool:
+    automatic = standing_authorization is not None
+    snapshot = request.get('source_key_mode') == 1
+    if automatic:
+        with closing(connect(root)) as con:
+            saved = con.execute("SELECT value FROM meta WHERE key='runtime_policy'").fetchone()
+            installed = json.loads(saved[0]).get('authorized_unknown_replay') if saved else None
+            if (installed is None or installed != standing_authorization
+                    or authorized_replay_policy({'automation': {'authorized_unknown_replay': installed}}) != installed):
+                raise ValueError('Current standing replay grant required')
+            window = authorized_replay_window(con, task, installed, datetime.now(UTC))
+            if not window['allowed']:
+                raise ValueError('Standing replay cooldown/budget not due')
+        original = _read_private(prepared, root / 'requests', task_id)
+        if (not prepared_request_matches(original, request, task)
+                or original.get('query_attempt_id') != task.get('active_attempt_id')
+                or (root / 'raw' / (task['active_attempt_id'] + '.json')).exists()):
+            raise ValueError('Reconcile exact saved response before any authorized replay')
+    modes = (allow_unstaged_interop, allow_unstaged_script_preparation, allow_orphaned_desktop_loss)
+    if any(type(mode) is not bool for mode in modes) or sum(modes) > 1:
         raise ValueError('Explicit operator replay mode required')
-    diagnostic = unstaged_interop_diagnostic(root, task, request, prepared) if allow_unstaged_interop else None
+    unstaged=any(modes)
+    if allow_orphaned_desktop_loss:
+        from downloader.tej_startup import orphan_desktop_loss_proof
+        diagnostic = orphan_desktop_loss_proof(root, task, request, prepared)
+    else:
+        diagnostic = unstaged_interop_diagnostic(root, task, request, prepared,
+            script_preparation=allow_unstaged_script_preparation) if unstaged else None
     stage_path = None
-    if not allow_unstaged_interop:
+    if not unstaged:
         _, stage_path = query_stage(root, task, request, prepared)
+    checked = datetime.now(UTC)
     payload, output, _ = bridge.execute(root, {**task, 'request_json':json.dumps({**request, 'action':'inspect_query_runtime'})})
+    if automatic:
+        observed = datetime.fromisoformat(payload.get('observed_at_utc', '').replace('Z', '+00:00'))
+        if (observed.tzinfo is None or not checked <= observed <= datetime.now(UTC) + timedelta(seconds=5)
+                or _read_private(output, root / 'raw', task_id) != payload):
+            raise ValueError('Fresh exact owned no-query readback required for standing replay')
     expected_true = ('vendor_notices_absent', 'source_binding_stable', 'source_selectors_enabled',
-                     'company_group_enabled', 'date_group_enabled', 'source_binding_unchanged')
-    if not allow_unstaged_interop:
+                     'company_group_enabled', 'source_binding_unchanged')
+    if not snapshot and not unstaged:
+        expected_true += ('date_group_enabled',)
+    if not unstaged:
         expected_true += ('binding_matches_failed_plan',)
     expected_false = ('market_data_query_submitted', 'date_text_input_sent', 'query_button_invoked',
                       'source_rows_adopted', 'credentials_read')
@@ -510,30 +633,36 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
     role_state = button.get('accessible_role_state')
     texts = [x.get('native_text') for x in payload.get('date_input_controls', [])
              if re.fullmatch(r'\d{4}/\d{2}/\d{2}', str(x.get('native_text')))]
-    if not allow_unstaged_interop and (len(fields) != 2 or fields[-1].get('items') != request['fields'] or len(axes) != 6
-            or axes[3].get('items') != request['company_labels'] or axes[-1].get('items') != request['date_labels']
-            or sorted(texts) != sorted([request['start'].replace('-', '/'), request['end'].replace('-', '/')])
+    if not unstaged and (len(fields) != 2 or fields[-1].get('items') != request['fields'] or len(axes) != 6
+            or axes[3].get('items') != request['company_labels']
+            or payload.get('source_key_mode') != request.get('source_key_mode', 2)
+            or not snapshot and (axes[-1].get('items') != request['date_labels']
+                or sorted(texts) != sorted([request['start'].replace('-', '/'), request['end'].replace('-', '/')]))
             or button.get('enabled') is not True or button.get('visible') is not True
             or not isinstance(role_state, list) or len(role_state) != 2
             or role_state[0] != 43 or button.get('default_action') != 'Press'):
         raise ValueError('Exact current query axes/button required; unknown barrier preserved')
-    if allow_unstaged_interop and (button.get('enabled') is not True or button.get('visible') is not True
+    if unstaged and (button.get('enabled') is not True or button.get('visible') is not True
             or not isinstance(role_state, list) or len(role_state) != 2 or role_state[0] != 43
             or button.get('default_action') != 'Press' or payload.get('source_key_mode') not in (1, 2, 3)):
         raise ValueError('Exact idle owned query button required; unknown barrier preserved')
     authorization = uuid.uuid4().hex
     audit_path = root / 'operator_replays' / (task_id + '-' + authorization + '.json')
-    audit = {'contract':OPERATOR_REPLAY_CONTRACT, 'authorization_id':authorization, 'task_id':task_id,
+    audit = {'contract':AUTHORIZED_REPLAY_CONTRACT if automatic else OPERATOR_REPLAY_CONTRACT,
+             'authorization_id':authorization, 'task_id':task_id,
              'observed_at_utc':datetime.now(UTC).isoformat(), 'original_attempted_at_utc':task['attempted_at_utc'],
              'original_request_path':str(prepared.resolve().relative_to(root.resolve())),
              'original_request_sha256':hashlib.sha256(prepared.read_bytes()).hexdigest(),
              'original_stage_path':str(stage_path.relative_to(root)) if stage_path else None,
              'original_stage_sha256':hashlib.sha256(stage_path.read_bytes()).hexdigest() if stage_path else None,
              'unstaged_interop_replay_explicitly_authorized':allow_unstaged_interop,
+             'unstaged_script_preparation_replay_explicitly_authorized':allow_unstaged_script_preparation,
+             'orphaned_desktop_loss_replay_authorized':allow_orphaned_desktop_loss,
              'original_launch_diagnostic_path':str(diagnostic.relative_to(root)) if diagnostic else None,
              'original_launch_diagnostic_sha256':hashlib.sha256(diagnostic.read_bytes()).hexdigest() if diagnostic else None,
              'readback_path':str(output.relative_to(root)), 'readback_sha256':hashlib.sha256(output.read_bytes()).hexdigest(),
-             'original_outcome':'unknown_retained_not_claimed_unsent', 'automatic_retry':False,
+             'original_outcome':'unknown_retained_not_claimed_unsent', 'automatic_retry':automatic,
+             'standing_authorization':standing_authorization,
              'possible_additional_provider_usage':True, 'source_rows_adopted':False}
     atomic_write_json(audit_path, audit)
     with closing(connect(root)) as con, con:
@@ -546,5 +675,5 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
     result = run_one(root, bridge, retry_authorization_id=authorization)
     with closing(connect(root)) as con, con:
         con.execute('UPDATE desktop_replays SET outcome=? WHERE authorization_id=?', (result, authorization))
-    return {'state':result, 'operator_replay':True, 'automatic_retry':False,
+    return {'state':result, 'operator_replay':not automatic, 'automatic_retry':automatic,
             'original_unknown_evidence_retained':True, 'authorization_id':authorization}

@@ -6,8 +6,37 @@ import pytest
 from scripts.build_tw_cross_source_fill_bundle import revenue_candidates
 from scripts.build_tw_release_schedule_dataset import normalize_source
 from stockagent.data.tw_public_cross_source_fill import (
-    MAPPINGS, missing_only, normalize_finmind,
+    MAPPINGS, missing_only, normalize_finmind, verify_wide_missing_only,
 )
+
+
+def test_wide_source_repair_protects_zero_and_requires_actual_fill_evidence():
+    original = pl.DataFrame({'source_index': ['2024-Q1', '2024-Q2'], '2330': [0., None]})
+    repaired = original.with_columns(pl.col('2330').fill_null(7.))
+    fills = pl.DataFrame({'source_index': ['2024-Q2'], 'symbol': ['2330'], 'value': [7.]})
+    assert verify_wide_missing_only(original, repaired, fills) == 1
+    with pytest.raises(ValueError, match='observed primary'):
+        verify_wide_missing_only(original, repaired.with_columns(pl.lit(7.).alias('2330')), fills)
+    with pytest.raises(ValueError, match='actual pinned fill'):
+        verify_wide_missing_only(original, repaired, fills.with_columns(pl.lit(8.).alias('value')))
+
+
+def test_prior_snapshot_restore_is_missing_only_and_keeps_latest_revision_and_zero():
+    from stockagent.data.tw_public_cross_source_fill import retain_verified_wide_snapshot
+    columns={str(1000+n):[1.,1.] for n in range(100)}
+    previous=pl.DataFrame({'source_index':['2024-Q1','2024-Q2'],**columns,
+        '2330':[0.,7.],'2317':[2.,2.],'9999':[3.,4.]})
+    current=pl.DataFrame({'source_index':['2024-Q1','2024-Q2'],**columns,
+        '2330':[0.,None],'2317':[3.,2.]})
+    repaired,fills,qa,_=retain_verified_wide_snapshot(current,previous)
+    assert qa['accepted'] and fills.height==3
+    assert repaired['2330'].to_list()==[0.,7.]
+    assert repaired['2317'].to_list()==[3.,2.] # Latest finite revision wins.
+    assert repaired['9999'].to_list()==[3.,4.]
+    assert verify_wide_missing_only(current,repaired,fills)==3
+    incompatible=previous.with_columns(pl.lit(100.).alias(str(1000+n)) for n in range(100))
+    actual,fills,qa,_=retain_verified_wide_snapshot(current,incompatible)
+    assert not qa['accepted'] and fills.is_empty() and actual.equals(current)
 from stockagent.data.tw_public_release_schedule import feature_name
 
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile Vast exact-release payload demand automatically
+
+[Timer]
+OnBootSec=30s
+OnActiveSec=5s
+OnUnitInactiveSec=15s
+Persistent=true
+Unit=stockagent-packed-transport.service
+
+[Install]
+WantedBy=timers.target

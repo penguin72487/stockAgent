@@ -22,14 +22,15 @@ function historyEstimate(row) {
 function networkTimeLabel(row) {
   if (valueNumber(row.retry_exhausted_partitions) > 0 && row.state === "retry_exhausted") return "自動重試已停止，待人工修復";
   const estimate = historyEstimate(row);
-  if (estimate) return completionEstimateView(estimate).scenarios[1].value;
+  if (estimate) return stageHasNoPendingWork(estimate, estimate.scenarios?.central || {})
+    ? "目前候選已查驗" : completionEstimateView(estimate).scenarios[1].value;
   // Never reinterpret an older backend's partition-based legacy number as ETA.
   return row.state === "complete" ? "已查驗目前任務" : "未知（分割數不等於請求數）";
 }
 function networkTimeBasis(row) {
   if (valueNumber(row.retry_exhausted_partitions) > 0) return `${count(row.retry_exhausted_partitions)} 個任務重試達上限，保留 ${count(row.retained_rows)} 筆舊資料；不是完成，不占用自動下載估時。`;
   const estimate = historyEstimate(row);
-  if (estimate) return `${completionEstimateView(estimate).scenarios[1].complete}；包含前面階段的等待，不是獨占額度。`;
+  if (estimate) return `${completionEstimateView(estimate).scenarios[1].complete}；本階段工時不等於累計完工，所有下載器共用額度。`;
   if (row.state === "delegated") return "由其他下載器承接；此舊 owner 不另估時間。";
   if (valueNumber(row.deferred_partitions) > 0) {
     return `仍有 ${count(row.deferred_partitions)} 個任務待重試；發出請求不代表已成功完成。完成估時請看上方階段，不能用剩餘分割數除以官方上限。`;
@@ -70,8 +71,12 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
   const info = estimate && typeof estimate === "object" ? estimate : {};
   const expiry = Date.parse(info.valid_until_utc || "");
   const expired = info.state === "stale" || (Number.isFinite(expiry) && expiry <= nowMs);
+  // A missing sample in one scenario must not hide another valid scenario.
+  // Prefer the DTO capability, retaining known older ordered snapshots only.
+  const orderedProjection = info.scenario_projection_contract === 1
+    || [6, 7, 8, 9, 10, 11, 12].includes(info.schema_version);
   const usable = !expired && (["estimated", "conditional", "current"].includes(info.state)
-    || ([6, 7, 8, 9].includes(info.schema_version) && info.state === "warming_up"));
+    || (orderedProjection && info.state === "warming_up"));
   const workload = info.workload || {};
   const exhaustedOnly = usable && workload.planned_requests === 0 && workload.retry_exhausted_tasks > 0;
   const scenarios = ["fastest", "central", "slowest"].map((key) => {
@@ -88,6 +93,8 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
     const retrying = !expired && info.state === "waiting_retry";
     const waiting = !expired && ["waiting_admission", "waiting_quota", "waiting_retry"].includes(info.state);
     const activeSeconds = valueNumber(scenario.active_work_seconds);
+    const ownSeconds = valueNumber(scenario.standalone_active_work_seconds);
+    const ownWork = usable && !available && !overdue && ownSeconds > 0;
     const completedAt = available ? timeLabel(scenario.estimated_complete_at_utc) : "—";
     const requests = valueNumber(scenario.request_count);
     const rate = valueNumber(scenario.effective_requests_per_hour);
@@ -96,6 +103,7 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
       conditional: available && conditional,
       value: expired ? "觀測已過期" : exhaustedOnly ? "重試耗盡，待人工修復" : overdue ? "已超過估計，尚未完成" : available ? `${conditional ? "條件試算 " : ""}${estimateDuration(seconds)}`
         : retrying ? "待重試，完成時間未定" : waiting && activeSeconds !== null ? `放行後 ${estimateDuration(activeSeconds)}`
+        : ownWork ? `本階段工時 ${estimateDuration(ownSeconds)}`
         : usable && activeSeconds !== null ? `有效工時 ${estimateDuration(activeSeconds)}` : "未知",
       complete: exhaustedOnly || completedAt === "—" ? "完成日期尚無法估算" : `${conditional ? "若下次重試成功，" : ""}預計 ${completedAt}（台北）`,
       detail: conditional
@@ -104,13 +112,16 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
         ? `估計 ${count(requests)} 次請求 · ${info.rate_evidence?.overall_rate_basis === "stage_weighted" ? "全程加權" : "有效"} ${rate === null ? "—" : oneDecimal.format(rate)} 次／小時`
         : overdue ? "估計期限不是成功收據；等待背景重新盤點，不把超時當成完成"
         : retrying ? `仍有 ${count(workload.retry_tasks)} 個失敗／部分回應待重試；成功後工時 ${activeSeconds === null ? "未知" : estimateDuration(activeSeconds)}，不是倒數`
-        : waiting ? "僅有效工時；尚不含未知等待時間" : usable && activeSeconds !== null ? "僅工時投影；超出可核實日曆範圍" : "等待可核實的工作量與速度",
+        : waiting ? "僅有效工時；尚不含未知等待時間"
+        : ownWork ? "僅目前候選的本階段工時；前置等待、之後新增工作與累計完成時間尚未核實"
+        : info.rate_evidence?.request_processing?.dependent_processing_unknown ? "尚未量測必要的本機彙總耗時；不以 API 次數捏造完成日期"
+        : usable && activeSeconds !== null ? "僅工時投影；超出可核實日曆範圍" : "等待可核實的工作量與速度",
       basis: typeof scenario.basis === "string" ? scenario.basis : "尚無此情境的估算依據",
     };
   });
   const stateLabel = expired ? "估算觀測已過期" : ({
     estimated: "三情境估算", conditional: "條件式三情境估算", current: "本輪可執行工作已查驗",
-    warming_up: "等待估算樣本", unavailable: "估算暫不可用",
+    warming_up: scenarios.some(row => row.complete.startsWith("預計 ")) ? "部分情境可估，其餘待耗時樣本" : "等待估算樣本", unavailable: "估算暫不可用",
     waiting_admission: "等待必要下載完成／校驗放行", waiting_quota: "等待共用配額恢復",
     waiting_retry: "尚未完成：等待成功重試",
   })[info.state] || "尚無全域估算";
@@ -125,9 +136,9 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
     : "依現有佇列排重試；不另外增加冷卻。";
   const rateBridge = expired ? "估算取樣已過期，等待背景重新取樣。"
     : info.state === "waiting_retry"
-      ? `滾動 60 分鐘實發 ${count(rates.rolling_requests_60m)} 次，是請求發出數，不是成功完成數。仍有 ${count(workload.retry_tasks)} 個任務待重試。${retryTiming}`
+      ? `滾動 60 分鐘實發 ${count(rates.rolling_requests_60m)} 次，是請求發出數，不是成功完成數。仍有 ${count(workload.retry_tasks)} 個任務待重試。${info.scheduling_projection?.independent_retry_requests > 0 ? "獨立來源重試不阻塞歷史佇列，到期仍共用配額。" : ""}${retryTiming}`
     : rates.scheduling_basis === "release_clock_events" && rates.rolling_complete_window && gross !== null && effective !== null
-      ? `${rates.stage_label || "目前階段"}：滾動 60 分鐘實發 ${count(rates.rolling_requests_60m)} 次；追新按發布／到期時點優先插入，未到期不扣容量。本階段平均回補速度 ${oneDecimal.format(effective)} 次／小時；此刻實際保留 ${count(rates.current_reserved_requests)} 次（含在途緩衝）。`
+      ? `${rates.stage_label || "目前階段"}：滾動 60 分鐘實發 ${count(rates.rolling_requests_60m)} 次；追新按發布／到期時點優先插入，未到期不扣容量。階段共用請求加權速度 ${oneDecimal.format(effective)} 次／小時（含插入追新，不等於大型檔下載速度）；此刻實際保留 ${count(rates.current_reserved_requests)} 次（含在途緩衝）。`
     : rates.rolling_complete_window && gross !== null && recurring !== null && effective !== null
       ? `${rates.stage_label || "目前階段"}：滾動 60 分鐘實發 ${count(rates.rolling_requests_60m)} 次 → 每小時 ${oneDecimal.format(gross)} 次，扣除未來追新模型 ${oneDecimal.format(recurring)} 次／小時 → 回補淨速度 ${oneDecimal.format(effective)} 次／小時（受共用限速上限約束）。`
       : "滾動一小時或追新負載證據不足；不以舊的活躍區間中位數替代。";
@@ -147,10 +158,26 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
 function stageHasNoPendingWork(item, raw, nowMs = Date.now()) {
   return ["current", "estimated", "conditional"].includes(item.state)
     && Date.parse(item.valid_until_utc || "") > nowMs
-    && item.workload?.planned_requests === 0 && raw.forecast_arrival_requests === 0
+    && item.workload?.planned_requests === 0 && (Boolean(item.dataset) || raw.forecast_arrival_requests === 0)
     && !item.workload?.inflight_tasks && !item.workload?.local_derived_tasks
     && !item.workload?.blocked_tasks && !item.workload?.unknown_datasets
     && !item.workload?.unscheduled_datasets && !item.workload?.retry_tasks && !item.workload?.retry_exhausted_tasks;
+}
+
+function freshWorkerStatus(info, owner, nowMs = Date.now()) {
+  const stamp = owner === "free" ? info.observed_at_utc : info[`${owner}_observed_at_utc`];
+  const age = nowMs - Date.parse(stamp || "");
+  return age >= -60000 && age <= 180000;
+}
+
+function historyScheduleLabel(item, data, nowMs = Date.now()) {
+  const info = data?.acquisition || {};
+  if (!freshWorkerStatus(info, "complement", nowMs)) return "實際排程觀測待更新";
+  if (info.complement_state === "running" && info.complement_active_task?.dataset === item.dataset) return "正在下載（工作取樣）";
+  if (info.complement_next_task?.dataset === item.dataset) return "下一筆已排程（尚非完成）";
+  if (stageHasNoPendingWork(item, item.scenarios?.central || {}, nowMs)) return "目前候選已查驗；未來追新另計";
+  if (item.workload?.planned_requests > 0) return "接續待抓；依歷史順序／追新插隊";
+  return "等待資料／排程證據";
 }
 
 function renderCompletionEstimate(estimate) {
@@ -188,6 +215,10 @@ function renderCompletionEstimate(estimate) {
       work.textContent = `剩餘 ${count(item.workload?.planned_requests)} 次（含 ${count(item.workload?.candidate_requests ?? 0)} 次未建候選）；待重試 ${count(item.workload?.retry_tasks ?? 0)} 個；累計 ${count(item.cumulative_planned_requests)} 次`;
       label.append(work); row.append(label);
       if (item.dataset) {
+        const schedule = document.createElement("small");
+        schedule.className = "estimate-stage-schedule";
+        schedule.textContent = historyScheduleLabel(item, state.latest);
+        label.append(schedule);
         const dataset = state.latest?.datasets?.find(value => value.id === item.dataset);
         const checked = dataset?.checked_partitions, total = dataset?.target_partitions;
         const completion = ratio(checked, total);
@@ -206,16 +237,18 @@ function renderCompletionEstimate(estimate) {
           ? item.retry_condition.scenarios[scenario.key] : item.scenarios?.[scenario.key] || {};
         const cell = document.createElement("td");
         const noWork = stageHasNoPendingWork(item, raw);
-        cell.textContent = noWork ? "目前無已知待發請求" : `${scenario.value}；${scenario.complete}`;
+        cell.textContent = noWork ? "目前無已知待發請求（目前候選已查驗）" : `${scenario.value}；${scenario.complete}`;
         const detail = document.createElement("small");
         const canShow = raw.state === "estimated"
           && (scenario.conditional || !["stale", "unavailable", "waiting_retry"].includes(item.state))
           && Date.parse(item.valid_until_utc || "") > Date.now() && Date.parse(raw.estimated_complete_at_utc || "") >= Date.now();
         detail.textContent = noWork ? "此階段不增加目前排程時間；未來新增需求另計。" : canShow && raw.stage_start_at_utc
           ? `階段開始 ${timeLabel(raw.stage_start_at_utc)}；本階段 ${estimateDuration(raw.stage_duration_seconds)}`
-          : "開始時間待前置階段／額度證據核實";
+          : item.scheduling_projection?.independent_retry_requests > 0
+            ? "獨立來源重試不阻塞歷史下載；到期仍使用共用配額。"
+            : `${scenario.detail}；開始時間待前置階段／額度證據核實`;
         const flow = document.createElement("small");
-        flow.textContent = `本階段淨速度 ${count(raw.effective_requests_per_hour)} 次／小時；等待期間新增日分區模型 ${count(raw.forecast_arrival_requests)} 次`;
+        flow.textContent = `回補基準 ${count(raw.base_request_count)} 次 · 等待期間新增日分區模型 ${count(raw.forecast_arrival_requests)} 次 · 插入追新模型 ${count(raw.forecast_refresh_requests ?? 0)} 次（既有欠帳只計一次） · 共用請求加權 ${count(raw.effective_requests_per_hour)} 次／小時`;
         cell.append(detail, flow); row.append(cell);
       }
       milestones.append(row);
@@ -404,11 +437,16 @@ function renderCapture(data) {
     const names = {free: "盤中", complement: "補充", sponsor: "Sponsor"};
     $("capture-freshness").textContent += `；存活／下次檢查：${workers.map(([name, worker]) => `${names[name] || name} ${worker.state === "running" ? "正在執行" : timeLabel(worker.next_check_at_utc)}`).join(" · ")}（心跳不代表新資料）`;
   }
-  text("capture-key", info.sponsor_active_tasks?.[0]?.dataset ? `${info.sponsor_active_tasks[0].dataset} · ${info.sponsor_active_tasks[0].partition}` : info.complement_active_task?.dataset ? `${info.complement_active_task.dataset} · ${info.complement_active_task.data_id || info.complement_active_task.partition || ""}` : info.active_task?.dataset ? `${info.active_task.dataset} · ${info.active_task.date || ""}` : running ? "執行中，等待下一次工作取樣" : "目前未觀測到進行中的請求");
+  const sponsorTask = freshWorkerStatus(info, "sponsor") && info.sponsor_state === "running" ? info.sponsor_active_tasks?.[0] : null;
+  const complementTask = freshWorkerStatus(info, "complement") && info.complement_state === "running" ? info.complement_active_task : null;
+  const freeTask = freshWorkerStatus(info, "free") && ["running", "backfilling"].includes(info.free_state) ? info.active_task : null;
+  const active = sponsorTask || complementTask || freeTask;
+  text("capture-key", active?.dataset ? `${active.dataset} · ${active.data_id || active.partition || active.date || ""}` : running ? "執行中，等待下一次工作取樣" : "目前未觀測到進行中的請求");
   const last = info.latest_result;
   text("capture-last", last ? `${last.dataset} · ${last.data_id || last.partition || last.date || ""} · ${last.status || "未知"} · ${count(last.rows)} 筆${last.observed_at_utc ? ` · ${timeLabel(last.observed_at_utc)}` : ""}` : "尚無可核實的最近結果");
-  const next = Array.isArray(info.queue_preview) ? info.queue_preview[0] : null;
-  text("capture-next", info.complement_next_task?.dataset ? `${info.complement_next_task.dataset} · ${info.complement_next_task.data_id || info.complement_next_task.partition || ""}` : next?.dataset ? `${next.dataset} · ${next.date || ""}` : "無待補佇列／尚未清點");
+  const next = freshWorkerStatus(info, "complement") ? info.complement_next_task : null;
+  const freeNext = freshWorkerStatus(info, "free") && Array.isArray(info.queue_preview) ? info.queue_preview[0] : null;
+  text("capture-next", next?.dataset ? `${next.dataset} · ${next.data_id || next.partition || ""}` : freeNext?.dataset ? `${freeNext.dataset} · ${freeNext.date || ""}` : "無近期待發工作取樣；不代表已完成");
   const universe = info.candidate_universe || {};
   text("capture-universe", `${count(universe.finmind_current_master_stock_ids)} 個現行主檔代號 + ${count(universe.additional_official_delisted_ids)} 個額外官方下市代號；歷史全域仍待驗證`);
   $("capture-dot").classList.toggle("active", running);

@@ -9,6 +9,7 @@ import pytest
 from scripts.finlab_workload import MIB, build_workload, record_measure, schedule_jobs
 from scripts.download_finlab_history import refresh_due, safe_stem
 from stockagent.live.finlab_dashboard import _public_workload
+from stockagent.data.finlab_acquisition_contract import process_owner
 
 NOW = datetime(2026, 9, 28, 2, tzinfo=UTC)
 
@@ -129,7 +130,7 @@ def setup_root(root):
 def test_active_sample_overrun_cannot_slide_a_fake_finish_forward(tmp_path):
     setup_root(tmp_path)
     write(tmp_path / "data_finlab/runs/latest.json", {
-        "state": "running", "active_key": "price:b", "active_started_at_utc": (NOW-timedelta(minutes=10)).isoformat()})
+        "state": "running", "owner": process_owner(), "active_key": "price:b", "active_started_at_utc": (NOW-timedelta(minutes=10)).isoformat()})
     result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path / "sdk", now=NOW,
                                quota=quota(5000), footer_budget_seconds=10)
     assert result["scenarios"]["reference"]["state"] == "insufficient_samples"
@@ -164,11 +165,12 @@ def test_no_footer_budget_keeps_counts_unknown_not_zero(tmp_path):
     assert all(row["record_count"] is None for row in result["datasets"])
 
 
-def test_live_incremental_quota_policy_and_v2_footer_cache_are_shared_with_projection(tmp_path):
+@pytest.mark.parametrize("cache_version", [2, 3, 4])
+def test_live_incremental_policy_reuses_compatible_footer_cache(tmp_path, cache_version):
     keys = setup_root(tmp_path)
     _, cache = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
                               quota=quota(), footer_budget_seconds=10)
-    cache["contract_version"] = 2
+    cache["contract_version"] = cache_version
     result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
                                quota=quota(.001), cache=cache, footer_budget_seconds=0)
     assert result["contract_version"] == 4 and result["quota_policy_version"] == 1

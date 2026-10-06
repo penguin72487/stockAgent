@@ -1,0 +1,24 @@
+# Owner-selected direct-input experiment, without any temporal basis bank.
+# Preserve exact value-only data, learned cash, width32, execution and DDP32.
+# No weights/optimizer reuse: this changes the architecture, not just transport.
+base_config: tw_day_trade_factorized_values_20261005_gaprepair_v4_bf16_v7.yaml
+experiment_name: tw-day-trade-factorized-values-20261005-gaprepair-v4-no-basis-bf16-v1
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261005_no_basis_v1/training-bf16
+  resume: false
+
+training:
+  pretrained_initialization_root: null
+  # Bound no-grad FIFO padding independently of model decision chunks.
+  # Exact carry state still flows through every owned date; nothing is reset.
+  eval_backtest_chunk_rows: 32
+  eval_backtest_chunk_rows_auto: false
+  financial_transformer:
+    temporal_basis_families: []
+    temporal_basis_disabled_families: []
+    temporal_basis_components_by_family: {}
+    temporal_basis_input: embedded
+    temporal_basis_algebraic_contraction: false
+    temporal_basis_fp32_contraction: false
+    feature_bottleneck_dim: 0

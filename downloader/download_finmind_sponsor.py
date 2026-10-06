@@ -34,7 +34,7 @@ from downloader.download_finmind_complement import (
     SourceError, Task, _db, _fetch_rows, _sha256, _store, _preflight_bulk_year_schemas,
 )
 from downloader.download_finmind_free import TAIPEI
-from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
+from downloader.finmind_account import backfill_budget, pacing_interval, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import (
     BATCH_CONTRACT_VERSION, RANGE_CONTRACTS, BatchContractError, RangeBatch,
     coalesce_pending_tasks, split_batch_rows,
@@ -1076,7 +1076,10 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                     reason = "protected_opening"
                 while not halt and len(in_flight) < workers and (not max_requests or sent < max_requests):
                     dispatch_now = datetime.now(UTC)
+                    previous_quota = account.get('official_requests_per_hour')
                     account = refresh_dispatch_account(account, token, root.parent, dispatch_now)
+                    if account.get('official_requests_per_hour') != previous_quota:
+                        limiter.interval_seconds = pacing_interval(account)
                     reservation = incremental_reservation(root.parent, dispatch_now)
                     budget = backfill_budget(
                         account, root.parent,

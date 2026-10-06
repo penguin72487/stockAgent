@@ -18,9 +18,23 @@ production services keep their existing owners. Run success alone does not prove
 their acceptance. Installation, commands and recovery boundaries are documented
 in [Agent workflow](../agent_workflow.md).
 
-The opt-in cross-node engineering role is documented in
+The isolated cross-node engineering role is documented in
 [Control workflow](../control_plane_workflow.md). Its PostgreSQL and Mamba Python role
-are independent of acquisition, CUDA and intraday services. Runtime discovery
+are independent of acquisition, CUDA and intraday services. Penguin's registered
+code-release verification now has its own canonical timer and exact-work claims;
+boot readiness includes fresh semantic receipts and the last service outcome.
+
+The DuckLake/Temporal role uses `scripts/run_lakehouse_control.sh` for the owner
+namespace and private Mamba runtime. Its `exec_fintech_python` uses canonical
+discovery and replaces the shell so systemd supervises Python. The worker wants
+the server without a stop-propagating `Requires`/`After` chain; disconnects
+reconnect/retry instead of cascading shutdown. Activities heartbeat every 10
+seconds with a 60-second lease, and prepared publication/copy/retirement journals
+survive interruption. Source replication and transport GC have independent
+owners. Readiness requires fresh paired NAS guards, both running workflows and
+loaded-code identity. Process crash acceptance does not prove physical cold
+boot. See [measured recovery](../ducklake_temporal_replication_2026-10-05.md).
+Runtime discovery
 recognizes a venv's `pyvenv.cfg` before resolving its Python symlink to the base
 interpreter, so an explicitly selected legacy role keeps its own dependency set.
 New engineering roles use Miniforge/mamba declarations plus platform-specific
@@ -64,6 +78,17 @@ proof. Setup and measured engine trials are in
   not a Windows cold-boot recovery proof.
 
 ## Testing And Verification
+
+Boot recovery uses the existing Windows S4U supervisor and named systemd owners.
+The foreground WSL holder is independent of gateway dispatch; systemd services
+alone do not keep WSL alive. Install bounded retry and the automatic observer
+with `scripts/install_boot_recovery_policies.py`; current evidence and limits are
+in [Boot recovery](../all_services_boot_recovery_2026-10-05.md).
+For the boot observer, use `scripts/run_boot_recovery_audit.sh`: it runs the whole
+check in PID 1's mount namespace. WSL interactive sessions may expose a different
+DrvFs view; a check in another namespace cannot establish the caller's storage
+readiness. The observer preserves market/source/settlement blockers and never
+restarts or liquidates a trading process to manufacture a ready status.
 
 Use focused tests after small changes, then broader tests when training/model/loss code changes.
 

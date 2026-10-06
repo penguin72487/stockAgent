@@ -343,11 +343,13 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
     return process_references_many((target,), limit=limit)
 
 
-def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list[str]:
+def process_references_many(targets: Iterable[Path], *, limit: int = 20,
+                            inode_keys: set[tuple[int, int]] | None = None) -> list[str]:
     """Scan /proc once for exact selected roots, excluding unrelated siblings."""
 
     targets = tuple(sorted({target.resolve() for target in targets}))
-    if not targets:
+    inode_keys = set(inode_keys or ())
+    if not targets and not inode_keys:
         return []
     references: list[str] = []
     own_pid = os.getpid()
@@ -376,7 +378,14 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list
                 value = os.readlink(descriptor)
             except OSError:
                 continue
-            if any(_path_is_under(value, target) for target in targets):
+            matches = any(_path_is_under(value, target) for target in targets)
+            if inode_keys and not matches:
+                try:
+                    info = descriptor.stat()
+                    matches = (info.st_dev, info.st_ino) in inode_keys
+                except OSError:
+                    pass
+            if matches:
                 references.append(f"pid={pid}:fd={descriptor.name}:{value}")
                 if len(references) >= limit:
                     return references
@@ -387,6 +396,18 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20) -> list
         except OSError:
             maps = ""
         map_lines = maps.splitlines()
+        if inode_keys:
+            for line in map_lines:
+                try:
+                    columns = line.split(maxsplit=5)
+                    major, minor = columns[3].split(":")
+                    key = (os.makedev(int(major, 16), int(minor, 16)), int(columns[4]))
+                except (IndexError, ValueError):
+                    continue
+                if key in inode_keys:
+                    references.append(f"pid={pid}:maps-inode:{key[0]}:{key[1]}")
+                    if len(references) >= limit:
+                        return references
         for target in targets:
             target_text = str(target)
             if f" {target_text}/" in maps or any(
@@ -408,6 +429,8 @@ def prune_partial_materialization(
     receipt_dir: Path,
     apply: bool = False,
     min_age_days: float = 7.0,
+    manual_immediate: bool = False,
+    d_primary_native_reads: bool = False,
 ) -> dict[str, Any]:
     """Manually prune proven redundant files in one abandoned fetch staging tree.
 
@@ -423,6 +446,8 @@ def prune_partial_materialization(
     from stockagent.data_sync.desync_snapshots import sha256_file
     from stockagent.data_sync.packed_snapshots import _load_inventory
 
+    if type(manual_immediate) is not bool or type(d_primary_native_reads) is not bool:
+        raise SnapshotError("manual partial cleanup and native D reads require explicit booleans")
     dataset = validate_slug(dataset, "dataset")
     snapshot_id = validate_slug(snapshot_id, "snapshot_id")
     prefix = f".{snapshot_id}.partial."
@@ -449,7 +474,8 @@ def prune_partial_materialization(
         raise SnapshotError("staging release is pinned")
     if process_references(target):
         raise SnapshotError("staging tree is currently in use")
-    cutoff = time.time_ns() - int(min_age_days * 86400 * 1e9)
+    effective_age_days = 0.0 if manual_immediate else min_age_days
+    cutoff = time.time_ns() - int(effective_age_days * 86400 * 1e9)
     with ExitStack() as stack:
         lock_paths = (
             _lock_path(materialized_root, dataset),
@@ -510,7 +536,9 @@ def prune_partial_materialization(
         # Mandatory even for the dry run: payload availability/manifest presence
         # alone isn't recoverability. This verifies SHA-256 and ZIP decoding.
         cold_proof = verify_packed_snapshot(
-            sync_root, resolved, reconstruct_paths=[item["path"] for item in selected]
+            sync_root, resolved, reconstruct_paths=[item["path"] for item in selected],
+            d_primary_native_blob_reads=d_primary_native_reads,
+            d_primary_native_pack_reads=d_primary_native_reads,
         )
         decoded_files = cold_proof["independently_reconstructed_files"]
         observed = time.time_ns()
@@ -522,6 +550,9 @@ def prune_partial_materialization(
             "dataset": dataset,
             "snapshot_id": snapshot_id,
             "apply": apply,
+            "manual_immediate": manual_immediate,
+            "configured_min_age_days": min_age_days,
+            "effective_min_age_days": effective_age_days,
             "checked_at": _utc_iso_from_ns(observed),
             "manifest_sha256": resolved.manifest_sha256,
             "cold_proof": cold_proof,

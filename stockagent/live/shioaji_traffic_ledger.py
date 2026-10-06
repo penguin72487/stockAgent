@@ -438,6 +438,7 @@ def shioaji_query(
     details: dict[str, Any] | None = None,
     request_count: int = 1,
     timing: dict[str, Any] | None = None,
+    observe_usage: bool = True,
 ) -> Iterator[Callable[[Any], None]]:
     """Record one or more billed requests without changing error behavior.
 
@@ -453,11 +454,14 @@ def shioaji_query(
     same event before that event is written, so they are returned to the caller
     for its existing operation receipt rather than causing a second write.
     Request-body time includes caller processing inside the context, not just
-    broker transport. No additional usage calls or requests are introduced.
+    broker transport. Latency-critical quotes may opt out of the two remote
+    quota observations. Their query count, rows, failures and durations remain
+    recorded, but usage and attributable bytes are explicitly unknown, never
+    zero. Independent quota observations retain authority over account usage.
     """
 
     context_started = time.monotonic()
-    before = _usage(api)
+    before = _usage(api) if observe_usage else None
     started = time.monotonic()
     rows = 0
     billed_requests = max(1, int(request_count))
@@ -480,7 +484,7 @@ def shioaji_query(
 
     def finish(error: BaseException | None = None) -> None:
         body_finished = time.monotonic()
-        after = _usage(api)
+        after = _usage(api) if observe_usage else None
         usage_finished = time.monotonic()
         phases = {
             "contract": QUERY_OBSERVATION_CONTRACT,
@@ -488,6 +492,12 @@ def shioaji_query(
             "request_body_ms": round((body_finished - started) * 1000.0, 3),
             "usage_after_ms": round((usage_finished - body_finished) * 1000.0, 3),
         }
+        if not observe_usage:
+            phases.update({
+                "usage_observation": "not_sampled_latency_critical",
+                "usage_before_ms": 0.0,
+                "usage_after_ms": 0.0,
+            })
         event = {
             "consumer": consumer,
             "method": method,
@@ -508,6 +518,8 @@ def shioaji_query(
             "details": _safe_details(details),
             "timing": phases,
         }
+        if not observe_usage:
+            event["usage_observation"] = "not_sampled_latency_critical"
         if error is not None:
             event["error_type"] = type(error).__name__
         else:

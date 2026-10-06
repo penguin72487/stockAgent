@@ -627,6 +627,14 @@ def _verify_physical_cache_files(
     return True, receipt, "full_sha256"
 
 
+PHYSICAL_PUBLIC_RELATIVE_MEMBERS = (
+    "twse_daily_ohlcv.parquet", "tpex_daily_ohlcv.parquet",
+    "tw_corporate_action_reference.parquet", "tw_corporate_action_entitlements.parquet",
+    "tw_corporate_action_entitlements.summary.json",
+    "tw_share_replacement_reference.parquet", "tw_share_replacement_reference.summary.json",
+)
+
+
 def _public_root(public_feature_path: str | Path) -> Path:
     path = Path(public_feature_path).resolve()
     if path.name != "tw_public_stock_daily.parquet" or path.parent.name != "features":
@@ -634,15 +642,7 @@ def _public_root(public_feature_path: str | Path) -> Path:
             "physical day-trade source requires the canonical public feature path"
         )
     root = path.parent.parent
-    required = (
-        root / "twse_daily_ohlcv.parquet",
-        root / "tpex_daily_ohlcv.parquet",
-        root / "tw_corporate_action_reference.parquet",
-        root / "tw_corporate_action_entitlements.parquet",
-        root / "tw_corporate_action_entitlements.summary.json",
-        root / "tw_share_replacement_reference.parquet",
-        root / "tw_share_replacement_reference.summary.json",
-    )
+    required = tuple(root / member for member in PHYSICAL_PUBLIC_RELATIVE_MEMBERS)
     missing = [str(item) for item in required if not item.is_file()]
     if missing:
         raise FileNotFoundError(

@@ -158,3 +158,44 @@ def test_deliberate_core_code_deletion_is_recorded_without_weakening_canonical_i
     assert "README.md" in inventory["deleted_tracked_paths"]
     assert "README.md" not in inventory["files"]
     verified_working_tree(destination / "code")
+
+
+def test_public_repository_skill_is_backed_up_as_a_complete_documentation_folder(auxiliary, tmp_path):
+    root, receipt, _ = auxiliary
+    members = {
+        '.agents/skills/example/SKILL.md': '---\nname: example\ndescription: Public workflow\n---\nUse the canonical owner.\n',
+        '.agents/skills/example/agents/openai.yaml': 'interface:\n  display_name: Public skill\n',
+        '.agents/skills/example/references/operations.md': 'Read the receipts.\n',
+        '.agents/skills/example/scripts/inspect.py': 'print("read-only status")\n',
+    }
+    for name, body in members.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    destination = tmp_path / 'skill-delivery'
+    result = export_auxiliary(root, destination, control_receipt=receipt)
+    verify(destination, result['envelope_identity_sha256'])
+    with zipfile.ZipFile(destination / 'code/working-tree.zip') as archive:
+        assert set(members) <= set(archive.namelist())
+        for name, body in members.items():
+            assert archive.read(name) == body.encode()
+    assert verified_working_tree(destination / 'code')['files_verified'] > len(members)
+    without_docs = working_tree_inventory(root, documentation=False, configs=True)
+    assert not any(name.startswith('.agents/') for name in without_docs['files'])
+
+
+@pytest.mark.parametrize('name,body', [
+    ('.env', 'PRIVATE_VALUE=synthetic-do-not-send'),
+    ('credentials.json', '{"api_key": "synthetic-do-not-send"}'),
+    ('settings.yaml', 'api_key: synthetic-do-not-send\n'),
+])
+def test_private_skill_configuration_is_excluded(auxiliary, name, body):
+    root, _, _ = auxiliary
+    relative = '.agents/skills/example/' + name
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    subprocess.run(['git', 'add', '-f', relative], cwd=root, check=True)
+    result = working_tree_inventory(root, documentation=True, configs=True)
+    assert relative not in result['files']
+    assert relative in result['excluded_private_paths']

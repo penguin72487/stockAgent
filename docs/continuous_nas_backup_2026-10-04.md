@@ -2,12 +2,16 @@
 
 本次把兩個試驗批次延伸成持續備份流程：penguin 封閉固定輸入，Syncthing
 送至 lab203，沿用 lab203 既有 worker 寫入 NAS，固定 snapshot 實際還原通過後，
-回傳不含私密設定的收據，再發下一批。NAS 是離機備份；同一 D 槽的 transport
+回傳不含私密設定的收據；來源可持續封裝其他批次，不等待上一批收據。NAS 是離機備份；同一 D 槽的 transport
 只是傳送暫存。來源與接收端回傳協定已接通，取得真實 NAS 固定還原收據。
 本輪完整盤點與歷史處置見[全量備份分析](lab203_complete_backup_rollout_2026-10-04.md)。
 使用者最新要求全自動、不再逐批人工轉貼。一般檔案流程已自動運作；新增
 還原驗收任務與一次性 v7 post-hook 安裝見
 [自動流程](lab203_automatic_backup_2026-10-04.md)。
+使用者後續要求整鏈並行，來源已調整為四批／32 GiB 同時在途及四工封裝；
+NAS 固定 v10 已取得配對 `pipeline-status.json` 部署證據，現場量測選定四批／
+兩工備份／兩工還原／四工驗證；詳見[並行管線](lab203_parallel_backup_2026-10-04.md)。
+服務啟用與逐批檔案還原均有各自的收據，全歷史覆蓋持續自動補傳。
 
 ## 目前證據
 
@@ -22,7 +26,8 @@
 | 有界 transport 現場驗收 | 第一波 98 檔、1,055,120 bytes 回收；來源完整 SHA／NAS 收據／覆蓋保留，lab203 completion 100%、needDeletes 0 |
 | 來源加密 code／SQL 還原 | 一次固定本機 Restic snapshot，2339 個程式 ZIP 成員逐檔吻合；50 張表、60 筆資料全部欄位／列指紋吻合；完整流程 5.793 秒 |
 | 相關回歸 | 134 項通過、0 skipped（`all-backup-focused-tests-accepted-final-v2-20261004.xml`）；含真實 Restic 命令、歷史處置、回收與中斷接手、物理／bind 別名引用、單一 owner 交接、容量／配對保護、跨批重建及 runtime identity |
-| NAS code／SQL、NAS canonical 重建 | 尚待 lab203 從新固定 NAS snapshot 驗證；本機結果不代替 NAS 結果 |
+| NAS code／SQL、NAS canonical 重建 | v7 三項固定驗收已取得機器收據；後續新 release／logical identity 仍各自驗收，不能推定全歷史 |
+| NAS 並行 driver | v10 固定 manifest 已由 penguin 驗證；四批／backup 2／restore 2／verify 4，同一 timer 完成後 15 秒接續 |
 | USB 金鑰保管 | 2026-10-04 使用者明確確認受控 USB 已保管完成；不再詢問。舊檔案 ACK 不驗證此項，仍保留其原欄位 |
 
 數量是本次盤點，不代表來源即時性、所有未發布資料或整台電腦已備份。14 個
@@ -41,7 +46,7 @@ catalog `publish:false` 的資料集不會被備份程式改名繞過發佈限�
 | 項目 | 現行值 |
 | --- | --- |
 | Producer | penguin，既有資料／網站來源權威 |
-| source service／timer | `stockagent-backup-stream.service`／`stockagent-backup-stream.timer`，每五分鐘 |
+| source service／timer | `stockagent-backup-stream.service`／`stockagent-backup-stream.timer`，同一 owner 完成後 30 秒接續 |
 | source owner／ledger | `/var/lib/stockagent/backup-stream/owner.lock`／`ledger.json` |
 | source runtime | 既有驗收 Miniforge／Mamba backup role；`/etc/stockagent/backup-stream.env` 選擇，執行前核對 runtime lock |
 | canonical cold | `/srv/stockagent-packed`，不修改其 heads、原物件、publisher 身分或發佈排程 |
@@ -50,13 +55,14 @@ catalog `publish:false` 的資料集不會被備份程式改名繞過發佈限�
 | sender Folder ID | `stockagent-backup-ingress-lab203`，penguin Send Only／lab203 Receive Only |
 | 回傳 Folder ID | `stockagent-backup-receipts-lab203`，penguin Receive Only／lab203 Send Only |
 | source 回傳接收路徑 | `/srv/stockagent-backup-receipts-lab203` |
-| 預設上限 | 每批 8 GiB／512 個資料成員，最多 1 個未驗收批次；pending／staging 16 GiB，transport 保留上限 1 TiB；單輪 timeout 8 小時 |
+| 預設上限 | 每批 8 GiB／512 個資料成員，最多 4 個未驗收批次；pending 32 GiB／staging 16 GiB，transport 保留上限 1 TiB；單輪 timeout 8 小時 |
+| 來源 worker | copy 4／verify 4；每輪至多 4 wave，掃描上一批同時封裝下一批；失敗 30／120／600 秒退避 |
 | 最低餘量 | 來源、lab203 ingress、NAS 至少保留 64 GiB；接收端現場可提高保留量或降低單批上限 |
 
 來源優先備份程式及 same-MVCC PostgreSQL dump，再送 current heads 與物件，
 接著送尚未覆蓋的保留歷史；相同 immutable SHA 跨版本只送一次。程式快照
 每小時檢查或在控制庫的新 dump 出現時檢查。控制庫 dump 仍由既有排程持有，
-五分鐘 transport 排程不代表資料庫五分鐘 RPO。
+transport 排程與 worker 數不代表資料庫 dump 的 RPO。
 本次盤點最大可用物件 5,707,388,416 bytes；沒有現有物件超出 8 GiB 單批預算。
 未來出現更大物件會明確等待容量調整，不切掉物件或跳過後稱完整。
 
@@ -103,7 +109,7 @@ source config 是來源部署的紀錄，
 `/opt/lab203-backup/`。執行程式不要直接追蹤 Syncthing 中移動的版本。
 v1 已傳送且保留；v2 的 paired profile 補齊 readiness 900 秒有效期，避免接收端
 直接沿用該 profile 時缺少 age 欄位。v2 已用於接通回傳，不改寫已封閉 package。
-本輪來源 queue／回收調整不需要替換既有 lab203 worker。
+先前 queue／回收調整沿用既有 lab203 worker；最新 NAS 階段並行已完成固定 v10 本機升級。
 
 ### 保留現場部署並接上共同協定
 
@@ -111,8 +117,11 @@ v1 已傳送且保留；v2 的 paired profile 補齊 readiness 900 秒有效期�
 `/opt/lab203-backup/code/worker.py`、`/etc/lab203-backup/config.json`、
 `/opt/lab203-backup/env`、`/srv/lab203-backup/state/owner.lock`、
 `/opt/lab203-backup/receipts/runtime-lock.json` 與 `lab203-nas.service`。
-私有 config 保持 600，原五分鐘 timer 不替換、不建立第二個 backup owner。
-既有 retries／失敗保留／後续有效批次繼續處理維持。延長正式單次 timeout 以容納
+私有 config 保持 600，不建立第二個 backup owner。v10 使用同一 timer 的 drop-in，
+完成後 15 秒接續，保留舊 worker／設定、既有重試 journal 與 v7 post-hook。
+新 driver 位於 `/opt/lab203-backup/backup-pipeline-code-v10`，使用
+`/etc/lab203-backup/backup-pipeline-v10.json`／`.env`。
+既有 retries／失敗保留／後續有效批次繼續處理維持。延長正式單次 timeout 以容納
 8 GiB restore 及週期全庫 read-data，不能沿用只有 63 MB 試驗的短 timeout。
 
 回傳 folder 配對僅限下列兩個身分，不開自動接受、不恢復舊分享或訓練／網站：
@@ -267,12 +276,13 @@ objects，重驗 pack/blob、CRC，再 fetch／完整 source fingerprint，不�
 來源另列 `usb_key_custody_user_confirmed=true`。金鑰內容、金鑰雜湊及私人保管
 路徑仍不進 Git／Syncthing／聊天。Windows 登出驗收依使用者指示維持取消。
 
-### 接續完成的回報
+### 接續驗收的自動回傳
 
-請回傳 adapter 前後 worker SHA、reverse folder 精確設定、第一個新 managed batch
-兩種 envelope hash、完整檔數／bytes、NAS repo／固定 snapshot、ACK hash，及
-penguin 確認 readiness／ACK 並自動送下一批的結果。原始私有流程收據留在
-`/var/log/lab203-backup/workflows`，程式／SQL／canonical／USB 驗證分別回報。
+日常 managed batch 的兩種 envelope hash、完整檔數／bytes、NAS repository／
+固定 snapshot、ACK 身分與語義驗收，由固定 runner 經反向 Syncthing folder
+自動回傳；penguin 驗 readiness／ACK 後接續下一批，不要求使用者轉貼。
+原始私有流程收據留在 `/var/log/lab203-backup/workflows`，檔案、SQL 與 canonical
+重建維持分開的 machine evidence；USB 保管依既有使用者確認。
 不以新批次成功宣稱全歷史完整；114 個已缺物件依本輪指示放棄恢復，
 未發佈資料維持不同的覆蓋範圍。
 

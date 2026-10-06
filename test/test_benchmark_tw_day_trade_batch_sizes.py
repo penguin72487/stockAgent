@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +43,62 @@ def _memory(*, peak: float = 0.5, headroom: float = 16.0) -> dict:
         "max_peak_fraction": peak,
         "min_headroom_gib": headroom,
     }
+
+
+def test_frozen_project_root_owns_config_resolution(tmp_path, monkeypatch) -> None:
+    @dataclass
+    class Config:
+        source: Path
+
+    config_path = tmp_path / "experiment.yaml"
+    seen = []
+    module = SimpleNamespace(
+        __file__=str(tmp_path / "stockagent/config.py"),
+        load_config=lambda path: seen.append(path) or Config(source=path),
+    )
+    monkeypatch.setattr(benchmark.sys, "path", benchmark.sys.path.copy())
+    monkeypatch.setattr(benchmark.importlib, "import_module", lambda name: module)
+    assert benchmark._resolved_source_config(config_path, tmp_path) == {"source": str(config_path)}
+    assert benchmark.sys.path[0] == str(tmp_path)
+    assert seen == [config_path]
+
+
+def test_frozen_project_root_rejects_an_already_loaded_foreign_library(tmp_path, monkeypatch) -> None:
+    module = SimpleNamespace(
+        __file__=str(tmp_path / "other/stockagent/config.py"),
+        load_config=lambda _: pytest.fail("must reject before reading the config"),
+    )
+    monkeypatch.setattr(benchmark.sys, "path", benchmark.sys.path.copy())
+    monkeypatch.setattr(benchmark.importlib, "import_module", lambda name: module)
+    with pytest.raises(ValueError, match="config library does not match --project-root"):
+        benchmark._resolved_source_config(tmp_path / "experiment.yaml", tmp_path)
+
+
+def test_ddp_score_accepts_canonical_trajectory_max_rank_names() -> None:
+    row = _epoch(3, wall=1.0, train=0.5)
+    row.update(epoch_max_rank_s=4.0, train_max_rank_s=3.0)
+    score = benchmark._score_curve(
+        [row], skip_epochs=2, minimum_steady_epochs=1, train_rows=90,
+        global_batch_size=32, memory=_memory(), max_peak_fraction=0.98,
+        min_headroom_gib=0.5, world_size=2,
+    )
+    assert score["ok"]
+    assert score["timing_scope"] == "maximum_rank"
+    assert score["median_epoch_wall_s"] == 4.0
+    assert score["epoch_wall_field"] == "epoch_max_rank_s"
+
+
+def test_ddp_score_rejects_rank_local_time_and_missing_graph_telemetry() -> None:
+    row = _epoch(3, wall=4.0, train=3.0)
+    row.pop("dynamo_unique_graphs_epoch_delta")
+    score = benchmark._score_curve(
+        [row], skip_epochs=2, minimum_steady_epochs=1, train_rows=90,
+        global_batch_size=32, memory=_memory(), max_peak_fraction=0.98,
+        min_headroom_gib=0.5, world_size=2,
+    )
+    assert not score["ok"]
+    assert any("maximum-rank" in reason for reason in score["reasons"])
+    assert any("graph telemetry" in reason for reason in score["reasons"])
 
 
 def test_parse_batch_sizes_requires_power_of_two_globally_and_per_rank() -> None:

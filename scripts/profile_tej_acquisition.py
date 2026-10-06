@@ -21,13 +21,44 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import SOURCE_SCOPE_CONTRACT
 
-PROFILE_CONTRACT = 'tej_bounded_acquisition_timing_profile_v2_scope_stages'
+PROFILE_CONTRACT = 'tej_bounded_acquisition_timing_profile_v3_full_windows_flow'
 SCOPE_TIMING_PHASES = frozenset({
     'context_and_source_binding', 'field_selection',
     'company_universe_and_lookup', 'date_model_and_lookup',
     'company_selection_and_verification', 'date_selection_and_verification',
     'final_source_and_preview_guards',
 })
+FLOW_TIMING_PHASES = frozenset({
+    'initialization_compile_seconds', 'scope_preparation_seconds',
+    'query_and_response_seconds', 'full_readback_seconds', 'serialize_and_save_seconds',
+})
+
+
+def _flow_metadata(path: Path, task_id: str, attempt: str) -> dict:
+    """Optional monotonic telemetry is never an authorization or raw data input."""
+    if not path.is_file() or path.stat().st_size > 64*1024:
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding='utf-8-sig'))
+        if (not isinstance(value, dict)
+                or value.get('contract') != 'tej_monotonic_windows_full_flow_v1'
+                or value.get('task_id') != task_id
+                or value.get('query_attempt_id') != attempt
+                or value.get('action') != 'download'):
+            return {}
+        phases = value.get('phases')
+        if not isinstance(phases, dict):
+            return {}
+        finite = lambda seconds: (type(seconds) in (int, float)
+                                  and math.isfinite(seconds) and 0 <= seconds <= 86400)
+        result = {'phases': {key: seconds for key, seconds in phases.items()
+                             if key in FLOW_TIMING_PHASES and finite(seconds)}}
+        for key in ('windows_bridge_seconds', 'windows_cpu_seconds'):
+            if finite(value.get(key)):
+                result[key] = value[key]
+        return result
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 def profile(root: Path, output: Path, *, limit: int = 60) -> dict:
@@ -79,6 +110,10 @@ def profile(root: Path, output: Path, *, limit: int = 60) -> dict:
                         if name in SCOPE_TIMING_PHASES and type(seconds) in (int, float)
                         and math.isfinite(seconds) and 0 <= seconds <= 900
                     }
+        if attempt:
+            flow = _flow_metadata(root/'raw'/(attempt+'.json.flow.json'), row['task_id'], attempt)
+            if flow:
+                sample['windows_flow'] = flow
         samples.append(sample)
 
     def summary(selected):

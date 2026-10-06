@@ -43,6 +43,8 @@ PREQUERY_FAILURES = {
     'local_date_input_failed_before_preview':'date_input_prequery_needs_review',
     'local_list_selection_failed_before_preview':'list_selection_prequery_needs_review',
     'local_query_activation_failed_before_preview':'query_activation_prequery_needs_review',
+    'local_source_binding_failed_before_preview':'source_binding_prequery_needs_review',
+    'local_query_preparation_failed_before_preview':'query_preparation_prequery_needs_review',
 }
 # Reviewed bridge used by the one legacy DateText foreground failure. This
 # compatibility proof accepts neither arbitrary error text nor current code
@@ -51,6 +53,7 @@ LEGACY_DATE_INPUT_BRIDGE_SHA256 = "64843cabb273595ffff5b6259ed974a0bf7e9d0c8f256
 LEGACY_FIELD_SELECTION_BRIDGE_SHA256 = "40e487a0545bad69499386d4b16f77552a2ab8d91abfcb915960f66003252e2a"
 LEGACY_DATE_GRID_BRIDGE_SHA256 = "7eb744b077eaca844904e3d55850c7c1a9849bf76ba011cc4be86b81de65c797"
 LEGACY_DATE_LAYOUT_BRIDGE_SHA256 = "f16f9bc5be060da3965e5b671ae76e1a4d53cb097a65dc9ef63d59d213ec86fc"
+LEGACY_CATALOG_BINDING_BRIDGE_SHA256 = "05f981e3116de763ae947f579287b03079a46aca46f0c53f5a0c7b8aa675f72f"
 
 
 class BeforeDataQueryError(RuntimeError):
@@ -131,6 +134,7 @@ def connect(root: Path) -> sqlite3.Connection:
       CREATE TABLE IF NOT EXISTS desktop_replays (
         authorization_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,original_attempted_at_utc TEXT,
         audit_path TEXT NOT NULL,audit_sha256 TEXT NOT NULL,consumed_at_utc TEXT,outcome TEXT);
+      CREATE INDEX IF NOT EXISTS desktop_replays_clock ON desktop_replays(consumed_at_utc,task_id);
       CREATE TABLE IF NOT EXISTS desktop_retry_windows (
         table_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,attempt_id TEXT NOT NULL,
         consecutive_failures INTEGER NOT NULL,next_attempt_at_utc TEXT NOT NULL,
@@ -928,6 +932,49 @@ class DesktopBridge:
     def windows_path(path: Path) -> str:
         return subprocess.check_output(["wslpath", "-w", str(path.resolve())], text=True).strip()
 
+    def script_release(self, root: Path, name: str, request: Path) -> tuple[Path,str]:
+        """Pin one immutable code object, not two reads of a changing checkout.
+
+        Preserve each version and bind its hash to this exact prepared request.
+        Updating the checkout cannot change an admitted attempt's script.
+        """
+        manifest_path=root/'launches'/(name+'.bridge.json')
+        request_digest=hashlib.sha256(request.read_bytes()).hexdigest()
+        if manifest_path.exists():
+            if manifest_path.is_symlink() or manifest_path.stat().st_size>4096:
+                raise ValueError('Invalid immutable bridge attempt manifest')
+            old=json.loads(manifest_path.read_text())
+            digest=old.get('bridge_script_sha256','')
+            release=root/'bridge_releases'/(digest+'.ps1')
+            if (old.get('contract')!='immutable_bridge_release_bound_to_prepared_request_v1'
+                    or old.get('attempt_id')!=name or old.get('request_sha256')!=request_digest
+                    or old.get('request_path')!=str(request.relative_to(root))
+                    or not re.fullmatch(r'[0-9a-f]{64}',digest)
+                    or old.get('bridge_release_path')!=str(release.relative_to(root))
+                    or release.is_symlink() or not release.is_file() or release.stat().st_size>256*1024
+                    or hashlib.sha256(release.read_bytes()).hexdigest()!=digest):
+                raise ValueError('Existing immutable bridge release differs; never overwrite')
+            return release,digest
+        source=self.repo/'scripts/tej_smart_wizard_bridge.ps1'
+        with source.open('rb') as stream:
+            code=stream.read(256*1024+1)
+        if not code or len(code)>256*1024:
+            raise ValueError('Bounded canonical bridge script required')
+        digest=hashlib.sha256(code).hexdigest()
+        release=root/'bridge_releases'/(digest+'.ps1')
+        if release.exists():
+            if release.is_symlink() or release.stat().st_size!=len(code) or release.read_bytes()!=code:
+                raise ValueError('Existing immutable bridge release differs; never overwrite')
+        else:
+            atomic_write_bytes(release,code)
+        atomic_write_json(manifest_path,{
+            'contract':'immutable_bridge_release_bound_to_prepared_request_v1',
+            'observed_at_utc':datetime.now(UTC).isoformat(),'attempt_id':name,
+            'request_path':str(request.relative_to(root)),
+            'request_sha256':request_digest,
+            'bridge_release_path':str(release.relative_to(root)),'bridge_script_sha256':digest},durable=True)
+        return release,digest
+
     def execute(self, root: Path, task: dict) -> tuple[dict, Path, float]:
         name = task["task_id"] + "-" + uuid.uuid4().hex
         request = root / "requests" / (name + ".json")
@@ -939,7 +986,8 @@ class DesktopBridge:
             wire_request = {**wire_request, 'query_attempt_id':name}
         atomic_write_json(request, {**wire_request, "contract_version": CONTRACT_VERSION,
                                     "task_id": task["task_id"], "desktop_input_contract": DESKTOP_INPUT_CONTRACT})
-        source = self.quote(self.windows_path(self.repo / "scripts/tej_smart_wizard_bridge.ps1"))
+        release,script_digest=self.script_release(root,name,request)
+        source = self.quote(self.windows_path(release))
         args = " ".join(f"-{key} {self.quote(str(value))}" for key, value in self.session.items()
                         if key in {"TejProcessId", "ExpectedWindow", "ExpectedTitle", "ExpectedWorkbook", "ExpectedExcelWindow"})
         if set(self.session) != {"TejProcessId", "ExpectedWindow", "ExpectedTitle", "ExpectedWorkbook", "ExpectedExcelWindow"}:
@@ -965,22 +1013,63 @@ class DesktopBridge:
                 atomic_write_json(worker_path, {**worker, 'bridge_attempt_id': name}, durable=False)
             except OSError:
                 pass
-        command = ("$ErrorActionPreference='Stop';$s=" + source + ";"
+        preentry_proof=json.dumps({'contract_version':CONTRACT_VERSION,'provider':'tej_smart_wizard',
+            'task_id':task['task_id'],'query_attempt_id':name,**{k:wire_request.get(k) for k in ('type','smart_id','table')},
+            'action':wire_request.get('action'),'market_data_query_submission_possible':False,
+            'error_code':'local_query_preparation_failed_before_preview','bridge_invoked':False,
+            'preparation_stage':'staging_bridge_script','bridge_script_sha256':script_digest},ensure_ascii=False)
+        command = ("$ErrorActionPreference='Stop';$bridgeEntered=$false;try{$s=" + source + ";"
                    "$d=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('StockAgent\\TEJSmartWizard\\worker-'+[Guid]::NewGuid().ToString('N'));"
                    "[void](New-Item -ItemType Directory -Path $d);$p=Join-Path $d 'bridge.ps1';Copy-Item -LiteralPath $s -Destination $p;"
-                   "if((Get-FileHash -LiteralPath $s).Hash -cne (Get-FileHash -LiteralPath $p).Hash){throw 'Script copy mismatch'};"
-                   f"try{{& $p {args} -Request {self.quote(self.windows_path(request))} -Output {self.quote(self.windows_path(output))}}}"
-                   "catch{[Console]::Error.WriteLine($_.Exception.Message);[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1}")
+                   "if((Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant() -cne "+self.quote(script_digest)+"){throw 'Script copy mismatch'};"
+                   "$tokens=$null;$parseErrors=$null;[void][Management.Automation.Language.Parser]::ParseFile($p,[ref]$tokens,[ref]$parseErrors);"
+                   "if($parseErrors.Count -ne 0){throw 'Pinned bridge syntax invalid; no invocation'};"
+                   f"$bridgeEntered=$true;& $p {args} -Request {self.quote(self.windows_path(request))} -Output {self.quote(self.windows_path(output))}}}"
+                   "catch{if(-not $bridgeEntered){$proof="+self.quote(preentry_proof)+"|ConvertFrom-Json;"
+                   "$proof|Add-Member -NotePropertyName observed_at_utc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'));"
+                   "[IO.File]::WriteAllText("+self.quote(self.windows_path(output.with_suffix('.json.outcome.json')))+
+                   ",($proof|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))};"
+                   "[Console]::Error.WriteLine($_.Exception.Message);[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1}")
         started = time.monotonic()
         try:
             from downloader.tej_windows_transport import UnpermittedWindowsLaunch, run_guarded_windows
+            launch_options = {}
+            # An enabled boot policy requires the actual logged-in desktop
+            # relay. The systemd boot relay can be Session 0 even while Excel
+            # exists in Session 1. Never invoke a GUI query through that relay.
+            with closing(connect(root)) as startup_con:
+                stored = startup_con.execute("SELECT value FROM meta WHERE key='runtime_policy'").fetchone()
+                startup_config = (json.loads(stored[0]).get('desktop_startup') or {}) if stored else {}
+            if startup_config.get('enabled') is True:
+                from downloader.tej_startup import interactive_transport
+                try:
+                    relay = interactive_transport(root)
+                    launch_options = {'windows_session_id': relay['windows_session_id'], 'interop_socket': relay['interop_socket']}
+                except (OSError, ValueError, KeyError, TypeError):
+                    # We have not called Popen, so this exact local result is
+                    # safely classifiable before Preview, not unknown.
+                    if is_preview:
+                        from downloader.tej_desktop_attempts import finish_attempt
+                        atomic_write_json(output.with_suffix('.json.outcome.json'), {
+                            'contract_version': CONTRACT_VERSION, 'provider':'tej_smart_wizard', 'action':'download',
+                            'task_id':task['task_id'], 'query_attempt_id':name,
+                            'observed_at_utc':datetime.now(UTC).isoformat(),
+                            **{k:wire_request[k] for k in ('type','smart_id','table')},
+                            'market_data_query_submission_possible':False,
+                            'error_code':'desktop_context_unavailable_before_preview',
+                            'preparation_stage':'verified_interactive_relay_unavailable', 'bridge_invoked':False})
+                        finish_attempt(root,name,'proven_not_submitted')
+                    raise BeforeDataQueryError('desktop_context_unavailable_before_preview') from None
             result = run_guarded_windows(command, request=request, windows_path=self.windows_path,
+                                **launch_options,
                                 # A complete bounded MSAA grid is read across
                                 # processes cell by cell. The former four-minute
                                 # deadline killed valid large readbacks after
                                 # the single Preview was already submitted.
                                 # Still finite; a timeout never resends it.
-                                timeout=900)
+                                timeout=30 if wire_request.get('action') in {
+                                    'inspect_notices','inspect_source_binding','inspect_query_runtime',
+                                    'confirm_metadata_error_cleared'} else 900)
         except UnpermittedWindowsLaunch as exc:
             from downloader.tej_windows_transport import validate_unpermitted
             validate_unpermitted(root, request, exc.evidence)
@@ -1020,7 +1109,9 @@ class DesktopBridge:
                 try:
                     outcome = json.loads(outcome_path.read_text(encoding="utf-8-sig"))
                     expected = wire_request
+                    negative_artifact=(not output.exists() and not output.with_suffix('.json.stage.json').exists())
                     if (expected.get('action')=='download' and outcome.get('action')=='download'
+                            and negative_artifact
                             and outcome.get('provider')=='tej_smart_wizard' and outcome.get('contract_version')==CONTRACT_VERSION
                             and outcome.get('task_id')==task['task_id']
                             and outcome.get('market_data_query_submission_possible') is False
@@ -1030,10 +1121,13 @@ class DesktopBridge:
                         finish_attempt(root,name,'proven_not_submitted')
                         raise SourceKeyLayoutError('source_key_layout_replan_required',outcome['source_key_mode'])
                     if (expected.get("action") == "download" and outcome.get("action") == "download"
+                            and negative_artifact
                             and outcome.get("provider") == "tej_smart_wizard" and outcome.get("contract_version") == CONTRACT_VERSION
                             and outcome.get("task_id") == task["task_id"]
                             and outcome.get("market_data_query_submission_possible") is False
                             and outcome.get("error_code") in PREQUERY_FAILURES
+                            and (outcome.get('error_code') not in {'local_source_binding_failed_before_preview',
+                                 'local_query_preparation_failed_before_preview'} or outcome.get('query_attempt_id')==name)
                             and all(outcome.get(k) == expected.get(k) for k in ("type", "smart_id", "table"))):
                         finish_attempt(root,name,'proven_not_submitted')
                         raise BeforeDataQueryError(outcome['error_code'])
@@ -1347,7 +1441,11 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
 
 def recover_desktop_response(root: Path, task_id: str, bridge: Any, *, response: str,
                              error_window: int | None = None) -> dict:
-    """Explicit operator-only adoption; never sends another Preview query."""
+    """Adopt one exactly retained response; never send another Preview query.
+
+    Automatic supervision may use preview/empty only, with its original-stage
+    guard. Other acknowledgements remain explicit operator actions.
+    """
     actions = {"preview": "recover_preview", "empty": "resolve_empty", "excel_error": "ack_excel_error",
                "plan": "recover_plan", "plan-empty-fields": "resume_plan_empty_fields", "plan-preparation": "plan"}
     if response not in actions:
@@ -1551,6 +1649,8 @@ def recover_legacy_local_input(root: Path, task_id: str, bridge: Any, prepared_r
     if diagnostic.stat().st_size > 32768:
         raise ValueError('Unreviewed diagnostic bound')
     lines = diagnostic.read_text(encoding='utf-8-sig').splitlines()
+    if lines and lines[0]=='Catalog binding did not become available; selection not sent':
+        return _recover_legacy_catalog_binding(root,task,req,bridge,original,diagnostic,lines)
     date_error='Exception calling "DateText" with "4" argument(s): "Foreground unavailable; no input sent"'
     field_error='Selected fields differ; no query'
     grid_error='Date disappeared from grid'
@@ -1599,6 +1699,76 @@ def recover_legacy_local_input(root: Path, task_id: str, bridge: Any, prepared_r
     atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,'state':state,
                                                'observed_at_utc':audit['observed_at_utc'],'task_id':task_id})
     return {'state':state,'market_data_query_repeated':False,'source_rows_adopted':False}
+
+
+def _recover_legacy_catalog_binding(root: Path, task: dict, req: dict, bridge: Any,
+                                    prepared: Path, diagnostic: Path, lines: list[str]) -> dict:
+    """Resolve only the reviewed v5 catalog exception BEFORE any Preview.
+
+    Current menus may be empty; an exact responsive, notice-free owner is
+    enough to classify the old unsent action. The next normal attempt must
+    rebuild and fully verify the source, never use those incomplete menus.
+    No old stage is invented and no diagnostic timestamp is backdated.
+    """
+    stack = r'(C:\\Users\\[^\\\r\n]+\\AppData\\Local\\StockAgent\\TEJSmartWizard\\worker-[0-9a-f]{32}\\bridge\.ps1): line ([0-9]+)'
+    helper = re.fullmatch('at Select-Combo, '+stack,lines[1]) if len(lines)==4 else None
+    caller = re.fullmatch('at <ScriptBlock>, '+stack,lines[2]) if len(lines)==4 else None
+    if (helper is None or caller is None or helper[1]!=caller[1]
+            or lines[3]!='at <ScriptBlock>, <No file>: line 1' or not task.get('active_attempt_id')):
+        raise ValueError('Exact reviewed catalog call stack required; unknown retained')
+    source=Path(subprocess.check_output(['wslpath','-u',helper[1]],text=True).strip())
+    if source.stat().st_size>256*1024:
+        raise ValueError('Bounded original catalog bridge required')
+    code=source.read_bytes();source_lines=code.decode('utf-8-sig').splitlines()
+    h,c=int(helper[2])-1,int(caller[2])-1
+    if (hashlib.sha256(code).hexdigest()!=LEGACY_CATALOG_BINDING_BRIDGE_SHA256
+            or not 0 <= h < c < len(source_lines)
+            or source_lines[h].strip()!="if($i -lt 0){throw 'Catalog binding did not become available; selection not sent'}"
+            or source_lines[c].strip()!='} else {Select-Combo $h $pair[1]}'
+            or code.count(b'[TejBridgeNative]::BeginPreviewDefaultAction($ExpectedWindow,$previewButton)')!=1):
+        raise ValueError('Original catalog code/callsite differs; no replay')
+    with closing(connect(root)) as con:
+        original=dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(task['task_id'],)).fetchone())
+        attempt=con.execute('SELECT * FROM desktop_attempts WHERE attempt_id=?',(task['active_attempt_id'],)).fetchone()
+        if (original!=task or attempt is None or attempt['state']!='unknown_outcome'
+                or attempt['request_path']!=str(prepared.relative_to(root))
+                or attempt['finished_at_utc'] is None
+                or con.execute("SELECT 1 FROM tasks WHERE state='running' OR "
+                    "(state='blocked' AND last_error_code='unknown_outcome_no_auto_retry' AND task_id!=?) LIMIT 1",
+                    (task['task_id'],)).fetchone()):
+            raise ValueError('Exact quiescent finished catalog attempt required')
+    check={**req,'action':'inspect_notices'}
+    payload,readback,_=bridge.execute(root,{**task,'request_json':json.dumps(check)})
+    if (payload.get('contract_version')!=CONTRACT_VERSION or payload.get('task_id')!=task['task_id']
+            or payload.get('action')!='inspect_notices' or payload.get('notices')!=[]
+            or any(payload.get(k) is not True for k in ('root_enabled','root_visible','normal_message_completed'))
+            or any(payload.get(k) is not False for k in ('hung_window','credentials_read','data_query_repeated'))
+            or readback.resolve().parent!=(root/'raw').resolve()
+            or readback.stat().st_size>2*1024**2
+            or json.loads(readback.read_text(encoding='utf-8-sig'))!=payload):
+        raise ValueError('Original shared owner is not verified responsive and notice-free')
+    audit={'contract':'reviewed_original_catalog_prepreview_failure_recovery_v1',
+           'observed_at_utc':datetime.now(UTC).isoformat(),'task_id':task['task_id'],
+           'query_attempt_id':task['active_attempt_id'],'data_query_repeated':False,
+           'original_attempt_proven_not_submitted':True,'source_rows_adopted':False,
+           'original_request_sha256':hashlib.sha256(prepared.read_bytes()).hexdigest(),
+           'original_diagnostic_sha256':hashlib.sha256(diagnostic.read_bytes()).hexdigest(),
+           'original_bridge_sha256':hashlib.sha256(code).hexdigest(),
+           'interface_readback_sha256':hashlib.sha256(readback.read_bytes()).hexdigest()}
+    atomic_write_json(root/'diagnostics'/(task['task_id']+'-catalog-recovery-'+uuid.uuid4().hex+'.json'),audit)
+    with closing(connect(root)) as con,con:
+        current=con.execute('SELECT * FROM tasks WHERE task_id=?',(task['task_id'],)).fetchone()
+        if dict(current)!=task:
+            raise ValueError('Catalog task changed during owner verification')
+        state=_mark_prequery_failure(con,task,'local_source_binding_failed_before_preview')
+        con.execute("UPDATE traffic SET state='failed_before_preview' WHERE action='download' "
+                    "AND started_at_utc=? AND state='failed'",(task['attempted_at_utc'],))
+    from downloader.tej_desktop_attempts import finish_attempt
+    finish_attempt(root,task['active_attempt_id'],'proven_not_submitted')
+    atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,'state':state,
+        'task_id':task['task_id'],'observed_at_utc':audit['observed_at_utc']})
+    return {'state':state,'market_data_query_repeated':False,'source_rows_adopted':False,
+            'original_attempt_proven_not_submitted':True}
 
 
 # Backward-compatible operator/test entrypoint; both use the same exact proof.
@@ -1663,11 +1833,14 @@ def recover_verified_input(root: Path, task_id: str, bridge: Any, prepared_reque
 def configure_runtime_policy(root: Path, config: dict) -> dict:
     """Version execution policy separately from immutable source requests."""
     from downloader.tej_scheduler import remaining_query_interval
+    from downloader.tej_desktop_attempts import authorized_replay_policy
+    from downloader.tej_startup import startup_policy
     remaining_query_interval(config,0.0)  # Reject an invalid limiter before any source action.
     policy = {'contract':BATCH_SCHEDULER_CONTRACT,
               'preview_submission_contract':PREVIEW_SUBMISSION_CONTRACT,
               'desktop_input_contract':DESKTOP_INPUT_CONTRACT,
               'download_burst':config.get('download_burst_between_discoveries',4),
+              'download_table_locality_burst':config.get('download_table_locality_burst',1),
               'auto_key3_replanning':config.get('auto_key3_replanning',False),
               'auto_snapshot_replanning':config.get('auto_snapshot_replanning',False),
               'auto_month_period_replanning':config.get('auto_month_period_replanning',False),
@@ -1678,9 +1851,13 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'prequery_retry_base_seconds':config.get('prequery_retry_base_seconds',60),
               'prequery_retry_max_seconds':config.get('prequery_retry_max_seconds',900),
               'metadata_failure_isolation':config.get('metadata_failure_isolation',False),
+              'authorized_unknown_replay':authorized_replay_policy(config),
+              'desktop_startup':startup_policy(config),
               'acknowledge_known_metadata_runtime_notices':config.get('acknowledge_known_metadata_runtime_notices',False)}
     if (isinstance(policy['download_burst'],bool) or not isinstance(policy['download_burst'],int)
             or not 1 <= policy['download_burst'] <= 20
+            or type(policy['download_table_locality_burst']) is not int
+            or not 1 <= policy['download_table_locality_burst'] <= 8
             or any(not isinstance(policy[k],bool) for k in
                    ('metadata_failure_isolation','acknowledge_known_metadata_runtime_notices','auto_key3_replanning','auto_snapshot_replanning','auto_month_period_replanning','auto_preview_capacity_replanning','source_validation_isolation','prequery_failure_isolation'))):
         raise ValueError('Unreviewed desktop runtime policy')
@@ -1696,7 +1873,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
 
 
 def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dict, table_id: str | None=None) -> sqlite3.Row | None:
-    """Interleave within the best priority band; rotate equal-value tables.
+    """Interleave the best priority band; bounded equal-value table locality.
 
     Legacy priorities encode phases; installed value priorities encode local
     gap and research relevance. No lower-value download may defer a higher-
@@ -1715,7 +1892,7 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
     if kind is not None:
         return candidate(kind)
     discovery,download = candidate('discover'),candidate('download')
-    values = dict(con.execute("SELECT key,value FROM meta WHERE key IN ('scheduler_consecutive_downloads','scheduler_last_download_table')"))
+    values = dict(con.execute("SELECT key,value FROM meta WHERE key IN ('scheduler_consecutive_downloads','scheduler_last_download_table','scheduler_table_consecutive_downloads')"))
     burst = int(values.get('scheduler_consecutive_downloads','0'))
     choose_discovery = discovery is not None and (download is None or
         int(discovery['priority'])//100 < int(download['priority'])//100 or
@@ -1726,6 +1903,15 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
         return None
     last_table = values.get('scheduler_last_download_table')
     if last_table and table_id is None:
+        # An exact priority tie may retain the current source for a FINITE
+        # burst. A better priority, due discovery, isolation or cooldown wins
+        # first; never use UI state as evidence or drain a whole table unfairly.
+        locality = policy.get('download_table_locality_burst',1)
+        streak = int(values.get('scheduler_table_consecutive_downloads','1'))
+        if locality > 1 and streak < locality:
+            local = con.execute("SELECT * FROM tasks WHERE state='pending' AND kind='download' AND priority=? AND table_id=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY task_id LIMIT 1",(download['priority'],last_table,now,now)).fetchone()
+            if local is not None:
+                return local
         rotated = con.execute("SELECT * FROM tasks WHERE state='pending' AND kind='download' AND priority=? AND table_id>? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY table_id,task_id LIMIT 1",(download['priority'],last_table,now,now)).fetchone()
         if rotated is not None:
             return rotated
@@ -1771,7 +1957,8 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
             return "local_disk_headroom_low"
         replay = None
         if retry_authorization_id is not None:
-            from downloader.tej_desktop_attempts import OPERATOR_REPLAY_CONTRACT
+            from downloader.tej_desktop_attempts import (OPERATOR_REPLAY_CONTRACT, AUTHORIZED_REPLAY_CONTRACT,
+                authorized_replay_policy, authorized_replay_window)
             if kind is not None or table_id is not None or not re.fullmatch(r'[0-9a-f]{32}',retry_authorization_id):
                 raise ValueError('One exact operator replay authorization required')
             replay = con.execute('SELECT * FROM desktop_replays WHERE authorization_id=?', (retry_authorization_id,)).fetchone()
@@ -1782,14 +1969,22 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
                     or audit.stat().st_size>16384 or hashlib.sha256(audit.read_bytes()).hexdigest()!=replay['audit_sha256']):
                 raise ValueError('Exact immutable operator replay audit required')
             proof = json.loads(audit.read_text())
-            if (proof.get('contract')!=OPERATOR_REPLAY_CONTRACT or proof.get('authorization_id')!=retry_authorization_id
-                    or proof.get('task_id')!=replay['task_id'] or proof.get('automatic_retry') is not False):
+            automatic = proof.get('contract') == AUTHORIZED_REPLAY_CONTRACT
+            if (proof.get('contract') not in (OPERATOR_REPLAY_CONTRACT, AUTHORIZED_REPLAY_CONTRACT)
+                    or proof.get('authorization_id')!=retry_authorization_id
+                    or proof.get('task_id')!=replay['task_id'] or proof.get('automatic_retry') is not automatic):
                 raise ValueError('Invalid operator replay audit')
             row = con.execute('SELECT * FROM tasks WHERE task_id=?',(replay['task_id'],)).fetchone()
             if (row is None or row['kind']!='download' or row['state']!='blocked'
                     or row['last_error_code']!='unknown_outcome_no_auto_retry'
                     or row['attempted_at_utc']!=replay['original_attempted_at_utc']):
                 raise ValueError('Unresolved task changed since operator replay inspection')
+            if automatic:
+                installed = policy.get('authorized_unknown_replay')
+                if (installed is None or proof.get('standing_authorization') != installed
+                        or authorized_replay_policy({'automation': {'authorized_unknown_replay': installed}}) != installed
+                        or not authorized_replay_window(con, dict(row), installed, datetime.fromisoformat(now))['allowed']):
+                    raise ValueError('Standing replay grant revoked, changed, or exhausted')
         # A crashed/timed-out process may already have exported a sheet. Never
         # silently move on or repeat it until local evidence is reconciled.
         if con.execute("SELECT 1 FROM tasks WHERE state='running' OR (state='blocked' AND last_error_code='unknown_outcome_no_auto_retry' AND task_id!=?) LIMIT 1",
@@ -1814,9 +2009,14 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
             con.execute('UPDATE desktop_replays SET consumed_at_utc=? WHERE authorization_id=?', (now,retry_authorization_id))
         if task['kind']=='discover':
             con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_consecutive_downloads','0')")
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_table_consecutive_downloads','0')")
         else:
             old = con.execute("SELECT value FROM meta WHERE key='scheduler_consecutive_downloads'").fetchone()
             con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_consecutive_downloads',?)",(str(min(20,int(old[0]) + 1) if old else 1),))
+            values=dict(con.execute("SELECT key,value FROM meta WHERE key IN ('scheduler_last_download_table','scheduler_table_consecutive_downloads')"))
+            streak=(min(8,int(values.get('scheduler_table_consecutive_downloads','0'))+1)
+                    if values.get('scheduler_last_download_table')==task['table_id'] else 1)
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_table_consecutive_downloads',?)",(str(streak),))
             con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_last_download_table',?)",(task['table_id'],))
         con.execute("UPDATE tasks SET state='running',attempted_at_utc=? WHERE task_id=?", (now, task["task_id"]))
         event = uuid.uuid4().hex

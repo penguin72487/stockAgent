@@ -32,10 +32,11 @@ public static class TejListFixture {
         protected override CreateParams CreateParams {get{var p=base.CreateParams;p.ExStyle|=0x08000000;return p;}}
     }
     public static Form Root,Other;
-    public static ListBox Labels;
+    public static ListBox Labels,Target;
     public static ComboBox Names;
     public static Button Select;
     public static int Changes,SelectClicks;
+    public static bool DisableAfterSelect;
     private static Thread thread;
     public static void Start() {
         var ready=new ManualResetEvent(false);
@@ -46,10 +47,15 @@ public static class TejListFixture {
             Labels.Items.AddRange(new object[]{"First","Second","Third"});
             Names=new ComboBox {Dock=DockStyle.Top,DropDownStyle=ComboBoxStyle.DropDownList};
             Names.Items.AddRange(new object[]{"First","first","\u53f0\u7063 caf\u00e9"});Names.SelectedIndex=0;
+            Target=new ListBox {Dock=DockStyle.Fill};
             Labels.SelectedIndexChanged+=(s,e)=>Changes++;
             Select=new Button {Text="Select",Dock=DockStyle.Bottom};
-            Select.Click+=(s,e)=>SelectClicks++;
-            group.Controls.Add(Labels);group.Controls.Add(Names);group.Controls.Add(Select);Root.Controls.Add(group);
+            Select.Click+=(s,e)=> {
+                SelectClicks++;
+                foreach(object item in Labels.SelectedItems)Target.Items.Add(item);
+                if(DisableAfterSelect)Select.Enabled=false;
+            };
+            group.Controls.Add(Target);group.Controls.Add(Labels);group.Controls.Add(Names);group.Controls.Add(Select);Root.Controls.Add(group);
             Root.Shown+=(s,e)=>ready.Set();Application.Run(Root);
         });
         thread.IsBackground=true;thread.SetApartmentState(ApartmentState.STA);thread.Start();
@@ -74,6 +80,14 @@ public static class TejListFixture {
     }
     public static void Disable() {Root.Invoke(new Action(()=>Labels.Enabled=false));}
     public static void DuplicateCombo() {Root.Invoke(new Action(()=>Names.Items.Add("First")));}
+    public static void LookupLabels(string[] labels) {
+        Root.Invoke(new Action(()=> {Labels.DataSource=null;Labels.Items.Clear();Labels.Items.AddRange(labels);Labels.ClearSelected();}));
+    }
+    public static void SelectCombo(int index) {Root.Invoke(new Action(()=>Names.SelectedIndex=index));}
+    public static void BatchReset(bool disableAfterSelect) {
+        Root.Invoke(new Action(()=> {Target.Items.Clear();Select.Dock=DockStyle.Bottom;Select.Enabled=true;SelectClicks=0;DisableAfterSelect=disableAfterSelect;}));
+    }
+    public static void WrongGeometry() {Root.Invoke(new Action(()=>{Select.Dock=DockStyle.None;Select.SetBounds(0,0,80,20);}));}
     public static void EnableRoot(bool enabled) {Root.Invoke(new Action(()=>Root.Enabled=enabled));}
     public static long ShowOther() {
         return (long)Root.Invoke(new Func<long>(()=> {
@@ -98,6 +112,10 @@ try {
     $foreground=[TejBridgeNative]::GetForegroundWindow()
     [TejBridgeNative]::AssertControlScope($rootHandle,$listHandle,$PID,'StockAgent owned list fixture')
     Check 'fresh_native_root_and_control_owner_verified' $true
+    Check 'native_group_caption_resolves_exact_owned_groupbox' ([TejBridgeNative]::ExactQueryGroup(
+        $rootHandle,'Owned source list',$PID,'StockAgent owned list fixture') -eq [TejBridgeNative]::GetParent([IntPtr]$listHandle).ToInt64())
+    $rejected=$false;try{[void][TejBridgeNative]::ExactQueryGroup($rootHandle,'Missing',$PID,'StockAgent owned list fixture')}catch{$rejected=$true}
+    Check 'native_group_missing_name_refused' $rejected
     foreach($case in @(@($rootHandle,$listHandle,$PID+1,'StockAgent owned list fixture'),
                       @($rootHandle,$listHandle,$PID,'Wrong owner title'),
                       @($rootHandle,[TejListFixture]::Other.Handle.ToInt64(),$PID,'StockAgent owned list fixture'))) {
@@ -113,6 +131,13 @@ try {
     Check 'native_combo_lookup_preserves_unicode' ([TejBridgeNative]::ExactComboIndex($rootHandle,$combo,$unicode) -eq 2)
     Check 'native_combo_lookup_missing_label_is_not_selected' ([TejBridgeNative]::ExactComboIndex($rootHandle,$combo,'Missing') -eq -1)
     Check 'native_combo_lookup_never_mutates_selection' ([TejBridgeNative]::Message($combo,0x147,0,0) -eq 0)
+    Check 'zero_extended_32bit_cb_err_is_negative' ([TejBridgeNative]::SignedControlResult(4294967295) -eq -1)
+    Check 'native_negative_cb_err_preserved' ([TejBridgeNative]::SignedControlResult(-1) -eq -1)
+    Check 'valid_index_and_large_handle_not_truncated' (
+        [TejBridgeNative]::SignedControlResult(23) -eq 23 -and [TejBridgeNative]::SignedControlResult(4294967296) -eq 4294967296)
+    [TejListFixture]::SelectCombo(-1)
+    Check 'no_selection_is_null_not_out_of_scope_exception' ($null -eq [TejBridgeNative]::SelectedComboText($rootHandle,$combo))
+    [TejListFixture]::SelectCombo(0)
     [TejListFixture]::DuplicateCombo();$rejected=$false
     try{[void][TejBridgeNative]::ExactComboIndex($rootHandle,$combo,'First')}catch{$rejected=$true}
     Check 'duplicate_exact_combo_labels_refused' $rejected
@@ -149,6 +174,69 @@ try {
         Check ($case+'_wrong_label_rejected_before_action') ($rejected -and [TejListFixture]::SelectClicks -eq 0)
     }
     }
+    [TejListFixture]::LookupLabels([string[]]@('first','First','台灣 café'))
+    $listHandle=[TejListFixture]::Labels.Handle.ToInt64()
+    Check 'exact_list_case_variant_uses_ordinal_name' ([TejBridgeNative]::ExactListIndex($rootHandle,$listHandle,'First') -eq 1)
+    Check 'exact_list_unicode_name_is_not_a_prefix' ([TejBridgeNative]::ExactListIndex($rootHandle,$listHandle,'台灣 café') -eq 2)
+    $rejected=$false;try{[void][TejBridgeNative]::ExactListIndex($rootHandle,$listHandle,'Fir')}catch{$rejected=$true}
+    Check 'list_prefix_is_not_an_exact_source_name' $rejected
+    [TejListFixture]::LookupLabels([string[]]@('First','Other','First'))
+    $rejected=$false;try{[void][TejBridgeNative]::ExactListIndex($rootHandle,$listHandle,'First')}catch{$rejected=$true}
+    Check 'duplicate_exact_list_source_name_is_refused' $rejected
+    [TejListFixture]::LookupLabels([string[]]@('first','First','台灣 café'))
+    $listHandle=[TejListFixture]::Labels.Handle.ToInt64()
+    $indices=[TejBridgeNative]::ExactListIndices($rootHandle,$listHandle,[string[]]@('First','first','台灣 café'),$PID,'StockAgent owned list fixture')
+    Check 'batch_search_keeps_ordinal_unicode_and_request_order' (($indices -join ',') -ceq '1,0,2')
+    $rejected=$false;try{[void][TejBridgeNative]::ExactListIndices($rootHandle,$listHandle,[string[]]@('First','First'),$PID,'StockAgent owned list fixture')}catch{$rejected=$true}
+    Check 'batch_search_duplicate_request_refused_without_selection' ($rejected -and [TejListFixture]::SelectClicks -eq 0)
+    [TejListFixture]::BatchReset($false)
+    $target=[TejListFixture]::Target.Handle.ToInt64();$batchButton=[TejListFixture]::Select.Handle.ToInt64()
+    $parent=[TejBridgeNative]::GetParent([IntPtr]$batchButton).ToInt64()
+    [TejBridgeNative]::SelectListBatch($rootHandle,$parent,$listHandle,$target,$batchButton,
+        [int[]]$indices,[string[]]@('First','first','台灣 café'),$PID,'StockAgent owned list fixture',$false)
+    Check 'batch_selection_reads_complete_normal_model_destination' ([TejBridgeNative]::SameItems(
+        [TejBridgeNative]::Items($target,$false),[string[]]@('First','first','台灣 café')) -and [TejListFixture]::SelectClicks -eq 3)
+    Check 'batch_selection_does_not_activate_foreground' ([TejBridgeNative]::GetForegroundWindow() -eq $foreground)
+    foreach($bad in @('wrong_parent','wrong_pid','wrong_label','wrong_geometry','duplicate_request')) {
+        [TejListFixture]::BatchReset($false);$rejected=$false
+        try {
+            $batchParent=$(if($bad -ceq 'wrong_parent'){$target}else{$parent})
+            $owner=$(if($bad -ceq 'wrong_pid'){$PID+1}else{$PID})
+            $labels=[string[]]$(if($bad -ceq 'wrong_label'){@('Wrong')}elseif($bad -ceq 'duplicate_request'){@('First','First')}else{@('First')})
+            $positions=[int[]]$(if($bad -ceq 'duplicate_request'){@(1,1)}else{@(1)})
+            # Swap source/target for geometry refusal while both lists remain
+            # real owned children. No click may be sent on a wrong layout.
+            if($bad -ceq 'wrong_geometry'){[TejListFixture]::WrongGeometry()}
+            [TejBridgeNative]::SelectListBatch($rootHandle,$batchParent,$listHandle,$target,$batchButton,
+                $positions,$labels,$owner,'StockAgent owned list fixture',($bad -ceq 'wrong_geometry'))
+        }catch{$rejected=$true}
+        Check ('batch_'+$bad+'_refused_before_click') ($rejected -and [TejListFixture]::SelectClicks -eq 0)
+    }
+    [TejListFixture]::BatchReset($true);$rejected=$false
+    try{[TejBridgeNative]::SelectListBatch($rootHandle,$parent,$listHandle,$target,$batchButton,
+        [int[]]$indices,[string[]]@('First','first','台灣 café'),$PID,'StockAgent owned list fixture',$false)}catch{$rejected=$true}
+    Check 'batch_midstream_disabled_button_stops_without_repeating' ($rejected -and [TejListFixture]::SelectClicks -eq 1 -and
+        ([TejBridgeNative]::Items($target,$false)).Count -eq 1)
+    [TejListFixture]::BatchReset($false)
+    Check 'native_button_named_lookup_keeps_owned_identity' ([TejBridgeNative]::ExactButton($rootHandle,$rootHandle,'Select',[int]::MinValue,43) -eq [TejListFixture]::Select.Handle.ToInt64())
+    $rejected=$false;try{[void][TejBridgeNative]::ExactButton($rootHandle,$rootHandle,'Select',[int]::MinValue,44)}catch{$rejected=$true}
+    Check 'same_caption_wrong_control_role_is_refused' $rejected
+    $rejected=$false;try{[void][TejBridgeNative]::ExactButton($rootHandle,$rootHandle,'Select',[int]::MaxValue)}catch{$rejected=$true}
+    Check 'named_button_still_requires_correct_geometry' $rejected
+    $button=[TejListFixture]::Select.Handle.ToInt64()
+    [TejBridgeNative]::VerifyResolvedButton($rootHandle,$rootHandle,$button,$PID,'StockAgent owned list fixture','Select')
+    Check 'batched_button_guard_does_not_send_an_action' ([TejListFixture]::SelectClicks -eq 0)
+    foreach($case in @('wrong_name','wrong_pid','wrong_parent')){
+        $rejected=$false
+        try {
+            $parent=$(if($case -ceq 'wrong_parent'){$listHandle}else{$rootHandle})
+            $owner=$(if($case -ceq 'wrong_pid'){$PID+1}else{$PID})
+            $caption=$(if($case -ceq 'wrong_name'){'Wrong'}else{'Select'})
+            [TejBridgeNative]::VerifyResolvedButton($rootHandle,$parent,$button,$owner,'StockAgent owned list fixture',$caption)
+        }catch{$rejected=$true}
+        Check ('batched_button_guard_'+$case+'_refused') ($rejected -and [TejListFixture]::SelectClicks -eq 0)
+    }
+    Check 'direct_search_keeps_foreground_unchanged' ([TejBridgeNative]::GetForegroundWindow() -eq $foreground)
     [TejListFixture]::Disable();$listHandle=[TejListFixture]::Labels.Handle.ToInt64()
     $rejected=$false
     try {Select-FixtureItem $rootHandle $listHandle 0 'First'}catch {$rejected=$true}

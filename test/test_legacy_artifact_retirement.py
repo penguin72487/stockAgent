@@ -15,6 +15,7 @@ import stockagent.data_sync.cold_primary as cold_primary
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec, publish_archive, restore_archive
 from stockagent.data_sync.packed_snapshots import initialize_packed_layout, resolve_latest_packed
+from dataclasses import replace
 
 
 def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -61,6 +62,159 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "bridge_inactive": True,
     }
     return spec, source, hot_tree, options
+
+
+@pytest.mark.parametrize('failure', [None, 'source-bytes', 'mirror', 'cold', 'unknown',
+    'original-reappeared', 'state', 'expired', 'service', 'pin', 'process', 'peer', 'redirect'])
+def test_interrupted_quarantine_resume_reaudits_exact_bytes_and_final_gates(tmp_path, monkeypatch, failure):
+    import stockagent.data_sync.artifact_retirement as common
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    original_bytes = (source/'checkpoint.pt').read_bytes()
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    final_gate = retirement._assert_unlink_gates
+    def interrupted(*args, **kwargs):
+        raise SnapshotError('controlled transport failure after rename')
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', interrupted)
+    with pytest.raises(SnapshotError, match='controlled transport'):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                          owned_verified_plan=plan, **options)
+    state_path = retirement._state_path(options['state_root'], spec.dataset)
+    state = json.loads(state_path.read_text())
+    quarantine = Path(state['quarantine'])
+    assert state['state']=='retiring' and not source.exists() and not hot.exists()
+    assert (quarantine/'source/checkpoint.pt').read_bytes()==original_bytes
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', final_gate)
+    before_audit = failure in {'source-bytes', 'mirror', 'unknown', 'original-reappeared', 'state', 'redirect'}
+    if not before_audit:
+        resumed = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+        assert resumed['quarantine_resume'] and resumed['manifest_sha256']==plan['manifest_sha256']
+    if failure=='source-bytes':
+        file=quarantine/'source/checkpoint.pt'; info=file.stat()
+        file.write_bytes(b'X'*info.st_size)
+        os.utime(file,ns=(info.st_atime_ns,info.st_mtime_ns))
+    elif failure=='mirror':
+        (quarantine/'hot/unknown.bin').write_bytes(b'unpreserved')
+    elif failure=='cold':
+        resolved=resolve_latest_packed(options['sync_root'],spec.dataset)
+        file=options['sync_root']/resolved.manifest['archive']['objects'][0]['relpath']
+        info=file.stat();file.write_bytes(b'X'*info.st_size)
+        os.utime(file,ns=(info.st_atime_ns,info.st_mtime_ns))
+    elif failure=='unknown':
+        (quarantine/'unknown-evidence').write_text('retain')
+    elif failure=='original-reappeared':
+        source.mkdir();(source/'new-generation').write_bytes(b'new bytes')
+    elif failure=='state':
+        state['plan_fingerprint']='changed';state_path.write_text(json.dumps(state))
+    elif failure=='expired':
+        resumed['full_verification']['verified_at_epoch']=time.time()-1501
+    elif failure=='service':
+        monkeypatch.setattr(common,'artifact_service_references',lambda paths,*args:
+                            {str(p):['new-web-consumer'] for p in paths})
+    elif failure=='pin':
+        monkeypatch.setattr(common,'_pinned_snapshot_ids',lambda *args:{plan['snapshot_id']})
+    elif failure=='process':
+        monkeypatch.setattr(common,'process_references',lambda *args:['live-open-fd'])
+    elif failure=='peer':
+        options['peer_probe']=lambda:{'ok':False,'checked_at':datetime.now(timezone.utc).isoformat()}
+    elif failure=='redirect':
+        moved=quarantine.with_name(quarantine.name+'-moved');quarantine.rename(moved)
+        quarantine.symlink_to(moved,target_is_directory=True)
+    if failure:
+        with pytest.raises(SnapshotError):
+            if before_audit:
+                retirement.plan_legacy_quarantine_resume(spec,plan,**options)
+            else:
+                retirement.apply_legacy_retirement(spec,expected_fingerprint=plan['plan_fingerprint'],
+                                                  owned_verified_plan=resumed,**options)
+        assert (quarantine/'source/checkpoint.pt').exists()
+        assert json.loads(state_path.read_text())['state']=='retiring'
+    else:
+        result=retirement.apply_legacy_retirement(spec,expected_fingerprint=plan['plan_fingerprint'],
+                                                 owned_verified_plan=resumed,**options)
+        assert result['deleted'] and result['resumed_quarantine'] and not quarantine.exists()
+        state=json.loads(state_path.read_text())
+        assert state['state']=='cold-only' and state['retirement_receipt']==result
+        restored=tmp_path/'restored-after-interruption'
+        restore_archive(spec,options['sync_root'],restored,materialized_root=tmp_path/'restored-cache')
+        assert (restored/'checkpoint.pt').read_bytes()==original_bytes
+
+
+@pytest.mark.parametrize('new_consumer', [False, True])
+def test_unequal_retained_hot_version_is_recovered_and_retired_separately(tmp_path, monkeypatch, new_consumer):
+    from stockagent.data_sync.legacy_artifact_archive import MANUAL_WSL_CAPTURE_CONTRACT, verify_cold_archive
+    spec, authority, hot, options = _fixture(tmp_path, monkeypatch)
+    original = (authority/'checkpoint.pt').read_bytes()
+    (hot/'checkpoint.pt').unlink()
+    (hot/'checkpoint.pt').write_bytes(b'previous unequal historical version')
+    old=time.time()-10*86400;os.utime(hot/'checkpoint.pt',(old,old))
+    spec=replace(spec,dataset='legacy-wsl-hot-version',manual_capture_min_stable_hours=12,
+                 capture_contract=MANUAL_WSL_CAPTURE_CONTRACT)
+    publish_archive(spec, options['hot_root'], options['sync_root'],
+                    repo_root=options['repo_root'], manual_capture=True)
+    proof=verify_cold_archive(spec,options['sync_root'])
+    assert proof['decoded_originals_verified'] and authority.is_dir()
+    shutil.copytree(options['sync_root'],tmp_path/'backup',dirs_exist_ok=True)
+    options.update(artifact_root=options['hot_root'],hot_root=tmp_path/'no-secondary-mirror',
+                   state_root=tmp_path/'hot-version-state',activation_root=tmp_path/'hot-version-activations',
+                   manual_immediate=True,manual_capture=True)
+    plan=retirement.plan_legacy_retirement(spec,**options)
+    assert plan['source']==str(hot) and plan['hot_mirror']['files']==0
+    if new_consumer:
+        monkeypatch.setattr(retirement,'_active_service_references',lambda *a:['new-web-consumer'])
+        with pytest.raises(SnapshotError,match='plan changed|blocked'):
+            retirement.apply_legacy_retirement(spec,expected_fingerprint=plan['plan_fingerprint'],
+                                               owned_verified_plan=plan,**options)
+        assert hot.is_dir()
+    else:
+        result=retirement.apply_legacy_retirement(spec,expected_fingerprint=plan['plan_fingerprint'],
+                                                 owned_verified_plan=plan,**options)
+        assert result['deleted'] and not hot.exists()
+        restored=tmp_path/'restored-hot-version'
+        restore_archive(spec,options['sync_root'],restored,materialized_root=tmp_path/'restore-cache')
+        assert (restored/'checkpoint.pt').read_bytes()==b'previous unequal historical version'
+    assert (authority/'checkpoint.pt').read_bytes()==original
+
+
+@pytest.mark.parametrize("failure", [None, "expired", "source", "mirror-directory", "cold", "service", "pin", "automatic"])
+def test_owned_manual_full_plan_preserves_final_retirement_gates(tmp_path, monkeypatch, failure):
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options["manual_immediate"] = True
+    before = retirement.plan_legacy_retirement(spec, **options)
+    if failure == "expired":
+        before["full_verification"]["verified_at_epoch"] = time.time() - 1501
+    elif failure == "source":
+        file = source / "checkpoint.pt"
+        info = file.stat()
+        file.write_bytes(b"X" * info.st_size)
+        os.utime(file, ns=(info.st_atime_ns, info.st_mtime_ns))
+    elif failure == "mirror-directory":
+        (hot / "new-empty").mkdir()
+    elif failure == "cold":
+        resolved = resolve_latest_packed(options["sync_root"], spec.dataset)
+        file = options["sync_root"] / resolved.manifest["archive"]["objects"][0]["relpath"]
+        info = file.stat()
+        file.write_bytes(b"X" * info.st_size)
+        os.utime(file, ns=(info.st_atime_ns, info.st_mtime_ns))
+    elif failure == "service":
+        monkeypatch.setattr(retirement, "_active_service_references", lambda *args: ["new-consumer"])
+    elif failure == "pin":
+        monkeypatch.setattr(retirement, "_pinned_snapshot_ids", lambda *args: {before["snapshot_id"]})
+    elif failure == "automatic":
+        options["manual_immediate"] = False
+    monkeypatch.setattr(retirement, "verify_packed_snapshot", lambda *a, **kw: pytest.fail("full cold audit must run outside the mutation owner"))
+    if failure:
+        with pytest.raises(SnapshotError):
+            retirement.apply_legacy_retirement(spec, expected_fingerprint=before["plan_fingerprint"],
+                                               owned_verified_plan=before, **options)
+        assert source.exists() and hot.exists()
+    else:
+        result = retirement.apply_legacy_retirement(spec, expected_fingerprint=before["plan_fingerprint"],
+                                                   owned_verified_plan=before, **options)
+        assert result["deleted"] and not source.exists() and not hot.exists()
+        restored = tmp_path / "restored"
+        restore_archive(spec, options["sync_root"], restored, materialized_root=tmp_path / "restore-cache")
+        assert (restored / "checkpoint.pt").read_bytes() == b"old unfinished run; preserve bytes, not deployment permission"
 
 
 def test_observation_enrollment_without_cold_release_deletes_nothing(tmp_path: Path, monkeypatch):

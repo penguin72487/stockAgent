@@ -113,5 +113,3 @@ def tx_front_benchmark_source_end(data_path: str | Path) -> np.datetime64:
     if not table.num_rows:
         raise ValueError("verified TX front-month benchmark source is empty")
     return np.max(np.asarray(table["date"].to_numpy(), dtype="datetime64[D]"))
-
-

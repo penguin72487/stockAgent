@@ -89,6 +89,73 @@ def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
     ]
 
 
+def test_batch_object_directory_barrier_precedes_manifest_and_head(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    flushed = []
+    flush = packed_snapshots._flush_object_directories
+    write_manifest = packed_snapshots.write_immutable_json
+
+    def record_flush(directories):
+        assert not list((cold / "manifests").rglob("*.json"))
+        assert not list((cold / "heads").rglob("*.json"))
+        assert directories and cold in directories
+        flush(directories)
+        flushed.append(set(directories))
+
+    def guarded_manifest(*args, **kwargs):
+        assert len(flushed) == 1
+        return write_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(packed_snapshots, "_flush_object_directories", record_flush)
+    monkeypatch.setattr(packed_snapshots, "write_immutable_json", guarded_manifest)
+    result = publish_packed_snapshot(cold, "prices", source, loose_file_threshold_bytes=1024,
+                                     batch_directory_fsync=True)
+    target = fetch_packed_snapshot(cold, tmp_path / "restore", result)
+    assert scan_tree(target)["portable_fingerprint_sha256"] == scan_tree(source)["portable_fingerprint_sha256"]
+
+
+def test_batch_directory_fsync_error_never_advances_head(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    cold = tmp_path / "cold"
+    initial = publish_packed_snapshot(cold, "prices", source)
+    head = initial.head_path.read_bytes()
+    (source / "new.bin").write_bytes(b"new-data" * 256)
+
+    def reject_flush(directories):
+        raise OSError("simulated cold directory durability failure")
+
+    monkeypatch.setattr(packed_snapshots, "_flush_object_directories", reject_flush)
+    with pytest.raises(OSError, match="durability failure"):
+        publish_packed_snapshot(cold, "prices", source, batch_directory_fsync=True)
+    assert initial.head_path.read_bytes() == head
+    assert len(list(initial.manifest_path.parent.glob("*.json"))) == 1
+
+
+def test_batched_object_install_fsyncs_payload_and_defers_directory(tmp_path, monkeypatch):
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    temporary = cold / "new.partial"
+    temporary.write_bytes(b"durable payload")
+    digest = packed_snapshots.sha256_file(temporary)
+    destination = cold / f"objects/blobs/{digest[:2]}/{digest}.blob"
+    events = []
+    real_fsync = os.fsync
+
+    def record_sync(fd):
+        assert not destination.exists()  # file fsync before rename
+        events.append(os.fstat(fd).st_mode)
+        real_fsync(fd)
+
+    monkeypatch.setattr(packed_snapshots.os, "fsync", record_sync)
+    monkeypatch.setattr(packed_snapshots, "_fsync_directory", lambda *_: pytest.fail("per-object directory flush"))
+    pending = set()
+    packed_snapshots._install_immutable_object(cold, temporary, destination,
+        expected_sha256=digest, pending_directories=pending)
+    assert len(events) == 1 and stat.S_ISREG(events[0])
+    assert destination.parent in pending and cold in pending
+
+
 def test_metadata_only_resolver_allows_edge_to_hydrate_missing_objects(
     tmp_path: Path,
 ) -> None:

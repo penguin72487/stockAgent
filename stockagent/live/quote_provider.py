@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import quote
@@ -2134,9 +2135,9 @@ def fetch_shared_day_trade_stock_snapshots(
                 )
             response_observed = time.perf_counter()
             broker_timing = payload.get("broker_timing")
-            timing = (
-                dict(broker_timing) if isinstance(broker_timing, dict) else {}
-            )
+            timing = dict(snapshot.transport_timing or {})
+            if isinstance(broker_timing, dict):
+                timing.update(broker_timing)
             timing.update(
                 {
                     "schema_version": 1,
@@ -2314,13 +2315,19 @@ def _fetch_shioaji_stock_snapshots_once(
     cache_ttl_seconds: float,
     api: object,
 ) -> PriceSnapshot:
+    snapshot_started = time.perf_counter()
+    query_timing: dict[str, Any] = {}
     if len(symbols) != len(fallback_prices):
         raise ValueError("symbols and fallback_prices must have equal length")
     ttl = max(0.0, float(cache_ttl_seconds))
     now_monotonic = time.monotonic()
     requested = [str(symbol).strip() for symbol in symbols]
+    snapshot_phases: dict[str, float | None] = {}
+    lock_requested = time.perf_counter()
 
     with _SHIOAJI_STOCK_LOCK:
+        lock_acquired = time.perf_counter()
+        snapshot_phases["lock_queue_ms"] = (lock_acquired - lock_requested) * 1000.0
         missing_codes: list[str] = []
         for code in requested:
             cached = _SHIOAJI_STOCK_CACHE.get(code)
@@ -2382,6 +2389,8 @@ def _fetch_shioaji_stock_snapshots_once(
             if contracts:
                 snapshot_batches.append(contracts)
 
+        snapshot_phases["contract_prepare_ms"] = (time.perf_counter() - lock_acquired) * 1000.0
+
         if snapshot_batches:
             # Shioaji accepts at most 500 contracts per Snapshot request. A
             # Taiwan universe therefore needs up to six requests. Waiting for
@@ -2395,11 +2404,13 @@ def _fetch_shioaji_stock_snapshots_once(
             callback_rows: list[tuple[list[object], int] | None] = [
                 None for _ in snapshot_batches
             ]
+            callback_offsets: list[float | None] = [None for _ in snapshot_batches]
             callbacks_open = [True]
 
             def make_callback(batch_index: int) -> Callable[[Any], None]:
                 def receive(rows: Any) -> None:
                     received_ms = int(time.time() * 1000)
+                    received_elapsed_ms = (time.perf_counter() - request_started) * 1000.0
                     try:
                         materialized = list(rows or ())
                     except TypeError:
@@ -2411,6 +2422,7 @@ def _fetch_shioaji_stock_snapshots_once(
                         ):
                             return
                         callback_rows[batch_index] = (materialized, received_ms)
+                        callback_offsets[batch_index] = received_elapsed_ms
                         condition.notify_all()
 
                 return receive
@@ -2428,7 +2440,14 @@ def _fetch_shioaji_stock_snapshots_once(
                 asset_class="stock",
                 details=query_details,
                 request_count=len(snapshot_batches),
+                # Account usage is not a dependency of a valid quote. Two
+                # synchronous quota reads blocked the 2026-10-05 opening for
+                # 8.66 seconds and triggered a second-process fallback. Keep
+                # query/row/failure accounting, with unknown byte attribution.
+                observe_usage=False,
+                timing=query_timing,
             ) as set_ledger_result:
+                request_started = time.perf_counter()
                 for batch_index, contracts in enumerate(snapshot_batches):
                     callback = make_callback(batch_index)
                     try:
@@ -2450,6 +2469,8 @@ def _fetch_shioaji_stock_snapshots_once(
                     if immediate:
                         callback(immediate)
 
+                submissions_completed = time.perf_counter()
+                snapshot_phases["submit_ms"] = (submissions_completed - request_started) * 1000.0
                 deadline = time.monotonic() + snapshot_timeout_ms / 1000.0
                 with condition:
                     while any(result is None for result in callback_rows):
@@ -2458,6 +2479,11 @@ def _fetch_shioaji_stock_snapshots_once(
                             break
                         condition.wait(timeout=remaining)
                     callbacks_open[0] = False
+
+                snapshot_phases["callback_wait_ms"] = (time.perf_counter() - submissions_completed) * 1000.0
+                observed_offsets = [value for value in callback_offsets if value is not None]
+                snapshot_phases["first_callback_ms"] = min(observed_offsets) if observed_offsets else None
+                snapshot_phases["last_callback_ms"] = max(observed_offsets) if observed_offsets else None
 
                 completed_batches = sum(
                     result is not None for result in callback_rows
@@ -2476,6 +2502,7 @@ def _fetch_shioaji_stock_snapshots_once(
 
             # The causal observation boundary is the callback receipt time,
             # never request submission time nor the exchange wall-clock field.
+            parse_started = time.perf_counter()
             for row, received_ms in rows_with_receipts:
                 code = str(getattr(row, "code", "") or "").strip()
                 contract = _SHIOAJI_STOCK_CONTRACTS.get(code)
@@ -2489,7 +2516,9 @@ def _fetch_shioaji_stock_snapshots_once(
                         received_ms=received_ms,
                     ),
                 )
+            snapshot_phases["callback_parse_ms"] = (time.perf_counter() - parse_started) * 1000.0
 
+        assemble_started = time.perf_counter()
         size = len(requested)
         prices = np.asarray(fallback_prices, dtype=np.float64).copy()
         available = np.zeros((size,), dtype=bool)
@@ -2528,7 +2557,9 @@ def _fetch_shioaji_stock_snapshots_once(
             timestamps_ms[idx] = int(values.get("received_ms") or 0)
             exchange_timestamps_ms[idx] = int(values.get("exchange_ms") or 0)
             simtrade_flags[idx] = int(values.get("simtrade", -1))
+        snapshot_phases["output_assemble_ms"] = (time.perf_counter() - assemble_started) * 1000.0
 
+    limits_started = time.perf_counter()
     prepared_limits, _limit_path = _load_prepared_tw_price_limits()
     prepared_count = 0
     for idx, code in enumerate(requested):
@@ -2642,6 +2673,7 @@ def _fetch_shioaji_stock_snapshots_once(
         source += "+locked_limit_book_repair"
     if snapshot_batches:
         source += "+nonblocking_batch_callbacks"
+    snapshot_phases["limit_resolve_ms"] = (time.perf_counter() - limits_started) * 1000.0
     return PriceSnapshot(
         prices=prices,
         source=source,
@@ -2663,6 +2695,21 @@ def _fetch_shioaji_stock_snapshots_once(
         timestamps_ms=timestamps_ms,
         exchange_timestamps_ms=exchange_timestamps_ms,
         simtrade_flags=simtrade_flags,
+        transport_timing={
+            # Nested spans explain the request body; they are not additional
+            # sequential costs and must not be summed with snapshot_total_ms.
+            **{f"snapshot_{key}": round(value, 3) if value is not None else None
+               for key, value in snapshot_phases.items()},
+            "snapshot_usage_observation": query_timing.get("usage_observation"),
+            **{
+                f"snapshot_{key}": query_timing.get(key)
+                for key in (
+                    "usage_before_ms", "request_body_ms", "usage_after_ms",
+                    "ledger_record_ms", "total_context_ms", "ledger_record_failed",
+                )
+            },
+            "snapshot_total_ms": round((time.perf_counter() - snapshot_started) * 1000.0, 3),
+        },
     )
 
 
@@ -2739,6 +2786,7 @@ def _fetch_shioaji_futures_snapshot_once(
             consumer="tw_day_trade_futures_benchmark",
             method="snapshots",
             asset_class="futures",
+            observe_usage=False,
             details={
                 "logical_code": normalized_logical,
                 "contract_count": len(requested_contracts),
@@ -2746,8 +2794,8 @@ def _fetch_shioaji_futures_snapshot_once(
             },
         ) as set_ledger_result:
             rows = list(api.snapshots(requested_contracts))
+            received_ms = int(time.time() * 1000)
             set_ledger_result(rows)
-        received_ms = int(time.time() * 1000)
         quotes: dict[str, dict[str, float | int | str | None]] = {}
         for row in rows:
             code = str(getattr(row, "code", "") or "").strip().upper()
@@ -3089,13 +3137,19 @@ def load_prices_csv(
 
 def _float_or_none(value: object) -> float | None:
     try:
-        text = str(value).strip()
-        if not text or text in {"-", "--", "null", "None"}:
-            return None
-        parsed = float(text.replace(",", ""))
+        if type(value) in (float, int):
+            # Native Snapshot numbers need neither formatting nor reparsing.
+            # Keep the text route for bool, Decimal, numpy scalar and custom
+            # wrappers so their existing conversion contract remains exact.
+            parsed = float(value)
+        else:
+            text = str(value).strip()
+            if not text or text in {"-", "--", "null", "None"}:
+                return None
+            parsed = float(text.replace(",", ""))
     except Exception:
         return None
-    if not (np.isfinite(parsed) and parsed > 0.0):
+    if not (math.isfinite(parsed) and parsed > 0.0):
         return None
     return parsed
 

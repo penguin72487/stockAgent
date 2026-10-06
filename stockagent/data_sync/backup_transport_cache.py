@@ -11,13 +11,14 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 
 from scripts.backup_delivery_receipt import validate_ack
 from scripts.verify_backup_delivery import regular
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_bytes
 from stockagent.data_sync.materialized_cache import process_references_many
 from stockagent.data_sync.offhost_backup import _regular, private_json
-from stockagent.data_sync.packed_backup import safe_path, signature
+from stockagent.data_sync.packed_backup import PinnedObjectSignatures, safe_path, signature, signature_from_stat
 from stockagent.runtime_identity import identity_sha256
 
 CONTRACT = "verified_reconstructible_cold_transport_cache_retirement_v1"
@@ -46,7 +47,11 @@ def same_ntfs_signature(current, recorded) -> bool:
     return len(recorded) == 5 and tuple(current)[1:] == tuple(recorded)[1:]
 
 
-def source_path(queue, row: dict, *, retain_head: bool = False) -> Path | None:
+def source_path(queue, row: dict, *, retain_head: bool = False, pinned=None) -> Path | None:
+    if pinned is not None and row["relative"].startswith("objects/"):
+        if not same_ntfs_signature(pinned.signature(row["relative"]),row["signature"]):
+            raise SnapshotError("original cold source changed; preserve its transport copy")
+        return queue.cold / row["relative"]  # Descriptor and every parent are pinned/rechecked above.
     path = safe_path(queue.cold, row["relative"])
     if row["relative"].startswith("heads/"):
         raw = row.get("captured_bytes_utf8")
@@ -99,31 +104,47 @@ def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool 
     if set(files) != required or set(delivery.get("transport_signatures", {})) != required:
         raise SnapshotError("cold cache lacks its full-SHA signature proof")
     source_proofs = []
-    for row in delivery["files"]:
-        member = files["cold/" + row["relative"]]
-        if (member["sha256"], member["bytes"]) != (row["sha256"], row["bytes"]):
-            raise SnapshotError("cold cache member differs from its source journal")
-        original = source_path(queue, row)
-        source_proofs.append({"relative": row["relative"], "sha256": row["sha256"],
-                              "source_signature": list(signature(original)) if original else None,
-                              "captured_head_retained_in_journal": original is None})
+    with PinnedObjectSignatures(queue.cold) as pinned:
+        for row in delivery["files"]:
+            member = files["cold/" + row["relative"]]
+            if (member["sha256"], member["bytes"]) != (row["sha256"], row["bytes"]):
+                raise SnapshotError("cold cache member differs from its source journal")
+            original = source_path(queue,row,pinned=pinned)
+            observed = (pinned.signature(row["relative"]) if row["relative"].startswith("objects/")
+                        else signature(original) if original else None)
+            if observed is not None and not row["relative"].startswith("heads/") and not same_ntfs_signature(observed,row["signature"]):
+                raise SnapshotError("original cold source changed during its pinned proof")
+            source_proofs.append({"relative":row["relative"],"sha256":row["sha256"],
+                "source_signature":list(observed) if observed is not None else None,
+                "captured_head_retained_in_journal":original is None})
+        pinned.recheck()
     expected = {*required, "backup-envelope.json", "READY"}
     observed = set()
     current_signatures = {}
-    for parent, dirs, names in os.walk(batch, followlinks=False):
+    if any(p.is_symlink() for p in (batch,*batch.parents)):
+        raise SnapshotError("cold cache capacity root is redirected")
+    root_identity=batch.stat()
+    def walk_error(error):
+        raise error
+    for parent,dirs,names,directory_fd in os.fwalk(batch,follow_symlinks=False,onerror=walk_error):
+        directory_info=os.fstat(directory_fd)
+        if directory_info.st_dev != root_identity.st_dev or (Path(parent) == batch and directory_info.st_ino != root_identity.st_ino):
+            raise SnapshotError("cold cache root/mount changed during inventory")
         for name in dirs:
-            if (Path(parent) / name).is_symlink():
+            item=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+            if not stat.S_ISDIR(item.st_mode) or item.st_dev != root_identity.st_dev:
                 raise SnapshotError("cold cache has a redirected directory")
         for name in names:
             path = Path(parent) / name
             relative = path.relative_to(batch).as_posix()
-            if relative not in expected or _regular(path).stat().st_nlink != 1:
+            item=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+            if relative not in expected or not stat.S_ISREG(item.st_mode) or item.st_nlink != 1 or item.st_dev != root_identity.st_dev:
                 raise SnapshotError("cold cache has an unknown or shared file")
             observed.add(relative)
-            before = signature(path)
+            before = signature_from_stat(item)
             if relative in required:
                 pinned = delivery["transport_signatures"][relative]
-                if not same_ntfs_signature(signature(path), pinned):
+                if not same_ntfs_signature(before,pinned):
                     # After interruption/remount, re-read instead of guessing.
                     if not resume:
                         raise SnapshotError("cold transport member changed since complete SHA verification")
@@ -134,6 +155,9 @@ def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool 
                     if digest.hexdigest() != files[relative]["sha256"] or signature(path) != before:
                         raise SnapshotError("interrupted cold cache member changed")
             current_signatures[relative] = list(before)
+    after=batch.stat()
+    if (root_identity.st_dev,root_identity.st_ino) != (after.st_dev,after.st_ino):
+        raise SnapshotError("cold cache authority changed during inventory")
     if (not resume and observed != expected) or not observed <= expected:
         raise SnapshotError("cold cache exact file set differs")
     ready = batch / "READY"
@@ -167,8 +191,10 @@ def retire(queue, ledger: dict, key: str) -> dict:
         return delivery["cache_retirement"]
     plan = build_plan(queue, delivery, root=stage if stage.exists() else batch, resume=stage.exists())
     if not stage.exists():
-        for row in delivery["files"]:
-            source_path(queue, row, retain_head=True)
+        with PinnedObjectSignatures(queue.cold) as pinned:
+            for row in delivery["files"]:
+                source_path(queue,row,retain_head=True,pinned=pinned)
+            pinned.recheck()
         delivery["cache_retirement"] = {**plan, "state": "prepared"}
         private_json(queue.ledger_path, ledger)
         # Recheck all sources and process references immediately before rename.

@@ -1,0 +1,11 @@
+# Installed per named critical service by install_boot_recovery_policies.py.
+# A persistent fault remains visible and is retried at a bounded rate.
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=__RESTART_MODE__
+RestartSec=__RESTART_SECONDS__
+RestartSteps=__RESTART_STEPS__
+RestartMaxDelaySec=__RESTART_MAX_SECONDS__
+__POST_START__

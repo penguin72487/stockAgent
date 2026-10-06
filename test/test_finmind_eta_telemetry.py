@@ -55,7 +55,7 @@ def test_complete_active_bins_keep_low_rates_and_report_idle(tmp_path):
     assert out['traffic']['windows']['1h']['ended_at_utc'] == NOW.isoformat()
     assert out["quota"]["reserved_requests_per_hour"] == 12
     assert out["quota"]["backfill_capacity_requests_per_hour"] == 5988
-    assert out["quota"]["paced_requests_per_hour"] < 6000
+    assert out["quota"]["paced_requests_per_hour"] == 6000
     assert out["traffic"]["success_rate"] is None
 
 

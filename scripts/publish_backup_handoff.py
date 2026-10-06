@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import uuid
 
@@ -44,13 +45,20 @@ FILES = (
     "scripts/run_lab203_recovery_queue.py", "scripts/run_lab203_recovery_queue.sh",
     "scripts/install_lab203_recovery_queue.py", "docs/lab203_automatic_backup_2026-10-04.md",
 )
+PIPELINE_FILES = (
+    "stockagent/data_sync/backup_relay_pipeline.py", "scripts/run_lab203_backup_pipeline.py",
+    "scripts/run_lab203_backup_pipeline.sh", "scripts/benchmark_lab203_backup_pipeline.py",
+    "scripts/install_lab203_backup_pipeline.py", "docs/lab203_parallel_backup_2026-10-04.md",
+)
 
 
 def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
-                    wait_for_owner: bool = False, publish_recovery_tasks: bool = False) -> dict:
+                    wait_for_owner: bool = False, publish_recovery_tasks: bool = False,
+                    physical_transport_alias: Path | None = None) -> dict:
     if name not in {"continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
                     "continuous-backup-20261004-v4", "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
-                    "continuous-backup-20261004-v7"}:
+                    "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9",
+                    "continuous-backup-20261004-v10"}:
         raise ValueError("use this explicitly versioned handoff scope")
     queue.storage_guard()
     destination = queue.transport / "tools" / name
@@ -58,12 +66,32 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
         raise ValueError("handoff destination is redirected")
     if destination.exists():
         raise ValueError("preserve a previously frozen handoff; use a new reviewed version")
+    if name.endswith(("-v8","-v9")):
+        raise ValueError("the current parallel installer targets v10; preserve the earlier frozen v8/v9")
+    control_only = physical_transport_alias is not None
+    if control_only and publish_recovery_tasks:
+        raise ValueError("independent control publication cannot mutate the source ledger/recovery queue")
+    if control_only:
+        alias = physical_transport_alias.absolute()
+        if any(p.is_symlink() for p in (alias,*alias.parents)) or alias.samefile(queue.transport) is not True:
+            raise ValueError("control handoff needs the exact enrolled physical transport alias")
+        if alias.stat().st_dev != queue.transport.stat().st_dev:
+            raise ValueError("control handoff alias belongs to another filesystem")
+        outside_staging = alias.parent / "stockagent-control-handoff-staging"
+        if any(p.is_symlink() for p in (outside_staging,*outside_staging.parents)):
+            raise ValueError("independent control staging is redirected")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (queue.state / "owner.lock").open("a") as owner:
+    lock_name = "handoff-publisher.lock" if control_only else "owner.lock"
+    with (queue.state / lock_name).open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
         queue.storage_guard()
-        identities = {name: stable_source_sha256(source_root, name) for name in FILES}
-        staging = queue.transport / ".staging" / ("handoff-" + uuid.uuid4().hex)
+        files = (*FILES, *PIPELINE_FILES) if name.endswith(("-v8","-v9","-v10")) else FILES
+        identities = {name: stable_source_sha256(source_root, name) for name in files}
+        payload_bytes=sum((source_root/name).stat().st_size for name in files)
+        if control_only and (payload_bytes > 1024**2 or shutil.disk_usage(alias).free < queue.config["reserve_bytes"]+2*1024**2):
+            raise ValueError("immutable control handoff exceeds its one MiB budget or disk reserve")
+        staging_parent = outside_staging if control_only else queue.transport / ".staging"
+        staging = staging_parent / ("handoff-" + uuid.uuid4().hex)
         staging.mkdir(mode=0o700, parents=True)
         rows = []
         for filename, digest in sorted(identities.items()):
@@ -76,6 +104,9 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
             "producer_device_id": queue.config["producer_device_id"], "receiver_device_id": queue.config["receiver_device_id"],
             "repository_id": queue.config["repository_id"], "replace_existing_worker": False,
             "automatic_execution_from_syncthing": False, "private_credentials_included": False}
+        if name.endswith(("-v8","-v9","-v10")):
+            manifest_body.update(upgrade_existing_service_driver=True, reuse_existing_owner=True,
+                                 measure_nas_before_worker_selection=True)
         manifest = {**manifest_body, "identity_sha256": identity_sha256(manifest_body)}
         private_json(staging / "handoff-manifest.json", manifest)
         raw_manifest = (staging / "handoff-manifest.json").read_bytes()
@@ -86,17 +117,24 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
         envelope = {**body, "identity_sha256": identity_sha256(body)}
         private_json(staging / "backup-envelope.json", envelope)
         verify(staging, envelope["identity_sha256"], require_ready=False)
-        if {name: stable_source_sha256(source_root, name) for name in FILES} != identities:
+        if {name: stable_source_sha256(source_root, name) for name in files} != identities:
             raise ValueError("handoff source changed; publication withheld")
         atomic_write_bytes(staging / "READY", (envelope["identity_sha256"] + "\n").encode(), mode=0o600)
         verified = verify(staging, envelope["identity_sha256"])
-        os.rename(staging, destination)
+        # The independent mode stages outside the watched ingress and renames
+        # through the same physical mount, avoiding bind-mount EXDEV and races
+        # with the producer's retained transport capacity walk.
+        if control_only:
+            queue.storage_guard()
+            if not alias.samefile(queue.transport):
+                raise ValueError("enrolled control alias changed before publication")
+        os.rename(staging, alias / "tools" / name if control_only else destination)
         directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
-        if name in {"continuous-backup-20261004-v6", "continuous-backup-20261004-v7"}:
+        if name in {"continuous-backup-20261004-v6", "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9", "continuous-backup-20261004-v10"}:
             bootstrap = signed({"contract": "fixed_automatic_backup_bootstrap_v1",
                 **{k: queue.config[k] for k in ("producer_device_id", "receiver_device_id", "repository_id")},
                 "package_relative": "tools/" + name,
@@ -118,10 +156,12 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
                 recovery_requests = {"state": "request_publication_failed", "error_type": type(error).__name__}
     return {"state": "frozen_receiver_handoff_published", "source_path": str(destination),
         "receiver_relative": "tools/" + name, "envelope_identity_sha256": envelope["identity_sha256"],
-        "handoff_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(), "source_files": len(FILES),
+        "handoff_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(), "source_files": len(files),
         "complete_files": verified["files_verified"] + 2,
         "complete_bytes": verified["bytes_verified"] + sum((destination / n).stat().st_size for n in ("READY", "backup-envelope.json")),
-        "receiver_adapter_deployed": False, "automatic_recovery_requests": recovery_requests}
+        "receiver_adapter_deployed": False, "automatic_recovery_requests": recovery_requests,
+        "publication_scope": "immutable_control_namespace_only" if control_only else "source_owner",
+        "source_ledger_modified":publish_recovery_tasks}
 
 
 def main() -> None:
@@ -130,17 +170,20 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wait-for-owner", action="store_true")
     parser.add_argument("--publish-recovery-requests", action="store_true")
+    parser.add_argument("--physical-transport-alias",type=Path,
+        help="Publish only a bounded immutable control package independently of the long data owner")
     parser.add_argument("--name", choices=("continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
                                          "continuous-backup-20261004-v3", "continuous-backup-20261004-v4",
                                          "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
-                                         "continuous-backup-20261004-v7"),
+                                         "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9", "continuous-backup-20261004-v10"),
                         default="continuous-backup-20261004-v7")
     args = parser.parse_args()
     if args.output.exists():
         parser.error("retain a fresh handoff publication receipt")
     queue = BackupStream(json.loads(args.config.read_bytes()))
     result = publish_handoff(queue, args.name, wait_for_owner=args.wait_for_owner,
-                             publish_recovery_tasks=args.publish_recovery_requests)
+                             publish_recovery_tasks=args.publish_recovery_requests,
+                             physical_transport_alias=args.physical_transport_alias)
     private_json(args.output, result)
     queue.scan_transport(queue.load_ledger())
     print(json.dumps(result, ensure_ascii=False))

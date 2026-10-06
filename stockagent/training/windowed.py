@@ -2194,7 +2194,9 @@ class WindowedSplitTensors:
         sample_mask = self._sample_mask_slice(int(start), rows)
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         timer = self._prepare_timer_start()
-        feature_slab = self.features.narrow(0, feature_start, slab_rows)
+        feature_slab = (self.features.slab(feature_start,slab_rows)
+                        if getattr(self.features,"_stockagent_factorized_features",False)
+                        else self.features.narrow(0, feature_start, slab_rows))
         self._prepare_timer_stop(prepare_timing, "window_slice", timer)
         timer = self._prepare_timer_start()
         (
@@ -2366,12 +2368,12 @@ class WindowedSplitTensors:
             return None
 
         timer = self._prepare_timer_start()
-        real_slab = self.features.narrow(0, feature_start, source_rows)
+        real_slab = (self.features.slab(feature_start,source_rows)
+                     if getattr(self.features,"_stockagent_factorized_features",False)
+                     else self.features.narrow(0, feature_start, source_rows))
         pad_rows = rows - real_rows
-        feature_slab = torch.cat(
-            (real_slab, real_slab[-1:].expand(pad_rows, *real_slab.shape[1:])),
-            dim=0,
-        ).contiguous()
+        feature_slab = (real_slab.pad_end(pad_rows) if getattr(real_slab,"_stockagent_factorized_slab",False)
+            else torch.cat((real_slab, real_slab[-1:].expand(pad_rows, *real_slab.shape[1:])),dim=0).contiguous())
         self._prepare_timer_stop(prepare_timing, "window_slice", timer)
 
         metadata = self._batch_metadata_from_row_range(
@@ -2410,10 +2412,13 @@ class WindowedSplitTensors:
         if last_feature_date < 0 or last_feature_date >= int(self.features.size(0)):
             return None
         timer = self._prepare_timer_start()
-        feature_slab = self.features[last_feature_date : last_feature_date + 1].expand(
-            rows + self.lookback - 1,
-            *self.features.shape[1:],
-        ).contiguous()
+        if getattr(self.features, "_stockagent_factorized_features", False):
+            feature_slab = self.features.slab(last_feature_date, 1).pad_end(rows + self.lookback - 2)
+        else:
+            feature_slab = self.features[last_feature_date : last_feature_date + 1].expand(
+                rows + self.lookback - 1,
+                *self.features.shape[1:],
+            ).contiguous()
         self._prepare_timer_stop(prepare_timing, "window_slice", timer)
 
         metadata = self._batch_metadata_from_row_range(

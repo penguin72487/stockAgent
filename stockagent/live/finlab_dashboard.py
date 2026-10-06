@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 from scripts.finlab_release_gate import catalog_readiness
 from stockagent.data.finlab_acquisition_contract import (
-    UPSTREAM_CHECK_MODES, safe_stem, WORKLOAD_CONTRACT_VERSION, intraday_progress,
+    UPSTREAM_CHECK_MODES, safe_stem, WORKLOAD_CONTRACT_VERSION, intraday_progress, process_owner_alive,
 )
 from scripts.snapshot_finlab_quota import load_quota_history
 
@@ -177,7 +177,9 @@ def _per_key_estimates(root: Path, datasets: list[dict[str, Any]],
         if seconds is not None:
             samples.setdefault(str(row.get("category") or ""), []).append(seconds)
     active = _read_json(root / "data_finlab/runs/latest.json", {})
-    active = active if isinstance(active, Mapping) and active.get("state") == "running" else {}
+    owner = active.get("owner") if isinstance(active, Mapping) else None
+    active = active if (isinstance(active, Mapping) and active.get("state") == "running"
+                        and process_owner_alive(owner, started_at_utc=active.get("started_at_utc"), now=now)) else {}
     for row in datasets:
         key = row["key"]
         receipt = receipts.get(key, {})
@@ -522,7 +524,10 @@ def build_finlab_public_status(
             and row["key"].startswith(("tw_minute:", "tw_tick:"))
         ]
     current_fetch = {}
-    if isinstance(running_receipt, Mapping) and running_receipt.get("state") == "running":
+    general_owner = running_receipt.get("owner") if isinstance(running_receipt, Mapping) else None
+    general_live = (isinstance(running_receipt, Mapping) and process_owner_alive(
+        general_owner, started_at_utc=running_receipt.get("started_at_utc"), now=observed))
+    if isinstance(running_receipt, Mapping) and running_receipt.get("state") == "running" and general_live:
         active_key = running_receipt.get("active_key")
         if isinstance(active_key, str) and any(row["key"] == active_key for row in datasets):
             current_fetch = {
@@ -532,13 +537,21 @@ def build_finlab_public_status(
     tick_worker = intraday_progress(root / "data_finlab", now=observed)
     public_worker = {k: (None if isinstance(tick_worker.get(k), float)
                         and not math.isfinite(tick_worker[k]) else tick_worker.get(k)) for k in (
-        "run_started_at_utc", "observed_at_utc", "state", "owner_alive", "age_seconds",
+        "run_started_at_utc", "observed_at_utc", "last_success_at_utc", "state", "owner_alive", "age_seconds",
         "active_key", "active_trade_date", "attempt_limit", "attempted", "successful",
         "scanned_candidates", "cached_skips", "quota_checks", "elapsed_seconds", "sample_count",
         "seconds_per_attempt_estimate", "remaining_batch_seconds_estimate",
         "estimated_batch_finish_at_utc", "stop_by_at_utc", "estimate_scope", "batch_eta_state",
     ) if k in tick_worker and (tick_worker[k] is None or isinstance(tick_worker[k], (str, int, float, bool)))}
     tick_active = public_worker.get("owner_alive") is True and public_worker.get("state") == "running"
+    if health == "waiting" and tick_active:
+        tick_receipt_age = _age_seconds(public_worker.get("last_success_at_utc"), observed)
+        # Upgrade during a rolling deployment only when this same short-lived
+        # owner has successful receipt evidence; never use systemd liveness.
+        if tick_receipt_age is None and public_worker.get("successful", 0) > 0:
+            tick_receipt_age = _age_seconds(public_worker.get("run_started_at_utc"), observed)
+        if tick_receipt_age is not None and tick_receipt_age <= 900:
+            health = "active"
     if current_fetch:
         phase = "general"
     elif tick_active:

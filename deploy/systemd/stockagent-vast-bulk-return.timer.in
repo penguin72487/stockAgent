@@ -1,0 +1,13 @@
+[Unit]
+Description=Resume received Vast preservation cohorts after boot and every five minutes
+
+[Timer]
+OnBootSec=3min
+OnActiveSec=30s
+OnUnitInactiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=5s
+Unit=stockagent-vast-bulk-return.service
+
+[Install]
+WantedBy=timers.target

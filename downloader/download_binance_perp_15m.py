@@ -38,6 +38,7 @@ from artifact_io import (  # noqa: E402
     atomic_write_text,
 )
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from quality_priority import collect_with_quality_priority, prioritize_records  # noqa: E402
 from dataset_lock import (  # noqa: E402
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     exclusive_dataset_lock,
@@ -53,6 +54,8 @@ from binance_historical_features import (  # noqa: E402
 )
 from ohlcv_hot_tail import (  # noqa: E402
     hot_tail_path,
+    invalid_candle_values,
+    plan_candle_reconcile_windows,
     read_logical_parquet,
     remove_hot_tail,
 )
@@ -309,6 +312,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-retries", type=int, default=8)
+    parser.add_argument('--symbols', nargs='+', default=None,
+                        help='Explicit quality-repair subset; retain the full catalog and global reports.')
     parser.add_argument("--retry-base", type=float, default=0.6)
     parser.add_argument(
         "--skip-historical-features",
@@ -572,13 +577,7 @@ def _validate_candles(frame: pl.DataFrame) -> None:
     if frame.select(pl.col("date").is_duplicated().any()).item():
         raise ValueError("normalized Binance candles contain duplicate timestamps")
     invalid = frame.filter(
-        (pl.col("open") <= 0)
-        | (pl.col("max") <= 0)
-        | (pl.col("min") <= 0)
-        | (pl.col("close") <= 0)
-        | (pl.col("min") > pl.min_horizontal("open", "close", "max"))
-        | (pl.col("max") < pl.max_horizontal("open", "close", "min"))
-        | (pl.col("Trading_Volume") < 0)
+        invalid_candle_values()
         | (pl.col("binance_volume_quote") < 0)
         | (pl.col("binance_trade_count") < 0)
     )
@@ -925,6 +924,8 @@ def _download_symbol(
             ),
         )
 
+    requested_start = effective_start
+
     if output_path.exists() and not refresh:
         existing = _load_logical_existing_info(output_path)
         if existing.error is not None or not existing.interval_ok:
@@ -967,6 +968,7 @@ def _download_symbol(
                     end_ms=closed_end,
                 )
                 if first_available is not None and existing.earliest_ms is not None:
+                    requested_start = max(requested_start, first_available)
                     if first_available >= existing.earliest_ms:
                         effective_start, _ = resolve_incremental_reconcile_start_ms(
                             expected_first_ms=effective_start,
@@ -983,7 +985,35 @@ def _download_symbol(
             closed_end - 24 * 60 * CANDLE_INTERVAL_MS,
         )
 
-    if effective_start > closed_end:
+    existing_frame: pl.DataFrame | None = None
+    request_windows = [(effective_start, closed_end)]
+    if not tail_only and existing is not None and existing.rows:
+        # Inspect the actual logical dates once, then reuse this frame for the
+        # merge. A current last bar is not evidence of a complete middle.
+        existing_frame = read_logical_parquet(output_path)
+        if existing.earliest_ms is not None:
+            # Current exchangeInfo can postdate retained source history. Its
+            # snapshot listing clock must not suppress an observed old gap.
+            requested_start = max(start_ms, min(requested_start, existing.earliest_ms))
+        planned = plan_candle_reconcile_windows(
+            existing_frame, earliest_ms=existing.earliest_ms, latest_ms=existing.latest_ms,
+            start_ms=min(requested_start, effective_start), end_ms=closed_end,
+            interval_ms=CANDLE_INTERVAL_MS,
+        )
+        request_windows = planned if planned is not None else [(requested_start, closed_end)]
+        # At this fixed 499-row weight tier, combine small disjoint windows
+        # that fit in one response. Large healthy middles are never fetched.
+        packed: list[tuple[int, int]] = []
+        for low, high in request_windows:
+            if packed and (high - packed[-1][0]) // CANDLE_INTERVAL_MS + 1 <= KLINE_LIMIT:
+                packed[-1] = (packed[-1][0], high)
+            else:
+                packed.append((low, high))
+        request_windows = packed
+        if request_windows:
+            effective_start = min(window[0] for window in request_windows)
+
+    if not request_windows or effective_start > closed_end:
         if existing is not None and existing.rows:
             return DownloadResult(
                 "crypto_binance_usdm_perp",
@@ -1006,40 +1036,39 @@ def _download_symbol(
         )
 
     candles = CandleFrameBuffer(_normalize_candles)
-    cursor = effective_start
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    while cursor <= closed_end:
-        payload = client.get(
-            KLINE_ENDPOINT,
-            {
-                "symbol": record.binance_symbol,
-                "interval": KLINE_INTERVAL,
-                "startTime": str(cursor),
-                "endTime": str(closed_end + CANDLE_INTERVAL_MS - 1),
-                "limit": str(KLINE_LIMIT),
-            },
-            weight=KLINE_REQUEST_WEIGHT,
-        )
-        if page_progress_callback is not None:
-            page_progress_callback(record.code)
-        if not isinstance(payload, list):
-            raise RuntimeError("Binance kline endpoint returned a non-list payload")
-        chunk = [row for row in payload if isinstance(row, list) and len(row) >= 11]
-        if not chunk:
-            break
-        candles.extend(
-            row
-            for row in chunk
-            if effective_start <= int(row[0]) <= closed_end
-            and int(row[6]) < now_ms
-        )
-        last_open = max(int(row[0]) for row in chunk)
-        next_cursor = last_open + CANDLE_INTERVAL_MS
-        if next_cursor <= cursor:
-            raise RuntimeError("Binance kline pagination made no forward progress")
-        cursor = next_cursor
-        if len(chunk) < KLINE_LIMIT:
-            break
+    for window_start, window_end in request_windows:
+        cursor = window_start
+        while cursor <= window_end:
+            payload = client.get(
+                KLINE_ENDPOINT,
+                {
+                    "symbol": record.binance_symbol,
+                    "interval": KLINE_INTERVAL,
+                    "startTime": str(cursor),
+                    "endTime": str(window_end + CANDLE_INTERVAL_MS - 1),
+                    "limit": str(KLINE_LIMIT),
+                },
+                weight=KLINE_REQUEST_WEIGHT,
+            )
+            if page_progress_callback is not None:
+                page_progress_callback(record.code)
+            if not isinstance(payload, list):
+                raise RuntimeError("Binance kline endpoint returned a non-list payload")
+            chunk = [row for row in payload if isinstance(row, list) and len(row) >= 11]
+            if not chunk:
+                break
+            candles.extend(
+                row for row in chunk if window_start <= int(row[0]) <= window_end
+                and int(row[6]) < now_ms
+            )
+            last_open = max(int(row[0]) for row in chunk)
+            next_cursor = last_open + CANDLE_INTERVAL_MS
+            if next_cursor <= cursor:
+                raise RuntimeError("Binance kline pagination made no forward progress")
+            cursor = next_cursor
+            if len(chunk) < KLINE_LIMIT:
+                break
 
     fresh = candles.finish()
     if fresh.is_empty():
@@ -1131,7 +1160,8 @@ def _download_symbol(
                 else None,
             )
         frame, changed = _merge_existing_with_fresh(
-            read_logical_parquet(output_path), fresh, effective_start
+            existing_frame if existing_frame is not None else read_logical_parquet(output_path),
+            fresh, effective_start
         )
         if not changed:
             if not hot_tail_path(output_path).is_file():
@@ -1184,6 +1214,7 @@ def _run_locked_download(
     args: argparse.Namespace, output_dir: Path, *, lock_wait_seconds: float,
 ) -> None:
     work_started = time.monotonic()
+    report_root = output_dir
     symbols_path = output_dir / "symbols.csv"
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
@@ -1203,10 +1234,29 @@ def _run_locked_download(
     symbols, exchange_info = _fetch_symbols(
         client,
         symbols_path,
-        limit=args.limit,
+        limit=None if args.symbols else args.limit,
     )
+    if args.symbols:
+        if not args.skip_historical_features:
+            raise ValueError('--symbols quality repair requires --skip-historical-features')
+        wanted = {_safe_symbol(value) for value in args.symbols}
+        symbols = [row for row in symbols if row.binance_symbol in wanted]
+        missing = wanted - {row.binance_symbol for row in symbols}
+        if missing:
+            raise ValueError('requested Binance symbols unavailable in retained source catalog')
+        # A repair subset must not replace the global catalog, latest job
+        # summary or progress. Its source files still use the canonical root.
+        reports = output_dir / 'quality_repair_runs' / started_at.strftime('%Y%m%dT%H%M%S%fZ')
+        reports.mkdir(parents=True, exist_ok=False)
+        report_root = reports
+        symbols_path = reports / 'symbols.csv'
+        report_path = reports / report_path.name
+        summary_path = reports / summary_path.name
+        receipt_path = reports / receipt_path.name
+        progress_path = reports / progress_path.name
     if not symbols:
         raise RuntimeError("No Binance USD-M perpetual symbols found")
+    symbols = prioritize_records(symbols, output_dir, tail_only=args.tail_only)
     _write_csv_atomic(pl.DataFrame([asdict(row) for row in symbols]), symbols_path)
     pipeline_progress = _PipelineProgress(
         progress_path,
@@ -1225,7 +1275,7 @@ def _run_locked_download(
     )
 
     def worker(record: SymbolRecord) -> DownloadResult:
-        result = _download_symbol(
+        result = collect_with_quality_priority(lambda page: _download_symbol(
             client,
             record,
             output_dir,
@@ -1234,10 +1284,9 @@ def _run_locked_download(
             mode=args.mode,
             refresh=args.refresh,
             tail_only=args.tail_only,
-            page_progress_callback=lambda _code: pipeline_progress.observe_request_page(
-                "candles"
-            ),
-        )
+            page_progress_callback=page,
+        ), root=output_dir, code=record.code, tail_only=args.tail_only,
+            page_observer=lambda _code: pipeline_progress.observe_request_page('candles'))
         pipeline_progress.update(
             "candles", result.status, item=record.code, message=result.message
         )
@@ -1268,7 +1317,7 @@ def _run_locked_download(
         on_error=on_error,
     )
 
-    feature_catalog_path = output_dir / "binance_historical_feature_catalog.json"
+    feature_catalog_path = report_root / "binance_historical_feature_catalog.json"
     _write_text_atomic(
         feature_catalog_path,
         json.dumps(feature_catalog_payload(), ensure_ascii=False, indent=2) + "\n",
@@ -1306,7 +1355,7 @@ def _run_locked_download(
                 pipeline_progress.update(stage, status, item=code)
             ),
         )
-    historical_feature_report_path = output_dir / "historical_feature_report.csv"
+    historical_feature_report_path = report_root / "historical_feature_report.csv"
     feature_rows = historical_feature_result_rows(historical_feature_results)
     feature_report = (
         pl.DataFrame(feature_rows, infer_schema_length=None)
@@ -1372,6 +1421,8 @@ def _run_locked_download(
     summary = {
         "asset_class": "crypto_binance_usdm_perp",
         "interval": KLINE_INTERVAL,
+        "requested_symbol_filter": args.symbols,
+        "provider_scope_is_complete": not bool(args.symbols),
         "symbol_count": len(symbols),
         "status_counts": status_counts,
         "row_count": sum(int(result.rows) for result in results),
@@ -1400,7 +1451,7 @@ def _run_locked_download(
     summary_text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     _write_text_atomic(
         feature_run_summary_path(
-            output_dir, features_enabled=not args.skip_historical_features
+            report_root, features_enabled=not args.skip_historical_features
         ),
         summary_text,
     )

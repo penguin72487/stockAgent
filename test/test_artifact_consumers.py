@@ -47,6 +47,75 @@ def test_runtime_enabled_market_is_protected(tmp_path):
     assert not _refs(tmp_path, "runtime")
 
 
+def test_live_signal_panel_default_is_protected_without_a_configured_cache_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", raising=False)
+    _market(tmp_path, enabled=True, output_dir="artifacts/markets/live-model")
+    root = tmp_path / "artifacts/cache/live_signal_panels"
+    refs = artifact_service_references((root,), tmp_path)[str(root)]
+    assert any("live_panel_disk_cache_root" in value for value in refs)
+    _market(tmp_path, enabled=False, output_dir="artifacts/markets/live-model")
+    assert artifact_service_references((root,), tmp_path)[str(root)] == []
+
+
+def test_live_signal_panel_environment_override_is_protected(tmp_path, monkeypatch):
+    root = tmp_path / "private-live-cache"
+    monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", str(root))
+    _market(tmp_path, enabled=True)
+    assert artifact_service_references((root,), tmp_path)[str(root)]
+
+
+def test_dashboard_supervisor_default_cache_is_protected_without_inherited_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", raising=False)
+    _market(tmp_path, enabled=True)
+    root = tmp_path / "artifacts/cache/tw_day_trade_dashboard_indexes"
+    assert any("dashboard_index_cache_dir" in ref
+               for ref in artifact_service_references((root,), tmp_path)[str(root)])
+    _market(tmp_path, enabled=False)
+    assert artifact_service_references((root,), tmp_path)[str(root)] == []
+
+
+def test_dashboard_cache_override_resolves_against_repository(tmp_path, monkeypatch):
+    _market(tmp_path, enabled=True)
+    root = tmp_path / "private-dashboard-cache"
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", "private-dashboard-cache")
+    assert artifact_service_references((root,), tmp_path)[str(root)]
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(root))
+    assert artifact_service_references((root,), tmp_path)[str(root)]
+
+
+def test_minute_maintenance_implicit_sources_are_protected(tmp_path):
+    _market(tmp_path, enabled=True)
+    root = tmp_path / "artifacts/data_repair/tw_day_trade_minute_curve"
+    assert any("local_minute_source" in ref
+               for ref in artifact_service_references((root,), tmp_path)[str(root)])
+    sibling = root.with_name("tw_day_trade_minute_curve_old_unused")
+    assert artifact_service_references((sibling,), tmp_path)[str(sibling)] == []
+
+
+def test_service_protects_relative_data_view_input_paths(tmp_path):
+    _market(tmp_path, enabled=True, input_root="data_tw_minute/research_dataset_developing_v5")
+    root = tmp_path / "data_tw_minute/research_dataset_developing_v5"
+    assert artifact_service_references((root,), tmp_path)[str(root)]
+    sibling = root.with_name("research_dataset_schema2_volume_bug_20260807")
+    assert artifact_service_references((sibling,), tmp_path)[str(sibling)] == []
+
+
+def test_replay_pins_protect_nondefault_sources_even_when_temporarily_missing(tmp_path):
+    state = tmp_path / "private-replay"
+    _market(tmp_path, enabled=False, overnight_simulation_enabled=True,
+            day_trade_simulation_state_dir=str(state))
+    state.mkdir()
+    root = tmp_path / "artifacts/data_repair/nondefault-originals"
+    receipt = state / "rebuild_receipt.json"
+    receipt.write_text(json.dumps({"sessions": [{"session_date": "2026-02-25",
+        "intraday_replay": {"source_files": [{"path": str(root / "minute.parquet"), "sha256": "a" * 64}]}}]}))
+    assert any("intraday_replay.source_files" in ref
+               for ref in artifact_service_references((root,), tmp_path)[str(root)])
+    receipt.write_text(json.dumps({"sessions": [{"intraday_replay": {"source_files": []}}]}))
+    with pytest.raises(SnapshotError, match="source pins"):
+        artifact_service_references((root,), tmp_path)
+
+
 def test_market_default_enabled_matches_runtime_loader(tmp_path):
     _market(tmp_path, output_dir="artifacts/markets/default")
     assert _refs(tmp_path, "default")
@@ -103,6 +172,17 @@ def test_experiment_inputs_and_initialization_are_protected(tmp_path, monkeypatc
     )
     assert _refs(tmp_path, "input") and _refs(tmp_path, "init")
     assert {path.name for path in loaded} == {"active.yaml", "candidate.yaml"}
+
+
+def test_resolved_experiment_path_objects_are_protected(tmp_path, monkeypatch):
+    @dataclass
+    class Config:
+        data: dict = field(default_factory=lambda: {
+            "parquet_root": Path("data_tw_minute/research_dataset_developing_v5")})
+    monkeypatch.setattr("stockagent.config.load_config", lambda path: Config())
+    _market(tmp_path, enabled=True, config_path="configs/active.yaml")
+    root = tmp_path / "data_tw_minute/research_dataset_developing_v5"
+    assert artifact_service_references((root,), tmp_path)[str(root)]
 
 
 def test_managed_alias_and_resolved_target_both_protected(tmp_path):

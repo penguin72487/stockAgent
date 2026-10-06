@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from scripts.publish_backup_handoff import FILES, publish_handoff
+from scripts.publish_backup_handoff import FILES, PIPELINE_FILES, publish_handoff
 from scripts.verify_backup_delivery import verify
 from stockagent.data_sync.backup_stream import BackupStream
 
@@ -88,3 +88,34 @@ def test_installer_bootstrap_does_not_write_bytecode_into_closed_synced_package(
                    cwd=root.parent, capture_output=True, check=True)
     assert not list(root.rglob("__pycache__"))
     verify(root, proof["envelope_identity_sha256"])
+
+
+def test_v10_parallel_installer_is_frozen_complete_and_does_not_mutate_package(handoff_queue):
+    for version in ("v8","v9"):
+        with pytest.raises(ValueError,match="targets v10"):
+            publish_handoff(handoff_queue,"continuous-backup-20261004-"+version)
+    proof = publish_handoff(handoff_queue, "continuous-backup-20261004-v10")
+    root = Path(proof["source_path"])
+    assert proof["source_files"] == len(FILES)+len(PIPELINE_FILES)
+    code = ("import sys;sys.path.insert(0,sys.argv[1]);import stockagent.data_sync.backup_relay_pipeline;"
+            "import scripts.benchmark_lab203_backup_pipeline;import scripts.install_lab203_backup_pipeline")
+    subprocess.run([sys.executable,"-I","-B","-c",code,str(root)],cwd=root.parent,check=True)
+    subprocess.run([sys.executable,"-I",str(root/"scripts/install_lab203_backup_pipeline.py"),"--help"],
+        cwd=root.parent,capture_output=True,check=True)
+    assert not list(root.rglob("__pycache__"))
+    verify(root,proof["envelope_identity_sha256"],workers=4)
+    pins = __import__("json").loads((handoff_queue.transport/"tools/automatic-backup-bootstrap-v10.json").read_bytes())
+    assert pins["envelope_identity_sha256"] == proof["envelope_identity_sha256"]
+
+
+def test_control_handoff_does_not_wait_for_or_mutate_the_active_data_owner(handoff_queue):
+    queue=handoff_queue
+    before=queue.load_ledger()
+    with (queue.state/"owner.lock").open("a") as owner:
+        fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        proof=publish_handoff(queue,"continuous-backup-20261004-v10",physical_transport_alias=queue.transport)
+        assert proof["publication_scope"] == "immutable_control_namespace_only"
+        assert queue.load_ledger() == before and not queue.ledger_path.exists()
+        verify(Path(proof["source_path"]),proof["envelope_identity_sha256"],workers=4)
+    with pytest.raises(ValueError,match="cannot mutate"):
+        publish_handoff(queue,"continuous-backup-20261004-v5",physical_transport_alias=queue.transport,publish_recovery_tasks=True)

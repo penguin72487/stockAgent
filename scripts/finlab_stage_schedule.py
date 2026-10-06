@@ -43,6 +43,7 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
                           for stage in STAGE_PRIORITY}
     stage_finishes = {stage: now.isoformat() for stage, count in remaining_by_stage.items() if not count}
     completions = {}
+    starts = {}
     stages_started = {}
     work = waits = queue_wait = 0.0
     resets = arrivals = processed = 0
@@ -56,7 +57,8 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
                 "quota_opening_wait_seconds": round(waits, 1), "queue_wait_seconds": round(queue_wait, 1),
                 "quota_resets": resets, "newly_due_checks": arrivals, "simulated_checks": processed,
                 "quota_share": quota_share, "duration_factor": duration_factor,
-                "key_finish_at_utc": completions, "stage_finish_at_utc": stage_finishes,
+                "key_finish_at_utc": completions, "key_start_at_utc": starts,
+                "stage_finish_at_utc": stage_finishes,
                 "stage_start_at_utc": stages_started}
 
     observed = utc_time(quota.get("observed_at_utc"))
@@ -223,6 +225,7 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
             heapq.heapify(ready)
         if key in targets:
             stages_started.setdefault(row["queue_role"], cursor.isoformat())
+            starts[key] = cursor.isoformat()
         duration = seconds * duration_factor
         cursor += timedelta(seconds=duration)
         work += duration
@@ -314,7 +317,8 @@ def stage_summary(rows: list[dict], scenarios: dict, *, now: datetime, tick: dic
 
 def next_release_waves(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
                        next_run: datetime | None, opening_policy=None, refresh_days=1,
-                       dispatch_interval_seconds=DISPATCH_INTERVAL_SECONDS) -> dict:
+                       dispatch_interval_seconds=DISPATCH_INTERVAL_SECONDS,
+                       handoff_seconds: dict | None = None) -> dict:
     """Forecast each stage's first *observed* future expiry wave, not all future data.
 
     This is distinct from today's completion. All other stages can still
@@ -335,15 +339,21 @@ def next_release_waves(rows: list[dict], *, now: datetime, quota: dict, reserve_
         estimates = {}
         for name, factor, share in (("fast", .75, 1), ("reference", 1, 1), ("slow", 1.5, .5)):
             lag = 0 if name == "fast" else dispatch_interval_seconds * (.5 if name == "reference" else 1)
+            lag += (handoff_seconds or {}).get(name, 0)
             dispatched = [dict(r, ready_at_utc=(first+timedelta(seconds=lag)).isoformat())
                           if r["key"] in keys else r for r in targets]
             estimate = forecast(dispatched, now=now, quota=quota, reserve_mb=reserve_mb,
                                 next_run=next_run, duration_factor=factor, quota_share=share,
                                 opening_policy=opening_policy, refresh_days=refresh_days,
                                 horizon_days=14, max_jobs=4000)
-            finish = estimate.get("stage_finish_at_utc", {}).get(stage)
+            # A stage can already have debt before this future wave. Its
+            # stage-wide start/finish would conflate two different workloads.
+            key_starts = estimate.get("key_start_at_utc", {})
+            key_finishes = estimate.get("key_finish_at_utc", {})
+            starts_in_wave = [key_starts[k] for k in keys if k in key_starts]
+            finish = max(key_finishes[k] for k in keys) if keys <= key_finishes.keys() else None
             estimates[name] = {"state": "conditional" if finish else estimate["state"],
-                               "start_at_utc": estimate.get("stage_start_at_utc", {}).get(stage),
+                               "start_at_utc": min(starts_in_wave) if starts_in_wave else None,
                                "finish_at_utc": finish}
         result[stage] = {"check_at_utc": first.isoformat(), "keys": len(wave),
                          "dispatch_interval_seconds": dispatch_interval_seconds,

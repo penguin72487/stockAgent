@@ -208,6 +208,44 @@ def _config():
     return load_config("configs/experiment_baseline.yaml")
 
 
+@pytest.mark.parametrize(
+    "execution_mode,backward_contract_key",
+    [
+        ("tw_stock_context_futures_portfolio", "futures_margin_backward_contract_version"),
+        ("crypto_perpetual", "crypto_backward_contract_version"),
+    ],
+)
+def test_pca_schedule_coexists_with_market_training_contracts(
+    execution_mode: str,
+    backward_contract_key: str,
+) -> None:
+    from stockagent.training.checkpoint_contract import (
+        _stable_fingerprint,
+        _training_checkpoint_contract,
+    )
+
+    config = _config()
+    config.training.model_name = "financial_transformer"
+    config.training.financial_transformer.temporal_basis_families = ["pca_klt"]
+    config.trading.execution_mode = execution_mode
+    config.trading.tw_futures_portfolio_capital_basis = "initial_margin"
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        config.training.futures_training_max_drawdown = 0.2
+    before = _training_checkpoint_contract(config)
+    config.training.temporal_basis_covariance_lag_batch_size = 8
+    after = _training_checkpoint_contract(config)
+    assert after["temporal_basis_covariance_schedule"]["lag_batch_size"] == min(
+        8, config.training.lookback
+    )
+    assert after[backward_contract_key] == before[backward_contract_key]
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        assert after["exact_policy_step"]["training_max_drawdown"] == 0.2
+    assert _stable_fingerprint(before) != _stable_fingerprint(after)
+    without_pca_schedule = dict(after)
+    without_pca_schedule.pop("temporal_basis_covariance_schedule")
+    assert without_pca_schedule == before
+
+
 def _day_trade_minute_panel() -> PanelData:
     panel = _panel()
     rows, symbols = panel.tradable_mask.shape

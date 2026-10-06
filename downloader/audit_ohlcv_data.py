@@ -57,6 +57,7 @@ class AuditResult:
     nan_ohlc_rows: int = 0
     bad_ohlc_rows: int = 0
     nonpositive_price_rows: int = 0
+    infinite_value_rows: int = 0
     negative_volume_rows: int = 0
     issues: str | None = None
     message: str | None = None
@@ -79,6 +80,7 @@ AUDIT_REPORT_SCHEMA: dict[str, pl.DataType] = {
     "nan_ohlc_rows": pl.Int64,
     "bad_ohlc_rows": pl.Int64,
     "nonpositive_price_rows": pl.Int64,
+    "infinite_value_rows": pl.Int64,
     "negative_volume_rows": pl.Int64,
     "issues": pl.String,
     "message": pl.String,
@@ -238,8 +240,6 @@ def _numeric_frame(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
 def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
     root, path, args = payload
     code = _code_from_path(path)
-    result = AuditResult(root=str(root), code=code, path=str(path), status="ok")
-    issues: list[str] = []
 
     try:
         frame, columns = _read_audit_frame(path)
@@ -252,6 +252,15 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
             issues="read_error",
             message=str(exc),
         )
+
+    return _audit_frame(root, path, args, frame, columns)
+
+
+def _audit_frame(root: Path, path: Path, args: argparse.Namespace,
+                 frame: pl.DataFrame, columns: set[str]) -> AuditResult:
+    """Shared checks on an already-read logical table; avoid a second decode."""
+    result = AuditResult(root=str(root), code=_code_from_path(path), path=str(path), status="ok")
+    issues: list[str] = []
 
     result.rows = int(frame.height)
     missing_required = [column for column in REQUIRED_COLUMNS if column not in columns]
@@ -350,6 +359,14 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
         )
         if result.negative_volume_rows:
             issues.append("negative_volume")
+
+    value_columns = [column for column in (*ohlc_columns, "Trading_Volume") if column in frame.columns]
+    if value_columns:
+        numeric = _numeric_frame(frame, value_columns)
+        result.infinite_value_rows = int(numeric.select(
+            pl.any_horizontal(pl.all().is_infinite()).fill_null(False).sum()).item())
+        if result.infinite_value_rows:
+            issues.append("infinite_values")
 
     if result.invalid_dates:
         issues.append("invalid_dates")

@@ -17,6 +17,7 @@ param(
     [Parameter(Mandatory=$true)][long]$ExpectedExcelWindow
 )
 $ErrorActionPreference='Stop'
+$bridgeClock=[Diagnostics.Stopwatch]::StartNew()
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -235,14 +236,19 @@ public static class TejBridgeNative {
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: source combo text readback unresolved");
         return text.ToString();
     }
+    public static long SignedControlResult(long value) {
+        // A 32-bit vendor can zero-extend CB_ERR into a 64-bit LRESULT.
+        // Normalize only that exact sentinel, never truncate valid handles.
+        return value==0xFFFFFFFFL ? -1 : value;
+    }
     public static string SelectedComboText(long root,long control) {
         // Exact no-data modal recovery must read the ORIGINAL disabled source
         // selections without enabling them. Read-only identity is not action
         // permission; source mutations keep their separate editable guards.
-        ComboScope(root,control,false);long index=Message(control,0x147u,0,0);
+        ComboScope(root,control,false);long index=SignedControlResult(Message(control,0x147u,0,0));
         if(index<0)return null;
         string value=ComboItem(control,index);
-        if(Message(control,0x147u,0,0)!=index)
+        if(SignedControlResult(Message(control,0x147u,0,0))!=index)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: source combo changed during readback");
         return value;
     }
@@ -254,7 +260,7 @@ public static class TejBridgeNative {
         if(count<1||count>150000)return -1;
         if(WriteText(new IntPtr(control),0x158u,new IntPtr(-1),label,2,10000,out result)==IntPtr.Zero)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact combo lookup unresolved");
-        long first=result.ToInt64(),index=first;int exact=-1;
+        long first=SignedControlResult(result.ToInt64()),index=first;int exact=-1;
         if(first<0)return -1;
         // CB_FINDSTRINGEXACT is case-insensitive. Independently compare the
         // actual Unicode text with Ordinal semantics, visit equivalent-case
@@ -266,7 +272,7 @@ public static class TejBridgeNative {
             }
             if(WriteText(new IntPtr(control),0x158u,new IntPtr(index),label,2,10000,out result)==IntPtr.Zero)
                 throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: combo duplicate check unresolved");
-            index=result.ToInt64();
+            index=SignedControlResult(result.ToInt64());
             if(index==first)return exact;
             if(index<0)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: combo menu changed during lookup");
         }
@@ -294,6 +300,69 @@ public static class TejBridgeNative {
         Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(new IntPtr(h),0xFFFFFFFCu,ref iid,out a));
         try {return a.get_accDefaultAction(0)??"";}
         finally {if(Marshal.IsComObject(a))Marshal.ReleaseComObject(a);}
+    }
+    public static string AccessibleName(long h) {
+        Guid iid=new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");Accessibility.IAccessible a;
+        Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(new IntPtr(h),0xFFFFFFFCu,ref iid,out a));
+        try {return (a.get_accName(0)??"").Trim();}
+        finally {if(Marshal.IsComObject(a))Marshal.ReleaseComObject(a);}
+    }
+    public static long ExactButton(long root,long parent,string name,int minimumTop) {
+        return ExactButton(root,parent,name,minimumTop,0);
+    }
+    public static long ExactButton(long root,long parent,string name,int minimumTop,int requiredRole) {
+        // Search real owned widget names directly. Do not enumerate virtual
+        // list rows, scroll a page, or cache a mutable result between queries.
+        IntPtr r=new IntPtr(root),p=new IntPtr(parent);uint rp,pp;
+        uint rt=GetWindowThreadProcessId(r,out rp),pt=GetWindowThreadProcessId(p,out pp);
+        if(!IsWindow(r)||!IsWindow(p)||(r!=p&&!IsChild(r,p))||rp==0||rp!=pp||rt!=pt)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: button group identity changed");
+        long found=0;
+        foreach(long h in Children(parent,"WindowsForms10.BUTTON.")) {
+            if(!IsWindowVisible(new IntPtr(h)))continue;
+            uint hp;if(GetWindowThreadProcessId(new IntPtr(h),out hp)!=rt||hp!=rp)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: button owner differs");
+            Rect rect;if(!GetWindowRect(new IntPtr(h),out rect))
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: button geometry unresolved");
+            if(rect.Top<minimumTop||Text(h).Trim()!=name)continue;
+            if(requiredRole!=0&&AccessibleState(h)[0]!=requiredRole)continue;
+            if(found!=0)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: ambiguous exact named button");
+            found=h;
+        }
+        if(found==0)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact named button absent");
+        return found;
+    }
+    public static void VerifyResolvedButton(long root,long parent,long button,int expectedPid,string title,string name) {
+        // One managed boundary, the SAME fresh mutable checks per click.
+        // Batching these checks does not cache an authorization verdict.
+        AssertControlScope(root,parent,expectedPid,title);
+        AssertControlScope(root,button,expectedPid,title);
+        IntPtr p=new IntPtr(parent),b=new IntPtr(button);
+        if(!IsChild(p,b)||!WindowClass(button).StartsWith("WindowsForms10.BUTTON.",StringComparison.Ordinal)||
+           Text(button).Trim()!=name||Dialogs(root).Length!=0||!IsWindowEnabled(b)||!IsWindowVisible(b))
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: resolved button identity/state changed");
+    }
+    public static long ExactQueryGroup(long root,string name,int expectedPid,string title) {
+        // Native GroupBox captions, NOT all widgets' cross-process UIA names.
+        // Resolve every time; still reject missing/duplicate/foreign groups.
+        AssertControlScope(root,root,expectedPid,title);
+        long found=0;
+        foreach(long h in Children(root,"WindowsForms10.")) {
+            string cls=WindowClass(h);
+            bool nativeGroup=cls.StartsWith("WindowsForms10.BUTTON.",StringComparison.Ordinal)&&(GetWindowLong(new IntPtr(h),-16)&0xF)==7;
+            // WinForms uses a user-painted Window-class GroupBox as well as
+            // native BS_GROUPBOX. Caption + GROUPING role certify both, never
+            // assume its HWND class is BUTTON from the visual appearance.
+            if(!IsWindowVisible(new IntPtr(h))||(!nativeGroup&&!cls.StartsWith("WindowsForms10.Window.",StringComparison.Ordinal)))continue;
+            AssertControlScope(root,h,expectedPid,title);
+            if(Text(h)!=name)continue;
+            if(AccessibleState(h)[0]!=20)throw new Exception("Native query caption is not a grouping control");
+            if(found!=0)throw new Exception("Missing/ambiguous native query group");
+            found=h;
+        }
+        if(found==0)throw new Exception("Missing/ambiguous native query group");
+        AssertControlScope(root,found,expectedPid,title);
+        return found;
     }
     public static void VerifyPreviewAction(long root,long button) {
         IntPtr r=new IntPtr(root),b=new IntPtr(button);uint rp,bp;
@@ -420,31 +489,105 @@ public static class TejBridgeNative {
             " style="+style+" afterClear="+afterClear+" afterSelect="+afterSelect+" afterCaret="+afterCaret+
             "; no Select action sent");
     }
-    public static int ExactListIndex(long root,long control,string label) {
+    private static long VerifyLookupList(long root,long control) {
         // Ask the real source list for one exact name, then independently read
         // it back. Downloads need <=32 companies, not 56,000 cross-process
         // text reads on every query. Discovery still inventories the full list.
         IntPtr r=new IntPtr(root),h=new IntPtr(control);uint rp,cp;
         uint rt=GetWindowThreadProcessId(r,out rp),ct=GetWindowThreadProcessId(h,out cp);
         if(!IsWindow(r)||!IsChild(r,h)||rp==0||rp!=cp||rt!=ct||
-           !IsWindowEnabled(h)||!IsWindowVisible(h)||String.IsNullOrEmpty(label)||label.Length>4096||Dialogs(root).Length!=0)
+           !IsWindowEnabled(r)||!IsWindowEnabled(h)||!IsWindowVisible(h)||Dialogs(root).Length!=0)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list lookup scope unavailable");
         var cls=new StringBuilder(256);GetClassNameW(h,cls,256);
         if(!cls.ToString().StartsWith("WindowsForms10.LISTBOX.",StringComparison.Ordinal))
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: unreviewed lookup control class");
-        long count=Message(control,0x18B,0,0);IntPtr result;
+        long count=Message(control,0x18B,0,0);
+        if(count<1||count>150000)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list count out of bounds");
+        return count;
+    }
+    private static int ExactListIndexCore(long control,string label,long count) {
+        IntPtr h=new IntPtr(control),result;
+        if(String.IsNullOrEmpty(label)||label.Length>4096)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label bound differs");
         if(count<1||count>150000||WriteText(h,0x1A2u,new IntPtr(-1),label,2,10000,out result)==IntPtr.Zero)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list lookup unresolved");
-        long index=result.ToInt64();
+        long first=SignedControlResult(result.ToInt64()),index=first;int exact=-1;
         if(index<0||index>=count)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label absent");
-        long length=Message(control,0x18A,index,0);
-        if(length<0||length>4096)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact source label bound differs");
-        var actual=new StringBuilder((int)length+1);
-        if(ReadText(h,0x189,new IntPtr(index),actual,2,10000,out result)==IntPtr.Zero||actual.ToString()!=label)
-            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact source label readback differs");
-        if(WriteText(h,0x1A2u,new IntPtr(index),label,2,10000,out result)==IntPtr.Zero||result.ToInt64()!=index)
-            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate or unresolved exact source label");
-        return (int)index;
+        // LB_FINDSTRINGEXACT is case-insensitive too. Visit only equivalent
+        // names, compare Unicode Ordinal and reject duplicate exact labels.
+        for(long scanned=0;scanned<count;scanned++) {
+            long length=Message(control,0x18A,index,0);
+            if(length<0||length>4096)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact source label bound differs");
+            var actual=new StringBuilder((int)length+1);
+            if(ReadText(h,0x189,new IntPtr(index),actual,2,10000,out result)==IntPtr.Zero)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact source label readback unresolved");
+            if(actual.ToString()==label) {
+                if(exact>=0)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate exact source label");
+                exact=(int)index;
+            }
+            if(WriteText(h,0x1A2u,new IntPtr(index),label,2,10000,out result)==IntPtr.Zero)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: list duplicate check unresolved");
+            index=SignedControlResult(result.ToInt64());
+            if(index==first) {
+                if(exact<0)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact source label readback differs");
+                return exact;
+            }
+            if(index<0||index>=count)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: list changed during search");
+        }
+        throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list search did not wrap within count");
+    }
+    public static int ExactListIndex(long root,long control,string label) {
+        return ExactListIndexCore(control,label,VerifyLookupList(root,control));
+    }
+    public static int[] ExactListIndices(long root,long control,string[] labels,int expectedPid,string title) {
+        // Read-only batch: one before/after modal/owner check, not an EnumWindows
+        // traversal for EVERY name. No selection authorization is cached; the
+        // action path independently checks the live identity/state per item.
+        AssertControlScope(root,control,expectedPid,title);
+        long count=VerifyLookupList(root,control);
+        if(labels==null||labels.Length<1||labels.Length>2000)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: lookup batch bound differs");
+        var seen=new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+        var indices=new int[labels.Length];
+        for(int i=0;i<labels.Length;i++) {
+            if(!seen.Add(labels[i]))throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate requested label");
+            indices[i]=ExactListIndexCore(control,labels[i],count);
+        }
+        AssertControlScope(root,control,expectedPid,title);
+        if(VerifyLookupList(root,control)!=count)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: list changed during batch lookup");
+        return indices;
+    }
+    public static void SelectListBatch(long root,long parent,long source,long target,long button,
+                                       int[] indices,string[] labels,int expectedPid,string title,bool companyGeometry) {
+        if(indices==null||labels==null||indices.Length!=labels.Length||labels.Length<1||labels.Length>2000)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: selection batch bound differs");
+        var seen=new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+        foreach(string label in labels)
+            if(String.IsNullOrEmpty(label)||!seen.Add(label))throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate/empty selection label");
+        AssertControlScope(root,target,expectedPid,title);
+        WaitSelectedList(root,target,0,null);
+        for(int i=0;i<labels.Length;i++) {
+            // All checks remain FRESH before each normal model event/action.
+            AssertControlScope(root,source,expectedPid,title);
+            AssertControlScope(root,target,expectedPid,title);
+            VerifyResolvedButton(root,parent,button,expectedPid,title,"Select");
+            if(!IsChild(new IntPtr(parent),new IntPtr(source))||!IsChild(new IntPtr(parent),new IntPtr(target))||
+               !IsWindowEnabled(new IntPtr(root))||!IsWindowEnabled(new IntPtr(parent)))
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: selection lists changed parent/state");
+            SelectListItem(root,source,indices[i],labels[i]);
+            VerifyResolvedButton(root,parent,button,expectedPid,title,"Select");
+            if(companyGeometry) {
+                Rect listRect,buttonRect;
+                if(!GetWindowRect(new IntPtr(source),out listRect)||!GetWindowRect(new IntPtr(button),out buttonRect)||buttonRect.Top<listRect.Bottom)
+                    throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: company list button geometry changed");
+            }
+            Message(button,0xF5u,0,0); // Exactly ONE action, never a timeout fallback.
+            WaitSelectedList(root,target,i+1,labels[i]);
+        }
+        AssertControlScope(root,target,expectedPid,title);
+        if(!SameItems(Items(target,false),labels))
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: full selected batch differs");
     }
     public static void WaitSelectedList(long root,long control,int expectedCount,string appendedName) {
         // A normal Select button may enqueue the WinForms update. Sent read
@@ -560,26 +703,34 @@ public static class TejBridgeNative {
     public static string[] PreviewHeader(long grid,int maxColumns) {
         Guid iid=new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");Accessibility.IAccessible a;
         Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(new IntPtr(grid),0xFFFFFFFCu,ref iid,out a));
-        if(a.accChildCount<1)return new string[0];
-        var row=a.get_accChild(1) as Accessibility.IAccessible;
-        if(row==null)return new string[0];
-        int columns=row.accChildCount;
-        if(columns>maxColumns+2)return new string[0];
-        var cells=new System.Collections.Generic.List<string>();
-        for(int c=1;c<=columns;c++) {
-            var cell=row.get_accChild(c) as Accessibility.IAccessible;
-            cells.Add(cell!=null?cell.get_accName(0):row.get_accName(c));
-        }
-        return cells.ToArray();
+        try {
+            if(a.accChildCount<1)return new string[0];
+            var row=a.get_accChild(1) as Accessibility.IAccessible;
+            try {
+                if(row==null)return new string[0];
+                int columns=row.accChildCount;
+                if(columns>maxColumns+2)return new string[0];
+                var cells=new System.Collections.Generic.List<string>();
+                for(int c=1;c<=columns;c++) {
+                    var cell=row.get_accChild(c) as Accessibility.IAccessible;
+                    try {cells.Add(cell!=null?cell.get_accName(0):row.get_accName(c));}
+                    finally {ReleaseAccessible(cell);}
+                }
+                return cells.ToArray();
+            }finally {ReleaseAccessible(row);}
+        }finally {ReleaseAccessible(a);}
     }
     public static int[] PreviewShape(long grid) {
         // Metadata only. A wide/different or empty result must not all look
         // like an empty header diagnostic; never read data-cell values here.
         Guid iid=new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");Accessibility.IAccessible a;
         Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(new IntPtr(grid),0xFFFFFFFCu,ref iid,out a));
-        int rows=a.accChildCount;if(rows<1)return new int[]{rows,0};
-        var header=a.get_accChild(1) as Accessibility.IAccessible;
-        return new int[]{rows,header==null?0:header.accChildCount};
+        try {
+            int rows=a.accChildCount;if(rows<1)return new int[]{rows,0};
+            var header=a.get_accChild(1) as Accessibility.IAccessible;
+            try {return new int[]{rows,header==null?0:header.accChildCount};}
+            finally {ReleaseAccessible(header);}
+        }finally {ReleaseAccessible(a);}
     }
     public static int PreviewRowLowerBound(long grid,int stopAfter) {
         // Metadata only: stop once overflow is proved, not at the end of a
@@ -657,7 +808,7 @@ public static class TejBridgeNative {
     private static extern int AccessibleChildren(Accessibility.IAccessible container,int start,int count,
         [Out,MarshalAs(UnmanagedType.LPArray,ArraySubType=UnmanagedType.Struct,SizeParamIndex=2)] object[] children,
         out int obtained);
-    public const string ReadbackContract="shared_rows_batched_msaa_preview_full_v1";
+    public const string ReadbackContract="owned_mta4_shared_row_complete_stability_v7";
     private static void ReleaseAccessible(object value) {
         if(value!=null&&Marshal.IsComObject(value))Marshal.ReleaseComObject(value);
     }
@@ -703,7 +854,40 @@ public static class TejBridgeNative {
     }
     public static object[] Preview(long grid,int maxRows,int maxColumns) {
         var sourceRows=SourceRows(grid,maxRows);
-        return PreviewRows(sourceRows,maxColumns);
+        try {return PreviewRows(sourceRows,maxColumns);}
+        finally {ReleaseRows(sourceRows);}
+    }
+    private static void VerifyPreviewRowStability(long grid,int maxRows,int expectedRows) {
+        // Recheck EVERY current child role through the standard MSAA child-ID
+        // property, not thousands of new IDispatch/RCW objects. Dimensions,
+        // role allowlist and exact record-row count are all still checked.
+        // Unsupported child IDs alone use the original complete enumeration.
+        Guid iid=new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");Accessibility.IAccessible a;
+        Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(new IntPtr(grid),0xFFFFFFFCu,ref iid,out a));
+        bool unsupported=false;
+        try {
+            int count=a.accChildCount,rows=0;
+            if(count<1||count>maxRows+4)throw new Exception("Preview row bound exceeded");
+            for(int i=1;i<=count;i++) {
+                object value;
+                try {value=a.get_accRole(i);}
+                catch(COMException error) {
+                    if(error.ErrorCode!=unchecked((int)0x80020003)&&error.ErrorCode!=unchecked((int)0x80070057))throw;
+                    unsupported=true;break;
+                }
+                if(!(value is int))throw new Exception("Unreviewed native child-role type");
+                int role=(int)value;
+                if(role==28)rows++;
+                else if(role!=3)throw new Exception("Unexpected non-row grid child role="+role);
+            }
+            if(!unsupported&&(a.accChildCount!=count||rows!=expectedRows))
+                throw new Exception("Source grid changed during readback");
+        }finally {ReleaseAccessible(a);}
+        if(unsupported) {
+            var verifiedRows=SourceRowsBatched(grid,maxRows);
+            try {if(verifiedRows.Length!=expectedRows)throw new Exception("Source grid changed during readback");}
+            finally {ReleaseRows(verifiedRows);}
+        }
     }
     private static object[] PreviewRows(Accessibility.IAccessible[] sourceRows,int maxColumns) {
         var result=new System.Collections.Generic.List<object>();
@@ -716,8 +900,10 @@ public static class TejBridgeNative {
             var cells=new System.Collections.Generic.List<string>();
             for(int c=1;c<=columns;c++) {
                 Accessibility.IAccessible cell=row.get_accChild(c) as Accessibility.IAccessible;
-                cells.Add(i==1?(cell!=null?cell.get_accName(0):row.get_accName(c)):
-                    (cell!=null?cell.get_accValue(0):row.get_accValue(c)));
+                try {
+                    cells.Add(i==1?(cell!=null?cell.get_accName(0):row.get_accName(c)):
+                        (cell!=null?cell.get_accValue(0):row.get_accValue(c)));
+                }finally {ReleaseAccessible(cell);}
             }
             result.Add(new object[]{i,cells.ToArray()});
         }
@@ -757,14 +943,32 @@ public static class TejBridgeNative {
     public static object[][] FullPreview(long grid,int maxRows,int maxColumns,out int objectFallbackCells,
                                         string progressPath,string task,string attempt) {
         var sourceRows=SourceRows(grid,maxRows);
-        return FullPreviewRows(grid,maxRows,maxColumns,sourceRows,false,out objectFallbackCells,progressPath,task,attempt);
+        try {return FullPreviewRows(grid,maxRows,maxColumns,sourceRows,false,out objectFallbackCells,progressPath,task,attempt);}
+        finally {ReleaseRows(sourceRows);}
     }
     public static object[][] CaptureFullPreview(long grid,int maxRows,int maxColumns,out int objectFallbackCells,
                                                 out object[] sample,out double[] timing,
                                                 string progressPath,string task,string attempt) {
+        // Only HWND/bounds/strings cross apartments. The worker acquires and
+        // releases its OWN public COM interfaces; no UI actions or queries.
+        object[][] result=null;object[] workerSample=null;double[] workerTiming=null;
+        int fallback=0;Exception error=null;
+        var worker=new System.Threading.Thread(()=>{
+            try {result=CaptureFullPreviewCore(grid,maxRows,maxColumns,out fallback,
+                out workerSample,out workerTiming,progressPath,task,attempt);}
+            catch(Exception failure){error=failure;}
+        });
+        worker.IsBackground=true;worker.SetApartmentState(System.Threading.ApartmentState.MTA);worker.Start();
+        if(!worker.Join(300000))throw new TimeoutException("Owned readback worker unresolved; preserve source attempt, no query repeat");
+        if(error!=null)throw new Exception("Owned complete readback failed",error);
+        objectFallbackCells=fallback;sample=workerSample;timing=workerTiming;return result;
+    }
+    private static object[][] CaptureFullPreviewCore(long grid,int maxRows,int maxColumns,out int objectFallbackCells,
+                                                out object[] sample,out double[] timing,
+                                                string progressPath,string task,string attempt) {
         // Share the first validated enumeration between the independent
         // object-path sample and child-ID full readback. Retain a SECOND full
-        // enumeration for post-readback stability. No omitted verification,
+        // role/count read for post-readback stability. No omitted verification,
         // cached source values across attempts, parallel UI actions or queries.
         var clock=System.Diagnostics.Stopwatch.StartNew();
         var sourceRows=SourceRowsBatched(grid,maxRows);double enumeration=clock.Elapsed.TotalSeconds;
@@ -779,6 +983,9 @@ public static class TejBridgeNative {
     private static object[][] FullPreviewRows(long grid,int maxRows,int maxColumns,
                                         Accessibility.IAccessible[] sourceRows,bool batchedVerification,
                                         out int objectFallbackCells,string progressPath,string task,string attempt) {
+        if(batchedVerification&&sourceRows.Length>=512&&
+           System.Threading.Thread.CurrentThread.GetApartmentState()==System.Threading.ApartmentState.MTA)
+            return ParallelPreviewRows(grid,maxRows,maxColumns,sourceRows,out objectFallbackCells,progressPath,task,attempt);
         objectFallbackCells=0;
         int count=sourceRows.Length;
         if(count<2)throw new Exception("Source Preview has no rows");
@@ -786,34 +993,8 @@ public static class TejBridgeNative {
         var progressClock=System.Diagnostics.Stopwatch.StartNew();
         WriteProgress(progressPath,task,attempt,"reading_preview",0,count-1);
         for(int i=1;i<=count;i++) {
-            var row=sourceRows[i-1];
-            // accChildCount is a cross-process COM call, not a local property.
-            // Read it once per row instead of once per financial cell.
-            int columns=row.accChildCount,skip=columns-maxColumns;
-            if(skip<0||skip>1)throw new Exception("Unexpected full Preview row schema at index "+i+": columns="+columns);
-            var cells=new object[maxColumns];bool blank=true;
-            // Header rows have a top-left corner child. Data rows in this
-            // vendor can omit their row-header child; prove each row's shape
-            // instead of shifting the company key out of the capture.
-            for(int c=skip+1;c<=columns;c++) {
-                string value;
-                if(i==1) {
-                    var cell=row.get_accChild(c) as Accessibility.IAccessible;
-                    value=cell!=null?cell.get_accName(0):row.get_accName(c);
-                } else {
-                    try {value=row.get_accValue(c);} // MSAA supports child IDs directly.
-                    catch(COMException error) {
-                        // Only an unsupported property/child ID uses the
-                        // established object path. A transport error stops.
-                        if(error.ErrorCode!=unchecked((int)0x80020003)&&error.ErrorCode!=unchecked((int)0x80070057))throw;
-                        var cell=row.get_accChild(c) as Accessibility.IAccessible;
-                        value=cell!=null?cell.get_accValue(0):row.get_accValue(c);objectFallbackCells++;
-                    }
-                }
-                if(value!=null)totalCharacters+=value.Length;
-                if(totalCharacters>64000000)throw new Exception("Source display text exceeds reviewed memory bound; preserve result for scoped recovery");
-                cells[c-skip-1]=value;if(!String.IsNullOrEmpty(value))blank=false;
-            }
+            bool blank;
+            var cells=ReadPreviewRow(sourceRows[i-1],i,maxColumns,ref totalCharacters,ref objectFallbackCells,out blank);
             if(i==count&&blank)continue; // DataGridView's empty new-row affordance.
             rows.Add(cells);
             // No new COM reads for progress, and no disk write per cell/row.
@@ -822,11 +1003,81 @@ public static class TejBridgeNative {
                 progressClock.Restart();
             }
         }
-        var verifiedRows=batchedVerification?SourceRowsBatched(grid,maxRows):SourceRows(grid,maxRows);
-        try {if(verifiedRows.Length!=count)throw new Exception("Source grid changed during readback");}
-        finally {ReleaseRows(verifiedRows);}
+        if(batchedVerification)VerifyPreviewRowStability(grid,maxRows,count);
+        else {
+            var verifiedRows=SourceRows(grid,maxRows);
+            try {if(verifiedRows.Length!=count)throw new Exception("Source grid changed during readback");}
+            finally {ReleaseRows(verifiedRows);}
+        }
         WriteProgress(progressPath,task,attempt,"reading_preview",count-1,count-1);
         return rows.ToArray();
+    }
+    private static object[][] ParallelPreviewRows(long grid,int maxRows,int maxColumns,
+                                        Accessibility.IAccessible[] sourceRows,out int objectFallbackCells,
+                                        string progressPath,string task,string attempt) {
+        // All RCWs originate and remain in the process MTA. Workers ONLY read
+        // disjoint complete rows; the query and every UI action stay serial.
+        // The final fresh whole-grid role/count verification is unchanged.
+        int count=sourceRows.Length,fallback=0,completed=0;long characters=0;
+        var result=new object[count][];
+        var progressClock=System.Diagnostics.Stopwatch.StartNew();var progressGuard=new object();
+        WriteProgress(progressPath,task,attempt,"reading_preview",0,count-1);
+        System.Threading.Tasks.Parallel.For(0,count,
+            new System.Threading.Tasks.ParallelOptions{MaxDegreeOfParallelism=4},i=>{
+            if(System.Threading.Thread.CurrentThread.GetApartmentState()!=System.Threading.ApartmentState.MTA)
+                throw new Exception("Unreviewed readback apartment; no partial adoption");
+            bool blank;
+            var cells=ReadPreviewRow(sourceRows[i],i+1,maxColumns,ref characters,ref fallback,out blank);
+            if(i!=count-1||!blank)result[i]=cells;
+            if(i>0)System.Threading.Interlocked.Increment(ref completed);
+            lock(progressGuard) {
+                if(progressClock.ElapsedMilliseconds>=2000) {
+                    WriteProgress(progressPath,task,attempt,"reading_preview",completed,count-1);
+                    progressClock.Restart();
+                }
+            }
+        });
+        if(completed!=count-1)throw new Exception("Incomplete parallel row readback; no partial adoption");
+        VerifyPreviewRowStability(grid,maxRows,count);
+        var rows=new System.Collections.Generic.List<object[]>();
+        for(int i=0;i<count;i++) {
+            if(result[i]==null) {
+                if(i!=count-1)throw new Exception("Missing complete parallel row; no partial adoption");
+            }else rows.Add(result[i]);
+        }
+        WriteProgress(progressPath,task,attempt,"reading_preview",count-1,count-1);
+        objectFallbackCells=fallback;return rows.ToArray();
+    }
+    private static object[] ReadPreviewRow(Accessibility.IAccessible row,int rowNumber,int maxColumns,
+                                         ref long totalCharacters,ref int fallback,out bool blank) {
+        // One shared value/shape/error contract for serial and parallel modes.
+        // The header can have one extra corner; prove EACH data row's layout.
+        // Preserve exact BSTR/null values, never parse/round financial numbers.
+        int columns=row.accChildCount,skip=columns-maxColumns;
+        if(skip<0||skip>1)throw new Exception("Unexpected full Preview row schema at index "+rowNumber+": columns="+columns);
+        var cells=new object[maxColumns];blank=true;
+        for(int c=skip+1;c<=columns;c++) {
+            string value;
+            if(rowNumber==1) {
+                var cell=row.get_accChild(c) as Accessibility.IAccessible;
+                try {value=cell!=null?cell.get_accName(0):row.get_accName(c);}
+                finally {ReleaseAccessible(cell);}
+            }else {
+                try {value=row.get_accValue(c);}
+                catch(COMException error) {
+                    // Unsupported property/ID alone uses the original path.
+                    // RPC, disconnection and unknown errors stop adoption.
+                    if(error.ErrorCode!=unchecked((int)0x80020003)&&error.ErrorCode!=unchecked((int)0x80070057))throw;
+                    var cell=row.get_accChild(c) as Accessibility.IAccessible;
+                    try {value=cell!=null?cell.get_accValue(0):row.get_accValue(c);System.Threading.Interlocked.Increment(ref fallback);}
+                    finally {ReleaseAccessible(cell);}
+                }
+            }
+            if(value!=null&&System.Threading.Interlocked.Add(ref totalCharacters,value.Length)>64000000)
+                throw new Exception("Source display text exceeds reviewed memory bound; preserve result for scoped recovery");
+            cells[c-skip-1]=value;if(!String.IsNullOrEmpty(value))blank=false;
+        }
+        return cells;
     }
 }
 '@ -ReferencedAssemblies @([Accessibility.IAccessible].Assembly.Location,[Windows.Forms.SendKeys].Assembly.Location)
@@ -834,8 +1085,11 @@ public static class TejBridgeNative {
 if(Test-Path -LiteralPath $Output){throw 'Refusing to overwrite bridge evidence'}
 $requestDoc=Get-Content -LiteralPath $Request -Raw -Encoding UTF8 | ConvertFrom-Json
 if($requestDoc.desktop_input_contract -and $requestDoc.desktop_input_contract -cne [TejBridgeNative]::InputContract){throw 'Incompatible desktop input contract'}
-if($requestDoc.contract_version -ne 4 -or $requestDoc.action -notin @('inspect','inspect_notices','inspect_date_input','inspect_query_runtime','probe_date_focus','probe_date_input','confirm_metadata_error_cleared','plan','recover_plan','resume_plan_empty_fields','download','resolve_empty','recover_preview','ack_excel_error','ack_source_memory_error','ack_preview_column_limit')){throw 'Unsupported request contract'}
-if($ExpectedTitle -cne ('TEJ Smart Wizard (Version 4.1.1.7) -- '+$ExpectedWorkbook)){throw 'Unreviewed wizard version or workbook'}
+if($requestDoc.contract_version -ne 4 -or $requestDoc.action -notin @('inspect','inspect_notices','inspect_source_binding','repair_source_binding','inspect_date_input','inspect_query_runtime','probe_date_focus','probe_date_input','confirm_metadata_error_cleared','plan','recover_plan','resume_plan_empty_fields','download','resolve_empty','recover_preview','ack_excel_error','ack_source_memory_error','ack_preview_column_limit')){throw 'Unsupported request contract'}
+$titlePrefix='TEJ Smart Wizard (Version 4.1.1.7) -- '
+if($ExpectedTitle -cne ($titlePrefix+$ExpectedWorkbook) -and
+   (-not $ExpectedTitle.StartsWith($titlePrefix,[StringComparison]::Ordinal) -or
+    -not $ExpectedTitle.EndsWith(('\'+$ExpectedWorkbook),[StringComparison]::Ordinal))){throw 'Unreviewed wizard version or workbook'}
 if($requestDoc.fields.Count -lt 1 -or $requestDoc.fields.Count -gt 2000){throw 'Unreviewed field bound'}
 if($requestDoc.max_cells -lt 100 -or $requestDoc.max_cells -gt 400000 -or $requestDoc.max_rows -gt 10000){throw 'Unreviewed output bound'}
 $mutex=[Threading.Mutex]::new($false,'Local\StockAgentTEJSmartWizardOwner')
@@ -849,6 +1103,19 @@ function Write-DownloadProgress([string]$stage) {
         [IO.Path]::GetFileNameWithoutExtension($Output),$stage,-1,-1)
 }
 $scopeClock=[Diagnostics.Stopwatch]::StartNew();$scopeLast=0.0;$scopeTimings=@{}
+$initializationSeconds=$bridgeClock.Elapsed.TotalSeconds
+$flowTimings=@{initialization_compile_seconds=$initializationSeconds}
+function Write-FlowTiming {
+    # Separate optional telemetry, never part of source adoption/retry proof.
+    try {
+        $flow=@{contract='tej_monotonic_windows_full_flow_v1';task_id=$requestDoc.task_id;
+            query_attempt_id=$requestDoc.query_attempt_id;action=$requestDoc.action;
+            observed_at_utc=[DateTime]::UtcNow.ToString('o');phases=$flowTimings;
+            windows_bridge_seconds=$bridgeClock.Elapsed.TotalSeconds;
+            windows_cpu_seconds=[Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds}
+        [IO.File]::WriteAllText(($Output+'.flow.json'),($flow|ConvertTo-Json -Depth 4 -Compress),[Text.UTF8Encoding]::new($false))
+    } catch {} # A telemetry failure must not repeat or invalidate the query.
+}
 function Stamp-ScopeTiming([string]$name) {
     $now=$scopeClock.Elapsed.TotalSeconds
     $scopeTimings[$name]=$now-$script:scopeLast;$script:scopeLast=$now
@@ -857,11 +1124,14 @@ try {
     $owns=$mutex.WaitOne(0)
     if(-not $owns){throw 'Another StockAgent desktop query owns this session'}
     if($requestDoc.action -in @('download','plan')){Write-DownloadProgress 'preparing_scope'}
-    $root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$ExpectedWindow)
+    try {
+        [TejBridgeNative]::AssertControlScope($ExpectedWindow,$ExpectedWindow,$TejProcessId,$ExpectedTitle)
+        $root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$ExpectedWindow)
+    }catch {throw 'DESKTOP_CONTEXT_BEFORE_QUERY: exact owned query window unavailable before source preparation'}
     function Assert-Scope([long]$h) {
         [TejBridgeNative]::AssertControlScope($ExpectedWindow,$h,$TejProcessId,$ExpectedTitle)
     }
-    if($root.Current.Name -cne $ExpectedTitle -or $root.Current.ProcessId -ne $TejProcessId){throw 'Wrong query scope'}
+    if($root.Current.Name -cne $ExpectedTitle -or $root.Current.ProcessId -ne $TejProcessId){throw 'DESKTOP_CONTEXT_BEFORE_QUERY: exact query scope changed'}
     # ActiveWorkbook/Application.Hwnd follow the user's current Excel view,
     # not the independent Wizard's pinned workbook. Read ONLY its exact named
     # book/window; never activate a workbook or select another Excel instance.
@@ -870,7 +1140,8 @@ try {
         $book=$excel.Workbooks.Item($ExpectedWorkbook)
         if($null -eq $book -or $book.Name -cne $ExpectedWorkbook -or $book.Windows.Count -ne 1 -or
            $book.Windows.Item(1).Hwnd -ne $ExpectedExcelWindow -or
-           -not [TejBridgeNative]::IsWindow([IntPtr]$ExpectedExcelWindow)) {
+           -not [TejBridgeNative]::IsWindow([IntPtr]$ExpectedExcelWindow) -or
+           ($ExpectedTitle -cne ($titlePrefix+$book.Name) -and $ExpectedTitle -cne ($titlePrefix+$book.FullName))) {
             throw 'Pinned workbook/window unavailable'
         }
     } catch {throw ('DESKTOP_CONTEXT_BEFORE_QUERY: '+$_.Exception.Message)}
@@ -921,7 +1192,8 @@ try {
         if($owner -ne $TejProcessId){throw 'Diagnostic query owner changed'}
         $threadState=@($process.Threads|Where-Object {$_.Id -eq $thread}|ForEach-Object {
             @{state=[string]$_.ThreadState;reason=$(if($_.ThreadState -eq 'Wait'){[string]$_.WaitReason}else{$null})}})
-        $payload=@{contract_version=4;action='inspect_notices';task_id=$requestDoc.task_id;notices=$notices;
+        $payload=@{contract_version=4;provider='tej_smart_wizard';action='inspect_notices';task_id=$requestDoc.task_id;notices=$notices;
+                   observed_at_utc=[DateTime]::UtcNow.ToString('o');
                    root_enabled=[TejBridgeNative]::IsWindowEnabled([IntPtr]$ExpectedWindow);
                    root_visible=[TejBridgeNative]::IsWindowVisible([IntPtr]$ExpectedWindow);
                    root_automation_enabled=$root.Current.IsEnabled;process_windows=$processWindows;
@@ -1023,12 +1295,10 @@ try {
         Write-Output 'Known Excel runtime failure acknowledged; no new data query';exit
     }
     function Find-QueryGroup([string]$name) {
-        $found=@(foreach($handle in [TejBridgeNative]::Children($ExpectedWindow,'')) {
-            if(-not [TejBridgeNative]::IsWindowVisible([IntPtr]$handle)){continue}
-            $node=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$handle)
-            if($node.Current.Name -ceq $name){Assert-Scope $handle;$node}
-        })
-        if($found.Count -ne 1){throw ('Missing/ambiguous query group: '+$name)};return $found[0]
+        $handle=[TejBridgeNative]::ExactQueryGroup($ExpectedWindow,$name,$TejProcessId,$ExpectedTitle)
+        $node=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$handle)
+        if($node.Current.NativeWindowHandle -ne $handle -or $node.Current.Name -cne $name){throw ('Query group identity differs: '+$name)}
+        Assert-Scope $handle;return $node
     }
     function Verify-EditableScope([switch]$BindingReadback) {
         if([TejBridgeNative]::Dialogs($ExpectedWindow).Count -ne 0){throw 'Vendor notice blocks source preparation; nothing acknowledged'}
@@ -1072,6 +1342,10 @@ try {
         }
     }
     function Control($group,[string]$name,[string]$class) {
+        if($class -ceq '*BUTTON*') {
+            $h=[TejBridgeNative]::ExactButton($ExpectedWindow,$group.Current.NativeWindowHandle,$name,[int]::MinValue)
+            Assert-Scope $h;return $h
+        }
         $prefix=@{'*BUTTON*'='WindowsForms10.BUTTON.';'*COMBOBOX*'='WindowsForms10.COMBOBOX.'}[$class]
         if(-not $prefix){throw 'Unreviewed native control class'}
         $matches=@(Native-Controls $group $prefix|Where-Object {([string]$_.Current.Name).Trim() -ceq $name})
@@ -1088,7 +1362,7 @@ try {
             try{$i=[TejBridgeNative]::ExactComboIndex($ExpectedWindow,$h,$name)}catch{if([DateTime]::UtcNow -ge $deadline){throw}}
             if($i -ge 0){break};Start-Sleep -Milliseconds 250
         }while([DateTime]::UtcNow -lt $deadline)
-        if($i -lt 0){throw 'Catalog binding did not become available; selection not sent'}
+        if($i -lt 0){throw 'SOURCE_BINDING_BEFORE_QUERY: catalog binding unavailable; selection not sent'}
         if((Message $h 0x147) -eq $i -and -not $notifyEvenIfSelected){return}
         if([TejBridgeNative]::Dialogs($ExpectedWindow).Count -ne 0 -or
            -not [TejBridgeNative]::IsWindowEnabled([IntPtr]$ExpectedWindow) -or
@@ -1097,10 +1371,27 @@ try {
         $notify=(([TejBridgeNative]::GetDlgCtrlID([IntPtr]$h) -band 65535) -bor 65536)
         [TejBridgeNative]::NotifyBinding($p,$h,$notify)
         do {
-            Start-Sleep -Milliseconds 250
             try{if((Message $h 0x147) -eq $i -and [TejBridgeNative]::SelectedComboText($ExpectedWindow,$h) -ceq $name){return}}catch{if([DateTime]::UtcNow -ge $deadline){throw}}
+            Start-Sleep -Milliseconds 25
         }while([DateTime]::UtcNow -lt $deadline)
-        throw 'Catalog selection did not resolve; notification never repeated'
+        throw 'SOURCE_BINDING_BEFORE_QUERY: catalog selection unresolved; notification never repeated'
+    }
+    function Prepare-SourceBinding {
+        # An unchanged parent can have lost its dependent menu after a vendor
+        # metadata refresh. Re-notify that exact parent once, not the Preview.
+        # A notification timeout exits immediately; never repeat that event.
+        $pairs=@(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))
+        for($index=0;$index -lt $pairs.Count;$index++) {
+            Verify-SourceSelectors
+            $h=Control $source $pairs[$index][0] '*COMBOBOX*'
+            if($index -gt 0 -and (Message $h 0x146) -eq 0) {
+                $parentPair=$pairs[$index-1];$parent=Control $source $parentPair[0] '*COMBOBOX*'
+                if([TejBridgeNative]::SelectedComboText($ExpectedWindow,$parent) -ceq $parentPair[1]) {
+                    Select-Combo $parent $parentPair[1] $true
+                }
+            }
+            Select-Combo $h $pairs[$index][1]
+        }
     }
     function Click-Button($group,[string]$name) {
         $h=Control $group $name '*BUTTON*'
@@ -1111,14 +1402,8 @@ try {
         # Per-batch resolution only; never cache mutable source selections.
         # Every click still reads the exact owned control's identity/state,
         # and every destination list still acknowledges this one action.
-        $parent=$group.Current.NativeWindowHandle;Assert-Scope $parent;Assert-Scope $h
-        $node=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h)
-        if(-not [TejBridgeNative]::IsChild([IntPtr]$parent,[IntPtr]$h) -or
-           -not [TejBridgeNative]::WindowClass($h).StartsWith('WindowsForms10.BUTTON.',[StringComparison]::Ordinal) -or
-           ([string]$node.Current.Name).Trim() -cne $name -or
-           [TejBridgeNative]::Dialogs($ExpectedWindow).Count -ne 0 -or
-           -not [TejBridgeNative]::IsWindowEnabled([IntPtr]$h) -or
-           -not [TejBridgeNative]::IsWindowVisible([IntPtr]$h)){throw 'LOCAL_SELECTION_BEFORE_QUERY: resolved button identity/state changed'}
+        $parent=$group.Current.NativeWindowHandle
+        [TejBridgeNative]::VerifyResolvedButton($ExpectedWindow,$parent,$h,$TejProcessId,$ExpectedTitle,$name)
         [void](Message $h 0xF5)
     }
     function Select-FieldList([string]$name,[long]$target,[int]$expectedCount) {
@@ -1129,20 +1414,17 @@ try {
         if(-not [TejBridgeNative]::PostMessageW([IntPtr]$h,0xF5,[IntPtr]::Zero,[IntPtr]::Zero)){throw 'Field selection action not queued'}
         $deadline=[DateTime]::UtcNow.AddSeconds(150)
         do {
-            Start-Sleep -Milliseconds 250
             try{$actual=Message $target 0x18B}catch{if([DateTime]::UtcNow -ge $deadline){throw};continue}
             if($actual -eq $expectedCount){return}
+            Start-Sleep -Milliseconds 25
         }while([DateTime]::UtcNow -lt $deadline)
         throw 'Field selection readback deadline exceeded; action never repeated'
     }
     function Set-Checkbox($group,[string]$name,[bool]$checked) {
-        $matches=@(Native-Controls $group 'WindowsForms10.BUTTON.'|Where-Object {
-            ([string]$_.Current.Name).Trim() -ceq $name -and
-            ([TejBridgeNative]::AccessibleState($_.Current.NativeWindowHandle))[0] -eq 44
-        })
-        if($matches.Count -ne 1){throw ('Missing/ambiguous checkbox: '+$name)}
-        $h=$matches[0].Current.NativeWindowHandle;Assert-Scope $h
-        $state=([TejBridgeNative]::AccessibleState($h))[1]
+        $h=[TejBridgeNative]::ExactButton($ExpectedWindow,$group.Current.NativeWindowHandle,$name,[int]::MinValue,44)
+        Assert-Scope $h;$roleState=[TejBridgeNative]::AccessibleState($h)
+        if($roleState[0] -ne 44){throw ('Missing/ambiguous checkbox: '+$name)}
+        $state=$roleState[1]
         if(($state -band 33) -ne 0){throw 'Checkbox is disabled or indeterminate'}
         if((($state -band 16) -ne 0) -ne $checked){[void](Message $h 0xF5)}
         $state=([TejBridgeNative]::AccessibleState($h))[1]
@@ -1153,11 +1435,8 @@ try {
         # Company Setting has TWO "Select" buttons: text-search selection and
         # the list-to-selected-list action. Use the one below the actual list.
         $bottom=$companyLists[2].Current.BoundingRectangle.Bottom
-        $buttons=@(Native-Controls $company 'WindowsForms10.BUTTON.'|Where-Object {
-            $_.Current.Name -ceq 'Select' -and $_.Current.BoundingRectangle.Top -ge $bottom
-        })
-        if($buttons.Count -ne 1){throw 'Ambiguous company-list selection action'}
-        return [long]$buttons[0].Current.NativeWindowHandle
+        $h=[TejBridgeNative]::ExactButton($ExpectedWindow,$company.Current.NativeWindowHandle,'Select',[int]$bottom)
+        Assert-Scope $h;return $h
     }
     function Select-Company([long]$resolvedButton) {
         $node=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$resolvedButton)
@@ -1175,9 +1454,31 @@ try {
         [void]($labels[0].Current.Name -cmatch '^Key=([123])\s*$')
         return [int]$Matches[1]
     }
-    if($requestDoc.action -in @('confirm_metadata_error_cleared','inspect_date_input','inspect_query_runtime','probe_date_focus','probe_date_input')) {
-        # The settlement/inspection actions are read-only. Explicit focus /
-        # same-value input probes below do not submit or adopt source queries.
+    if($requestDoc.action -eq 'inspect_source_binding') {
+        # Read-only diagnosis also works when a selector has no selection or
+        # an empty menu. Such a state is not a verified source binding.
+        $selectors=@(foreach($pair in @(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))) {
+            $h=Control $source $pair[0] '*COMBOBOX*'
+            $items=Items $h $true;$selected=[TejBridgeNative]::SignedControlResult((Message $h 0x147))
+            @{name=$pair[0];enabled=[TejBridgeNative]::IsWindowEnabled([IntPtr]$h);
+              item_count=$items.Count;native_selected_index=$selected;
+              selected_text=$(if($selected -ge 0 -and $selected -lt $items.Count){$items[$selected]}else{$null});
+              requested_label=$pair[1];requested_exact_matches=@($items|Where-Object {$_ -ceq $pair[1]}).Count;
+              items=$items}
+        })
+        $payload=@{contract_version=4;provider='tej_smart_wizard';action='inspect_source_binding';task_id=$requestDoc.task_id;
+            observed_at_utc=[DateTime]::UtcNow.ToString('o');selectors=$selectors;
+            root_enabled=[TejBridgeNative]::IsWindowEnabled([IntPtr]$ExpectedWindow);
+            vendor_notices_absent=([TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0);
+            market_data_query_submitted=$false;source_binding_changed=$false;credentials_read=$false}
+        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+        Write-Output 'Source selector metadata inspected; no binding event or query';exit
+    }
+    if($requestDoc.action -eq 'repair_source_binding'){Prepare-SourceBinding}
+    if($requestDoc.action -in @('repair_source_binding','confirm_metadata_error_cleared','inspect_date_input','inspect_query_runtime','probe_date_focus','probe_date_input')) {
+        # Settlement/inspection is read-only. The explicit binding repair
+        # above changes metadata selectors only, never Preview/query axes.
+        # Focus/same-value input probes below also do not submit source queries.
         Verify-SourceSelectors
         $actualBinding=@{};$bindingSame=$true
         foreach($pair in @(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))) {
@@ -1199,7 +1500,14 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             observed_at_utc=[DateTime]::UtcNow.ToString('o');vendor_notices_absent=$true;
             actual_binding=$actualBinding;binding_matches_failed_plan=$bindingSame;source_axes_adopted=$false;source_binding_stable=$true;
-            current_field_lists=@((Lists $source)|ForEach-Object {@{items=(Items $_.Current.NativeWindowHandle);style=[TejBridgeNative]::GetWindowLong([IntPtr]$_.Current.NativeWindowHandle,-16)}});
+            current_field_lists=@(
+                $fieldAxes=Lists $source
+                for($axis=0;$axis -lt $fieldAxes.Count;$axis++) {
+                    $handle=$fieldAxes[$axis].Current.NativeWindowHandle
+                    @{items=$(if($requestDoc.action -ne 'inspect_query_runtime' -or $axis -eq 1){Items $handle}else{$null});
+                      item_count=(Message $handle 0x18B);style=[TejBridgeNative]::GetWindowLong([IntPtr]$handle,-16)}
+                }
+            );
             source_selectors_enabled=$true;company_group_enabled=(Find-QueryGroup 'Company Setting').Current.IsEnabled;
             date_group_enabled=(Find-QueryGroup 'Date Setting').Current.IsEnabled;market_data_query_submitted=$false;credentials_read=$false}
         if($requestDoc.action -in @('inspect_date_input','inspect_query_runtime','probe_date_focus','probe_date_input')) {
@@ -1221,8 +1529,14 @@ try {
             $payload.preview_button=@{handle=$h;enabled=$node.Current.IsEnabled;visible=[TejBridgeNative]::IsWindowVisible([IntPtr]$h);
                 accessible_role_state=@([TejBridgeNative]::AccessibleState($h));default_action=[TejBridgeNative]::AccessibleDefaultAction($h);
                 supports_invoke_pattern=$supportsInvoke;supported_patterns=@($node.GetSupportedPatterns()|ForEach-Object {$_.ProgrammaticName})}
+            $payload.inspection_axes_contract='exact_selected_axes_catalog_counts_only_v1'
             $payload.current_query_axes=@(foreach($g in @((Find-QueryGroup 'Company Setting'),(Find-QueryGroup 'Date Setting'))){
-                foreach($list in (Lists $g)){@{handle=$list.Current.NativeWindowHandle;items=(Items $list.Current.NativeWindowHandle);
+                $axes=Lists $g
+                for($axis=0;$axis -lt $axes.Count;$axis++){
+                    $list=$axes[$axis]
+                    @{handle=$list.Current.NativeWindowHandle;
+                    items=$(if($axis -eq $axes.Count-1){Items $list.Current.NativeWindowHandle}else{$null});
+                    item_count=(Message $list.Current.NativeWindowHandle 0x18B);
                     native_style=[TejBridgeNative]::GetWindowLong([IntPtr]$list.Current.NativeWindowHandle,-16);
                     native_current_index=(Message $list.Current.NativeWindowHandle 0x188);
                     native_selected_count=(Message $list.Current.NativeWindowHandle 0x190)}}
@@ -1313,12 +1627,18 @@ try {
         return [long]$matches[0].Current.NativeWindowHandle
     }
     function NumericScale-Control {
-        $matches=@(Native-Controls $root 'WindowsForms10.COMBOBOX.'|Where-Object {
-            ((Items $_.Current.NativeWindowHandle $true) -join "`t") -ceq "-`tUnit`tThousand`tMillion`tBillion"
+        # Unit scale has five exact labels. A large Data/Sector catalog cannot
+        # be this control: inspect count BEFORE reading a complete menu. Still
+        # verify every plausible candidate and reject duplicates, no handle cache.
+        $matches=@(foreach($handle in [TejBridgeNative]::Children($ExpectedWindow,'WindowsForms10.COMBOBOX.')) {
+            Assert-Scope $handle
+            if(-not [TejBridgeNative]::IsWindowVisible([IntPtr]$handle)){continue}
+            if((Message $handle 0x146) -eq 5 -and
+               ((Items $handle $true) -join "`t") -ceq "-`tUnit`tThousand`tMillion`tBillion"){$handle}
         })
         if($matches.Count -gt 1){throw 'Ambiguous vendor numeric-scale selector'}
         if($matches.Count -eq 0){return [long]0}
-        return [long]$matches[0].Current.NativeWindowHandle
+        return [long]$matches[0]
     }
     function Read-NumericScale {
         $h=NumericScale-Control
@@ -1594,12 +1914,12 @@ try {
         $h=Control $source $pair[0] '*COMBOBOX*'
         if([TejBridgeNative]::SelectedComboText($ExpectedWindow,$h) -cne $pair[1]){$bindingAlreadyMatches=$false}
     }
-    foreach($pair in @(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))) {
-        $h=Control $source $pair[0] '*COMBOBOX*'
-        if($requestDoc.action -in @('recover_plan','resume_plan_empty_fields')) {
+    if($requestDoc.action -in @('recover_plan','resume_plan_empty_fields')) {
+        foreach($pair in @(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))) {
+            $h=Control $source $pair[0] '*COMBOBOX*'
             if([TejBridgeNative]::SelectedComboText($ExpectedWindow,$h) -cne $pair[1]){throw 'Plan recovery source binding changed; no repeated selection'}
-        } else {Select-Combo $h $pair[1]}
-    }
+        }
+    } else {Prepare-SourceBinding}
     $sourceKeyMode=Read-SourceKeyMode
     Stamp-ScopeTiming 'context_and_source_binding'
     if($requestDoc.action -eq 'download') {
@@ -1632,14 +1952,12 @@ try {
             Select-FieldList 'Select All' $fieldLists[1].Current.NativeWindowHandle $fieldMenu.Count
         } else {
             $fieldSelectButton=Control $source 'Select' '*BUTTON*'
-            $selectedCount=0
-            foreach($field in $requestDoc.fields) {
-                $index=[Array]::IndexOf($fieldMenu,$field);if($index -lt 0){throw 'Field disappeared'}
-                [TejBridgeNative]::SelectListItem($ExpectedWindow,$fieldLists[0].Current.NativeWindowHandle,$index,$field)
-                Click-ResolvedButton $source $fieldSelectButton 'Select'
-                $selectedCount++
-                [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$fieldLists[1].Current.NativeWindowHandle,$selectedCount,$field)
-            }
+            $fieldIndices=[int[]]@(foreach($field in $requestDoc.fields) {
+                $index=[Array]::IndexOf($fieldMenu,$field);if($index -lt 0){throw 'Field disappeared'};$index
+            })
+            [TejBridgeNative]::SelectListBatch($ExpectedWindow,$source.Current.NativeWindowHandle,
+                $fieldLists[0].Current.NativeWindowHandle,$fieldLists[1].Current.NativeWindowHandle,$fieldSelectButton,
+                $fieldIndices,[string[]]$requestDoc.fields,$TejProcessId,$ExpectedTitle,$false)
             if((Control $source 'Select' '*BUTTON*') -ne $fieldSelectButton){throw 'LOCAL_SELECTION_BEFORE_QUERY: field selector changed during batch'}
         }
     }
@@ -1660,9 +1978,8 @@ try {
             [void](Set-Checkbox $company 'Set Industry' $false)
             Select-Combo $sectorCombo 'ALL' $true
             $universeRefresh=$true
-            # The queued selection notification may still be refreshing the
-            # company menu. This is one metadata action, never a query retry.
-            Start-Sleep -Milliseconds 500
+            # NotifyBinding waits for the single parent event to finish.
+            # Read its resulting catalog immediately, without blind padding.
             $sectorLabels=Items $sectorCombo $true
             $availableCompanies=Items $companyLists[2].Current.NativeWindowHandle
         }
@@ -1715,12 +2032,12 @@ try {
         $refreshUniverse=$queryEditModeChanged -or (-not $bindingAlreadyMatches) -or
             $requestDoc.refresh_company_universe_once -eq $true
         Select-Combo $sectorCombo 'ALL' $refreshUniverse
-        if($refreshUniverse){Start-Sleep -Milliseconds 500}
+        # NotifyBinding has acknowledged the full normal sector callback.
     }
     $numericScale=Set-NumericScaleDefault
     [void](Verify-EditableScope)
     $availableCompanyCount=Message $companyLists[2].Current.NativeWindowHandle 0x18B
-    $companyIndices=@{}
+    $companyIndices=@()
     if($requestDoc.action -eq 'download') {
         $availableCompanies=@()
         # The ALL branch independently reads and validates the complete
@@ -1728,10 +2045,8 @@ try {
         # per-item lookup is needed for a list we will select in its entirety.
         # A count alone NEVER certifies scope; SameItems below remains mandatory.
         if($requestDoc.company_labels.Count -ne $availableCompanyCount) {
-            foreach($label in $requestDoc.company_labels) {
-                if($companyIndices.ContainsKey($label)){throw 'LOCAL_SELECTION_BEFORE_QUERY: duplicate requested company'}
-                $companyIndices[$label]=[TejBridgeNative]::ExactListIndex($ExpectedWindow,$companyLists[2].Current.NativeWindowHandle,$label)
-            }
+            $companyIndices=[TejBridgeNative]::ExactListIndices($ExpectedWindow,$companyLists[2].Current.NativeWindowHandle,
+                [string[]]$requestDoc.company_labels,$TejProcessId,$ExpectedTitle)
         }
     } else {$availableCompanies=Items $companyLists[2].Current.NativeWindowHandle}
     Stamp-ScopeTiming 'company_universe_and_lookup'
@@ -1777,13 +2092,11 @@ try {
     [void](Verify-EditableScope)
     $dateLists=Lists $dates;if($dateLists.Count -ne 2){throw 'Wrong date list layout'}
     $availableDateCount=Message $dateLists[0].Current.NativeWindowHandle 0x18B
-    $dateIndices=@{}
+    $dateIndices=@()
     if($requestDoc.action -eq 'download') {
         if($requestDoc.date_labels.Count -ne $availableDateCount) {
-            foreach($label in $requestDoc.date_labels) {
-                if($dateIndices.ContainsKey($label)){throw 'LOCAL_SELECTION_BEFORE_QUERY: duplicate requested date'}
-                $dateIndices[$label]=[TejBridgeNative]::ExactListIndex($ExpectedWindow,$dateLists[0].Current.NativeWindowHandle,$label)
-            }
+            $dateIndices=[TejBridgeNative]::ExactListIndices($ExpectedWindow,$dateLists[0].Current.NativeWindowHandle,
+                [string[]]$requestDoc.date_labels,$TejProcessId,$ExpectedTitle)
         }
     } else {$availableDates=Items $dateLists[0].Current.NativeWindowHandle}
     }
@@ -1807,22 +2120,25 @@ try {
         $expectedRows=$requestDoc.company_labels.Count*$(if($sourceKeyMode -eq 1){1}else{$requestDoc.date_labels.Count})
         if($expectedRows -gt $requestDoc.max_rows -or ($expectedRows+1)*($requestDoc.fields.Count+$sourceKeyMode) -gt $requestDoc.max_cells){throw 'Query exceeds reviewed memory/cell bound'}
         if($sourceKeyMode -ne 1){[TejBridgeNative]::WaitSelectedList($ExpectedWindow,$dateLists[1].Current.NativeWindowHandle,0,$null)}
-        Click-Button $company 'Clear All'
-        [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$companyLists[3].Current.NativeWindowHandle,0,$null)
-        if($requestDoc.company_labels.Count -eq $availableCompanyCount) {
-            Click-Button $company 'Select All'
-            [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$companyLists[3].Current.NativeWindowHandle,$availableCompanyCount,$null)
-        } else {
-            $companySelectButton=Company-SelectButton
-            $selectedCount=0
-            foreach($label in $requestDoc.company_labels) {
-                $index=$companyIndices[$label]
-                [TejBridgeNative]::SelectListItem($ExpectedWindow,$companyLists[2].Current.NativeWindowHandle,$index,$label)
-                Select-Company $companySelectButton
-                $selectedCount++
-                [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$companyLists[3].Current.NativeWindowHandle,$selectedCount,$label)
+        # Fresh complete source-bound destination read, not cached permission.
+        # Keep lookup and final full company/date/field verification unchanged.
+        $companySelectionAlreadyMatches=$bindingAlreadyMatches -and
+            [TejBridgeNative]::SameItems([string[]](Items $companyLists[3].Current.NativeWindowHandle),[string[]]$requestDoc.company_labels) -and
+            ($requestDoc.company_labels.Count -ne $availableCompanyCount -or
+             [TejBridgeNative]::SameItems([string[]](Items $companyLists[2].Current.NativeWindowHandle),[string[]]$requestDoc.company_labels))
+        if(-not $companySelectionAlreadyMatches) {
+            Click-Button $company 'Clear All'
+            [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$companyLists[3].Current.NativeWindowHandle,0,$null)
+            if($requestDoc.company_labels.Count -eq $availableCompanyCount) {
+                Click-Button $company 'Select All'
+                [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$companyLists[3].Current.NativeWindowHandle,$availableCompanyCount,$null)
+            } else {
+                $companySelectButton=Company-SelectButton
+                [TejBridgeNative]::SelectListBatch($ExpectedWindow,$company.Current.NativeWindowHandle,
+                    $companyLists[2].Current.NativeWindowHandle,$companyLists[3].Current.NativeWindowHandle,$companySelectButton,
+                    [int[]]$companyIndices,[string[]]$requestDoc.company_labels,$TejProcessId,$ExpectedTitle,$true)
+                if((Company-SelectButton) -ne $companySelectButton){throw 'LOCAL_SELECTION_BEFORE_QUERY: company selector changed during batch'}
             }
-            if((Company-SelectButton) -ne $companySelectButton){throw 'LOCAL_SELECTION_BEFORE_QUERY: company selector changed during batch'}
         }
         $selectedCompanies=Items $companyLists[3].Current.NativeWindowHandle
         if(-not [TejBridgeNative]::SameItems([string[]]$selectedCompanies,[string[]]$requestDoc.company_labels)){throw 'LOCAL_SELECTION_BEFORE_QUERY: Company selection mismatch'}
@@ -1833,14 +2149,9 @@ try {
             [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$dateLists[1].Current.NativeWindowHandle,$availableDateCount,$null)
         } else {
             $dateSelectButton=Control $dates 'Select' '*BUTTON*'
-            $selectedCount=0
-            foreach($label in $requestDoc.date_labels) {
-                $index=$dateIndices[$label]
-                [TejBridgeNative]::SelectListItem($ExpectedWindow,$dateLists[0].Current.NativeWindowHandle,$index,$label)
-                Click-ResolvedButton $dates $dateSelectButton 'Select'
-                $selectedCount++
-                [TejBridgeNative]::WaitSelectedList($ExpectedWindow,$dateLists[1].Current.NativeWindowHandle,$selectedCount,$label)
-            }
+            [TejBridgeNative]::SelectListBatch($ExpectedWindow,$dates.Current.NativeWindowHandle,
+                $dateLists[0].Current.NativeWindowHandle,$dateLists[1].Current.NativeWindowHandle,$dateSelectButton,
+                [int[]]$dateIndices,[string[]]$requestDoc.date_labels,$TejProcessId,$ExpectedTitle,$false)
             if((Control $dates 'Select' '*BUTTON*') -ne $dateSelectButton){throw 'LOCAL_SELECTION_BEFORE_QUERY: date selector changed during batch'}
         }
         $selectedDates=Items $dateLists[1].Current.NativeWindowHandle
@@ -1874,6 +2185,9 @@ try {
         $stage.source_scope_proof=$sourceScopeProof
         $stage.scope_preparation_timings_contract='monotonic_complete_scope_stages_v1'
         $stage.scope_preparation_seconds=$scopeTimings
+        $stage.fresh_company_selection_reused=$companySelectionAlreadyMatches
+        $stage.bridge_initialization_seconds=$initializationSeconds
+        $stage.operation_contract='fresh_verified_native_selection_batches_v1'
         $stage.preview_submission_contract=[TejBridgeNative]::SubmissionContract
         $stage.query_attempt_id=$requestDoc.query_attempt_id
         $stage.before_preview_signatures=@($beforePreviewSignatures)
@@ -1888,17 +2202,23 @@ try {
         # Mark BEFORE submission: a crash during the default action remains
         # unknown, never be classified as safe to submit again.
         $querySubmissionPossible=$true
+        $flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds
+        $queryClock=[Diagnostics.Stopwatch]::StartNew()
         [TejBridgeNative]::BeginPreviewDefaultAction($ExpectedWindow,$previewButton)
         Write-DownloadProgress 'awaiting_preview'
         $startedPolling=[DateTime]::UtcNow;$deadline=$startedPolling.AddSeconds(150);$grids=@();$freshPreviewTransitionVerified=$false
         do {
             $elapsed=([DateTime]::UtcNow-$startedPolling).TotalSeconds
-            Start-Sleep -Milliseconds $(if($elapsed -lt 2){250}else{1000})
             if([TejBridgeNative]::PreviewActionState() -eq -1){throw 'Single Preview default action failed; outcome unknown; no fallback'}
             $empty=Empty-Response
             if($null -ne $empty) {
+                $flowTimings.query_and_response_seconds=$queryClock.Elapsed.TotalSeconds
+                $saveClock=[Diagnostics.Stopwatch]::StartNew()
                 [IO.File]::WriteAllText($Output,($empty|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
                 Write-DownloadProgress 'response_saved'
+                $flowTimings.serialize_and_save_seconds=$saveClock.Elapsed.TotalSeconds
+                $flowTimings.full_readback_seconds=0.0
+                Write-FlowTiming
                 Write-Output 'Exact provider empty response saved; no data invented';exit
             }
             $grids=@(Matching-Preview)
@@ -1906,10 +2226,16 @@ try {
                 $signature=[TejBridgeNative]::PreviewSignature($grids[0].Current.NativeWindowHandle)
                 $freshPreviewTransitionVerified=$signature -cnotin $beforePreviewSignatures
             }
+            if($grids.Count -eq 0 -or -not $freshPreviewTransitionVerified) {
+                Start-Sleep -Milliseconds $(if($elapsed -lt 0.2){25}elseif($elapsed -lt 2){100}else{500})
+            }
         } while(($grids.Count -eq 0 -or -not $freshPreviewTransitionVerified) -and [DateTime]::UtcNow -lt $deadline)
         if($grids.Count -ne 1){throw 'No unambiguous vendor Preview; no export'}
         if(-not $freshPreviewTransitionVerified){throw 'No proved fresh result transition; no stale result adopted'}
+        $flowTimings.query_and_response_seconds=$queryClock.Elapsed.TotalSeconds
+        $captureClock=[Diagnostics.Stopwatch]::StartNew()
         $payload=Capture-Preview $grids[0]
+        $flowTimings.full_readback_seconds=$captureClock.Elapsed.TotalSeconds
     }
     if($requestDoc.action -in @('plan','recover_plan','resume_plan_empty_fields')){$payload.source_key_mode=$sourceKeyMode}
     if($requestDoc.action -in @('plan','recover_plan','resume_plan_empty_fields')) {
@@ -1922,11 +2248,29 @@ try {
         $payload.source_period_key_contract=$(if($payload.source_key_headers[1] -ceq 'YYYYMM'){
             'literal_source_yyyymm_period_key_v1'}else{'literal_source_data_yymm_period_key_v1'})
     }
+    if($requestDoc.action -in @('plan','recover_plan','resume_plan_empty_fields')){$flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds}
+    $saveClock=[Diagnostics.Stopwatch]::StartNew()
     $json=$payload|ConvertTo-Json -Depth 8 -Compress
     [IO.File]::WriteAllText($Output,$json,[Text.UTF8Encoding]::new($false))
     Write-DownloadProgress 'response_saved'
+    $flowTimings.serialize_and_save_seconds=$saveClock.Elapsed.TotalSeconds
+    Write-FlowTiming
     Write-Output ($payload.action+' succeeded; raw values written only to the private local output')
 } catch {
+    # The durable negative proof covers EVERY caught preparation exception,
+    # not just a few string prefixes. It never authorizes a modal dismissal,
+    # source adoption or replay once the Preview boundary was crossed.
+    if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
+       -not (Test-Path -LiteralPath ($Output+'.stage.json')) -and
+       -not (Test-Path -LiteralPath ($Output+'.outcome.json'))) {
+        $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;
+            query_attempt_id=$requestDoc.query_attempt_id;type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
+            action='download';market_data_query_submission_possible=$false;
+            error_code=$(if($_.Exception.ToString().Contains('SOURCE_BINDING_BEFORE_QUERY:')){
+                'local_source_binding_failed_before_preview'}else{'local_query_preparation_failed_before_preview'});
+            observed_at_utc=[DateTime]::UtcNow.ToString('o')}
+        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+    }
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        $_.Exception.ToString().Contains('SOURCE_KEY_LAYOUT_BEFORE_QUERY:')) {
         $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;

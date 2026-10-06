@@ -1,0 +1,27 @@
+{
+  "contract_version": 1,
+  "dataset": "USStockPriceMinute",
+  "basis": "official_published_us_cash_calendar",
+  "first": "2021-01-01",
+  "last": "2026-12-31",
+  "closed_weekdays": [5, 6],
+  "timestamp_date_basis": "provider_single_day_UTC_core_cash_minutes_not_Taipei_dates",
+  "sources": [
+    "https://ir.theice.com/press/news-details/2020/NYSE-Group-Announces-2021-2022-and-2023-Holiday-and-Early-Closings-Calendar/default.aspx",
+    "https://ir.theice.com/press/news-details/2021/NYSE-Group-Announces-2022-2023-and-2024-Holiday-and-Early-Closings-Calendar/default.aspx",
+    "https://ir.theice.com/press/news-details/2023/NYSE-Group-Announces-2024-2025-and-2026-Holiday-and-Early-Closings-Calendar/default.aspx",
+    "https://ir.theice.com/press/news-details/2024/The-New-York-Stock-Exchange-Will-Close-Markets-on-January-9-to-Honor-the-Passing-of-Former-President-Jimmy-Carter-on-National-Day-of-Mourning/default.aspx",
+    "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar"
+  ],
+  "holidays": {
+    "2021": ["01-01", "01-18", "02-15", "04-02", "05-31", "07-05", "09-06", "11-25", "12-24"],
+    "2022": ["01-17", "02-21", "04-15", "05-30", "06-20", "07-04", "09-05", "11-24", "12-26"],
+    "2023": ["01-02", "01-16", "02-20", "04-07", "05-29", "06-19", "07-04", "09-04", "11-23", "12-25"],
+    "2024": ["01-01", "01-15", "02-19", "03-29", "05-27", "06-19", "07-04", "09-02", "11-28", "12-25"],
+    "2025": ["01-01", "01-09", "01-20", "02-17", "04-18", "05-26", "06-19", "07-04", "09-01", "11-27", "12-25"],
+    "2026": ["01-01", "01-19", "02-16", "04-03", "05-25", "06-19", "07-03", "09-07", "11-26", "12-25"]
+  },
+  "early_closes_still_open": ["2021-11-26", "2022-11-25", "2023-07-03", "2023-11-24", "2024-07-03", "2024-11-29", "2024-12-24", "2025-07-03", "2025-11-28", "2025-12-24", "2026-11-27", "2026-12-24"],
+  "explicitly_open_exceptions": ["2021-06-18", "2021-12-31"],
+  "notes": "Published cash schedule, not observed provider coverage. Juneteenth first observed in 2022. Saturday New Year 2022 has no preceding-Friday holiday. Positive source observations on excluded dates disable pruning. Outside these bounds nothing is excluded."
+}

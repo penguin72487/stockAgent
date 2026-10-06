@@ -39,6 +39,7 @@ class DayTradeCarryEventCompressionFallback(RuntimeError):
 _COMPILED_PATHS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
 _COMPILED_SESSIONS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
 _COMPILED_SWEEP_STEPS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
+_COMPILED_COMMITS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
 _COMPILED_PATH_LOCK = threading.Lock()
 _CARRY_COMPILE_STATS = {
     "compile_constructors": 0,
@@ -61,6 +62,12 @@ _CARRY_COMPILE_STATS = {
     "sparse_event_session_calls": 0,
     "sparse_event_cells": 0,
     "dense_event_cells_avoided": 0,
+    "checkpointed_trajectory_blocks": 0,
+    "commit_compile_constructors": 0,
+    "compiled_commit_calls": 0,
+    "flat_terminal_batches": 0,
+    "flat_terminal_cleared_sessions": 0,
+    "flat_terminal_fallback_batches": 0,
 }
 
 
@@ -113,6 +120,7 @@ def reset_day_trade_carry_compile_stats(*, clear_cache: bool = False) -> None:
             _COMPILED_PATHS.clear()
             _COMPILED_SESSIONS.clear()
             _COMPILED_SWEEP_STEPS.clear()
+            _COMPILED_COMMITS.clear()
 
 
 def invalidate_day_trade_carry_compiled_caches() -> tuple[int, int]:
@@ -128,6 +136,7 @@ def invalidate_day_trade_carry_compiled_caches() -> tuple[int, int]:
         _COMPILED_PATHS.clear()
         _COMPILED_SESSIONS.clear()
         _COMPILED_SWEEP_STEPS.clear()
+        _COMPILED_COMMITS.clear()
     return counts
 
 
@@ -171,6 +180,23 @@ def _carry_full_session_compile_enabled(reference: Tensor) -> bool:
     )
 
 
+def _inventory_path_nav_with_history_grad(
+    state: DayTradeInventoryState, *, prices: Tensor, minute_filled_shares: Tensor,
+    marks: Tensor, initial_capital: float, require_minute_nav_grad: bool,
+) -> Tensor:
+    """Keep the exact solvency scan, omit its unused adjoint for loss callers.
+
+    The public simulator retains differentiable minute diagnostics by default.
+    Financial state, fills and the post-conversion close remain differentiable;
+    this policy concerns only the pre-conversion intraday valuation branch.
+    """
+    with torch.set_grad_enabled(torch.is_grad_enabled() and require_minute_nav_grad):
+        return inventory_path_nav(
+            state, prices=prices, minute_filled_shares=minute_filled_shares,
+            marks=marks, initial_capital=initial_capital,
+        )
+
+
 def _compiled_inventory_path(
     state: DayTradeInventoryState,
     *,
@@ -178,6 +204,7 @@ def _compiled_inventory_path(
     capacity_shares: Tensor,
     marks: Tensor,
     initial_capital: float,
+    require_minute_nav_grad: bool = True,
 ) -> tuple[InventoryPathReduction, Tensor]:
     """Compile only the date/claim-independent FIFO tensor core.
 
@@ -200,6 +227,7 @@ def _compiled_inventory_path(
         int(state.cohorts.shape[1]),
         float(initial_capital),
         training_graph,
+        require_minute_nav_grad,
         tuple(sorted(compile_options.items())),
     )
     with _COMPILED_PATH_LOCK:
@@ -236,12 +264,13 @@ def _compiled_inventory_path(
                     prices=path_prices,
                     capacity_shares=path_capacity,
                 )
-                minute_nav = inventory_path_nav(
+                minute_nav = _inventory_path_nav_with_history_grad(
                     slim,
                     prices=path_prices,
                     minute_filled_shares=path.minute_filled_shares,
                     marks=path_marks,
                     initial_capital=initial_capital,
+                    require_minute_nav_grad=require_minute_nav_grad,
                 )
                 reduction = path.reduction
                 return (
@@ -300,14 +329,15 @@ def _compiled_inventory_path(
             raise
         _CARRY_COMPILE_STATS["eager_fallback_calls"] += 1
         path = reduce_inventory_fifo_path(
-            state, prices=prices, capacity_shares=capacity_shares
+            state, prices=prices, capacity_shares=capacity_shares,
         )
-        return path, inventory_path_nav(
+        return path, _inventory_path_nav_with_history_grad(
             state,
             prices=prices,
             minute_filled_shares=path.minute_filled_shares,
             marks=marks,
             initial_capital=initial_capital,
+            require_minute_nav_grad=require_minute_nav_grad,
         )
 
     _CARRY_COMPILE_STATS["compiled_path_calls"] += 1
@@ -379,6 +409,7 @@ def _compiled_session_execution(
     rebate_rate: Tensor,
     initial_capital: float,
     event_compression: bool,
+    require_minute_nav_grad: bool = True,
 ) -> tuple[DayTradeInventoryState, DayTradeInventoryState, Tensor, Tensor]:
     """Compile the complete opening/FIFO/mark/conversion tensor trajectory.
 
@@ -406,6 +437,7 @@ def _compiled_session_execution(
         int(funded.cohorts.shape[1]),
         float(initial_capital),
         training_graph,
+        require_minute_nav_grad,
         session.daily_proxy_mask is not None,
         session.terminal_liquidation_price is not None,
         bool(event_compression),
@@ -602,12 +634,13 @@ def _compiled_session_execution(
                             prices=prices,
                             capacity_shares=capacity,
                         )
-                        minute_nav = inventory_path_nav(
+                        minute_nav = _inventory_path_nav_with_history_grad(
                             opening.state,
                             prices=prices,
                             minute_filled_shares=path.minute_filled_shares,
                             marks=marks,
                             initial_capital=initial_capital,
+                            require_minute_nav_grad=require_minute_nav_grad,
                         )
                         # The dense minute recurrence above is unchanged.  Its
                         # training/eval caller needs only the exact minimum and
@@ -642,14 +675,15 @@ def _compiled_session_execution(
                             "sparse carry source cannot produce a formal minute history"
                         )
                     first = reduce_inventory_fifo_path(
-                        opening.state, prices=prices, capacity_shares=capacity
+                        opening.state, prices=prices, capacity_shares=capacity,
                     )
-                    first_marks = inventory_path_nav(
+                    first_marks = _inventory_path_nav_with_history_grad(
                         opening.state,
                         prices=prices,
                         minute_filled_shares=first.minute_filled_shares,
                         marks=marks,
                         initial_capital=initial_capital,
+                        require_minute_nav_grad=require_minute_nav_grad,
                     )
                     # Fills at the first insolvent mark happened; no later fill
                     # is permitted.  The complete artifact path intentionally
@@ -665,12 +699,13 @@ def _compiled_session_execution(
                         prices=prices,
                         capacity_shares=capacity * before_alive,
                     )
-                    minute_nav = inventory_path_nav(
+                    minute_nav = _inventory_path_nav_with_history_grad(
                         opening.state,
                         prices=prices,
                         minute_filled_shares=path.minute_filled_shares,
                         marks=marks,
                         initial_capital=initial_capital,
+                        require_minute_nav_grad=require_minute_nav_grad,
                     )
                     path_state = path.reduction.state
                     exit_notional = (
@@ -696,6 +731,8 @@ def _compiled_session_execution(
                     * torch.nan_to_num(entry_price, nan=0)
                 ).sum()
                 notional = notional + exit_notional
+                if not require_minute_nav_grad:
+                    minute_nav = minute_nav.detach()
                 return (
                     path_state.cohorts,
                     path_state.realized_net_pnl - slim_realized,
@@ -816,6 +853,7 @@ def _run_inventory_path(
     capacity_shares: Tensor,
     marks: Tensor,
     initial_capital: float,
+    require_minute_nav_grad: bool = True,
 ) -> tuple[InventoryPathReduction, Tensor]:
     if _carry_path_compile_enabled(state.cohorts):
         return _compiled_inventory_path(
@@ -824,6 +862,7 @@ def _run_inventory_path(
             capacity_shares=capacity_shares,
             marks=marks,
             initial_capital=initial_capital,
+            require_minute_nav_grad=require_minute_nav_grad,
         )
     # Telemetry is an eager orchestration concern.  Mutating a Python counter
     # inside an enclosing ``torch.compile(fullgraph=True)`` region turns its
@@ -831,14 +870,15 @@ def _run_inventory_path(
     if not torch.compiler.is_compiling():
         _CARRY_COMPILE_STATS["eager_path_calls"] += 1
     path = reduce_inventory_fifo_path(
-        state, prices=prices, capacity_shares=capacity_shares
+        state, prices=prices, capacity_shares=capacity_shares,
     )
-    return path, inventory_path_nav(
+    return path, _inventory_path_nav_with_history_grad(
         state,
         prices=prices,
         minute_filled_shares=path.minute_filled_shares,
         marks=marks,
         initial_capital=initial_capital,
+        require_minute_nav_grad=require_minute_nav_grad,
     )
 
 
@@ -1282,24 +1322,89 @@ class DayTradeCarryResult:
     final_state: DayTradeCarryState
 
 
+def _pad_inventory_choice(name: str, before: Tensor, after: Tensor) -> Tensor:
+    if name in {"cohorts", "claims"} and before.shape[0] < after.shape[0]:
+        padding = before.new_zeros((after.shape[0] - before.shape[0], *before.shape[1:]))
+        if name == "cohorts" and before.shape[0]:
+            # Preserve the original frozen-default FIFO padding convention.
+            padding[..., CohortField.ACQUIRED_DAY] = before[-1, :, CohortField.ACQUIRED_DAY]
+        before = torch.cat((before, padding))
+    return before
+
+
 def _choose_inventory(condition: Tensor, new: DayTradeInventoryState,
                       old: DayTradeInventoryState) -> DayTradeInventoryState:
     """Freeze physical evidence on economic default; do not call it bad data."""
-    values = {}
-    for field in fields(old):
-        before, after = getattr(old, field.name), getattr(new, field.name)
-        if field.name in {"cohorts", "claims"} and before.shape[0] < after.shape[0]:
-            padding = before.new_zeros((after.shape[0] - before.shape[0], *before.shape[1:]))
-            if field.name == "cohorts" and before.shape[0]:
-                # Inactive shape-padding still has to preserve FIFO chronology
-                # when a financially defaulted (but valid) account is restored.
-                padding[..., CohortField.ACQUIRED_DAY] = before[-1, :, CohortField.ACQUIRED_DAY]
-            before = torch.cat((before, padding))
-        values[field.name] = torch.where(condition, after, before)
+    values = {field.name: torch.where(condition, getattr(new, field.name),
+        _pad_inventory_choice(field.name, getattr(old, field.name), getattr(new, field.name)))
+        for field in fields(old)}
     return DayTradeInventoryState(**values)
 
 
 _INVENTORY_FIELDS = tuple(f.name for f in fields(DayTradeInventoryState))
+
+
+def _commit_carry_inventory(candidate: DayTradeInventoryState,
+    working: DayTradeInventoryState, original: DayTradeInventoryState, *,
+    trade_alive: Tensor, accept: Tensor) -> DayTradeInventoryState:
+    """One fused selection instead of three full-ledger read/write passes.
+
+    where(valid, where(alive, where(trade_alive, candidate, working), old), old)
+    equals where(valid & alive, where(trade_alive, candidate, working), old).
+    Calendar/claim padding is still the canonical eager operation. The kernel
+    contains only selection, no FP64 reduction, scan, index or column stacking.
+    """
+    candidates = tuple(getattr(candidate, name) for name in _INVENTORY_FIELDS)
+    working_values = tuple(_pad_inventory_choice(name, getattr(working, name), value)
+                           for name, value in zip(_INVENTORY_FIELDS, candidates))
+    originals = tuple(_pad_inventory_choice(name, getattr(original, name), value)
+                       for name, value in zip(_INVENTORY_FIELDS, candidates))
+    cohort_index = _INVENTORY_FIELDS.index("cohorts")
+
+    def core(new, work, old, trading, accepting):
+        return (torch.where(accepting, torch.where(trading, new, work), old),)
+
+    # Claims have a variable row axis and are tiny relative to [K,S,12]. Keep
+    # those eager; compiling them here would specialize once per action/date.
+    inputs = (candidates[cohort_index], working_values[cohort_index],
+              originals[cohort_index], trade_alive, accept)
+    compiled = None
+    if (_carry_path_compile_enabled(candidate.cohorts)
+            and _env_truthy("STOCKAGENT_DAY_TRADE_CARRY_COMMIT_COMPILE", "1")):
+        options = _carry_compile_options()
+        key = (str(candidate.cohorts.device), torch.is_grad_enabled(),
+               tuple((tuple(value.shape), tuple(value.stride()), str(value.dtype), value.requires_grad)
+                     for value in inputs), tuple(sorted(options.items())))
+        with _COMPILED_PATH_LOCK:
+            compiled = _COMPILED_COMMITS.get(key)
+            if compiled is None:
+                compiled = torch.compile(_compile_isolated_code_object(core,
+                    name=f"day_trade_carry_commit_{abs(hash(key))}"), fullgraph=True,
+                    dynamic=False, options=options)
+                _COMPILED_COMMITS[key] = compiled
+                _CARRY_COMPILE_STATS["commit_compile_constructors"] += 1
+    if compiled is None:
+        cohorts, = core(*inputs)
+    else:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore",
+                    message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*",
+                    category=UserWarning)
+                cohorts, = compiled(*inputs)
+            _CARRY_COMPILE_STATS["compiled_commit_calls"] += 1
+        except Exception:
+            with _COMPILED_PATH_LOCK:
+                _COMPILED_COMMITS.pop(key, None)
+            _CARRY_COMPILE_STATS["compile_failures"] += 1
+            if _strict_no_fallback_enabled():
+                raise
+            _CARRY_COMPILE_STATS["eager_fallback_calls"] += 1
+            cohorts, = core(*inputs)
+    values = tuple(cohorts if name == "cohorts" else torch.where(accept,
+        torch.where(trade_alive, new, work), old)
+        for name, new, work, old in zip(_INVENTORY_FIELDS, candidates, working_values, originals))
+    return DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values)))
 
 
 def _sweep_checkpoint_enabled(weights: Tensor) -> bool:
@@ -1590,6 +1695,7 @@ def execute_carry_session(
     can_enter: Tensor, buy_fee_rate: Tensor, day_sell_fee_rate: Tensor,
     normal_sell_fee_rate: Tensor, rebate_rate: Tensor, initial_capital: float,
     event_compression: bool = False,
+    require_minute_nav_grad: bool = True,
 ) -> tuple[DayTradeCarryState, Tensor, Tensor]:
     """09:00 target, 09:01 delta, scheduled exits, then physical residual carry.
 
@@ -1694,7 +1800,7 @@ def execute_carry_session(
             # volume. The canonical final NAV below replaces only mark 270.
             path_inventory, terminal_notional = (
                 _liquidate_terminal_inventory_without_capacity(
-                    path_inventory, terminal_price=session.terminal_liquidation_price
+                    path_inventory, terminal_price=session.terminal_liquidation_price,
                 )
             )
             converted = convert_inventory_to_margin(path_inventory, day=session.day)
@@ -1711,6 +1817,7 @@ def execute_carry_session(
             rebate_rate=rebate_rate,
             initial_capital=initial_capital,
             event_compression=event_compression,
+            require_minute_nav_grad=require_minute_nav_grad,
         )
     else:
         opening = rebalance_inventory_at_open(funded, weights=target_weights,
@@ -1784,6 +1891,7 @@ def execute_carry_session(
                     capacity_shares=capacity,
                     marks=session.marks,
                     initial_capital=initial_capital,
+                    require_minute_nav_grad=require_minute_nav_grad,
                 )
                 path_inventory = path.reduction.state
                 exit_notional = (
@@ -1796,6 +1904,7 @@ def execute_carry_session(
                 capacity_shares=capacity,
                 marks=session.marks,
                 initial_capital=initial_capital,
+                require_minute_nav_grad=require_minute_nav_grad,
             )
             # A solvent first pass has ``before_alive == 1`` at every minute,
             # hence the replay inputs and every differentiable result match.
@@ -1812,6 +1921,7 @@ def execute_carry_session(
                     capacity_shares=capacity * before_alive,
                     marks=session.marks,
                     initial_capital=initial_capital,
+                    require_minute_nav_grad=require_minute_nav_grad,
                 )
             path_inventory = path.reduction.state
             exit_notional = (
@@ -1829,6 +1939,8 @@ def execute_carry_session(
         notional = ((opening.reduction.filled_shares + opening.addition_shares.abs())
                     * torch.nan_to_num(session.entry_price, nan=0)).sum()
         notional = notional + exit_notional
+    if not require_minute_nav_grad:
+        marks = marks.detach()
     valid = valid & _require(torch.isfinite(marks), "carry account minute valuation is invalid")
     intraday_alive = trade_alive & (marks > 0).all()
     final_inventory = _choose_inventory(intraday_alive, converted, path_inventory)
@@ -1861,11 +1973,10 @@ def execute_carry_session(
         committed_marks = torch.stack(
             (exact_minimum, committed_marks[-1])
         )
-    final_inventory = _choose_inventory(trade_alive, final_inventory, working)
-    final_inventory = _choose_inventory(state.alive, final_inventory, inventory)
     # Source failure is atomic across the account, including malformed action
     # terms on CUDA. Do not leave successful peers half-advanced on retry.
-    final_inventory = _choose_inventory(valid, final_inventory, inventory)
+    final_inventory = _commit_carry_inventory(final_inventory, working, inventory,
+        trade_alive=trade_alive, accept=state.alive & valid)
     final_inventory = replace(final_inventory,
         failed=torch.maximum(final_inventory.failed, (~valid).to(torch.float64)))
     return (DayTradeCarryState(final_inventory, committed_marks[-1],
@@ -1873,11 +1984,15 @@ def execute_carry_session(
             committed_marks, torch.where(trade_alive & valid, notional, 0))
 
 
-def run_day_trade_carry_sessions(
+def _run_day_trade_carry_sessions_core(
     weights: Tensor, sessions: tuple[DayTradeCarrySession, ...], *, can_enter: Tensor,
     buy_fee_rate: Tensor, day_sell_fee_rate: Tensor, normal_sell_fee_rate: Tensor,
     rebate_rate: Tensor, initial_capital: float, initial_state: DayTradeCarryState | None = None,
     event_compression: bool = False,
+    require_minute_nav_grad: bool = True,
+    _fixed_cohort_rows: int | None = None,
+    _compact_initial_state: bool = True,
+    _flat_terminal_proofs: list[Tensor] | None = None,
 ) -> DayTradeCarryResult:
     """Chronological executor used by the canonical simulator/loss boundary."""
     if weights.ndim != 2 or weights.shape[0] != len(sessions) or not sessions:
@@ -1900,14 +2015,22 @@ def run_day_trade_carry_sessions(
     # made its state grow by one inert cohort row per session.  The helper is a
     # no-op for any state that still participates in autograd and its stable
     # packing preserves every active FIFO row and claim in chronological order.
-    state = _compact_detached_carry_state(state)
+    if _compact_initial_state:
+        state = _compact_detached_carry_state(state)
+    flat_terminal = _flat_terminal_proofs is not None
+    if flat_terminal and (state.inventory.cohorts.numel() or state.inventory.claims.numel()):
+        raise ValueError("flat-terminal candidate requires an empty incoming physical ledger")
+    inert_history = []
     compile_paths = _carry_path_compile_enabled(weights)
     if compile_paths:
         # Every session appends exactly one acquisition row. Temporarily pad
         # each input to K-1 so every FIFO core in this truncated-BPTT call sees
         # the same power-of-two K; remove only those inert middle rows after it.
         maximum_rows = int(state.inventory.cohorts.shape[0]) + len(sessions)
-        path_cohort_rows = 1 << max(0, int(maximum_rows - 1).bit_length())
+        path_cohort_rows = (_fixed_cohort_rows if _fixed_cohort_rows is not None
+                            else 1 << max(0, int(maximum_rows - 1).bit_length()))
+        if path_cohort_rows < maximum_rows:
+            raise ValueError("fixed checkpoint cohort axis cannot truncate inventory")
         pre_session_rows = path_cohort_rows - 1
     else:
         pre_session_rows = -1
@@ -1980,7 +2103,7 @@ def run_day_trade_carry_sessions(
             )
         if compile_paths:
             state, logical_rows = _pad_carry_state_cohorts(
-                state, target_rows=pre_session_rows
+                state, target_rows=0 if flat_terminal else pre_session_rows
             )
         else:
             logical_rows = -1
@@ -1994,7 +2117,9 @@ def run_day_trade_carry_sessions(
             weights=weights[i], can_enter=can_enter[i], buy_fee_rate=buy_fee_rate,
             day_sell_fee_rate=day_sell_fee_rate, normal_sell_fee_rate=normal_sell_fee_rate,
             rebate_rate=rebate_rate, initial_capital=initial_capital,
-            event_compression=event_compression)
+            event_compression=event_compression,
+            require_minute_nav_grad=require_minute_nav_grad,
+        )
         if compile_paths:
             state = _strip_carry_session_padding(
                 state, logical_rows_before_session=logical_rows
@@ -2108,50 +2233,176 @@ def run_day_trade_carry_sessions(
             )
             / state.last_nav.clamp_min(1e-30), 0))
         defaults.append(~state.alive)
+        if flat_terminal:
+            cohorts = state.inventory.cohorts
+            # Terminal unlimited closes make these three quantities constant
+            # zero with zero action Jacobian. Keep realized PnL/fees/claims/NAV
+            # connected; this is not a new truncation or a daily capital reset.
+            proof = ((cohorts[..., CohortField.SHARES] == 0).all()
+                & (cohorts[..., CohortField.ENTRY_COST] == 0).all()
+                & (cohorts[..., CohortField.LOCKED_SHARES] == 0).all()
+                & (state.inventory.claims[..., 0] == 0).all()
+                & (state.inventory.failed == 0) & state.alive)
+            _flat_terminal_proofs.append(proof)
+            inert_history.append(cohorts)
+            state = replace(state, inventory=replace(state.inventory,
+                cohorts=cohorts.new_empty((0, cohorts.shape[1], cohorts.shape[2]))))
+            _CARRY_COMPILE_STATS["flat_terminal_cleared_sessions"] += 1
+    if flat_terminal:
+        # Retain the complete public/checkpoint representation, including
+        # inactive acquisition dates. These rows are immutable after a proved
+        # terminal close; only their needless re-execution was removed. The
+        # user-approved compact FP64 sums may differ from zero-padded sums by
+        # roundoff; never restore O(B**2*S) padding merely to match those bits.
+        state = replace(state, inventory=replace(state.inventory,
+            cohorts=torch.cat(inert_history, dim=0)))
     result = DayTradeCarryResult(torch.stack(returns), torch.stack(turns), torch.stack(exposure),
         torch.stack(holdings), torch.stack(curves), torch.stack(defaults), state)
-    if event_compression:
-        # One synchronization per truncated-BPTT batch, never one per session.
-        # Dense sessions carry their exact first-pass 270-point NAV; sparse
-        # sessions carry a conservative bound.  Positivity proves the masked
-        # default replay is an identity.  An inconclusive batch is recomputed
-        # by the complete authoritative path, never accepted approximately.
-        certified = torch.isfinite(result.minute_nav).all() & (
-            result.minute_nav > 0
-        ).all()
-        if not bool(certified.detach().cpu()):
-            del result, state, returns, turns, curves, holdings, exposure, defaults
-            _CARRY_COMPILE_STATS["event_compression_fallback_batches"] += 1
-            if sessions[0].uses_sparse_events:
-                raise DayTradeCarryEventCompressionFallback(
-                    "sparse event certificate was inconclusive; dense minute replay required"
-                )
-            fallback = run_day_trade_carry_sessions(
-                weights,
-                sessions,
-                can_enter=can_enter,
-                buy_fee_rate=buy_fee_rate,
-                day_sell_fee_rate=day_sell_fee_rate,
-                normal_sell_fee_rate=normal_sell_fee_rate,
-                rebate_rate=rebate_rate,
-                initial_capital=initial_capital,
-                initial_state=initial_state,
-                event_compression=False,
-            )
-            # The caller requested the compact ABI.  The fallback still
-            # computes all 270 authoritative points, then retains their exact
-            # worst and closing NAV so downstream buffers keep a fixed shape.
-            compact_curve = torch.stack(
-                (fallback.minute_nav.amin(dim=-1), fallback.minute_nav[:, -1]),
-                dim=-1,
-            )
-            return replace(fallback, minute_nav=compact_curve)
-        if result.minute_nav.shape[-1] != 2:
-            result = replace(
-                result,
-                minute_nav=torch.stack(
-                    (result.minute_nav.amin(dim=-1), result.minute_nav[:, -1]),
-                    dim=-1,
-                ),
-            )
+    return result
+
+
+
+
+_CARRY_RESULT_FIELDS = ("strategy_returns", "turnovers", "weights_history",
+    "shares_history", "minute_nav", "settlement_default")
+
+
+def _carry_checkpoint_block_rows(weights: Tensor) -> int:
+    if not torch.is_grad_enabled() or not weights.requires_grad:
+        return 0
+    raw = os.environ.get("STOCKAGENT_DAY_TRADE_CARRY_CHECKPOINT_BLOCK_ROWS", "0")
+    try:
+        rows = int(raw)
+    except ValueError as exc:
+        raise ValueError("carry checkpoint block rows must be zero or a power of two") from exc
+    if rows < 0 or (rows and rows & (rows - 1)):
+        raise ValueError("carry checkpoint block rows must be zero or a power of two")
+    return rows
+
+
+def _run_checkpointed_carry_sessions(
+    weights: Tensor, sessions: tuple[DayTradeCarrySession, ...], *, can_enter: Tensor,
+    buy_fee_rate: Tensor, day_sell_fee_rate: Tensor, normal_sell_fee_rate: Tensor,
+    rebate_rate: Tensor, initial_capital: float, initial_state: DayTradeCarryState | None = None,
+    event_compression: bool = False,
+    require_minute_nav_grad: bool = True,
+    block_rows: int,
+) -> DayTradeCarryResult:
+    """Canonical FIFO recurrence with optional exact block rematerialization.
+
+    The runtime-only block size is NOT a BPTT boundary: all input state/action
+    tensors remain connected. Only the original public batch boundary detaches
+    state. Keep the same whole-batch cohort axis and one solvency certificate,
+    including complete fallback replay, so financial math/reduction order and
+    default/claim ownership remain identical. Evaluation retains the ordinary
+    path and all requested minute/artifact histories.
+    """
+    if weights.ndim != 2 or weights.shape[0] != len(sessions) or not sessions:
+        raise ValueError("carry sessions must match a nonempty [T,S] action trajectory")
+    if can_enter.shape != weights.shape:
+        raise ValueError("carry entry permissions must match the action trajectory")
+    if any(a.day >= b.day for a, b in zip(sessions, sessions[1:])):
+        raise ValueError("carry sessions must be strictly chronological")
+    state = initial_state or DayTradeCarryState.empty(weights.shape[1], initial_capital, weights.device)
+    state.validate(symbols=weights.shape[1], device=weights.device, initial_capital=initial_capital)
+    state = _compact_detached_carry_state(state)
+    maximum_rows = int(state.inventory.cohorts.shape[0]) + len(sessions)
+    fixed_rows = (1 << max(0, int(maximum_rows - 1).bit_length())
+                  if _carry_path_compile_enabled(weights) else None)
+    histories = {name: [] for name in _CARRY_RESULT_FIELDS}
+    n = len(_INVENTORY_FIELDS)
+    for begin in range(0, len(sessions), block_rows):
+        end = min(begin + block_rows, len(sessions))
+        # Bind every block's calendar/source metadata. Never capture the mutable
+        # outer state or last loop slice for a delayed backward recomputation.
+        def core(*values, block_sessions=sessions[begin:end],
+                 block_permissions=can_enter[begin:end], prior_day=state.last_session_day):
+            inventory = DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values[:n])))
+            incoming = DayTradeCarryState(inventory, values[n], values[n+1], initial_capital, prior_day)
+            result = _run_day_trade_carry_sessions_core(values[n+2], block_sessions,
+                can_enter=block_permissions, buy_fee_rate=buy_fee_rate,
+                day_sell_fee_rate=day_sell_fee_rate, normal_sell_fee_rate=normal_sell_fee_rate,
+                rebate_rate=rebate_rate, initial_capital=initial_capital, initial_state=incoming,
+                event_compression=event_compression, _fixed_cohort_rows=fixed_rows,
+                require_minute_nav_grad=require_minute_nav_grad,
+                _compact_initial_state=False)
+            final = result.final_state
+            return (*(getattr(final.inventory, name) for name in _INVENTORY_FIELDS),
+                final.last_nav, final.alive,
+                *(getattr(result, name) for name in _CARRY_RESULT_FIELDS))
+        inputs = (*(getattr(state.inventory, name) for name in _INVENTORY_FIELDS),
+                  state.last_nav, state.alive, weights[begin:end])
+        values = checkpoint(core, *inputs, use_reentrant=False, preserve_rng_state=False)
+        _CARRY_COMPILE_STATS["checkpointed_trajectory_blocks"] += 1
+        state = DayTradeCarryState(
+            DayTradeInventoryState(**dict(zip(_INVENTORY_FIELDS, values[:n]))),
+            values[n], values[n+1], initial_capital, sessions[end-1].day)
+        for name, value in zip(_CARRY_RESULT_FIELDS, values[n+2:]):
+            histories[name].append(value)
+    result = DayTradeCarryResult(*(torch.cat(histories[name], dim=0)
+        for name in _CARRY_RESULT_FIELDS), state)
+    return result
+
+
+def run_day_trade_carry_sessions(
+    weights: Tensor, sessions: tuple[DayTradeCarrySession, ...], *, can_enter: Tensor,
+    buy_fee_rate: Tensor, day_sell_fee_rate: Tensor, normal_sell_fee_rate: Tensor,
+    rebate_rate: Tensor, initial_capital: float, initial_state: DayTradeCarryState | None = None,
+    event_compression: bool = False,
+    require_minute_nav_grad: bool = True,
+    _allow_flat_terminal: bool = True,
+) -> DayTradeCarryResult:
+    """Exact physical FIFO; block rematerialization never detaches state."""
+    common = dict(can_enter=can_enter, buy_fee_rate=buy_fee_rate,
+        day_sell_fee_rate=day_sell_fee_rate, normal_sell_fee_rate=normal_sell_fee_rate,
+        rebate_rate=rebate_rate, initial_capital=initial_capital,
+        initial_state=initial_state, event_compression=event_compression,
+        require_minute_nav_grad=require_minute_nav_grad)
+    block_rows = _carry_checkpoint_block_rows(weights)
+    flat_candidate = (_allow_flat_terminal and _env_truthy("STOCKAGENT_DAY_TRADE_CARRY_FLAT_TERMINAL", "0")
+        and torch.is_grad_enabled() and weights.requires_grad and weights.ndim == 2
+        and bool(sessions) and not require_minute_nav_grad
+        and all(s.terminal_liquidation_price is not None and s.entry_path is None
+                and not s.uses_sparse_events for s in sessions))
+    if flat_candidate:
+        incoming = initial_state or DayTradeCarryState.empty(weights.shape[1], initial_capital, weights.device)
+        incoming = _compact_detached_carry_state(incoming)
+        flat_candidate = not (incoming.inventory.cohorts.numel() or incoming.inventory.claims.numel())
+    if flat_candidate:
+        proofs: list[Tensor] = []
+        result = _run_day_trade_carry_sessions_core(weights, sessions,
+            **{**common, "initial_state": incoming}, _flat_terminal_proofs=proofs)
+        certified = (torch.stack(proofs).all() & torch.isfinite(result.minute_nav).all()
+                     & (result.minute_nav > 0).all())
+        if bool(certified.detach().cpu()):
+            _CARRY_COMPILE_STATS["flat_terminal_batches"] += 1
+            return result
+        # One batch certificate, not one synchronizing host check per day.
+        # Replay the canonical full ledger on any uncertain/source/default
+        # case, before accepting outputs or performing an optimizer update.
+        del result
+        _CARRY_COMPILE_STATS["flat_terminal_fallback_batches"] += 1
+    if block_rows and len(sessions) > block_rows:
+        result = _run_checkpointed_carry_sessions(weights, sessions, **common, block_rows=block_rows)
+    else:
+        result = _run_day_trade_carry_sessions_core(weights, sessions, **common)
+    if not event_compression:
+        return result
+    # Exactly one certificate per public BPTT batch. Both execution paths have
+    # returned: releasing a provisional result before fallback frees its graph,
+    # not just one alias while another helper frame still owns every history.
+    certified = torch.isfinite(result.minute_nav).all() & (result.minute_nav > 0).all()
+    if not bool(certified.detach().cpu()):
+        del result
+        _CARRY_COMPILE_STATS["event_compression_fallback_batches"] += 1
+        if sessions[0].uses_sparse_events:
+            raise DayTradeCarryEventCompressionFallback(
+                "sparse event certificate was inconclusive; dense minute replay required")
+        fallback = run_day_trade_carry_sessions(weights, sessions,
+            **{**common, "event_compression": False}, _allow_flat_terminal=False)
+        return replace(fallback, minute_nav=torch.stack(
+            (fallback.minute_nav.amin(dim=-1), fallback.minute_nav[:, -1]), dim=-1))
+    if result.minute_nav.shape[-1] != 2:
+        result = replace(result, minute_nav=torch.stack(
+            (result.minute_nav.amin(dim=-1), result.minute_nav[:, -1]), dim=-1))
     return result
