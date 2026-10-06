@@ -57,7 +57,7 @@ PID 1 mount namespace，並把 Vast 的 `use`／`gc`／`evict` 路由至 index-o
 - **來源到備份：** canonical collector／build／strict audit → catalog-backed 原子發布
   到 D → DuckLake 固定 registry／原 manifest bytes → Temporal 封閉增量波次 →
   Syncthing ingress → lab203 固定 relay → rclone immutable NAS archive、獨立還原
-  與全檔 SHA → paired ACK。Restic 接 code/config/SQL 傳統備份，原歷史保留；
+  與全檔 SHA → paired ACK。Restic 接原始 manifest/head、code/config/SQL 傳統備份，原歷史保留；
   packed／PG 語義收據另驗，兩套覆蓋不能直接相加。
 - **來源到研究：** 在 Vast 取固定 source release，核對 Git／config／ABI／runtime，
   已登錄 rclone SFTP payload 與 Syncthing index 分工；完整 SHA、demand fence、
@@ -102,6 +102,7 @@ deferred 原因與下一個 owner。分開說明可連線、傳輸收斂、檔�
 
 本 skill 是操作導航；維護中的程式、config 與 topic contract 建立當前實作。
 現行部署與完整 scope 見 `docs/ducklake_temporal_replication_2026-10-05.md`；
+固定清冊補傳與 NAS 去重進度修正見 `docs/nas_sync_catchup_2026-10-06.md`。
 不用歷史「尚未採用」結論取代目前收據。
 它不固定硬體調校，也不宣稱全歷史、所有 cache 或實際 filesystem 格式遷移已完成。
 架構變更時先更新原契約／runbook，再同步修正此 skill 的入口、範例與 references。

@@ -146,12 +146,14 @@ def ordered_items(items: list[dict], order: str, by_root: dict) -> list[dict]:
 
 
 @contextmanager
-def cohort_owner(state_root: Path):
+def cohort_owner(state_root: Path, *, wait: bool = False):
     """One progress writer per retained cohort, independent of the D owner."""
+    if type(wait) is not bool:
+        raise SnapshotError('cohort owner wait must be an explicit boolean')
     path = real(state_root / "cohort-owner.lock")
     with path.open("a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as error:
             raise SnapshotError("this retained legacy cohort already has an owner") from error
         yield
@@ -163,6 +165,21 @@ def archive_one(args, policy: dict, row: dict, spec: LegacyArchiveSpec) -> None:
     if before["fingerprint"] != row["fingerprint"] or before["process_references"]:
         raise SnapshotError("remote source changed or is in use; inventory again")
     _check_d_primary_mount(args.sync_root)
+    if row.get("private_scratch_removed") is True:
+        if ((args.state_root / "staging" / spec.dataset).exists()
+                or (spec.stage_root / spec.dataset).exists()):
+            raise SnapshotError("retired private scratch reappeared; preserve for audit")
+        if row.get("cold_verified") is not True:
+            raise SnapshotError("removed scratch has no verified cold release")
+        result = {"dataset":spec.dataset, "snapshot_id":row["snapshot_id"],
+                  "manifest_sha256":row["manifest_sha256"]}
+        with phase(args, row, spec, "reuse-cold-after-local-scratch-retirement"):
+            proof = verify_cold_archive(spec, args.sync_root,
+                                        verification_root=args.state_root / "verification-scratch")
+        exact_recovery(result, proof, resolve_latest_packed(args.sync_root, spec.dataset))
+        commit_prepared_archive(args, policy, row, spec, before, None, None, None, None,
+                                reused_result=result, reused_proof=proof)
+        return
     # Original copy + encoded stage + independent reconstruction. One wave,
     # native ext4 and real C backing-space admission before any growth.
     scratch_parent = args.state_root / "staging"
@@ -222,22 +239,31 @@ def exact_recovery(result, proof, resolved):
         raise SnapshotError("cold head changed after independent recovery; source retained")
 
 
-def commit_prepared_archive(args, policy, row, spec, before, scratch, source_root, intent, intent_path):
-    with publication_owner(args, row, spec):
+def commit_prepared_archive(args, policy, row, spec, before, scratch, source_root, intent, intent_path,
+                            *, reused_result=None, reused_proof=None):
+    if reused_result is None:
         _check_d_primary_mount(args.sync_root)
-        with phase(args, row, spec, "pre-commit-source-probe"):
-            current = remote(args, {"action": "observe", "relative_root": row["relative_root"]})
-        if current != before or current["process_references"]:
-            raise SnapshotError("remote source changed while private encoding awaited the owner")
+        @contextmanager
+        def owner():
+            with publication_owner(args, row, spec):
+                with phase(args, row, spec, "pre-commit-source-probe"):
+                    current = remote(args, {"action": "observe", "relative_root": row["relative_root"]})
+                if current != before or current["process_references"]:
+                    raise SnapshotError("remote source changed while private encoding awaited the owner")
+                yield
         with phase(args, row, spec, "publishing-d-cold"):
             row["archive_compression"] = spec.compression_profile
             result = publish_archive(spec, source_root, args.sync_root, repo_root=ROOT,
-                                     manual_capture=True, defer_scan=True,
+                                     manual_capture=True, defer_scan=True, publication_owner=owner,
                                      batch_directory_fsync=getattr(args, "batch_directory_fsync", False))
+        with phase(args, row, spec, "independent-d-recovery"):
+            proof = verify_cold_archive(spec, args.sync_root,
+                                        verification_root=args.state_root / "verification-scratch")
+    else:
+        if scratch is not None or reused_proof is None:
+            raise SnapshotError("cold reuse must not republish a private scratch")
+        result, proof = reused_result, reused_proof
     row.update(result)
-    with phase(args, row, spec, "independent-d-recovery"):
-        proof = verify_cold_archive(spec, args.sync_root,
-                                    verification_root=args.state_root / "verification-scratch")
     resolved = resolve_latest_packed(args.sync_root, spec.dataset)
     exact_recovery(result, proof, resolved)
     manifest = proof["manifest"]
@@ -298,6 +324,11 @@ def commit_prepared_archive(args, policy, row, spec, before, scratch, source_roo
         atomic_write_json(args.state_root / "post-retirement-recovery" / (spec.dataset + ".json"), post)
         row["post_retirement_d_recovery_verified"] = True
     row["state"] = "remote-source-retired" if row["retirement"]["deleted"] else "cold-verified-source-protected"
+    if scratch is None:
+        # A previous exact local prune already removed both copies. Never
+        # hydrate them merely to finish a remote acknowledgement.
+        row["private_scratch_removed"] = True
+        return
     # Only these exact private scratch copies may go, after full D restore.
     # Interrupted or altered stages are retained, not blanket-deleted.
     encoded = spec.stage_root / spec.dataset

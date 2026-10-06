@@ -375,6 +375,8 @@ class BackupStream:
             raise SnapshotError("unreferenced cold inclusion must be an explicit boolean")
         if type(configuration.get("cold_object_replication_enabled", True)) is not bool:
             raise SnapshotError("cold object replication must be an explicit boolean")
+        if type(configuration.get('cold_metadata_replication_enabled', False)) is not bool:
+            raise SnapshotError('cold metadata replication must be an explicit boolean')
         cache = configuration.get("cold_transport_cache", {})
         if cache.get("enabled") is True and configuration.get("automatic_batch_deletion") is not True:
             raise SnapshotError("cold cache retirement must be reported as automatic batch deletion")
@@ -619,10 +621,35 @@ class BackupStream:
                         break
                     deferred = {key for key, item in retries.items() if item["next_attempt_epoch"] > time.time()}
                     auxiliary = ledger.get("auxiliary_pending")
-                    selection = [] if (not self.config.get("cold_object_replication_enabled", True)
+                    metadata_only = (not self.config.get("cold_object_replication_enabled", True)
+                                     and self.config.get("cold_metadata_replication_enabled", False))
+                    selection_covered = covered['published_file_keys'] | covered['accepted_file_keys'] | deferred
+                    if metadata_only:
+                        from stockagent.data_sync.nas_coverage import restic_keys
+                        # Pilot reports remain provenance, not machine restore
+                        # receipts. Re-deliver their small metadata for a proof.
+                        selection_covered = covered['published_file_keys'] | restic_keys(ledger) | deferred
+                    selection_catalog = {**catalog, "files": [r for r in catalog["files"] if r["role"] == "cold_metadata"]} if metadata_only else catalog
+                    selection = [] if ((not self.config.get("cold_object_replication_enabled", True) and not metadata_only)
                         or auxiliary and auxiliary["complete_bytes"] <= limit) else select_wave(
-                        catalog, covered["published_file_keys"] | covered["accepted_file_keys"] | deferred,
+                        selection_catalog, selection_covered,
                         maximum_bytes=limit, maximum_files=self.config["maximum_batch_files"])
+                    selection_identity = catalog['identity_sha256']
+                    if (not selection and metadata_only and self.config.get('metadata_backfill_catalog')
+                            and not (auxiliary and auxiliary['complete_bytes'] <= limit)):
+                        fixed_path = _regular(Path(self.config['metadata_backfill_catalog']))
+                        if fixed_path.stat().st_size > 128 * 1024**2:
+                            raise SnapshotError('fixed metadata backfill inventory is oversized')
+                        raw = fixed_path.read_bytes()
+                        if hashlib.sha256(raw).hexdigest() != self.config.get('metadata_backfill_sha256'):
+                            raise SnapshotError('fixed metadata backfill inventory changed')
+                        fixed = json.loads(raw)
+                        if fixed.get('contract') != CATALOG:
+                            raise SnapshotError('fixed metadata backfill contract differs')
+                        selection = select_wave({**fixed, 'files': [r for r in fixed['files'] if r['role'] == 'cold_metadata']},
+                            selection_covered,
+                            maximum_bytes=limit, maximum_files=self.config['maximum_batch_files'])
+                        selection_identity = fixed['identity_sha256']
                     if auxiliary and auxiliary["complete_bytes"] <= limit:
                         staging = safe_path(self.transport, auxiliary["staging_relative"])
                         key = auxiliary["export"]["envelope_identity_sha256"]
@@ -634,7 +661,7 @@ class BackupStream:
                         staging = self.transport / ".staging" / uuid.uuid4().hex
                         try:
                             result = export_incremental_delivery(self.backup_read_root(), selection, staging,
-                                catalog_identity=catalog["identity_sha256"],
+                                catalog_identity=selection_identity,
                                 copy_workers=self.pipeline.get("copy_workers", 1),
                                 verify_workers=self.pipeline.get("verify_workers", 1))
                         except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
@@ -655,7 +682,7 @@ class BackupStream:
                             continue
                         key = result["envelope_identity_sha256"]
                         self.publish_closed(ledger, selection, staging, key,
-                                            catalog["identity_sha256"], "incremental_cold_objects")
+                                            selection_identity, "incremental_cold_objects")
                         for row in selection:
                             retries.pop(file_key(row), None)
                     else:
@@ -711,6 +738,13 @@ class BackupStream:
                 "catalog_observed_at_utc": catalog["observed_at_utc"],
                 "observed_at_utc": datetime.now(timezone.utc).isoformat()}
             from stockagent.data_sync.nas_recovery_acceptance import recovery_status
+            if self.config.get('immutable_archive_state_root'):
+                from stockagent.data_sync.nas_coverage import combined_coverage, read_ledger
+                try:
+                    result['combined_nas_coverage'] = combined_coverage(catalog, ledger,
+                        read_ledger(Path(self.config['immutable_archive_state_root']) / 'source-replication-ledger.json'))
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    result['combined_nas_coverage'] = {'state': 'unavailable', 'error_type': type(error).__name__}
             try:
                 result["independent_recovery"] = recovery_status(self.config, self.receipts)
             except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:

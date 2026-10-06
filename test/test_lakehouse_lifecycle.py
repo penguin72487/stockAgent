@@ -3,6 +3,7 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -194,6 +195,78 @@ def test_source_ack_is_durable_without_waiting_for_transport_gc(delivery, monkey
     persisted = json.loads(ledger_path.read_bytes())['deliveries'][identity]
     assert persisted['nas_acceptance']['state'] == 'nas_archive_file_recovery_verified'
     assert batch.exists() and original.exists()
+
+
+def test_accepted_history_is_not_rewritten_once_per_wave(delivery, monkeypatch):
+    c, identity, batch, original, proof = delivery
+    sha = hashlib.sha256(original.read_bytes()).hexdigest()
+    relative = original.relative_to(Path(c['cold_root'])).as_posix()
+    key = relative + '@' + sha
+    ledger = Path(c['state_root']) / 'source-replication-ledger.json'
+    atomic_write_json(ledger, {'deliveries': {identity: {'file_keys': [key], 'bytes': original.stat().st_size,
+        'nas_acceptance': lakehouse.acceptance(c, identity)}}})
+    class Catalog:
+        def execute(self, sql): return self
+        def fetchall(self): return [(relative, sha, original.stat().st_size)]
+        def close(self): pass
+    monkeypatch.setattr(lakehouse, 'guard', lambda policy: None)
+    monkeypatch.setattr(lakehouse, 'connect', lambda *args, **kwargs: Catalog())
+    write = lakehouse.atomic_write_json
+    calls = []
+    def observe(path, *args, **kwargs):
+        calls.append(Path(path))
+        return write(path, *args, **kwargs)
+    monkeypatch.setattr(lakehouse, 'atomic_write_json', observe)
+    lakehouse.stage_source_wave(c)
+    assert ledger not in calls
+
+
+def test_source_pipeline_prioritizes_unbacked_bytes_and_keeps_disjoint_pending_waves(source_wave, monkeypatch):
+    c, chosen, physical, ledger_path, ledger, source = source_wave
+    c['transport_root'] = str(physical / 'lakehouse')
+    c['receipt_root'] = str(Path(c['state_root']) / 'receipts')
+    Path(c['receipt_root']).mkdir()
+    legacy = Path(c['state_root']) / 'restic'
+    legacy.mkdir()
+    entries = list(chosen)
+    for index in range(3):
+        data = ('unbacked-' + str(index)).encode() * 30
+        sha = hashlib.sha256(data).hexdigest()
+        relative = f'objects/blobs/{sha[:2]}/{sha}.blob'
+        p = Path(c['cold_root']) / relative
+        p.parent.mkdir(parents=True, exist_ok=True);p.write_bytes(data)
+        entries.append((relative, sha, len(data)))
+    backed = chosen[0]
+    atomic_write_json(legacy / 'ledger.json', {'deliveries': {'old': {'files': [
+        {'relative': backed[0], 'sha256': backed[1], 'bytes': backed[2]}], 'acceptance': True}}})
+    c['source_replication'] = {'maximum_pending_deliveries': 2, 'maximum_wave_files': 1,
+        'maximum_wave_bytes': 1024**2, 'maximum_pending_bytes': 2 * 1024**2,
+        'prioritize_uncovered_nas': True, 'restic_state_root': str(legacy)}
+    class Catalog:
+        def execute(self, sql): return self
+        def fetchall(self): return entries
+        def close(self): pass
+    monkeypatch.setattr(lakehouse, 'guard', lambda policy: None)
+    monkeypatch.setattr(lakehouse, 'connect', lambda *args, **kwargs: Catalog())
+    monkeypatch.setattr(lakehouse, 'notify_transport', lambda *args: None)
+    monkeypatch.setattr(cache, 'PHYSICAL_TRANSPORT_ROOT', physical)
+    monkeypatch.setattr(lakehouse.shutil, 'disk_usage', lambda root: SimpleNamespace(free=1024**4))
+    first = lakehouse.stage_source_wave(c)
+    second = lakehouse.stage_source_wave(c)
+    third = lakehouse.stage_source_wave(c)
+    assert len(first['pending_delivery_ids']) == 1
+    assert len(second['pending_delivery_ids']) == len(third['pending_delivery_ids']) == 2
+    persisted = json.loads((Path(c['state_root']) / 'source-replication-ledger.json').read_bytes())
+    keys = [row['file_keys'][0] for row in persisted['deliveries'].values()]
+    assert len(set(keys)) == 2 and backed[0] + '@' + backed[1] not in keys
+    assert second['pending_bytes'] <= c['source_replication']['maximum_pending_bytes']
+
+
+@pytest.mark.parametrize('policy', [{'maximum_pending_deliveries': True}, {'maximum_wave_bytes': 9 * 1024**3},
+    {'maximum_pending_deliveries': 0}, {'prioritize_uncovered_nas': 'true'}, {'unknown_limit': 7}])
+def test_source_policy_refuses_unbounded_or_ambiguous_settings(policy):
+    with pytest.raises(ValueError):
+        lakehouse.source_wave_policy({'source_replication': policy})
 
 
 @pytest.mark.parametrize('change', ['source', 'unknown', 'open', 'ack_pair', 'ack_bytes', 'ack_boolean_exit'])

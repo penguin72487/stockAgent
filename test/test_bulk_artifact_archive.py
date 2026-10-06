@@ -16,6 +16,12 @@ from stockagent.data_sync import bulk_archive_retirement as retirement
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
+@pytest.fixture
+def partition_budget(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(archive.os, 'statvfs', lambda _: SimpleNamespace(f_bavail=2 * 1024**4, f_frsize=1))
+
+
 def tar_bytes(entries):
     out = BytesIO()
     with tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as writer:
@@ -366,3 +372,174 @@ def test_explicit_restore_requires_real_native_workspace_budget_before_scratch(t
     with pytest.raises(SnapshotError,match='physical budget'):
         archive.restore_original_root(payload,index,'cache/one',tmp_path/'restored')
     assert not (tmp_path/'restored').exists() and not list(tmp_path.glob('.stockagent-bulk-restore-*'))
+
+
+def test_partition_reuses_verified_parts_and_retains_failed_partial(tmp_path, monkeypatch, partition_budget):
+    from contextlib import contextmanager
+    payload = tmp_path / 'received.zst'
+    payload.write_bytes(bytes(range(256)))
+    index = {'compressed_bytes': 256, 'compressed_sha256': hashlib.sha256(payload.read_bytes()).hexdigest()}
+    stage = tmp_path / 'parts'
+    original_reader = archive.binary_reader
+    @contextmanager
+    def interrupted(path):
+        with original_reader(path) as stream:
+            class Reader:
+                count = 0
+                def read(self, size):
+                    self.count += 1
+                    if self.count == 3:
+                        raise OSError('controlled interruption')
+                    return stream.read(size)
+            yield Reader()
+    monkeypatch.setattr(archive, 'binary_reader', interrupted)
+    with pytest.raises(OSError, match='controlled interruption'):
+        archive.stage_compressed_parts(payload, stage, index, part_bytes=32)
+    complete = stage / 'payload.part-00000.zst'
+    before = complete.stat().st_ino
+    partials = list((tmp_path / 'parts-partial').glob('*.partial'))
+    assert partials and not (stage / 'compressed_parts.json').exists()
+    monkeypatch.setattr(archive, 'binary_reader', original_reader)
+    plan = archive.stage_compressed_parts(payload, stage, index, part_bytes=32)
+    assert complete.stat().st_ino == before
+    assert all(p.exists() for p in partials)
+    assert archive.payload_hash(tuple(stage / p['path'] for p in plan['parts'])) == index['compressed_sha256']
+    assert payload.read_bytes() == bytes(range(256))
+
+
+def test_partition_rejects_corrupt_retained_part_without_overwrite(tmp_path, partition_budget):
+    payload = tmp_path / 'received.zst'
+    payload.write_bytes(b'a' * 100)
+    index = {'compressed_bytes': 100, 'compressed_sha256': hashlib.sha256(payload.read_bytes()).hexdigest()}
+    stage = tmp_path / 'parts'
+    archive.stage_compressed_parts(payload, stage, index, part_bytes=32)
+    corrupt = stage / 'payload.part-00001.zst'
+    corrupt.write_bytes(b'b' * 32)
+    with pytest.raises(SnapshotError, match='readback differs'):
+        archive.stage_compressed_parts(payload, stage, index, part_bytes=32)
+    assert corrupt.read_bytes() == b'b' * 32 and payload.read_bytes() == b'a' * 100
+
+
+def test_partition_rejects_same_byte_source_mutation(tmp_path, monkeypatch, partition_budget):
+    payload = tmp_path / 'received.zst'
+    payload.write_bytes(b'a' * 100)
+    index = {'compressed_bytes': 100, 'compressed_sha256': hashlib.sha256(payload.read_bytes()).hexdigest()}
+    original_fsync = archive._fsync_directory
+    def mutate(directory):
+        original_fsync(directory)
+        info = payload.stat()
+        os.utime(payload, ns=(info.st_atime_ns, info.st_mtime_ns + 1000000))
+    monkeypatch.setattr(archive, '_fsync_directory', mutate)
+    with pytest.raises(SnapshotError, match='differs from the received frame'):
+        archive.stage_compressed_parts(payload, tmp_path / 'parts', index, part_bytes=32)
+    assert not (tmp_path / 'parts/compressed_parts.json').exists()
+
+
+def test_chunked_canonical_preservation_decodes_and_restores_originals(tmp_path, monkeypatch, partition_budget):
+    from stockagent.data_sync import cold_primary, packed_snapshots, syncthing_scan, training_return
+    cold = tmp_path / 'cold'; cold.mkdir()
+    incoming = tmp_path / 'incoming'; batch = incoming / 'exact'; batch.mkdir(parents=True)
+    raw = tar_bytes([('cache/one', 'dir', None), ('cache/one/empty', 'dir', None),
+                     ('cache/one/a.bin', 'file', bytes(range(256)) * 100),
+                     ('cache/one/b.bin', 'link', 'cache/one/a.bin')])
+    encoded = subprocess.check_output(['zstd', '-1', '-q', '-c'], input=raw)
+    payload = batch / 'cache.tar.zst'; payload.write_bytes(encoded)
+    index = archive.index_zstd(payload, expected_sha256=hashlib.sha256(encoded).hexdigest(), scopes={'cache'})
+    monkeypatch.setattr(archive, 'SYNC_ROOT', cold)
+    monkeypatch.setattr(archive, 'NATIVE_COLD', cold)
+    monkeypatch.setattr(archive, 'INCOMING', incoming)
+    monkeypatch.setattr(archive, 'PART_BYTES', 64)
+    monkeypatch.setattr(archive, 'native_guard', lambda: None)
+    monkeypatch.setattr(cold_primary, 'd_primary_read_alias', lambda path: path)
+    monkeypatch.setattr(training_return, 'admit_workspace', lambda *_: None)
+    original_publish, original_verify = packed_snapshots.publish_packed_snapshot, packed_snapshots.verify_packed_snapshot
+    def publish(*args, **kwargs):
+        assert kwargs.pop('d_primary_native_blob_reads') is True
+        return original_publish(*args, **kwargs)
+    def verify(*args, **kwargs):
+        assert kwargs.pop('d_primary_native_blob_reads') is True
+        return original_verify(*args, **kwargs)
+    monkeypatch.setattr(packed_snapshots, 'publish_packed_snapshot', publish)
+    monkeypatch.setattr(packed_snapshots, 'verify_packed_snapshot', verify)
+    monkeypatch.setattr(syncthing_scan, 'scan_after_publish', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(syncthing_scan, 'queue_after_publish', lambda *_args, **_kwargs: True)
+    proof = archive.publish_preservation(batch, {'scope': 'cache', 'payload': str(payload), 'producer_exit_code': 0}, index, repo_root=tmp_path)
+    assert proof['preservation_contract'] == archive.PARTS_CONTRACT
+    assert proof['cold_verified'] is True and proof['decoded_originals_verified'] is True
+    resolved = packed_snapshots.resolve_packed_snapshot_id(cold, proof['dataset'], proof['snapshot_id'])
+    files = archive.canonical_blobs(cold, resolved)
+    assert archive.verify_retained_preservation(proof) == files
+    parts = archive.preservation_payload(files)
+    assert len(parts) > 1 and all(p.stat().st_size <= 64 for p in parts)
+    assert archive.index_zstd(parts, expected_sha256=index['compressed_sha256'], scopes={'cache'})['rows'] == index['rows']
+    restored = tmp_path / 'restored'
+    result = archive.restore_original_root(parts, index, 'cache/one', restored)
+    assert result['state'] == 'original_root_restored_verified'
+    assert (restored / 'a.bin').samefile(restored / 'b.bin') and (restored / 'empty').is_dir()
+    assert (restored / 'a.bin').read_bytes() == bytes(range(256)) * 100
+    assert (restored / 'a.bin').stat().st_mtime_ns == 1234567890123456789
+    with pytest.raises((SnapshotError, tarfile.ReadError, BrokenPipeError)):
+        archive.index_zstd(tuple(reversed(parts)), expected_sha256=index['compressed_sha256'], scopes={'cache'})
+    plan = json.loads(files['compressed_parts.json'].read_text())
+    plan['parts'].reverse()
+    with pytest.raises(SnapshotError, match='order'):
+        archive.validate_parts_plan(plan)
+    assert payload.read_bytes() == encoded
+    parts[0].write_bytes(b'x' * parts[0].stat().st_size)
+    with pytest.raises(SnapshotError, match='changed after independent decode'):
+        archive.verify_retained_preservation(proof)
+
+
+def test_native_blob_link_targets_the_physical_mount_alias(tmp_path, monkeypatch):
+    from stockagent.data_sync import cold_primary
+    physical = tmp_path / 'physical'; physical.mkdir()
+    canonical = tmp_path / 'canonical'; canonical.symlink_to(physical, target_is_directory=True)
+    payload = tmp_path / 'incoming'; payload.write_bytes(b'exact')
+    monkeypatch.setattr(archive, 'SYNC_ROOT', canonical)
+    monkeypatch.setattr(archive, 'NATIVE_COLD', physical)
+    monkeypatch.setattr(archive, 'native_guard', lambda: None)
+    monkeypatch.setattr(cold_primary, 'd_primary_read_alias', lambda path: path)
+    original_link, called = os.link, []
+    def same_mount(source, destination, **kwargs):
+        assert destination.is_relative_to(physical)
+        called.append(destination)
+        return original_link(source, destination, **kwargs)
+    monkeypatch.setattr(archive.os, 'link', same_mount)
+    result = archive.install_native_blob(payload, hashlib.sha256(b'exact').hexdigest())
+    assert called and result.is_relative_to(canonical) and result.samefile(payload)
+
+
+@pytest.mark.parametrize('partitioned', [False, True])
+def test_publication_rejects_changed_carrier_against_received_proof_before_cas_admission(
+        tmp_path, monkeypatch, partition_budget, partitioned):
+    cold = tmp_path / 'cold'; cold.mkdir()
+    incoming = tmp_path / 'incoming'; batch = incoming / 'exact'; batch.mkdir(parents=True)
+    payload = batch / 'cache.tar.zst'; payload.write_bytes(b'original' * 8)
+    index = {'compressed_bytes': payload.stat().st_size,
+             'compressed_sha256': hashlib.sha256(payload.read_bytes()).hexdigest()}
+    monkeypatch.setattr(archive, 'SYNC_ROOT', cold)
+    monkeypatch.setattr(archive, 'NATIVE_COLD', cold)
+    monkeypatch.setattr(archive, 'INCOMING', incoming)
+    monkeypatch.setattr(archive, 'native_guard', lambda: None)
+    if partitioned:
+        monkeypatch.setattr(archive, 'PART_BYTES', 16)
+        original_stage = archive.stage_compressed_parts
+        def changed_part(*args, **kwargs):
+            plan = original_stage(*args, **kwargs)
+            part = args[1] / plan['parts'][0]['path']
+            part.write_bytes(b'X' * part.stat().st_size)
+            return plan
+        monkeypatch.setattr(archive, 'stage_compressed_parts', changed_part)
+    else:
+        payload.write_bytes(b'X' * payload.stat().st_size)
+    with pytest.raises(SnapshotError, match='incoming blob differs from proof'):
+        archive.publish_preservation(batch, {'scope': 'cache', 'payload': str(payload),
+                                            'producer_exit_code': 0}, index, repo_root=tmp_path)
+    assert not list(cold.rglob('*.blob')) and not list(cold.rglob('*.manifest.json'))
+
+
+def test_ordered_carrier_can_reuse_one_deduplicated_cas_blob(tmp_path):
+    part = tmp_path / 'blob'; part.write_bytes(b'original carrier bytes')
+    paths = (part, part, part)
+    assert archive.payload_hash(paths) == hashlib.sha256(part.read_bytes() * 3).hexdigest()
+    assert len(archive.payload_signatures(paths)) == 3

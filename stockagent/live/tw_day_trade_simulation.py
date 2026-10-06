@@ -24,6 +24,7 @@ import json
 import math
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Final, Iterable, Mapping, Sequence
 import uuid
 from zoneinfo import ZoneInfo
@@ -857,23 +858,26 @@ def _prepare_entry_plan(
     }
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_json(
+    path: Path, payload: Mapping[str, Any], *, timings: dict[str, Any] | None = None,
+) -> None:
+    started = perf_counter()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
     try:
+        # Indentation sends the stdlib encoder through recursive Python code.
+        # Machine-read state keeps every value/precision but uses the compact
+        # C encoder; both durability barriers below are intentionally retained.
+        encoded = json.dumps(
+            payload, ensure_ascii=False, indent=None, separators=(",", ":"),
+            sort_keys=True, default=str,
+        ) + "\n"
+        encoded_at = perf_counter()
         with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                    default=str,
-                )
-                + "\n"
-            )
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        file_synced_at = perf_counter()
         os.replace(temporary, path)
         # The rename is only crash-durable after the containing directory is
         # synced.  This state is the exactly-once boundary for the append-only
@@ -885,6 +889,15 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        completed_at = perf_counter()
+        if timings is not None:
+            timings.update({
+                "file": path.name,
+                "json_encode_ms": round((encoded_at - started) * 1000.0, 3),
+                "file_write_fsync_ms": round((file_synced_at - encoded_at) * 1000.0, 3),
+                "replace_directory_fsync_ms": round((completed_at - file_synced_at) * 1000.0, 3),
+                "total_ms": round((completed_at - started) * 1000.0, 3),
+            })
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1351,6 +1364,7 @@ class TwDayTradeSimulationEngine:
         self._corporate_action_coverage_end: date | None = None
         self._margin_action_cache: dict[tuple[Any, ...], Any] = {}
         self._engine_run_id = uuid.uuid4().hex
+        self.last_persist_metrics: dict[str, Any] | None = None
         self._deferred_ledger_rows: dict[Path, list[Mapping[str, Any]]] | None = None
         self.state = self._load_state()
         stock_benchmarks_migrated = self._migrate_stock_benchmark_contract()
@@ -3595,6 +3609,7 @@ class TwDayTradeSimulationEngine:
         opening_signal_batch_mode_count: int = 1,
         opening_signal_batch_expected_mode_count: int = 1,
         opening_signal_batch_complete: bool = True,
+        state_publication: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist one measured input-to-ledger sample for the public panel."""
 
@@ -3721,6 +3736,9 @@ class TwDayTradeSimulationEngine:
                 "price_response_received_at": summary.get("price_response_received_at"),
                 "price_receipt_timing": dict(summary.get("price_receipt_timing") or {}),
                 "quote_transport": dict(live_latency.get("quote_transport") or {}),
+                # Subphases of ledger_compute_persist_ms, not extra serial
+                # stages. Never substitute these for the durable wall clock.
+                "state_publication": dict(state_publication) if state_publication else None,
                 "opening_signal_batch": {
                     "observed_mode_count": max(0, int(opening_signal_batch_mode_count)),
                     "expected_mode_count": max(
@@ -7480,6 +7498,15 @@ class TwDayTradeSimulationEngine:
             mode["terminal_curve_mark"] = terminal_signature
 
     def _persist(self, now: datetime | None = None) -> None:
+        persist_started = perf_counter()
+        self.last_persist_metrics = None
+        writes: list[dict[str, Any]] = []
+
+        def publish(path: Path, payload: Mapping[str, Any]) -> None:
+            timing: dict[str, Any] = {}
+            _atomic_json(path, payload, timings=timing)
+            writes.append(timing)
+
         # A live process can replay a 09:01 financial event at 11:00. Its
         # liveness/commit publication time is not that historical event time.
         # Offline replay keeps its explicit deterministic clock by default.
@@ -7517,6 +7544,7 @@ class TwDayTradeSimulationEngine:
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
+        fingerprint_completed = perf_counter()
         content_revision = int(self.state.get("dashboard_content_revision") or 0)
         if material_fingerprint != self.state.get("dashboard_content_fingerprint"):
             content_revision += 1
@@ -7525,7 +7553,7 @@ class TwDayTradeSimulationEngine:
         self.state["state_revision"] = revision
         self.state["engine_run_id"] = self._engine_run_id
         self.state["updated_at"] = observed.isoformat(timespec="seconds")
-        _atomic_json(self.state_path, self.state)
+        publish(self.state_path, self.state)
         enabled_markets = active_markets
         all_modes = self.state.get("modes") or {}
         mode_rows = [
@@ -7533,7 +7561,7 @@ class TwDayTradeSimulationEngine:
             for market in enabled_markets
             if isinstance(all_modes.get(market), Mapping)
         ]
-        _atomic_json(
+        publish(
             self.positions_path,
             {
                 "schema_version": 1,
@@ -7615,7 +7643,7 @@ class TwDayTradeSimulationEngine:
             if blocked
             else "waiting"
         )
-        _atomic_json(
+        publish(
             self.status_path,
             {
                 "schema_version": SIMULATION_SCHEMA_VERSION,
@@ -7757,7 +7785,7 @@ class TwDayTradeSimulationEngine:
                 },
             },
         )
-        _atomic_json(
+        publish(
             self.service_sync_path,
             {
                 "schema_version": SERVICE_SYNC_SCHEMA_VERSION,
@@ -7807,6 +7835,13 @@ class TwDayTradeSimulationEngine:
                 },
             },
         )
+        self.last_persist_metrics = {
+            "schema_version": 1,
+            "state_revision": revision,
+            "total_ms": round((perf_counter() - persist_started) * 1000.0, 3),
+            "projection_fingerprint_ms": round((fingerprint_completed - persist_started) * 1000.0, 3),
+            "files": writes,
+        }
 
 
 __all__ = [

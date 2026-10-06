@@ -1,0 +1,9 @@
+{
+  "maximum_pending_deliveries": 4,
+  "maximum_wave_bytes": 2147483648,
+  "maximum_single_object_bytes": 8589934592,
+  "maximum_pending_bytes": 34359738368,
+  "maximum_wave_files": 1024,
+  "prioritize_uncovered_nas": true,
+  "restic_state_root": "/var/lib/stockagent/backup-stream"
+}

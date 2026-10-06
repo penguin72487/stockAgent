@@ -23,9 +23,14 @@ import time
 from stockagent.data_sync.desync_snapshots import (
     SnapshotError, _safe_relative_path, _fsync_directory, atomic_write_json as _atomic_write_json, sha256_file,
 )
-from stockagent.data_sync.windows_cold_io import binary_reader, hash_file, metadata_path
+from stockagent.data_sync.windows_cold_io import (
+    BinaryWriter, binary_reader, hash_file, metadata_path, windows_path,
+)
 
 CONTRACT = "one_shot_zstd_tar_preservation_v1"
+PARTS_CONTRACT = "bounded_zstd_tar_preservation_v2"
+PRESERVATION_CONTRACTS = frozenset({CONTRACT, PARTS_CONTRACT})
+PART_BYTES = 2 * 1024**3
 ROLE = "legacy-compressed-preservation"
 SYNC_ROOT = Path("/srv/stockagent-packed")
 NATIVE_COLD = Path("/mnt/d/stockagent-cold-primary/packed")
@@ -141,11 +146,44 @@ def index_tar_stream(stream, *, scopes, maximum_original_bytes=2 * 1024**4):
             "logical_bytes": original_bytes, "member_fingerprint_sha256": digest(rows)}
 
 
-def index_zstd(payload, *, expected_sha256, scopes, progress=None):
-    payload = metadata_path(payload)
-    before = signature(payload)
-    if not stat.S_ISREG(before[5]):
+def payload_paths(payload):
+    paths = tuple(metadata_path(p) for p in payload) if isinstance(payload, (tuple, list)) else (metadata_path(payload),)
+    # Distinct logical parts may share the same CAS blob. Their ordered
+    # occurrences must all be read, even when physical storage deduplicates.
+    if not 1 <= len(paths) <= 4096:
+        raise SnapshotError("compressed preservation part sequence is unbounded")
+    return paths
+
+
+def payload_signatures(payload):
+    result = [signature(p) for p in payload_paths(payload)]
+    if any(not stat.S_ISREG(s[5]) for s in result):
         raise SnapshotError("compressed preservation type mismatch")
+    return result
+
+
+def payload_blocks(payload):
+    for path in payload_paths(payload):
+        with binary_reader(path) as source:
+            while chunk := source.read(8 * 1024 * 1024):
+                yield chunk
+
+
+def payload_hash(payload):
+    before = payload_signatures(payload)
+    value, total = hashlib.sha256(), 0
+    for chunk in payload_blocks(payload):
+        value.update(chunk)
+        total += len(chunk)
+    if total != sum(s[2] for s in before) or payload_signatures(payload) != before:
+        raise SnapshotError("compressed parts changed during full SHA")
+    return value.hexdigest()
+
+
+def index_zstd(payload, *, expected_sha256, scopes, progress=None):
+    payload = payload_paths(payload)
+    before = payload_signatures(payload)
+    expected_bytes = sum(s[2] for s in before)
     # Hash exactly the bytes consumed by zstd, in the same physical read.
     # Independent original decoding stays mandatory; eliminate a redundant
     # whole-archive disk pass rather than weakening the SHA/checksum gate.
@@ -154,32 +192,31 @@ def index_zstd(payload, *, expected_sha256, scopes, progress=None):
         def feed():
             total, value = 0, hashlib.sha256()
             last = time.monotonic()
-            with binary_reader(payload) as source:
-                try:
-                    while chunk := source.read(8 * 1024 * 1024):
-                        decoder.stdin.write(chunk)
-                        value.update(chunk)
-                        total += len(chunk)
-                        if progress and time.monotonic() - last >= 15:
-                            progress({"compressed_read_bytes": total, "compressed_total_bytes": before[2]})
-                            last = time.monotonic()
-                finally:
-                    decoder.stdin.close()
+            try:
+                for chunk in payload_blocks(payload):
+                    decoder.stdin.write(chunk)
+                    value.update(chunk)
+                    total += len(chunk)
+                    if progress and time.monotonic() - last >= 15:
+                        progress({"compressed_read_bytes": total, "compressed_total_bytes": expected_bytes})
+                        last = time.monotonic()
+            finally:
+                decoder.stdin.close()
             return total, value.hexdigest()
         with ThreadPoolExecutor(max_workers=1) as workers:
             incoming = workers.submit(feed)
             try:
                 result = index_tar_stream(decoder.stdout, scopes=scopes)
                 total, actual = incoming.result(timeout=30)
-                if decoder.wait(timeout=30) or total != before[2] or actual != expected_sha256:
+                if decoder.wait(timeout=30) or total != expected_bytes or actual != expected_sha256:
                     raise SnapshotError("compressed preservation SHA/frame/checksum failed")
             except BaseException:
                 decoder.terminate()
                 decoder.wait(timeout=30)
                 raise
-    if signature(payload) != before:
+    if payload_signatures(payload) != before:
         raise SnapshotError("compressed archive changed during full original decode")
-    result.update(compressed_sha256=expected_sha256, compressed_bytes=before[2],
+    result.update(compressed_sha256=expected_sha256, compressed_bytes=expected_bytes,
                   verified_at_epoch=time.time())
     return result
 
@@ -204,12 +241,12 @@ def root_records(index):
 
 
 def canonical_blobs(sync_root, resolved):
-    """Resolve the two full blobs; never accept a same-named sidecar index."""
+    """Resolve exact canonical blobs, including the ordered v2 carrier parts."""
     from stockagent.data_sync.packed_snapshots import _load_inventory, _validate_inventory
     inventory = _load_inventory(sync_root, resolved.manifest)
     _validate_inventory(resolved.manifest, inventory)
     objects = {r["sha256"]: r for r in resolved.manifest["archive"]["objects"]}
-    files = {}
+    files, members = {}, {}
     for row in inventory:
         if row["kind"] != "file":
             continue
@@ -217,9 +254,149 @@ def canonical_blobs(sync_root, resolved):
         if store["kind"] != "blob":
             raise SnapshotError("compressed preservation requires bounded full blobs")
         files[row["path"]] = sync_root / objects[store["object_sha256"]]["relpath"]
-    if set(files) != {"payload.tar.zst", "member_inventory.json"}:
+        members[row["path"]] = row
+    metadata = resolved.manifest.get("metadata", {})
+    if metadata.get("preservation_contract") == PARTS_CONTRACT:
+        if "compressed_parts.json" not in files:
+            raise SnapshotError("ordered compressed part plan is missing")
+        plan_path = metadata_path(files["compressed_parts.json"])
+        if (plan_path.stat().st_size > 1024**2
+                or hash_file(plan_path) != metadata.get("compressed_parts_sha256")):
+            raise SnapshotError("canonical compressed part plan differs")
+        plan = json.loads(plan_path.read_text())
+        validate_parts_plan(plan)
+        if (plan["compressed_sha256"] != metadata.get("compressed_sha256")
+                or str(plan["compressed_bytes"]) != metadata.get("compressed_bytes")
+                or set(files) != {"member_inventory.json", "compressed_parts.json", *(r["path"] for r in plan["parts"])}):
+            raise SnapshotError("unexpected compressed preservation cold part set")
+        for part in plan["parts"]:
+            if (members[part["path"]]["sha256"] != part["sha256"]
+                    or members[part["path"]]["size"] != part["bytes"]):
+                raise SnapshotError("canonical compressed part differs from ordered plan")
+    elif set(files) != {"payload.tar.zst", "member_inventory.json"}:
         raise SnapshotError("unexpected compressed preservation cold member set")
     return files
+
+
+def preservation_payload(files):
+    if "compressed_parts.json" not in files:
+        return files["payload.tar.zst"]
+    plan = json.loads(metadata_path(files["compressed_parts.json"]).read_text())
+    validate_parts_plan(plan)
+    return tuple(files[part["path"]] for part in plan["parts"])
+
+
+def validate_parts_plan(plan):
+    import re
+    if (set(plan) != {"schema_version", "preservation_contract", "compressed_sha256", "compressed_bytes", "part_bytes", "parts"}
+            or plan.get("schema_version") != 1 or plan.get("preservation_contract") != PARTS_CONTRACT
+            or not re.fullmatch("[0-9a-f]{64}", str(plan.get("compressed_sha256", "")))
+            or type(plan.get("part_bytes")) is not int or not 1 <= plan["part_bytes"] <= PART_BYTES
+            or type(plan.get("compressed_bytes")) is not int or not 1 <= plan["compressed_bytes"] <= 2 * 1024**4
+            or not isinstance(plan.get("parts"), list) or not 1 <= len(plan["parts"]) <= 4096):
+        raise SnapshotError("invalid bounded compressed part plan")
+    for number, part in enumerate(plan["parts"]):
+        if (set(part) != {"path", "bytes", "sha256"} or part["path"] != f"payload.part-{number:05d}.zst"
+                or type(part["bytes"]) is not int or not 1 <= part["bytes"] <= plan["part_bytes"]
+                or number < len(plan["parts"]) - 1 and part["bytes"] != plan["part_bytes"]
+                or not re.fullmatch("[0-9a-f]{64}", str(part.get("sha256", "")))):
+            raise SnapshotError("compressed part order, size or identity differs")
+    if sum(p["bytes"] for p in plan["parts"]) != plan["compressed_bytes"]:
+        raise SnapshotError("compressed part total differs")
+
+
+def stage_compressed_parts(payload, stage, index, *, part_bytes=None, progress=None):
+    """Preserve the original frame in bounded byte-identical carrier parts.
+
+    Complete parts can be reused after a crash; unknown/partial files remain
+    outside the published set. A fresh full original SHA and stable signature
+    bind every ordered part to the already decoded received archive.
+    """
+    part_bytes = PART_BYTES if part_bytes is None else part_bytes
+    if type(part_bytes) is not int or not 1 <= part_bytes <= PART_BYTES:
+        raise SnapshotError("compressed preservation part budget is invalid")
+    payload, stage = metadata_path(payload), metadata_path(stage)
+    before = signature(payload)
+    if not stat.S_ISREG(before[5]) or before[2] != index["compressed_bytes"]:
+        raise SnapshotError("received compressed archive differs before partition")
+    stage.mkdir(mode=0o700, exist_ok=True)
+    if stage.is_symlink() or stage.resolve() != stage:
+        raise SnapshotError("compressed part staging is redirected")
+    work = stage.parent / (stage.name + "-partial")
+    work.mkdir(mode=0o700, exist_ok=True)
+    if work.is_symlink() or work.resolve() != work:
+        raise SnapshotError("compressed partial staging is redirected")
+    fs = os.statvfs(stage)
+    if fs.f_bavail * fs.f_frsize < before[2] + 64 * 1024**3:
+        raise SnapshotError("compressed partition lacks full budget and D reserve")
+    parts, whole, total = [], hashlib.sha256(), 0
+    last = time.monotonic()
+    with binary_reader(payload) as source:
+        while total < before[2]:
+            name = f"payload.part-{len(parts):05d}.zst"
+            target = stage / name
+            if target.is_symlink():
+                raise SnapshotError("retained compressed part is redirected")
+            partial = work / (name + f".{time.time_ns()}.partial")
+            existing = target.exists()
+            writer = None
+            value, count = hashlib.sha256(), 0
+            try:
+                if not existing:
+                    writer = (BinaryWriter(partial, reserve_bytes=64 * 1024**3)
+                              if windows_path(partial) is not None else partial.open("xb"))
+                limit = min(part_bytes, before[2] - total)
+                while count < limit:
+                    block = source.read(min(8 * 1024**2, limit - count))
+                    if not block:
+                        raise SnapshotError("received compressed archive truncated during partition")
+                    value.update(block)
+                    whole.update(block)
+                    count += len(block)
+                    total += len(block)
+                    if writer is not None:
+                        writer.write(block)
+                    if progress and time.monotonic() - last >= 15:
+                        progress({"compressed_partition_bytes": total, "compressed_total_bytes": before[2]})
+                        last = time.monotonic()
+                if writer is not None:
+                    if isinstance(writer, BinaryWriter):
+                        writer.finish()
+                    else:
+                        writer.flush()
+                        os.fsync(writer.fileno())
+            finally:
+                if writer is not None:
+                    writer.close()
+            expected = value.hexdigest()
+            candidate = target if existing else partial
+            if (not candidate.is_file() or candidate.lstat().st_size != count
+                    or hash_file(candidate) != expected):
+                raise SnapshotError("compressed part readback differs; retain all evidence")
+            if not existing:
+                os.chmod(partial, 0o600, follow_symlinks=False)
+                os.link(partial, target, follow_symlinks=False)
+                _fsync_directory(stage)
+                partial.unlink()
+                _fsync_directory(work)
+            parts.append({"path": name, "bytes": count, "sha256": expected})
+        if source.read(1):
+            raise SnapshotError("received compressed archive grew during partition")
+    if whole.hexdigest() != index["compressed_sha256"] or signature(payload) != before:
+        raise SnapshotError("compressed partition differs from the received frame")
+    plan = {"schema_version": 1, "preservation_contract": PARTS_CONTRACT,
+            "compressed_sha256": index["compressed_sha256"], "compressed_bytes": before[2],
+            "part_bytes": part_bytes, "parts": parts}
+    validate_parts_plan(plan)
+    plan_path = stage / "compressed_parts.json"
+    if plan_path.exists():
+        if json.loads(plan_path.read_text()) != plan:
+            raise SnapshotError("retained ordered part plan differs")
+    else:
+        atomic_write_json(plan_path, plan)
+    if set(p.name for p in stage.iterdir()) - {"member_inventory.json", "compressed_parts.json", *(p["path"] for p in parts)}:
+        raise SnapshotError("unknown compressed partition staging members retained")
+    return plan
 
 
 @contextmanager
@@ -229,9 +406,8 @@ def decoded_stream(payload):
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as decoder:
         def feed():
             try:
-                with binary_reader(payload) as source:
-                    while block := source.read(4 * 1024 * 1024):
-                        decoder.stdin.write(block)
+                for block in payload_blocks(payload):
+                    decoder.stdin.write(block)
             finally:
                 decoder.stdin.close()
         with ThreadPoolExecutor(max_workers=1) as workers:
@@ -287,8 +463,8 @@ def restore_original_root(payload, index, relative_root, destination):
     stage = Path(tempfile.mkdtemp(prefix=".stockagent-bulk-restore-", dir=destination.parent))
     deps = Path(tempfile.mkdtemp(prefix=".stockagent-bulk-dependencies-", dir=destination.parent))
     dependency_paths, restored = {}, set()
-    before = signature(payload)
-    if hash_file(payload) != index["compressed_sha256"]:
+    before = payload_signatures(payload)
+    if payload_hash(payload) != index["compressed_sha256"]:
         raise SnapshotError("cold compressed archive differs before explicit restore")
     try:
         with decoded_stream(payload) as decoded:
@@ -337,7 +513,7 @@ def restore_original_root(payload, index, relative_root, destination):
                 while chunk := container.fileobj.read(8 * 1024 * 1024):
                     if any(chunk):
                         raise SnapshotError("non-padding bytes at end of explicit restore")
-        if restored != set(selected) or signature(payload) != before:
+        if restored != set(selected) or payload_signatures(payload) != before:
             raise SnapshotError("incomplete original reconstruction or changed cold object")
         for name, expected in selected.items():
             if expected["kind"] != "file":
@@ -416,8 +592,10 @@ def install_native_blob(source, digest_value):
         canonical = SYNC_ROOT / relative
         # Both incoming and canonical names use the same stable 9p mount for
         # metadata/link operations; bulk reads still use Windows FileStream.
-        native = canonical
+        native = metadata_path(NATIVE_COLD / relative)
         _ensure_shared_packed_directory(SYNC_ROOT, canonical.parent)
+        if not native.parent.samefile(canonical.parent):
+            raise SnapshotError("native canonical installation parent differs")
         if canonical.exists():
             from stockagent.data_sync.cold_primary import d_primary_read_alias
             if hash_file(d_primary_read_alias(canonical)) != digest_value:
@@ -444,14 +622,23 @@ def publish_preservation(directory, receipt, index, *, repo_root, progress=None,
         or directory.resolve() != directory or metadata_path(INCOMING) not in directory.parents):
         raise SnapshotError("preservation publication requires exact private D incoming root")
     scope = receipt["scope"]
-    dataset = "legacy-vast-bulk-" + scope + "-" + index["compressed_sha256"][:24]
-    stage = directory / ("publish-" + scope)
+    partitioned = index["compressed_bytes"] > PART_BYTES
+    preservation_contract = PARTS_CONTRACT if partitioned else CONTRACT
+    dataset = "legacy-vast-bulk-" + scope + ("-parts-v2-" if partitioned else "-") + index["compressed_sha256"][:24]
+    stage = directory / ("publish-" + scope + ("-parts-v2" if partitioned else ""))
     stage.mkdir(mode=0o700, exist_ok=True)
-    alias = stage / "payload.tar.zst"
-    if not alias.exists():
-        os.link(payload, alias, follow_symlinks=False)
-    elif not alias.samefile(payload):
-        raise SnapshotError("incoming payload alias is unexpected")
+    if partitioned:
+        plan = stage_compressed_parts(payload, stage, index, progress=progress)
+        carriers = [stage / p["path"] for p in plan["parts"]] + [stage / "compressed_parts.json"]
+        carrier_digests = [p["sha256"] for p in plan["parts"]] + [hash_file(stage / "compressed_parts.json")]
+    else:
+        alias = stage / "payload.tar.zst"
+        if not alias.exists():
+            os.link(payload, alias, follow_symlinks=False)
+        elif not alias.samefile(payload):
+            raise SnapshotError("incoming payload alias is unexpected")
+        carriers = [alias]
+        carrier_digests = [index["compressed_sha256"]]
     manifest = stage / "member_inventory.json"
     # The canonical member inventory is deterministic; observations are stored
     # in local receipts rather than minting a new release for a retry.
@@ -461,15 +648,21 @@ def publish_preservation(directory, receipt, index, *, repo_root, progress=None,
             raise SnapshotError("retained preservation index differs; keep evidence")
     else:
         atomic_write_json(manifest, stable)
-    for source in (alias, manifest):
-        install_native_blob(source, hash_file(source))
-    metadata = {"transport_role": ROLE, "preservation_contract": CONTRACT,
+    # Bind admission to the received/partition proof instead of inventing a
+    # fresh identity from potentially changed bytes. The installer still reads
+    # every source and canonical object in full; avoid the extra caller pass.
+    for source, expected in zip((*carriers, manifest), (*carrier_digests, hash_file(manifest)), strict=True):
+        install_native_blob(source, expected)
+    metadata = {"transport_role": ROLE, "preservation_contract": preservation_contract,
                 "deployable": "false", "completion_claim": "not_checked",
                 "source_scope": scope, "origin_node_id": "vastai1T",
                 "compressed_sha256": index["compressed_sha256"],
                 "member_inventory_sha256": sha256_file(manifest),
                 "preservation_policy_sha256": sha256_file(POLICY_PATH),
                 "scope_completeness": "transport-clean" if receipt["producer_exit_code"] == 0 else "must-reconcile"}
+    if partitioned:
+        metadata.update(compressed_parts_sha256=sha256_file(stage / "compressed_parts.json"),
+                        compressed_bytes=str(index["compressed_bytes"]))
     resolved = publish_packed_snapshot(SYNC_ROOT, dataset, stage, node_id="penguin",
                                       loose_file_threshold_bytes=1, pack_buckets=1,
                                       d_primary_native_blob_reads=True,
@@ -495,7 +688,7 @@ def verify_preservation(publication, index, *, progress=None):
     resolved = resolve_packed_snapshot_id(SYNC_ROOT, publication["dataset"], publication["snapshot_id"])
     metadata = resolved.manifest.get("metadata", {})
     if (resolved.manifest_sha256 != publication["manifest_sha256"]
-            or metadata.get("preservation_contract") != CONTRACT or metadata.get("transport_role") != ROLE
+            or metadata.get("preservation_contract") not in PRESERVATION_CONTRACTS or metadata.get("transport_role") != ROLE
             or metadata.get("deployable") != "false"
             or metadata.get("compressed_sha256") != index["compressed_sha256"]
             or any(publication.get(k) != v for k, v in metadata.items())):
@@ -508,16 +701,43 @@ def verify_preservation(publication, index, *, progress=None):
     verify_packed_snapshot(SYNC_ROOT, resolved, d_primary_native_blob_reads=True)
     if hash_file(aliases["member_inventory.json"]) != metadata["member_inventory_sha256"]:
         raise SnapshotError("canonical member inventory differs")
-    cold_index = index_zstd(aliases["payload.tar.zst"], expected_sha256=index["compressed_sha256"],
+    cold_index = index_zstd(preservation_payload(aliases), expected_sha256=index["compressed_sha256"],
                            scopes={r["path"].split("/")[0] for r in index["rows"]}, progress=progress)
     if cold_index["rows"] != index["rows"]:
         raise SnapshotError("independent canonical D original decode differs")
-    return {"dataset": publication["dataset"], "snapshot_id": resolved.manifest["snapshot_id"],
+    proof = {"dataset": publication["dataset"], "snapshot_id": resolved.manifest["snapshot_id"],
             "manifest_sha256": resolved.manifest_sha256, **metadata,
             "cold_verified": True, "decoded_originals_verified": True,
             "verified_at_epoch": time.time(),
-            "cold_blob_signature": signature(files["payload.tar.zst"]),
             "cold_index_signature": signature(files["member_inventory.json"])}
+    if metadata["preservation_contract"] == PARTS_CONTRACT:
+        proof["cold_part_signatures"] = {name: signature(path) for name, path in files.items()}
+    else:
+        proof["cold_blob_signature"] = signature(files["payload.tar.zst"])
+    return proof
+
+
+def verify_retained_preservation(proof):
+    """Reuse full independent decode only while the exact cold inodes persist."""
+    from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id
+    native_guard()
+    resolved = resolve_packed_snapshot_id(SYNC_ROOT, proof["dataset"], proof["snapshot_id"])
+    metadata = resolved.manifest.get("metadata", {})
+    if (resolved.manifest_sha256 != proof["manifest_sha256"]
+            or metadata.get("preservation_contract") not in PRESERVATION_CONTRACTS
+            or metadata.get("transport_role") != ROLE
+            or any(proof.get(k) != v for k, v in metadata.items())
+            or proof.get("cold_verified") is not True or proof.get("decoded_originals_verified") is not True):
+        raise SnapshotError("retained preservation proof differs from canonical release")
+    files = canonical_blobs(SYNC_ROOT, resolved)
+    if metadata["preservation_contract"] == PARTS_CONTRACT:
+        unchanged = {name: signature(path) for name, path in files.items()} == proof.get("cold_part_signatures")
+    else:
+        unchanged = (signature(files["payload.tar.zst"]) == proof.get("cold_blob_signature")
+                     and signature(files["member_inventory.json"]) == proof.get("cold_index_signature"))
+    if not unchanged:
+        raise SnapshotError("cold object changed after independent decode; full verification required")
+    return files
 
 
 @contextmanager

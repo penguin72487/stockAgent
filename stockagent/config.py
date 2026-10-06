@@ -1372,13 +1372,22 @@ def _normalize_base_config_refs(value: Any) -> list[str]:
     )
 
 
-def _load_raw_config(path: str | Path, stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+def _config_source_identity(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _load_raw_config(
+    path: str | Path, stack: tuple[Path, ...] = (), *,
+    source_signatures: dict[Path, tuple[int, ...]] | None = None,
+) -> dict[str, Any]:
     config_path = Path(path).expanduser()
     if not config_path.is_absolute():
         config_path = config_path.resolve()
     if config_path in stack:
         cycle = " -> ".join(str(item) for item in (*stack, config_path))
         raise ValueError(f"Config inheritance cycle detected: {cycle}")
+    signature = _config_source_identity(config_path) if source_signatures is not None else None
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.load(handle, Loader=_UniqueKeySafeLoader) or {}
     if not isinstance(raw, dict):
@@ -1387,17 +1396,25 @@ def _load_raw_config(path: str | Path, stack: tuple[Path, ...] = ()) -> dict[str
     base_refs: list[str] = []
     for key in _CONFIG_INHERITANCE_KEYS:
         base_refs.extend(_normalize_base_config_refs(raw.pop(key, None)))
-    if not base_refs:
-        return raw
-
     merged: dict[str, Any] = {}
     next_stack = (*stack, config_path)
     for ref in base_refs:
         base_path = Path(ref).expanduser()
         if not base_path.is_absolute():
             base_path = config_path.parent / base_path
-        merged = _deep_merge_config(merged, _load_raw_config(base_path, next_stack))
-    return _deep_merge_config(merged, raw)
+        base = (
+            _load_raw_config(base_path, next_stack)
+            if source_signatures is None
+            else _load_raw_config(base_path, next_stack, source_signatures=source_signatures)
+        )
+        merged = _deep_merge_config(merged, base)
+    if source_signatures is not None:
+        if _config_source_identity(config_path) != signature or (
+            config_path in source_signatures and source_signatures[config_path] != signature
+        ):
+            raise ValueError(f"Config source changed during load: {config_path}")
+        source_signatures[config_path] = signature
+    return _deep_merge_config(merged, raw) if base_refs else raw
 
 
 def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
@@ -5451,8 +5468,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
-def load_config(path: str | Path) -> ExperimentConfig:
-    raw = _load_raw_config(path)
+def load_config(
+    path: str | Path, *, source_signatures: dict[Path, tuple[int, ...]] | None = None,
+) -> ExperimentConfig:
+    raw = (_load_raw_config(path) if source_signatures is None
+           else _load_raw_config(path, source_signatures=source_signatures))
     _validate_raw_config_bool_types(raw)
     raw = _merge_defaults(raw)
     training_raw = raw["training"]

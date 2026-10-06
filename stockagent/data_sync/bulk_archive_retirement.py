@@ -14,7 +14,7 @@ import stat
 import time
 import uuid
 
-from stockagent.data_sync.bulk_archive import CONTRACT, ROLE, digest, safe_member
+from stockagent.data_sync.bulk_archive import PRESERVATION_CONTRACTS, ROLE, digest, safe_member
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_json, sha256_file
 from stockagent.data_sync.remote_legacy_return import (
     acknowledgement_age, active_configuration_references, artifact_process_references,
@@ -64,7 +64,7 @@ def validate_ack(ack):
     body = {k: v for k, v in ack.items() if k != "identity_sha256"}
     version = ack.get("contract")
     if (version not in {"d_verified_bulk_archive_return_v1", "d_verified_bulk_archive_return_v2"}
-        or ack.get("preservation_contract") != CONTRACT or digest(body) != ack.get("identity_sha256")
+        or ack.get("preservation_contract") not in PRESERVATION_CONTRACTS or digest(body) != ack.get("identity_sha256")
         or ack.get("origin_node_id") != "vastai1T" or ack.get("authority_node_id") != "penguin"
         or ack.get("cold_verified") is not True or ack.get("decoded_originals_verified") is not True
         or ack.get("manual_immediate") is not True or ack.get("minimum_stable_hours") != 12):

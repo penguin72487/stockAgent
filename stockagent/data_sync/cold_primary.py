@@ -44,7 +44,7 @@ def d_primary_read_alias(path: Path) -> Path:
     """Read one existing canonical object through the native D mount only.
 
     Locks, heads and authority remain canonical. The enrolled D volume and
-    identical NTFS file ID/portable stat prove this is another namespace of the
+    identical NTFS file ID, size and clock prove this is another namespace of the
     SAME physical object, not a second replica or a cached proof. The caller
     still hashes every byte and rechecks the canonical signature afterwards.
     """
@@ -72,11 +72,16 @@ def d_primary_read_alias(path: Path) -> Path:
             raise SnapshotError("native D object is redirected")
         first, second = path.lstat(), alias.lstat()
         # st_dev differs between the two 9p mounts. NTFS file IDs do not.
-        fields = ("st_ino", "st_size", "st_mtime_ns", "st_mode", "st_uid", "st_gid", "st_nlink")
+        # 9p mounts can project different permission bits for the same NTFS
+        # file (observed 0777 vs 0744). Those bits are not the identity or the
+        # original artifact's portable mode; that mode lives in its manifest.
+        # Require both file types, every identity/clock field and full caller
+        # hashing, without changing either object's permissions.
+        fields = ("st_ino", "st_size", "st_mtime_ns", "st_uid", "st_gid", "st_nlink")
         if any(getattr(first, key) != getattr(second, key) for key in fields):
             raise SnapshotError("native D object identity differs from canonical inode")
         import stat
-        if not stat.S_ISREG(first.st_mode):
+        if not stat.S_ISREG(first.st_mode) or not stat.S_ISREG(second.st_mode):
             raise SnapshotError("D read alias is not a regular immutable object")
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         raise SnapshotError("cannot validate native D read alias") from error

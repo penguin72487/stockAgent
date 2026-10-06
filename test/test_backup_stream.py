@@ -84,6 +84,61 @@ def test_delegated_cold_replication_ingests_old_ack_without_new_payload(stream):
 def test_cold_delegation_requires_explicit_boolean(stream):
     with pytest.raises(SnapshotError, match='explicit boolean'):
         BackupStream({**stream[0].config, 'cold_object_replication_enabled': 'false'})
+    with pytest.raises(SnapshotError, match='explicit boolean'):
+        BackupStream({**stream[0].config, 'cold_metadata_replication_enabled': 'true'})
+
+
+def test_delegated_objects_keep_exact_metadata_backup_on_the_existing_owner(stream):
+    queue = stream[0]
+    queue.config.update(cold_object_replication_enabled=False, cold_metadata_replication_enabled=True)
+    readiness(queue)
+    result = queue.cycle()
+    ledger = queue.load_ledger()
+    assert result['pipeline']['published_waves']
+    assert all(row['role'] == 'cold_metadata' for d in ledger['deliveries'].values() for row in d['files'])
+    assert queue.cold.exists()
+
+
+def test_frozen_metadata_backfill_retains_a_head_that_advanced_after_capture(stream, tmp_path):
+    queue, cold, source, first, second = stream
+    fixed = capture_catalog(cold, Path(queue.config['publication_catalog']))
+    prior = next(row for row in fixed['files'] if row['relative'].startswith('heads/'))
+    raw = json.dumps(fixed).encode()
+    path = tmp_path / 'fixed-catalog.json'
+    path.write_bytes(raw)
+    (source / '價格.txt').write_text('new head after the frozen cohort\n')
+    publish_packed_snapshot(cold, 'prices', source, loose_file_threshold_bytes=1024, pack_buckets=2)
+    queue.config.update(cold_object_replication_enabled=False, cold_metadata_replication_enabled=True,
+                        metadata_backfill_catalog=str(path), metadata_backfill_sha256=hashlib.sha256(raw).hexdigest())
+    readiness(queue)
+    for _ in range(10):
+        queue.cycle()
+        ledger = queue.load_ledger()
+        for delivery in ledger['deliveries'].values():
+            if not delivery.get('acceptance'):
+                acknowledge(queue, delivery)
+        if any(file_key(prior) == file_key(row) for delivery in ledger['deliveries'].values() for row in delivery['files']):
+            break
+    assert any(file_key(prior) == file_key(row) for delivery in queue.load_ledger()['deliveries'].values()
+               for row in delivery['files'])
+    assert (cold / prior['relative']).read_bytes() != prior['captured_bytes_utf8'].encode()
+
+
+def test_reported_pilot_metadata_is_sent_for_machine_restore_proof(stream):
+    queue = stream[0]
+    catalog = capture_catalog(queue.cold, Path(queue.config['publication_catalog']))
+    pilot = next(row for row in catalog['files'] if row['relative'].startswith('manifests/'))
+    ledger = empty_ledger()
+    ledger['reported_baseline'] = [{'files': [pilot],
+        **{key: 'a' * 64 for key in ('envelope_identity_sha256', 'envelope_file_sha256', 'snapshot_id', 'report_sha256')},
+        'batch_relative': 'batch-pilot', 'repository_id': queue.config['repository_id'],
+        'evidence_origin': 'user_relayed_acceptance'}]
+    module.private_json(queue.ledger_path, ledger)
+    queue.config.update(cold_object_replication_enabled=False, cold_metadata_replication_enabled=True,
+                        maximum_batch_files=100)
+    readiness(queue)
+    queue.cycle()
+    assert any(file_key(pilot) == file_key(row) for d in queue.load_ledger()['deliveries'].values() for row in d['files'])
 
 
 def acknowledge(queue, delivery, **changes):

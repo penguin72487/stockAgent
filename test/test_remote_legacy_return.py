@@ -7,9 +7,85 @@ import time
 from types import SimpleNamespace
 
 import pytest
+
+
+def test_local_cleanup_handoff_only_accepts_its_fixed_inventory_and_receipts():
+    from scripts.handoff_remote_legacy_archive_worker import LOCAL_COHORTS, ROOT, validate_worker_argv
+    for cohort, inventory in LOCAL_COHORTS.items():
+        argv = ['python', 'scripts/retire_local_offline_artifacts.py', 'apply',
+                '--inventory', str(inventory.relative_to(ROOT)), '--receipt-dir', str(cohort)]
+        validate_worker_argv(argv, cohort)
+        retried = argv + ['--retry-rounds', '3']
+        validate_worker_argv(retried, cohort)
+        for changed in (retried[:-1] + ['2'], retried + ['--ignore-consumers']):
+            with pytest.raises(SnapshotError):
+                validate_worker_argv(changed, cohort)
+        queued = argv + ['--wait-for-owner', '--retry-rounds', '3']
+        validate_worker_argv(queued, cohort)
+        for changed in (queued[:-1] + ['4'], queued + ['--ignore-consumers'],
+                        queued[:-3] + ['--retry-rounds', '3', '--wait-for-owner']):
+            with pytest.raises(SnapshotError):
+                validate_worker_argv(changed, cohort)
+        for index, replacement in ((2, 'inventory'), (4, '/tmp/other-inventory.json'),
+                                   (6, '/tmp/other-receipts')):
+            changed = argv.copy(); changed[index] = replacement
+            with pytest.raises(SnapshotError):
+                validate_worker_argv(changed, cohort)
+        with pytest.raises(SnapshotError):
+            validate_worker_argv(argv + ['--ignore-consumers'], cohort)
+
+
+def test_scratch_handoff_rejects_foreign_or_non_destructive_worker():
+    from scripts.handoff_remote_legacy_archive_worker import SCRATCH_COHORTS, validate_worker_argv
+    for cohort, receipts in SCRATCH_COHORTS.items():
+        argv = ['python', 'scripts/prune_verified_return_scratch.py', '--state-root', str(cohort),
+                '--receipt-dir', str(receipts), '--apply']
+        validate_worker_argv(argv, cohort, scratch_prune=True)
+        validate_worker_argv(argv+['--wait-for-owner'], cohort, scratch_prune=True)
+        for changed in (argv[:-1], argv + ['--dataset', 'foreign'],
+                        argv+['--wait-for-owner','--ignore-consumers'],
+                        [*argv[:5], '/tmp/other', argv[-1]]):
+            with pytest.raises(SnapshotError):
+                validate_worker_argv(changed, cohort, scratch_prune=True)
+
+
+def test_local_scratch_queue_waits_for_the_original_cohort_owner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from scripts.return_remote_legacy_archives import cohort_owner
+    entered=[]
+    def waiting():
+        with cohort_owner(tmp_path, wait=True):
+            entered.append(True)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with cohort_owner(tmp_path):
+            future=pool.submit(waiting)
+            time.sleep(0.05)
+            assert not future.done() and entered == []
+            with pytest.raises(SnapshotError,match='already has an owner'):
+                with cohort_owner(tmp_path):
+                    pytest.fail('competing owner entered')
+        future.result(timeout=5)
+    assert entered == [True]
 import stockagent.data_sync.remote_legacy_return as returns
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec, prepare_archive
+
+
+def test_independent_config_protects_relative_data_view_without_open_fds(tmp_path):
+    import subprocess
+    import sys
+    source = tmp_path/'data_tw_minute/research_dataset_developing_v5'
+    source.mkdir(parents=True)
+    config = tmp_path/'research.yaml'
+    config.write_text('data:\n  parquet_root: data_tw_minute/research_dataset_developing_v5\n')
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)',
+                              '--config', str(config)], cwd=tmp_path)
+    try:
+        refs = returns.active_configuration_references(source, tmp_path)
+        assert any(f'pid={child.pid}:active-config' in ref for ref in refs)
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
 
 
 def test_persistent_handoff_selects_only_the_exact_retained_cohort():
@@ -32,6 +108,20 @@ def test_worker_handoff_requires_an_unowned_childless_boundary():
                    {"observation_complete": False}):
         assert not safe_boundary({**safe, **change})
     assert not safe_boundary(safe, stopped=True)
+
+
+def test_queued_handoff_cannot_stop_an_active_cohort_or_partial_observation():
+    from scripts.handoff_remote_legacy_archive_worker import safe_boundary
+    queued = {'state': 'S', 'wchan': 'locks_lock_inode_wait', 'children': [],
+              'common_fd_present': False, 'holds_common_lock': False,
+              'queued_owner_wait': True, 'cohort_fd_present': True, 'holds_cohort_lock': False}
+    assert safe_boundary(queued)
+    assert safe_boundary({**queued, 'state': 'T'}, stopped=True)
+    for change in ({'holds_cohort_lock': True}, {'cohort_fd_present': False},
+                   {'queued_owner_wait': False}, {'holds_common_lock': True},
+                   {'children': [123]}, {'observation_complete': False},
+                   {'wchan': 'p9_client_rpc'}):
+        assert not safe_boundary({**queued, **change})
 
 
 def test_handoff_transient_proc_fd_race_is_incomplete_not_worker_exit(tmp_path, monkeypatch):

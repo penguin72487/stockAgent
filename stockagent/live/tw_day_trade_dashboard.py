@@ -2440,6 +2440,9 @@ def _opening_signal_latency_summary(
             "quote_transport": row.get("quote_transport")
             if isinstance(row.get("quote_transport"), Mapping)
             else {},
+            "state_publication": row.get("state_publication")
+            if isinstance(row.get("state_publication"), Mapping)
+            else None,
             "previous_signal_history_disabled": row.get(
                 "previous_signal_history_disabled"
             ),
@@ -2487,6 +2490,8 @@ def _opening_signal_latency_summary(
                 existing["price_receipt_timing"] = candidate["price_receipt_timing"]
             if not existing.get("quote_transport"):
                 existing["quote_transport"] = candidate["quote_transport"]
+            if not existing.get("state_publication"):
+                existing["state_publication"] = candidate["state_publication"]
             if is_attempt:
                 existing["previous_signal_history_disabled"] = candidate[
                     "previous_signal_history_disabled"

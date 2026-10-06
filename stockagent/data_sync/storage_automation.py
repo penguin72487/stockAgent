@@ -199,7 +199,7 @@ def automation_status(
             ("state", "observed_at_utc", "available_file_count", "available_bytes",
              "nas_covered_file_count", "nas_covered_bytes", "pending_delivery_count", "pending_bytes",
              "receipt_errors", "readiness_error", "auxiliary_error", "all_history_backup_verified",
-             "canonical_reconstruction_verified", "automatic_recovery", "parallel_receiver"), now=now)
+             "canonical_reconstruction_verified", "automatic_recovery", "parallel_receiver", "combined_nas_coverage"), now=now)
         receipts["control_backup"] = bounded_receipt(
             state_base / "stockagent/control-plane/backups/latest.json",
             ("state", "observed_at_utc", "bytes", "sha256", "logical_state_identity_sha256",
@@ -215,7 +215,8 @@ def automation_status(
         receipts['immutable_source_archive'] = bounded_receipt(lake_state / 'source-replication-status.json',
             ('state', 'observed_at_utc', 'available_object_count', 'available_object_bytes',
              'nas_archive_covered_objects', 'nas_archive_covered_bytes', 'pending_delivery_ids',
-             'transport_cache_reclaimed_bytes', 'source_deletion_enabled'), now=now)
+             'transport_cache_reclaimed_bytes', 'source_deletion_enabled', 'pending_bytes',
+             'maximum_pending_deliveries', 'maximum_wave_bytes'), now=now)
         receipts['lake_relay'] = bounded_receipt(Path('/srv/stockagent-backup-receipts-lab203/lakehouse/relay-status.json'),
             ('state', 'observed_at_utc', 'nas_mount_guard_verified', 'runtime_lock_verified',
              'single_owner_verified', 'automatic_archive_deletion'), now=now)
@@ -294,6 +295,13 @@ def print_human_status(value: dict[str, Any]) -> None:
         if receipt.get("read_state") == "read":
             print(f"  收據距今 {receipt['receipt_age_seconds']/60:.1f} 分鐘（非持續 heartbeat）")
     archive = value['receipts'].get('immutable_source_archive', {}).get('values', {})
+    combined = value['receipts'].get('nas_backup', {}).get('values', {}).get('combined_nas_coverage', {})
+    if combined.get('contract') == 'deduplicated_nas_file_coverage_v1':
+        total = combined['available_bytes']
+        complete = combined['nas_covered_bytes']
+        print(f"NAS 去重覆蓋：{complete/1e9:.3f} / {total/1e9:.3f} GB；"
+              f"{100*complete/total if total else 0:.2f}%；"
+              f"尚缺 {combined['pending_bytes']/1e9:.3f} GB／{combined['pending_file_count']} 檔")
     if archive:
         print(f"NAS immutable archive：{archive.get('nas_archive_covered_bytes', 0)/1e9:.3f} / "
               f"{archive.get('available_object_bytes', 0)/1e9:.3f} GB；"

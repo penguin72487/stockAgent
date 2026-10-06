@@ -261,6 +261,9 @@ def test_free_eta_uses_worker_retry_heads_not_a_zero_second_guess(tmp_path, monk
     result, rows = _result(tmp_path, monkeypatch, specs)
     assert result['summary']['retry_tasks'] == 2
     assert result['summary']['max_retry_wait_seconds'] == 900
+    assert result['summary']['independent_retry_tasks'] == 2
+    assert result['summary']['independent_retry_requests'] == 2
+    assert all(row['independent_retry_clock_known'] for row in rows.values() if row['retry_tasks'])
 
 
 def test_stale_free_status_is_unknown_not_finished(tmp_path, monkeypatch):

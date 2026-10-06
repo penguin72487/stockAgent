@@ -17,7 +17,7 @@ import sqlite3
 from typing import Any, Mapping
 
 
-CONTRACT_VERSION = 2  # Verified scheduled tail, without guessing beyond actual sessions.
+CONTRACT_VERSION = 3  # Independently scoped calendars; never apply TW holidays overseas.
 
 
 @dataclass(frozen=True)
@@ -28,11 +28,17 @@ class HistoryClosures:
     first: str | None = None
     last: str | None = None
     observed_at_utc: str | None = None
+    basis: str = 'receipt_verified_cash_sessions'
+    dataset_scopes: tuple[tuple[str, HistoryClosures], ...] = ()
+
+    def scope(self, dataset: str) -> HistoryClosures:
+        return next((value for name, value in self.dataset_scopes if name == dataset), self)
 
     def count(self, dataset: str, first: date, last: date) -> int:
         if dataset not in self.datasets or last < first:
             return 0
-        return bisect_right(self.days, last.isoformat()) - bisect_left(self.days, first.isoformat())
+        days = self.scope(dataset).days
+        return bisect_right(days, last.isoformat()) - bisect_left(days, first.isoformat())
 
     def advance(self, dataset: str, day: date, *, direction: int) -> date:
         if direction not in {-1, 1}:
@@ -53,8 +59,12 @@ def load_closures(connection: sqlite3.Connection) -> HistoryClosures:
     if hashlib.sha256(body.encode()).hexdigest() != digest:
         raise ValueError('history_calendar_metadata_integrity')
     value = json.loads(body)
+    scopes = tuple((dataset, HistoryClosures(tuple(scope['closed_days']), frozenset({dataset}),
+                     scope['receipt_sha256'], scope['first'], scope['last'], value['observed_at_utc'], scope['basis']))
+                   for dataset, scope in sorted(value.get('dataset_scopes', {}).items()))
     return HistoryClosures(tuple(value['closed_days']), frozenset(value['datasets']),
-                           value['receipt_sha256'], value['first'], value['last'], value['observed_at_utc'])
+                           value['receipt_sha256'], value['first'], value['last'], value['observed_at_utc'],
+                           value.get('basis', 'receipt_verified_cash_sessions'), scopes)
 
 
 def arrival_density(closures: HistoryClosures, dataset: str, now: datetime) -> dict[str, Any]:
@@ -67,6 +77,7 @@ def arrival_density(closures: HistoryClosures, dataset: str, now: datetime) -> d
     from downloader.finmind_scheduling import TAIPEI
     fallback = {'state': 'calendar_day_upper_model', 'factor': 1.0,
                 'basis': 'unverified_or_non_cash_calendar_not_assumed_closed'}
+    closures = closures.scope(dataset)
     if dataset not in closures.datasets or not closures.first or not closures.last:
         return fallback
     first, last = date.fromisoformat(closures.first), date.fromisoformat(closures.last)
@@ -78,15 +89,19 @@ def arrival_density(closures: HistoryClosures, dataset: str, now: datetime) -> d
     sessions = 365 - closures.count(dataset, start, end)
     if not 0 < sessions <= 365:
         return fallback
-    return {'state': 'modeled_from_verified_cash_year', 'factor': sessions / 365,
-            'basis': 'trailing_actual_sessions_not_exact_future_holidays',
+    published = closures.basis == 'official_published_us_cash_calendar'
+    return {'state': ('modeled_from_published_cash_calendar_year' if published else 'modeled_from_verified_cash_year'),
+            'factor': sessions / 365,
+            'basis': ('published_schedule_not_observed_provider_sessions' if published else
+                      'trailing_actual_sessions_not_exact_future_holidays'),
             'first_date': start.isoformat(), 'last_date': end.isoformat(),
             'observed_sessions': sessions, 'calendar_days': 365,
             'receipt_sha256': closures.receipt_sha256}
 
 
 def reconcile_closures(connection: sqlite3.Connection, sources: Mapping[str, Any],
-                       official_sessions: Any, now: datetime, *, day_decision=None) -> HistoryClosures:
+                       official_sessions: Any, now: datetime, *, day_decision=None,
+                       additional_calendars: Mapping[str, HistoryClosures] | None = None) -> HistoryClosures:
     """Called only by the canonical worker under its existing writer lock.
 
     The proof applies inside its verified bounds only. Existing nonempty
@@ -94,8 +109,10 @@ def reconcile_closures(connection: sqlite3.Connection, sources: Mapping[str, Any
     Unknown proof never becomes an empty observation or a completed task.
     """
     previous = load_closures(connection)
+    from downloader.finmind_storage_objects import CASH_OBJECTS
     datasets = frozenset(name for name, source in sources.items()
-                         if source.grain == 'day' and source.universe in {'stocks', 'brokers'})
+                         if source.grain == 'day' and (source.universe in {'stocks', 'brokers'}
+                         or (source.endpoint == 'storage_objects' and name in CASH_OBJECTS)))
     connection.execute('CREATE TABLE IF NOT EXISTS finmind_history_calendar ('
                        'singleton INTEGER PRIMARY KEY CHECK(singleton=1),metadata_json TEXT NOT NULL,sha256 TEXT NOT NULL)')
     connection.execute('CREATE TABLE IF NOT EXISTS finmind_history_calendar_versions ('
@@ -124,19 +141,40 @@ def reconcile_closures(connection: sqlite3.Connection, sources: Mapping[str, Any
                 if decision.status == 'closed' and 'official TWSE' in decision.reason:
                     tail.append(day.isoformat())
             closed += tuple(tail)
+    additional = {name: scope for name, scope in (additional_calendars or {}).items() if name in sources}
+    for name, scope in additional.items():
+        # Explicit market/date-grain boundary, not a generic weekend heuristic.
+        if (sources[name].universe != 'us' or sources[name].grain != 'day'
+                or scope.datasets != frozenset({name}) or scope.dataset_scopes
+                or tuple(sorted(set(scope.days))) != scope.days or not scope.receipt_sha256
+                or not scope.first or not scope.last or scope.first > scope.last
+                or any(not scope.first <= day <= scope.last for day in scope.days)):
+            raise ValueError('invalid_additional_cash_calendar_scope')
     connection.execute('CREATE TEMP TABLE IF NOT EXISTS finmind_history_closed_days (day TEXT PRIMARY KEY)')
-    connection.execute('DELETE FROM finmind_history_closed_days')
-    connection.executemany('INSERT INTO finmind_history_closed_days VALUES (?)', ((day,) for day in closed))
     conflicts: set[str] = set()
-    if datasets and closed:
-        placeholders = ','.join('?' for _ in datasets)
-        conflicts = {row[0] for row in connection.execute(
-            f'SELECT DISTINCT dataset FROM tasks WHERE dataset IN ({placeholders}) AND rows>0 '
-            'AND partition IN (SELECT day FROM finmind_history_closed_days)', tuple(sorted(datasets)))}
-    active = datasets - conflicts if closed else frozenset()
-    new_closed = frozenset(closed)
-    for dataset in sorted(datasets | previous.datasets):
-        removed = (set(previous.days) - new_closed if dataset in active else set(previous.days))
+    active = set()
+    scoped_metadata = {}
+    loaded_days = None
+    for dataset in sorted(datasets | previous.datasets | additional.keys()):
+        scope = additional.get(dataset)
+        current_days = scope.days if scope else closed if dataset in datasets else ()
+        if current_days != loaded_days:
+            connection.execute('DELETE FROM finmind_history_closed_days')
+            connection.executemany('INSERT INTO finmind_history_closed_days VALUES (?)',
+                                   ((day,) for day in current_days))
+            loaded_days = current_days
+        conflict = connection.execute(
+            'SELECT 1 FROM tasks WHERE dataset=? AND rows>0 '
+            'AND partition IN (SELECT day FROM finmind_history_closed_days) LIMIT 1', (dataset,)).fetchone()
+        if conflict:
+            conflicts.add(dataset)
+        elif current_days:
+            active.add(dataset)
+            if scope:
+                scoped_metadata[dataset] = {'closed_days': scope.days, 'first': scope.first, 'last': scope.last,
+                                           'receipt_sha256': scope.receipt_sha256, 'basis': scope.basis}
+        previous_days = previous.scope(dataset).days if dataset in previous.datasets else ()
+        removed = (set(previous_days) - set(current_days) if dataset in active else set(previous_days))
         if dataset in previous.datasets and removed:
             # Rewalk only when a formerly excluded date lost its proof. INSERT
             # OR IGNORE preserves all completed tasks; counting removes overlap.
@@ -155,7 +193,7 @@ def reconcile_closures(connection: sqlite3.Connection, sources: Mapping[str, Any
         if dataset in active:
             connection.execute(
                 "UPDATE tasks SET state='non_session',next_attempt_at_utc=NULL WHERE dataset=? AND rows=0 "
-                "AND state IN ('pending','failed') AND partition IN (SELECT day FROM finmind_history_closed_days)",
+                "AND state IN ('pending','failed','observed_empty') AND partition IN (SELECT day FROM finmind_history_closed_days)",
                 (dataset,))
             connection.execute(
                 "UPDATE tasks SET state='pending',next_attempt_at_utc=NULL WHERE dataset=? AND state='non_session' "
@@ -168,11 +206,17 @@ def reconcile_closures(connection: sqlite3.Connection, sources: Mapping[str, Any
                 'receipt_sha256': receipt, 'observed_at_utc': now.isoformat(),
                 'conflicting_datasets': sorted(conflicts),
                 'basis': 'receipt_verified_cash_sessions_and_official_scheduled_tail_not_derivative_dates'}
+    metadata['dataset_scopes'] = scoped_metadata
+    # Observed-at changes are heartbeats, not another semantic calendar version.
+    semantic = {key: value for key, value in metadata.items() if key != 'observed_at_utc'}
+    prior_semantic = {}
+    if connection.execute('SELECT 1 FROM finmind_history_calendar WHERE singleton=1').fetchone():
+        prior_value = json.loads(connection.execute(
+            'SELECT metadata_json FROM finmind_history_calendar WHERE singleton=1').fetchone()[0])
+        prior_semantic = {key: value for key, value in prior_value.items() if key != 'observed_at_utc'}
     body = json.dumps(metadata, sort_keys=True, separators=(',', ':'))
     digest = hashlib.sha256(body.encode()).hexdigest()
-    # Archive a proof only when its semantic scope changes, not every heartbeat.
-    same_proof = (previous.days == closed and previous.datasets == active and previous.receipt_sha256 == receipt
-                  and previous.first == metadata['first'] and previous.last == metadata['last'])
+    same_proof = json.dumps(prior_semantic, sort_keys=True) == json.dumps(semantic, sort_keys=True)
     if not same_proof:
         connection.execute('INSERT OR IGNORE INTO finmind_history_calendar_versions VALUES (?,?)', (digest, body))
     connection.execute('INSERT OR REPLACE INTO finmind_history_calendar VALUES (1,?,?)', (body, digest))

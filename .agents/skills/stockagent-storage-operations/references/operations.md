@@ -156,7 +156,9 @@ penguin 只有 Syncthing 資料／收據通道，沒有 lab203 SSH。日常工�
 不要列印私有設定／PG dump。NAS archive 的反向證據在
 `/srv/stockagent-backup-receipts-lab203/lakehouse/relay-status.json` 與
 `lake-<full identity>.json`；不能只靠這些檔名當作驗收。
-`automation-status --human` 分列 NAS archive 及原 Restic 覆蓋，兩套有重疊。
+`automation-status --human` 以相對路徑及 SHA 去重兩套已驗收 ledger，顯示總 NAS
+覆蓋；archive／Restic 分項仍有重疊，不能相加。使用者轉述的 pilot 證據與
+機器獨立還原證據分列，不能把前者當作全檔機器驗收。
 
 lab203 新 relay 固定程式在 `/opt/lab203-lake-relay/code`，私有 policy 在
 `/etc/lab203-backup/lake-relay.json`。只在 lab203 本機維運同一服務：
@@ -167,7 +169,18 @@ sudo journalctl -u lab203-lake-relay.service -u lab203-nas.service -n 40 --no-pa
 ```
 
 source 新增 raw waves 已由 Temporal 接手；原 backup stream 保留 ACK／auxiliary／
-恢復和傳統 SQL 備份。不還原 live PG files，不同步正在寫的 Restic repository。
+恢復、原始 manifest/head metadata 和傳統 SQL 備份。來源以固定 pending-count／
+bytes 上限重疊封裝、傳輸與 NAS 驗收，已發布的 file keys 不重複入列。公開候選
+設定在 `configs/data_sync/lake_source_replication.json`；實際生效需核對私有設定與
+worker 已載入的程式身分。完整補傳以固定 cohort 的逐檔機器收據結案，另持續處理
+新發布資料，避免 moving denominator 掩蓋進度；見
+`docs/nas_sync_catchup_2026-10-06.md`。不還原 live PG files，不同步正在寫的 Restic repository。
+已收到但尚未入庫的 legacy compressed carrier 另凍結 received cohort；沿原 bulk
+owner 修復／分段發布，原值 cold recovery 後才併入 NAS 逐檔驗收清冊。
+`scripts/audit_nas_sync.py --upstream-cohort PATH --upstream-sha256 SHA`
+可同時觀察 fixed cold cohort 與 received originals；`--require-transport-convergence`
+另要求 paired connected、正反向 idle／need 0／error 0。它是唯讀 observer，
+不另開 publisher 或 NAS writer；逾時退出 75、state 非 accepted 均未結案。
 新碼需固定本機安裝，不能直接執行後續同步收到的程式。現場已完成固定 v1
 安裝，日常資料不需再次詢問 Codex 或手動轉貼。
 

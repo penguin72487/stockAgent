@@ -26,5 +26,6 @@ fi
 
 # Share the canonical cohort/ingress owners; keep bulk preservation behind
 # the data, web and execution services on penguin.
-exec ionice -c 3 nice -n 19 "$python_bin" \
+exec ionice -c 3 nice -n 19 /usr/bin/bash \
+  scripts/run_authority_storage_operation.sh \
   scripts/return_remote_legacy_archives.py "$@" "${cohort_args[@]}"

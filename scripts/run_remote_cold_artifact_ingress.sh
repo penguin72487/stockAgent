@@ -4,17 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-exec 9>/run/lock/stockagent-remote-cold-artifact-ingress.lock
-lock_wait_seconds="${COLD_ARTIFACT_INGRESS_LOCK_WAIT_SECONDS:-1800}"
-if [[ ! "$lock_wait_seconds" =~ ^[1-9][0-9]*$ ]] || (( lock_wait_seconds > 3600 )); then
-  echo "Ingress owner wait must be an integer from 1 to 3600 seconds."
-  exit 64
-fi
-echo "Waiting up to ${lock_wait_seconds}s for the existing ingress owner at its transaction boundary."
-if ! flock -w "$lock_wait_seconds" 9; then
-  echo "The existing ingress owner is still busy; no source was changed."
-  exit 75
-fi
+# The Python entrypoint owns one ingress cycle and takes the existing shared
+# owner only for publication and source retirement, after independent reads.
 
 if [[ -r /etc/stockagent/remote-cold-artifact-ingress.env ]]; then
   set -a

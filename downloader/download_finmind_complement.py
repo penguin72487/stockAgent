@@ -35,7 +35,7 @@ from downloader.artifact_io import (atomic_write_bytes, atomic_write_json, atomi
 from downloader.finmind_parent_recovery import repair_content_addressed_collision
 from downloader.common import SharedRateLimiter, load_env_file
 from downloader.download_finmind_free import API_URL, TAIPEI, ProviderError, _record_request_start
-from downloader.finmind_account import backfill_budget, rate_limiter, verified_account, refresh_dispatch_account
+from downloader.finmind_account import backfill_budget, pacing_interval, rate_limiter, verified_account, refresh_dispatch_account
 from downloader.finmind_batching import RangeBatch
 from downloader.finmind_scheduling import (
     PRODUCT_HISTORY_STARTS, incremental_reservation, next_release_check, _read_metadata,
@@ -51,6 +51,7 @@ from downloader import finmind_supplemental as supplemental
 from downloader import finmind_news as news
 from downloader import finmind_retry_cohorts as retry_cohorts
 from downloader import finmind_retry_policy as retry_policy
+from downloader import finmind_storage_objects as storage_objects
 from downloader.finmind_history_order import HISTORY_STAGES, first_unfinished_dataset, metadata as history_order_metadata
 from downloader.finmind_catalog import (
     ALL_DATASETS as ALL_DATASETS,
@@ -298,8 +299,67 @@ def _reconcile_periodic_publication(connection: sqlite3.Connection, now: datetim
     return changed
 
 
+def _repair_taiex_query_dates(connection: sqlite3.Connection, root: Path, now: datetime) -> int:
+    """Requeue proven wrong-date empties once; preserve observations and receipts.
+
+    The old generic floor clamped every pre-2019 TAIEX request to the 2019-01-01
+    holiday. Never treat those empty responses as a search of the intended day.
+    A valid old response, an exhausted task or another stock is not reopened.
+    """
+    connection.execute('CREATE TABLE IF NOT EXISTS finmind_taiex_query_date_repairs ('
+                       'partition TEXT PRIMARY KEY,prior_task_json TEXT NOT NULL,'
+                       'receipt_sha256 TEXT NOT NULL,changed_at_utc TEXT NOT NULL)')
+    connection.execute('CREATE TABLE IF NOT EXISTS finmind_source_query_repair_checks ('
+                       'name TEXT PRIMARY KEY,metadata_json TEXT NOT NULL)')
+    name = 'taiex_identity_history_floor_v6'
+    if connection.execute('SELECT 1 FROM finmind_source_query_repair_checks WHERE name=?', (name,)).fetchone():
+        return 0
+    cursor = connection.execute("SELECT * FROM tasks WHERE dataset='TaiwanStockKBar' AND data_id='TAIEX' "
+                                "AND partition<'2019-01-01' AND state='observed_empty' AND rows=0")
+    columns = [item[0] for item in cursor.description]
+    repaired = checked = 0
+    for values in cursor.fetchall():
+        task = dict(zip(columns, values))
+        checked += 1
+        relative = task.get('receipt_path')
+        if not isinstance(relative, str) or not relative:
+            continue
+        path = root / relative
+        if Path(relative).is_absolute() or '..' in Path(relative).parts or path.is_symlink() \
+                or not path.resolve().is_relative_to(root.resolve()):
+            continue
+        try:
+            with path.open('rb') as stream:
+                body = stream.read(64 * 1024 + 1)
+            if len(body) > 64 * 1024:
+                continue
+            receipt = json.loads(body)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('request'), dict):
+            continue
+        request = receipt['request']
+        if (receipt.get('dataset') != 'TaiwanStockKBar' or receipt.get('data_id') != 'TAIEX'
+                or receipt.get('partition') != task['partition'] or receipt.get('rows') != 0
+                or receipt.get('status') != 'observed_empty' or request.get('endpoint') != 'data'
+                or request.get('request_start_date') != '2019-01-01'
+                or request.get('request_end_date') != task['partition']):
+            continue
+        connection.execute('INSERT OR IGNORE INTO finmind_taiex_query_date_repairs VALUES (?,?,?,?)',
+                           (task['partition'], json.dumps(task, sort_keys=True), hashlib.sha256(body).hexdigest(), now.isoformat()))
+        connection.execute("UPDATE tasks SET state='pending',next_attempt_at_utc=NULL,"
+                           "error_code='taiex_history_query_date_repair' "
+                           "WHERE dataset='TaiwanStockKBar' AND data_id='TAIEX' AND partition=?", (task['partition'],))
+        repaired += 1
+    connection.execute('INSERT INTO finmind_source_query_repair_checks VALUES (?,?)',
+                       (name, json.dumps({'contract_version': 6, 'checked': checked, 'requeued': repaired,
+                                         'observed_at_utc': now.isoformat(), 'raw_receipts_modified': 0})))
+    return repaired
+
+
 def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> None:
     _recover_bulk_year_claims(connection)
+    _repair_taiex_query_dates(connection, root, _now())
     jobs: list[tuple[str, str, str, str, int]] = []
     jobs.extend((dataset, "", "latest", "snapshot", 0) for dataset in SNAPSHOTS if dataset not in DERIVATIVE_SNAPSHOTS)
     # Empty-ID bulk snapshots are rejected by these endpoints despite an old
@@ -409,6 +469,7 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
     # Reuse Sponsor's canonical receipt/byte-verified cash-session loader.
     # Do not apply this calendar to futures/option timestamp-date partitions.
     from downloader.download_finmind_sponsor import _official_session_calendar
+    from downloader.finmind_us_calendar import published_calendar
     supplemental.seed(connection, {
         "stocks": stocks,
         "futures": _derivative_ids(root, "TaiwanFuturesDaily"),
@@ -416,7 +477,8 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
         "bonds": _snapshot_ids(root.parent / "sponsor", "TaiwanStockConvertibleBondInfo", "cb_id"),
         "brokers": _snapshot_ids(root, "TaiwanSecuritiesTraderInfo", "securities_trader_id"),
         "us": sorted({canonical_us_id(value) for value in _snapshot_ids(root, "USStockInfo", "stock_id")}),
-    }, _now(), day_decision=day_decision, official_sessions=_official_session_calendar(), include_status=False)
+    }, _now(), day_decision=day_decision, official_sessions=_official_session_calendar(),
+       additional_calendars=published_calendar(_now()), include_status=False)
     # A completed history is a renewable observation, not a one-off archive.
     # Migrate the former 30-day delay, preserving the last actual fetch clock.
     for dataset, identifier, partition, state, attempted, due, priority, latest in connection.execute(
@@ -1104,6 +1166,9 @@ def _sha256(path: Path) -> str:
 def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
            request_metadata: dict[str, Any] | None = None,
            correction: dict[str, Any] | None = None) -> dict[str, Any]:
+    if isinstance(rows, storage_objects.StorageObject):
+        return _store_storage_object(root, task, rows, now, request_metadata=request_metadata, correction=correction)
+    store_started = time.monotonic()
     transport = getattr(rows, 'observation', None)
     # A current quote can legitimately disappear when its contract expires;
     # archive that prior capture but do not invent a continuing live quote.
@@ -1191,6 +1256,15 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
                         "storage_contract_version": 2,
                         "field_non_null_counts": field_non_null,
                         "all_null_fields": [name for name, count in field_non_null.items() if count == 0]})
+    if (task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg' and not task.data_id
+            and request_metadata is not None and 'local_derivation_seconds' in request_metadata):
+        request_metadata['local_derivation_seconds'] += time.monotonic() - store_started
+    return _publish_receipt(root, task, rows, receipt, now, transport=transport)
+
+
+def _publish_receipt(root: Path, task: Task, rows, receipt: dict, now: datetime, *,
+                     transport=None, fingerprint=None) -> dict:
+    """One append-only receipt/update publication path for JSON and Parquet."""
     receipt_path = root / "receipts" / task.dataset / (
         hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else "all"
     ) / f"{task.partition}.json"
@@ -1206,12 +1280,64 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
                 raise SourceError("receipt_history_corrupt", retry_after=0)
         else:
             atomic_write_bytes(archived, previous, durable=True)
-    observation = record_success(root, task, rows, receipt, now, transport=transport)
+    observation = record_success(root, task, rows, receipt, now, transport=transport,
+                                 **({'fingerprint': fingerprint,
+                                     'fingerprint_basis': 'provider_parquet_bytes_v1_not_semantic_rows'}
+                                    if fingerprint else {}))
     if observation is not None:
         receipt['update_observation'] = observation
     atomic_write_json(receipt_path, receipt)
     receipt["receipt_path"] = str(receipt_path.relative_to(root))
     return receipt
+
+
+def _store_storage_object(root: Path, task: Task, value: storage_objects.StorageObject,
+                          now: datetime, *, request_metadata: dict, correction=None) -> dict:
+    """Install validated original bytes; no Python row materialization/reencode."""
+    store_started = time.monotonic()
+    if task.data_id or task.dataset not in storage_objects.OBJECT_FIRST:
+        raise SourceError('object_store_identity_mismatch')
+    folder = root / 'parquet' / task.dataset / 'all' / task.partition
+    folder.mkdir(parents=True, exist_ok=True)
+    final = folder / f'{value.sha256}.parquet'
+    try:
+        if final.exists():
+            if _sha256(final) != value.sha256:
+                repair_content_addressed_collision(value.path, final, root)
+            else:
+                value.path.unlink()
+        else:
+            durable_replace(value.path, final)
+        mapped = task.dataset in {'TaiwanStockTradingDailyReport', 'TaiwanStockWarrantTradingDailyReport'}
+        receipt = {
+            'schema_version': 1, 'dataset': task.dataset, 'data_id': '', 'partition': task.partition,
+            'kind': task.kind, 'status': 'complete', 'rows': value.rows,
+            'source_first_date': task.partition, 'source_last_date': task.partition,
+            'fetched_at_utc': _iso(now), 'historical_point_in_time': False,
+            'coverage_claim': 'observed_whole_market_object_not_provider_history_completeness',
+            'request': request_metadata, 'parquet_path': str(final.relative_to(root)),
+            'parquet_size_bytes': final.stat().st_size, 'sha256': value.sha256,
+            'storage_contract_version': 3, 'source_bytes_preserved': True,
+            'field_non_null_counts': value.field_non_null_counts,
+            'all_null_fields': [name for name, count in value.field_non_null_counts.items() if not count],
+            'volume_units': {
+                'stock_share_unit_status': ('provider_fields_already_shares' if mapped else
+                                           'mixed_market_lots_or_shares_preserved' if task.dataset in storage_objects.CASH_OBJECTS
+                                           else 'native_derivative_contracts_preserved_not_shares'),
+                'source_volume_units': ({'buy': 'shares', 'sell': 'shares'} if mapped else
+                                        {'volume': 'TWSE_TPEX_lots_emerging_shares'} if task.dataset in storage_objects.CASH_OBJECTS
+                                        else {'volume': 'provider_contracts_not_matched_volume_normalized'}),
+                'unit_source': storage_objects.DOCUMENTATION[task.dataset],
+            },
+        }
+        if correction:
+            from downloader.finmind_corrections import correction_receipt_metadata
+            receipt.update(correction_receipt_metadata(correction, authoritative_empty=False))
+        receipt['request']['transfer_and_validation_seconds'] += time.monotonic() - store_started
+        return _publish_receipt(root, task, value, receipt, now, transport=value.observation,
+                                fingerprint=value.sha256)
+    finally:
+        value.path.unlink(missing_ok=True)
 
 
 def _derive_wide(root: Path, connection: sqlite3.Connection, task: Task) -> list[dict[str, Any]]:
@@ -1257,18 +1383,29 @@ def _derive_wide(root: Path, connection: sqlite3.Connection, task: Task) -> list
 def _derive_broker_aggregate(root: Path, task: Task) -> tuple[list[dict], dict]:
     from downloader.parquet_integrity import parquet_receipt_error
 
-    path = root / 'receipts' / 'TaiwanStockTradingDailyReport' / hashlib.sha256(task.data_id.encode()).hexdigest()[:12] / f'{task.partition}.json'
+    started = time.monotonic()
+    identifier = hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else 'all'
+    path = root / 'receipts' / 'TaiwanStockTradingDailyReport' / identifier / f'{task.partition}.json'
     parent = json.loads(path.read_bytes())
     if (parent.get('status') != 'complete' or parent.get('dataset') != 'TaiwanStockTradingDailyReport'
             or parent.get('data_id') != task.data_id or parent.get('partition') != task.partition
             or parquet_receipt_error(root, parent)):
         raise SourceError('invalid_broker_parent', retry_after=900)
-    rows = pq.read_table(root / parent['parquet_path']).to_pylist()
-    supplemental.validate_response('TaiwanStockTradingDailyReport', task.data_id, task.partition, date.fromisoformat(task.partition), rows)
-    return supplemental.aggregate_brokers(rows), {
+    def parent_rows():
+        for batch in pq.ParquetFile(root / parent['parquet_path']).iter_batches(batch_size=65536, use_threads=False):
+            rows = batch.to_pylist()
+            if task.data_id:
+                supplemental.validate_response('TaiwanStockTradingDailyReport', task.data_id, task.partition,
+                                               date.fromisoformat(task.partition), rows)
+            elif parent.get('request', {}).get('endpoint') != 'storage_objects':
+                raise SourceError('unverified_market_broker_parent', retry_after=900)
+            yield from rows
+    rows = supplemental.aggregate_brokers(parent_rows())
+    return rows, {
         'supplemental_contract_version': supplemental.CONTRACT_VERSION,
         'query_shape': 'local_broker_aggregate_from_verified_raw', 'request_count': 0,
         'parent_sha256': parent['sha256'], 'parent_receipt': str(path.relative_to(root)),
+        'local_derivation_seconds': time.monotonic() - started,
         'price_semantics': 'unrounded_quantity_weighted_average_not_independent_provider_response',
         'contract_probe': 'artifacts/data_quality/finmind_repair_2026-09-29/broker_aggregation_probe.json',
     }
@@ -1395,6 +1532,11 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
                 next_check += timedelta(days=1)
             return _iso(next_check)
         if task.kind == "id_day" or (task.kind == "id_month" and task.partition[:7] != local.strftime("%Y-%m")):
+            if spec.publication_day_lag and date.fromisoformat(task.partition) > supplemental._eligible_anchor(spec, now):
+                publication = datetime.combine(date.fromisoformat(task.partition) + timedelta(days=spec.publication_day_lag),
+                                               datetime.min.time(), TAIPEI).replace(hour=spec.release_hour,
+                                                                                   minute=spec.release_minute)
+                return _iso(publication)
             # Immutable past requests remain checked-empty, not complete. A
             # reviewed correction notice may requeue either state immediately.
             return _iso(now + timedelta(days=90 if empty else 365))
@@ -1449,6 +1591,18 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
 
 
 def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, Any], now: datetime) -> None:
+    request = receipt.get('request', {})
+    if request.get('endpoint') == 'storage_objects' and receipt['rows'] > 0:
+        connection.execute('INSERT INTO finmind_object_transfer_samples '
+                           '(dataset,partition,seconds,bytes,rows,observed_at_utc) VALUES (?,?,?,?,?,?)',
+                           (task.dataset, task.partition, request['transfer_and_validation_seconds'],
+                            receipt.get('parquet_size_bytes', 0), receipt['rows'], now.isoformat()))
+    if (task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg' and not task.data_id
+            and receipt['status'] == 'complete' and request.get('local_derivation_seconds', 0) > 0):
+        connection.execute('INSERT INTO finmind_object_derivation_samples '
+                           '(dataset,partition,seconds,observed_at_utc) VALUES (?,?,?,?)',
+                           ('TaiwanStockTradingDailyReport', task.partition,
+                            request['local_derivation_seconds'], now.isoformat()))
     next_at = _next_refresh(task, now, empty=receipt['status'] == 'observed_empty',
                             latest_date=receipt.get('source_last_date'))
     # Retained history after an empty incremental response is not evidence that
@@ -1545,7 +1699,10 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
         "MAX(last_data_date),MAX(last_attempt_at_utc) FROM tasks GROUP BY dataset,state"
     ):
         dataset, task_state, count, rows, size, first, last_date, attempted = row
-        if task_state in {"deprecated_query_shape", "outside_documented_range", "identifier_alias", "non_session", "not_observation_date"}:
+        if task_state in {"deprecated_query_shape", "outside_documented_range", "identifier_alias", "non_session", "not_observation_date", "object_tier_paused"}:
+            if task_state == 'deprecated_query_shape':
+                summary[dataset]['retained_rows'] += rows or 0
+                summary[dataset]['retained_bytes'] += size or 0
             continue
         item = summary[dataset]
         item["target"] += count
@@ -1575,6 +1732,10 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
         "news": "enabled_whole_market_calendar_day", "training": "raw_not_pit_validated",
         "series": summary,
         "historical_frontiers": supplemental.frontier_status(connection, _now()),
+        "storage_objects": {'contract_version': storage_objects.CONTRACT_VERSION,
+                            'enabled_datasets': sorted(storage_objects.active_datasets(connection)),
+                            'api_calls_per_day': 1, 'transfer_calls_per_day': 1,
+                            'quota_scope': 'shared_finmind_account_not_additional_owner'},
         "retry_cohorts": retry_cohorts.summary(connection),
         "retry_policy": retry_policy.summary(connection),
         "candidate_universe": {
@@ -1622,6 +1783,8 @@ def run_once(root: Path, *, max_requests: int = 0,
             limiter = rate_limiter(account)
         from downloader.finmind_corrections import apply_worker_corrections, correction_context, reconcile_worker_corrections
 
+        if required_keys is None and account.get('observed_at_utc'):
+            storage_objects.configure(connection, account, _now())
         if required_keys is None:
             _populate(connection, root, today=_now().astimezone(TAIPEI).date())
         from downloader.finmind_integrity import audit_completed_batch
@@ -1638,7 +1801,14 @@ def run_once(root: Path, *, max_requests: int = 0,
         last_status_at = time.monotonic()
         while not max_requests or completed < max_requests:
             now = _now()
+            previous_tier = account.get('tier')
+            previous_quota = account.get('official_requests_per_hour')
             account = refresh_dispatch_account(account, token, root.parent, now)
+            if account.get('official_requests_per_hour') != previous_quota:
+                limiter.interval_seconds = pacing_interval(account)
+            if required_keys is None and account.get('tier') != previous_tier:
+                storage_objects.configure(connection, account, now)
+                _populate(connection, root, today=now.astimezone(TAIPEI).date())
             delegated = _sponsor_delegated(root, now) if account["tier"] in {"Sponsor", "SponsorPro"} else frozenset()
             local = now.astimezone(TAIPEI)
             if shutil.disk_usage(root).free < MIN_FREE_BYTES:
@@ -1693,6 +1863,11 @@ def run_once(root: Path, *, max_requests: int = 0,
                         rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
                                            max_response_bytes=BULK_MAX_RESPONSE_BYTES)
                         history_metadata['validation'] = news.validate_response(task.partition, rows)
+                    elif task.dataset in storage_objects.active_datasets(connection) and not task.data_id:
+                        rows, history_metadata = storage_objects.fetch(
+                            session, limiter, root, task, token,
+                            heartbeat=lambda: _status(connection, root, state='running', active=task,
+                                                      last=last, delegated=delegated))
                     elif task.dataset in supplemental.SOURCES:
                         endpoint, params, history_metadata = supplemental.request_contract(
                             task.dataset, task.data_id, task.partition, local.date())

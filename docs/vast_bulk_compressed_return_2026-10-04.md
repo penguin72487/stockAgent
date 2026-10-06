@@ -22,7 +22,9 @@ Vast 原始目錄 → GNU tar PAX＋zstd-1（SSH 加密串流）
 
 沒有在 Vast 建第二份完整壓縮檔；沒有 C 完整副本；沒有新增 Syncthing raw
 artifacts folder。SSH bulk 傳输和 Syncthing QUIC index 是兩件事。
-incoming、publish alias、正式 blob 共用同一 NTFS inode，不多寫一份巨大 payload。
+v1 小型 carrier 的 incoming、publish alias、正式 blob 共用同一 NTFS inode。
+2026-10-06 的 v2 把超過 2 GiB 的 carrier 切成有序分段：原 carrier 保留，各段與
+正式 blob 共用 inode；分段額外使用有界 D 容量，不建立另一份完整單檔壓縮副本。
 release ID 是小型原子索引，不是原始目錄的完整 snapshot 複本。
 
 一次性保存設定：[`vastai_bulk_preservation.json`](../configs/data_sync/vastai_bulk_preservation.json)。
@@ -118,6 +120,13 @@ run_fintech_python scripts/receive_vast_bulk_archives.py --scope cache \
 `cold_preserved_retirement_audited` 只代表逐根審查結束，仍需看
 `all_sources_retired`、`deleted`、`reclaimed_allocated_bytes`。
 failed prefix 是 retained evidence，不能交 organizer 當完整 archive。
+大型 carrier 的 `bounded_zstd_tar_preservation_v2` 保存 `compressed_parts.json`、
+`member_inventory.json` 與每段最多 2 GiB 的完整 blob。part plan 固定順序、大小、
+每段 SHA 和原 compressed SHA；發布後串流連接 canonical parts，重新解碼全部
+原始成員。既有 v1 和新 v2 都由 `restore_vast_bulk_archive.py` 還原，不需完整
+單檔 scratch，且不啟用模型。完整部分可在重試沿用，partial／未知資料保留。
+先完成每個已收到 cohort 的冷保存，再審核遠端回收；NAS raw relay 沿原格式
+獨立讀回每個 part，不能把檔案 ACK 宣稱為新的 NAS 原始成員語意解碼。
 已收完的獨立 batch 可另外以不帶 `--apply` 的 organizer 做原值全解碼；它只寫
 `.verification.json` 與原始成員索引，不能覆寫 `.organization.json` 的正式入庫／
 回收收據。`received_originals_verified_read_only` 不是 canonical D 恢復驗收。

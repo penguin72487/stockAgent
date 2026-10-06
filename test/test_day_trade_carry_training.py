@@ -168,6 +168,37 @@ def test_physical_day_trade_trajectory_cadence_matches_one_fixed_policy_loss():
     assert timing.gradient_norm_observations == 1
 
 
+def test_physical_loss_omits_only_unused_intraday_adjoint(monkeypatch):
+    import stockagent.training.loss as loss_module
+
+    split, runtime, loss_fn = fixture(rows=7)
+    simulator = loss_module.run_backtest_torch
+    control = True
+    observed_flags = []
+
+    def audited_simulator(*args, **kwargs):
+        observed_flags.append(kwargs["day_trade_carry_require_minute_nav_grad"])
+        if control:
+            kwargs["day_trade_carry_require_minute_nav_grad"] = True
+        return simulator(*args, **kwargs)
+
+    monkeypatch.setattr(loss_module, "run_backtest_torch", audited_simulator)
+    expected_model = Policy()
+    expected, expected_state = reference(split, runtime, loss_fn, expected_model)
+    expected_grad, = torch.autograd.grad(expected, expected_model.action)
+    control = False
+    actual_model = Policy()
+    actual, state = reference(split, runtime, loss_fn, actual_model)
+    grad, = torch.autograd.grad(actual, actual_model.action)
+    assert observed_flags == [False, False]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(grad, expected_grad, rtol=0, atol=0)
+    torch.testing.assert_close(state.last_nav, expected_state.last_nav, rtol=0, atol=0)
+    for f in fields(state.inventory):
+        torch.testing.assert_close(getattr(state.inventory, f.name),
+                                   getattr(expected_state.inventory, f.name), rtol=0, atol=0)
+
+
 def test_physical_training_prefetches_each_chronological_batch(monkeypatch):
     split, runtime, loss_fn = fixture()
     calls = []

@@ -104,14 +104,16 @@ def _schema(conn: sqlite3.Connection) -> None:
 
 
 def record_success(root: Path, task: Any, rows: list, receipt: dict,
-                   now: datetime, *, transport: dict | None = None) -> dict | None:
+                   now: datetime, *, transport: dict | None = None,
+                   fingerprint: str | None = None,
+                   fingerprint_basis: str = 'canonical_row_multiset_v1') -> dict | None:
     if not monitored(task, now):
         return None
     transport = transport or getattr(rows, "observation", {})
     checked = transport.get("response_received_at_utc") or now.astimezone(UTC).isoformat()
     started = transport.get("request_started_at_utc")
     request_id = transport.get("request_id") or uuid.uuid4().hex
-    fingerprint = row_fingerprint(rows)
+    fingerprint = fingerprint or row_fingerprint(rows)
     first = receipt.get("source_first_date") or receipt.get("date")
     last = receipt.get("source_last_date") or receipt.get("date")
     root.mkdir(parents=True, exist_ok=True)
@@ -145,7 +147,7 @@ def record_success(root: Path, task: Any, rows: list, receipt: dict,
             "publication_basis": "observed_interval_not_exact_publication",
             "source_first_date": first, "source_last_date": last,
             "rows": len(rows), "fingerprint": fingerprint,
-            "fingerprint_basis": "canonical_row_multiset_v1", "unchanged_checks": unchanged,
+            "fingerprint_basis": fingerprint_basis, "unchanged_checks": unchanged,
             "stored_content_sha256": receipt.get("sha256"),
             "response_rows": transport.get("response_rows", len(rows)),
             "network_seconds": transport.get("network_seconds"),

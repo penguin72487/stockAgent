@@ -1303,6 +1303,16 @@ function renderOperations(data) {
     const brokerText = brokerParts.length
       ? `；報價通道（取價內含分段，不可相加）${brokerParts.map(([name, value]) => `${name} ${latencyValue(value)}`).join(" · ")}`
       : "";
+    const publication = row.state_publication || {};
+    const publicationFiles = Array.isArray(publication.files) ? publication.files : [];
+    const publicationParts = [["完整發布", publication.total_ms], ["內容指紋", publication.projection_fingerprint_ms]];
+    for (const [label, key] of [["JSON 編碼", "json_encode_ms"], ["檔案寫入／同步", "file_write_fsync_ms"], ["替換／目錄同步", "replace_directory_fsync_ms"]]) {
+      if (publicationFiles.length && publicationFiles.every(file => file[key] != null && Number.isFinite(Number(file[key])) && Number(file[key]) >= 0)) {
+        publicationParts.push([label, publicationFiles.reduce((sum, file) => sum + Number(file[key]), 0)]);
+      }
+    }
+    const publicationText = publication.total_ms == null ? ""
+      : `；帳本發布（帳本落盤內含分段，不可再相加）${publicationParts.filter(([, value]) => value != null && Number.isFinite(Number(value))).map(([label, value]) => `${label} ${latencyValue(value)}`).join(" · ")}`;
     const accountingNote = transport.snapshot_usage_observation === "not_sampled_latency_critical"
       ? "；即時取價不查流量；配額由獨立觀測更新，此筆流量未知，非免費／零流量"
       : "";
@@ -1319,7 +1329,7 @@ function renderOperations(data) {
     return `<div class="progress-row opening-latency-row">
       <div class="progress-title"><strong>${esc(strategyLabel(row))}</strong>${badge(`${latencyValue(row.ready_from_0900_ms)} / ${latencyValue(openingGoalMs)}`, kind)}</div>
       ${progress(ratio, kind)}
-      <small>${esc(`行情覆蓋 ${latencyValue(row.source_ready_from_0900_ms)} · 行情就緒到訊號 ${latencyValue(row.source_ready_to_signal_ms)} · ${stagesText}${brokerText}${ledgerText}${historyGuard}${accountingNote}`)}</small>
+      <small>${esc(`行情覆蓋 ${latencyValue(row.source_ready_from_0900_ms)} · 行情就緒到訊號 ${latencyValue(row.source_ready_to_signal_ms)} · ${stagesText}${brokerText}${ledgerText}${publicationText}${historyGuard}${accountingNote}`)}</small>
     </div>`;
   }).join("") || `<div class="empty-inline">所選日尚無 09:00 自動訊號測速；不以手動或回放資料冒充。</div>`;
   setHtml("opening-stage-progress", openingStageHtml);

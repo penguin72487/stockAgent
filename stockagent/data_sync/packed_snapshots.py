@@ -325,6 +325,25 @@ def _copy_and_hash(source: Path, destination: Path) -> str:
     return digest.hexdigest()
 
 
+def _native_copy_and_hash(source: Path, destination: Path) -> str:
+    """Durable C-to-D stream with independent Linux and Windows full SHA."""
+    from stockagent.data_sync.windows_cold_io import BinaryWriter
+
+    digest = hashlib.sha256()
+    writer = BinaryWriter(destination)
+    try:
+        with source.open("rb") as stream:
+            while block := stream.read(8 * 1024 * 1024):
+                digest.update(block)
+                writer.write(block)
+        result = writer.finish()
+        if result.get("sha256") != digest.hexdigest():
+            raise SnapshotError("native durable copy checksum differs; partial retained")
+        return digest.hexdigest()
+    finally:
+        writer.close()
+
+
 def _install_immutable_object(
     sync_root: Path,
     temporary: Path,
@@ -870,6 +889,7 @@ def publish_packed_snapshot(
     defer_scan: bool = False,
     batch_directory_fsync: bool = False,
     d_primary_native_blob_reads: bool = False,
+    d_primary_native_blob_writes: bool = False,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     source = source.resolve()
@@ -880,6 +900,13 @@ def publish_packed_snapshot(
         raise SnapshotError("d_primary_native_blob_reads must be an explicit boolean")
     if d_primary_native_blob_reads and sync_root != Path("/srv/stockagent-packed"):
         raise SnapshotError("native D blob reads require the canonical enrolled D store")
+    if type(d_primary_native_blob_writes) is not bool:
+        raise SnapshotError("d_primary_native_blob_writes must be an explicit boolean")
+    if d_primary_native_blob_writes:
+        if sync_root != Path("/srv/stockagent-packed"):
+            raise SnapshotError("native D blob writes require the canonical enrolled D store")
+        from stockagent.data_sync.cold_primary import _check_d_primary_mount
+        _check_d_primary_mount(sync_root)
     if _paths_overlap(sync_root, source):
         raise SnapshotError("snapshot source and packed sync root must not overlap")
     if loose_file_threshold_bytes < 1:
@@ -1022,7 +1049,13 @@ def publish_packed_snapshot(
                 already_present = True
             else:
                 temporary = staging_root / f"blob-{uuid.uuid4().hex}.partial"
-                copied_digest = _copy_and_hash(source_path, temporary)
+                # Interleaved real C-to-D write/full-readback measurements on
+                # penguin favor DrvFs at 64 MiB and native FileStream at 512 MiB.
+                # Keep process startup off smaller copies; other callers keep
+                # the established default unless they explicitly enable it.
+                copied_digest = (_native_copy_and_hash(source_path, temporary)
+                                 if d_primary_native_blob_writes and entry.size >= 512 * 1024**2
+                                 else _copy_and_hash(source_path, temporary))
                 _ensure_source_stat(source_path, entry)
                 if copied_digest != digest:
                     raise SnapshotError(f"source file changed while packing: {source_path}")
@@ -1424,12 +1457,27 @@ def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool):
     expected_bytes = int(item["bytes"])
     if (not stat.S_ISREG(before.st_mode) or path.is_symlink() or before.st_size != expected_bytes):
         raise SnapshotError("native pack input is redirected or its size changed")
+    fingerprint = (_source_stat(before), before.st_nlink)
+    # Real two-member 383 KiB pack recovery measured 0.146s via DrvFs vs
+    # 1.764s through native scratch. Bound this path tightly to that small
+    # family; larger or many-member packs retain native sequential recovery.
+    stored_members = int(item.get('stored_file_count', item.get('file_count', 3)))
+    if expected_bytes <= 512 * 1024 and 1 <= stored_members <= 2:
+        with path.open('rb') as source:
+            payload = source.read(expected_bytes + 1)
+        if (len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != item['sha256']
+                or (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint):
+            raise SnapshotError('native pack checksum or immutable source signature differs')
+        with io.BytesIO(payload) as source:
+            yield source
+        if (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint:
+            raise SnapshotError('native pack changed during reconstruction')
+        return
     scratch_root = Path("/var/lib")
     if shutil.disk_usage(scratch_root).free < expected_bytes + 32 * 1024**3:
         raise SnapshotError("native pack read lacks one-pack space plus 32 GiB reserve")
     from stockagent.data_sync.training_return import admit_workspace
     admit_workspace(scratch_root, expected_bytes + 32 * 1024**3)
-    fingerprint = (_source_stat(before), before.st_nlink)
     with tempfile.TemporaryFile(dir=scratch_root) as scratch:
         digest, total = hashlib.sha256(), 0
         with binary_reader(path) as source:
@@ -1448,6 +1496,24 @@ def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool):
         yield scratch
         if (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint:
             raise SnapshotError("native pack changed during reconstruction")
+
+
+MAX_NATIVE_HASH_MEMBER_BYTES = 8 * 1024**3
+MAX_NATIVE_HASH_BATCH_BYTES = 16 * 1024**3
+
+
+def _native_blob_hash_batches(members):
+    batch, total = [], 0
+    for path, count in members:
+        if not 0 <= count <= MAX_NATIVE_HASH_MEMBER_BYTES:
+            continue  # the caller keeps its full streaming SHA path
+        if batch and (len(batch) == 16 or total + count > MAX_NATIVE_HASH_BATCH_BYTES):
+            yield batch
+            batch, total = [], 0
+        batch.append(path)
+        total += count
+    if batch:
+        yield batch
 
 
 def verify_packed_snapshot(
@@ -1489,6 +1555,18 @@ def verify_packed_snapshot(
     for relative in sorted(selected_paths or ()):
         row = file_rows[relative]
         selected_by_object.setdefault(row["storage"]["object_sha256"], []).append(row)
+    native_blob_digests: dict[Path, str] = {}
+    native_blob_signatures = {}
+    if d_primary_native_blob_reads:
+        from stockagent.data_sync.windows_cold_io import hash_many, _stable
+        blob_members = [(_path_under(sync_root, str(item['relpath']), 'object relpath'), int(item['bytes']))
+                        for item in manifest['archive']['objects'] if item['kind'] == 'blob']
+        blob_paths = [path for path, count in blob_members if count <= MAX_NATIVE_HASH_MEMBER_BYTES]
+        native_blob_signatures = {path: path.lstat() for path in blob_paths}
+        # Keep every full object hash and native before/after signature gate;
+        # amortize the Windows process start across a bounded set of objects.
+        for batch in _native_blob_hash_batches(blob_members):
+            native_blob_digests.update(hash_many(batch))
     reconstructed_files = 0
     verified_bytes = 0
     for item in manifest["archive"]["objects"]:
@@ -1507,9 +1585,10 @@ def verify_packed_snapshot(
             # _native_pack_source performs the complete object SHA before ZIP
             # access, under before/after immutable source signatures.
             actual = item['sha256']
-        elif d_primary_native_blob_reads and item['kind'] == 'blob':
-            from stockagent.data_sync.windows_cold_io import hash_file
-            actual = hash_file(path)
+        elif path in native_blob_digests and item['kind'] == 'blob':
+            actual = native_blob_digests[path]
+            if not _stable(native_blob_signatures[path], path.lstat()):
+                raise SnapshotError('native cold blob changed after full batch hashing')
         else:
             actual = (
                 hashlib.sha256(pack_bytes).hexdigest()
@@ -1580,6 +1659,8 @@ def verify_packed_snapshot(
     if materialized_path is not None:
         _verify_materialized(materialized_path, manifest, entries)
         result["materialized_verified"] = True
+    if any(not _stable(before, path.lstat()) for path, before in native_blob_signatures.items()):
+        raise SnapshotError('native cold blob changed during release verification')
     return result
 
 
