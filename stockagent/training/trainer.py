@@ -26252,6 +26252,9 @@ def _run_training_impl(
             # individual encoder and market/head partitions instead of trying
             # to capture filesystem reads in a monolithic fullgraph wrapper.
             model.factorized_input_compile=model_compile_requested
+            model.factorized_encoder_checkpoint=config.training.factorized_encoder_checkpoint
+            model.factorized_encoder_vram_safety_margin_bytes=int(
+                config.training.vram_safety_margin_gb * 1024**3)
             if model_compile_requested:
                 import torch._functorch.config as factorized_aot_config
                 if not hasattr(factorized_aot_config,"backward_pass_autocast"):

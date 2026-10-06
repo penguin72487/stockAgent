@@ -325,6 +325,10 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     # not observations, shapes, graph arithmetic or the optimizer trajectory.
     # Exact runtime/config/source receipts still record the selected mode.
     snapshot["data"].pop("factorized_transfer_mode", None)
+    # Activation retention changes storage/recomputation, not the compiled
+    # encoder mathematics, RNG or optimizer. Exact release/config receipts
+    # retain this executor setting; canonical semantic resume stays unchanged.
+    snapshot["training"].pop("factorized_encoder_checkpoint", None)
     if not getattr(config.data, "factorized_feature_manifest", ""):
         snapshot["data"].pop("factorized_feature_manifest", None)
     elif config.training.enable_torch_compile:
@@ -936,6 +940,7 @@ def _training_checkpoint_contract_schema_3(
     # constraint below separately prevents unsafe optimizer resume when enabled.
     contract.pop("cache_train_features_in_amp_dtype", None)
     contract.pop("compile_eval_model", None)
+    contract.pop("factorized_encoder_checkpoint", None)
     contract.pop("day_trade_optimizer_step_per_trajectory", None)
     contract.pop("day_trade_sub_lot_recovery", None)
     contract.pop("day_trade_training_annual_episodes", None)

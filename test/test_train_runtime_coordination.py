@@ -42,7 +42,7 @@ def test_epoch_wall_max_is_available_without_hot_path_profiling(monkeypatch):
     assert payload == {"epoch_total_s": 4.0, "train_total_s": 3.0}
 
 
-@pytest.mark.parametrize("numba_maximum", [2, 8])
+@pytest.mark.parametrize("numba_maximum", [2, 8, 64])
 def test_first_numba_panel_call_preserves_rank_cpu_budget(numba_maximum):
     pytest.importorskip("numba")
     # A fresh process is essential: the first Numba OpenMP launch is what used
@@ -57,7 +57,7 @@ expected = min(4, train._available_cpu_count())
 train._configure_cpu_parallelism(cpu_threads=4, compile_threads=1)
 assert torch.get_num_threads() == expected
 assert numba.get_num_threads() == min(expected, numba.config.NUMBA_NUM_THREADS)
-values = np.array([[1., 2., 4., 8.]])
+values = np.tile(np.array([[1., 2., 4., 8.]]), (5_000, 1))
 for _ in range(2):
     actual = panel_numba.safe_log_ratio_array(values, np.ones_like(values))
     np.testing.assert_allclose(actual, np.log(values), rtol=0, atol=1e-15)
