@@ -11,16 +11,26 @@ python_bin="$(resolve_fintech_python)"
 
 cohort_args=()
 if [[ "${1:-}" == "--cohort" ]]; then
+  readiness_args=()
   case "${2:-}" in
     main) cohort_root=/var/lib/stockagent-vast-legacy-return ;;
     partitions) cohort_root=/var/lib/stockagent-vast-legacy-return-partitions ;;
+    reviewed-main-20261006) cohort_root=/var/lib/stockagent-vast-reviewed-return-20261006 ;;
+    reviewed-panel-20261006)
+      cohort_root=/var/lib/stockagent-vast-reviewed-partitions-20261006
+      readiness_args=(--selection "$cohort_root/scope-selection.json")
+      ;;
     *) exit 64 ;;
   esac
   shift 2
   cohort_args=(--state-root "$cohort_root")
+  if [[ "$cohort_root" == /var/lib/stockagent-vast-reviewed-* || "${STOCKAGENT_LEGACY_REVIEWED_20261006:-0}" == 1 ]]; then
+    cohort_args+=(--policy configs/data_sync/vastai_reviewed_legacy_return_20261006.json)
+  fi
+  cohort_args+=("${readiness_args[@]}")
   if [[ "${1:-}" == "--check-ready" ]]; then
     [[ "$#" == 1 ]] || exit 64
-    exec "$python_bin" scripts/check_legacy_return_ready.py "$cohort_root"
+    exec "$python_bin" scripts/check_legacy_return_ready.py "$cohort_root" "${readiness_args[@]}"
   fi
 fi
 

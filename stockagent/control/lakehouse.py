@@ -13,7 +13,7 @@ import time
 import uuid
 
 from downloader.artifact_io import atomic_write_json
-from stockagent.data_sync.immutable_replication import digest, replicate, seal, verify
+from stockagent.data_sync.immutable_replication import digest, read_manifest, replicate, seal, verify
 from stockagent.runtime_identity import identity_sha256, runtime_identity, validate_runtime_lock
 
 
@@ -158,6 +158,12 @@ def register(c: dict) -> dict:
                                   Path("configs/data_sync/backup_history_disposition_20261004.json"),
                                   include_unreferenced_objects=include_orphans)
         if catalog["metadata_errors"]:
+            atomic_write_json(state / 'catalog-refresh-errors.json', {
+                'state': 'catalog_refresh_rejected',
+                'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+                'source_catalog_sha256': catalog.get('identity_sha256'),
+                'metadata_errors': catalog['metadata_errors'],
+                'last_committed_registry_preserved': True}, durable=True)
             raise ValueError("source catalog metadata errors must remain explicit")
         con = connect(c)
         try:
@@ -309,7 +315,7 @@ def finish_export(c: dict, result: dict, journal: Path) -> dict:
     return finished
 
 
-def acceptance(c: dict, delivery_id: str) -> dict:
+def acceptance(c: dict, delivery_id: str, *, enrolled_source=None) -> dict:
     from stockagent.data_sync.immutable_replication import HASH
     from stockagent.data_sync.immutable_transport_cache import validate_archive_receipt, validate_sources
     if not HASH.fullmatch(delivery_id):
@@ -324,7 +330,7 @@ def acceptance(c: dict, delivery_id: str) -> dict:
     if not source.exists():
         source = Path(c["transport_root"]) / ("lake-" + delivery_id)
     if source.exists():
-        manifest = verify(source)
+        manifest = read_manifest(source) if enrolled_source is not None else verify(source)
         manifest_bytes = (source / "manifest.json").read_bytes()
     else:
         cached = json.loads((Path(c["state_root"]) / ("cache-retirement-" + delivery_id + ".json")).read_bytes())
@@ -335,6 +341,19 @@ def acceptance(c: dict, delivery_id: str) -> dict:
         if manifest["identity_sha256"] != delivery_id or identity_sha256({k: v for k, v in manifest.items() if k != "identity_sha256"}) != delivery_id:
             raise ValueError("cached archive source manifest differs")
         validate_sources(c, delivery_id, manifest, cached["primary_signatures"])
+    if enrolled_source is not None:
+        # NAS has independently restored this exact sealed payload. Confirm
+        # its enrolled authority membership without rereading gigabytes in
+        # the sender. Full local recovery/set/SHA gates still precede GC.
+        context = manifest['context']
+        mapping = context.get('source_object_paths', {rel: rel for rel in manifest['files']})
+        if (manifest['identity_sha256'] != delivery_id or context.get('kind') != 'immutable_source_objects'
+                or any(context.get(k) != c[k] for k in ('producer_device_id', 'receiver_device_id'))
+                or set(mapping) != set(manifest['files'])
+                or {mapping[rel]+'@'+item['sha256'] for rel,item in manifest['files'].items()}
+                   != set(enrolled_source['file_keys'])
+                or sum(item['bytes'] for item in manifest['files'].values()) != enrolled_source['bytes']):
+            raise ValueError('NAS receipt differs from the enrolled source publication')
     value = validate_archive_receipt(c, delivery_id, manifest, manifest_bytes)
     return {"state": "nas_archive_file_recovery_verified", "delivery_identity_sha256": delivery_id, "receipt_identity_sha256": value["identity_sha256"],
             "catalog_semantic_restore_verified": value.get("catalog_semantic_restore_verified", False)}
@@ -355,7 +374,7 @@ def retire_accepted_transport(c, delivery_id, proof):
         return {"state": "retirement_deferred", "error_type": type(error).__name__}
 
 
-def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
+def _publish_source_wave(c, chosen, physical, ledger_path, ledger, *, redelivery=None):
     """Durable fixed wave, including recovery between copying/sealing/enrollment."""
     from downloader.artifact_io import atomic_write_text
     from stockagent.data_sync.immutable_replication import safe
@@ -373,6 +392,8 @@ def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
     else:
         body = {'contract': 'durable_immutable_source_wave_v1', 'files': [list(r) for r in chosen],
                 'producer_device_id': c['producer_device_id'], 'receiver_device_id': c['receiver_device_id']}
+        if redelivery:
+            body['redelivery'] = redelivery
         journal = {'state': 'copying', 'intent': body, 'intent_sha256': identity_sha256(body), 'files': body['files']}
         atomic_write_json(journal_path, journal, durable=True)
     chosen = journal['files']
@@ -386,6 +407,8 @@ def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
     context = {'kind': 'immutable_source_objects', 'producer_device_id': c['producer_device_id'],
                'receiver_device_id': c['receiver_device_id'], 'source_object_paths': source_paths,
                'transport_layout': 'flat-sha256-v1'}
+    if body.get('redelivery'):
+        context['redelivery'] = body['redelivery']
     staging = physical / '.staging' / ('lake-raw-' + journal['intent_sha256'])
     delivery_id = journal.get('delivery_identity_sha256')
     published = physical / 'lakehouse' / ('lake-' + delivery_id) if delivery_id else None
@@ -447,6 +470,14 @@ def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
         raise ValueError('published wave differs from its durable intent')
     size = sum(r[2] for r in chosen)
     ledger['deliveries'].setdefault(delivery_id, {'file_keys': [r[0] + '@' + r[1] for r in chosen], 'bytes': size})
+    if body.get('redelivery'):
+        retry = body['redelivery']
+        ledger['deliveries'][delivery_id]['retry_of'] = retry['delivery_identity_sha256']
+        original = ledger['deliveries'][retry['delivery_identity_sha256']]
+        attempts = original.setdefault('redeliveries', [])
+        if delivery_id not in attempts:
+            attempts.append(delivery_id)
+        original['last_redelivery_epoch'] = time.time()
     atomic_write_json(ledger_path, ledger, durable=True)
     atomic_write_json(journal_path, {**journal, 'state': 'enrolled'}, durable=True)
     return delivery_id, published
@@ -464,6 +495,28 @@ def stage_source_wave(c: dict) -> dict:
     policy = source_wave_policy(c)
     guard(c)
     state = Path(c["state_root"])
+    refresh_error = None
+    if policy['refresh_source_catalog']:
+        checkpoint = state / 'source-catalog-refresh.json'
+        previous = json.loads(checkpoint.read_bytes()) if checkpoint.exists() else {}
+        if previous.get('state') in ('registered', 'refresh_deferred') and previous.get('retry_at_epoch', 0) > time.time():
+            refresh_error = previous.get('error')
+        else:
+            try:
+                register(c)
+                atomic_write_json(checkpoint, {'state': 'registered',
+                    'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+                    'retry_at_epoch': time.time()+policy['catalog_refresh_retry_seconds']}, durable=True)
+            except BlockingIOError:
+                pass  # The shared catalog owner is capturing/exporting; use its last committed version.
+            except (OSError, ValueError) as error:
+                # A rejected new registry version cannot withhold already
+                # committed, authorized immutable objects from the sender.
+                refresh_error = {'error_type': type(error).__name__,
+                    'scope': 'new catalog refresh; last committed registry remains in use'}
+                atomic_write_json(checkpoint, {'state': 'refresh_deferred', 'error': refresh_error,
+                    'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+                    'retry_at_epoch': time.time()+policy['catalog_refresh_retry_seconds']}, durable=True)
     ledger_path = state / "source-replication-ledger.json"
     with (state / "source-replication-owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -475,8 +528,21 @@ def stage_source_wave(c: dict) -> dict:
         acknowledged = set()
         pending = []
         changed = False
+        receipt_errors = []
+        scan = state/'pending-transport-scan.json'
+        if scan.exists() and json.loads(scan.read_bytes()).get('state') == 'retry_scan':
+            notify_transport(c)
         for delivery_id, row in ledger["deliveries"].items():
-            proof = row.get("nas_acceptance") or acceptance(c, delivery_id)
+            try:
+                proof = row.get("nas_acceptance")
+                if not proof:
+                    proof = (acceptance(c, delivery_id, **({'enrolled_source': row} if policy['decouple_nas_acceptance'] else {}))
+                             if (Path(c['receipt_root'])/('lake-'+delivery_id+'.json')).exists()
+                             else {'state': 'waiting_nas_archive_acceptance'})
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                receipt_errors.append({'delivery_identity_sha256': delivery_id, 'error_type': type(error).__name__})
+                pending.append(delivery_id)
+                continue
             if proof["state"] == "nas_archive_file_recovery_verified":
                 if row.get("nas_acceptance") != proof:
                     row["nas_acceptance"] = proof
@@ -499,6 +565,14 @@ def stage_source_wave(c: dict) -> dict:
         # an ever-growing ledger once per already accepted historical wave.
         if changed:
             atomic_write_json(ledger_path, ledger, durable=True)
+        # A replacement proof covers the same canonical file keys. The failed
+        # attempt remains retained and never acquires a fabricated ACK.
+        pending = [key for key in pending if not any(
+            ledger['deliveries'][child].get('nas_acceptance')
+            and ledger['deliveries'][child].get('retry_of') == key
+            and set(ledger['deliveries'][child]['file_keys']) == set(ledger['deliveries'][key]['file_keys'])
+            and ledger['deliveries'][child]['bytes'] == ledger['deliveries'][key]['bytes']
+            for child in ledger['deliveries'][key].get('redeliveries', []))]
         con = connect(c, read_only=True)
         try:
             rows = con.execute("SELECT DISTINCT relative, sha256, bytes FROM lake.source_objects WHERE role IN ('packed_object','unreferenced_cold_object') ORDER BY bytes,relative,sha256").fetchall()
@@ -507,23 +581,31 @@ def stage_source_wave(c: dict) -> dict:
         total = sum(row[2] for row in rows)
         covered = sum(row[2] for row in rows if row[0] + "@" + row[1] in acknowledged)
         pending_bytes = sum(ledger['deliveries'][key]['bytes'] for key in pending)
+        retained_bytes = sum(row['bytes'] for row in ledger['deliveries'].values()
+            if row.get('transport_retirement', {}).get('state') != 'retired')
         result = {"state": "waiting_nas_archive_acceptance" if pending else "monitoring_increments",
                   "observed_at_utc": datetime.now(timezone.utc).isoformat(), "available_object_bytes": total,
                   "nas_archive_covered_bytes": covered, "available_object_count": len(rows),
                   "nas_archive_covered_objects": len(acknowledged), "pending_delivery_ids": pending,
                   "pending_bytes": pending_bytes,
-                  "maximum_pending_deliveries": policy['maximum_pending_deliveries'],
+                  "maximum_pending_deliveries": None if policy['decouple_nas_acceptance'] else policy['maximum_pending_deliveries'],
                   "maximum_wave_bytes": policy['maximum_wave_bytes'],
+                  "publication_waits_for_nas_ack": not policy['decouple_nas_acceptance'],
+                  "retained_transport_bytes": retained_bytes, "receipt_errors": receipt_errors,
+                  "catalog_refresh_error": refresh_error,
+                  "redelivery_attempts": sum(len(row.get('redeliveries', [])) for row in ledger['deliveries'].values()),
                   "source_deletion_enabled": False, "transport_deletion_enabled": c.get('transport_cache_retirement') is True,
                   "transport_cache_reclaimed_bytes": sum(r.get('transport_retirement',{}).get('reclaimed_bytes',0) for r in ledger['deliveries'].values()
                                                           if r.get('transport_retirement',{}).get('state') == 'retired')}
-        if len(pending) < policy['maximum_pending_deliveries']:
+        if policy['decouple_nas_acceptance'] or len(pending) < policy['maximum_pending_deliveries']:
             already_nas = set()
             if policy['prioritize_uncovered_nas']:
                 already_nas = restic_keys(read_ledger(Path(policy['restic_state_root']) / 'ledger.json'))
             published = {key for row in ledger['deliveries'].values() for key in row['file_keys']}
             eligible = sorted(rows, key=lambda row: (row[0] + '@' + row[1] in already_nas, row[2], row[0], row[1]))
-            limit = min(policy['maximum_wave_bytes'], policy['maximum_pending_bytes'] - pending_bytes)
+            room = (policy['maximum_retained_transport_bytes'] - retained_bytes if policy['decouple_nas_acceptance']
+                    else policy['maximum_pending_bytes'] - pending_bytes)
+            limit = min(policy['maximum_wave_bytes'], room)
             chosen = []
             size = 0
             for row in eligible:
@@ -533,7 +615,7 @@ def stage_source_wave(c: dict) -> dict:
                     break
                 if size + row[2] > limit:
                     if (not chosen and row[2] <= policy['maximum_single_object_bytes']
-                            and row[2] <= policy['maximum_pending_bytes'] - pending_bytes):
+                            and row[2] <= room):
                         chosen.append(row)
                         size += row[2]
                         break
@@ -541,24 +623,39 @@ def stage_source_wave(c: dict) -> dict:
                 chosen.append(row)
                 size += row[2]
             journal_path = state / 'source-wave-current.json'
+            redelivery = None
             if journal_path.exists():
                 journal = json.loads(journal_path.read_bytes())
                 if (journal.get('state') in ('copying', 'sealed')
                         and journal.get('delivery_identity_sha256') not in ledger['deliveries']):
                     chosen = journal['files']
                     size = sum(r[2] for r in chosen)
+                    redelivery = journal['intent'].get('redelivery')
                 elif journal.get('delivery_identity_sha256') in ledger['deliveries']:
                     atomic_write_json(journal_path, {**journal, 'state': 'enrolled'}, durable=True)
+            if redelivery is None and policy['receiver_requested_redelivery'] and not (
+                    journal_path.exists() and json.loads(journal_path.read_bytes()).get('state') in ('copying', 'sealed')):
+                try:
+                    retry_files, retry_request = requested_source_redelivery(c, ledger, room, policy)
+                    if retry_files:
+                        chosen, redelivery = retry_files, retry_request
+                        size = sum(r[2] for r in chosen)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    result['redelivery_request_error'] = type(error).__name__
             if chosen:
                 physical = PHYSICAL_TRANSPORT_ROOT
                 transport_parent = Path(c["transport_root"]).parent
                 if not physical.samefile(transport_parent) or shutil.disk_usage(physical).free < size + 64 * 1024**3:
                     raise ValueError("bounded source replication lacks the enrolled D transport/capacity")
-                delivery_id, destination = _publish_source_wave(c, chosen, physical, ledger_path, ledger)
+                delivery_id, destination = _publish_source_wave(c, chosen, physical, ledger_path, ledger,
+                                                               redelivery=redelivery)
                 pending.append(delivery_id)
                 result.update(state="waiting_nas_archive_acceptance", pending_delivery_ids=pending,
-                              pending_bytes=pending_bytes + size)
+                              pending_bytes=pending_bytes + size, retained_transport_bytes=retained_bytes+size,
+                              redelivery_attempts=sum(len(row.get('redeliveries', [])) for row in ledger['deliveries'].values()))
                 notify_transport(c, ["lakehouse/" + destination.name])
+            elif room <= 0:
+                result['state'] = 'waiting_transport_capacity'
         atomic_write_json(state / "source-replication-status.json", result)
         return result
 
@@ -567,21 +664,93 @@ def source_wave_policy(c: dict) -> dict:
     policy = {'maximum_pending_deliveries': 1, 'maximum_wave_bytes': 1024**3,
               'maximum_single_object_bytes': 8 * 1024**3,
               'maximum_pending_bytes': 8 * 1024**3, 'maximum_wave_files': 1024,
-              'prioritize_uncovered_nas': False, 'restic_state_root': '/var/lib/stockagent/backup-stream'}
+              'prioritize_uncovered_nas': False, 'restic_state_root': '/var/lib/stockagent/backup-stream',
+              'decouple_nas_acceptance': False, 'maximum_retained_transport_bytes': 256 * 1024**3,
+              'receiver_requested_redelivery': False, 'maximum_redelivery_attempts': 3,
+              'redelivery_cooldown_seconds': 600, 'refresh_source_catalog': False,
+              'catalog_refresh_retry_seconds': 600}
     configured = c.get('source_replication', {})
     if not isinstance(configured, dict) or set(configured) - set(policy):
         raise ValueError('unknown bounded source replication policy')
     policy.update(configured)
     bounds = {'maximum_pending_deliveries': (1, 8), 'maximum_wave_bytes': (1024**2, 8 * 1024**3),
               'maximum_single_object_bytes': (1024**2, 8 * 1024**3),
-              'maximum_pending_bytes': (1024**2, 64 * 1024**3), 'maximum_wave_files': (1, 4096)}
+              'maximum_pending_bytes': (1024**2, 64 * 1024**3), 'maximum_wave_files': (1, 4096),
+              'maximum_retained_transport_bytes': (1024**2, 1024**4),
+              'maximum_redelivery_attempts': (1, 10), 'redelivery_cooldown_seconds': (1, 86400),
+              'catalog_refresh_retry_seconds': (60, 3600)}
     if any(type(policy[k]) is not int or not lower <= policy[k] <= upper for k, (lower, upper) in bounds.items()):
         raise ValueError('source replication exceeds its bounded resource policy')
     if (type(policy['prioritize_uncovered_nas']) is not bool
+            or type(policy['decouple_nas_acceptance']) is not bool
+            or type(policy['receiver_requested_redelivery']) is not bool
+            or type(policy['refresh_source_catalog']) is not bool
             or not Path(policy['restic_state_root']).is_absolute()
             or policy['maximum_wave_bytes'] > policy['maximum_pending_bytes']):
         raise ValueError('invalid source replication priority or pending budget')
     return policy
+
+
+def requested_source_redelivery(c, ledger, room, policy):
+    """A paired receiver's failed job requests a new immutable attempt.
+
+    Preserve the failed directory/NAS attempt; the existing receiver discovers
+    the new sealed delivery without executing code or overwriting its archive.
+    At most one attempt is active per failed root; all other jobs keep moving.
+    """
+    from stockagent.data_sync.immutable_replication import HASH, safe
+    path = Path(c['receipt_root']) / 'relay-status.json'
+    if not path.exists():
+        return [], None
+    if path.is_symlink() or path.stat().st_size > 1024**2:
+        raise ValueError('receiver retry status is redirected or oversized')
+    value = json.loads(path.read_bytes())
+    if (any(value.get(k) != c[k] for k in ('producer_device_id', 'receiver_device_id'))
+            or any(value.get(k) is not True for k in ('nas_mount_guard_verified', 'single_owner_verified', 'runtime_lock_verified'))):
+        raise ValueError('redelivery needs the paired fixed receiver owner')
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(value['observed_at_utc'])).total_seconds()
+    if not -300 <= age <= 86400:
+        return [], None
+    # READY and payload arrive independently. Incomplete ingress and temporary
+    # NAS/capacity conditions need receiver retries, not duplicate payloads.
+    failed_jobs = [j for j in value['jobs']
+                   if j.get('state') in ('deferred', 'rejected', 'retry_wait')
+                   and j.get('error_type') not in ('FileNotFoundError', 'TimeoutError',
+                       'ConnectionError', 'CapacityError')]
+    failed = {j.get('delivery', '').removeprefix('lake-') for j in failed_jobs}
+    for job in failed_jobs:
+        name = job.get('delivery', '')
+        identity = name.removeprefix('lake-')
+        if job.get('state') not in ('deferred', 'rejected', 'retry_wait') or not HASH.fullmatch(identity):
+            continue
+        row = ledger['deliveries'].get(identity)
+        if not row or row.get('nas_acceptance'):
+            continue
+        identity = row.get('retry_of', identity)
+        row = ledger['deliveries'][identity]
+        if row.get('nas_acceptance'):
+            continue
+        attempts = row.get('redeliveries', [])
+        if (len(attempts) >= policy['maximum_redelivery_attempts']
+                or any(ledger['deliveries'][key].get('nas_acceptance') for key in attempts)
+                or (attempts and attempts[-1] not in failed)
+                or time.time() - row.get('last_redelivery_epoch', 0) < policy['redelivery_cooldown_seconds']):
+            continue
+        root = safe(Path(c['transport_root']), 'lake-'+identity)
+        m = json.loads((root / 'manifest.json').read_bytes())
+        if (m['identity_sha256'] != identity or identity_sha256({k:v for k,v in m.items() if k!='identity_sha256'}) != identity
+                or (root/'READY').read_text() != identity+'\n' or m['context']['kind'] != 'immutable_source_objects'):
+            raise ValueError('requested retry differs from the enrolled sealed source')
+        files = [(m['context']['source_object_paths'][rel], item['sha256'], item['bytes'])
+                 for rel,item in m['files'].items()]
+        if (set(r[0]+'@'+r[1] for r in files) != set(row['file_keys'])
+                or sum(r[2] for r in files) != row['bytes']):
+            raise ValueError('requested retry membership differs from the source ledger')
+        if row['bytes'] > room:
+            continue
+        return files, {'delivery_identity_sha256': identity, 'attempt': len(attempts)+1,
+                       'request_identity_sha256': identity_sha256(value)}
+    return [], None
 
 
 def restore_lake_delivery(root: Path, scratch: Path, *, extensions: Path, pg_bin: Path, validate_restored=None) -> dict:

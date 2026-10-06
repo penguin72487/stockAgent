@@ -98,11 +98,8 @@ def capture(args, batches):
     inventory_path = STATE / "cache-capture-inventory.json"
     observation = observe(SimpleNamespace(output=inventory_path, ssh_target=args.ssh_target,
                                           ssh_port=args.ssh_port, identity_file=args.identity_file))
-    if (observation.get("training_only_role_verified") is not True
-            or observation["node_profile"]["machine_sha256"] != policy["node_machine_sha256"]
-            or observation["node_profile"]["limits"]["cpu_worker_budget"] < threads
-            or observation["node_profile"]["limits"]["memory_headroom_bytes"] < 2 * 1024**3):
-        raise SnapshotError("capture measurement/role/resource budget no longer matches the actual remote node")
+    if observation.get("training_only_role_verified") is not True:
+        raise SnapshotError("capture origin is no longer the verified training-only node")
     atomic_write_json(inventory_path, observation)
     selected, deferred = select(observation, policy, preserved_metadata(batches), now_ns=time.time_ns())
     status = {"state": "legacy_cache_capture_deferred" if deferred else "enrolled_legacy_caches_captured",
@@ -110,6 +107,13 @@ def capture(args, batches):
               "source_deleted": False, "new_cache_namespaces_selected": False}
     atomic_write_json(STATE / "cache-capture-status.json", status)
     if not selected:
+        return False
+    if (observation["node_profile"]["machine_sha256"] != policy["node_machine_sha256"]
+            or observation["node_profile"]["limits"]["cpu_worker_budget"] < threads
+            or observation["node_profile"]["limits"]["memory_headroom_bytes"] < 2 * 1024**3):
+        status.update(state="legacy_cache_capture_resource_remeasurement_pending",
+                      capture_started=False, source_deleted=False)
+        atomic_write_json(STATE / "cache-capture-status.json", status)
         return False
     command = [sys.executable, str(ROOT / "scripts/receive_vast_bulk_archives.py"), "--scope", "cache",
                "--cache-inventory", str(inventory_path), "--threads", str(threads), "--apply",

@@ -115,12 +115,17 @@ def validate_ack(value: dict, dispatch: dict) -> None:
         raise ValueError("NAS acceptance needs a plausible timezone-aware timestamp")
 
 
-def validate_readiness(value: dict, configuration: dict, *, now: datetime | None = None) -> None:
+def validate_readiness(value: dict, configuration: dict, *, now: datetime | None = None,
+                       admission_only: bool = False) -> None:
     valid_signature(value, READY, fields=READY_FIELDS)
     for field in ("producer_device_id", "receiver_device_id", "repository_id"):
         if value[field] != configuration[field]:
             raise ValueError("relay readiness has another paired identity/repository")
     for field in ("single_owner_verified", "nas_mount_guard_verified", "runtime_lock_verified"):
+        if admission_only and field == 'nas_mount_guard_verified':
+            if type(value[field]) is not bool:
+                raise ValueError('relay mount status must be an explicit boolean')
+            continue
         if value[field] is not True:
             raise ValueError("relay readiness has not verified its owner, mount and runtime")
     for field in ("automatic_pruning", "automatic_batch_deletion"):
@@ -135,7 +140,7 @@ def validate_readiness(value: dict, configuration: dict, *, now: datetime | None
     if observed.tzinfo is None:
         raise ValueError("relay readiness needs a timezone")
     age = ((now or datetime.now(timezone.utc)) - observed).total_seconds()
-    if age < -300 or age > configuration["readiness_max_age_seconds"]:
+    if age < -300 or (not admission_only and age > configuration["readiness_max_age_seconds"]):
         raise ValueError("relay readiness is stale or in the future")
 
 

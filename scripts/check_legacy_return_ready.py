@@ -6,9 +6,10 @@ import argparse
 import fcntl
 import json
 from pathlib import Path
+import time
 
 
-def readiness(state_root: Path) -> tuple[bool, str]:
+def readiness(state_root: Path, *, selection_path: Path | None = None) -> tuple[bool, str]:
     if not state_root.is_dir() or state_root.is_symlink():
         return False, "cohort_not_initialized"
     paths = {name: state_root / name for name in (
@@ -37,6 +38,13 @@ def readiness(state_root: Path) -> tuple[bool, str]:
         items = progress.get("items") if isinstance(progress, dict) else None
         if not isinstance(items, list):
             return False, "progress_items_invalid"
+        selected = None
+        if selection_path is not None:
+            from scripts.return_remote_legacy_archives import load_cohort_selection
+            try:
+                selected = load_cohort_selection(selection_path, state_root)
+            except Exception:
+                return False, "fixed_cohort_selection_invalid"
         for row in items:
             if not isinstance(row, dict) or not isinstance(row.get("state"), str):
                 return False, "progress_items_invalid"
@@ -50,16 +58,24 @@ def readiness(state_root: Path) -> tuple[bool, str]:
                 return False, "progress_items_invalid"
         retained = {"remote-source-retired", "source-protected", "non-directory-protected",
                     "empty-directory-protected"}
-        if any(row.get("files", 0) > 0 and row["state"] not in retained for row in items):
-            return True, "retained_cohort_has_retryable_items"
+        for row in items:
+            if selected is not None and row.get("relative_root") not in selected:
+                continue
+            if row.get("files", 0) > 0 and row["state"] not in retained:
+                return True, "retained_cohort_has_retryable_items"
+            if (row["state"] == "source-protected" and row.get("blockers") == ["source-not-twelve-hour-stable"]
+                    and type(row.get("newest_mtime_ns")) is int and row["newest_mtime_ns"] > 0
+                    and time.time_ns() - row["newest_mtime_ns"] >= 12 * 3_600_000_000_000):
+                return True, "selected_source_stability_floor_elapsed"
         return False, "no_retryable_items_in_retained_cohort"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("state_root", type=Path)
+    parser.add_argument("--selection", type=Path)
     args = parser.parse_args()
-    ready, reason = readiness(args.state_root)
+    ready, reason = readiness(args.state_root, selection_path=args.selection)
     print(json.dumps({"ready": ready, "reason": reason}))
     # ExecCondition skips on 1. A running cohort is not a successful backup.
     return 0 if ready else 1

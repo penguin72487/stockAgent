@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -118,6 +119,44 @@ def test_only_enrolled_backup_transport_maps_to_windows(monkeypatch):
     assert native.windows_path(Path('/srv/stockagent-backup-ingress-lab203/.staging/fixed/member')) == (
         'D:\\stockagent-backup-ingress-lab203\\.staging\\fixed\\member')
     assert native.windows_path(Path('/srv/unrelated-backup/member')) is None
+
+
+@pytest.mark.parametrize('damage',['none','overlay','write'])
+def test_enrolled_lake_allows_only_native_hash_on_its_actual_d_volume(monkeypatch,damage):
+    from stockagent.data_sync import cold_primary,packed_backup
+    path=Path('/srv/stockagent-d-volume/stockagent-immutable-lake/releases/fixed/data.parquet')
+    monkeypatch.setattr(Path,'resolve',lambda self:self)
+    monkeypatch.setattr(Path,'is_symlink',lambda self:False)
+    monkeypatch.setattr(Path,'stat',lambda self:SimpleNamespace(st_dev=9 if self==path and damage=='overlay' else 7))
+    monkeypatch.setattr(cold_primary,'_check_d_primary_mount',lambda root:None)
+    monkeypatch.setattr(packed_backup,'mounted_volume',lambda root:(None,None,'D:'))
+    assert native.windows_path(path)=='D:\\stockagent-immutable-lake\\releases\\fixed\\data.parquet'
+    if damage=='none':
+        assert native._configuration(path,mode='hash',expected_bytes=9*1024**2)['mode']=='hash'
+    else:
+        with pytest.raises(SnapshotError,match='read-only'):
+            native._configuration(path,mode='write' if damage=='write' else 'hash',expected_bytes=9*1024**2)
+
+
+@pytest.mark.parametrize('count',[1,2])
+def test_measured_mid_size_copy_uses_native_batch_or_single_tail_without_changing_bytes(tmp_path,monkeypatch,count):
+    from stockagent.data_sync import offhost_backup
+    data=b'x'*(9*1024**2);sha=hashlib.sha256(data).hexdigest();sources=[];members=[];calls=[]
+    for i in range(count):
+        p=tmp_path/('source'+str(i));p.write_bytes(data);sources.append(p)
+        members.append((p,tmp_path/'target'/str(i),sha,len(data)))
+    monkeypatch.setattr(native,'windows_path',lambda p: 'D:\\stockagent-cold-primary\\fixed' if p in sources
+                        else 'D:\\stockagent-backup-ingress-lab203\\.staging\\fixed')
+    def single(p,d,**options):
+        calls.append(('single',1));d.parent.mkdir(parents=True,exist_ok=True);d.write_bytes(p.read_bytes())
+    def batch(values):
+        calls.append(('batch',len(values)))
+        for p,d,s,n in values:d.parent.mkdir(parents=True,exist_ok=True);d.write_bytes(p.read_bytes())
+    monkeypatch.setattr(native,'copy_verified',single);monkeypatch.setattr(native,'copy_many',batch)
+    offhost_backup.copy_verified_many(members)
+    assert calls==[('single',1)] if count==1 else calls==[('batch',2)]
+    for p,d,s,n in members:
+        assert p.read_bytes()==d.read_bytes()==data and hashlib.sha256(d.read_bytes()).hexdigest()==sha
 
 
 @pytest.mark.parametrize('damage', ['changed_source', 'wrong_sha', 'copy_failure'])

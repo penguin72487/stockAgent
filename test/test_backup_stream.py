@@ -64,6 +64,30 @@ def readiness(queue, **changes):
     return value
 
 
+def test_independent_publication_keeps_sending_during_stale_or_unavailable_nas(stream):
+    queue = stream[0]
+    queue.config.update(publication_requires_receiver_ready=False, maximum_batch_files=1)
+    readiness(queue, observed_at_utc='2020-01-01T00:00:00+00:00', nas_mount_guard_verified=False,
+              ingress_free_bytes=0, nas_free_bytes=0)
+    first = queue.cycle()
+    second = queue.cycle()
+    assert first['pending_delivery_count'] == 1
+    assert second['pending_delivery_count'] == 2
+    assert not second['readiness_error']
+    assert all(not row.get('acceptance') for row in queue.load_ledger()['deliveries'].values())
+
+
+def test_independent_publication_still_refuses_another_receiver_and_full_source_storage(stream):
+    queue = stream[0]
+    queue.config['publication_requires_receiver_ready'] = False
+    readiness(queue, receiver_device_id='unknown-peer')
+    assert queue.cycle()['state'] == 'waiting_receiver_readiness'
+    readiness(queue)
+    queue.config['maximum_retained_transport_bytes'] = 1
+    assert queue.cycle()['state'] == 'backpressure'
+    assert not queue.load_ledger()['deliveries']
+
+
 def test_delegated_cold_replication_ingests_old_ack_without_new_payload(stream):
     queue = stream[0]
     readiness(queue)

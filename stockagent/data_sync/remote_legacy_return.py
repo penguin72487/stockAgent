@@ -15,6 +15,7 @@ import stat
 import time
 import uuid
 from dataclasses import asdict
+from collections import defaultdict
 
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
 from stockagent.data_sync.artifact_consumers import artifact_service_references
@@ -22,6 +23,7 @@ from stockagent.data_sync.desync_snapshots import SnapshotError, _safe_relative_
 from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec, _archive_directories, source_plan
 from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references
 from stockagent.data_sync.packed_snapshots import _load_inventory, _validate_inventory, resolve_packed_snapshot_id
+from stockagent.data_sync.training_return import shared_inode_references
 
 RECOVERY_HOLDS = Path("/var/lib/stockagent-legacy-return/recovery-holds.json")
 
@@ -150,6 +152,46 @@ def signature(info) -> list[int]:
             info.st_ctime_ns, info.st_mode, info.st_nlink]
 
 
+def verify_original_inode(path, row, expected_sha256, verified_inodes, *, hash_file=None):
+    key = tuple(row["signature"])
+    actual = verified_inodes.get(key)
+    if actual is None:
+        actual = (hash_file or sha256_file)(path)
+        verified_inodes[key] = actual
+    if actual != expected_sha256 or signature(path.lstat()) != row["signature"]:
+        raise SnapshotError("original bytes changed or differ from verified D decode")
+
+
+def unlink_preserved_file_names(root, rows):
+    """Unlink only caller-verified names and account for the last inode link."""
+    groups = defaultdict(list)
+    for row in rows:
+        if row["kind"] == "file":
+            groups[tuple(row["signature"][:2])].append(row)
+    reclaimed = 0
+    for members in groups.values():
+        first = root / members[0]["path"]
+        info = first.lstat()
+        if signature(info) != members[0]["signature"]:
+            raise SnapshotError("inode changed before unlink; remaining quarantine retained")
+        blocks = info.st_blocks * 512
+        with first.open("rb") as handle:
+            latest = signature(os.fstat(handle.fileno()))
+            for row in members:
+                path = root / row["path"]
+                if signature(path.lstat()) != latest:
+                    raise SnapshotError("inode mutated during retirement; remaining names retained")
+                path.unlink()
+                after = signature(os.fstat(handle.fileno()))
+                if after[:4] != latest[:4] or after[5] != latest[5] or after[6] != latest[6] - 1:
+                    raise SnapshotError("inode changed during unlink; remaining names retained")
+                latest = after
+            freed = latest[6] == 0
+        if freed:
+            reclaimed += blocks
+    return reclaimed
+
+
 def metadata_tree(source: Path) -> dict:
     """Read-only complete inventory, including shared blocks and empty dirs."""
     source = real(source)
@@ -224,12 +266,17 @@ def acknowledgement_age(verified_at_epoch: float, maximum_age_seconds: float) ->
 
 def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
     body = {k: v for k, v in ack.items() if k != "identity_sha256"}
-    if (ack.get("contract") != "d_verified_remote_legacy_return_v1"
+    version = ack.get("contract")
+    if (version not in {"d_verified_remote_legacy_return_v1", "d_verified_remote_legacy_return_v2"}
         or identity(body) != ack.get("identity_sha256") or ack.get("cold_verified") is not True
         or ack.get("origin_node_id") != "vastai1T" or ack.get("authority_node_id") != "penguin"
         or ack.get("dataset") != dataset_name(ack.get("relative_root", ""))):
         raise SnapshotError("invalid or stale exact D archive acknowledgement")
-    acknowledgement_age(ack.get("verified_at_epoch", 0), 300)
+    shared_policy = ack.get("shared_file_policy", "reject_unknown_names")
+    if (version == "d_verified_remote_legacy_return_v2" and shared_policy != "unlink_preserved_names_only"
+            or version == "d_verified_remote_legacy_return_v1" and "shared_file_policy" in ack):
+        raise SnapshotError("shared-name policy does not match the acknowledgement version")
+    acknowledgement_age(ack.get("verified_at_epoch", 0), 1800 if version.endswith("_v2") else 300)
     root = real(artifact_root)
     source = real(root / ack["relative_root"])
     archive = ack["archive_manifest"]
@@ -247,8 +294,12 @@ def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
     blockers = []
     if any(r["kind"] == "unsupported" or r["cross_filesystem"] for r in observed["rows"]):
         blockers.append("unsupported-or-cross-filesystem-entry")
-    if any(r["signature"][6] != 1 for r in file_rows):
+    if version.endswith("_v1") and any(r["signature"][6] != 1 for r in file_rows):
         blockers.append("shared-inode-requires-separate-audit")
+    inode_refs = shared_inode_references(observed)
+    if inode_refs:
+        blockers.append("shared-inode-in-use")
+    verified_inodes = {}
     for row in file_rows:
         path = source / row["path"]
         expected = expected_files[row["path"]]
@@ -256,9 +307,9 @@ def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
         if (signature(info) != row["signature"] or info.st_size != expected["source"]["size"]
             or info.st_mtime_ns != expected["source"]["mtime_ns"]
             or stat.S_IMODE(info.st_mode) != expected["source"]["mode"]
-            or sha256_file(path) != expected["original_sha256"]
             or signature(path.lstat()) != row["signature"]):
             raise SnapshotError("remote source bytes or metadata differ from the D archive")
+        verify_original_inode(path, row, expected["original_sha256"], verified_inodes)
     if metadata_tree(source) != observed:
         raise SnapshotError("remote source mutated during exact recovery comparison")
     scope = root / PurePosixPath(ack["relative_root"]).parts[0]
@@ -295,6 +346,7 @@ def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
     result = {"source": str(source), "relative_root": ack["relative_root"],
               "rows": observed["rows"], "ack_identity_sha256": ack["identity_sha256"],
               "reclaimable_allocated_file_bytes": observed["reclaimable_allocated_file_bytes"],
+              "shared_file_policy": shared_policy, "inode_references": inode_refs,
               "blockers": sorted(set(blockers)), "process_references": refs, "service_references": services,
               "convergence": convergence}
     result["fingerprint"] = identity({k: v for k, v in result.items() if k != "convergence"})
@@ -324,14 +376,17 @@ def retire(artifact_root: Path, repo_root: Path, state_root: Path, ack: dict, *,
         source.rename(quarantine)
         atomic_write_json(journal, {"state": "quarantined", "plan": plan, "ack": ack, "quarantine": str(quarantine)})
         current = metadata_tree(quarantine)
-        if current["rows"] != plan["rows"] or process_references(quarantine) or artifact_process_references(source, artifact_root):
+        if (current["rows"] != plan["rows"] or process_references(quarantine)
+                or artifact_process_references(source, artifact_root) or shared_inode_references(current)):
             raise SnapshotError("quarantined artifact changed or is active; quarantine retained")
         originals = {r["path"]: r["original_sha256"] for r in ack["archive_manifest"]["files"]}
+        verified_inodes = {}
         for row in current["rows"]:
             if row["kind"] == "file":
                 path = quarantine / row["path"]
-                if signature(path.lstat()) != row["signature"] or sha256_file(path) != originals[row["path"]]:
+                if signature(path.lstat()) != row["signature"]:
                     raise SnapshotError("quarantined original differs; retain for audit")
+                verify_original_inode(path, row, originals[row["path"]], verified_inodes)
         from scripts.configure_artifact_ingress_syncthing import credentials
         from scripts.manage_packed_edge import _convergence
         base, key = credentials()
@@ -340,21 +395,19 @@ def retire(artifact_root: Path, repo_root: Path, state_root: Path, ack: dict, *,
             or artifact_service_references([source, quarantine], repo_root).get(str(source))
             or artifact_service_references([source, quarantine], repo_root).get(str(quarantine))
             or active_configuration_references(source, repo_root)
-            or metadata_tree(quarantine)["rows"] != plan["rows"] or process_references(quarantine)):
+            or metadata_tree(quarantine)["rows"] != plan["rows"] or process_references(quarantine)
+            or shared_inode_references(current)):
             raise SnapshotError("post-quarantine recovery/consumer/transport gate failed; retained")
-        for row in current["rows"]:
-            if row["kind"] == "file":
-                path = quarantine / row["path"]
-                if signature(path.lstat()) != row["signature"]:
-                    raise SnapshotError("file mutated before unlink; retain quarantine")
-                path.unlink()
+        acknowledgement_age(ack.get("verified_at_epoch", 0), 1800 if ack["contract"].endswith("_v2") else 300)
+        reclaimed = unlink_preserved_file_names(quarantine, current["rows"])
         for row in sorted(current["rows"], key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
             if row["kind"] == "directory":
                 (quarantine / row["path"]).rmdir()
         quarantine.rmdir()
         result = {"state": "exact-d-backed-source-retired", "deleted": True,
-                  "reclaimed_allocated_bytes": plan["reclaimable_allocated_file_bytes"],
+                  "reclaimed_allocated_bytes": reclaimed,
                   "snapshot_id": ack["snapshot_id"], "manifest_sha256": ack["manifest_sha256"],
-                  "cold_deleted": False}
+                  "cold_deleted": False, "shared_file_policy": plan["shared_file_policy"],
+                  "external_shared_names_deleted": False}
         atomic_write_json(journal, {"state": "retired", "plan": plan, "ack": ack, "result": result})
         return result

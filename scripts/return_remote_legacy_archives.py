@@ -45,7 +45,8 @@ def private_control_prefix() -> str:
     canonical_archive = (ROOT / "stockagent/data_sync/legacy_artifact_archive.py").read_text()
     code = "import sys, types\n"
     for name, relative in (("stockagent.data_sync.node_roles", "stockagent/data_sync/node_roles.py"),
-                           ("stockagent.data_sync.artifact_consumers", "stockagent/data_sync/artifact_consumers.py")):
+                           ("stockagent.data_sync.artifact_consumers", "stockagent/data_sync/artifact_consumers.py"),
+                           ("stockagent.data_sync.training_return", "stockagent/data_sync/training_return.py")):
         code += f"m=types.ModuleType({name!r});m.__file__={'/root/stockAgent/' + relative!r};sys.modules[{name!r}]=m\n"
         code += f"exec({(ROOT / relative).read_text()!r},m.__dict__)\n"
     code += "archive_module = types.ModuleType('stockagent.data_sync.legacy_artifact_archive')\n"
@@ -162,8 +163,22 @@ def cohort_owner(state_root: Path, *, wait: bool = False):
 def archive_one(args, policy: dict, row: dict, spec: LegacyArchiveSpec) -> None:
     with phase(args, row, spec, "fresh-source-probe"):
         before = remote(args, {"action": "observe", "relative_root": row["relative_root"]})
-    if before["fingerprint"] != row["fingerprint"] or before["process_references"]:
+    if before["process_references"]:
         raise SnapshotError("remote source changed or is in use; inventory again")
+    if before["fingerprint"] != row["fingerprint"]:
+        # Other exact-root retirements can unlink an external hardlink name.
+        # The retained immutable archive may still preserve these same names
+        # and bytes. Keep the initial inventory untouched, record a fresh
+        # observation and require full D recovery plus full source SHA below.
+        if not (policy.get("schema_version") == 2 and row.get("cold_verified") is True
+                and row.get("private_scratch_removed") is True):
+            raise SnapshotError("remote source changed or is in use; inventory again")
+        inventory = json.loads(real(args.state_root / "inventory.json").read_text())
+        original = next((r for r in inventory["items"] if r["relative_root"] == row["relative_root"]), None)
+        if original is None or portable(original["rows"]) != portable(before["rows"]):
+            raise SnapshotError("returned source portable metadata changed; original retained")
+        row["current_source_fingerprint"] = before["fingerprint"]
+        row["source_reobservation_requires_exact_cold_and_source_sha"] = True
     _check_d_primary_mount(args.sync_root)
     if row.get("private_scratch_removed") is True:
         if ((args.state_root / "staging" / spec.dataset).exists()
@@ -239,6 +254,50 @@ def exact_recovery(result, proof, resolved):
         raise SnapshotError("cold head changed after independent recovery; source retained")
 
 
+def preservation_policy(policy):
+    required = {"schema_version", "authority_node_id", "origin_node_id", "scopes", "minimum_stable_hours",
+                "reserve_bytes", "maximum_item_bytes", "archive_only", "retire_verified_source"}
+    optional = {"transfer_compression", "archive_compression", "batch_directory_fsync"}
+    version = policy.get("schema_version")
+    if version == 2:
+        required.add("shared_file_policy")
+    if (not required.issubset(policy) or set(policy) - required - optional or type(version) is not int
+            or version not in {1, 2} or policy["authority_node_id"] != "penguin"
+            or policy["origin_node_id"] != "vastai1T" or policy["scopes"] != ["markets", "ablations"]
+            or type(policy["minimum_stable_hours"]) not in {int, float} or policy["minimum_stable_hours"] < 12
+            or any(type(policy[name]) is not int or policy[name] <= 0
+                   for name in ("reserve_bytes", "maximum_item_bytes"))
+            or policy["archive_only"] is not True or type(policy["retire_verified_source"]) is not bool
+            or version == 2 and policy["shared_file_policy"] != "unlink_preserved_names_only"):
+        raise SnapshotError("invalid scoped legacy return preservation policy")
+    return policy
+
+
+def recovery_ack_contract(policy):
+    """Keep the original reject-shared contract unless the cohort opts in."""
+    if policy.get("schema_version", 1) == 2:
+        return "d_verified_remote_legacy_return_v2", 1500
+    return "d_verified_remote_legacy_return_v1", 240
+
+
+def load_cohort_selection(path: Path, state_root: Path) -> set[str]:
+    value = json.loads(real(path).read_text())
+    inventory = real(state_root / "inventory.json")
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "inventory_sha256", "relative_roots"}
+            or value["schema_version"] != 1 or value["inventory_sha256"] != sha256_file(inventory)
+            or not isinstance(value["relative_roots"], list) or not 1 <= len(value["relative_roots"]) <= 2000
+            or any(not isinstance(root, str) for root in value["relative_roots"])
+            or len(set(value["relative_roots"])) != len(value["relative_roots"])):
+        raise SnapshotError("cohort selection is not bound to its fixed inventory")
+    roots = set(value["relative_roots"])
+    known = {row["relative_root"] for row in json.loads(inventory.read_text())["items"] if row.get("files", 0) > 0}
+    if not roots.issubset(known):
+        raise SnapshotError("cohort selection contains unreviewed roots")
+    for root in roots:
+        dataset_name(root)
+    return roots
+
+
 def commit_prepared_archive(args, policy, row, spec, before, scratch, source_root, intent, intent_path,
                             *, reused_result=None, reused_proof=None):
     if reused_result is None:
@@ -290,17 +349,20 @@ def commit_prepared_archive(args, policy, row, spec, before, scratch, source_roo
             exact_recovery(result, proof, resolved)
             # Do not mint a fresh acknowledgement timestamp from metadata.
             # Reconstruct outside the mutation owner again after expiry.
-            if 0 <= time.time() - proof["verified_at_epoch"] <= 1500:
+            ack_contract, recovery_budget = recovery_ack_contract(policy)
+            if 0 <= time.time() - proof["verified_at_epoch"] <= recovery_budget:
                 current = remote(args, {"action": "observe", "relative_root": row["relative_root"]})
                 if current != before or current["process_references"]:
                     raise SnapshotError("remote source changed while awaiting retirement; source retained")
                 if _convergence(base, key, "stockagent-packed", "vastai1T").get("ok") is not True:
                     raise SnapshotError("packed peer changed before retirement; source retained")
-                ack = {"contract": "d_verified_remote_legacy_return_v1", "authority_node_id": "penguin",
+                ack = {"contract": ack_contract, "authority_node_id": "penguin",
                        "origin_node_id": "vastai1T", "relative_root": row["relative_root"], "dataset": spec.dataset,
                        "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256,
                        "legacy_manifest_sha256": resolved.manifest["metadata"]["legacy_manifest_sha256"],
                        "cold_verified": True, "verified_at_epoch": proof["verified_at_epoch"], "archive_manifest": manifest}
+                if ack_contract.endswith("_v2"):
+                    ack["shared_file_policy"] = policy["shared_file_policy"]
                 ack["identity_sha256"] = identity(ack)
                 atomic_write_json(args.state_root / "acknowledgements" / (spec.dataset + ".json"), ack)
                 with phase(args, row, spec, "fresh-source-retirement"):
@@ -387,19 +449,14 @@ def main() -> int:
     p.add_argument("--reuse-progress", type=Path, help="import an exact completed cohort after fresh D recovery and origin absence checks")
     p.add_argument("--from-inventory", type=Path, help="retained full inventory for explicit oversized-root partitions")
     p.add_argument("--partition-root", action="append", default=[])
+    p.add_argument("--wait-for-owner", action="store_true", help="queue behind this exact retained cohort owner")
+    p.add_argument("--selection", type=Path, help="exact roots bound to the retained inventory SHA-256")
     p.add_argument("--apply", action="store_true")
     args = p.parse_args()
     os.umask(0o077)
     if socket.gethostname() != "penguin" or args.sync_root != Path("/srv/stockagent-packed"):
         raise SnapshotError("legacy return may run only on enrolled penguin D authority")
-    policy = json.loads(args.policy.read_text())
-    expected = {"schema_version", "authority_node_id", "origin_node_id", "scopes", "minimum_stable_hours", "reserve_bytes", "maximum_item_bytes", "archive_only", "retire_verified_source"}
-    if (not expected.issubset(policy) or set(policy) - expected - {"transfer_compression", "archive_compression", "batch_directory_fsync"}
-        or policy["schema_version"] != 1 or policy["authority_node_id"] != "penguin"
-        or policy["origin_node_id"] != "vastai1T" or policy["scopes"] != ["markets", "ablations"]
-        or policy["minimum_stable_hours"] < 12 or policy["archive_only"] is not True
-        or type(policy["retire_verified_source"]) is not bool):
-        raise SnapshotError("invalid scoped legacy return preservation policy")
+    policy = preservation_policy(json.loads(args.policy.read_text()))
     configured_compression = policy.get("transfer_compression", "none")
     if not isinstance(configured_compression, str) or configured_compression not in {"none", "zstd-1"}:
         raise SnapshotError("invalid legacy transfer compression profile")
@@ -412,7 +469,11 @@ def main() -> int:
     args.archive_compression = args.archive_compression or configured_archive
     args.batch_directory_fsync = configured_batch if args.batch_directory_fsync is None else args.batch_directory_fsync
     real(args.state_root).mkdir(mode=0o700, parents=True, exist_ok=True)
-    with cohort_owner(args.state_root):
+    if args.selection:
+        if args.command != "archive" or args.include_root:
+            raise SnapshotError("use one exact selection only for an existing archive cohort")
+        args.include_root = sorted(load_cohort_selection(args.selection, args.state_root))
+    with cohort_owner(args.state_root, wait=args.wait_for_owner):
         return run_cohort(args, policy)
 
 

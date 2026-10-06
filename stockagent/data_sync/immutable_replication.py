@@ -22,6 +22,7 @@ from stockagent.runtime_identity import identity_sha256
 CONTRACT = "immutable_lake_delivery_v1"
 ACK = "immutable_lake_archive_acceptance_v1"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
+NATIVE_HASH_MIN_BYTES = 8 * 1024**2  # Penguin NTFS full-hash comparison, 2026-10-06.
 
 
 def safe(root: Path, relative: str) -> Path:
@@ -39,7 +40,7 @@ def digest(path: Path) -> str:
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("immutable member is not a regular file")
-    if before.st_size >= 128 * 1024**2:
+    if NATIVE_HASH_MIN_BYTES <= before.st_size <= 8 * 1024**3:
         from stockagent.data_sync.windows_cold_io import hash_file, windows_path
         if windows_path(path) is not None:
             return hash_file(path)
@@ -63,7 +64,8 @@ def inventory(root: Path) -> dict:
             continue
         pending.append((path, relative))
     from stockagent.data_sync.windows_cold_io import hash_many, windows_path
-    native = [p for p, _ in pending if p.lstat().st_size >= 16 * 1024**2 and windows_path(p) is not None]
+    native = [p for p, _ in pending if NATIVE_HASH_MIN_BYTES <= p.lstat().st_size <= 8 * 1024**3
+              and windows_path(p) is not None]
     hashes = {}
     if len(native) > 1:
         for offset in range(0, len(native), 16):
@@ -86,7 +88,7 @@ def seal(root: Path, context: dict) -> dict:
     return value
 
 
-def verify(root: Path, *, require_ready: bool = True) -> dict:
+def _read_manifest(root: Path) -> dict:
     safe(root, "manifest.json")
     if (root / "manifest.json").stat().st_size > 16 * 1024**2:
         raise ValueError("lake manifest exceeds the bounded metadata size")
@@ -101,16 +103,26 @@ def verify(root: Path, *, require_ready: bool = True) -> dict:
         safe(root, relative)
         if not HASH.fullmatch(row["sha256"]) or type(row["bytes"]) is not int or row["bytes"] < 0:
             raise ValueError("invalid immutable member hash/size")
+    return value
+
+
+def read_manifest(root: Path, *, require_ready: bool = True) -> dict:
+    """Validate bounded metadata; payload SHA/set verification is in verify."""
+    value = _read_manifest(root)
+    if require_ready or (root / 'READY').exists():
+        if safe(root, "READY").read_text() != value["identity_sha256"] + "\n":
+            raise ValueError("READY differs from its exact manifest")
+    return value
+
+
+def verify(root: Path, *, require_ready: bool = True) -> dict:
+    value = _read_manifest(root)
     actual = inventory(root)
     expected = {**value["files"], "manifest.json": actual.get("manifest.json")}
-    if require_ready:
+    if require_ready or "READY" in actual:
         if safe(root, "READY").read_text() != value["identity_sha256"] + "\n":
             raise ValueError("READY differs from its exact manifest")
         expected["READY"] = actual.get("READY")
-    elif "READY" in actual:
-        if (root / "READY").read_text() != value["identity_sha256"] + "\n":
-            raise ValueError("existing READY differs")
-        expected["READY"] = actual["READY"]
     if actual != expected:
         raise ValueError("immutable delivery exact set or full SHA-256 differs")
     return value

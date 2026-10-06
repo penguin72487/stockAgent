@@ -103,6 +103,8 @@ deferred 原因與下一個 owner。分開說明可連線、傳輸收斂、檔�
 本 skill 是操作導航；維護中的程式、config 與 topic contract 建立當前實作。
 現行部署與完整 scope 見 `docs/ducklake_temporal_replication_2026-10-05.md`；
 固定清冊補傳與 NAS 去重進度修正見 `docs/nas_sync_catchup_2026-10-06.md`。
+傳送不等 NAS 驗收、個別失敗重傳與實際容量政策見
+`docs/nas_send_verify_parallel_2026-10-06.md`；不要把來源再次縮回四批 ACK 窗口。
 不用歷史「尚未採用」結論取代目前收據。
 它不固定硬體調校，也不宣稱全歷史、所有 cache 或實際 filesystem 格式遷移已完成。
 架構變更時先更新原契約／runbook，再同步修正此 skill 的入口、範例與 references。
