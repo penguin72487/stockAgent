@@ -8,7 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from stockagent.data_sync.bulk_archive import (
-    CONTRACT, ROLE, SYNC_ROOT, NATIVE_COLD, canonical_blobs, native_guard, restore_original_root,
+    PRESERVATION_CONTRACTS, ROLE, SYNC_ROOT, canonical_blobs, native_guard,
+    preservation_payload, restore_original_root,
 )
 from stockagent.data_sync.cold_primary import d_primary_read_alias
 from stockagent.data_sync.desync_snapshots import SnapshotError, sha256_file
@@ -27,7 +28,7 @@ def main():
     native_guard()
     resolved = resolve_packed_snapshot_id(SYNC_ROOT, args.dataset, args.release_id)
     metadata = resolved.manifest.get("metadata", {})
-    if metadata.get("preservation_contract") != CONTRACT or metadata.get("transport_role") != ROLE:
+    if metadata.get("preservation_contract") not in PRESERVATION_CONTRACTS or metadata.get("transport_role") != ROLE:
         raise SnapshotError("selected release is not compressed legacy preservation")
     files = canonical_blobs(SYNC_ROOT, resolved)
     aliases = {name: d_primary_read_alias(path) for name, path in files.items()}
@@ -40,7 +41,7 @@ def main():
                           "activate_model": False, "cold_deleted": False}), flush=True)
         return 0
     verify_packed_snapshot(SYNC_ROOT, resolved, d_primary_native_blob_reads=True)
-    result = restore_original_root(aliases["payload.tar.zst"], index, args.relative_root, args.destination)
+    result = restore_original_root(preservation_payload(aliases), index, args.relative_root, args.destination)
     print(json.dumps(result), flush=True)
     return 0
 

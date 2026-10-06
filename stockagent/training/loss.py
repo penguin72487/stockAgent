@@ -1880,6 +1880,12 @@ def risk_aware_loss(
         day_trade_carry_sessions=day_trade_carry_sessions,
         initial_day_trade_carry_state=initial_day_trade_carry_state,
         day_trade_carry_event_compression=day_trade_carry_event_compression,
+        # No objective below consumes the physical intraday NAV diagnostics.
+        # Keep their exact values/solvency checks, but avoid retaining and
+        # differentiating that 270-minute branch in the compiled FIFO kernel.
+        # The authoritative state, daily returns, close NAV, turnover and
+        # concentration remain differentiable; the simulator default is True.
+        day_trade_carry_require_minute_nav_grad=False,
         futures_portfolio_training_surrogate_only=(
             futures_portfolio_training_surrogate_only
         ),

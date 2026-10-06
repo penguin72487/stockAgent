@@ -8,11 +8,12 @@ SHA-256 so recovery can be independently checked without a giant tarball.
 from __future__ import annotations
 
 import gzip
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -52,6 +53,34 @@ COMPRESSION_PROFILES = {DEFAULT_COMPRESSION_PROFILE, ADAPTIVE_COMPRESSION_PROFIL
                         ZSTD_COMPRESSION_PROFILE, ZSTD3_COMPRESSION_PROFILE}
 CODEC_SUFFIXES = {"raw": "raw", "gzip": "gz", "zstd": "zst"}
 C_TEMP_STAGE_ROOT = Path("/var/lib/stockagent-legacy-archive-stage")
+MANUAL_WSL_CAPTURE_CONTRACT = "manual-wsl-artifact-preservation-v1"
+MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "maintenance", "operations"}
+MANUAL_OFFLINE_SIMULATION_CONTRACT = "manual-wsl-offline-simulation-preservation-v1"
+MANUAL_TRANSFER_QUARANTINE_CONTRACT = "manual-wsl-retired-transfer-preservation-v1"
+MANUAL_MINUTE_DERIVED_VIEW_CONTRACT = "manual-wsl-retired-minute-view-preservation-v1"
+RETIRED_MINUTE_DERIVED_VIEWS = frozenset({
+    "data_tw_minute/research_dataset_developing_v5",
+    "data_tw_minute/research_dataset_schema2_volume_bug_20260807",
+})
+OFFLINE_SIMULATION_PREFIXES = ("official-close-settlement-", "account-addition-",
+                               "recompute-all-", "tw-day-trade-independent-")
+
+
+def reviewed_offline_simulation_root(relative: str) -> bool:
+    path = _safe_relative_path(relative, "offline simulation root")
+    return (len(path.parts) == 2 and path.parts[0] == "live"
+            and any(path.parts[1].startswith(prefix) and len(path.parts[1]) > len(prefix)
+                    for prefix in OFFLINE_SIMULATION_PREFIXES))
+
+
+def reviewed_transfer_quarantine_root(relative: str) -> bool:
+    path = _safe_relative_path(relative, "retired transport root")
+    return (len(path.parts) == 2 and path.parts[0] == "stockagent-transfer-quarantine"
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}_ssh_transport", path.parts[1]) is not None)
+
+
+def reviewed_minute_derived_view_root(relative: str) -> bool:
+    return _safe_relative_path(relative, "retired minute derived view").as_posix() in RETIRED_MINUTE_DERIVED_VIEWS
 
 
 @dataclass(frozen=True)
@@ -63,6 +92,15 @@ class LegacyArchiveSpec:
     manual_capture_min_stable_hours: float | None = None
     durable_staging: bool = True
     compression_profile: str = DEFAULT_COMPRESSION_PROFILE
+    capture_contract: str | None = None
+
+
+def legacy_process_scope(spec: LegacyArchiveSpec | None, artifact_root: Path) -> Path:
+    if spec is not None and spec.capture_contract == MANUAL_MINUTE_DERIVED_VIEW_CONTRACT:
+        if not reviewed_minute_derived_view_root(spec.relative_root):
+            raise SnapshotError("minute view process scope requires its reviewed root")
+        return artifact_root / "data_tw_minute"
+    return artifact_root
 
 
 def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
@@ -76,7 +114,26 @@ def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
     for item in rows:
         dataset = validate_slug(item.get("dataset", ""), "legacy dataset")
         relative = _safe_relative_path(item.get("relative_root", ""), "legacy root")
-        if relative.parts[0] not in {"markets", "ablations"} or len(relative.parts) < 2:
+        capture_contract = item.get("capture_contract")
+        if capture_contract not in {None, MANUAL_WSL_CAPTURE_CONTRACT, MANUAL_OFFLINE_SIMULATION_CONTRACT,
+                                    MANUAL_TRANSFER_QUARANTINE_CONTRACT, MANUAL_MINUTE_DERIVED_VIEW_CONTRACT}:
+            raise SnapshotError("unknown manual artifact preservation contract")
+        allowed = {"markets", "ablations"}
+        if capture_contract == MANUAL_WSL_CAPTURE_CONTRACT:
+            allowed |= MANUAL_WSL_SCOPES
+        if capture_contract == MANUAL_OFFLINE_SIMULATION_CONTRACT:
+            if not reviewed_offline_simulation_root(relative.as_posix()):
+                raise SnapshotError("offline simulation capture excludes canonical live ledgers")
+            allowed = {"live"}
+        if capture_contract == MANUAL_TRANSFER_QUARANTINE_CONTRACT:
+            if not reviewed_transfer_quarantine_root(relative.as_posix()):
+                raise SnapshotError("retired transport capture requires one explicitly dated quarantine root")
+            allowed = {"stockagent-transfer-quarantine"}
+        if capture_contract == MANUAL_MINUTE_DERIVED_VIEW_CONTRACT:
+            if not reviewed_minute_derived_view_root(relative.as_posix()):
+                raise SnapshotError("retired minute view capture excludes current originals and other data roots")
+            allowed = {"data_tw_minute"}
+        if relative.parts[0] not in allowed or len(relative.parts) < 2:
             raise SnapshotError("legacy archives must be scoped under markets or ablations")
         days = item.get("minimum_stable_days")
         manual_hours = item.get("manual_capture_min_stable_hours")
@@ -99,10 +156,12 @@ def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
             or manual_hours < 12
         ):
             raise SnapshotError("manual capture requires an allowlisted stability floor of at least 12 hours")
+        if capture_contract is not None and manual_hours is None:
+            raise SnapshotError("manual artifact preservation requires an explicit stability floor")
         if dataset in result or any(x.relative_root == relative.as_posix() for x in result.values()):
             raise SnapshotError("duplicate legacy archive dataset/root")
         result[dataset] = LegacyArchiveSpec(dataset, relative.as_posix(), days, stage_root, manual_hours, durable_staging,
-                                          item["compression"])
+                                          item["compression"], capture_contract)
     return result
 
 
@@ -122,6 +181,17 @@ def source_plan(
 ) -> list[dict[str, Any]]:
     if type(manual_capture) is not bool:
         raise SnapshotError("manual capture must be an explicit boolean")
+    if spec.capture_contract is not None and not manual_capture:
+        raise SnapshotError("reviewed WSL artifacts require explicit manual capture; no automatic enrollment")
+    if (spec.capture_contract == MANUAL_OFFLINE_SIMULATION_CONTRACT
+            and not reviewed_offline_simulation_root(spec.relative_root)):
+        raise SnapshotError("offline simulation capture excludes canonical live ledgers")
+    if (spec.capture_contract == MANUAL_TRANSFER_QUARANTINE_CONTRACT
+            and not reviewed_transfer_quarantine_root(spec.relative_root)):
+        raise SnapshotError("retired transport capture excludes live producer and other /srv roots")
+    if (spec.capture_contract == MANUAL_MINUTE_DERIVED_VIEW_CONTRACT
+            and not reviewed_minute_derived_view_root(spec.relative_root)):
+        raise SnapshotError("retired minute view capture excludes current originals and other data roots")
     if manual_capture and (
         type(spec.manual_capture_min_stable_hours) not in (int, float)
         or not math.isfinite(spec.manual_capture_min_stable_hours)
@@ -187,6 +257,13 @@ def _native_read_options(sync_root: Path) -> dict[str, bool]:
         # Measured complete real-pack recovery: native sequential D read, one
         # anonymous SSD pack, CRC/member SHA and original decode remain intact.
         native["d_primary_native_pack_reads"] = True
+    return native
+
+
+def _native_publish_options(sync_root: Path) -> dict[str, bool]:
+    native = _native_blob_options(sync_root)
+    if native:
+        native["d_primary_native_blob_writes"] = True
     return native
 
 
@@ -284,11 +361,15 @@ def _encode_one(source_file: Path, target: Path, codec: str, *, durable: bool = 
     return digest.hexdigest()
 
 
-def _manual_capture_usage_gate(source: Path, artifact_root: Path) -> None:
+def _manual_capture_usage_gate(source: Path, artifact_root: Path, *, repo_root: Path | None = None,
+                               spec: LegacyArchiveSpec | None = None) -> None:
     from stockagent.data_sync.artifact_consumers import artifact_service_references
+    from stockagent.data_sync.remote_legacy_return import active_configuration_references
 
-    references = artifact_process_references(source, artifact_root)
-    services = artifact_service_references((source,), artifact_root.parent)[str(source)]
+    references = artifact_process_references(source, legacy_process_scope(spec, artifact_root))
+    repository = repo_root.resolve() if repo_root is not None else artifact_root.parent
+    services = artifact_service_references((source,), repository)[str(source)]
+    references.extend(active_configuration_references(source, repository))
     if references or services:
         raise SnapshotError(f"manual capture source is in use: {(references + services)[:3]}")
 
@@ -308,7 +389,8 @@ def _archive_directories(source: Path) -> list[dict[str, Any]]:
 
 
 def prepare_archive(
-    spec: LegacyArchiveSpec, artifact_root: Path, *, manual_capture: bool = False
+    spec: LegacyArchiveSpec, artifact_root: Path, *, manual_capture: bool = False,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     artifact_root = artifact_root.resolve()
     if spec.compression_profile not in COMPRESSION_PROFILES:
@@ -326,13 +408,13 @@ def prepare_archive(
         windows_c = Path("/mnt/c")
         if os.path.ismount(windows_c) and shutil.disk_usage(windows_c).free < planned_bytes + 32 * 1024**3:
             raise SnapshotError("Windows C backing volume lacks scratch budget plus 32 GiB reserve")
-    references = artifact_process_references(source, artifact_root)
+    references = artifact_process_references(source, legacy_process_scope(spec, artifact_root))
     if references:
         raise SnapshotError(f"legacy source has process references: {references[:3]}")
     planned = source_plan(source, spec, manual_capture=manual_capture)
     directories = _archive_directories(source)
     if manual_capture:
-        _manual_capture_usage_gate(source, artifact_root)
+        _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
     stage.mkdir(parents=True, exist_ok=True)
     plan_path = stage / "source_plan.json"
     if plan_path.exists():
@@ -427,7 +509,7 @@ def prepare_archive(
     if _archive_directories(source) != directories:
         raise SnapshotError("legacy directories changed during staging; stage retained for audit")
     if manual_capture:
-        _manual_capture_usage_gate(source, artifact_root)
+        _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
     manifest = {
         "schema_version": ARCHIVE_SCHEMA,
         "dataset": spec.dataset,
@@ -439,6 +521,8 @@ def prepare_archive(
     }
     if spec.compression_profile != DEFAULT_COMPRESSION_PROFILE:
         manifest["encoding_profile"] = spec.compression_profile
+    if spec.capture_contract is not None:
+        manifest["capture_contract"] = spec.capture_contract
     if manual_capture:
         manifest["source_stability"] = {
             "mode": "manual-exact-capture-v1",
@@ -452,6 +536,7 @@ def prepare_archive(
 def verify_archive_directory(
     archive: Path, source: Path | None = None, *, spec: LegacyArchiveSpec | None = None,
     manual_capture: bool = False, artifact_root: Path | None = None,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     manifest = json.loads((archive / "legacy_archive_manifest.json").read_text(encoding="utf-8"))
     if (
@@ -465,6 +550,7 @@ def verify_archive_directory(
     if spec is not None and (
         manifest.get("dataset") != spec.dataset
         or manifest.get("relative_root") != spec.relative_root
+        or manifest.get("capture_contract") != spec.capture_contract
     ):
         raise SnapshotError("legacy archive identity differs from allowlisted source")
     capture = manifest.get("source_stability")
@@ -499,7 +585,7 @@ def verify_archive_directory(
     if manual_capture and source is not None:
         if artifact_root is None:
             raise SnapshotError("manual capture verification requires the original artifact root")
-        _manual_capture_usage_gate(source, artifact_root.resolve())
+        _manual_capture_usage_gate(source, artifact_root.resolve(), repo_root=repo_root, spec=spec)
     rows = manifest.get("files")
     if not isinstance(rows, list) or not rows:
         raise SnapshotError("legacy archive has no file inventory")
@@ -563,7 +649,7 @@ def verify_archive_directory(
         if directories is not None and _archive_directories(source) != directories:
             raise SnapshotError("legacy directories changed during verification")
         if manual_capture:
-            _manual_capture_usage_gate(source, artifact_root.resolve())
+            _manual_capture_usage_gate(source, artifact_root.resolve(), repo_root=repo_root, spec=spec)
     return {"dataset": manifest["dataset"], "files": len(rows), "original_bytes": total, "manifest": manifest,
             "source_metadata_drift": source_metadata_drift}
 
@@ -573,45 +659,63 @@ def publish_archive(
     manual_capture: bool = False,
     defer_scan: bool = False,
     batch_directory_fsync: bool = False,
+    pack_buckets: int = 32,
+    publication_owner=None,
 ):
     if type(defer_scan) is not bool or type(batch_directory_fsync) is not bool:
         raise SnapshotError("defer_scan and batch_directory_fsync must be booleans")
+    if type(pack_buckets) is not int or not 1 <= pack_buckets <= 4096:
+        raise SnapshotError("legacy publication pack_buckets must be an integer between 1 and 4096")
+    if publication_owner is not None and not callable(publication_owner):
+        raise SnapshotError('legacy publication owner must be a context factory')
+    if spec.compression_profile not in COMPRESSION_PROFILES:
+        raise SnapshotError('unknown legacy compression profile')
+    if not spec.durable_staging and not manual_capture:
+        raise SnapshotError('rebuildable staging requires explicit manual capture; cold publication remains durable')
     if spec.stage_root == C_TEMP_STAGE_ROOT and sync_root.resolve() != Path("/srv/stockagent-packed"):
         raise SnapshotError("C scratch may publish only into the guarded D canonical cold store")
-    manifest = prepare_archive(spec, artifact_root, manual_capture=manual_capture)
     source, _stage, archive = _paths(spec, artifact_root.resolve())
+    if not (archive / 'legacy_archive_manifest.json').exists():
+        prepare_archive(spec, artifact_root, manual_capture=manual_capture, repo_root=repo_root)
+    # A complete stage keeps its original observation provenance. Re-verify
+    # every encoded/original byte and current source signature, rather than
+    # recreating source_plan after another verified hard link was removed.
     proof = verify_archive_directory(archive, source, spec=spec, manual_capture=manual_capture,
-                                     artifact_root=artifact_root)
+                                     artifact_root=artifact_root, repo_root=repo_root)
     baseline = source_plan(source, spec, manual_capture=manual_capture)
     def source_guard():
         if source_plan(source, spec, manual_capture=manual_capture) != baseline:
             raise SnapshotError("legacy source changed before cold commit")
         if manual_capture:
-            _manual_capture_usage_gate(source, artifact_root.resolve())
-    resolved = publish_packed_snapshot(
-        sync_root,
-        spec.dataset,
-        archive,
-        loose_file_threshold_bytes=8 * 1024 * 1024,
-        pack_buckets=32,
-        metadata={
-            "transport_role": "legacy-quarantine-archive",
-            "deployable": "false",
-            "completion_claim": "not_checked",
-            "source_relative_root": spec.relative_root,
-            "legacy_manifest_sha256": sha256_file(archive / "legacy_archive_manifest.json"),
-        },
-        repo_root=repo_root,
-        source_guard=source_guard,
-        **({"defer_scan": True} if defer_scan else {}),
-        **({"batch_directory_fsync": True} if batch_directory_fsync else {}),
-        **_native_blob_options(sync_root),
-    )
+            _manual_capture_usage_gate(source, artifact_root.resolve(), repo_root=repo_root, spec=spec)
+    # Full C/original validation and subsequent D recovery are independent
+    # reads. Acquire the caller's shared owner only for canonical publication;
+    # its source_guard still rejects changes made while waiting for the owner.
+    with (publication_owner() if publication_owner is not None else nullcontext()):
+        resolved = publish_packed_snapshot(
+            sync_root,
+            spec.dataset,
+            archive,
+            loose_file_threshold_bytes=8 * 1024 * 1024,
+            pack_buckets=pack_buckets,
+            metadata={
+                "transport_role": "legacy-quarantine-archive",
+                "deployable": "false",
+                "completion_claim": "not_checked",
+                "source_relative_root": spec.relative_root,
+                "legacy_manifest_sha256": sha256_file(archive / "legacy_archive_manifest.json"),
+            },
+            repo_root=repo_root,
+            source_guard=source_guard,
+            **({"defer_scan": True} if defer_scan else {}),
+            **({"batch_directory_fsync": True} if batch_directory_fsync else {}),
+            **_native_publish_options(sync_root),
+        )
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive, **_native_read_options(sync_root))
     # Publication may have been slow. Never declare the hot source preserved
     # if it changed after the archive verification but before the cold commit.
     verify_archive_directory(archive, source, spec=spec, manual_capture=manual_capture,
-                             artifact_root=artifact_root)
+                             artifact_root=artifact_root, repo_root=repo_root)
     return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256, "source_files": proof["files"], "source_bytes": proof["original_bytes"], "cold_bytes": resolved.manifest["archive"]["stored_bytes"]}
 
 
@@ -668,6 +772,20 @@ def verify_cold_archive(
     return proof
 
 
+def _stage_cold_generation(sync_root: Path, spec: LegacyArchiveSpec) -> dict[str, Any]:
+    resolved = resolve_latest_packed(sync_root, spec.dataset)
+    objects = []
+    for item in [resolved.manifest["archive"]["inventory"], *resolved.manifest["archive"]["objects"]]:
+        path = sync_root / item["relpath"]
+        observed = path.lstat()
+        if (path.resolve() != path or not stat.S_ISREG(observed.st_mode)
+                or observed.st_size != item["bytes"]):
+            raise SnapshotError("C stage cold object generation is unavailable")
+        objects.append({"relative": item["relpath"], "signature": _source_signature(observed)})
+    return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
+            "manifest_sha256": resolved.manifest_sha256, "objects": objects}
+
+
 def plan_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path
 ) -> dict[str, Any]:
@@ -693,13 +811,18 @@ def plan_archive_stage_prune(
         raise SnapshotError("C stage retirement state differs from the selected cold release")
     if str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized")):
         raise SnapshotError("C stage release is pinned")
+    generation = _stage_cold_generation(sync_root, spec)
+    identity_before = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
+                       "manifest_sha256": resolved.manifest_sha256}
+    stage_before = _stage_prune_fingerprint(stage, identity_before)
     archive = stage / "archive"
     proof = verify_archive_directory(archive, spec=spec)
     if sha256_file(archive / "legacy_archive_manifest.json") != resolved.manifest.get("metadata", {}).get("legacy_manifest_sha256"):
         raise SnapshotError("C stage manifest differs from the cold release")
     inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
-                           reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"])
+                           reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
+                           **_native_read_options(sync_root))
     rows = proof["manifest"]["files"]
     if json.loads((stage / "source_plan.json").read_text()) != [
         {"path": row["path"], "source": row["source"]} for row in rows
@@ -723,15 +846,35 @@ def plan_archive_stage_prune(
                 raise SnapshotError("C stage contains a non-regular file")
             signatures.append({"path": path.relative_to(stage).as_posix(), "source": _source_signature(path.lstat())})
     signatures.sort(key=lambda row: row["path"])
-    if {row["path"] for row in signatures} != expected:
+    observed_paths = {row["path"] for row in signatures}
+    duplicates = []
+    for extra in sorted(observed_paths-expected):
+        match = re.fullmatch(r"receipts/\.syncthing\.([0-9a-f]{64})\.json\.[0-9]+\.[0-9a-f]{32}\.tmp", extra)
+        canonical = "receipts/"+match[1]+".json" if match else None
+        path = stage/extra
+        if (canonical not in expected or path.stat().st_size > 65536
+                or path.stat().st_size != (stage/canonical).stat().st_size
+                or sha256_file(path) != sha256_file(stage/canonical)):
+            raise SnapshotError("C stage has unknown or missing files; preserve for audit")
+        # This is an exact duplicate of a control receipt already checked
+        # against the fixed original manifest, never an unclassified payload.
+        duplicates.append({"path":extra,"canonical_receipt":canonical,"sha256":sha256_file(path)})
+    if observed_paths != expected | {r["path"] for r in duplicates}:
         raise SnapshotError("C stage has unknown or missing files; preserve for audit")
     if process_references(stage):
         raise SnapshotError("C stage has live process references")
     identity = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
                 "manifest_sha256": resolved.manifest_sha256, "signatures": signatures}
+    fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    if stage_before != fingerprint or _stage_cold_generation(sync_root, spec) != generation:
+        raise SnapshotError("C stage or cold generation changed during full verification")
     return {"dataset": spec.dataset, "stage": str(stage), "snapshot_id": resolved.manifest["snapshot_id"],
             "manifest_sha256": resolved.manifest_sha256, "apply_ready": True,
-            "stage_fingerprint": hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+            "stage_fingerprint": fingerprint,
+            "verified_duplicate_control_files": duplicates,
+            "full_verification": {"contract": "owned-archive-stage-verification-v1",
+                "verified_at_epoch": time.time(), "cold_generation": generation,
+                "artifact_root": str(artifact_root.resolve()), "state_root": str(state_root.resolve())},
             "reclaimable_allocated_file_bytes": _reclaimable_file_bytes(stage), "cold_objects_deleted": 0}
 
 
@@ -753,21 +896,57 @@ def _stage_prune_fingerprint(stage: Path, plan: dict[str, Any]) -> str:
 
 def apply_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path,
-    expected_fingerprint: str,
+    expected_fingerprint: str, owned_verified_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with _exclusive_lock(state_root / "retirements" / f"{spec.dataset}.lock"):
         return _apply_archive_stage_prune(spec, sync_root, artifact_root=artifact_root,
-                                          state_root=state_root, expected_fingerprint=expected_fingerprint)
+            state_root=state_root, expected_fingerprint=expected_fingerprint,
+            owned_verified_plan=owned_verified_plan)
+
+
+def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint):
+    from stockagent.data_sync.cold_primary import _check_d_primary_mount
+    from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids
+    _check_d_primary_mount(sync_root)
+    proof = plan.get("full_verification", {})
+    if (spec.stage_root != C_TEMP_STAGE_ROOT or plan.get("dataset") != spec.dataset
+            or plan.get("stage") != str(spec.stage_root / spec.dataset)
+            or plan.get("stage_fingerprint") != expected_fingerprint or plan.get("apply_ready") is not True
+            or proof.get("contract") != "owned-archive-stage-verification-v1"
+            or not 0 <= time.time() - proof.get("verified_at_epoch", 0) <= 1500
+            or proof.get("artifact_root") != str(artifact_root.resolve())
+            or proof.get("state_root") != str(state_root.resolve())
+            or proof.get("cold_generation") != _stage_cold_generation(sync_root, spec)):
+        raise SnapshotError("owned C stage full verification expired or its generation changed")
+    state = json.loads((state_root / "retirements" / f"{spec.dataset}.json").read_text())
+    source = artifact_root.resolve() / spec.relative_root
+    if (state.get("state") != "cold-only" or state.get("dataset") != spec.dataset
+            or state.get("relative_root") != spec.relative_root
+            or state.get("snapshot_id") != plan["snapshot_id"]
+            or proof["cold_generation"]["manifest_sha256"] != plan["manifest_sha256"]
+            or proof["cold_generation"]["snapshot_id"] != plan["snapshot_id"]
+            or source.exists() or source.is_symlink()
+            or plan["snapshot_id"] in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized"))):
+        raise SnapshotError("owned C stage retirement, source or pin gate changed")
 
 
 def _apply_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path,
-    expected_fingerprint: str,
+    expected_fingerprint: str, owned_verified_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     from stockagent.data_sync.materialized_cache import process_references, _pinned_snapshot_ids
 
-    plan = plan_archive_stage_prune(spec, sync_root, artifact_root=artifact_root, state_root=state_root)
+    if owned_verified_plan is None:
+        plan = plan_archive_stage_prune(spec, sync_root, artifact_root=artifact_root, state_root=state_root)
+    else:
+        plan = owned_verified_plan
+        _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
+        stage = Path(plan["stage"])
+        if stage.is_symlink() or stage.resolve() != stage or not stage.is_dir():
+            raise SnapshotError("C stage is missing or redirected")
+        if _stage_prune_fingerprint(Path(plan["stage"]), plan) != expected_fingerprint:
+            raise SnapshotError("C stage changed after dry run")
     if plan["stage_fingerprint"] != expected_fingerprint:
         raise SnapshotError("C stage changed after dry run")
     stage = Path(plan["stage"])
@@ -780,9 +959,16 @@ def _apply_archive_stage_prune(
     verify_archive_directory(quarantine / "archive", spec=spec)
     _check_d_primary_mount(sync_root)
     resolved = resolve_latest_packed(sync_root, spec.dataset)
-    inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
-    verify_packed_snapshot(sync_root, resolved,
-                           reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"])
+    if owned_verified_plan is None:
+        inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
+        verify_packed_snapshot(sync_root, resolved,
+                               reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
+                               **_native_read_options(sync_root))
+    else:
+        # The same CLI owner just decoded every fixed D member outside this
+        # mutation. Retain the full post-rename C decode and fresh generation,
+        # source, state, pin, process and quarantine checks; never extend proof.
+        _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
     source = artifact_root.resolve() / spec.relative_root
     if (resolved.manifest_sha256 != plan["manifest_sha256"] or process_references(quarantine)
         or process_references(stage) or source.exists() or source.is_symlink()

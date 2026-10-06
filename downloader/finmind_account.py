@@ -112,12 +112,18 @@ def _probe_account(session: requests.Session, token: str) -> dict[str, object]:
 def rate_limiter(account: dict[str, object]) -> SharedRateLimiter:
     """One process-shared pacing key across Free and Sponsor workers.
 
-    Slight spacing above the nominal cadence protects against sliding-window
-    rounding.  402/429 still triggers the existing shared provider cooldown.
+    Provider usage admission reserves in-flight requests separately. Do not
+    subtract an arbitrary fixed spacing from a larger paid entitlement.
+    402/429 still triggers the existing shared provider cooldown.
     """
-    limit = account["official_requests_per_hour"]
-    assert type(limit) is int
-    return SharedRateLimiter(3600.0 / limit + 0.01, name="finmind-v4-data")
+    return SharedRateLimiter(pacing_interval(account), name="finmind-v4-data")
+
+
+def pacing_interval(account: dict) -> float:
+    limit = account.get('official_requests_per_hour')
+    if type(limit) is not int or not 0 < limit <= 100_000:
+        raise ValueError('verified hourly FinMind quota required')
+    return 3600.0 / limit
 
 
 def refresh_dispatch_account(account: dict, token: str, root: Path, now: datetime) -> dict:

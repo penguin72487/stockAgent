@@ -359,8 +359,10 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             'materialized_working_set_limit','catalog_contract_version',
             'unseeded_history_candidates','unseeded_forward_candidates','frontier_estimate_contract_version',
             'raw_unseeded_calendar_candidates','excluded_calendar_candidates','already_materialized_candidates',
-            'materialized_history_limit','materialized_forward_batch_limit')
+            'materialized_history_limit','materialized_forward_batch_limit','object_unseeded_candidates')
         } if isinstance(raw_frontier, Mapping) and raw_frontier else {}
+        if isinstance(raw_frontier, Mapping) and raw_frontier.get('query_shape') == 'whole_market_storage_object_day':
+            frontier['query_shape'] = 'whole_market_storage_object_day'
         unseeded = _nonnegative_int(frontier.get('unseeded_partition_candidates')) or 0
         if unseeded:
             pending = (pending or 0) + unseeded

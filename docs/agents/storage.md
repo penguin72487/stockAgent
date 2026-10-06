@@ -217,8 +217,21 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   the private ingress/receipt channel; live catalog/repository files never sync.
 - Restic continues code/config/SQL backup and retains original raw history.
   `cold_object_replication_enabled: false` delegates new cold payload waves to
-  Temporal; the original stream still consumes old ACKs and auxiliary/recovery
-  work. Overlapping coverage counters must not be added.
+  Temporal; `cold_metadata_replication_enabled: true` keeps exact packed
+  manifest/head bytes in the original stream, alongside old ACKs and
+  auxiliary/recovery work. A pinned frozen catalog can backfill heads that have
+  since advanced. Overlapping coverage counters must not be added: use the
+  exact relative-path/SHA union of authority-validated ledgers, separating
+  machine recovery proofs from user-relayed pilot reports.
+- Source replication admits disjoint waves under explicit pending-count,
+  pending-byte, single-object and capacity bounds. The selected private policy
+  comes from `configs/data_sync/lake_source_replication.json`; prioritize files
+  without confirmed NAS coverage. Pending waves are reserved, not republished.
+  Keep the original durable publication journal and owner; load new worker code
+  at an idle publication boundary and verify its fingerprint. Full file/set/SHA
+  and independent NAS recovery checks remain mandatory. The
+  [2026-10-06 catch-up report](../nas_sync_catchup_2026-10-06.md) records the frozen
+  inventory, source I/O measurements and current acceptance scope.
 - Source ACKs persist before cleanup. `stockagent-lake-transport-gc.timer`
   handles one exact accepted wave per invocation through the shared journal
   and per-delivery lock. Inventory, primary recovery, process, signatures and
@@ -453,6 +466,91 @@ catalog credentials or hard-code an interpreter path.
   artifact-consumer gate. Missing referenced configuration fails closed. Other
   collector/preparation dependencies still require a separate dependency and
   process audit; a clean Discord gate alone does not prove inactivity.
+- The user's 2026-10-06 WSL cleanup also authorizes explicit, individually
+  inventoried offline artifact children under `cache`, `replays`, `audits`,
+  `datasets`, `data_repair`, `maintenance` and `operations`. This one-shot scope
+  requires `capture_contract: manual-wsl-artifact-preservation-v1`, an explicit
+  manual capture with a 12-hour stability floor and manual immediate retirement;
+  it cannot enroll automatic publication or cache deletion. Use
+  `scripts/retire_local_offline_artifacts.py` through the authority namespace
+  wrapper, retaining every source/mirror/D recovery, process/configuration,
+  pin, transport and quarantine gate. Existing enrolled archives may be selected
+  by `--existing-dataset`; bind the catalog SHA in the inventory and reuse their
+  exact cold release only after full original recovery and source comparison.
+  Historical simulations require the separate
+  `manual-wsl-offline-simulation-preservation-v1` contract and one explicit
+  child with a reviewed `official-close-settlement-`, `account-addition-`,
+  `recompute-all-` or `tw-day-trade-independent-` prefix. Promoted service roots
+  still fail the shared consumer gate. All other `live` roots, `runtime`, canonical sources,
+  current acquisition state and referenced receipts remain protected. Implicit
+  live panel caches and the supervisor's dashboard index cache are service
+  consumers even when no YAML names them.
+  Minute-curve maintenance also consumes its canonical local minute defaults
+  under `artifacts/data_repair/tw_day_trade_minute_curve`. Protect these implicit
+  inputs and every `intraday_replay.source_files` path in the current simulation
+  `rebuild_receipt.json`, including configured state-directory overrides. Missing
+  pinned files remain protected recovery dependencies. Malformed source pins
+  deny retirement; a readable file is not proof its SHA still matches a pin.
+  A root restored for a current service is retained on a manual cleanup retry;
+  its historical retirement receipt is not current permission to remove it.
+  A retained hot mirror that differs from the authority source is a separate
+  historical version, not a deletable duplicate. The explicit `--hot-mirror`
+  inventory binds the fixed `/srv/stockagent-artifacts-hot` source, the actual
+  repository consumer configuration and a distinct dataset identity. Independently
+  recover that version before removing its names; never rewrite the authority
+  archive to make two different versions appear equal.
+  An explicitly dated retired `/srv/stockagent-transfer-quarantine/
+  YYYY-MM-DD_ssh_transport` root may use the separate manual
+  `manual-wsl-retired-transfer-preservation-v1` profile. `--transfer-quarantine`
+  binds `/srv`, a distinct dataset namespace and original relative paths;
+  current `/srv/stockagent-live`, packed data, undated or nested arbitrary roots
+  are excluded. Preserve/decode its exact originals before applying the same
+  consumer, stability, pin, convergence, quarantine and last-link gates.
+  The two reviewed legacy minute views `data_tw_minute/research_dataset_developing_v5`
+  and `research_dataset_schema2_volume_bug_20260807` have a separate explicit
+  `manual-wsl-retired-minute-view-preservation-v1` profile. `--minute-derived-view`
+  selects these fixed views; optional `--minute-view-name` selects one by its
+  fixed name without putting source paths in an invoker argv. Repository data
+  paths and config `Path` values participate in consumer checks. Physical
+  capture stays rooted at the repository, while ancestor process references
+  use the `data_tw_minute` domain; direct cwd/FD/mmap/config and data ancestor
+  holders remain protected. Current `research_dataset`, broker chunks and
+  other raw roots are excluded. Archived buggy views remain non-deployable
+  preservation evidence, with their original metadata and values intact.
+  Private Vast return scratch is distinct from remote source retirement:
+  `scripts/prune_verified_return_scratch.py` may remove a retained cohort's
+  exact local source/encoded copies after fresh independent D original recovery,
+  exact file/directory/control sets and unchanged private quarantine signatures,
+  under the original cohort and common mutation owners. Remote originals, D
+  objects, NAS snapshots and unregistered/interrupted partial evidence are not
+  deleted. A separately inventoried, complete failed verification workspace
+  may be explicitly bound to its fixed snapshot and manifest in the local
+  pruner. Require fresh independent D original recovery, canonical materialized
+  hashes and portable fingerprint, original decoding, exact READY/lock/file/
+  directory sets, no FD/mmap/shared names and unchanged quarantine signatures;
+  never discover or delete other failed workspaces by their name prefix.
+  A complete interrupted legacy quarantine may be resumed through the same
+  manual retirement owner, using its original plan/state/path and exact fixed
+  release. Repeat independent cold recovery and a full source/mirror audit;
+  require unchanged generations, absent original names, exact quarantine
+  contents and fresh post-audit consumer/pin/transport gates. Unknown, partial,
+  redirected or modified quarantine remains retained. A completed canonical
+  transaction persists its retirement receipt in its state before returning,
+  so a missing outer CLI receipt can be reconciled without repeating deletion.
+  A verified C encoding-stage plan may be passed directly to its apply within
+  the same owner. Its fixed D object generations, stage fingerprint, retired
+  state and 1500-second clock remain binding; full post-rename encoded SHA and
+  original decoding still run. This avoids repeating full D reads solely for
+  the immediate dry-run/apply handoff, without extending the proof timestamp.
+  Record a completed local scratch prune in the original cohort ledger without
+  changing its remote retirement state. The existing return worker resumes the
+  fixed D release with another full original recovery and the existing source,
+  transport and acknowledgement gates, rather than downloading removed scratch
+  again. Reappeared copies or changed release identities require an audit.
+  The explicit local pruner's `--wait-for-owner` may queue behind the original
+  cohort owner, without holding the shared mutation owner while waiting.
+  The return producer retains its default single-owner rejection. See the
+  [2026-10-06 WSL cleanup evidence](../wsl_storage_cleanup_2026-10-06.md).
 - An explicit user request to retire hot artifacts **without waiting seven
   days** authorizes a one-shot `--manual-immediate` age bypass in the canonical
   full-run/legacy retirement tools. Bind this mode into the dry-run fingerprint
@@ -520,6 +618,18 @@ catalog credentials or hard-code an interpreter path.
   checks; keep the production 8 KiB mount. Prefix resume requires exact
   compressed SHA before append. Retain failed fragments; never count transport
   as cold acceptance. See [bulk return](../vast_bulk_compressed_return_2026-10-04.md).
+- The 2026-10-06 bounded preservation v2 keeps received compressed frames and
+  publishes carriers larger than 2 GiB as ordered, independently SHA-verified
+  parts, each at most 2 GiB, plus the original-member index and exact part plan.
+  They use the existing packed blob format and fixed NAS relay; original frame
+  SHA, full canonical original decoding and retirement gates remain mandatory.
+  The versioned dataset/layout does not rewrite v1 releases. Install hardlinks
+  through the enrolled physical D alias and prove its parent is the canonical
+  parent; equal device numbers alone do not prove two bind mounts support links.
+  Preserve all received cohorts before remote cleanup, so private retirement
+  waits cannot strand later received source bytes. NAS file ACKs for parts and
+  independent original decoding remain distinct evidence. See the
+  [catch-up scope](../nas_sync_catchup_2026-10-06.md).
 - The 2026-10-05 bulk acknowledgement v2 may unlink only the exact fully
   preserved names, leaving every external hardlink intact. Bind
   `shared_file_policy: unlink_preserved_names_only` into the acknowledgement
@@ -535,6 +645,19 @@ catalog credentials or hard-code an interpreter path.
   exact release, D guard, current source/consumer/convergence and original proof
   expiry when reacquiring the retirement owner; never refresh a proof from stat
   alone. Worker upgrades remain limited to an unowned childless lock wait.
+- The explicit WSL cleanup may compute a complete source/mirror/D retirement
+  dry run outside that mutation owner, under its fixed cohort owner. Only the
+  same in-process manual apply may reuse that complete audit for at most
+  1,500 seconds. Bind every cold object and inventory signature, fixed release,
+  source/mirror/archive complete metadata fingerprint; reject any generation
+  change, refresh consumers/pins/lease/convergence and repeat original-source
+  hashing after quarantine. Expiration requires another full audit outside the
+  mutation owner. No CLI accepts a saved proof to bypass a fresh audit, and
+  automatic retention keeps its existing full verification path.
+- Native full-blob SHA batching retains before/after signatures and full digest
+  comparison. Bound each invocation by 16 objects, 8 GiB per object and 16 GiB
+  total, matching the adapter contract; larger blobs use full streaming SHA.
+  Batch size never authorizes partial hashing or inference of recovery.
 - A training-only role can exclude foreign penguin service templates only
   through a root-owned local enrollment, matching node identity, index-only
   edge state and current Supervisor/independent-process observation. It cannot
@@ -666,6 +789,12 @@ catalog credentials or hard-code an interpreter path.
   files that exactly match that release inventory; retain unknown, mismatched,
   young and shared-inode evidence. A missing cold object blocks cleanup. Keep
   the dry-run and apply receipts; never remove cold objects or clear a pin.
+  The user's 2026-10-06 immediate unused-cache cleanup authorizes the one-shot
+  `--manual-immediate` age bypass for an explicitly inventoried partial name.
+  Record the mode and effective age in both receipts, keep the automatic
+  seven-day default and every fetch lock, pin/process, cold-byte/decode and
+  exact unchanged-file gate. `--native-d-reads` is restricted to the enrolled
+  canonical D authority. Unknown partial prefixes and unmatched files remain.
 - Windows `%LOCALAPPDATA%\Temp` is not a disposable tree.  Never blanket-delete
   it from WSL or Windows.  Orphaned WSL swap recovery must use
   `scripts/cleanup_windows_wsl_temp_swap.ps1`: only a top-level GUID directory

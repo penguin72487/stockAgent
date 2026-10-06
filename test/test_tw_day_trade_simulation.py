@@ -482,6 +482,8 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, veri
             opening_signal_batch_mode_count=3,
             opening_signal_batch_expected_mode_count=3,
             opening_signal_batch_complete=True,
+            state_publication={"schema_version": 1, "state_revision": 1, "total_ms": 3.0,
+                               "projection_fingerprint_ms": 0.5, "files": []},
         )
 
     payload = build_dashboard_snapshot(
@@ -503,6 +505,7 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, veri
     assert opening["observed_mode_count"] == 1
     assert opening["expected_mode_count"] == 1
     assert opening["complete"] is True
+    assert opening["modes"][0]["state_publication"]["total_ms"] == 3.0
     assert opening["first_ready_ms"] == pytest.approx(1_000.0)
     assert opening["final_ready_ms"] == pytest.approx(1_000.0)
     latest_receipt = json.loads(

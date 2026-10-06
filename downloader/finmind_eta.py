@@ -17,7 +17,7 @@ from downloader.artifact_io import atomic_write_json
 
 TAIPEI = ZoneInfo('Asia/Taipei')
 SCOPE_LABEL = 'FinMind 已排程可執行工作（含次要校驗）'
-SNAPSHOT_CONTRACT_VERSION = 9  # Exhausted retries are unresolved data, not automatic request work.
+SNAPSHOT_CONTRACT_VERSION = 12  # Independent retry lanes and standalone stage cost evidence.
 
 
 def _number(value: Any) -> float | None:
@@ -83,9 +83,21 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
     observed_slow = _number(rates.get('wall_p10'))
     central_rate = min(cap, max(0.0, observed_middle - reserved)) if None not in (cap, observed_middle, reserved) else None
     slow_rate = min(central_rate, max(0.0, observed_slow - reserved)) if None not in (central_rate, observed_slow, reserved) else None
+    processing = telemetry.get('request_processing_rates')
+    if processing is not None:
+        # A signed whole-day file can take seconds/minutes per single quota
+        # grant. Old JSON call rates are not evidence of that transfer speed.
+        measured = processing.get('rates', {})
+        if measured.get('fastest') is not None and fastest_rate is not None:
+            fastest_rate = min(fastest_rate, measured['fastest'])
+        central_rate = (min(central_rate, measured['central'])
+                        if central_rate is not None and measured.get('central') is not None else None)
+        slow_rate = (min(slow_rate, measured['slowest'])
+                     if slow_rate is not None and measured.get('slowest') is not None else None)
     counts = {key: summary.get(key) for key in ('required_requests', 'validation_requests', 'unbatched_requests',
               'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
-              'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests')}
+              'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests',
+              'independent_retry_tasks', 'independent_retry_requests', 'independent_inflight_tasks')}
     counts['planned_requests'] = int(planned) if planned is not None else None
     blockers: list[dict[str, Any]] = []
     for field, reason in (
@@ -121,7 +133,8 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
             '當前追新欠帳只計入工作量一次；未來追新是模型負載，不把當下額度保留量再扣一次。',
             '全量容量尚未驗證；估時假設磁碟空間足夠，既有 25 GiB 剩餘空間守門不會被略過。',
         ],
-        'rate_evidence': {'official_requests_per_hour': official, 'paced_requests_per_hour': quota.get('paced_requests_per_hour'),
+        'rate_evidence': {'request_processing': processing,
+                          'official_requests_per_hour': official, 'paced_requests_per_hour': quota.get('paced_requests_per_hour'),
                           'reserved_requests_per_hour': reserved, 'observed_active_bins': rates.get('active_bin_count'),
                           'observed_idle_bins': rates.get('idle_bin_count'),
                           'dispatch_rate_p50': _number(rates.get('p50')), 'dispatch_rate_p10': observed_slow,

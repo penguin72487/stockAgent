@@ -81,11 +81,12 @@ def recovery_hold_references(source: Path, repo_root: Path) -> list[str]:
     return refs
 
 
-def active_configuration_references(source: Path, repo_root: Path) -> list[str]:
-    """Protect independent jobs even after they have closed their input fds."""
+def active_configuration_references_many(sources, repo_root: Path) -> dict[str, list[str]]:
+    """Resolve each active configuration once for a read-only selected cohort."""
     import yaml
-    from stockagent.data_sync.artifact_consumers import _strings
-    result = recovery_hold_references(source, repo_root)
+    from stockagent.data_sync.artifact_consumers import _strings, is_repository_data_path
+    sources = tuple(source.resolve() for source in sources)
+    result = {str(source): recovery_hold_references(source, repo_root) for source in sources}
     for process in Path("/proc").glob("[0-9]*"):
         try:
             argv = (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
@@ -108,15 +109,22 @@ def active_configuration_references(source: Path, repo_root: Path) -> list[str]:
                     documents.append(asdict(load_config(path)))
                 for document in documents:
                     for field, value in _strings(document):
-                        if not value.startswith("artifacts/") and not Path(value).is_absolute():
+                        if not is_repository_data_path(value):
                             continue
                         paths = [Path(value)] if Path(value).is_absolute() else [cwd / value, repo_root / value]
-                        if any(p.resolve() == source.resolve() or source.resolve() in p.resolve().parents
-                               or p.resolve() in source.resolve().parents for p in paths):
-                            result.append(f"pid={process.name}:active-config:{path}:{field}")
+                        resolved_paths = tuple(p.resolve() for p in paths)
+                        for source in sources:
+                            if any(p == source or source in p.parents or p in source.parents for p in resolved_paths):
+                                result[str(source)].append(f"pid={process.name}:active-config:{path}:{field}")
             except Exception as error:
-                result.append(f"pid={process.name}:active-config-unreadable:{type(error).__name__}")
-    return sorted(set(result))
+                for references in result.values():
+                    references.append(f"pid={process.name}:active-config-unreadable:{type(error).__name__}")
+    return {source: sorted(set(references)) for source, references in result.items()}
+
+
+def active_configuration_references(source: Path, repo_root: Path) -> list[str]:
+    """Protect independent jobs even after they have closed their input fds."""
+    return active_configuration_references_many((source,), repo_root)[str(source.resolve())]
 
 
 def identity(value: dict) -> str:

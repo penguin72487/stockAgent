@@ -179,7 +179,7 @@ def _assert_unlink_gates(plan: Mapping[str, Any], quarantine: Path, **options: A
 
     source = Path(plan["source"])
     artifact_root = Path(options["artifact_root"])
-    refs = artifact_process_references(source, artifact_root / "markets")
+    refs = artifact_process_references(source, artifact_root)
     for path in (Path(plan["hot_tree"]), quarantine):
         refs.extend(process_references(path))
     if refs:
@@ -187,6 +187,10 @@ def _assert_unlink_gates(plan: Mapping[str, Any], quarantine: Path, **options: A
     services = artifact_service_references((source,), options.get("repo_root", artifact_root.parent))
     if services[str(source)]:
         raise SnapshotError("retirement post-rename service reference; quarantine retained")
+    from stockagent.data_sync.remote_legacy_return import active_configuration_references
+
+    if active_configuration_references(source, options.get("repo_root", artifact_root.parent)):
+        raise SnapshotError("retirement post-rename active configuration reference; quarantine retained")
     if str(plan["snapshot_id"]) in _pinned_snapshot_ids(Path(options["materialized_root"])):
         raise SnapshotError("retirement post-rename release pinned; quarantine retained")
     if not options["bridge_inactive"] or _running_hot_bridge(Path(options["hot_root"])):

@@ -39,6 +39,10 @@ def digest(path: Path) -> str:
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("immutable member is not a regular file")
+    if before.st_size >= 128 * 1024**2:
+        from stockagent.data_sync.windows_cold_io import hash_file, windows_path
+        if windows_path(path) is not None:
+            return hash_file(path)
     with path.open("rb") as stream:
         value = hashlib.file_digest(stream, "sha256").hexdigest()
     after = path.lstat()
@@ -51,12 +55,21 @@ def digest(path: Path) -> str:
 def inventory(root: Path) -> dict:
     safe(root, "manifest.json")
     files = {}
+    pending = []
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         safe(root, relative)
         if path.is_dir():
             continue
-        files[relative] = {"sha256": digest(path), "bytes": path.stat().st_size}
+        pending.append((path, relative))
+    from stockagent.data_sync.windows_cold_io import hash_many, windows_path
+    native = [p for p, _ in pending if p.lstat().st_size >= 16 * 1024**2 and windows_path(p) is not None]
+    hashes = {}
+    if len(native) > 1:
+        for offset in range(0, len(native), 16):
+            hashes.update(hash_many(native[offset:offset + 16]))
+    for path, relative in pending:
+        files[relative] = {"sha256": hashes[path] if path in hashes else digest(path), "bytes": path.stat().st_size}
     return files
 
 

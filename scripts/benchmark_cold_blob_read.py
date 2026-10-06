@@ -39,6 +39,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument('--hash-batch-only', action='store_true',
+                        help='Compare full native SHA per process versus bounded batching; no copies')
     args = parser.parse_args()
     if args.output.exists() or not 1 <= args.rounds <= 5:
         parser.error("fresh receipt and 1-5 rounds required")
@@ -53,13 +55,33 @@ def main():
             info = path.stat()
             if 8 * 1024**2 <= info.st_size <= 32 * 1024**2:
                 samples.append({"path": path, "signature": signature(path), "sha256": path.stem})
-            if len(samples) == 3:
+            if len(samples) == (8 if args.hash_batch_only else 3):
                 break
-        if len(samples) == 3:
+        if len(samples) == (8 if args.hash_batch_only else 3):
             break
-    if len(samples) != 3:
-        raise SnapshotError("three bounded real cold objects were not found")
+    if len(samples) != (8 if args.hash_batch_only else 3):
+        raise SnapshotError("bounded real cold objects were not found")
     total = sum(row["signature"][2] for row in samples)
+    if args.hash_batch_only:
+        from stockagent.data_sync.windows_cold_io import hash_file, hash_many
+        rows=[]
+        for turn in range(args.rounds):
+            for profile in (('individual','batch') if turn%2==0 else ('batch','individual')):
+                if any(signature(s['path']) != s['signature'] for s in samples):
+                    raise SnapshotError('immutable measurement object changed')
+                started=time.monotonic()
+                hashes=(hash_many([s['path'] for s in samples]) if profile=='batch' else
+                        {s['path']:hash_file(s['path']) for s in samples})
+                if any(hashes[s['path']] != s['sha256'] or signature(s['path']) != s['signature'] for s in samples):
+                    raise SnapshotError('native measurement full SHA or signature differs')
+                row={'profile':profile,'round':turn+1,'bytes':total,'seconds':time.monotonic()-started,
+                     'every_full_sha256_verified':True}
+                rows.append(row);print(json.dumps(row),flush=True)
+        medians={p:statistics.median(r['seconds'] for r in rows if r['profile']==p) for p in ('individual','batch')}
+        atomic_write_json(args.output,{'scope':'bounded real cold blob full SHA; no reconstruction/NAS multiplier',
+            'samples':[{**r,'path':str(r['path'])} for r in samples],'runs':rows,'medians':medians,
+            'authoritative_cold_changed':False,'scratch_created':False,'os_cache_flushed':False})
+        return
     admit_workspace(Path("/var/lib"), 32 * 1024**3 + 2 * total)
     private = Path(tempfile.mkdtemp(prefix="stockagent-native-cold-read-", dir="/var/lib"))
     rows = []

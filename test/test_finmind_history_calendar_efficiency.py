@@ -39,7 +39,9 @@ def test_compact_cash_calendar_preserves_saturday_and_futures_timestamp_days(tmp
         stats = supplemental.seed(conn, {'stocks': ['2330', '2317'], 'futures': ['MTX']}, NOW,
                                   official_sessions=proof())
         assert conn.execute('SELECT COUNT(*) FROM tasks WHERE dataset=?', (CASH,)).fetchone()[0] == 14
-        assert conn.execute('SELECT COUNT(*) FROM tasks WHERE dataset=?', (FUTURES,)).fetchone()[0] == 9
+        # Physical tick dates are published on the next morning, so today's
+        # still-open date is not a ninth historical request candidate.
+        assert conn.execute('SELECT COUNT(*) FROM tasks WHERE dataset=?', (FUTURES,)).fetchone()[0] == 8
         assert conn.execute('SELECT COUNT(*) FROM tasks WHERE dataset=? AND partition=?',
                             (CASH, '2026-09-26')).fetchone()[0] == 2
         assert conn.execute('SELECT COUNT(*) FROM tasks WHERE dataset=? AND partition=?',

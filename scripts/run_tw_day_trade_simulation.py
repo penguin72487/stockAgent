@@ -2806,6 +2806,9 @@ def main(argv: list[str] | None = None) -> int:
                             opening_batch_expected_mode_count
                         ),
                         opening_signal_batch_complete=opening_batch_complete,
+                        state_publication=(
+                            engine.last_persist_metrics if result == "registered" else None
+                        ),
                     )
                 if result == "registered":
                     # register_signal already persisted this minute's complete

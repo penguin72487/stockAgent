@@ -324,6 +324,15 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
     additional complete source passes merely to establish the same copy proof.
     """
     before = signature(_regular(source)) if source is not None else None
+    if source is not None and expected_bytes >= 128 * 1024**2:
+        from stockagent.data_sync.windows_cold_io import windows_path, copy_verified
+        origin, target = windows_path(source), windows_path(destination)
+        if (origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
+                and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
+            copy_verified(source, destination, expected_sha256=expected_sha256, expected_bytes=expected_bytes)
+            if signature(source) != before:
+                raise SnapshotError('native incremental source changed during copy')
+            return
     stream = source.open("rb") if source is not None else io.BytesIO(payload)
     destination.parent.mkdir(parents=True, exist_ok=True)
     hashed = hashlib.sha256()
@@ -339,6 +348,26 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
     if (hashed.hexdigest() != expected_sha256 or count != expected_bytes or destination.stat().st_size != expected_bytes
             or (source is not None and signature(source) != before)):
         raise SnapshotError("incremental source bytes differ from the canonical selection")
+
+
+def copy_verified_many(members):
+    """Amortize native process startup without weakening per-member proofs."""
+    from stockagent.data_sync.windows_cold_io import windows_path, copy_many
+    native = []
+    for source, destination, sha, count in members:
+        origin, target = windows_path(source), windows_path(destination)
+        if (count >= 16 * 1024**2 and origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
+                and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
+            native.append((source, destination, sha, count))
+        else:
+            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
+    for offset in range(0, len(native), 16):
+        group = native[offset:offset + 16]
+        if len(group) == 1:
+            source, destination, sha, count = group[0]
+            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
+        else:
+            copy_many(group)
 
 
 def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: Path, *,

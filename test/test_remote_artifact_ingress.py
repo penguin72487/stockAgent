@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,22 @@ from scripts.ingest_remote_cold_artifacts import (
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.training.lifecycle import TrainingRunLifecycle
 from test_training_lifecycle import _write_minimal_completed_artifacts
+
+
+@pytest.fixture(autouse=True)
+def isolated_ingress_owners(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingress,'INGRESS_OWNER',tmp_path/'ingress-cycle.lock')
+    monkeypatch.setattr(ingress,'PUBLICATION_OWNER',tmp_path/'common-publication.lock')
+
+
+def shared_owner_held():
+    with ingress.PUBLICATION_OWNER.open('a') as probe:
+        try:
+            fcntl.flock(probe,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(probe,fcntl.LOCK_UN)
+        return False
 
 
 def _candidate(relative_root: str, *, references: tuple[str, ...] = ()) -> RemoteCandidate:
@@ -290,7 +307,13 @@ def test_deferred_release_content_is_fully_verified_before_any_remote_retirement
     }
     monkeypatch.setattr("scripts.manage_packed_edge._request_json", lambda base, key, route, *a: responses[route])
     acknowledgements = []
+    real_ack=ingress.make_ack
+    def independent_ack(*args,**kwargs):
+        assert not shared_owner_held()
+        return real_ack(*args,**kwargs)
+    monkeypatch.setattr(ingress,'make_ack',independent_ack)
     def record_retirement(args, ack, policy, *, apply):
+        assert shared_owner_held()
         acknowledgements.append(ack)
         return {"state": "unit-retirement-not-applied", "deleted": False}
     monkeypatch.setattr(ingress, "remote_retirement", record_retirement)
@@ -303,6 +326,79 @@ def test_deferred_release_content_is_fully_verified_before_any_remote_retirement
     assert len(acknowledgements) == 1
     assert acknowledgements[0]["cold_reconstruction_verified"] is True
     assert acknowledgements[0]["independently_reconstructed_files"] == 1
+
+
+def test_busy_ingress_cycle_cannot_overwrite_active_owner_status(tmp_path,monkeypatch):
+    status=tmp_path/'status.json';status.write_text('{"state":"original-owner-running"}')
+    monkeypatch.setattr('sys.argv',['ingress','--apply','--output',str(status)])
+    monkeypatch.setenv('COLD_ARTIFACT_INGRESS_LOCK_WAIT_SECONDS','1')
+    monkeypatch.setattr(ingress,'_run_cycle',lambda *a:pytest.fail('second writer entered the ingress cycle'))
+    with ingress.INGRESS_OWNER.open('a') as existing:
+        fcntl.flock(existing,fcntl.LOCK_EX)
+        assert ingress.main()==75
+    assert json.loads(status.read_text())=={'state':'original-owner-running'}
+
+
+def test_ingress_waiter_joins_blocking_kernel_queue_and_releases_owner(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    owner_path=tmp_path/'owner.lock';entered=threading.Event();release=threading.Event()
+    monkeypatch.setenv('COLD_ARTIFACT_INGRESS_LOCK_WAIT_SECONDS','3')
+    def waiter():
+        with ingress.ingress_owner(owner_path):
+            entered.set()
+            assert release.wait(timeout=3)
+    with owner_path.open('a') as held, ThreadPoolExecutor(max_workers=1) as pool:
+        fcntl.flock(held,fcntl.LOCK_EX)
+        waiting=pool.submit(waiter)
+        assert not entered.wait(timeout=0.1)
+        fcntl.flock(held,fcntl.LOCK_UN)
+        assert entered.wait(timeout=2)
+        with owner_path.open('a') as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        release.set();waiting.result(timeout=3)
+    with owner_path.open('a') as other:
+        fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+
+def test_independent_ingress_io_does_not_hold_the_shared_publication_owner(tmp_path,monkeypatch):
+    candidate=_candidate('markets/closed-cycle')
+    monkeypatch.setattr('sys.argv',['ingress','--apply','--ssh-target','root@peer',
+        '--identity-file',str(tmp_path/'key'),'--state-root',str(tmp_path/'state'),
+        '--sync-root',str(tmp_path/'cold'),'--scope','markets','--stable-hours','0',
+        '--include-root',candidate.relative_root])
+    events=[]
+    def discovered(**kwargs):
+        assert not shared_owner_held()
+        return [candidate]
+    monkeypatch.setattr(ingress,'discover_remote_artifacts',discovered)
+    monkeypatch.setattr(ingress,'_resolved_release',lambda *a,**k:None)
+    def transferred(candidate,**kwargs):
+        events.append(('transfer',shared_owner_held()))
+        source=kwargs['destination_artifact_root']/candidate.relative_root
+        source.mkdir(parents=True);(source/'result').write_bytes(b'private test source')
+    monkeypatch.setattr(ingress,'_rsync_candidate',transferred)
+    def validated(root,spec):
+        events.append(('source-audit',shared_owner_held()))
+        return {'files':candidate.files,'logical_bytes':candidate.logical_bytes,
+                'newest_mtime_ns':candidate.newest_mtime_ns,'source':str(root/spec.relative_root)}
+    monkeypatch.setattr(ingress,'validate_cold_artifact_source',validated)
+    def published(sync_root,root,spec,**kwargs):
+        events.append(('publish',shared_owner_held()))
+        return SimpleNamespace(manifest={'snapshot_id':'fixed-cycle','dataset':spec.dataset},manifest_sha256='a'*64)
+    monkeypatch.setattr(ingress,'publish_cold_artifact',published)
+    def verified(*args,**kwargs):
+        events.append(('cold-verify',shared_owner_held()))
+        return {'unit_workflow_verified':True}
+    monkeypatch.setattr(ingress,'verify_packed_snapshot',verified)
+    def returned(*args,**kwargs):
+        events.append(('return-verification',shared_owner_held()))
+        return {}
+    monkeypatch.setattr(ingress,'returned_source',returned)
+    assert ingress.main()==0
+    assert events==[('transfer',False),('source-audit',False),('publish',True),
+                    ('cold-verify',False),('return-verification',False)]
 
 
 @pytest.mark.parametrize("problem", ["system-error", "folder-error", "scanning", "unknown-needed-count", "disconnected"])
@@ -365,3 +461,41 @@ def test_transport_is_rechecked_after_slow_cold_recovery_before_source_cleanup(t
     result = ingress.returned_source(args, candidate, resolved, policy)
     assert recovered == [True] and result["cold_recovery_completed"] is True
     assert result["deleted"] is False and (args.state_root / "training-return-waiting-peer.json").is_file()
+
+
+@pytest.mark.parametrize('changed', ['release', 'cold-authority', 'transport'])
+def test_shared_retirement_owner_refreshes_release_authority_and_transport(tmp_path, monkeypatch, changed):
+    from scripts import configure_artifact_ingress_syncthing as syncthing
+    candidate = _candidate('markets/fresh-owner-gates')
+    resolved = SimpleNamespace(manifest_sha256='a'*64,
+        manifest={'dataset': ingress.automatic_dataset_name(candidate.relative_root), 'snapshot_id': 'fixed-release'})
+    args = SimpleNamespace(sync_root=tmp_path/'cold', state_root=tmp_path/'state', apply=True,
+                           origin_node_id='vastai1T')
+    policy = ingress.load_policy(Path('configs/data_sync/training_return.json'))
+    monkeypatch.setattr(syncthing, 'credentials', lambda: ('http://local', 'private-unit-key'))
+    resilience_calls = []
+    def resilience(*a):
+        resilience_calls.append(shared_owner_held())
+        return {'cold_primary_verified': not (changed == 'cold-authority' and shared_owner_held())}
+    monkeypatch.setattr('stockagent.data_sync.cold_primary.verify_cold_resilience', resilience)
+    peer_calls = []
+    def peer(*a):
+        peer_calls.append(shared_owner_held())
+        return {'ok': not (changed == 'transport' and shared_owner_held()), 'checks': {'fresh': True}}
+    monkeypatch.setattr('scripts.manage_packed_edge._convergence', peer)
+    def fixed(*a):
+        assert shared_owner_held()
+        return SimpleNamespace(manifest_sha256=('b'*64 if changed == 'release' else resolved.manifest_sha256))
+    monkeypatch.setattr(ingress, 'resolve_packed_snapshot_id', fixed)
+    monkeypatch.setattr(ingress, 'make_ack', lambda *a, **k: {'identity_sha256': 'a'*64})
+    monkeypatch.setattr(ingress, 'remote_retirement',
+                        lambda *a, **k: pytest.fail('changed gate authorized source retirement'))
+    result = ingress.returned_source(args, candidate, resolved, policy)
+    assert result['deleted'] is False
+    assert resilience_calls[0] is False and peer_calls[:2] == [False, False]
+    if changed == 'transport':
+        assert peer_calls[-1] is True and result['state'] == 'waiting-packed-peer-convergence'
+        assert (args.state_root/'training-return-waiting-peer.json').exists()
+    else:
+        assert result['state'] == 'remote-retirement-failed'
+    assert not shared_owner_held()

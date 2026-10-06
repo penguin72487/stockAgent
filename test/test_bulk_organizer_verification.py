@@ -193,6 +193,27 @@ def test_existing_coordinator_prevents_competing_retirement_journal(tmp_path, mo
         assert organizer.main() == 75
 
 
+def test_every_received_cohort_is_preserved_before_remote_retirement(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer, 'INCOMING', tmp_path)
+    batches = []
+    for number in range(2):
+        directory = tmp_path / f'20261006T00000{number}-abcdef012345'
+        directory.mkdir()
+        (directory / 'intent.json').write_text(json.dumps({
+            'authority_node_id': 'penguin', 'origin_node_id': 'vastai1T', 'scopes': ['cache']}))
+        (directory / 'cache.receipt.json').write_text(json.dumps({
+            'scope': 'cache', 'state': 'compressed_transport_received',
+            'completed_at_epoch': 1, 'compressed_sha256': 'a' * 64}))
+        batches.append(directory)
+    calls = []
+    def process(args, directory, receipt):
+        calls.append(('preserve' if getattr(args, '_preserve_only', False) else 'retire', directory))
+        return getattr(args, '_preserve_only', False)
+    monkeypatch.setattr(organizer, 'organize', process)
+    assert organizer.run_batches(SimpleNamespace(batch=batches, watch=False, apply=True, retire=True)) == 75
+    assert calls == [('preserve', p) for p in batches] + [('retire', p) for p in batches]
+
+
 def test_bulk_handoff_never_accepts_a_live_transaction_or_child():
     sample = {"observation_complete": True, "common_fd_present": True,
               "holds_common_lock": False, "children": [], "state": "S",

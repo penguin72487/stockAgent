@@ -11,7 +11,9 @@ sees only the atomically completed release.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import json
 import inspect
 import os
@@ -58,8 +60,33 @@ from stockagent.data_sync.training_return import admitted, admit_workspace, load
 
 INGRESS_SCHEMA_VERSION = 1
 AUTOMATION_CONTRACT = "cold-return-v3-full-convergence"
+INGRESS_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress-cycle.lock')
+PUBLICATION_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress.lock')
 _SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 _REMOTE_ABSOLUTE_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
+
+
+@contextmanager
+def ingress_owner(path: Path):
+    """Keep one ingress writer while sharing only actual mutation boundaries."""
+    wait = os.environ.get('COLD_ARTIFACT_INGRESS_LOCK_WAIT_SECONDS', '1800')
+    if not re.fullmatch(r'[1-9][0-9]*', wait) or int(wait) > 3600:
+        raise SnapshotError('ingress owner wait must be between 1 and 3600 seconds')
+    if path.is_symlink() or path.parent.resolve() != path.parent:
+        raise SnapshotError('ingress owner path is redirected')
+    with path.open('a') as owner:
+        # Use a bounded blocking waiter in the kernel's lock queue. Polling
+        # LOCK_NB can starve behind continuously queued publication workers.
+        result = subprocess.run(['flock', '--exclusive', '--wait', wait, str(owner.fileno())],
+            pass_fds=(owner.fileno(),), capture_output=True, timeout=int(wait)+5, check=False)
+        if result.returncode == 1:
+            raise BlockingIOError('existing ingress owner is busy; no source was changed')
+        if result.returncode != 0:
+            raise SnapshotError('ingress owner acquisition failed; no source was changed')
+        try:
+            yield
+        finally:
+            fcntl.flock(owner, fcntl.LOCK_UN)
 
 _REMOTE_DISCOVERY_PROGRAM = r"""
 from pathlib import Path, PurePosixPath
@@ -468,7 +495,23 @@ def returned_source(args, candidate, resolved, policy, *, retire_source: bool = 
         atomic_write_json(receipt, {"ack": ack, "state": "durable_return_verified"})
     if retire_source:
         try:
-            result = remote_retirement(args, ack, policy, apply=args.apply)
+            if args.apply:
+                with ingress_owner(PUBLICATION_OWNER):
+                    held = resolve_packed_snapshot_id(args.sync_root, wave['dataset'], wave['snapshot_id'])
+                    if held.manifest_sha256 != wave['manifest_sha256']:
+                        raise SnapshotError('fixed training cold release changed before source retirement')
+                    current_resilience = verify_cold_resilience(
+                        args.sync_root, held, REPO_ROOT / 'configs/data_sync/packed_backup.json')
+                    if not (current_resilience.get('cold_primary_verified')
+                            or current_resilience.get('backup_verified')):
+                        raise SnapshotError('returned cold authority changed before source retirement')
+                    convergence = _convergence(base, key, 'stockagent-packed', policy['origin_node_id'])
+                    if not convergence['ok']:
+                        return {'deleted': False, 'state': 'waiting-packed-peer-convergence',
+                                'transport_checks': convergence['checks'], 'cold_recovery_completed': True}
+                    result = remote_retirement(args, ack, policy, apply=True)
+            else:
+                result = remote_retirement(args, ack, policy, apply=False)
         except (OSError, SnapshotError, subprocess.SubprocessError) as error:
             result = {"state": "remote-retirement-failed", "deleted": False, "error_type": type(error).__name__}
     else:
@@ -548,9 +591,7 @@ def cycle_progress(args, phase: str, candidate=None) -> None:
         atomic_write_json(args.output, values)
 
 
-def main() -> int:
-    cycle_started = time.perf_counter()
-    args = build_parser().parse_args()
+def _run_cycle(args, cycle_started: float) -> int:
     try:
         if not args.ssh_target or args.identity_file is None:
             raise SnapshotError("--ssh-target and --identity-file are required")
@@ -729,20 +770,21 @@ def main() -> int:
                     f"{candidate.relative_root}"
                 )
             cycle_progress(args, "publishing-d-cold", candidate)
-            resolved = publish_cold_artifact(
-                args.sync_root,
-                staging_artifact_root,
-                spec,
-                node_id=args.node_id,
-                repo_root=REPO_ROOT,
-                defer_scan=policy is not None,
-                metadata={
-                    "ingress_origin_node_id": args.origin_node_id,
-                    "ingress_remote_newest_mtime_ns": candidate.newest_mtime_ns,
-                    "ingress_transport": "ssh-rsync",
-                    "ingress_transport_compression": args.transfer_compression,
-                },
-            )
+            with ingress_owner(PUBLICATION_OWNER):
+                resolved = publish_cold_artifact(
+                    args.sync_root,
+                    staging_artifact_root,
+                    spec,
+                    node_id=args.node_id,
+                    repo_root=REPO_ROOT,
+                    defer_scan=policy is not None,
+                    metadata={
+                        "ingress_origin_node_id": args.origin_node_id,
+                        "ingress_remote_newest_mtime_ns": candidate.newest_mtime_ns,
+                        "ingress_transport": "ssh-rsync",
+                        "ingress_transport_compression": args.transfer_compression,
+                    },
+                )
             proof = verify_packed_snapshot(
                 args.sync_root,
                 resolved,
@@ -819,6 +861,23 @@ def main() -> int:
             atomic_write_json(args.output, {"state": "cycle_failed", "error_type": type(exc).__name__,
                                            "observed_at_epoch": time.time(), "automation_contract": AUTOMATION_CONTRACT})
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+def main() -> int:
+    started = time.perf_counter()
+    args = build_parser().parse_args()
+    if not args.apply:
+        return _run_cycle(args, started)
+    try:
+        with ingress_owner(INGRESS_OWNER):
+            return _run_cycle(args, started)
+    except BlockingIOError as error:
+        # A waiting non-owner must not overwrite the active owner's status.
+        print(f'ERROR: {error}', file=sys.stderr)
+        return 75
+    except (OSError, SnapshotError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
         return 2
 
 

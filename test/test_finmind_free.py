@@ -138,19 +138,21 @@ def test_receipt_requires_real_parquet_and_prioritizes_recent(tmp_path: Path) ->
     assert counts["total"] == 6
     assert counts["complete"] == 1
     assert counts["deferred"] == 1
+    assert counts['series'][SESSION_DATASETS[1]]['retry_tasks'] == 1
     assert tasks[0][1] == days[-1]
     (tmp_path / done["parquet_path"]).unlink()
     _, counts = _candidate_days(days, tmp_path, now=now)
     assert counts["complete"] == 0
 
 
-def test_session_retry_times_are_projected_from_existing_receipts_without_new_calls(tmp_path):
+@pytest.mark.parametrize('receipt_state', ['failed', 'partial', 'observed_empty', 'provider_empty'])
+def test_session_retry_times_are_projected_from_existing_receipts_without_new_calls(tmp_path, receipt_state):
     now = datetime(2026, 9, 25, 7, 0, tzinfo=UTC)
     days = [date(2026, 9, 23), date(2026, 9, 24)]
     for day, wait in zip(days, (60, 900)):
         path = tmp_path / 'receipts' / SESSION_DATASETS[0] / f'{day}.json'
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({'status': 'partial',
+        path.write_text(json.dumps({'status': receipt_state,
             'retry_at_utc': (now + timedelta(seconds=wait)).isoformat()}))
     tasks, counts = _candidate_days(days, tmp_path, now=now)
     item = counts['series'][SESSION_DATASETS[0]]

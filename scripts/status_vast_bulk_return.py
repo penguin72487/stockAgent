@@ -54,6 +54,14 @@ def main():
                          'decoded_compressed_bytes':progress.get('compressed_read_bytes'),
                          'decode_compressed_total_bytes':progress.get('compressed_total_bytes'),
                          'cold_proof_present':proof.is_file(),
+                         'canonical_recovery_compressed_bytes':state.get('compressed_read_bytes')
+                             if state.get('state')=='independent_canonical_d_original_recovery' else None,
+                         'canonical_recovery_compressed_total_bytes':state.get('compressed_total_bytes')
+                             if state.get('state')=='independent_canonical_d_original_recovery' else None,
+                         'canonical_partition_compressed_bytes':state.get('compressed_partition_bytes')
+                             if state.get('state')=='publishing_canonical_compressed_cold' else None,
+                         'canonical_dataset':state.get('dataset'),
+                         'canonical_snapshot_id':state.get('snapshot_id'),
                          'source_roots_retired':sum(r.get('deleted') is True for r in state.get('roots',{}).values()),
                          'reclaimed_allocated_bytes':state.get('reclaimed_allocated_bytes',0),
                          'all_sources_retired':state.get('all_sources_retired',False)})

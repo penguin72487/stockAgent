@@ -235,6 +235,13 @@ CAS／inventory 都需固定具名版本，不能只拿目前 heads 或 latest�
 
 ## 覆蓋與尚未宣稱的範圍
 
+2026-10-06 已將來源進度改為 Restic／immutable archive 的相對路徑與 SHA 精確
+聯集，區分機器獨立還原和轉述 pilot 證據；raw 波次採有界平行在途與未覆蓋
+物件優先，原 Restic 接續保存 manifest/head metadata。固定清冊、Windows
+原生 I/O 實測及本輪全量驗收狀態見
+[補傳報告](nas_sync_catchup_2026-10-06.md)。這不會把下面的歷史驗收自動擴張為
+全歷史完成。
+
 2026-10-05T04:21:55Z 原 Restic source status：710,128,363,417／768,843,372,660
 bytes，無 pending batches，`all_history_backup_verified: false`。新 archive 是
 另一份獨立補齊，分母亦可能隨當前 canonical publication 成長；最終最新數值保存

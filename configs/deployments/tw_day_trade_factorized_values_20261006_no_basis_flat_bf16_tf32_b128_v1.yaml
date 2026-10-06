@@ -1,0 +1,20 @@
+base_config: /root/stockAgent/artifacts/markets/tw_day_trade_no_basis_batch_powers_20261006_v1/large_batch_optimization_v5/code/configs/deployments/tw_day_trade_factorized_values_20261006_no_basis_runtime_optimized_v1.yaml
+
+# Remote-only numeric/gradient segmentation experiment; no old optimizer donor.
+# Admission requires the complete dual-card fold receipt, not this YAML alone.
+# All 14,726 value channels and the exact physical market rules stay selected.
+environment:
+  amp_dtype: bf16
+  use_tensor_cores: true
+  cpu_threads: 8
+
+training:
+  batch_size_train: 128
+  factorized_encoder_checkpoint: true
+  epochs: 1000
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261006_no_basis_flat_bf16_tf32_b128_v1/training-bf16
+  require_cuda: true
+  resume: true
+  isolate_train_folds: false

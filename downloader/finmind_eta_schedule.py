@@ -6,15 +6,22 @@ import math
 from downloader.finmind_scheduling import TAIPEI
 
 
-def release_aware_finish(start, requests, rate, events, *, day_is_protected):
+def release_aware_finish(start, requests, rate, events, *, day_is_protected, event_counts=None,
+                         priority_rate=None):
     """Drain required work and released priority work through ONE service lane.
 
-    No capacity is charged before release. Releases arriving during the opening
+    Rates can differ: a JSON refresh is not a whole-market file download plus
+    local aggregation. Both consume the same account; work is charged using
+    its own bounded service rate, conservatively serialized rather than given
+    two full quota lanes. No capacity is charged before release. Releases arriving during the opening
     pause wait in the queue. Each later stage starts from its predecessor's
     completion, so a recurring request is never charged in two stages.
     """
     if rate <= 0 or not math.isfinite(rate) or requests < 0:
         raise ValueError('positive finite capacity and nonnegative work required')
+    priority_rate = rate if priority_rate is None else priority_rate
+    if priority_rate <= 0 or not math.isfinite(priority_rate):
+        raise ValueError('positive finite priority capacity required')
     cursor = start.astimezone(UTC)
     horizon = cursor + timedelta(days=3660)
     heap = []
@@ -70,8 +77,10 @@ def release_aware_finish(start, requests, rate, events, *, day_is_protected):
             stamp, index = heapq.heappop(heap)
             row = events[index]
             if not row['session_only'] or protected_day(stamp.astimezone(TAIPEI).date()):
-                remaining += row['requests']
+                remaining += row['requests'] * rate / priority_rate
                 refresh += row['requests']
+                if event_counts is not None:
+                    event_counts[index] = event_counts.get(index, 0) + row['requests']
             period = row['interval_seconds']
             if period:
                 heapq.heappush(heap, (publishing_boundary(stamp + timedelta(seconds=period), row), index))

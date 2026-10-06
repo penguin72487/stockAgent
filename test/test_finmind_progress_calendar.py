@@ -46,7 +46,8 @@ def test_tail_closure_is_compact_reversible_and_does_not_apply_to_night_data(tmp
         assert conn.execute('SELECT count(*) FROM tasks WHERE dataset=? AND partition=?',
                             (cash, '2026-10-03')).fetchone()[0] == 0
         assert conn.execute('SELECT count(*) FROM tasks WHERE dataset=? AND partition=?',
-                            (futures, '2026-10-03')).fetchone()[0] == 1
+                            (futures, '2026-10-03')).fetchone()[0] == 0  # Not published yet.
+        assert futures not in load_closures(conn).datasets
         assert supplemental.frontier_status(conn, NOW)[cash]['unseeded_partition_candidates'] == 0
         unknown = lambda day: SimpleNamespace(status='unknown', reason='unverified')
         supplemental.seed(conn, {'stocks': ['2330', '2317'], 'futures': ['TX']}, NOW,
@@ -54,6 +55,12 @@ def test_tail_closure_is_compact_reversible_and_does_not_apply_to_night_data(tmp
         assert load_closures(conn).days == ()
         assert conn.execute('SELECT count(*) FROM tasks WHERE dataset=? AND partition=? AND state=?',
                             (cash, '2026-10-03', 'pending')).fetchone()[0] == 2
+        supplemental.seed(conn, {'stocks': ['2330', '2317'], 'futures': ['TX']}, NOW + timedelta(hours=8),
+                          official_sessions=proof, day_decision=unknown)
+        # Once that physical date is eligible, the cash closure cannot prune
+        # Saturday's night-session ticks or claim there were no trades.
+        assert conn.execute('SELECT count(*) FROM tasks WHERE dataset=? AND partition=?',
+                            (futures, '2026-10-03')).fetchone()[0] == 1
 
 
 def test_old_recheck_cannot_steal_missing_partition_priority(tmp_path):

@@ -359,7 +359,7 @@ def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
     """Durable fixed wave, including recovery between copying/sealing/enrollment."""
     from downloader.artifact_io import atomic_write_text
     from stockagent.data_sync.immutable_replication import safe
-    from stockagent.data_sync.offhost_backup import copy_verified_bytes
+    from stockagent.data_sync.offhost_backup import copy_verified_many
     from stockagent.data_sync.packed_backup import object_descriptor
     journal_path = Path(c['state_root']) / 'source-wave-current.json'
     journal = json.loads(journal_path.read_bytes()) if journal_path.exists() else {}
@@ -398,6 +398,7 @@ def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
             safe(staging, path.relative_to(staging).as_posix())
             if not path.is_dir() and (not path.is_file() or path.relative_to(staging).as_posix() not in allowed):
                 raise ValueError('retain unknown interrupted source-wave member')
+        fresh = []
         for flat, spec in descriptors.items():
             source = safe(Path(c['cold_root']), source_paths[flat])
             destination = safe(staging, flat)
@@ -422,8 +423,12 @@ def _publish_source_wave(c, chosen, physical, ledger_path, ledger):
                         raise ValueError('interrupted copy still has a process owner')
                     partial.unlink()
             if not partial.exists():
-                copy_verified_bytes(source, partial, expected_sha256=spec['sha256'], expected_bytes=spec['bytes'])
-            partial.rename(destination)
+                fresh.append((source, partial, spec['sha256'], spec['bytes']))
+            else:
+                partial.rename(destination)
+        copy_verified_many(fresh)
+        for _, partial, _, _ in fresh:
+            partial.rename(partial.with_name(partial.name.removesuffix('.partial')))
         if (staging / 'manifest.json').exists():
             manifest = verify(staging, require_ready=False)
             if not (staging / 'READY').exists():
@@ -454,6 +459,9 @@ def stage_source_wave(c: dict) -> dict:
     paired NAS independent-restore receipts, not from transfer completion.
     """
     from stockagent.data_sync.immutable_replication import safe
+    from stockagent.data_sync.nas_coverage import read_ledger, restic_keys
+    from stockagent.data_sync.immutable_transport_cache import PHYSICAL_TRANSPORT_ROOT
+    policy = source_wave_policy(c)
     guard(c)
     state = Path(c["state_root"])
     ledger_path = state / "source-replication-ledger.json"
@@ -466,22 +474,31 @@ def stage_source_wave(c: dict) -> dict:
                                       'observed_at_utc': datetime.now(timezone.utc).isoformat()})
         acknowledged = set()
         pending = []
+        changed = False
         for delivery_id, row in ledger["deliveries"].items():
             proof = row.get("nas_acceptance") or acceptance(c, delivery_id)
             if proof["state"] == "nas_archive_file_recovery_verified":
-                row["nas_acceptance"] = proof
+                if row.get("nas_acceptance") != proof:
+                    row["nas_acceptance"] = proof
+                    changed = True
                 retired = state / ('cache-retirement-' + delivery_id + '.json')
                 if retired.exists():
                     value = json.loads(retired.read_bytes())
-                    row['transport_retirement'] = {k: value[k] for k in
+                    retirement = {k: value[k] for k in
                         ('state', 'reclaimed_bytes', 'primary_source_files_deleted', 'nas_archive_files_deleted')}
+                    if row.get('transport_retirement') != retirement:
+                        row['transport_retirement'] = retirement
+                        changed = True
                 # Archive coverage must survive a crash without waiting for
                 # HDD unlink/parent audits. The bounded GC owner consumes the
                 # same exact proof and canonical retirement implementation.
-                atomic_write_json(ledger_path, ledger, durable=True)
                 acknowledged.update(row["file_keys"])
             else:
                 pending.append(delivery_id)
+        # Persist new ACKs before admitting the next wave, but do not rewrite
+        # an ever-growing ledger once per already accepted historical wave.
+        if changed:
+            atomic_write_json(ledger_path, ledger, durable=True)
         con = connect(c, read_only=True)
         try:
             rows = con.execute("SELECT DISTINCT relative, sha256, bytes FROM lake.source_objects WHERE role IN ('packed_object','unreferenced_cold_object') ORDER BY bytes,relative,sha256").fetchall()
@@ -489,21 +506,38 @@ def stage_source_wave(c: dict) -> dict:
             con.close()
         total = sum(row[2] for row in rows)
         covered = sum(row[2] for row in rows if row[0] + "@" + row[1] in acknowledged)
+        pending_bytes = sum(ledger['deliveries'][key]['bytes'] for key in pending)
         result = {"state": "waiting_nas_archive_acceptance" if pending else "monitoring_increments",
                   "observed_at_utc": datetime.now(timezone.utc).isoformat(), "available_object_bytes": total,
                   "nas_archive_covered_bytes": covered, "available_object_count": len(rows),
                   "nas_archive_covered_objects": len(acknowledged), "pending_delivery_ids": pending,
+                  "pending_bytes": pending_bytes,
+                  "maximum_pending_deliveries": policy['maximum_pending_deliveries'],
+                  "maximum_wave_bytes": policy['maximum_wave_bytes'],
                   "source_deletion_enabled": False, "transport_deletion_enabled": c.get('transport_cache_retirement') is True,
                   "transport_cache_reclaimed_bytes": sum(r.get('transport_retirement',{}).get('reclaimed_bytes',0) for r in ledger['deliveries'].values()
                                                           if r.get('transport_retirement',{}).get('state') == 'retired')}
-        if not pending:
+        if len(pending) < policy['maximum_pending_deliveries']:
+            already_nas = set()
+            if policy['prioritize_uncovered_nas']:
+                already_nas = restic_keys(read_ledger(Path(policy['restic_state_root']) / 'ledger.json'))
+            published = {key for row in ledger['deliveries'].values() for key in row['file_keys']}
+            eligible = sorted(rows, key=lambda row: (row[0] + '@' + row[1] in already_nas, row[2], row[0], row[1]))
+            limit = min(policy['maximum_wave_bytes'], policy['maximum_pending_bytes'] - pending_bytes)
             chosen = []
             size = 0
-            for row in rows:
-                if row[0] + "@" + row[1] in acknowledged:
+            for row in eligible:
+                if row[0] + "@" + row[1] in published:
                     continue
-                if chosen and (len(chosen) >= 1024 or size + row[2] > 1024**3):
+                if len(chosen) >= policy['maximum_wave_files']:
                     break
+                if size + row[2] > limit:
+                    if (not chosen and row[2] <= policy['maximum_single_object_bytes']
+                            and row[2] <= policy['maximum_pending_bytes'] - pending_bytes):
+                        chosen.append(row)
+                        size += row[2]
+                        break
+                    continue
                 chosen.append(row)
                 size += row[2]
             journal_path = state / 'source-wave-current.json'
@@ -516,16 +550,38 @@ def stage_source_wave(c: dict) -> dict:
                 elif journal.get('delivery_identity_sha256') in ledger['deliveries']:
                     atomic_write_json(journal_path, {**journal, 'state': 'enrolled'}, durable=True)
             if chosen:
-                physical = Path("/srv/stockagent-d-volume/stockagent-backup-ingress-lab203")
+                physical = PHYSICAL_TRANSPORT_ROOT
                 transport_parent = Path(c["transport_root"]).parent
                 if not physical.samefile(transport_parent) or shutil.disk_usage(physical).free < size + 64 * 1024**3:
                     raise ValueError("bounded source replication lacks the enrolled D transport/capacity")
                 delivery_id, destination = _publish_source_wave(c, chosen, physical, ledger_path, ledger)
-                result.update(state="waiting_nas_archive_acceptance", pending_delivery_ids=[delivery_id])
+                pending.append(delivery_id)
+                result.update(state="waiting_nas_archive_acceptance", pending_delivery_ids=pending,
+                              pending_bytes=pending_bytes + size)
                 notify_transport(c, ["lakehouse/" + destination.name])
-        atomic_write_json(ledger_path, ledger)
         atomic_write_json(state / "source-replication-status.json", result)
         return result
+
+
+def source_wave_policy(c: dict) -> dict:
+    policy = {'maximum_pending_deliveries': 1, 'maximum_wave_bytes': 1024**3,
+              'maximum_single_object_bytes': 8 * 1024**3,
+              'maximum_pending_bytes': 8 * 1024**3, 'maximum_wave_files': 1024,
+              'prioritize_uncovered_nas': False, 'restic_state_root': '/var/lib/stockagent/backup-stream'}
+    configured = c.get('source_replication', {})
+    if not isinstance(configured, dict) or set(configured) - set(policy):
+        raise ValueError('unknown bounded source replication policy')
+    policy.update(configured)
+    bounds = {'maximum_pending_deliveries': (1, 8), 'maximum_wave_bytes': (1024**2, 8 * 1024**3),
+              'maximum_single_object_bytes': (1024**2, 8 * 1024**3),
+              'maximum_pending_bytes': (1024**2, 64 * 1024**3), 'maximum_wave_files': (1, 4096)}
+    if any(type(policy[k]) is not int or not lower <= policy[k] <= upper for k, (lower, upper) in bounds.items()):
+        raise ValueError('source replication exceeds its bounded resource policy')
+    if (type(policy['prioritize_uncovered_nas']) is not bool
+            or not Path(policy['restic_state_root']).is_absolute()
+            or policy['maximum_wave_bytes'] > policy['maximum_pending_bytes']):
+        raise ValueError('invalid source replication priority or pending budget')
+    return policy
 
 
 def restore_lake_delivery(root: Path, scratch: Path, *, extensions: Path, pg_bin: Path, validate_restored=None) -> dict:

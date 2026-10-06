@@ -5,6 +5,12 @@ if [[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]; then
   exec nsenter --mount=/proc/1/ns/mnt -- bash "$stockagent_lakehouse_script" "$@"
 fi
 cd "$(dirname "$(dirname "$stockagent_lakehouse_script")")"
+if [[ -S /run/WSL/1_interop && ! -S "${WSL_INTEROP:-/missing}" ]]; then
+  export WSL_INTEROP=/run/WSL/1_interop
+fi
+if ! command -v powershell.exe >/dev/null 2>&1 && [[ -f /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]]; then
+  export PATH="$PATH:/mnt/c/Windows/System32/WindowsPowerShell/v1.0"
+fi
 source scripts/runtime_env.sh
 stockagent_lakehouse_prefix="$(run_fintech_python - <<'PY'
 import json,os

@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -25,7 +26,7 @@ from scripts.manage_packed_edge import _convergence
 from stockagent.data_sync.bulk_archive import (
     CONTRACT, INCOMING, SYNC_ROOT, canonical_blobs, digest, index_zstd,
     ingress_owner, native_guard, load_policy, publish_preservation, verify_preservation, root_records, signature,
-    atomic_write_json,
+    atomic_write_json, verify_retained_preservation,
 )
 from stockagent.data_sync.desync_snapshots import SnapshotError, sha256_file
 from stockagent.data_sync.windows_cold_io import metadata_path
@@ -78,15 +79,7 @@ def private_remote(args, ack, *, apply):
 
 
 def verify_retained_proof(proof):
-    native_guard()
-    resolved = resolve_packed_snapshot_id(SYNC_ROOT, proof["dataset"], proof["snapshot_id"])
-    if resolved.manifest_sha256 != proof["manifest_sha256"]:
-        raise SnapshotError("current canonical cold manifest changed")
-    files = canonical_blobs(SYNC_ROOT, resolved)
-    if (signature(files["payload.tar.zst"]) != proof["cold_blob_signature"]
-        or signature(files["member_inventory.json"]) != proof["cold_index_signature"]):
-        raise SnapshotError("cold object changed after independent decode; full verification required")
-    return files
+    return verify_retained_preservation(proof)
 
 
 def retire_roots(args, directory, receipt, index, proof, state):
@@ -108,7 +101,9 @@ def retire_roots(args, directory, receipt, index, proof, state):
         if time.time() - proof["verified_at_epoch"] > 1500:
             files = verify_retained_proof(proof)
             from stockagent.data_sync.cold_primary import d_primary_read_alias
-            fresh = index_zstd(d_primary_read_alias(files["payload.tar.zst"]), expected_sha256=proof["compressed_sha256"],
+            from stockagent.data_sync.bulk_archive import preservation_payload
+            aliases = {name: d_primary_read_alias(path) for name, path in files.items()}
+            fresh = index_zstd(preservation_payload(aliases), expected_sha256=proof["compressed_sha256"],
                                scopes={receipt["scope"]})
             if fresh["rows"] != index["rows"]:
                 raise SnapshotError("refreshed D originals differ")
@@ -229,6 +224,8 @@ def organize(args, directory, receipt):
                      manifest_sha256=proof["manifest_sha256"])
         atomic_write_json(status_path, state)
         print(json.dumps({"scope": scope, "state": state["state"], "dataset": proof["dataset"]}), flush=True)
+        if getattr(args, "_preserve_only", False):
+            return True
         return retire_roots(args, directory, receipt, index, proof, state)
     except BlockingIOError:
         state.update(state="originals_verified_waiting_existing_ingress_owner", observed_at_epoch=time.time())
@@ -240,6 +237,11 @@ def run_batches(args):
     while True:
         batches = args.batch or received_batches()
         pending, failed = False, False
+        # Received bytes must all become recoverable before slow/private
+        # remote cleanup is considered. Keep the same coordinator and journal.
+        preserve_first = getattr(args, "apply", False) and getattr(args, "retire", False)
+        preservation_args = SimpleNamespace(**vars(args), _preserve_only=True) if preserve_first else args
+        retirement_queue = []
         for directory in batches:
             directory = metadata_path(directory)
             if (directory.resolve() != directory or directory.parent != metadata_path(INCOMING)
@@ -270,13 +272,24 @@ def run_batches(args):
                 if receipt.get("scope") != scope:
                     raise SnapshotError("received scope differs from its sealed batch")
                 try:
-                    pending = not organize(args, directory, receipt) or pending
+                    ready = organize(preservation_args, directory, receipt)
+                    pending = not ready or pending
+                    if preserve_first and ready:
+                        retirement_queue.append((directory, receipt))
                 except (SnapshotError, subprocess.TimeoutExpired) as error:
                     atomic_write_json(directory / (scope + ".organization-error.json"),
                                       {"state": "source_preserved_organization_failed", "error": str(error),
                                        "observed_at_epoch": time.time()})
                     print(json.dumps({"scope": scope, "state": "organization_failed_source_preserved", "error": str(error)}), flush=True)
                     failed = True
+        for directory, receipt in retirement_queue:
+            try:
+                pending = not organize(args, directory, receipt) or pending
+            except (SnapshotError, subprocess.TimeoutExpired) as error:
+                atomic_write_json(directory / (receipt["scope"] + ".organization-error.json"),
+                                  {"state": "source_preserved_organization_failed", "error": str(error),
+                                   "observed_at_epoch": time.time()})
+                failed = True
         if not args.watch:
             # A deferred owner/consumer is not a completed return.
             return 2 if failed else 75 if pending else 0

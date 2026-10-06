@@ -162,10 +162,17 @@ $drive=[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($base))
 @{free_bytes=[int64]$drive.AvailableFreeSpace;distribution=$distribution} | ConvertTo-Json -Compress
 }""" + " '" + distro + "'"
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
-    result = subprocess.run([configuration["powershell"], "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                             encoded], capture_output=True, timeout=30)
-    if result.returncode:
-        raise ValueError("actual Windows backing-drive capacity is unavailable")
+    from stockagent.data_sync.windows_cold_io import retryable_interop_startup
+    for attempt in range(3):
+        result = subprocess.run([configuration["powershell"], "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                                 encoded], capture_output=True, timeout=30)
+        if not result.returncode:
+            break
+        if attempt < 2 and not result.stdout and retryable_interop_startup(result.stderr):
+            time.sleep((0.2, 1.0)[attempt])
+            continue
+        category = "interop-startup-timeout" if retryable_interop_startup(result.stderr) else "native-query-rejected"
+        raise ValueError("actual Windows backing-drive capacity is unavailable: " + category)
     # JSON is UTF-8/ASCII; localized PowerShell stderr may use another Windows
     # code page. Do not decode irrelevant stderr before inspecting exit status.
     value = json.loads(result.stdout.decode("utf-8-sig"))

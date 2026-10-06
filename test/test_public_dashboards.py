@@ -1493,7 +1493,9 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 assert "前前" not in page.locator("#finlab-freshness").inner_text()
                 assert page.locator("#pipeline-grid .pipeline-card:not(.skeleton)").count() == 0
                 page.evaluate("() => {StockAgentAcquisition.reveal('pipelines');document.getElementById('pipelines').scrollIntoView({block:'start',behavior:'instant'});}")
-                page.wait_for_function("() => document.querySelectorAll('#pipeline-grid .pipeline-card:not(.skeleton)').length === 5")
+                # Current FinLab distinguishes private cold release from remote
+                # READY: six existing pipeline cards, not the old five-card UI.
+                page.wait_for_function("() => document.querySelectorAll('#pipeline-grid .pipeline-card:not(.skeleton)').length === 6")
                 assert page.locator("#volume-downloaded").text_content() == "60 MiB"
                 assert page.locator("#volume-total").text_content() == "約 120 MiB"
                 page.evaluate("window.StockAgentAcquisition.reveal('workload')")
@@ -1511,7 +1513,7 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 assert page.locator("#download-progress").count() == 0
                 page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
                 page.locator("#finlab-health").get_by_text("更新暫停，顯示上次資料").wait_for(timeout=5000)
-                assert page.locator("#pipeline-grid .pipeline-card").count() == 5
+                assert page.locator("#pipeline-grid .pipeline-card").count() == 6
                 page.locator("#finlab-health").get_by_text("資料觀測正常").wait_for(timeout=8000)
                 assert attempts >= 4
                 page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")

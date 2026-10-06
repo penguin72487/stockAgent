@@ -10,8 +10,8 @@ from downloader.finmind_eta import SNAPSHOT_CONTRACT_VERSION
 from downloader.finmind_history_order import HISTORY_STAGES, STAGES, metadata as history_order_metadata
 
 
-ORDERED_SNAPSHOT_VERSIONS = frozenset({6, 7, 8, SNAPSHOT_CONTRACT_VERSION})
-RETRY_SNAPSHOT_VERSIONS = frozenset({7, 8, SNAPSHOT_CONTRACT_VERSION})
+ORDERED_SNAPSHOT_VERSIONS = frozenset(range(6, SNAPSHOT_CONTRACT_VERSION + 1))
+RETRY_SNAPSHOT_VERSIONS = frozenset(range(7, SNAPSHOT_CONTRACT_VERSION + 1))
 PUBLIC_SNAPSHOT_VERSIONS = frozenset({3, 4, 5}) | ORDERED_SNAPSHOT_VERSIONS
 
 
@@ -87,6 +87,7 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
     usable = fresh and state not in {'unavailable', 'stale'}
     result = {
         'schema_version': payload['schema_version'] if payload.get('schema_version') in PUBLIC_SNAPSHOT_VERSIONS else 2,
+        'scenario_projection_contract': 1 if payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS else None,
         'state': state, 'observed_at_utc': observed.isoformat() if observed else None,
         'valid_until_utc': expiry.isoformat() if expiry else None,
         'scope_label': str(payload.get('scope_label', 'FinMind 已排程工作'))[:160],
@@ -99,7 +100,8 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         result['workload'] = {key: _number(work.get(key)) for key in (
             'required_requests', 'validation_requests', 'planned_requests', 'unbatched_requests',
             'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
-            'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests')}
+            'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests',
+            'independent_retry_tasks', 'independent_retry_requests', 'independent_inflight_tasks')}
     result['retry_wait_seconds'] = _number(payload.get('retry_wait_seconds')) if usable else None
     scenarios = payload.get('scenarios')
     for key in ('fastest', 'central', 'slowest'):
@@ -134,13 +136,21 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             forecast_arrival_requests=_number(raw.get('forecast_arrival_requests')),
             forecast_refresh_requests=_number(raw.get('forecast_refresh_requests')),
             cumulative_request_count=_number(raw.get('cumulative_request_count')),
-            cumulative_active_work_seconds=_number(raw.get('cumulative_active_work_seconds')) if usable else None)
+            cumulative_active_work_seconds=_number(raw.get('cumulative_active_work_seconds')) if usable else None,
+            standalone_active_work_seconds=_number(raw.get('standalone_active_work_seconds')) if usable else None)
+    projection = payload.get('scheduling_projection')
+    if isinstance(projection, dict):
+        result['scheduling_projection'] = {
+            'independent_retry_requests': _number(projection.get('independent_retry_requests')),
+            'independent_inflight_tasks': _number(projection.get('independent_inflight_tasks')),
+            'basis': 'independent_worker_retry_does_not_block_history_lane',
+        }
     rates = payload.get('rate_evidence')
     if isinstance(rates, dict):
         result['rate_evidence'] = {key: _number(rates.get(key)) for key in (
             'official_requests_per_hour', 'paced_requests_per_hour', 'rolling_requests_60m',
             'gross_requests_per_hour', 'future_recurring_requests_per_hour',
-            'effective_requests_per_hour', 'current_reserved_requests')}
+            'effective_requests_per_hour', 'current_reserved_requests', 'priority_requests_per_hour')}
         result['rate_evidence'].update(
             scheduling_basis='release_clock_events' if rates.get('scheduling_basis') == 'release_clock_events' else 'average_load',
             rolling_complete_window=rates.get('rolling_complete_window') is True,
@@ -149,6 +159,16 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         for key in ('rolling_window_start_at_utc', 'rolling_window_end_at_utc'):
             stamp = _stamp(rates.get(key))
             result['rate_evidence'][key] = stamp.isoformat() if stamp else None
+        processing = rates.get('request_processing')
+        if isinstance(processing, dict):
+            result['rate_evidence']['request_processing'] = {
+                'object_requests': _number(processing.get('object_requests')),
+                'samples': _number(processing.get('samples')),
+                'dependent_processing_samples': _number(processing.get('dependent_processing_samples')),
+                'dependent_processing_unknown': processing.get('dependent_processing_unknown') is True,
+                'basis': 'observed_object_and_mandatory_local_cost_not_legacy_request_rate',
+                'rates': {key: _number(processing.get('rates', {}).get(key)) for key in ('fastest', 'central', 'slowest')},
+            }
     assumptions = payload.get('assumptions')
     if isinstance(assumptions, list):
         result['assumptions'] = [item[:400] for item in assumptions[:10] if isinstance(item, str)]
