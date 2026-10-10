@@ -177,6 +177,54 @@ def test_cache_plan_preserves_bytes_then_only_exact_transport_is_retired(deliver
     assert lakehouse.acceptance(c, identity)['state'] == 'nas_archive_file_recovery_verified'
 
 
+def test_nas_archive_receipt_is_distinct_from_corrupted_local_transport_retirement(delivery):
+    c, identity, batch, original, proof = delivery
+    row = {'file_keys': [original.relative_to(Path(c['cold_root'])).as_posix()+'@'+digest(original)],
+           'bytes': original.stat().st_size}
+    transport_file = batch/original.relative_to(Path(c['cold_root']))
+    transport_file.write_bytes(b'x'*row['bytes'])
+    # The receiver independently restored the original fixed archive. Later
+    # local transport corruption does not erase that disaster-recovery proof.
+    assert lakehouse.acceptance(c, identity, enrolled_source=row)['state'] == 'nas_archive_file_recovery_verified'
+    with pytest.raises(ValueError, match='full SHA'):
+        lakehouse.acceptance(c, identity)
+    with pytest.raises(ValueError, match='full SHA'):
+        cache.retire(c, identity, proof, apply=True)
+    assert transport_file.exists() and original.read_bytes() == b'preserved authoritative bytes'
+
+
+def test_nas_receipt_refuses_another_enrolled_source_membership(delivery):
+    c, identity, batch, original, proof = delivery
+    with pytest.raises(ValueError, match='enrolled source'):
+        lakehouse.acceptance(c, identity, enrolled_source={'file_keys': ['different@'+'f'*64],
+                                                         'bytes': original.stat().st_size})
+    assert batch.exists() and original.exists()
+
+
+@pytest.mark.parametrize('damage', ['none', 'wrong_sha', 'source_change'])
+def test_batched_primary_recovery_verification_preserves_sha_and_stability_gates(tmp_path, monkeypatch, damage):
+    from stockagent.data_sync import windows_cold_io as native
+    data = b'canonical observation'*(8*1024**2//21+2)
+    sha = hashlib.sha256(data).hexdigest();relative=f'objects/blobs/{sha[:2]}/{sha}.blob'
+    source=tmp_path/relative;source.parent.mkdir(parents=True);source.write_bytes(data)
+    m={'context':{'kind':'immutable_source_objects','source_object_paths':{'payload/a':relative}},
+       'files':{'payload/a':{'sha256':sha,'bytes':len(data)}}}
+    batches=[]
+    monkeypatch.setattr(native,'windows_path',lambda path:'D:\\fixed')
+    def hashes(paths):
+        batches.append(paths)
+        if damage=='source_change':source.write_bytes(b'x'*len(data))
+        return {p:('f'*64 if damage=='wrong_sha' else sha) for p in paths}
+    monkeypatch.setattr(native,'hash_many',hashes)
+    monkeypatch.setattr(cache,'digest',lambda path:pytest.fail('recovery hashes should use the measured batch path'))
+    if damage=='none':
+        assert cache.validate_sources({'cold_root':str(tmp_path)},'a'*64,m)['payload/a']
+    else:
+        with pytest.raises(ValueError,match='cannot reconstruct'):
+            cache.validate_sources({'cold_root':str(tmp_path)},'a'*64,m)
+    assert batches==[[source]] and source.exists()
+
+
 def test_source_ack_is_durable_without_waiting_for_transport_gc(delivery, monkeypatch):
     c, identity, batch, original, proof = delivery
     relative = original.relative_to(Path(c['cold_root'])).as_posix()
@@ -267,6 +315,206 @@ def test_source_pipeline_prioritizes_unbacked_bytes_and_keeps_disjoint_pending_w
 def test_source_policy_refuses_unbounded_or_ambiguous_settings(policy):
     with pytest.raises(ValueError):
         lakehouse.source_wave_policy({'source_replication': policy})
+
+
+@pytest.fixture
+def independent_source(source_wave, monkeypatch):
+    c, chosen, physical, ledger_path, ledger, source = source_wave
+    c['transport_root'] = str(physical / 'lakehouse')
+    c['receipt_root'] = str(Path(c['state_root']) / 'receipts')
+    c['lake_root'] = str(Path(c['state_root']) / 'lake')
+    Path(c['receipt_root']).mkdir()
+    entries = list(chosen)
+    for index in range(6):
+        data = ('independent-' + str(index)).encode() * 30
+        sha = hashlib.sha256(data).hexdigest()
+        relative = f'objects/blobs/{sha[:2]}/{sha}.blob'
+        p = Path(c['cold_root']) / relative
+        p.parent.mkdir(parents=True, exist_ok=True);p.write_bytes(data)
+        entries.append((relative, sha, len(data)))
+    class Catalog:
+        def execute(self, sql): return self
+        def fetchall(self): return entries
+        def close(self): pass
+    c['source_replication'] = {'decouple_nas_acceptance': True, 'maximum_wave_files': 1,
+        'maximum_retained_transport_bytes': 1024**2, 'receiver_requested_redelivery': True}
+    monkeypatch.setattr(lakehouse, 'guard', lambda policy: None)
+    monkeypatch.setattr(lakehouse, 'connect', lambda *args, **kwargs: Catalog())
+    monkeypatch.setattr(lakehouse, 'notify_transport', lambda *args: None)
+    monkeypatch.setattr(cache, 'PHYSICAL_TRANSPORT_ROOT', physical)
+    monkeypatch.setattr(lakehouse.shutil, 'disk_usage', lambda root: SimpleNamespace(free=1024**4))
+    return c, entries, Path(c['state_root'])/'source-replication-ledger.json'
+
+
+def failed_receiver(c, identity, **changes):
+    value = {'producer_device_id': c['producer_device_id'], 'receiver_device_id': c['receiver_device_id'],
+        'nas_mount_guard_verified': True, 'single_owner_verified': True, 'runtime_lock_verified': True,
+        'observed_at_utc': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+        'jobs': [{'delivery': 'lake-'+identity, 'state': 'deferred', 'error_type': 'RuntimeError'}], **changes}
+    atomic_write_json(Path(c['receipt_root'])/'relay-status.json', value)
+
+
+def test_source_confirms_exact_nas_receipt_and_sends_next_wave_without_local_batch_reread(independent_source, monkeypatch):
+    from stockagent.data_sync import immutable_replication as immutable
+    c, entries, ledger_path = independent_source
+    original = lakehouse.stage_source_wave(c)['pending_delivery_ids'][0]
+    root = Path(c['transport_root'])/('lake-'+original)
+    raw = (root/'manifest.json').read_bytes();m=json.loads(raw)
+    ack = {'contract': ACK, 'delivery_identity_sha256': original,
+           'manifest_file_sha256': hashlib.sha256(raw).hexdigest(),
+           'complete_files': len(m['files'])+2,
+           'complete_bytes': sum(v['bytes'] for v in m['files'].values())+len(raw)+65,
+           'producer_device_id': c['producer_device_id'], 'receiver_device_id': c['receiver_device_id'],
+           'command_exit_codes': [0, 0], 'restore_command_exit_codes': [0, 0],
+           **{k: True for k in ('all_files_sha256_verified', 'exact_file_set_verified', 'source_unchanged_verified',
+               'nas_independent_restore_verified', 'nas_mount_guard_verified', 'single_owner_verified', 'runtime_lock_verified')}}
+    atomic_write_json(Path(c['receipt_root'])/('lake-'+original+'.json'),
+                      {**ack, 'identity_sha256': identity_sha256(ack)})
+    full_inventory = immutable.inventory
+    def inventory(path):
+        if path == root:raise AssertionError('NAS receipt admission blocks the sender on a local full reread')
+        return full_inventory(path)
+    monkeypatch.setattr(immutable, 'inventory', inventory)
+    result = lakehouse.stage_source_wave(c)
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    assert result['nas_archive_covered_objects'] == 1 and rows[original]['nas_acceptance']
+    assert len(rows) == 2 and len(result['pending_delivery_ids']) == 1
+
+
+def test_source_keeps_sending_beyond_nas_window_and_refreshes_catalog(independent_source, monkeypatch):
+    c, entries, ledger_path = independent_source
+    c['source_replication']['refresh_source_catalog'] = True
+    captures = []
+    monkeypatch.setattr(lakehouse, 'register', lambda config: captures.append(True))
+    results = [lakehouse.stage_source_wave(c) for _ in range(6)]
+    assert len(results[-1]['pending_delivery_ids']) == 6 and len(captures) == 1
+    assert results[-1]['publication_waits_for_nas_ack'] is False
+    assert results[-1]['nas_archive_covered_bytes'] == 0
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    assert len({key for row in rows.values() for key in row['file_keys']}) == 6
+    assert all(not row.get('nas_acceptance') for row in rows.values())
+
+
+def test_failed_new_catalog_refresh_keeps_committed_source_sending_and_backs_off(independent_source, monkeypatch):
+    c, entries, ledger_path = independent_source
+    c['source_replication']['refresh_source_catalog'] = True
+    calls = []
+    def reject(config):
+        calls.append(True)
+        raise ValueError('new metadata is not yet admissible')
+    monkeypatch.setattr(lakehouse, 'register', reject)
+    first = lakehouse.stage_source_wave(c)
+    second = lakehouse.stage_source_wave(c)
+    assert len(second['pending_delivery_ids']) == 2 and len(calls) == 1
+    assert first['catalog_refresh_error']['error_type'] == 'ValueError'
+    assert second['catalog_refresh_error'] == first['catalog_refresh_error']
+    assert not any(v.get('nas_acceptance') for v in json.loads(ledger_path.read_bytes())['deliveries'].values())
+
+
+def test_rejected_catalog_metadata_diagnostics_preserve_previous_registry(independent_source, monkeypatch):
+    from stockagent.data_sync import backup_stream
+    c, entries, ledger_path = independent_source
+    errors = [{'relative': 'heads/example/new.json', 'reason': 'SnapshotError'}]
+    monkeypatch.setattr(backup_stream, 'capture_catalog', lambda *args, **kwargs: {'metadata_errors': errors})
+    with pytest.raises(ValueError, match='metadata errors'):
+        lakehouse.register(c)
+    proof = json.loads((Path(c['state_root'])/'catalog-refresh-errors.json').read_bytes())
+    assert proof['metadata_errors'] == errors and proof['last_committed_registry_preserved'] is True
+    assert not (Path(c['state_root'])/'catalog-status.json').exists()
+
+
+def test_independent_source_still_honors_retained_capacity(independent_source):
+    c, entries, ledger_path = independent_source
+    first = lakehouse.stage_source_wave(c)
+    c['source_replication']['maximum_retained_transport_bytes'] = 1024**2
+    data = json.loads(ledger_path.read_bytes())
+    next(iter(data['deliveries'].values()))['bytes'] = 1024**2
+    atomic_write_json(ledger_path, data)
+    second = lakehouse.stage_source_wave(c)
+    assert second['state'] == 'waiting_transport_capacity'
+    assert second['pending_delivery_ids'] == first['pending_delivery_ids']
+
+
+def test_receiver_failure_requeues_exact_bytes_without_overwriting_failed_attempt(independent_source):
+    c, entries, ledger_path = independent_source
+    first = lakehouse.stage_source_wave(c)
+    original = first['pending_delivery_ids'][0]
+    original_root = Path(c['transport_root'])/('lake-'+original)
+    before = (original_root/'manifest.json').read_bytes()
+    failed_receiver(c, original)
+    second = lakehouse.stage_source_wave(c)
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    retry = rows[original]['redeliveries'][0]
+    assert retry != original and rows[retry]['retry_of'] == original
+    assert rows[retry]['file_keys'] == rows[original]['file_keys']
+    assert (original_root/'manifest.json').read_bytes() == before
+    assert not rows[retry].get('nas_acceptance')
+    # A retry still in progress does not generate another retry or block new data.
+    third = lakehouse.stage_source_wave(c)
+    assert len(third['pending_delivery_ids']) == 3
+    assert json.loads(ledger_path.read_bytes())['deliveries'][original]['redeliveries'] == [retry]
+
+
+def test_wrong_receiver_retry_and_bad_ack_do_not_block_other_data(independent_source, monkeypatch):
+    c, entries, ledger_path = independent_source
+    original = lakehouse.stage_source_wave(c)['pending_delivery_ids'][0]
+    failed_receiver(c, original, receiver_device_id='unknown-peer')
+    (Path(c['receipt_root'])/('lake-'+original+'.json')).write_text('{}')
+    monkeypatch.setattr(lakehouse, 'acceptance', lambda *args, **kwargs: (_ for _ in ()).throw(ValueError('bad ACK')))
+    result = lakehouse.stage_source_wave(c)
+    assert len(result['pending_delivery_ids']) == 2
+    assert result['receipt_errors'] and result['redelivery_request_error'] == 'ValueError'
+    assert not json.loads(ledger_path.read_bytes())['deliveries'][original].get('redeliveries')
+
+
+@pytest.mark.parametrize('error_type', ['FileNotFoundError', 'TimeoutError', 'ConnectionError', 'CapacityError'])
+def test_incomplete_ingress_or_temporary_nas_wait_keeps_sending_without_duplicate_retry(independent_source, error_type):
+    c, entries, ledger_path = independent_source
+    original = lakehouse.stage_source_wave(c)['pending_delivery_ids'][0]
+    failed_receiver(c, original, jobs=[{'delivery': 'lake-'+original, 'state': 'deferred',
+                                      'error_type': error_type}])
+    result = lakehouse.stage_source_wave(c)
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    assert len(result['pending_delivery_ids']) == 2
+    assert not rows[original].get('redeliveries')
+    assert len({key for row in rows.values() for key in row['file_keys']}) == 2
+
+
+def test_verified_redelivery_covers_original_keys_without_fabricating_original_ack(independent_source, monkeypatch):
+    c, entries, ledger_path = independent_source
+    original = lakehouse.stage_source_wave(c)['pending_delivery_ids'][0]
+    failed_receiver(c, original)
+    lakehouse.stage_source_wave(c)
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    retry = rows[original]['redeliveries'][0]
+    original_bytes = rows[original]['bytes']
+    (Path(c['receipt_root'])/('lake-'+retry+'.json')).write_text('{}')
+    monkeypatch.setattr(lakehouse,'acceptance',lambda config,key,**kwargs:{'state':'nas_archive_file_recovery_verified',
+        'delivery_identity_sha256':key,'receipt_identity_sha256':'f'*64})
+    result = lakehouse.stage_source_wave(c)
+    persisted = json.loads(ledger_path.read_bytes())['deliveries']
+    assert result['nas_archive_covered_bytes'] == original_bytes
+    assert result['nas_archive_covered_objects'] == 1
+    assert original not in result['pending_delivery_ids']
+    assert persisted[retry]['nas_acceptance'] and not persisted[original].get('nas_acceptance')
+    assert persisted[original]['redeliveries'] == [retry]
+    assert (Path(c['transport_root'])/('lake-'+original)).exists()
+
+
+def test_rejected_redelivery_retries_only_after_receiver_reports_its_failure(independent_source):
+    c, entries, ledger_path = independent_source
+    c['source_replication']['redelivery_cooldown_seconds'] = 1
+    original = lakehouse.stage_source_wave(c)['pending_delivery_ids'][0]
+    failed_receiver(c, original)
+    lakehouse.stage_source_wave(c)
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    first_retry = rows[original]['redeliveries'][0]
+    rows[original]['last_redelivery_epoch'] = 0
+    atomic_write_json(ledger_path,{'deliveries':rows})
+    failed_receiver(c, first_retry)
+    lakehouse.stage_source_wave(c)
+    attempts = json.loads(ledger_path.read_bytes())['deliveries'][original]['redeliveries']
+    assert len(attempts) == 2 and attempts[0] == first_retry and attempts[1] != first_retry
 
 
 @pytest.mark.parametrize('change', ['source', 'unknown', 'open', 'ack_pair', 'ack_bytes', 'ack_boolean_exit'])

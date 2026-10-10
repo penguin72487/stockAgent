@@ -1,8 +1,13 @@
 {
-  "maximum_pending_deliveries": 4,
+  "decouple_nas_acceptance": true,
+  "refresh_source_catalog": true,
+  "catalog_refresh_retry_seconds": 600,
+  "maximum_retained_transport_bytes": 274877906944,
+  "receiver_requested_redelivery": true,
+  "maximum_redelivery_attempts": 3,
+  "redelivery_cooldown_seconds": 600,
   "maximum_wave_bytes": 2147483648,
   "maximum_single_object_bytes": 8589934592,
-  "maximum_pending_bytes": 34359738368,
   "maximum_wave_files": 1024,
   "prioritize_uncovered_nas": true,
   "restic_state_root": "/var/lib/stockagent/backup-stream"

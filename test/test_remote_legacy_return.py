@@ -232,6 +232,94 @@ def test_shared_inode_is_not_automatically_unlinked(example, tmp_path):
     assert "shared-inode-requires-separate-audit" in result["blockers"]
 
 
+def shared_ack(ack):
+    ack = {**ack, "contract": "d_verified_remote_legacy_return_v2",
+           "shared_file_policy": "unlink_preserved_names_only"}
+    ack["identity_sha256"] = returns.identity({k: v for k, v in ack.items() if k != "identity_sha256"})
+    return ack
+
+
+def test_v2_retirement_preserves_external_names_and_reports_zero_reclaim(example, tmp_path):
+    root, source, state, ack = example
+    alias = tmp_path / "outside-name"
+    os.link(source / "unique.bin", alias)
+    result = returns.retire(root, tmp_path, state, shared_ack(ack), apply=True)
+    assert result["deleted"] and not source.exists()
+    assert alias.read_bytes() == b"original result"
+    assert result["reclaimed_allocated_bytes"] == 0
+    assert result["external_shared_names_deleted"] is False
+
+
+def test_v2_retirement_reclaims_internal_links_once(example, tmp_path, monkeypatch):
+    root, source, state, ack = example
+    original = source / "unique.bin"
+    os.link(original, source / "second-name.bin")
+    spec = LegacyArchiveSpec(ack["dataset"], ack["relative_root"], 7, tmp_path / "new-stage")
+    ack["archive_manifest"] = prepare_archive(spec, root)
+    expected = original.stat().st_blocks * 512
+    reads = []
+    hash_file = returns.sha256_file
+    def measured(path):
+        reads.append(path)
+        return hash_file(path)
+    monkeypatch.setattr(returns, "sha256_file", measured)
+    result = returns.retire(root, tmp_path, state, shared_ack(ack), apply=True)
+    assert result["deleted"] and result["reclaimed_allocated_bytes"] == expected
+    assert len(reads) == 3  # plan, repeated plan, quarantined comparison
+
+
+def test_v2_shared_open_descriptor_blocks_retirement(example, tmp_path):
+    import subprocess
+    import sys
+    root, source, state, ack = example
+    alias = tmp_path / "outside-open-name"
+    os.link(source / "unique.bin", alias)
+    child = subprocess.Popen([sys.executable, "-c",
+                              "import sys,time; f=open(sys.argv[1],'rb'); print('ready',flush=True); time.sleep(30)",
+                              str(alias)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        result = returns.retire(root, tmp_path, state, shared_ack(ack), apply=True)
+        assert not result["deleted"] and "shared-inode-in-use" in result["blockers"]
+        assert source.exists() and alias.exists()
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+        child.stdout.close()
+
+
+@pytest.mark.parametrize("change", ["v1-opt-in", "v2-missing-policy", "v2-unknown-policy", "v2-stale"])
+def test_shared_contract_is_explicit_and_fresh(example, tmp_path, change):
+    root, source, state, ack = example
+    ack = shared_ack(ack)
+    if change == "v1-opt-in":
+        ack["contract"] = "d_verified_remote_legacy_return_v1"
+    elif change == "v2-missing-policy":
+        ack.pop("shared_file_policy")
+    elif change == "v2-unknown-policy":
+        ack["shared_file_policy"] = "delete-all-aliases"
+    else:
+        ack["verified_at_epoch"] = time.time() - 1801
+    ack["identity_sha256"] = returns.identity({k: v for k, v in ack.items() if k != "identity_sha256"})
+    with pytest.raises(SnapshotError):
+        returns.retire(root, tmp_path, state, ack, apply=True)
+    assert source.exists()
+
+
+def test_ack_budget_and_shared_policy_preserve_v1_and_require_v2_opt_in():
+    from scripts.return_remote_legacy_archives import ROOT, preservation_policy, recovery_ack_contract
+    original = json.loads((ROOT / "configs/data_sync/vastai_legacy_archive_return.json").read_text())
+    reviewed = json.loads((ROOT / "configs/data_sync/vastai_reviewed_legacy_return_20261006.json").read_text())
+    assert recovery_ack_contract(preservation_policy(original)) == ("d_verified_remote_legacy_return_v1", 240)
+    assert recovery_ack_contract(preservation_policy(reviewed)) == ("d_verified_remote_legacy_return_v2", 1500)
+    for invalid in ({**original, "shared_file_policy": "unlink_preserved_names_only"},
+                    {k: v for k, v in reviewed.items() if k != "shared_file_policy"},
+                    {**reviewed, "shared_file_policy": "delete-all-aliases"},
+                    {**reviewed, "minimum_stable_hours": 0}):
+        with pytest.raises(SnapshotError, match="policy"):
+            preservation_policy(invalid)
+
+
 def test_stale_or_forged_ack_is_rejected(example, tmp_path):
     root, source, state, ack = example
     ack["verified_at_epoch"] = time.time() - 301

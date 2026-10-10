@@ -27,6 +27,7 @@ ALIASES = (
     (Path('/mnt/d/stockagent-cold-primary'), 'stockagent-cold-primary'),
     (Path('/srv/stockagent-backup-ingress-lab203'), 'stockagent-backup-ingress-lab203'),
     (Path('/srv/stockagent-d-volume/stockagent-backup-ingress-lab203'), 'stockagent-backup-ingress-lab203'),
+    (Path('/srv/stockagent-d-volume/stockagent-immutable-lake'), 'stockagent-immutable-lake'),
 )
 
 
@@ -88,6 +89,11 @@ def _configuration(path, *, mode, offset=0, prefix_sha256=None, reserve_bytes=32
         if (mounted_volume(Path('/srv/stockagent-d-volume'))[2] != 'D:'
                 or not physical.samefile(Path('/srv/stockagent-backup-ingress-lab203'))):
             raise SnapshotError('Native transport differs from its enrolled D backing volume')
+    if native.startswith('D:\\stockagent-immutable-lake\\'):
+        from stockagent.data_sync.packed_backup import mounted_volume
+        mount = Path('/srv/stockagent-d-volume')
+        if mode != 'hash' or mounted_volume(mount)[2] != 'D:' or Path(path).stat().st_dev != mount.stat().st_dev:
+            raise SnapshotError('Native lake hash requires its enrolled D volume and read-only mode')
     config = {'path': native, 'mode': mode, 'offset': offset,
               'prefix_sha256': prefix_sha256, 'reserve_bytes': reserve_bytes}
     if mode == 'write' and not native.startswith('D:\\stockagent-cold-primary\\'):

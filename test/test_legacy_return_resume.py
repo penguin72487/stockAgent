@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import time
 
 import pytest
 
@@ -83,3 +84,29 @@ def test_uninitialized_cohort_is_not_created(tmp_path):
     missing = tmp_path / "missing"
     assert readiness(missing) == (False, "cohort_not_initialized")
     assert not missing.exists()
+
+
+def test_fixed_selection_skips_unselected_pending_roots(cohort):
+    from stockagent.data_sync.desync_snapshots import sha256_file
+    inventory = {"items": [{"relative_root": "markets/reviewed", "files": 1},
+                           {"relative_root": "ablations/other-owner", "files": 1}]}
+    (cohort / "inventory.json").write_text(json.dumps(inventory))
+    (cohort / "scope-selection.json").write_text(json.dumps({
+        "schema_version": 1, "inventory_sha256": sha256_file(cohort / "inventory.json"),
+        "relative_roots": ["markets/reviewed"]}))
+    (cohort / "progress.json").write_text(json.dumps({"items": [
+        {"relative_root": "markets/reviewed", "files": 1, "state": "remote-source-retired"},
+        {"relative_root": "ablations/other-owner", "files": 1, "state": "would-return-to-d-cold"}]}))
+    assert readiness(cohort)[0]
+    assert readiness(cohort, selection_path=cohort / "scope-selection.json") == (False, "no_retryable_items_in_retained_cohort")
+    (cohort / "inventory.json").write_text(json.dumps({"items": []}))
+    assert readiness(cohort, selection_path=cohort / "scope-selection.json") == (False, "fixed_cohort_selection_invalid")
+
+
+@pytest.mark.parametrize("hours,ready", [(11, False), (13, True)])
+def test_young_reviewed_source_retries_only_after_stability_floor(cohort, hours, ready):
+    (cohort / "progress.json").write_text(json.dumps({"items": [{
+        "relative_root": "markets/young", "files": 1, "state": "source-protected",
+        "blockers": ["source-not-twelve-hour-stable"],
+        "newest_mtime_ns": time.time_ns() - hours * 3_600_000_000_000}]}))
+    assert readiness(cohort)[0] is ready

@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+import pytest
 
 from scripts import capture_inactive_training_cache as capture
 
@@ -58,3 +60,26 @@ def test_retained_index_must_match_received_compressed_sha(tmp_path):
                                                           "producer_exit_code": 0, "compressed_sha256": "a" * 64}))
     (tmp_path / "cache.original-index.json").write_text(json.dumps({"compressed_sha256": "b" * 64, "rows": []}))
     assert capture.preserved_metadata([tmp_path]) == {}
+
+
+@pytest.mark.parametrize('covered', [True, False])
+def test_capture_resource_drift_cannot_start_transfer_or_block_no_work(tmp_path,monkeypatch,covered):
+    _,inventory,policy=observation()
+    inventory.update(training_only_role_verified=True,node_profile={
+        'machine_sha256':'current-node', 'limits':{'cpu_worker_budget':1,'memory_headroom_bytes':1}})
+    measurement=tmp_path/'measurement.json'
+    measurement.write_text(json.dumps({'state':'measured_remote_transport_accepted','selected_threads':2}))
+    policy.update(schema_version=1,one_shot=True,origin_node_id='vastai1T',authority_node_id='penguin',
+                  measurement_receipt=str(measurement),measurement_sha256=capture.sha256_file(measurement),
+                  node_machine_sha256='previous-node')
+    path=tmp_path/'policy.json';path.write_text(json.dumps(policy))
+    monkeypatch.setattr(capture,'POLICY',path);monkeypatch.setattr(capture,'STATE',tmp_path)
+    monkeypatch.setattr(capture,'private_file',lambda *a:None)
+    monkeypatch.setattr(capture,'observe',lambda *a:inventory)
+    fingerprints={'legacy-view':{capture.portable_fingerprint(inventory['caches'][0]['rows'])}} if covered else {}
+    monkeypatch.setattr(capture,'preserved_metadata',lambda *a:fingerprints)
+    monkeypatch.setattr(capture.subprocess,'run',lambda *a,**kw:pytest.fail('resource drift cannot authorize capture'))
+    assert capture.capture(SimpleNamespace(ssh_target='unused',ssh_port=22,identity_file=tmp_path/'key'),[]) is False
+    status=json.loads((tmp_path/'cache-capture-status.json').read_text())
+    assert status['source_deleted'] is False
+    assert status['state']==('enrolled_legacy_caches_captured' if covered else 'legacy_cache_capture_resource_remeasurement_pending')

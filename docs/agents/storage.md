@@ -223,15 +223,34 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   since advanced. Overlapping coverage counters must not be added: use the
   exact relative-path/SHA union of authority-validated ledgers, separating
   machine recovery proofs from user-relayed pilot reports.
-- Source replication admits disjoint waves under explicit pending-count,
-  pending-byte, single-object and capacity bounds. The selected private policy
+- Source publication and NAS acceptance can overlap independently. With
+  `decouple_nas_acceptance`, ACK backlog does not consume a four-batch window;
+  retained spool capacity, physical reserve and single-object limits control
+  admission. The selected private policy
   comes from `configs/data_sync/lake_source_replication.json`; prioritize files
   without confirmed NAS coverage. Pending waves are reserved, not republished.
+  A paired failed-job status may request a new immutable attempt with the same
+  original file keys/SHA/bytes; preserve failed attempts, bound retries, and
+  never manufacture their ACKs from a replacement. Receipt errors affect that
+  delivery rather than blocking unrelated source publication. The Restic source
+  stream likewise separates cached pairing admission from current NAS readiness;
+  actual NAS guards remain mandatory on its receiver.
+  Source receipt admission binds the sealed metadata to the already enrolled
+  authority keys/SHAs/bytes and exact paired independent NAS recovery proof;
+  it need not reread the local payload before admitting unrelated waves.
+  Full local set/SHA, primary reconstruction and process checks still precede
+  transport retirement. Rejected new catalog refreshes remain explicit and
+  retry with backoff while the last committed registry keeps supplying valid
+  immutable objects; this is not acceptance of the rejected new version.
   Keep the original durable publication journal and owner; load new worker code
-  at an idle publication boundary and verify its fingerprint. Full file/set/SHA
+  at an idle publication boundary, or through separately accepted canonical
+  interrupted-activity recovery retaining intents and uncommitted staging;
+  verify the actually loaded fingerprint. Full file/set/SHA
   and independent NAS recovery checks remain mandatory. The
   [2026-10-06 catch-up report](../nas_sync_catchup_2026-10-06.md) records the frozen
   inventory, source I/O measurements and current acceptance scope.
+  [Send/verify concurrency](../nas_send_verify_parallel_2026-10-06.md) records the
+  later user-selected policy and deployed retry/capacity behavior.
 - Source ACKs persist before cleanup. `stockagent-lake-transport-gc.timer`
   handles one exact accepted wave per invocation through the shared journal
   and per-delivery lock. Inventory, primary recovery, process, signatures and
