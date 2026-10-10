@@ -13,6 +13,7 @@ import gc
 import hashlib
 import json
 import os
+import runpy
 from pathlib import Path
 import sys
 import time
@@ -33,6 +34,9 @@ def main():
     parser.add_argument("--compare-transport", action="store_true",
         help="Bit-check every actual raw chunk and compare native control/transport gradients, no optimizer.")
     args = parser.parse_args()
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))["admit_output"](
+        args.output, "benchmark"
+    )
     sys.path.insert(0, str(args.code_root.resolve(strict=True)))
     import numpy as np
     import torch

@@ -376,6 +376,9 @@ def load_tw_day_trade_execution_tape(
     historical execution; minute 270 uses the official close-auction price.
     """
 
+    if cache_dir is not None:
+        from stockagent.storage_layout import admit_output
+        cache_dir = admit_output(Path(cache_dir), 'cache')
     if pq is None or pc is None:
         raise RuntimeError("PyArrow is required for day-trade minute execution")
     root_path = Path(root)

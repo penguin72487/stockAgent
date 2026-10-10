@@ -5,16 +5,24 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import io
 import json
 import math
 import sys
 import warnings
 from pathlib import Path
 
+import matplotlib
+
+# These are offline artifacts; never probe a desktop/Qt event loop on WSL or
+# a headless worker while a completed GPU experiment is waiting for its plots.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.ticker import PercentFormatter
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +57,11 @@ LABELS = {
     "output_signed_softmax": "Output: signed softmax",
     "output_signed_entmax15": "Output: signed entmax15",
     "output_signed_sparsemax": "Output: signed sparsemax",
+    "pooling__attention": "Full-then-last + attention pooling",
+    "lookback__d256": "Lookback 256",
+    "embedding__d16": "Embedding 16",
+    "embedding__d64": "Embedding 64",
+    "embedding__d128": "Embedding 128",
 }
 
 METRIC_NAMES = (
@@ -255,6 +268,7 @@ def load(
     split: str,
     *,
     baseline_root: Path | None = None,
+    require_baseline: bool = True,
 ) -> dict[str, list[dict]]:
     runs: dict[str, list[dict]] = {}
     for path in sorted(root.glob("*/summary.json")):
@@ -271,6 +285,10 @@ def load(
                 )
                 continue
         runs[path.parent.name] = rows
+    if not require_baseline:
+        # Absolute mode never invents a baseline from another experiment or
+        # silently drops variants just because their last fold IDs differ.
+        return runs
     if "baseline" not in runs:
         baseline_rows: list[dict] = []
         if baseline_root is not None:
@@ -336,6 +354,250 @@ def bootstrap_ci(values: np.ndarray, rng: np.random.Generator) -> tuple[float, f
     return tuple(np.quantile(draws, [0.025, 0.975]))
 
 
+def _absolute_records(root: Path, split: str, calendar_receipt: Path | None):
+    """Read completed observations; date ownership stays with saved receipts."""
+    calendar = json.loads(calendar_receipt.read_text()) if calendar_receipt else {}
+    if calendar and calendar.get("state") != "accepted_calendar_context":
+        raise ValueError("absolute plots require an accepted calendar receipt")
+    records, series = [], {}
+    for name, rows in load(root, split, require_baseline=False).items():
+        for row in rows:
+            fold_id = int(row["fold_id"])
+            fold_dir = root / name / f"fold_{fold_id:02d}"
+            marker_path = fold_dir / "fold_complete.json"
+            if not marker_path.is_file():
+                warnings.warn(f"excluding {name}/fold_{fold_id:02d}: not complete", stacklevel=2)
+                continue
+            marker = json.loads(marker_path.read_text())
+            if marker.get("status") != "complete" or marker.get("fold_id") != fold_id:
+                raise ValueError(f"invalid completed fold identity: {marker_path}")
+            case = calendar.get("cases", {}).get(name, {})
+            if calendar and fold_id not in case.get("fold_ids", []):
+                raise ValueError(f"calendar receipt does not own {name}/fold_{fold_id}")
+            if split == "val":
+                if not case:
+                    raise ValueError("absolute validation plots require --calendar-receipt")
+                interval = case["actual_intervals"]["val"]
+                count, first, last = interval["sessions"], interval["first"], interval["last"]
+                dates_sha = case["period_contract"]["panel_calendar_sha256"]
+                returns_sha = "summary_only"
+            else:
+                filename = "deployment_test_backtest.npz" if split == "deployment" else "test_backtest.npz"
+                with np.load(fold_dir / filename, allow_pickle=False) as archive:
+                    dates = np.asarray(archive["dates"], dtype="datetime64[D]")
+                    returns = np.asarray(archive["strategy_returns"], dtype=np.float64)
+                if (dates.ndim != 1 or returns.ndim != 1 or not len(dates)
+                        or len(dates) != len(returns) or np.isnat(dates).any()
+                        or np.any(dates[1:] <= dates[:-1]) or np.isnan(returns).any()):
+                    raise ValueError(f"invalid observed backtest dates/returns: {fold_dir / filename}")
+                count, first, last = len(dates), str(dates[0]), str(dates[-1])
+                stem = "deployment" if split == "deployment" else "test"
+                if (count, first, last) != (marker[f"{stem}_rows"], marker[f"{stem}_date_start"],
+                                            marker[f"{stem}_date_end"]):
+                    raise ValueError(f"backtest/complete receipt coverage differs: {marker_path}")
+                if case:
+                    interval = case["actual_intervals"]["test"]
+                    if (count, first, last) != (interval["sessions"], interval["first"], interval["last"]):
+                        raise ValueError(f"calendar/backtest coverage differs: {name}")
+                dates_sha = hashlib.sha256(dates.astype("<i8").tobytes()).hexdigest()
+                returns_sha = hashlib.sha256(returns.astype("<f8").tobytes()).hexdigest()
+                series[name, fold_id] = (dates, returns)
+            period = (fold_id, tuple(row["train_years"]), tuple(row["val_years"]),
+                      count, first, last, dates_sha)
+            cohort_id = hashlib.sha256(json.dumps(period).encode()).hexdigest()[:8]
+            record = {"variant": name, "fold_id": fold_id, "cohort_id": cohort_id,
+                      "train_years": "-".join(map(str, row["train_years"])),
+                      "val_years": "-".join(map(str, row["val_years"])),
+                      "test_years": "-".join(map(str, row["test_years"])),
+                      "calculation_rows": count, "calculation_date_start": first,
+                      "calculation_date_end": last, "dates_sha256": dates_sha,
+                      "returns_sha256": returns_sha,
+                      "summary_sha256": hashlib.sha256((root / name / "summary.json").read_bytes()).hexdigest()}
+            record.update({metric_name: float(row[f"{split}_metrics"][metric_name])
+                           for metric_name in METRIC_NAMES})
+            records.append(record)
+    # Preserve the configured/completed queue order, not a ranking of unlike periods.
+    queue_path = root / "summary.json"
+    queue = json.loads(queue_path.read_text()) if queue_path.is_file() else []
+    order = {row["name"]: index for index, row in enumerate(queue) if "name" in row}
+    records.sort(key=lambda row: (order.get(row["variant"], len(order)), row["variant"], row["fold_id"]))
+    return records, series
+
+
+def _write_absolute_plots(root: Path, output: Path, split: str, prefix: str,
+                          scope_label: str, calendar_receipt: Path | None) -> dict:
+    """Incremental reporting without a statistical or synthetic reference run."""
+    from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_text
+
+    records, series = _absolute_records(root, split, calendar_receipt)
+    clean_records = [{key: (None if isinstance(value, float) and not math.isfinite(value) else value)
+                      for key, value in row.items()} for row in records]
+    identity = {"contract": "absolute_ablation_charts_v1", "split": split, "prefix": prefix,
+                "scope_label": scope_label, "records": clean_records,
+                "renderer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    status_path = output / f"{prefix}_plot_status.json"
+    output.mkdir(parents=True, exist_ok=True)
+    if status_path.is_file():
+        previous = json.loads(status_path.read_text())
+        pngs = [output / path for path in previous.get("png_files", [])]
+        def valid_png(path):
+            if not path.is_file():
+                return False
+            with path.open("rb") as handle:
+                return handle.read(8) == b"\x89PNG\r\n\x1a\n"
+        csvs = [output / f"{prefix}_{suffix}.csv" for suffix in ("fold_metrics", "absolute_sharpe_summary")]
+        if (previous.get("input_sha256") == digest and pngs and all(valid_png(path) for path in pngs)
+                and all(path.is_file() and path.stat().st_size > 0 for path in csvs)):
+            return previous
+    groups = {}
+    for row in records:
+        groups.setdefault(row["cohort_id"], []).append(row)
+    status = {**identity, "input_sha256": digest,
+              "state": "charts_written" if records else "waiting_completed_runs",
+              "comparison_mode": "absolute", "completed_observations": len(records),
+              "configured_variants": [path.stem for path in sorted((root / "generated_configs").glob("*.yaml"))],
+              "paired_effects_available": False, "confidence_intervals_available": False,
+              "note": "No matched baseline. Separate date/train-ownership cohorts; no pooled ranking or one-fold CI.",
+              "png_files": []}
+    if not records:
+        atomic_write_json(status_path, status)
+        return status
+    table = io.StringIO()
+    writer = csv.DictWriter(table, fieldnames=list(records[0]))
+    writer.writeheader()
+    writer.writerows(records)
+    atomic_write_text(output / f"{prefix}_fold_metrics.csv", table.getvalue())
+    table = io.StringIO()
+    writer = csv.writer(table)
+    writer.writerow(["variant", "fold_id", "cohort_id", "mean_sharpe", "ci95_low", "ci95_high", "median_sharpe"])
+    writer.writerows([row["variant"], row["fold_id"], row["cohort_id"], row["sharpe"], "", "", row["sharpe"]]
+                     for row in records)
+    atomic_write_text(output / f"{prefix}_absolute_sharpe_summary.csv", table.getvalue())
+    plt.rcParams.update({"font.size": 10, "axes.titleweight": "bold", "figure.facecolor": "white"})
+    blue, ink, grid = "#2864A8", "#252A34", "#D9DEE7"
+    groups = list(groups.values())
+
+    def title(rows):
+        row = rows[0]
+        return (f"Fold {row['fold_id']} | {row['calculation_rows']} sessions\n"
+                f"{row['calculation_date_start']} to {row['calculation_date_end']}")
+
+    def save(fig, filename):
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", dpi=160, bbox_inches="tight")
+        atomic_write_bytes(output / filename, buffer.getvalue())
+        plt.close(fig)
+        status["png_files"].append(filename)
+
+    fig, axes = plt.subplots(1, len(groups), squeeze=False,
+                             figsize=(max(11, 8 * len(groups)), max(6, .32 * max(map(len, groups)) + 3)),
+                             sharex=True)
+    for ax, rows in zip(axes[0], groups, strict=True):
+        for index, row in enumerate(rows):
+            if math.isfinite(row["sharpe"]):
+                ax.scatter(row["sharpe"], index, color=blue, edgecolor=ink, zorder=3)
+            else:
+                ax.text(.02, index, "unavailable", transform=ax.get_yaxis_transform())
+        ax.set_yticks(range(len(rows)), [display_label(row["variant"]) for row in rows])
+        ax.set_ylim(-.75, len(rows) - .25)
+        ax.axvline(0, color=ink, lw=.8)
+        ax.set_xlabel("Observed Sharpe (no baseline subtraction or CI)")
+        ax.set_title(title(rows))
+        ax.grid(axis="x", color=grid)
+    fig.suptitle(f"Absolute {scope_label} Sharpe by completed variant", fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, .93))
+    save(fig, f"{prefix}_absolute_sharpe_by_variant.png")
+
+    names = list(dict.fromkeys(row["variant"] for row in records))
+    matrix = np.full((len(names), len(groups)), np.nan)
+    for col, rows in enumerate(groups):
+        for row in rows:
+            matrix[names.index(row["variant"]), col] = row["sharpe"]
+    finite = matrix[np.isfinite(matrix)]
+    limit = max(1., float(np.max(np.abs(finite)))) if finite.size else 1.
+    cmap = plt.get_cmap("RdBu").with_extremes(bad="#E6E8EC")
+    fig, ax = plt.subplots(figsize=(max(12, 4 * len(groups)), max(6, .34 * len(names) + 3)))
+    mark = ax.imshow(np.ma.masked_invalid(matrix), aspect="auto", cmap=cmap, vmin=-limit, vmax=limit)
+    ax.set_yticks(range(len(names)), [display_label(name) for name in names])
+    ax.set_xticks(range(len(groups)), [title(rows) for rows in groups])
+    for r in range(len(names)):
+        for c in range(len(groups)):
+            ax.text(c, r, f"{matrix[r, c]:.3f}" if np.isfinite(matrix[r, c]) else "N/A",
+                    ha="center", va="center",
+                    color="white" if np.isfinite(matrix[r, c]) and abs(matrix[r, c]) > .6 * limit else ink)
+    fig.colorbar(mark, ax=ax, label="Absolute Sharpe (not a paired effect)")
+    ax.set_title(f"{scope_label}: observed folds; grey cells are not comparable/missing")
+    fig.tight_layout()
+    save(fig, f"{prefix}_fold_sharpe_heatmap.png")
+
+    for metric_name, metric_label in RISK_SCATTER_Y_METRICS:
+        height = max(7, .35 * max(map(len, groups)) + 3)
+        fig = plt.figure(figsize=(max(15, 11 * len(groups)), height))
+        for index, rows in enumerate(groups):
+            # Reserve both side label columns for every full experiment name.
+            width = 1 / len(groups)
+            ax = fig.add_axes([index * width + .23 * width, .15, .54 * width, .66])
+            valid = [row for row in rows if math.isfinite(row["max_drawdown"]) and math.isfinite(row[metric_name])]
+            if valid:
+                x = np.asarray([row["max_drawdown"] for row in valid])
+                y = np.asarray([row[metric_name] for row in valid])
+                xpad, ypad = max(.002, float(np.ptp(x)) * .15), max(.005, float(np.ptp(y)) * .15)
+                ax.set_xlim(float(x.min()) - xpad, float(x.max()) + xpad)
+                ax.set_ylim(float(y.min()) - ypad, float(y.max()) + ypad)
+                ranked = sorted(valid, key=lambda row: row["max_drawdown"])
+                cut = (len(ranked) + 1) // 2
+                for side_rows, side_x, align in [(ranked[:cut], -.035, "right"), (ranked[cut:], 1.035, "left")]:
+                    side_rows = sorted(side_rows, key=lambda row: row[metric_name])
+                    positions = (np.linspace(.08, .92, len(side_rows)) if len(side_rows) > 1
+                                 else [.5] if side_rows else [])
+                    for row, position in zip(side_rows, positions, strict=True):
+                        xy = (row["max_drawdown"], row[metric_name])
+                        ax.scatter(*xy, color=blue, edgecolor="white", zorder=3)
+                        ax.annotate(display_label(row["variant"]), xy=xy, xytext=(side_x, position),
+                                    textcoords="axes fraction", ha=align, va="center", fontsize=10,
+                                    annotation_clip=False, arrowprops={"arrowstyle": "-", "color": blue, "lw": .7})
+            if len(valid) != len(rows):
+                ax.text(.5, -.17, "Non-finite metrics: see CSV; never replaced by zero", transform=ax.transAxes, ha="center")
+            ax.xaxis.set_major_formatter(PercentFormatter(1))
+            if metric_name in {"cagr", "daily_hit_rate"}:
+                ax.yaxis.set_major_formatter(PercentFormatter(1))
+            ax.set_xlabel("Max drawdown (less negative is better)")
+            ax.set_title(title(rows))
+            ax.text(.01, .98, metric_label, transform=ax.transAxes, va="top")
+            ax.grid(color=grid)
+        fig.suptitle(f"{scope_label}: drawdown vs {metric_label}", fontweight="bold", y=.98)
+        fig.text(.5, .925, "Completed fold observations; separate intervals, no pooled median or baseline effect",
+                 ha="center", color="#596273")
+        filename = f"{prefix}_risk_return_{metric_name}_medians.png"
+        save(fig, filename)
+        if metric_name == "cagr":
+            alias = f"{prefix}_risk_return_medians.png"
+            atomic_write_bytes(output / alias, (output / filename).read_bytes())
+            status["png_files"].append(alias)
+
+    if series:
+        from stockagent.backtest.report import _safe_equity_for_plot
+        fig, axes = plt.subplots(1, len(groups), squeeze=False, figsize=(max(12, 8 * len(groups)), 6))
+        palette = ["#2864A8", "#D9782D", "#697B43", "#9E5885", "#AF8C37"]
+        for ax, rows in zip(axes[0], groups, strict=True):
+            for row in rows:
+                dates, returns = series[row["variant"], row["fold_id"]]
+                slot = names.index(row["variant"])
+                ax.plot(dates, _safe_equity_for_plot(returns), label=display_label(row["variant"]),
+                        color=palette[slot % len(palette)], linestyle=["-", "--", ":", "-."][(slot // len(palette)) % 4])
+            ax.set_xlim(np.datetime64(rows[0]["calculation_date_start"]), np.datetime64(rows[0]["calculation_date_end"]))
+            ax.set_title(title(rows))
+            ax.set_ylabel("Normalized equity (canonical plot scale)")
+            ax.legend(loc="upper left", bbox_to_anchor=(0, -.17))
+            ax.grid(color=grid)
+        fig.suptitle(f"{scope_label}: persisted net-return equity, separate ownership periods", fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, .94))
+        save(fig, f"{prefix}_equity_by_variant.png")
+    atomic_write_json(status_path, status)
+    return status
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -348,7 +610,18 @@ def main() -> None:
     parser.add_argument("--prefix", default=None)
     parser.add_argument("--baseline-root", type=Path, default=None)
     parser.add_argument("--scope-label", default=None)
+    parser.add_argument("--comparison-mode", choices=("paired", "absolute"), default="paired")
+    parser.add_argument("--calendar-receipt", type=Path, default=None)
     args = parser.parse_args()
+    if args.comparison_mode == "absolute":
+        prefix = args.prefix or args.split
+        if not prefix or Path(prefix).name != prefix:
+            raise ValueError("invalid plot prefix")
+        status = _write_absolute_plots(args.root, args.output_dir, args.split, prefix,
+            args.scope_label or args.split, args.calendar_receipt)
+        print(json.dumps({key: status[key] for key in
+                          ("state", "completed_observations", "png_files", "paired_effects_available")}))
+        return
     runs = load(args.root, args.split, baseline_root=args.baseline_root)
     fold_count = len(runs["baseline"])
     prefix = args.prefix or args.split

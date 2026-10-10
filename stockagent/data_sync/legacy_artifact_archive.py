@@ -58,6 +58,8 @@ MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "m
 MANUAL_OFFLINE_SIMULATION_CONTRACT = "manual-wsl-offline-simulation-preservation-v1"
 MANUAL_TRANSFER_QUARANTINE_CONTRACT = "manual-wsl-retired-transfer-preservation-v1"
 MANUAL_MINUTE_DERIVED_VIEW_CONTRACT = "manual-wsl-retired-minute-view-preservation-v1"
+MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT = "manual-vast-offline-artifact-preservation-v1"
+VAST_OFFLINE_SCOPES = frozenset({"smoke", "operations"})
 RETIRED_MINUTE_DERIVED_VIEWS = frozenset({
     "data_tw_minute/research_dataset_developing_v5",
     "data_tw_minute/research_dataset_schema2_volume_bug_20260807",
@@ -81,6 +83,11 @@ def reviewed_transfer_quarantine_root(relative: str) -> bool:
 
 def reviewed_minute_derived_view_root(relative: str) -> bool:
     return _safe_relative_path(relative, "retired minute derived view").as_posix() in RETIRED_MINUTE_DERIVED_VIEWS
+
+
+def reviewed_vast_offline_root(relative: str) -> bool:
+    path = _safe_relative_path(relative, "reviewed Vast offline artifact root")
+    return len(path.parts) == 2 and path.parts[0] in VAST_OFFLINE_SCOPES
 
 
 @dataclass(frozen=True)
@@ -116,7 +123,8 @@ def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
         relative = _safe_relative_path(item.get("relative_root", ""), "legacy root")
         capture_contract = item.get("capture_contract")
         if capture_contract not in {None, MANUAL_WSL_CAPTURE_CONTRACT, MANUAL_OFFLINE_SIMULATION_CONTRACT,
-                                    MANUAL_TRANSFER_QUARANTINE_CONTRACT, MANUAL_MINUTE_DERIVED_VIEW_CONTRACT}:
+                                    MANUAL_TRANSFER_QUARANTINE_CONTRACT, MANUAL_MINUTE_DERIVED_VIEW_CONTRACT,
+                                    MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT}:
             raise SnapshotError("unknown manual artifact preservation contract")
         allowed = {"markets", "ablations"}
         if capture_contract == MANUAL_WSL_CAPTURE_CONTRACT:
@@ -133,6 +141,10 @@ def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
             if not reviewed_minute_derived_view_root(relative.as_posix()):
                 raise SnapshotError("retired minute view capture excludes current originals and other data roots")
             allowed = {"data_tw_minute"}
+        if capture_contract == MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT:
+            if not reviewed_vast_offline_root(relative.as_posix()):
+                raise SnapshotError("Vast offline capture requires one explicitly reviewed smoke/operations root")
+            allowed = VAST_OFFLINE_SCOPES
         if relative.parts[0] not in allowed or len(relative.parts) < 2:
             raise SnapshotError("legacy archives must be scoped under markets or ablations")
         days = item.get("minimum_stable_days")
@@ -183,6 +195,9 @@ def source_plan(
         raise SnapshotError("manual capture must be an explicit boolean")
     if spec.capture_contract is not None and not manual_capture:
         raise SnapshotError("reviewed WSL artifacts require explicit manual capture; no automatic enrollment")
+    if (spec.capture_contract == MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT
+            and not reviewed_vast_offline_root(spec.relative_root)):
+        raise SnapshotError("Vast offline capture is outside its reviewed namespaces")
     if (spec.capture_contract == MANUAL_OFFLINE_SIMULATION_CONTRACT
             and not reviewed_offline_simulation_root(spec.relative_root)):
         raise SnapshotError("offline simulation capture excludes canonical live ledgers")
@@ -753,7 +768,7 @@ def verify_cold_archive(
     temporary = Path(tempfile.mkdtemp(prefix="stockagent-legacy-verify-", dir=scratch_parent))
     try:
         native = _native_read_options(sync_root)
-        archive = fetch_packed_snapshot(sync_root, temporary, resolved, **native)
+        archive = fetch_packed_snapshot(sync_root, temporary, resolved, verification_only=True, **native)
         if sha256_file(archive / "legacy_archive_manifest.json") != metadata.get("legacy_manifest_sha256"):
             raise SnapshotError("reconstructed legacy manifest differs from cold metadata")
         proof = verify_archive_directory(archive, spec=spec)
@@ -766,6 +781,7 @@ def verify_cold_archive(
     proof.update(snapshot_id=resolved.manifest["snapshot_id"],
                  manifest_sha256=resolved.manifest_sha256, cold_verified=True,
                  decoded_originals_verified=True, verification_scratch_removed=True,
+                 verification_only_reconstruction=True,
                  verified_at_epoch=time.time())
     if admission is not None:
         proof["verification_workspace"] = {"parent": str(scratch_parent), **admission}

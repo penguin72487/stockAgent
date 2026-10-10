@@ -18,6 +18,7 @@ import stat
 import subprocess
 import time
 import uuid
+from datetime import datetime
 
 from stockagent.data_sync.artifact_maintenance import artifact_process_references, automatic_dataset_name
 from stockagent.data_sync.artifact_consumers import artifact_service_references
@@ -30,9 +31,11 @@ from stockagent.data_sync.materialized_cache import process_references_many
 CONTRACT = "durable_completed_training_return_v2"
 ACK_TTL_SECONDS = 1800
 ACK_FUTURE_SKEW_SECONDS = 60
-POLICY_FIELDS = {"schema_version", "authority_node_id", "origin_node_id", "scopes", "stable_hours",
+POLICY_FIELDS_V2 = {"schema_version", "authority_node_id", "origin_node_id", "scopes", "stable_hours",
                  "maximum_run_bytes", "maximum_run_files", "reserve_bytes", "retire_verified_source",
                  "shared_file_policy"}
+POLICY_FIELDS = POLICY_FIELDS_V2 | {"minimum_hot_retention_hours"}
+MINIMUM_HOT_RETENTION_HOURS = 7 * 24
 
 
 def identity(value: dict) -> str:
@@ -42,7 +45,11 @@ def identity(value: dict) -> str:
 
 def load_policy(value: dict | Path) -> dict:
     c = json.loads(value.read_text()) if isinstance(value, Path) else dict(value)
-    if set(c) != POLICY_FIELDS or c["schema_version"] != 2:
+    if c.get("schema_version") == 2 and set(c) == POLICY_FIELDS_V2:
+        # Existing owners may still carry a v2 policy in memory. Their next
+        # authenticated control call must enforce the new retention floor too.
+        c = {**c, "schema_version": 3, "minimum_hot_retention_hours": MINIMUM_HOT_RETENTION_HOURS}
+    if set(c) != POLICY_FIELDS or c["schema_version"] != 3:
         raise SnapshotError("unsupported completed training return policy")
     if c["authority_node_id"] != "penguin" or c["origin_node_id"] != "vastai1T":
         raise SnapshotError("completed training return needs the enrolled two roles")
@@ -59,7 +66,66 @@ def load_policy(value: dict | Path) -> dict:
         raise SnapshotError("completed training source retirement must be explicit")
     if c["shared_file_policy"] != "unlink_returned_names_only":
         raise SnapshotError("shared returned files must preserve every external inode name")
+    hours = c["minimum_hot_retention_hours"]
+    if (type(hours) not in (int, float) or not math.isfinite(hours)
+            or not MINIMUM_HOT_RETENTION_HOURS <= hours <= 24 * 365):
+        raise SnapshotError("formal training hot retention must be at least seven days")
     return c
+
+
+def training_hot_retention(source: Path, rows: list[dict], *,
+                           minimum_hours: float = MINIMUM_HOT_RETENTION_HOURS,
+                           required: bool = False) -> dict:
+    """Retain formal results after completion AND the last source write.
+
+    Publication remains independent. Legacy/bulk parents containing a recent
+    lifecycle inherit this same floor; ordinary panel/cache trees do not.
+    Static evidence enters the plan fingerprint, never a changing age value.
+    """
+    if (type(minimum_hours) not in (int, float) or not math.isfinite(minimum_hours)
+            or minimum_hours < MINIMUM_HOT_RETENTION_HOURS):
+        raise SnapshotError("formal training hot retention cannot be bypassed")
+    files = {row["path"]: row for row in rows if row["kind"] == "file"}
+    markers = {"run_manifest.json", "progress.json", "epoch_curve.jsonl",
+               "checkpoint_best.pt", "checkpoint_last.pt"}
+    applies = required or any(PurePosixPath(name).name in markers for name in files)
+    if not applies:
+        return {"applies": False, "minimum_hours": minimum_hours, "blockers": []}
+    if not files:
+        raise SnapshotError("formal training retention has no source evidence")
+    newest = max(int(row["signature"][3]) for row in files.values())
+    completions = []
+    for name in sorted(files):
+        if PurePosixPath(name).name != "run_manifest.json":
+            continue
+        path = source / str(PurePosixPath(name).parent) / "progress.json"
+        try:
+            progress = json.loads(path.read_text())
+            if progress.get("state") != "complete":
+                if required:
+                    raise SnapshotError("formal training retention requires completed lifecycle")
+                continue
+            stamp = datetime.fromisoformat(progress["updated_at"].replace("Z", "+00:00"))
+            if stamp.tzinfo is None or not math.isfinite(stamp.timestamp()):
+                raise ValueError("completion timestamp lacks timezone")
+            completions.append({"progress_relative": path.relative_to(source).as_posix(),
+                                "completed_at": stamp.isoformat(), "epoch": stamp.timestamp()})
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise SnapshotError("formal training retention evidence is unreadable") from error
+    if required and not completions:
+        raise SnapshotError("formal training retention lacks canonical completion timestamp")
+    anchor = max([newest / 1_000_000_000, *(r["epoch"] for r in completions)])
+    until = anchor + minimum_hours * 3600
+    return {"applies": True, "minimum_hours": minimum_hours,
+            "newest_source_mtime_ns": newest, "completions": completions,
+            "retain_until_epoch": until,
+            "blockers": ["training-hot-retention-not-expired"] if time.time() < until else []}
+
+
+def recovered_source_references(source: Path, repo_root: Path) -> list[str]:
+    # Lazy import avoids the existing shared-inode helper's import cycle.
+    from stockagent.data_sync.remote_legacy_return import recovery_hold_references
+    return recovery_hold_references(source, repo_root)
 
 
 def admitted(relative: str, policy: dict) -> bool:
@@ -234,8 +300,14 @@ def plan_retirement(artifact_root: Path, state_root: Path, repo_root: Path, ack:
             dependency_error.update(file_name=Path(error.filename or "unknown").name, line=error.lineno)
     observed = inventory(source)
     _matches(observed, ack)
+    retention = training_hot_retention(source, observed["rows"],
+                                      minimum_hours=policy["minimum_hot_retention_hours"], required=True)
+    recovery_refs = recovered_source_references(source, repo_root)
     inode_refs = shared_inode_references(observed)
     blockers = (["retirement-disabled"] if not policy["retire_verified_source"] else [])
+    blockers += retention["blockers"]
+    if recovery_refs:
+        blockers.append("source-recovery-hold")
     if refs:
         blockers.append("source-in-use")
     if service_refs:
@@ -248,7 +320,8 @@ def plan_retirement(artifact_root: Path, state_root: Path, repo_root: Path, ack:
             "policy_identity_sha256": identity(policy), "relative_root": ack["relative_root"],
             "source": str(source), "rows": observed["rows"], "allocated_bytes": observed["allocated_bytes"],
             "process_references": refs, "service_references": service_refs,
-            "service_dependency_error": dependency_error, "blockers": blockers}
+            "service_dependency_error": dependency_error, "blockers": blockers,
+            "hot_retention": retention, "recovery_references": recovery_refs}
     body.update(shared_file_names=observed["shared_file_names"], shared_inode_references=inode_refs)
     return {**body, "plan_fingerprint": identity(body)}
 
@@ -285,6 +358,10 @@ def apply_retirement(artifact_root: Path, state_root: Path, repo_root: Path, ack
             raise SnapshotError("shared returned inode became active; retained quarantine")
         if artifact_service_references([source], repo_root).get(str(source)):
             raise SnapshotError("returned source acquired a service dependency; retained quarantine")
+        if (recovered_source_references(source, repo_root)
+                or training_hot_retention(quarantine, observed["rows"],
+                    minimum_hours=policy["minimum_hot_retention_hours"], required=True)["blockers"]):
+            raise SnapshotError("returned source retention/hold changed; retained quarantine")
         validate_ack(ack, policy)
         inode_states = {}
         for row in observed["rows"]:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
 import json
 import os
 import platform
 import shutil
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,6 +23,128 @@ from stockagent.runtime_identity import runtime_identity, validate_runtime_lock
 REQUIRED = ("numpy", "pyarrow", "yaml", "torch", "polars")
 
 
+def _torch_cuda_report(torch, *, require_cuda: bool, minimum_devices: int = 1) -> tuple[dict, list[str]]:
+    """Separate NVML discovery from initialized, executable CUDA devices.
+
+    CUDA visibility is inherited before this process imports Torch and is never
+    changed here. This process exits after preflight; its CUDA/RNG state cannot
+    contaminate a trainer or the long-lived ablation scheduler.
+    """
+    info = {
+        "cuda_available": False,
+        "cuda_version": torch.version.cuda,
+        "device_count": 0,
+        "devices": [],
+        "cuda_runtime_initialized": False,
+        "cuda_compute_verified": False,
+        "verified_device_indices": [],
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "minimum_cuda_devices": minimum_devices if require_cuda else None,
+        "probe_errors": [],
+        "probe_contract": "initialized_compute_cuda_preflight_v2",
+    }
+
+    def error(stage: str, exc: Exception) -> None:
+        info["probe_errors"].append({"stage": stage, "type": type(exc).__name__, "message": str(exc)})
+
+    available = False
+    try:
+        available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        error("availability", exc)
+    try:
+        info["device_count"] = int(torch.cuda.device_count())
+    except Exception as exc:
+        error("discovery", exc)
+    count = info["device_count"]
+    if not available or count <= 0 or info["probe_errors"]:
+        reasons = [f"CUDA {item['stage']} failed: {item['type']}: {item['message']}"
+                   for item in info["probe_errors"]]
+        if require_cuda or count > 0:
+            reasons.append(f"CUDA compute is unavailable; discovered devices={count}. "
+                           "NVML device discovery is not proof of CUDA initialization.")
+        return info, reasons
+    if require_cuda and count < minimum_devices:
+        return info, [f"CUDA requires at least {minimum_devices} devices; discovered {count}"]
+    try:
+        torch.cuda.init()
+        info["cuda_runtime_initialized"] = True
+    except Exception as exc:
+        error("initialization", exc)
+    if info["cuda_runtime_initialized"]:
+        for index in range(count):
+            try:
+                name = torch.cuda.get_device_name(index)
+                info["devices"].append(name)
+                if require_cuda:
+                    value = torch.ones(1, device=f"cuda:{index}")
+                    torch.cuda.synchronize(index)
+                    if float(value.item()) != 1.0:
+                        raise RuntimeError("one-element CUDA allocation/kernel verification failed")
+                    info["verified_device_indices"].append(index)
+                    del value
+            except Exception as exc:
+                error(f"device:{index}", exc)
+                break
+    info["cuda_compute_verified"] = bool(require_cuda and len(info["verified_device_indices"]) == count)
+    info["cuda_available"] = bool(info["cuda_runtime_initialized"] and not info["probe_errors"])
+    reasons = [f"CUDA {item['stage']} failed: {item['type']}: {item['message']}"
+               for item in info["probe_errors"]]
+    return info, reasons
+
+
+def _gpu_recovery_diagnostics() -> dict:
+    """NVML recovery flags explain host ownership; they never prove compute health."""
+    info = {"status": "unavailable", "gpus": [], "host_os_reboot_required": None}
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid,gpu_recovery_action", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"nvidia-smi exit {result.returncode}: {result.stderr.strip()[:1024]}")
+        gpus = []
+        for row in csv.reader(result.stdout.splitlines()):
+            if not row:
+                continue
+            if len(row) != 3 or not row[0].strip().isdigit() or not row[1].strip().startswith("GPU-"):
+                raise ValueError("unexpected nvidia-smi GPU recovery query row")
+            gpus.append({"index": int(row[0]), "uuid": row[1].strip(), "recovery_action": row[2].strip()})
+        if not gpus:
+            raise ValueError("nvidia-smi GPU recovery query returned no rows")
+        info.update(status="observed", gpus=gpus,
+                    host_os_reboot_required=any(gpu["recovery_action"].lower() == "reboot" for gpu in gpus))
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        info["error"] = {"type": type(exc).__name__, "message": str(exc)}
+    return info
+
+
+def _cuda_device_diagnostics() -> dict:
+    """Read/open only: never chmod, recreate devices, or reset a host driver."""
+    nodes = []
+    for name in ("/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"):
+        node = {"path": name}
+        try:
+            value = Path(name).stat()
+            node["character_device"] = stat.S_ISCHR(value.st_mode)
+            if node["character_device"]:
+                node.update(major=os.major(value.st_rdev), minor=os.minor(value.st_rdev))
+                descriptor = os.open(name, os.O_RDWR | os.O_CLOEXEC)
+                os.close(descriptor)
+                node["open"] = "ok"
+        except OSError as exc:
+            node["error"] = {"errno": exc.errno, "message": str(exc)}
+        nodes.append(node)
+    recovery = _gpu_recovery_diagnostics()
+    hint = "If UVM has EIO or permission errors, the host/container GPU owner must restore device access."
+    if recovery["host_os_reboot_required"]:
+        hint = ("NVIDIA reports GPU Recovery Action=Reboot: the physical host OS requires recovery/reboot "
+                "by the host owner. Restarting only the Docker instance is not a host OS reboot.")
+    return {"device_nodes": nodes, "gpu_recovery": recovery,
+            "recovery_hint": hint + " Do not reinstall the injected driver, hide the error with "
+                             "NVML-only checks, or fall back to CPU."}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate and describe the selected stockAgent runtime.")
     parser.add_argument(
@@ -32,11 +157,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="treat runtime consistency warnings as failures",
     )
+    parser.add_argument("--minimum-cuda-devices", type=int, default=1,
+                        help="required device count with --require-cuda (DDP launchers use 2)")
     parser.add_argument("--runtime-lock-output", type=Path,
                         help="write an exact installed-runtime identity after successful validation")
     parser.add_argument("--expected-runtime-lock", type=Path,
                         help="fail when installed packages or the platform differ from this lock")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.minimum_cuda_devices < 1:
+        parser.error("--minimum-cuda-devices must be positive")
+    if args.minimum_cuda_devices != 1 and not args.require_cuda:
+        parser.error("--minimum-cuda-devices requires --require-cuda")
+    return args
 
 
 def main() -> int:
@@ -69,14 +201,12 @@ def main() -> int:
     if modules.get("torch") is not None:
         import torch
 
-        torch_info = {
-            "cuda_available": bool(torch.cuda.is_available()),
-            "cuda_version": torch.version.cuda,
-            "device_count": int(torch.cuda.device_count()),
-            "devices": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
-        }
-        if args.require_cuda and not torch_info["cuda_available"]:
-            failures.append("CUDA is required but torch.cuda.is_available() is false")
+        torch_info, cuda_errors = _torch_cuda_report(
+            torch, require_cuda=args.require_cuda, minimum_devices=args.minimum_cuda_devices,
+        )
+        (failures if args.require_cuda else warnings).extend(cuda_errors)
+        if not torch_info["cuda_available"] and torch.version.cuda is not None:
+            torch_info["device_diagnostics"] = _cuda_device_diagnostics()
 
     conda_prefix = os.environ.get("CONDA_PREFIX")
     conda_prefix_matches = conda_prefix is None or Path(conda_prefix).resolve() == python_prefix

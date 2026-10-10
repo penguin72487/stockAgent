@@ -353,11 +353,16 @@ def _postprocess_plot_specs(spec: dict[str, Any]) -> list[dict[str, str]]:
             raise ValueError(f"postprocess_plots[{index}] has invalid split")
         if not _SAFE_NAME.fullmatch(prefix):
             raise ValueError(f"postprocess_plots[{index}] has invalid prefix")
+        comparison_mode = str(entry.get("comparison_mode", "paired"))
+        if comparison_mode not in {"paired", "absolute"}:
+            raise ValueError(f"postprocess_plots[{index}] has invalid comparison_mode")
         plots.append(
             {
                 "split": split,
                 "prefix": prefix,
                 "scope_label": str(entry.get("scope_label", "")).strip(),
+                "comparison_mode": comparison_mode,
+                "calendar_receipt": str(entry.get("calendar_receipt", "")).strip(),
             }
         )
     if len({plot["prefix"] for plot in plots}) != len(plots):
@@ -389,7 +394,22 @@ def _render_postprocess_plots(
             command.extend(["--scope-label", plot["scope_label"]])
         if baseline_root is not None:
             command.extend(["--baseline-root", str(baseline_root)])
+        if plot.get("comparison_mode", "paired") != "paired":
+            command.extend(["--comparison-mode", plot["comparison_mode"]])
+        if plot.get("calendar_receipt"):
+            command.extend(["--calendar-receipt", plot["calendar_receipt"]])
         subprocess.run(command, cwd=REPO_ROOT, check=True)
+
+
+def _available_postprocess_plots(output_root: Path, plots: list[dict[str, str]],
+                                 baseline_root: Path | None) -> list[dict[str, str]]:
+    if baseline_root is not None or (output_root / "baseline" / "summary.json").is_file():
+        return plots
+    available = [plot for plot in plots if plot.get("comparison_mode", "paired") == "absolute"]
+    if len(available) != len(plots):
+        print("[ablation] paired charts deferred: no matching baseline; "
+              "absolute charts remain available", flush=True)
+    return available
 
 
 def _resolve_path(raw: str | Path, *, relative_to: Path) -> Path:
@@ -677,6 +697,32 @@ def _experiment_rows(spec_path: Path, selected: set[str] | None = None) -> tuple
     return spec, rows
 
 
+def _last_fold_id(config: Any) -> int:
+    """Resolve the last canonical fold from metadata, not a guessed year/ID."""
+    import numpy as np
+    from stockagent.data.walkforward import (
+        build_expanding_year_folds, year_boundary_offset_sessions,
+    )
+
+    path = getattr(config.data, "factorized_feature_manifest", None)
+    if not path:
+        raise ValueError("fold_selection=last requires a dated factorized feature manifest")
+    dates = np.asarray(json.loads(Path(path).read_text())["dates"], dtype="datetime64[D]")
+    if dates.ndim != 1 or not dates.size or np.isnat(dates).any() or np.any(dates[1:] <= dates[:-1]):
+        raise ValueError("fold selection calendar must be nonempty, finite and strictly increasing")
+    w = config.walk_forward
+    folds = build_expanding_year_folds(dates, min_train_years=w.min_train_years,
+        val_years=w.val_years, require_future_test_year=w.require_future_test_year,
+        split_start_year=w.split_start_year,
+        year_boundary_offset_sessions=year_boundary_offset_sessions(config))
+    return int(folds[-1].fold_id)
+
+
+def _run_start_fold(run: dict[str, Any], explicit: int | None) -> int:
+    """One fold owner for argv, completion checks, summary and retries."""
+    return int(explicit if explicit is not None else run.get("start_fold", 1))
+
+
 def _build_configs(
     spec_path: Path,
     spec: dict[str, Any],
@@ -696,6 +742,9 @@ def _build_configs(
     fixed_overrides = spec.get("matrix", {}).get("fixed_overrides", {})
     if not isinstance(fixed_overrides, dict):
         raise ValueError("matrix.fixed_overrides must be a mapping")
+    selection = spec.get("fold_selection")
+    if selection not in (None, "last"):
+        raise ValueError("fold_selection must be 'last' or omitted")
     generated_root = output_root / "generated_configs"
     generated_root.mkdir(parents=True, exist_ok=True)
 
@@ -714,13 +763,19 @@ def _build_configs(
         with config_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(raw, handle, sort_keys=False, allow_unicode=True)
         # Validate every effective config before launching the first expensive run.
-        load_config(config_path)
+        config = load_config(config_path)
+        if selection == "last":
+            raw["runner"]["start_fold"] = _last_fold_id(config)
+            with config_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(raw, handle, sort_keys=False, allow_unicode=True)
+            config = load_config(config_path)
         rows.append(
             {
                 **experiment,
                 "source_config_path": base_path,
                 "config_path": config_path,
                 "output_dir": run_dir,
+                "start_fold": int(config.runner.start_fold),
             }
         )
     return rows
@@ -857,6 +912,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--plots-only", action="store_true",
+                        help="Refresh completed-result charts without configs, workers, summary or checkpoints.")
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--force", action="store_true", help="Run even when all requested fold markers exist.")
     parser.add_argument("--stop-on-fail", action="store_true")
@@ -922,6 +979,15 @@ def main() -> None:
         )
     )
     output_root.mkdir(parents=True, exist_ok=True)
+    if args.plots_only:
+        if args.dry_run or args.collect_only:
+            raise ValueError("--plots-only cannot be combined with --dry-run/--collect-only")
+        baseline_raw = spec.get("baseline_artifact_root")
+        baseline = _resolve_path(str(baseline_raw), relative_to=REPO_ROOT) if baseline_raw else None
+        plots = _available_postprocess_plots(output_root, _postprocess_plot_specs(spec), baseline)
+        if plots:
+            _render_postprocess_plots(output_root, plots, baseline_root=baseline)
+        return
     runs = _build_configs(spec_path, spec, experiments, output_root)
     runtime = spec.get("runtime", {})
     if not isinstance(runtime, dict):
@@ -968,18 +1034,13 @@ def main() -> None:
         nonlocal plots_refreshed
         if not postprocess_plots:
             return
-        if baseline_root is None and not (
-            output_root / "baseline" / "summary.json"
-        ).is_file():
-            print(
-                "[ablation] charts deferred until baseline/summary.json exists",
-                flush=True,
-            )
+        available_plots = _available_postprocess_plots(output_root, postprocess_plots, baseline_root)
+        if not available_plots:
             return
         try:
             _render_postprocess_plots(
                 output_root,
-                postprocess_plots,
+                available_plots,
                 baseline_root=baseline_root,
             )
         except subprocess.CalledProcessError as exc:
@@ -1029,7 +1090,7 @@ def main() -> None:
     ) -> None:
         complete_after, requested_after = _fold_status(
             run["output_dir"],
-            args.start_fold,
+            _run_start_fold(run, args.start_fold),
             args.max_folds,
             expected_fold_count,
         )
@@ -1073,7 +1134,7 @@ def main() -> None:
     for run_index, run in enumerate(runs, start=1):
         command = [str(args.runner.resolve()), "-c", str(run["config_path"]), "--"]
         for flag, value in (
-            ("--start-fold", args.start_fold),
+            ("--start-fold", _run_start_fold(run, args.start_fold)),
             ("--max-folds", args.max_folds),
             ("--epochs", args.epochs),
             ("--seed", args.seed),
@@ -1086,7 +1147,7 @@ def main() -> None:
 
         complete_before, requested = _fold_status(
             run["output_dir"],
-            args.start_fold,
+            _run_start_fold(run, args.start_fold),
             args.max_folds,
             expected_fold_count,
         )
@@ -1130,6 +1191,11 @@ def main() -> None:
     if args.dry_run:
         _print_progress(total_runs, total_runs, "dry-run configs validated")
         return
+
+    if not args.collect_only and any(row["status"] == "complete" for row in summary_by_order.values()):
+        # Refresh skipped results once before the next expensive worker, not
+        # once per old variant. New successful workers still refresh immediately.
+        refresh_plots("already-complete variants")
 
     active: dict[int, _ActiveRun] = {}
     first_failure: int | None = None
@@ -1362,7 +1428,7 @@ def main() -> None:
                             pending.append(retry_item)
                         complete_after, requested_after = _fold_status(
                             job.run["output_dir"],
-                            args.start_fold,
+                            _run_start_fold(job.run, args.start_fold),
                             args.max_folds,
                             expected_fold_count,
                         )

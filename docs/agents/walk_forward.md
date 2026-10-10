@@ -58,6 +58,14 @@ Use for split ownership, model horizons, benchmark returns and stitched reportin
   a split-only start and silently drop the first `lookback-1` owned targets.
 - For stitched deployment tests, the next model owns its new-year first target
   under panel history; the preceding model stops immediately before that target.
+- Incremental Taiwan stock-account reports replay only the earliest available
+  consecutive completed-fold interval. A pre-existing later fold remains in
+  independent reset-state diagnostics but is deferred from stitched curves until
+  the intervening folds complete; never jump missing sessions or insert synthetic
+  flat rows to age T+2 claims. `walkforward_deployment_coverage.json` records the
+  report contract, stitched and deferred fold IDs. Session gaps within a fold or
+  between adjacent folds remain hard errors. This is report-only and does not
+  invalidate compatible model/optimizer checkpoints.
 - Derive stitched deployment prefix ownership from the authoritative
   `CrossSectionalDataset.valid_indices` of the full fold test. Do not recompute
   mode-specific row eligibility inside the report helper: in particular, the
