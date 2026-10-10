@@ -149,6 +149,58 @@ def test_dry_run_then_exact_cold_backed_retirement(tmp_path, monkeypatch):
     assert not root.exists() and result['cold_deleted'] is False
 
 
+@pytest.mark.parametrize('reason', ['absent', 'consumer', 'changed'])
+def test_candidate_observation_skips_unusable_roots_without_hash_or_delete(tmp_path, monkeypatch, reason):
+    root, data, ack = source(tmp_path, monkeypatch)
+    if reason == 'absent':
+        data.unlink()
+        (root / 'empty').rmdir()
+        root.rmdir()
+    elif reason == 'consumer':
+        monkeypatch.setattr(retirement, 'consumers', lambda *_: ['active-training'])
+    else:
+        data.write_bytes(b'new generation')
+    monkeypatch.setattr(retirement, 'sha256_file', lambda *_: pytest.fail('metadata observation read payload'))
+    result = retirement.observe_preserved_roots(tmp_path, [ack['root']])['cache/one']
+    assert result['deleted'] is False and result['candidate_only'] is True
+    assert result['state'] == {'absent': 'source-absent-without-new-retirement',
+                               'consumer': 'source-protected',
+                               'changed': 'source-changed-from-preservation'}[reason]
+    assert data.exists() == (reason != 'absent')
+
+
+def test_candidate_metadata_is_not_original_byte_proof(tmp_path, monkeypatch):
+    root, data, ack = source(tmp_path, monkeypatch)
+    original_time = data.stat().st_mtime_ns
+    original = data.read_bytes()
+    data.write_bytes(bytes(len(original)))
+    os.utime(data, ns=(original_time, original_time))
+    result = retirement.observe_preserved_roots(tmp_path, [ack['root']])['cache/one']
+    assert result['state'] == 'metadata-candidate-requires-exact-proof'
+    with pytest.raises(SnapshotError, match='original bytes'):
+        retirement.retire(tmp_path, ack, apply=True, state_root=tmp_path / 'state')
+    assert root.is_dir() and data.is_file()
+
+
+def test_batched_training_consumer_observation_protects_only_referenced_roots(tmp_path, monkeypatch):
+    from stockagent.data_sync import node_roles
+    paths = [tmp_path / 'artifacts/cache' / name for name in ('active', 'offline')]
+    monkeypatch.setattr(node_roles, 'training_only_node', lambda: True)
+    calls = []
+    def configs(sources, repo):
+        calls.append(tuple(sources))
+        return {str(p.resolve()): ['pid=12:active-config:closed-input'] if p == paths[0] else [] for p in sources}
+    monkeypatch.setattr(retirement, 'active_configuration_references_many', configs)
+    monkeypatch.setattr(retirement, 'artifact_service_references', lambda sources, _: {str(p): [] for p in sources})
+    monkeypatch.setattr(retirement, 'artifact_process_references_many', lambda *_: [f'pid=12:fd=9:{paths[0]}/array.npy'])
+    result = retirement._candidate_consumers_many(paths, tmp_path)
+    assert result[str(paths[0])] and result[str(paths[1])] == []
+    assert calls == [tuple(paths)]
+    monkeypatch.setattr(retirement, 'artifact_process_references_many', lambda *_: [f'pid=13:cmdline:{tmp_path}/artifacts/cache'])
+    result = retirement._candidate_consumers_many(paths, tmp_path)
+    assert all(any('pid=13:cmdline:' in ref for ref in refs) for refs in result.values())
+
+
 @pytest.mark.parametrize('failure', ['stale', 'hash', 'extra', 'metadata', 'root_metadata', 'consumer', 'transport', 'recent', 'shared'])
 def test_retirement_preserves_source_on_failed_proof(tmp_path, monkeypatch, failure):
     root, data, ack = source(tmp_path, monkeypatch)
@@ -254,6 +306,34 @@ def test_v2_internal_aliases_reclaim_allocated_bytes_once(tmp_path, monkeypatch)
     ack, _ = make_ack(tmp_path, ["cache/one"])
     result = retirement.retire(tmp_path, shared_name_ack(ack), apply=True, state_root=tmp_path / "state")
     assert result["reclaimed_allocated_bytes"] == blocks and not root.exists()
+
+
+def test_shared_original_inode_is_hashed_once_per_verification_pass(tmp_path, monkeypatch):
+    root, data, _ = source(tmp_path, monkeypatch)
+    os.link(data, root / 'another.npy')
+    ack, _ = make_ack(tmp_path, ['cache/one'])
+    calls = []
+    original = retirement.sha256_file
+    def counted(path):
+        calls.append(path)
+        return original(path)
+    monkeypatch.setattr(retirement, 'sha256_file', counted)
+    result = retirement.retire(tmp_path, shared_name_ack(ack), apply=True, state_root=tmp_path / 'state')
+    assert result['deleted'] and not root.exists()
+    # Source plan, repeated plan and quarantine each read the inode afresh.
+    assert len(calls) == 3
+
+
+def test_shared_hash_reuse_still_checks_each_archived_name_digest(tmp_path, monkeypatch):
+    root, data, _ = source(tmp_path, monkeypatch)
+    os.link(data, root / 'another.npy')
+    ack, _ = make_ack(tmp_path, ['cache/one'])
+    row = next(r for r in ack['root']['rows'] if r['path'].endswith('/data.npy'))
+    row['sha256'] = 'f' * 64
+    ack['root']['root_fingerprint_sha256'] = archive.digest(ack['root']['rows'])
+    with pytest.raises(SnapshotError, match='original bytes'):
+        retirement.retire(tmp_path, shared_name_ack(ack), apply=True, state_root=tmp_path / 'state')
+    assert root.is_dir() and data.is_file()
 
 
 @pytest.mark.parametrize("contract,policy", [

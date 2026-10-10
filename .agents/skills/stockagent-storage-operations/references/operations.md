@@ -47,6 +47,14 @@ need bytes／items／deletes 為零，folder／system errors 為零，valid／re
 符合該流程。`scanning` 即使 need 為零也未收斂。冷索引、payload demand、備份 ingress
 與反向 receipts 各有邊界，不能拿一個 folder 通過代替其餘。
 
+來源的 raw ACK admission 核對固定 manifest／READY、已登錄 file keys／SHA／
+bytes 與真正 NAS 獨立還原回執；不把本機整批重讀放在下一批 sender 之前。
+回收仍必須完成原本的 full SHA／exact set／primary 重建與 process gates。
+新清冊錯誤保存原診斷並按 600 秒重試，已提交 registry 的來源繼續傳送；新增
+版本尚未驗收不可算入完整性。不要讓一次清冊錯誤再次阻塞所有已登錄資料。
+NTFS hash／copy 門檻與批次的實測範圍見 `docs/nas_send_verify_parallel_2026-10-06.md`；
+不把單批 hash 或 copy 加速換算成 NAS 全流程的改善倍數。
+
 ## 2. 既有排程與責任
 
 | 節點 | 排程／owner | 主要設定或契約 |
@@ -81,7 +89,10 @@ systemctl start --no-block stockagent-backup-stream.service
 ```
 
 確認同 unit／owner 沒有另一份手動 runner。不要平行直接啟動底層 Python worker，
-不要重啟正在恢復／發布的服務；調整前保存現有收據及程序身分。
+不要臨時重啟正在恢復／發布的服務；調整前保存現有收據及程序身分。已授權
+的 worker 升級優先等待 publication 邊界；有必要實測中斷接手時，沿既有
+`verify_temporal_recovery.py`、durable intents 與實際 retry／history 驗收操作，
+保留未封閉 staging，核對真正 loaded code。不把一般 restart 當作接手完成。
 
 ## 3. D 與 mount namespace
 
@@ -169,8 +180,12 @@ sudo journalctl -u lab203-lake-relay.service -u lab203-nas.service -n 40 --no-pa
 ```
 
 source 新增 raw waves 已由 Temporal 接手；原 backup stream 保留 ACK／auxiliary／
-恢復、原始 manifest/head metadata 和傳統 SQL 備份。來源以固定 pending-count／
-bytes 上限重疊封裝、傳輸與 NAS 驗收，已發布的 file keys 不重複入列。公開候選
+恢復、原始 manifest/head metadata 和傳統 SQL 備份。現行 `decouple_nas_acceptance`
+讓來源持續發布，不等四批 NAS ACK；256 GiB retained spool／64 GiB physical
+reserve 控制容量，已發布 file keys 不重複入列。paired 失敗回執只重傳該固定
+批次，保留失敗 attempt；其他資料繼續傳送。NAS完成／回收仍需真正 ACK。
+Restic source 亦不以 NAS freshness 阻止發布，接收端自行驗實際 NAS guards。
+完整生效邊界見 `docs/nas_send_verify_parallel_2026-10-06.md`。公開候選
 設定在 `configs/data_sync/lake_source_replication.json`；實際生效需核對私有設定與
 worker 已載入的程式身分。完整補傳以固定 cohort 的逐檔機器收據結案，另持續處理
 新發布資料，避免 moving denominator 掩蓋進度；見

@@ -216,7 +216,8 @@ def automation_status(
             ('state', 'observed_at_utc', 'available_object_count', 'available_object_bytes',
              'nas_archive_covered_objects', 'nas_archive_covered_bytes', 'pending_delivery_ids',
              'transport_cache_reclaimed_bytes', 'source_deletion_enabled', 'pending_bytes',
-             'maximum_pending_deliveries', 'maximum_wave_bytes'), now=now)
+             'maximum_pending_deliveries', 'maximum_wave_bytes', 'publication_waits_for_nas_ack',
+             'retained_transport_bytes', 'redelivery_attempts', 'receipt_errors', 'catalog_refresh_error'), now=now)
         receipts['lake_relay'] = bounded_receipt(Path('/srv/stockagent-backup-receipts-lab203/lakehouse/relay-status.json'),
             ('state', 'observed_at_utc', 'nas_mount_guard_verified', 'runtime_lock_verified',
              'single_owner_verified', 'automatic_archive_deletion'), now=now)
@@ -307,5 +308,10 @@ def print_human_status(value: dict[str, Any]) -> None:
               f"{archive.get('available_object_bytes', 0)/1e9:.3f} GB；"
               f"{archive.get('nas_archive_covered_objects', 0)} / {archive.get('available_object_count', 0)} 物件；"
               f"{len(archive.get('pending_delivery_ids', []))} 批待驗收")
+        if archive.get('publication_waits_for_nas_ack') is False:
+            print(f"  來源持續發布，不等 NAS 驗收；保留暫存 {archive.get('retained_transport_bytes', 0)/1e9:.3f} GB；"
+                  f"失敗重傳 {archive.get('redelivery_attempts', 0)} 次")
+        if archive.get('catalog_refresh_error'):
+            print('  新清冊更新待重試；已登錄來源持續傳送，新增版本尚未驗收。')
         print("  原 Restic 覆蓋另列，不相加成去重後的全歷史覆蓋。")
     print("排程啟用 ≠ 冷恢復驗證完成；不自動解壓，不刪唯一冷資料。")

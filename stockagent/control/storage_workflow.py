@@ -54,7 +54,8 @@ def check_nas_acceptance(delivery_id: str) -> dict:
     with activity_lease():
         result = acceptance(c, delivery_id)
         if result['state'] == 'nas_archive_file_recovery_verified':
-            result['transport_retirement'] = retire_accepted_transport(c, delivery_id, result)
+            atomic_write_json(Path(c['state_root']) / ('catalog-acceptance-'+delivery_id+'.json'), result, durable=True)
+            result['transport_retirement'] = {'state': 'delegated_to_transport_gc'}
     atomic_write_json(Path(c["state_root"]) / "replication-status.json", result)
     return result
 

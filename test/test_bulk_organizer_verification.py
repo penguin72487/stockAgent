@@ -1,4 +1,5 @@
 import json
+import time
 from contextlib import contextmanager
 import fcntl
 from types import SimpleNamespace
@@ -99,6 +100,70 @@ def test_partial_retirement_is_retried_with_same_cold_proof(tmp_path, monkeypatc
     receipt = {"scope": "cache", "compressed_sha256": "a" * 64}
     assert organizer.organize(SimpleNamespace(apply=True, retire=True, watch=True), tmp_path, receipt) is False
     assert calls == [proof, "retire"]
+
+
+def test_unusable_candidates_do_not_refresh_expired_recovery_or_send_retirement(tmp_path, monkeypatch):
+    records = [{'relative_root': 'cache/' + name, 'directory_root': True,
+                'unsupported': False, 'logical_bytes': 10} for name in ('gone', 'active', 'changed')]
+    states = ['source-absent-without-new-retirement', 'source-protected', 'source-changed-from-preservation']
+    observed = {r['relative_root']: {'state': state, 'deleted': False, 'candidate_only': True}
+                for r, state in zip(records, states)}
+    monkeypatch.setattr(organizer, 'root_records', lambda _: records)
+    monkeypatch.setattr(organizer, 'private_observe_roots', lambda *_: observed)
+    monkeypatch.setattr(organizer, 'verify_retained_proof', lambda *_: pytest.fail('reread unusable cold cohort'))
+    monkeypatch.setattr(organizer, 'index_zstd', lambda *_: pytest.fail('refreshed recovery from unusable source'))
+    monkeypatch.setattr(organizer, 'private_remote', lambda *_args, **_kwargs: pytest.fail('sent retirement'))
+    proof = {'verified_at_epoch': time.time() - 10000}
+    before = dict(proof)
+    state = {}
+    receipt = {'scope': 'cache', 'approved_cache_roots': list(observed)}
+    assert not organizer.retire_roots(SimpleNamespace(retire=True), tmp_path, receipt,
+                                       {'rows': []}, proof, state)
+    assert proof == before and state['all_sources_retired'] is False
+    assert all(r['deleted'] is False for r in state['roots'].values())
+
+
+def test_incomplete_candidate_observation_is_rejected(tmp_path, monkeypatch):
+    records = [{'relative_root': 'cache/one', 'directory_root': True,
+                'unsupported': False, 'logical_bytes': 10}]
+    monkeypatch.setattr(organizer, 'root_records', lambda _: records)
+    monkeypatch.setattr(organizer, 'private_observe_roots', lambda *_: {})
+    with pytest.raises(SnapshotError, match='omitted or added'):
+        organizer.retire_roots(SimpleNamespace(retire=True), tmp_path,
+                               {'scope': 'cache', 'approved_cache_roots': ['cache/one']},
+                               {'rows': []}, {}, {})
+
+
+def test_candidate_never_replaces_exact_plan_apply_and_largest_is_processed_first(tmp_path, monkeypatch):
+    records = [{'relative_root': 'cache/' + name, 'directory_root': True,
+                'unsupported': False, 'logical_bytes': size} for name, size in [('small', 1), ('large', 100)]]
+    monkeypatch.setattr(organizer, 'root_records', lambda _: records)
+    monkeypatch.setattr(organizer, 'private_observe_roots', lambda *_: {
+        r['relative_root']: {'state': 'metadata-candidate-requires-exact-proof',
+                             'candidate_only': True, 'deleted': False} for r in records})
+    monkeypatch.setattr(organizer, 'verify_retained_proof', lambda *_: {})
+    monkeypatch.setattr(organizer, 'credentials', lambda: ('private-local', 'hidden'))
+    monkeypatch.setattr(organizer, '_convergence', lambda *_: {'ok': True})
+    monkeypatch.setattr(organizer, 'load_policy', lambda: {'shared_file_policy': 'unlink_preserved_names_only'})
+    @contextmanager
+    def owner(*, wait):
+        assert wait is False
+        yield
+    monkeypatch.setattr(organizer, 'ingress_owner', owner)
+    calls = []
+    def remote(args, ack, *, apply):
+        calls.append((ack['root']['relative_root'], apply))
+        return {'state': 'retired' if apply else 'would-retire', 'deleted': apply,
+                'reclaimed_allocated_bytes': 10 if apply else 0}
+    monkeypatch.setattr(organizer, 'private_remote', remote)
+    proof = dict.fromkeys(('dataset', 'snapshot_id', 'manifest_sha256', 'preservation_contract',
+                          'compressed_sha256', 'member_inventory_sha256', 'source_scope'), 'fixed')
+    proof.update(cold_verified=True, decoded_originals_verified=True, verified_at_epoch=time.time())
+    assert organizer.retire_roots(SimpleNamespace(retire=True), tmp_path,
+                                  {'scope': 'cache', 'approved_cache_roots': [r['relative_root'] for r in records]},
+                                  {'rows': []}, proof, {})
+    assert calls == [('cache/large', False), ('cache/large', True),
+                     ('cache/small', False), ('cache/small', True)]
 
 
 def test_publication_is_owned_but_independent_recovery_does_not_block_other_cohorts(tmp_path, monkeypatch):

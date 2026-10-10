@@ -7,6 +7,7 @@
   "include_unreferenced_cold_objects": true,
   "cold_object_replication_enabled": false,
   "cold_metadata_replication_enabled": true,
+  "publication_requires_receiver_ready": false,
   "immutable_archive_state_root": "/var/lib/stockagent/lakehouse-control",
   "metadata_backfill_catalog": "/var/lib/stockagent/backup-stream/full-sync-cohort-20261006.json",
   "metadata_backfill_sha256": "c714ff4078c4b365941126665c81e1e047af770424497a5bdffd421622e45227",
@@ -36,7 +37,7 @@
     "verify_workers": 4,
     "retry_delays_seconds": [30, 120, 600]
   },
-  "maximum_retained_transport_bytes": 1099511627776,
+  "maximum_retained_transport_bytes": 274877906944,
   "reserve_bytes": 68719476736,
   "readiness_max_age_seconds": 900,
   "auxiliary": {
