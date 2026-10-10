@@ -83,6 +83,96 @@ def test_deep_merge_preserves_unmodified_nested_values() -> None:
     assert base["training"]["model"]["dropout"] == 0.1
 
 
+@pytest.mark.parametrize("explicit,expected", [(None, 11), (10, 10)])
+def test_scheduler_uses_same_case_fold_for_launch_retry_summary_and_skip(
+    tmp_path: Path, monkeypatch, explicit: int | None, expected: int,
+) -> None:
+    import json
+
+    spec_path = tmp_path / "case_fold.yaml"
+    spec_path.write_text(yaml.safe_dump({
+        "base_config": "configs/markets/tw_day_trade_daily_no_default.yaml",
+        "matrix": {"include_baseline": True,
+                   "fixed_overrides": {"runner": {"start_fold": 11}},
+                   "dimensions": [{"name": "unused", "enabled": False,
+                                   "path": "training.learning_rate", "values": []}]},
+    }))
+    output = tmp_path / "output"
+    old = output / "baseline" / "fold_09" / "fold_complete.json"
+    old.parent.mkdir(parents=True)
+    old.write_text("{}")
+    if explicit is None:
+        wrong = output / "baseline" / "fold_10" / "fold_complete.json"
+        wrong.parent.mkdir()
+        wrong.write_text("{}")
+    commands = []
+
+    class RetryThenComplete:
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+            self.pid = 99_000 + len(commands)
+            self.returncode = None
+            self.attempt = len(commands)
+
+        def poll(self):
+            self.returncode = 1 if self.attempt == 1 else 0
+            if self.returncode == 0:
+                marker = output / "baseline" / f"fold_{expected:02d}" / "fold_complete.json"
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("{}")
+            return self.returncode
+
+    monkeypatch.setattr(ablation_module.subprocess, "Popen", RetryThenComplete)
+    argv = ["run_ablation_experiments.py", "--spec", str(spec_path),
+            "--output-root", str(output), "--runner", "/bin/true",
+            "--max-folds", "1", "--retry-backoff-seconds", "0"]
+    if explicit is not None:
+        argv += ["--start-fold", str(explicit)]
+    monkeypatch.setattr(ablation_module.sys, "argv", argv)
+    ablation_module.main()
+    assert len(commands) == 2
+    assert all(command[command.index("--start-fold") + 1] == str(expected)
+               for command in commands)
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary[0]["folds_complete"] == summary[0]["folds_requested"] == 1
+    assert summary[0]["attempts"] == 2
+    ablation_module.main()
+    assert len(commands) == 2  # Selected fold completed; no third worker.
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary[0]["status"] == "complete"
+
+
+def test_last_fold_selection_uses_canonical_calendar_and_rejects_bad_metadata(tmp_path: Path):
+    import json
+    import numpy as np
+    from dataclasses import replace
+
+    c = load_config(Path(__file__).resolve().parents[1] /
+        "configs/deployments/tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml")
+    path = tmp_path / "manifest.json"
+    dates = np.arange("2014-01-06", "2026-10-03", dtype="datetime64[D]")
+    dates = dates[np.is_busday(dates)].astype(str).tolist()
+    path.write_text(json.dumps({"dates": dates}))
+    c = replace(c, data=replace(c.data, factorized_feature_manifest=str(path)),
+                walk_forward=replace(c.walk_forward, split_start_year=2014,
+                    year_boundary_mode="lookback_shifted", lookback_context="panel_history"))
+    assert ablation_module._last_fold_id(c) == 11
+    assert ablation_module._last_fold_id(replace(c, training=replace(c.training, lookback=256))) == 10
+    for malformed in ([], ["2026-01-02", "2026-01-01"], ["NaT"], [["2026-01-01"]]):
+        path.write_text(json.dumps({"dates": malformed}))
+        with pytest.raises(ValueError, match="strictly increasing"):
+            ablation_module._last_fold_id(c)
+    with pytest.raises(ValueError, match="dated factorized feature manifest"):
+        ablation_module._last_fold_id(replace(c, data=replace(c.data, factorized_feature_manifest=None)))
+
+
+def test_build_configs_rejects_unknown_fold_selection(tmp_path: Path):
+    spec = {"base_config": "configs/markets/tw_day_trade_daily_no_default.yaml",
+            "fold_selection": "guess_2026"}
+    with pytest.raises(ValueError, match="fold_selection"):
+        _build_configs(tmp_path / "spec.yaml", spec, [], tmp_path / "output")
+
+
 def test_deep_merge_replaces_basis_limits_when_family_set_changes() -> None:
     base = {
         "training": {

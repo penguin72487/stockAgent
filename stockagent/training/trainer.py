@@ -18598,6 +18598,30 @@ def _try_load_fresh_fold_physical_deployment_segment(
         return None
 
 
+def _stitched_deployment_prefix_results(
+    results: Sequence[FoldResult],
+    *,
+    execution_mode: str,
+) -> list[FoldResult]:
+    """Select the earliest available consecutive model-ownership interval.
+
+    A later completed fold is a valid independent test, but cannot be appended
+    across missing models: that would skip exchange sessions while ageing the
+    carried T+2 account. Keep the session-continuity check inside replay; this
+    selector only defers non-adjacent fold IDs during incremental reporting.
+    """
+    ordered = sorted(results, key=lambda item: int(item.fold_id))
+    fold_ids = [int(item.fold_id) for item in ordered]
+    if len(set(fold_ids)) != len(fold_ids):
+        raise RuntimeError("stitched deployment has duplicate fold ownership")
+    if normalize_execution_mode(execution_mode) not in TW_STOCK_EXECUTION_MODES:
+        return ordered
+    for index in range(1, len(ordered)):
+        if fold_ids[index] != fold_ids[index - 1] + 1:
+            return ordered[:index]
+    return ordered
+
+
 def _replay_taiwan_stitched_deployment(
     output_path: Path,
     results: list[FoldResult],
@@ -18663,8 +18687,23 @@ def _replay_taiwan_stitched_deployment(
     )
     date_parts: list[np.ndarray] = []
     fold_segments: list[tuple[Path, int, int]] = []
+    replay_results = _stitched_deployment_prefix_results(
+        results, execution_mode=mode
+    )
+    replay_fold_ids = {int(item.fold_id) for item in replay_results}
+    deferred_fold_ids = sorted(
+        int(item.fold_id) for item in results
+        if int(item.fold_id) not in replay_fold_ids
+    )
+    if deferred_fold_ids:
+        print(
+            "[WalkForward] stitched account uses contiguous completed folds "
+            f"{sorted(replay_fold_ids)}; deferring {deferred_fold_ids} until "
+            "the intervening folds complete (independent test results retained)",
+            flush=True,
+        )
     cursor = 0
-    for fold_result in sorted(results, key=lambda item: int(item.fold_id)):
+    for fold_result in replay_results:
         fold_dir = _fold_dir(output_path, fold_result.fold_id)
         artifact_path = _deployment_backtest_path(fold_dir)
         if not artifact_path.exists():
@@ -19244,6 +19283,28 @@ def _replay_taiwan_stitched_deployment(
             benchmark_label=_benchmark_plot_label(config),
             day_trade_carry_context=segment_context,
         )
+    from downloader.artifact_io import atomic_write_json
+
+    fold_id_by_path = {
+        _fold_dir(output_path, item.fold_id): int(item.fold_id)
+        for item in replay_results
+    }
+    atomic_write_json(output_path / "walkforward_deployment_coverage.json", {
+        "report_contract": "contiguous_completed_fold_prefix_v1",
+        "state": (
+            "awaiting_intervening_folds" if deferred_fold_ids
+            else "contiguous_available_folds"
+        ),
+        "coverage_scope": "currently_completed_fold_artifacts",
+        "completed_fold_ids": sorted(int(item.fold_id) for item in results),
+        "stitched_fold_ids": [fold_id_by_path[path] for path, _, _ in fold_segments],
+        "deferred_fold_ids": deferred_fold_ids,
+        "rows": int(stitched_dates.size),
+        "date_start": str(stitched_dates[0]),
+        "date_end": str(stitched_dates[-1]),
+        "session_continuity_required": mode in TW_STOCK_EXECUTION_MODES,
+        "fabricated_gap_rows": 0,
+    })
     return stitched
 
 
@@ -19285,6 +19346,18 @@ def _refresh_walkforward_artifacts(
             panel=panel,
             config=config,
         )
+
+    # Future completed folds remain in reset-state diagnostics, but their
+    # independent deployment prefixes are not a continuation of this account.
+    deployment_fold_ids = {
+        int(item.fold_id)
+        for item in _stitched_deployment_prefix_results(
+            results,
+            execution_mode=(
+                config.trading.execution_mode if config is not None else "naive"
+            ),
+        )
+    }
 
     all_strategy_returns: list[np.ndarray] = []
     all_benchmark_returns: list[np.ndarray] = []
@@ -19377,7 +19450,7 @@ def _refresh_walkforward_artifacts(
         # Stitched deployment is a different accounting surface: positions,
         # cash, and settlement state continue across fold boundaries.  Never
         # substitute it for the reset-at-fold-start test ledger above.
-        if deployment_path.exists():
+        if deployment_path.exists() and int(result.fold_id) in deployment_fold_ids:
             if physical_source is None:
                 deployment_backtest, deployment_dates = _load_backtest_artifact(
                     deployment_path

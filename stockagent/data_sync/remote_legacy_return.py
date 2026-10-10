@@ -15,15 +15,74 @@ import stat
 import time
 import uuid
 from dataclasses import asdict
+from collections import defaultdict
 
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
 from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.desync_snapshots import SnapshotError, _safe_relative_path, atomic_write_json, sha256_file
-from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec, _archive_directories, source_plan
+from stockagent.data_sync.legacy_artifact_archive import (
+    LegacyArchiveSpec, _archive_directories, source_plan, MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT,
+    reviewed_vast_offline_root,
+)
 from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references
 from stockagent.data_sync.packed_snapshots import _load_inventory, _validate_inventory, resolve_packed_snapshot_id
+from stockagent.data_sync.training_return import shared_inode_references, training_hot_retention
 
 RECOVERY_HOLDS = Path("/var/lib/stockagent-legacy-return/recovery-holds.json")
+_ACTIVE_CONFIG_VERSIONS = {}
+
+
+def _active_configuration(path: Path, cwd: Path, argv: list[str]):
+    """Resolve using the actual selected trainer when checkout schemas differ."""
+    from stockagent.config import load_config
+    try:
+        signatures = {}
+        return asdict(load_config(path, source_signatures=signatures)), list(signatures)
+    except (ValueError, KeyError, TypeError):
+        # A new frozen experiment can be valid while this control checkout
+        # predates its model fields. Never strip unknown fields or weaken the
+        # consumer gate. Use its canonical loader in a fresh CPU process.
+        train_entry = next((a for a in argv if a == "train.py" or a.endswith("/train.py")), None)
+        if train_entry is None:
+            raise
+        entry = Path(train_entry)
+        root = (entry if entry.is_absolute() else cwd / entry).resolve().parent
+        loader = root / 'stockagent/config.py'
+        if not loader.is_file() or root == Path(__file__).resolve().parents[2]:
+            raise
+        key = (str(root), str(path.resolve()))
+        cached = _ACTIVE_CONFIG_VERSIONS.get(key)
+        if cached and all(p.is_file() and sha256_file(p) == digest for p,digest in cached['proofs'].items()):
+            return cached['configuration'], cached['sources']
+        import subprocess, sys
+        program = '''
+import sys,json,hashlib
+from pathlib import Path
+from dataclasses import asdict
+sys.path.insert(0,str(Path.cwd()))
+import stockagent.config as module
+assert Path(module.__file__).resolve()==Path.cwd()/'stockagent/config.py'
+sources={}
+config=module.load_config(sys.argv[1],source_signatures=sources)
+proofs={}
+for p,signature in sources.items():
+ assert module._config_source_identity(p)==signature, 'config changed after admission'
+ proofs[str(p)]=hashlib.sha256(p.read_bytes()).hexdigest()
+ assert module._config_source_identity(p)==signature, 'config changed while hashing'
+proofs[str(Path(module.__file__).resolve())]=hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+print(json.dumps({'configuration':asdict(config),'sources':[str(p) for p in sources],'proofs':proofs},default=str))
+'''
+        run = subprocess.run([sys.executable, '-c', program, str(path)], cwd=root,
+                             env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'},
+                             capture_output=True, text=True, timeout=30, check=True)
+        result = json.loads(run.stdout)
+        source_paths = [Path(p) for p in result['sources']]
+        proofs = {Path(p):digest for p,digest in result['proofs'].items()}
+        if not all(p.is_file() and sha256_file(p) == digest for p,digest in proofs.items()):
+            raise SnapshotError('selected active configuration changed during observation')
+        _ACTIVE_CONFIG_VERSIONS[key] = {'configuration':result['configuration'],
+                                       'sources':source_paths,'proofs':proofs}
+        return result['configuration'], source_paths
 
 
 def _recovery_hold_policy() -> dict:
@@ -93,6 +152,31 @@ def active_configuration_references_many(sources, repo_root: Path) -> dict[str, 
             cwd = Path(os.readlink(process / "cwd"))
         except OSError:
             continue
+        # Operational cache/code inputs remain dependencies after the last fd
+        # closes. Inspect only path variables, never credentials or arbitrary
+        # environment values. The broad checkout path is not an artifact lease.
+        try:
+            environment = (process / "environ").read_bytes().decode(errors="replace").split("\0")
+        except OSError:
+            environment = []
+        for item in environment:
+            name, sep, value = item.partition("=")
+            if not sep or name == "STOCKAGENT_REPO_ROOT" or not (
+                name.startswith("STOCKAGENT_") or name in {"PYTHONPATH", "LD_LIBRARY_PATH", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"}
+            ):
+                continue
+            for component in value.split(":"):
+                if not is_repository_data_path(component):
+                    continue
+                path = Path(component).expanduser()
+                if not path.is_absolute():
+                    path = cwd / path
+                path = path.resolve()
+                if path in {repo_root, repo_root / "artifacts"}:
+                    continue
+                for source in sources:
+                    if path == source or source in path.parents or path in source.parents:
+                        result[str(source)].append(f"pid={process.name}:runtime-env:{name}:{path}")
         configurations = [argv[i+1] for i, a in enumerate(argv[:-1]) if a in {"--config", "--config-file"}]
         configurations += [a.partition("=")[2] for a in argv if a.startswith("--config=")]
         training = any(a.endswith("/train.py") or a == "train.py" for a in argv)
@@ -105,8 +189,15 @@ def active_configuration_references_many(sources, repo_root: Path) -> dict[str, 
             try:
                 documents = [yaml.safe_load(path.read_text())]
                 if training:
-                    from stockagent.config import load_config
-                    documents.append(asdict(load_config(path)))
+                    configuration, sources_used = _active_configuration(path, cwd, argv)
+                    documents.append(configuration)
+                    # A config's base chain is a runtime/resume dependency,
+                    # even when resolved dataclasses omit inheritance keys.
+                    for configured_source in sources_used:
+                        inherited = Path(configured_source).resolve()
+                        for source in sources:
+                            if inherited == source or source in inherited.parents or inherited in source.parents:
+                                result[str(source)].append(f"pid={process.name}:active-config-source:{inherited}")
                 for document in documents:
                     for field, value in _strings(document):
                         if not is_repository_data_path(value):
@@ -133,7 +224,7 @@ def identity(value: dict) -> str:
 
 def dataset_name(relative: str) -> str:
     path = _safe_relative_path(relative, "remote legacy root")
-    if len(path.parts) < 2 or path.parts[0] not in {"markets", "ablations"}:
+    if (len(path.parts) < 2 or path.parts[0] not in {"markets", "ablations"}) and not reviewed_vast_offline_root(relative):
         raise SnapshotError("remote legacy return is outside approved artifact scopes")
     return "legacy-vast-return-" + hashlib.sha256(relative.encode()).hexdigest()[:24]
 
@@ -148,6 +239,46 @@ def real(path: Path) -> Path:
 def signature(info) -> list[int]:
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
             info.st_ctime_ns, info.st_mode, info.st_nlink]
+
+
+def verify_original_inode(path, row, expected_sha256, verified_inodes, *, hash_file=None):
+    key = tuple(row["signature"])
+    actual = verified_inodes.get(key)
+    if actual is None:
+        actual = (hash_file or sha256_file)(path)
+        verified_inodes[key] = actual
+    if actual != expected_sha256 or signature(path.lstat()) != row["signature"]:
+        raise SnapshotError("original bytes changed or differ from verified D decode")
+
+
+def unlink_preserved_file_names(root, rows):
+    """Unlink only caller-verified names and account for the last inode link."""
+    groups = defaultdict(list)
+    for row in rows:
+        if row["kind"] == "file":
+            groups[tuple(row["signature"][:2])].append(row)
+    reclaimed = 0
+    for members in groups.values():
+        first = root / members[0]["path"]
+        info = first.lstat()
+        if signature(info) != members[0]["signature"]:
+            raise SnapshotError("inode changed before unlink; remaining quarantine retained")
+        blocks = info.st_blocks * 512
+        with first.open("rb") as handle:
+            latest = signature(os.fstat(handle.fileno()))
+            for row in members:
+                path = root / row["path"]
+                if signature(path.lstat()) != latest:
+                    raise SnapshotError("inode mutated during retirement; remaining names retained")
+                path.unlink()
+                after = signature(os.fstat(handle.fileno()))
+                if after[:4] != latest[:4] or after[5] != latest[5] or after[6] != latest[6] - 1:
+                    raise SnapshotError("inode changed during unlink; remaining names retained")
+                latest = after
+            freed = latest[6] == 0
+        if freed:
+            reclaimed += blocks
+    return reclaimed
 
 
 def metadata_tree(source: Path) -> dict:
@@ -176,10 +307,20 @@ def metadata_tree(source: Path) -> dict:
             "fingerprint": identity({"rows": rows})}
 
 
-def inventory_scopes(artifact_root: Path, include_roots: list[str] | None = None) -> dict:
+def inventory_scopes(artifact_root: Path, include_roots: list[str] | None = None,
+                     *, capture_contract: str | None = None) -> dict:
     artifact_root = real(artifact_root)
+    scopes = ("markets", "ablations")
+    if capture_contract is not None:
+        if (capture_contract != MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT or not include_roots
+                or len(set(include_roots)) != len(include_roots)
+                or any(not reviewed_vast_offline_root(root) for root in include_roots)):
+            raise SnapshotError("offline inventory requires the exact manually reviewed root list")
+        scopes = tuple(sorted({PurePosixPath(root).parts[0] for root in include_roots}))
+    elif include_roots and any(PurePosixPath(root).parts[0] not in scopes for root in include_roots):
+        raise SnapshotError("default inventory excludes unregistered artifact namespaces")
     results = []
-    for scope in ("markets", "ablations"):
+    for scope in scopes:
         parent = real(artifact_root / scope)
         for source in sorted(parent.iterdir()):
             relative = source.relative_to(artifact_root).as_posix()
@@ -195,6 +336,8 @@ def inventory_scopes(artifact_root: Path, include_roots: list[str] | None = None
             newest = max((r["signature"][3] for r in result["rows"] if r["kind"] == "file"), default=0)
             results.append({"relative_root": relative, "state": "inventoried", **result,
                             "newest_mtime_ns": newest, "process_references": refs})
+    if capture_contract is not None and {row["relative_root"] for row in results} != set(include_roots):
+        raise SnapshotError("reviewed offline root disappeared before fixed inventory")
     return {"schema_version": 1, "origin_node_id": "vastai1T", "authority_node_id": "penguin",
             "all_scopes_inventoried": not bool(include_roots),
             "captured_at_epoch": time.time(), "artifact_root": str(artifact_root), "items": results}
@@ -224,15 +367,29 @@ def acknowledgement_age(verified_at_epoch: float, maximum_age_seconds: float) ->
 
 def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
     body = {k: v for k, v in ack.items() if k != "identity_sha256"}
-    if (ack.get("contract") != "d_verified_remote_legacy_return_v1"
+    version = ack.get("contract")
+    if (version not in {"d_verified_remote_legacy_return_v1", "d_verified_remote_legacy_return_v2",
+                        "d_verified_remote_legacy_return_v3"}
         or identity(body) != ack.get("identity_sha256") or ack.get("cold_verified") is not True
         or ack.get("origin_node_id") != "vastai1T" or ack.get("authority_node_id") != "penguin"
         or ack.get("dataset") != dataset_name(ack.get("relative_root", ""))):
         raise SnapshotError("invalid or stale exact D archive acknowledgement")
-    acknowledgement_age(ack.get("verified_at_epoch", 0), 300)
+    shared_policy = ack.get("shared_file_policy", "reject_unknown_names")
+    offline = reviewed_vast_offline_root(ack["relative_root"])
+    if (version == "d_verified_remote_legacy_return_v3" and (
+            not offline or ack.get("capture_contract") != MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT)
+            or version != "d_verified_remote_legacy_return_v3" and (offline or "capture_contract" in ack)):
+        raise SnapshotError("offline artifact names require the explicit versioned capture acknowledgement")
+    if (version in {"d_verified_remote_legacy_return_v2", "d_verified_remote_legacy_return_v3"}
+            and shared_policy != "unlink_preserved_names_only"
+            or version == "d_verified_remote_legacy_return_v1" and "shared_file_policy" in ack):
+        raise SnapshotError("shared-name policy does not match the acknowledgement version")
+    acknowledgement_age(ack.get("verified_at_epoch", 0), 300 if version.endswith("_v1") else 1800)
     root = real(artifact_root)
     source = real(root / ack["relative_root"])
     archive = ack["archive_manifest"]
+    if offline and archive.get("capture_contract") != MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT:
+        raise SnapshotError("cold manifest does not preserve the reviewed offline capture contract")
     if (archive.get("dataset") != ack["dataset"] or archive.get("relative_root") != ack["relative_root"]
         or archive.get("deployable") is not False or archive.get("completion_claim") != "not_checked"
         or not isinstance(archive.get("directories"), list)):
@@ -245,10 +402,16 @@ def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
     if _archive_directories(source) != archive["directories"]:
         raise SnapshotError("remote source directory metadata differs from its archive")
     blockers = []
+    retention = training_hot_retention(source, observed["rows"])
+    blockers += retention["blockers"]
     if any(r["kind"] == "unsupported" or r["cross_filesystem"] for r in observed["rows"]):
         blockers.append("unsupported-or-cross-filesystem-entry")
-    if any(r["signature"][6] != 1 for r in file_rows):
+    if version.endswith("_v1") and any(r["signature"][6] != 1 for r in file_rows):
         blockers.append("shared-inode-requires-separate-audit")
+    inode_refs = shared_inode_references(observed)
+    if inode_refs:
+        blockers.append("shared-inode-in-use")
+    verified_inodes = {}
     for row in file_rows:
         path = source / row["path"]
         expected = expected_files[row["path"]]
@@ -256,9 +419,9 @@ def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
         if (signature(info) != row["signature"] or info.st_size != expected["source"]["size"]
             or info.st_mtime_ns != expected["source"]["mtime_ns"]
             or stat.S_IMODE(info.st_mode) != expected["source"]["mode"]
-            or sha256_file(path) != expected["original_sha256"]
             or signature(path.lstat()) != row["signature"]):
             raise SnapshotError("remote source bytes or metadata differ from the D archive")
+        verify_original_inode(path, row, expected["original_sha256"], verified_inodes)
     if metadata_tree(source) != observed:
         raise SnapshotError("remote source mutated during exact recovery comparison")
     scope = root / PurePosixPath(ack["relative_root"]).parts[0]
@@ -295,6 +458,8 @@ def retirement_plan(artifact_root: Path, repo_root: Path, ack: dict) -> dict:
     result = {"source": str(source), "relative_root": ack["relative_root"],
               "rows": observed["rows"], "ack_identity_sha256": ack["identity_sha256"],
               "reclaimable_allocated_file_bytes": observed["reclaimable_allocated_file_bytes"],
+              "shared_file_policy": shared_policy, "inode_references": inode_refs,
+              "hot_retention": retention,
               "blockers": sorted(set(blockers)), "process_references": refs, "service_references": services,
               "convergence": convergence}
     result["fingerprint"] = identity({k: v for k, v in result.items() if k != "convergence"})
@@ -324,14 +489,17 @@ def retire(artifact_root: Path, repo_root: Path, state_root: Path, ack: dict, *,
         source.rename(quarantine)
         atomic_write_json(journal, {"state": "quarantined", "plan": plan, "ack": ack, "quarantine": str(quarantine)})
         current = metadata_tree(quarantine)
-        if current["rows"] != plan["rows"] or process_references(quarantine) or artifact_process_references(source, artifact_root):
+        if (current["rows"] != plan["rows"] or process_references(quarantine)
+                or artifact_process_references(source, artifact_root) or shared_inode_references(current)):
             raise SnapshotError("quarantined artifact changed or is active; quarantine retained")
         originals = {r["path"]: r["original_sha256"] for r in ack["archive_manifest"]["files"]}
+        verified_inodes = {}
         for row in current["rows"]:
             if row["kind"] == "file":
                 path = quarantine / row["path"]
-                if signature(path.lstat()) != row["signature"] or sha256_file(path) != originals[row["path"]]:
+                if signature(path.lstat()) != row["signature"]:
                     raise SnapshotError("quarantined original differs; retain for audit")
+                verify_original_inode(path, row, originals[row["path"]], verified_inodes)
         from scripts.configure_artifact_ingress_syncthing import credentials
         from scripts.manage_packed_edge import _convergence
         base, key = credentials()
@@ -340,21 +508,20 @@ def retire(artifact_root: Path, repo_root: Path, state_root: Path, ack: dict, *,
             or artifact_service_references([source, quarantine], repo_root).get(str(source))
             or artifact_service_references([source, quarantine], repo_root).get(str(quarantine))
             or active_configuration_references(source, repo_root)
-            or metadata_tree(quarantine)["rows"] != plan["rows"] or process_references(quarantine)):
+            or training_hot_retention(quarantine, current["rows"])["blockers"]
+            or metadata_tree(quarantine)["rows"] != plan["rows"] or process_references(quarantine)
+            or shared_inode_references(current)):
             raise SnapshotError("post-quarantine recovery/consumer/transport gate failed; retained")
-        for row in current["rows"]:
-            if row["kind"] == "file":
-                path = quarantine / row["path"]
-                if signature(path.lstat()) != row["signature"]:
-                    raise SnapshotError("file mutated before unlink; retain quarantine")
-                path.unlink()
+        acknowledgement_age(ack.get("verified_at_epoch", 0), 300 if ack["contract"].endswith("_v1") else 1800)
+        reclaimed = unlink_preserved_file_names(quarantine, current["rows"])
         for row in sorted(current["rows"], key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
             if row["kind"] == "directory":
                 (quarantine / row["path"]).rmdir()
         quarantine.rmdir()
         result = {"state": "exact-d-backed-source-retired", "deleted": True,
-                  "reclaimed_allocated_bytes": plan["reclaimable_allocated_file_bytes"],
+                  "reclaimed_allocated_bytes": reclaimed,
                   "snapshot_id": ack["snapshot_id"], "manifest_sha256": ack["manifest_sha256"],
-                  "cold_deleted": False}
+                  "cold_deleted": False, "shared_file_policy": plan["shared_file_policy"],
+                  "external_shared_names_deleted": False}
         atomic_write_json(journal, {"state": "retired", "plan": plan, "ack": ack, "result": result})
         return result

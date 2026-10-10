@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from downloader.artifact_io import atomic_write_json  # noqa: E402
 from stockagent.runtime_identity import runtime_identity, source_identity  # noqa: E402
+from stockagent.storage_layout import admit_output  # noqa: E402
 from stockagent.config import _CONFIG_INHERITANCE_KEYS, _normalize_base_config_refs, _UniqueKeySafeLoader, load_config  # noqa: E402
 import yaml  # noqa: E402
 
@@ -52,6 +53,7 @@ def _config_files(root: Path, entry: Path) -> dict[str, bytes]:
 
 
 def build_release(root: Path, output: Path, *, uv: str, config: Path | None = None) -> dict:
+    output = admit_output(output, "code")
     os.umask(0o077)
     root = root.resolve()
     started = time.perf_counter()

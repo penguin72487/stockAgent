@@ -1,0 +1,117 @@
+fold_selection: last
+# Exactly the user's 27 OFAT variants; all own lookback-shifted annual periods.
+# No new baseline training, no reuse of calendar-period optimizer/results.
+base_config: configs/deployments/tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_last_fold_selected_20261008_v6
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 8
+  torch_compile_threads: 16
+postprocess_plots:
+  - split: val
+    prefix: val_shifted
+    scope_label: last fold / lookback-shifted validation
+  - split: test
+    prefix: test_shifted_diagnostic
+    scope_label: last fold / lookback-shifted test diagnostic
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: false
+  fixed_overrides:
+    runner:
+      require_cuda: true
+      resume: true
+      isolate_train_folds: false
+    walk_forward:
+      split_start_year: 2014
+      year_boundary_mode: lookback_shifted
+      lookback_context: panel_history
+    training:
+      multi_gpu_strategy: distributed_data_parallel
+      pretrained_initialization_root: null
+      day_trade_sparse_events: false
+      debug_timing_sync: false
+  dimensions:
+    - name: pooling
+      enabled: true
+      variants:
+        - name: attention
+          description: full-then-last + attention pooling；其他參數維持基準。
+          overrides: {training: {financial_transformer: {temporal_query_mode: full_then_last, temporal_pooling: attention}}}
+    - name: lookback
+      enabled: true
+      path: training.lookback
+      values:
+        - {name: d256, value: 256, description: lookback256；從每年首交易日加256個觀測交易日起算，視窗可跨年。}
+    - name: embedding
+      enabled: true
+      path: training.financial_transformer.d_model
+      values:
+        - {name: d16, value: 16, description: embedding16；lookback32。}
+        - {name: d64, value: 64, description: embedding64；lookback32。}
+        - {name: d128, value: 128, description: embedding128；lookback32。}
+    - name: cross_context
+      enabled: true
+      variants:
+        - name: no_latent
+          description: 移除 latent factors，保留 market tokens。
+          overrides: {training: {financial_transformer: {use_latent_factors: false}}}
+        - name: no_market
+          description: 移除 market tokens，保留 latent factors。
+          overrides: {training: {financial_transformer: {use_market_tokens: false}}}
+    - name: time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      values:
+        - {name: 'off', value: false, description: 移除時間位置編碼。}
+    - name: rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      values:
+        - {name: 'off', value: false, description: 移除時間 RoPE。}
+    - name: qk_norm
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      values:
+        - {name: 'off', value: false, description: 移除 Q/K normalization。}
+    - name: input_rms
+      enabled: true
+      path: training.financial_transformer.causal_feature_rms_normalization
+      values:
+        - {name: 'off', value: false, description: 移除訓練區間擬合的特徵 RMS。}
+    - name: norm
+      enabled: true
+      path: training.financial_transformer.norm_type
+      values:
+        - {name: rmsnorm, value: rmsnorm, description: LayerNorm → RMSNorm。}
+    - name: ffn
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      values:
+        - {name: gelu, value: gelu, description: SwiGLU → GELU。}
+    - name: output
+      enabled: true
+      path: training.financial_transformer.portfolio_output_mode
+      values:
+        - {name: log_cash, value: score_entmax_log_cash, description: log-cash entmax。}
+        - {name: score_cash, value: score_entmax_cash, description: score-entmax cash。}
+        - {name: score_cash_v2, value: score_entmax_cash_v2, description: score-entmax cash v2。}
+        - {name: global_cash, value: score_entmax_global_cash, description: global cash。}
+        - {name: bounded_cash, value: score_entmax_bounded_cash, description: bounded cash。}
+        - {name: learned_cash, value: learned_cash, description: learned-cash L1。}
+        - {name: cash_l1, value: cash_l1, description: 顯式 cash L1。}
+        - {name: l1, value: l1, description: raw-score L1。}
+        - {name: projection_l1, value: projection_l1, description: projection L1。}
+        - {name: signed_softmax, value: signed_softmax, description: signed-softmax。}
+        - {name: signed_sparsemax, value: signed_sparsemax, description: signed-sparsemax。}
+        - {name: signed_entmax, value: signed_entmax15, description: signed-entmax 1.5。}
+    - name: annual_reset
+      enabled: true
+      path: training.day_trade_training_annual_episodes
+      values:
+        - {name: 'off', value: false, description: 取消訓練年度重置；仍用同一位移切分。}
+    - name: sub_lot_gradient
+      enabled: true
+      path: training.day_trade_sub_lot_recovery
+      values:
+        - {name: 'on', value: true, description: 零股恢復梯度；精確 forward/eval 不變。}

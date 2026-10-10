@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import runpy
 import signal
 import statistics
 import subprocess
@@ -438,6 +439,11 @@ def _write_candidate_config(
     start_fold: int,
 ) -> None:
     config = deepcopy(base)
+    data = config.get('data', {})
+    cache = data.get('day_trade_minute_execution_cache_dir')
+    if cache:
+        layout = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'stockagent/storage_layout.py'))
+        data['day_trade_minute_execution_cache_dir'] = str(layout['runtime_cache_path'](cache, ROOT))
     runner = config.setdefault("runner", {})
     training = config.setdefault("training", {})
     runner.update(
@@ -791,7 +797,8 @@ def _select_winner(results: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 def _default_output_root() -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return ROOT / "artifacts/benchmarks" / f"tw_day_trade_daily_batch_power2_{timestamp}"
+    layout = runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))
+    return layout['node_root'](ROOT) / "artifacts/benchmarks" / f"tw_day_trade_daily_batch_power2_{timestamp}"
 
 
 def _resolved_source_config(config_path: Path, project_root: Path) -> dict[str, Any]:
@@ -877,6 +884,9 @@ def main() -> None:
         raise SystemExit(f"config does not exist: {args.config}")
     args.output_root = (
         args.output_root.expanduser().resolve() if args.output_root is not None else _default_output_root()
+    )
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))["admit_output"](
+        args.output_root, "benchmark"
     )
     gpu_ids = [part.strip() for part in args.cuda_visible_devices.split(",") if part.strip()]
     if not gpu_ids or any(not value.isdigit() for value in gpu_ids):

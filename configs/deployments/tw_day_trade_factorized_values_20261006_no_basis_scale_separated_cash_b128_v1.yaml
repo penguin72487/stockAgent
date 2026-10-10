@@ -1,0 +1,11 @@
+base_config: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261006_no_basis_flat_bf16_tf32_b128_v1/config.yaml
+
+# Output-only experiment: retain the accepted source/data, batch, precision,
+# exact execution, optimizer and reporting settings. Never resume the old head.
+training:
+  financial_transformer:
+    portfolio_output_mode: score_entmax_scale_separated_cash
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261006_no_basis_flat_bf16_tf32_b128_scale_separated_cash_v1/training-bf16
+

@@ -1,0 +1,250 @@
+# OFAT catalog, not a default instruction to run every experiment.
+# The foreground bridge replaces base_config with the accepted remote launch
+# copy, retaining its exact source release and relocated data/cache paths.
+base_config: configs/deployments/tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_fold10_ablations_20261008_v1
+expected_fold_count: 10
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 8
+  torch_compile_threads: 16
+postprocess_plots:
+  - split: val
+    prefix: val
+    baseline_label: 年度重置完整特徵基準
+  - split: test
+    prefix: test_2026_diagnostic
+    baseline_label: 年度重置完整特徵基準
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  fixed_overrides:
+    runner:
+      start_fold: 10
+      require_cuda: true
+      resume: true
+      isolate_train_folds: false
+    training:
+      multi_gpu_strategy: distributed_data_parallel
+      pretrained_initialization_root: null
+      day_trade_sparse_events: false
+      debug_timing_sync: false
+  dimensions:
+    - name: cross_context
+      enabled: true
+      variants:
+        - name: no_latent
+          description: 移除 latent factor 路徑，保留 market tokens。
+          overrides: {training: {financial_transformer: {use_latent_factors: false}}}
+        - name: no_market
+          description: 移除 market token 路徑，保留 latent factors。
+          overrides: {training: {financial_transformer: {use_market_tokens: false}}}
+        - name: temporal_only
+          description: 同時移除兩個跨股票資訊路徑；組合機制比較，不是單一旗標消融。
+          overrides: {training: {financial_transformer: {use_latent_factors: false, use_market_tokens: false}}}
+    - name: time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      values:
+        - {name: 'off', value: false, description: 移除時間位置編碼，保留 RoPE。}
+    - name: rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      values:
+        - {name: 'off', value: false, description: 移除時間 RoPE，保留時間位置編碼。}
+    - name: qk_norm
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      values:
+        - {name: 'off', value: false, description: 移除 attention Q/K normalization。}
+    - name: input_rms
+      enabled: true
+      path: training.financial_transformer.causal_feature_rms_normalization
+      values:
+        - {name: 'off', value: false, description: 移除訓練區間擬合的特徵 RMS 尺度校正，保留來源原值。}
+    - name: norm
+      enabled: true
+      path: training.financial_transformer.norm_type
+      values:
+        - {name: rmsnorm, value: rmsnorm, description: LayerNorm 換成 RMSNorm；算子替換實驗。}
+    - name: ffn
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      values:
+        - {name: gelu, value: gelu, description: SwiGLU 換成 GELU。}
+    - name: temporal_query
+      enabled: true
+      path: training.financial_transformer.temporal_query_mode
+      values:
+        - {name: full_then_last, value: full_then_last, description: 完整時間 self-attention 後取最後一步，對比 last-only。}
+    - name: pooling
+      enabled: true
+      variants:
+        - name: mean
+          description: 全時間 attention 後平均池化；query 與 pooling 為配套架構修改。
+          overrides: {training: {financial_transformer: {temporal_query_mode: full_then_last, temporal_pooling: mean}}}
+        - name: attention
+          description: 全時間 attention 後可學習池化；query 與 pooling 為配套架構修改。
+          overrides: {training: {financial_transformer: {temporal_query_mode: full_then_last, temporal_pooling: attention}}}
+    - name: temporal_layers
+      enabled: true
+      path: training.financial_transformer.temporal_layers
+      values:
+        - {name: zero, value: 0, description: 移除時間 Transformer blocks，保留 candle encoder 與跨股票路徑。}
+        - {name: one, value: 1, description: 時間層數 2 → 1。}
+        - {name: three, value: 3, description: 時間層數 2 → 3。}
+    - name: embedding
+      enabled: true
+      path: training.financial_transformer.d_model
+      values:
+        - {name: d16, value: 16, description: embedding 32 → 16，不做 SVD／基底分解。}
+        - {name: d64, value: 64, description: embedding 32 → 64，不做 SVD／基底分解；VRAM 待實跑。}
+        - {name: d128, value: 128, description: embedding 32 → 128；VRAM 待實跑，不保證 global batch256 可容納。}
+    - name: temporal_heads
+      enabled: true
+      path: training.financial_transformer.temporal_heads
+      values:
+        - {name: h2, value: 2, description: 時間 attention heads 4 → 2，總 d_model 不變。}
+        - {name: h8, value: 8, description: 時間 attention heads 4 → 8，總 d_model 不變。}
+    - name: cross_heads
+      enabled: true
+      path: training.financial_transformer.cross_heads
+      values:
+        - {name: h2, value: 2, description: latent／market attention heads 4 → 2。}
+        - {name: h8, value: 8, description: latent／market attention heads 4 → 8。}
+    - name: latent_count
+      enabled: true
+      path: training.financial_transformer.num_latent_factors
+      values:
+        - {name: n4, value: 4, description: latent factors 16 → 4。}
+        - {name: n8, value: 8, description: latent factors 16 → 8。}
+        - {name: n32, value: 32, description: latent factors 16 → 32。}
+        - {name: n64, value: 64, description: latent factors 16 → 64。}
+    - name: market_count
+      enabled: true
+      path: training.financial_transformer.num_market_tokens
+      values:
+        - {name: n4, value: 4, description: market tokens 16 → 4。}
+        - {name: n8, value: 8, description: market tokens 16 → 8。}
+        - {name: n32, value: 32, description: market tokens 16 → 32。}
+        - {name: n64, value: 64, description: market tokens 16 → 64。}
+    - name: latent_depth
+      enabled: true
+      path: training.financial_transformer.latent_layers
+      values:
+        - {name: two, value: 2, description: latent blocks 1 → 2。}
+    - name: market_depth
+      enabled: true
+      path: training.financial_transformer.market_layers
+      values:
+        - {name: two, value: 2, description: market blocks 1 → 2。}
+    - name: temporal_ffn
+      enabled: true
+      path: training.financial_transformer.temporal_ffn_mult
+      values:
+        - {name: m2, value: 2, description: 時間 FFN expansion 4 → 2。}
+        - {name: m8, value: 8, description: 時間 FFN expansion 4 → 8。}
+    - name: cross_ffn
+      enabled: true
+      path: training.financial_transformer.cross_ffn_mult
+      values:
+        - {name: m2, value: 2, description: 跨股票 FFN expansion 4 → 2。}
+        - {name: m8, value: 8, description: 跨股票 FFN expansion 4 → 8。}
+    - name: head_depth
+      enabled: true
+      path: training.financial_transformer.head_layers
+      values:
+        - {name: linear, value: 0, description: 移除 score head 的 gated hidden layer，只留 linear output。}
+        - {name: two, value: 2, description: score head hidden layers 1 → 2。}
+    - name: head_width
+      enabled: true
+      path: training.financial_transformer.head_hidden_dim
+      values:
+        - {name: d16, value: 16, description: score head hidden width 32 → 16。}
+        - {name: d64, value: 64, description: score head hidden width 32 → 64。}
+    - name: lookback
+      enabled: true
+      path: training.lookback
+      values:
+        - {name: d8, value: 8, description: lookback 32 → 8；樣本上下文變動，不是同張量算子消融。}
+        - {name: d16, value: 16, description: lookback 32 → 16。}
+        - {name: d64, value: 64, description: lookback 32 → 64；VRAM 待實跑。}
+    - name: dropout
+      enabled: true
+      path: training.financial_transformer.dropout
+      values:
+        - {name: p10, value: 0.1, description: dropout 0 → 10%；正則化掃描。}
+        - {name: p20, value: 0.2, description: dropout 0 → 20%；正則化掃描。}
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - {name: low, value: 0.00003, description: learning rate 1e-4 → 3e-5。}
+        - {name: high, value: 0.0003, description: learning rate 1e-4 → 3e-4。}
+    - name: weight_decay
+      enabled: true
+      path: training.weight_decay
+      values:
+        - {name: zero, value: 0.0, description: 移除 AdamW weight decay 0.01。}
+        - {name: high, value: 0.1, description: weight decay 0.01 → 0.1。}
+    - name: seed
+      enabled: true
+      path: training.seed
+      values:
+        - {name: s7, value: 7, description: 隨機種子 42 → 7；重複穩健性檢查，不是機制消融。}
+        - {name: s123, value: 123, description: 隨機種子 42 → 123。}
+    - name: output
+      enabled: true
+      path: training.financial_transformer.portfolio_output_mode
+      values:
+        - {name: log_cash, value: score_entmax_log_cash, description: log-cash entmax，對比 scale-separated cash。}
+        - {name: score_cash, value: score_entmax_cash, description: 原 score-entmax cash output。}
+        - {name: score_cash_v2, value: score_entmax_cash_v2, description: score-entmax cash v2 output。}
+        - {name: global_cash, value: score_entmax_global_cash, description: global cash output。}
+        - {name: bounded_cash, value: score_entmax_bounded_cash, description: bounded cash output。}
+        - {name: learned_cash, value: learned_cash, description: 獨立現金 gate 的 learned-cash L1 output。}
+        - {name: cash_l1, value: cash_l1, description: 顯式 cash L1 output。}
+        - {name: cash_entmax, value: cash_entmax15, description: cash-entmax 1.5 output。}
+        - {name: l1, value: l1, description: 無 cash slot 的 raw-score L1 output。}
+        - {name: projection_l1, value: projection_l1, description: 投影 L1 output。}
+        - {name: signed_softmax, value: signed_softmax, description: signed-softmax output。}
+        - {name: signed_sparsemax, value: signed_sparsemax, description: signed-sparsemax output。}
+        - {name: signed_entmax, value: signed_entmax15, description: signed-entmax 1.5 output。}
+        - {name: activation_l1, value: activation_l1, description: activation-L1 output，保持基準 pre_normalized executor。}
+    - name: annual_reset
+      enabled: true
+      path: training.day_trade_training_annual_episodes
+      values:
+        - {name: 'off', value: false, description: 僅此比較取消訓練年度帳戶重置；fold10 與資料不變。屬訓練帳戶契約實驗。}
+    - name: sub_lot_gradient
+      enabled: true
+      path: training.day_trade_sub_lot_recovery
+      values:
+        - {name: 'on', value: true, description: 開啟零股恢復梯度；forward 整股成交不變，backward 契約改變。}
+    - name: batch
+      enabled: true
+      path: training.batch_size_train
+      values:
+        - {name: b128, value: 128, description: global batch256 → 128；梯度分段改變，不是等價效能測試。}
+        - {name: b512, value: 512, description: global batch256 → 512；VRAM 待實跑，梯度分段改變。}
+        - {name: b1024, value: 1024, description: global batch256 → 1024；VRAM 待實跑，沒有吞吐最優或可容納的保證。}
+    - name: encoder_checkpoint
+      enabled: true
+      path: training.factorized_encoder_checkpoint
+      values:
+        - {name: 'off', value: false, description: 關閉 encoder activation 重算；forward 不變，額外 VRAM 待實跑。}
+    - name: compile
+      enabled: true
+      path: training.enable_torch_compile
+      values:
+        - {name: 'off', value: false, description: 關閉 canonical model compile；保留獨立 input/ledger kernel，非全程 eager。}
+    - name: temporal_fp32
+      enabled: true
+      path: training.financial_transformer.temporal_blocks_fp32
+      values:
+        - {name: 'off', value: false, description: 時間 blocks 使用 BF16 autocast，不動金融 ledger 精度；需誤差與完整效能驗證。}
+    - name: portfolio_fp32
+      enabled: true
+      path: training.financial_transformer.portfolio_blocks_fp32
+      values:
+        - {name: 'off', value: false, description: portfolio blocks 使用 BF16 autocast，不動金融 ledger 精度；需誤差與完整效能驗證。}
