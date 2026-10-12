@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Launch a pinned trainer: existing resume or an accepted new annual run."""
 from __future__ import annotations
+import ast
 import argparse
 import hashlib
 import json
@@ -18,6 +19,44 @@ from scripts.manage_gpu_jobs import _busy_gpu_indices, _gpu_lease_command
 
 
 ANNUAL_LAUNCH_CONTRACT = 'accepted_annual_scale_cash_launch_v1'
+
+
+def _verify_reporting_source_amendment(launch, accepted_source_sha256):
+    """Permit a receipt-backed report fix, never an unmeasured trainer change."""
+    amendment_path = launch.get('reporting_source_amendment')
+    if amendment_path is None:
+        assert launch['source_sha256'] == accepted_source_sha256, 'source_sha256'
+        return
+    path = Path(amendment_path)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == launch['reporting_source_amendment_sha256'], 'report amendment changed'
+    amendment = json.loads(path.read_text())
+    assert amendment['contract'] == 'report_only_stitched_source_amendment_v1'
+    assert amendment['state'] == 'verified' and not amendment['optimizer_contract_changed']
+    assert amendment['parent_source_sha256'] == accepted_source_sha256
+    assert amendment['source_sha256'] == launch['source_sha256']
+    assert amendment['source_receipt'] == launch['source_receipt']
+    assert amendment['config_sha256'] == launch['config_sha256']
+    parent_receipt = Path(amendment['parent_source_receipt'])
+    receipt = Path(launch['source_receipt'])
+    for item, expected in ((parent_receipt, accepted_source_sha256),
+                           (receipt, launch['source_sha256'])):
+        assert verify_source_release(item, item.parent / 'build-source')['source_sha256'] == expected
+        verify_release_bundles(item)
+    parent = json.loads(parent_receipt.read_text())['code']['files']
+    current = json.loads(receipt.read_text())['code']['files']
+    assert parent.keys() == current.keys(), 'report fix changes source inventory'
+    changed = sorted(name for name in parent if parent[name] != current[name])
+    assert changed == ['stockagent/training/trainer.py'], 'report fix changes another module'
+    allowed = {'_stitched_deployment_prefix_results',
+               '_replay_taiwan_stitched_deployment', '_refresh_walkforward_artifacts'}
+    trees = []
+    for item in (parent_receipt, receipt):
+        tree = ast.parse((item.parent / 'build-source/stockagent/training/trainer.py').read_text())
+        tree.body = [node for node in tree.body
+                     if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                             and node.name in allowed)]
+        trees.append(ast.dump(tree, include_attributes=False))
+    assert trees[0] == trees[1], 'report fix changes train, loss, model or optimizer code'
 
 
 def _verify_launch_config(launch):
@@ -52,7 +91,8 @@ def _annual_acceptance(launch):
     assert hashlib.sha256(path.read_bytes()).hexdigest() == launch['acceptance_sha256'], 'acceptance receipt changed'
     proof = json.loads(path.read_text())
     assert proof['state'] == 'accepted' and proof['contract'] == ANNUAL_LAUNCH_CONTRACT
-    for key in ('source_sha256', 'config_sha256', 'fold_ids'):
+    _verify_reporting_source_amendment(launch, proof['source_sha256'])
+    for key in ('config_sha256', 'fold_ids'):
         assert proof[key] == launch[key], key
     assert proof['fold_ids'] == [10] and proof['train_years'] == list(range(2015, 2025))
     assert proof['context_years'] == [2014] and proof['val_years'] == [2025] and proof['test_years'] == [2026]

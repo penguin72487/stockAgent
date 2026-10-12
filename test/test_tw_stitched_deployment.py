@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -374,6 +376,135 @@ def test_stitched_replay_preserves_t2_claim_and_expands_dynamic_symbols(
         replayed_again.receivables_history,
         stitched.receivables_history,
     )
+
+
+def test_stitched_replay_defers_future_fold_without_ageing_t2_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    closes = np.full((4, 3), 10.0, dtype=np.float32)
+    closes[0, 1] = 11.0
+    panel = _day_trade_panel(closes)
+    first = _write_fold_requests(
+        tmp_path, fold_id=1, dates=panel.dates[:1], symbols=("2330",),
+        requests=np.asarray([[1.0]]),
+    )
+    future = _write_fold_requests(
+        tmp_path, fold_id=3, dates=panel.dates[3:], symbols=("2330",),
+        requests=np.asarray([[0.0]]),
+    )
+    future_path = trainer_module._deployment_backtest_path(
+        trainer_module._fold_dir(tmp_path, 3)
+    )
+    future_hash = hashlib.sha256(future_path.read_bytes()).hexdigest()
+    config = _day_trade_config()
+    partial = trainer_module._replay_taiwan_stitched_deployment(
+        tmp_path, [future, first], panel=panel, config=config,
+    )
+    assert partial is not None
+    np.testing.assert_allclose(partial.cash_history, [100.0])
+    np.testing.assert_allclose(partial.receivables_history, [[0.0, 10.0]])
+    assert hashlib.sha256(future_path.read_bytes()).hexdigest() == future_hash
+    coverage_path = tmp_path / "walkforward_deployment_coverage.json"
+    partial_coverage = json.loads(coverage_path.read_text())
+    assert partial_coverage["stitched_fold_ids"] == [1]
+    assert partial_coverage["deferred_fold_ids"] == [3]
+    assert partial_coverage["state"] == "awaiting_intervening_folds"
+
+    bridge = _write_fold_requests(
+        tmp_path, fold_id=2, dates=panel.dates[1:3], symbols=("2330",),
+        requests=np.zeros((2, 1)),
+    )
+    connected = trainer_module._replay_taiwan_stitched_deployment(
+        tmp_path, [future, bridge, first], panel=panel, config=config,
+    )
+    assert connected is not None
+    np.testing.assert_allclose(connected.cash_history, [100.0, 100.0, 110.0, 110.0])
+    np.testing.assert_allclose(
+        connected.receivables_history, [[0.0, 10.0], [10.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+    )
+    coverage = json.loads(coverage_path.read_text())
+    assert coverage["stitched_fold_ids"] == [1, 2, 3]
+    assert coverage["deferred_fold_ids"] == []
+    assert coverage["rows"] == 4
+
+
+@pytest.mark.parametrize(
+    "owned_rows",
+    [[[0, 2]], [[0], [2]]],
+    ids=["missing_session_inside_fold", "missing_session_between_adjacent_folds"],
+)
+def test_stitched_replay_still_rejects_missing_exchange_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owned_rows: list[list[int]],
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    panel = _day_trade_panel(np.full((3, 3), 10.0, dtype=np.float32))
+    results = [
+        _write_fold_requests(
+            tmp_path, fold_id=index + 1, dates=panel.dates[rows],
+            symbols=("2330",), requests=np.zeros((len(rows), 1)),
+        )
+        for index, rows in enumerate(owned_rows)
+    ]
+    with pytest.raises(RuntimeError, match="every exchange session"):
+        trainer_module._replay_taiwan_stitched_deployment(
+            tmp_path, results, panel=panel, config=_day_trade_config(),
+        )
+
+
+def test_stitched_prefix_keeps_requested_late_fold_and_rejects_duplicates() -> None:
+    only_late = [_fold_result(10)]
+    assert trainer_module._stitched_deployment_prefix_results(
+        only_late, execution_mode="tw_day_trade",
+    ) == only_late
+    with pytest.raises(RuntimeError, match="duplicate fold ownership"):
+        trainer_module._stitched_deployment_prefix_results(
+            [_fold_result(1), _fold_result(1)], execution_mode="tw_day_trade",
+        )
+
+
+def test_refresh_keeps_all_fold_tests_but_only_connected_deployment_plots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    panel = _day_trade_panel(np.full((4, 3), 10.0, dtype=np.float32))
+    panel.dates = np.asarray(
+        ["2025-01-02", "2025-01-03", "2025-01-06", "2026-01-02"],
+        dtype="datetime64[D]",
+    )
+    folds = [
+        _write_fold_requests(
+            tmp_path, fold_id=fold_id, dates=panel.dates[rows],
+            symbols=("2330",), requests=np.zeros((len(rows), 1)),
+        )
+        for fold_id, rows in [(1, [0]), (10, [3])]
+    ]
+    for result in folds:
+        folder = trainer_module._fold_dir(tmp_path, result.fold_id)
+        backtest, dates = trainer_module._load_backtest_artifact(
+            trainer_module._deployment_backtest_path(folder)
+        )
+        trainer_module._save_backtest_artifact(
+            trainer_module._backtest_path(folder), backtest, dates,
+        )
+    captured = {}
+    monkeypatch.setattr(
+        trainer_module, "plot_first_year_fold_metric_bars",
+        lambda ids, _strategy, _benchmark, path, **kwargs:
+        captured.update({Path(path).name: list(ids)}),
+    )
+    for name in ("plot_fold_first_year_returns", "plot_fold_first_year_returns_log10",
+                 "plot_first_year_turnover_concentration"):
+        monkeypatch.setattr(trainer_module, name, lambda *args, **kwargs: None)
+    trainer_module._refresh_walkforward_artifacts(
+        tmp_path, folds, panel=panel, config=_day_trade_config(),
+    )
+    assert captured["walkforward_first_year_fold_metrics.png"] == [1, 10]
+    assert captured["walkforward_stitched_deployment_fold_metrics.png"] == [1]
 
 
 def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
