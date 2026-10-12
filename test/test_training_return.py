@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,14 @@ def example(tmp_path, monkeypatch):
     lifecycle.finish_fold(1)
     _write_minimal_completed_artifacts(lifecycle.layout, group_name="train_2020-2021", fold_id=1, execution_mode="naive")
     lifecycle.complete(fold_ids=[1])
+    # Existing destructive-path tests exercise a legitimately expired run.
+    # Fresh-run retention is verified separately below, without bypass flags.
+    old = returns.time.time() - 8 * 24 * 3600
+    progress = json.loads((source / "progress.json").read_text())
+    progress["updated_at"] = datetime.fromtimestamp(old, timezone.utc).isoformat()
+    (source / "progress.json").write_text(json.dumps(progress))
+    for path in source.rglob("*"):
+        os.utime(path, (old, old))
     cold = tmp_path / "cold"
     initialize_packed_layout(cold, node_id="penguin")
     spec = ColdArtifactSpec(automatic_dataset_name(relative), relative, None, 64, 4, 0, "training-lifecycle-v1")
@@ -36,10 +45,12 @@ def example(tmp_path, monkeypatch):
     ack = returns.make_ack(cold, release, relative_root=relative, origin="vastai1T")
     policy = returns.load_policy(Path("configs/data_sync/training_return.json"))
     policy["stable_hours"] = 0
+    policy["retire_verified_source"] = True
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setattr(returns, "artifact_process_references", lambda *args: [])
     monkeypatch.setattr(returns, "artifact_service_references", lambda *args: {})
+    monkeypatch.setattr(returns, "recovered_source_references", lambda *args: [])
     return artifact, source, state, cold, release, ack, policy
 
 
@@ -55,6 +66,76 @@ def test_complete_return_reconstructs_after_exact_source_cleanup(example, tmp_pa
     restored = fetch_packed_snapshot(cold, tmp_path / "restored", release)
     assert (restored / "fold_01/checkpoint_best.pt").is_file()
     assert returns.inventory(restored)["rows"]
+
+
+def test_recent_run_is_backed_up_but_hot_retirement_waits_seven_days(example, tmp_path):
+    artifact, source, state, cold, release, ack, policy = example
+    now = returns.time.time()
+    os.utime(source / "fold_01/checkpoint_best.pt", (now, now))
+    # The already independently reconstructed ACK remains valid: bytes match.
+    plan = returns.plan_retirement(artifact, state, tmp_path, ack, policy)
+    assert "training-hot-retention-not-expired" in plan["blockers"]
+    assert plan["hot_retention"]["retain_until_epoch"] >= now + 7 * 24 * 3600
+    with pytest.raises(SnapshotError, match="blocked"):
+        returns.apply_retirement(artifact, state, tmp_path, ack, policy, plan["plan_fingerprint"])
+    assert source.is_dir() and release.manifest_sha256 == ack["manifest_sha256"]
+    restored = fetch_packed_snapshot(cold, tmp_path / "backed-up-recent-run", release)
+    assert (restored / "fold_01/checkpoint_best.pt").read_bytes() == (source / "fold_01/checkpoint_best.pt").read_bytes()
+
+
+def test_completion_timestamp_cannot_be_bypassed_by_backdating_file_mtime(example):
+    _, source, _, _, _, _, _ = example
+    now = returns.time.time()
+    p = source / "progress.json"
+    progress = json.loads(p.read_text())
+    progress["updated_at"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    p.write_text(json.dumps(progress))
+    for path in source.rglob("*"):
+        os.utime(path, (now - 8 * 86400, now - 8 * 86400))
+    retention = returns.training_hot_retention(source, returns.inventory(source)["rows"], required=True)
+    assert retention["blockers"] == ["training-hot-retention-not-expired"]
+    assert retention["retain_until_epoch"] == pytest.approx(now + 7 * 86400, rel=0, abs=1e-6)
+
+
+def test_formal_retention_applies_to_legacy_parent_but_not_plain_cache(example):
+    artifact, source, _, _, _, _, _ = example
+    now = returns.time.time()
+    os.utime(source / "fold_01/checkpoint_best.pt", (now, now))
+    from stockagent.data_sync.remote_legacy_return import metadata_tree
+    parent = source.parent
+    assert returns.training_hot_retention(parent, metadata_tree(parent)["rows"])["blockers"]
+    cache = artifact / "cache/panel"
+    cache.mkdir(parents=True)
+    (cache / "array.npy").write_bytes(b"rebuildable panel")
+    assert returns.training_hot_retention(cache, metadata_tree(cache)["rows"]) == {
+        "applies": False, "minimum_hours": 168, "blockers": []}
+
+
+def test_recovered_completed_run_is_protected_by_explicit_hold(example, tmp_path, monkeypatch):
+    artifact, source, state, _, _, ack, policy = example
+    monkeypatch.setattr(returns, "recovered_source_references", lambda *args: ["explicit-recovery-hold:markets/complete-run"])
+    plan = returns.plan_retirement(artifact, state, tmp_path, ack, policy)
+    assert "source-recovery-hold" in plan["blockers"]
+    with pytest.raises(SnapshotError, match="blocked"):
+        returns.apply_retirement(artifact, state, tmp_path, ack, policy, plan["plan_fingerprint"])
+    assert source.exists()
+
+
+def test_v2_owner_policy_gets_seven_day_floor_without_restarting_owner():
+    policy = json.loads(Path("configs/data_sync/training_return.json").read_text())
+    policy.pop("minimum_hot_retention_hours")
+    policy["schema_version"] = 2
+    upgraded = returns.load_policy(policy)
+    assert upgraded["schema_version"] == 3
+    assert upgraded["minimum_hot_retention_hours"] == 168
+
+
+@pytest.mark.parametrize("hours", [0, 167, True, float("nan"), float("inf")])
+def test_seven_day_formal_retention_cannot_be_lowered(hours):
+    policy = json.loads(Path("configs/data_sync/training_return.json").read_text())
+    policy["minimum_hot_retention_hours"] = hours
+    with pytest.raises(SnapshotError, match="at least seven days"):
+        returns.load_policy(policy)
 
 
 def test_same_size_changed_source_fails_content_ack(example, tmp_path):

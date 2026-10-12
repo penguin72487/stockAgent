@@ -5,6 +5,7 @@ from datetime import date
 import sys
 import threading
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -56,7 +57,7 @@ class _FakeApi:
     def _snapshot_rows(self, contracts):
         now_ns = int(
             np.datetime64(
-                __import__("datetime").datetime.now().replace(tzinfo=None),
+                __import__("datetime").datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None),
                 "ns",
             ).astype(np.int64)
         )

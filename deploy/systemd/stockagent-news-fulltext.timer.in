@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume private news text backfill; refresh RSS and accepted local metadata incrementally
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=stockagent-news-fulltext.service
+
+[Install]
+WantedBy=timers.target

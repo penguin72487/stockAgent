@@ -42,17 +42,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--deadline-seconds',type=int,default=600)
+    parser.add_argument('--reload-code-only',action='store_true',help='reload the existing owner without changing source capacity policy')
     args = parser.parse_args()
     if args.output.exists() or not 1 <= args.deadline_seconds <= 600:
         parser.error('use a new receipt and a bounded handoff deadline')
     c=configuration();guard(c)
-    policy=json.loads((ROOT/'configs/data_sync/lake_source_replication.json').read_bytes())
+    policy=(c['source_replication'] if args.reload_code_only else
+            json.loads((ROOT/'configs/data_sync/lake_source_replication.json').read_bytes()))
     source_wave_policy({**c,'source_replication':policy})
     ready=json.loads(Path('/srv/stockagent-backup-receipts-lab203/readiness.json').read_bytes())
     if any(ready[k] != c[k] for k in ('producer_device_id','receiver_device_id')):
         raise ValueError('source policy capacity belongs to another paired receiver')
     reserve=64*1024**3
-    if policy['maximum_retained_transport_bytes'] > ready['ingress_free_bytes']-reserve:
+    if not args.reload_code_only and policy['maximum_retained_transport_bytes'] > ready['ingress_free_bytes']-reserve:
         raise ValueError('requested spool exceeds the reported receiver capacity reserve')
     private=Path('/etc/stockagent/lakehouse-control.json')
     original=private.read_bytes()
@@ -67,7 +69,13 @@ def main():
                 with ExitStack() as stack:
                     for name in ('source-replication-owner.lock','catalog-owner.lock'):
                         f=stack.enter_context((Path(c['state_root'])/name).open('a'))
-                        fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        remaining=max(1,int(deadline-time.monotonic()))
+                        acquired=subprocess.run(['flock','--exclusive','--wait',str(remaining),str(f.fileno())],
+                                                pass_fds=(f.fileno(),),capture_output=True,timeout=remaining+5)
+                        if acquired.returncode==1:
+                            raise TimeoutError('publication owner has not reached its handoff boundary')
+                        if acquired.returncode:
+                            raise RuntimeError('canonical owner acquisition failed')
                     subprocess.run(['systemctl','stop',OWNER],check=True,timeout=110)
                     stopped=True
                     if private.read_bytes() != original:
@@ -84,9 +92,10 @@ def main():
                             stream.write(original);stream.flush();os.fsync(stream.fileno())
                     elif backup.read_bytes()!=original:
                         raise ValueError('private rollback identity conflicts')
-                    updated=json.loads(original);updated['source_replication']=policy
-                    atomic_write_json(private,updated,durable=True)
-                    os.chmod(private,0o600)
+                    if not args.reload_code_only:
+                        updated=json.loads(original);updated['source_replication']=policy
+                        atomic_write_json(private,updated,durable=True)
+                        os.chmod(private,0o600)
                 break
             except BlockingIOError:
                 if time.monotonic()>=deadline:
@@ -107,6 +116,7 @@ def main():
         if pid('postgresql@18-main.service')!=pg_pid or pid('stockagent-temporal.service')!=server_pid:
             raise ValueError('authority PG or Temporal server changed unexpectedly')
         result={'state':'accepted','observed_at_utc':datetime.now(timezone.utc).isoformat(),
+                'reload_code_only':args.reload_code_only,
                 'publication_owner_boundary_verified':True,'previous_pid':previous_pid,'current_pid':pid(OWNER),
                 'loaded_code_identity_sha256':worker['code_identity_sha256'],'source_policy':policy,
                 'private_configuration_before_sha256':hashlib.sha256(original).hexdigest(),

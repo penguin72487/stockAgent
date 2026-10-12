@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>FinLab API 資料監控｜StockAgent</title>
   <link rel="stylesheet" href="../shioaji/styles.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=5">
+  <link rel="stylesheet" href="styles.css?v=7">
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
   <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
@@ -47,6 +47,12 @@
 
     <section id="workload" class="section-block" aria-labelledby="workload-title">
       <header class="section-heading"><span>00</span><div><h2 id="workload-title">下載工作量與預估完成時間</h2><p id="workload-freshness">正在讀取本機工作量快照；不會額外呼叫 FinLab。</p></div></header>
+      <div class="kpi-grid" id="history-overview" aria-label="歷史取得與追新分工">
+        <article class="kpi featured"><span>一般歷史已取得 → 自動追新</span><strong id="history-incremental">—</strong><p id="history-incremental-note">核對有效來源物件，不以目錄張數判定歷史完整。</p></article>
+        <article class="kpi"><span>一般歷史尚未取得</span><strong id="history-backfill">—</strong><p id="history-backfill-note">可執行回補、來源待修復分開。</p></article>
+        <article class="kpi"><span>逐筆／分鐘實際已取得範圍</span><strong id="history-intraday-range">—</strong><p id="history-intraday-note">未知的更早歷史不冒充可下載。</p></article>
+      </div>
+      <p id="minute-priority-now" class="data-note" aria-live="polite">排程切換為分鐘優先；正在核對下載收據。</p>
       <div class="progress-card">
         <div class="finlab-volume-heading"><span>一般歷史追新 · 按完整來源大小加權</span><strong id="volume-progress-label">待量測</strong></div>
         <progress id="volume-progress" class="progress-track" max="1" aria-label="可估一般歷史追新的流量加權進度"></progress>
@@ -56,7 +62,7 @@
         <div id="workload-records" class="workload-records" aria-label="按筆數口徑分開的追新進度"></div>
       </div>
       <div class="kpi-grid workload-eta">
-        <article class="kpi featured"><span>本次觀測待辦清完 · 參考情境</span><strong id="download-global-eta">待估算</strong><p id="workload-time-left">—</p></article>
+        <article class="kpi featured"><span>一般表本輪待辦 · 參考情境（分鐘另列）</span><strong id="download-global-eta">待估算</strong><p id="workload-time-left">—</p></article>
         <article class="kpi"><span>實際下載加處理 · 估計工作時間</span><strong id="workload-processing">—</strong><p>不含等待配額、排程和開盤保護</p></article>
         <article class="kpi"><span>等待配額／排程／開盤保護</span><strong id="workload-wait">—</strong><p id="workload-reset-count">—</p></article>
       </div>
@@ -92,7 +98,7 @@
       <div class="kpi-grid">
         <article class="kpi featured"><span>已使用</span><strong id="quota-used">—</strong><p id="quota-percent">尚無觀測</p></article>
         <article class="kpi"><span>FinLab 原始剩餘</span><strong id="quota-remaining">—</strong><p>帳號上限扣除已使用量</p></article>
-        <article class="kpi"><span>歷史／整表保留後可用</span><strong id="quota-safe-remaining">—</strong><p id="quota-reserve-basis">本機回補保留量預設 50 MB；追新與帳號觀測另列</p></article>
+        <article class="kpi"><span>分鐘線保留後可用</span><strong id="quota-safe-remaining">—</strong><p id="quota-reserve-basis">分鐘線預留 50 MB；重置前解除本機預留，追新仍優先</p></article>
         <article class="kpi"><span>重置規則</span><strong id="quota-reset">—</strong><p id="quota-reset-basis">官方 08:00 台北時間；日期依規則推算</p></article>
       </div>
       <div class="quota-track"><div class="quota-track-header"><span>帳號已用比例</span><strong id="quota-ratio">—</strong></div><progress id="quota-progress" max="1" aria-label="FinLab 帳號每日資料流量使用比例"></progress><small id="quota-observed">尚未取得獨立帳號觀測</small></div>
@@ -134,20 +140,29 @@
         <article class="kpi"><span>下次排程</span><strong id="download-next">—</strong><p id="download-state">—</p></article>
       </div>
       <p id="download-breakdown" class="data-note">—</p>
-      <div class="finlab-toolbar"><label>搜尋資料鍵<input id="dataset-search" type="search" autocomplete="off" placeholder="鍵名或類別"></label><label>狀態<select id="dataset-filter"><option value="all">全部（未取得優先）</option><option value="not_downloaded">未取得（全部）</option><option value="downloaded">已取得</option><option value="pending">尚未嘗試</option><option value="attention">失敗／權限／暫緩</option></select></label><span id="dataset-result-count">—</span></div>
-      <div class="finlab-table-scroll" role="region" aria-label="FinLab 資料鍵明細" tabindex="0"><table><thead><tr><th>資料鍵</th><th>狀態</th><th>原因／下一步</th><th>最早</th><th>最新</th><th>資料量</th><th>筆數口徑</th><th>本機容量</th><th>需再下載 · 估</th><th>單鍵估計耗時</th><th>預計完成 · 條件情境</th><th>最後嘗試</th><th>最後來源查詢</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="13">讀取中…</td></tr></tbody></table></div>
+      <div class="finlab-toolbar"><label>搜尋資料鍵<input id="dataset-search" type="search" autocomplete="off" placeholder="鍵名或類別"></label><label>下載模式／狀態<select id="dataset-filter"><option value="all">全部</option><option value="incremental">已取得歷史 · 追新</option><option value="backfill">歷史未取得／分區回補</option><option value="source_wait">來源待修復</option><option value="not_downloaded">未取得（全部）</option><option value="downloaded">已取得</option><option value="pending">尚未嘗試</option><option value="attention">失敗／權限／暫緩</option></select></label><label>資料分類<select id="dataset-group"><option value="all">全部分類</option></select></label><label>檢視排序<select id="dataset-sort"><option value="queue">未完成優先，再依重要性</option><option value="importance">研究重要性</option><option value="oldest_check">最久未查源</option><option value="size">本機容量由大到小</option><option value="name">資料鍵名稱</option></select></label><span id="dataset-result-count">—</span></div>
+      <p class="data-note">重要性是預設台股研究用途分級，不是模型實測的特徵重要度；可切換分類與排序。此處只改檢視，不從公開頁控制下載。實際排程：到期行情 → 缺失歷史 → 其他追新 → 標籤 → 來源重試 → 分鐘優先 → 剩餘配額 Tick。</p>
+      <div class="finlab-table-scroll" role="region" aria-label="FinLab 資料鍵明細" tabindex="0"><table><thead><tr><th>資料鍵</th><th>下載模式／狀態</th><th>分類／重要性</th><th>原因／下一步</th><th>最早</th><th>最新</th><th>資料量</th><th>筆數口徑</th><th>本機容量</th><th>下次傳輸 · 估</th><th>單鍵估計耗時</th><th>預計完成 · 條件情境</th><th>最後嘗試</th><th>最後來源查詢</th></tr></thead><tbody id="dataset-rows"><tr><td colspan="14">讀取中…</td></tr></tbody></table></div>
       <button type="button" id="dataset-more" class="finlab-more" hidden>載入更多</button>
-      <section class="finlab-market" aria-labelledby="market-title">
-        <h3 id="market-title">全市場原始 Tick 與本機合成分鐘</h3>
+      <section id="market" class="finlab-market" aria-labelledby="market-title">
+        <h3 id="market-title">全市場股票／TDR · 分鐘優先、Tick 後補</h3>
         <p id="market-basis" class="data-note">正在核對官方現有／下市名單與逐檔分區收據…</p>
-        <p class="data-note">Tick 是同帳號最低優先級：先補／追新一般歷史資料及處理可發版研究資料，當輪可執行待辦清空且仍有保留額度之外的餘量才抓 Tick。分鐘棒在本機依逐筆成交合成；舊版直接下載的分鐘檔保留但不算合成進度。此區以「代號 × 交易日 × 粒度」計算，尚未通過逐時點訓練或冷庫發版守門。</p>
+        <p class="data-note">本分區排程涵蓋現有與下市股票／TDR，不包含 ETF 或期貨分月分鐘；這些不能用股票分區的進度宣稱已取得。</p>
+        <p class="data-note">分鐘線直接向 FinLab 下載；已有 Tick 可合成的分鐘沿用。兩種來源按股票＋交易日去重，來源待上架各自記錄。先補分鐘的已觀測日期窗與到期重查，沒有可執行分鐘缺口後才抓 Tick；更早未確認歷史另做有界探查。尚未通過逐時點訓練或冷庫發版守門。</p>
         <div class="kpi-grid">
           <article class="kpi"><span>股票名單</span><strong id="market-symbols">—</strong><p id="market-former">—</p></article>
-          <article class="kpi"><span>Tick 合成分鐘分區</span><strong id="market-minute">—</strong><progress id="market-minute-progress" class="progress-track" max="1" aria-label="全市場合成分鐘分區覆蓋率"></progress></article>
-          <article class="kpi"><span>逐筆分區</span><strong id="market-tick">—</strong><progress id="market-tick-progress" class="progress-track" max="1" aria-label="全市場逐筆分區覆蓋率"></progress></article>
+          <article class="kpi"><span>分鐘 · 直接＋合成去重／候選分區</span><strong id="market-minute">—</strong><progress id="market-minute-progress" class="progress-track" max="1" aria-label="分鐘的候選覆蓋，非供應商完整率"></progress><p id="market-minute-count">—</p></article>
+          <article class="kpi"><span>逐筆 · 已收／候選分區</span><strong id="market-tick">—</strong><progress id="market-tick-progress" class="progress-track" max="1" aria-label="逐筆資料的候選覆蓋，非供應商完整率"></progress><p id="market-tick-count">—</p></article>
           <article class="kpi"><span>FinLab 日收盤價代號</span><strong id="market-daily">—</strong><p id="market-daily-gap">—</p></article>
-          <article class="kpi"><span>完成時間</span><strong id="market-eta">未知</strong><p id="market-state">—</p></article>
+          <article class="kpi"><span>近期分鐘回補完成 · 條件式</span><strong id="market-eta">計算中</strong><p id="tick-eta-summary">—</p></article>
         </div>
+        <p id="market-state" class="data-note" aria-live="polite">—</p>
+        <h4>分鐘優先 · 進度與分階段完成時間</h4>
+        <p id="tick-estimation-basis" class="data-note">正在讀取完整批次測量…</p>
+        <div class="finlab-table-scroll finlab-tick-progress" role="region" aria-label="分鐘分階段進度與條件式預估完成時間" tabindex="0"><table><thead><tr><th>階段／日期窗</th><th>已取得／候選股票日</th><th>來源待上架／待查</th><th>K棒筆數 · 實際／預估</th><th>本機容量 · 實際／預估</th><th>剩餘下載流量 · 估</th><th>完成日期 · 情境</th></tr></thead><tbody id="minute-phases"><tr><td colspan="7">讀取中…</td></tr></tbody></table></div>
+        <h4>Tick 後補 · 獨立進度與預估</h4>
+        <p class="data-note">最新日與近期回補的 ETA 假設候選均已發布；更早歷史只估「首次查完候選」，不是把 2003 年起的 Tick 全部抓完。既有派工仍交錯探查；近期估時已含探索成本，更早階段按近期結束後集中探查估計。來源補檔等待無法預測，另列未上架數。快速／參考／較慢是敏感度情境，不是保證或統計信賴區間；不包含之後新增的交易日。</p>
+        <div class="finlab-table-scroll finlab-tick-progress" role="region" aria-label="Tick 分階段進度與條件式預估完成時間" tabindex="0"><table><thead><tr><th>階段／日期窗</th><th>已取得／候選股票日</th><th>來源待上架／待查</th><th>Tick 筆數 · 實際／預估</th><th>本機容量 · 實際／預估</th><th>剩餘下載流量 · 估</th><th>完成日期 · 情境</th></tr></thead><tbody id="intraday-phases"><tr><td colspan="7">讀取中…</td></tr></tbody></table></div>
         <div class="finlab-toolbar"><label>搜尋股票代號<input id="market-search" type="search" autocomplete="off" placeholder="例如 2330、2867、tw_tick"></label><span id="market-result-count">—</span></div>
         <div class="finlab-table-scroll" role="region" aria-label="全市場逐檔分鐘與 Tick 進度" tabindex="0"><table><thead><tr><th>動態資料鍵</th><th>分類</th><th>FinLab 日收盤價</th><th>目標日分區</th><th>已收</th><th>未上架／其他失敗</th><th>資料最早</th><th>資料最新</th><th>筆數</th><th>本機容量</th></tr></thead><tbody id="market-rows"><tr><td colspan="10">正在讀取…</td></tr></tbody></table></div>
         <button type="button" id="market-more" class="finlab-more" hidden>載入更多</button>
@@ -164,8 +179,8 @@
       <p class="limitation">流量進度以既有原始 Feather 物件大小為整表下載基準，不是壓縮後 Parquet，也不是帳號累計用量。分子是本輪已查新來源的大小，分母再加目前可估待辦；未知大小、來源全空與全市場 Tick 不會被假補成零。筆數依寬表非空資料格、明細列、來源標籤分開，不把一個交易日當成一筆全市場資料，也不混加不同口徑。估時使用上次強制下載及轉存耗時、逐表配額容納、日額度重置與交易日開盤保護；未來新增、重新到期工作及來源失敗不在固定待辦情境內。每分鐘只更新本機量測，瀏覽器不查 FinLab。新私有包仍須既有全目錄來源與雜湊守門；上述進度不保證逐股歷史完整或 PIT。遠端研究限定私人、非商業用途。</p>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=14" defer></script>
-  <script src="../dashboard-acquisition.js?v=3" defer></script>
-  <script src="app.js?v=17" defer></script>
+  <script src="../dashboard-core.js?v=15" defer></script>
+  <script src="../dashboard-acquisition.js?v=5" defer></script>
+  <script src="app.js?v=26" defer></script>
 </body>
 </html>

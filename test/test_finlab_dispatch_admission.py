@@ -28,6 +28,23 @@ def test_minute_dispatch_does_not_start_a_heavy_idle_sweep(tmp_path):
     assert refresh_due(tmp_path, now=NOW) == (False, "nothing_actionable_now")
 
 
+def test_shared_intraday_cooldown_skips_pool_but_not_due_general_data(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/intraday/source_backoff.json", {
+        "retry_at_utc": (NOW+timedelta(minutes=15)).isoformat()})
+    assert refresh_due(tmp_path, now=NOW) == (False, "intraday_source_cooldown")
+    setup(tmp_path, pending=True, remaining=1000)
+    assert refresh_due(tmp_path, now=NOW) == (True, "general_work_due")
+
+
+def test_expired_or_invalid_intraday_cooldown_does_not_suppress_recovery(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": True})
+    for at in ("invalid", (NOW-timedelta(seconds=1)).isoformat()):
+        write(tmp_path / "data_finlab/intraday/source_backoff.json", {"retry_at_utc": at})
+        assert refresh_due(tmp_path, now=NOW) == (True, "residual_tick_capacity")
+
+
 def test_verified_sdk_due_update_bypasses_local_history_reserve(tmp_path):
     setup(tmp_path, pending=True, remaining=0)
     assert refresh_due(tmp_path, now=NOW) == (True, "general_work_due")
@@ -56,6 +73,56 @@ def test_tick_only_uses_proven_residual_capacity(tmp_path):
     assert refresh_due(tmp_path, now=NOW) == (True, "residual_tick_capacity")
     write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": False, "scheduled_reserve_mb": 500})
     assert not refresh_due(tmp_path, now=NOW)[0]
+
+
+def test_minute_work_is_admitted_even_when_tick_backlog_is_zero(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": True, "scheduled_reserve_mb": 50})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {"acquisition_mode": "minute_first_tick_residual",
+        "by_kind": {"tw_tick": {"remaining_partitions": 0}, "tw_minute": {"remaining_partitions": 100}}})
+    assert refresh_due(tmp_path, now=NOW) == (True, "minute_first_residual_capacity")
+
+
+def test_minute_dispatch_uses_50mb_not_tick_scheduled_reserve(tmp_path):
+    setup(tmp_path, remaining=60)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {
+        "minute_residual_allowed": True, "supplemental_allowed": False, "scheduled_reserve_mb": 800})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {
+        "acquisition_mode": "minute_first_tick_residual", "by_kind": {"tw_minute": {"remaining_partitions": 1}}})
+    assert refresh_due(tmp_path, now=NOW) == (True, "minute_first_residual_capacity")
+    write(tmp_path / "artifacts/live/finlab/quota_latest.json", {"observed_at_utc": NOW.isoformat(), "remaining_mb": 50})
+    assert refresh_due(tmp_path, now=NOW) == (False, "minute_quota_floor_reached")
+
+
+def test_pre_reset_dispatch_drain_runs_even_on_closed_market_and_under_50mb(tmp_path):
+    before_reset = NOW.replace(hour=23)
+    setup(tmp_path, remaining=20)
+    workload = tmp_path / "artifacts/live/finlab/workload_latest.json"
+    value = json.loads(workload.read_text())
+    value["generated_at_utc"] = before_reset.isoformat()
+    value["datasets"][0]["next_source_check_at_utc"] = (before_reset+timedelta(hours=2)).isoformat()
+    write(workload, value)
+    write(tmp_path / "artifacts/live/finlab/quota_latest.json", {
+        "observed_at_utc": before_reset.isoformat(), "remaining_mb": 20})
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {
+        "minute_residual_allowed": True, "supplemental_allowed": True, "scheduled_reserve_mb": 800})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {
+        "acquisition_mode": "minute_first_tick_residual", "by_kind": {"tw_minute": {"remaining_partitions": 1}}})
+    assert refresh_due(tmp_path, now=before_reset) == (True, "minute_pre_reset_drain")
+    write(tmp_path / "artifacts/live/finlab/quota_latest.json", {
+        "observed_at_utc": before_reset.isoformat(), "remaining_mb": 0})
+    assert refresh_due(tmp_path, now=before_reset) == (False, "minute_quota_floor_reached")
+
+
+def test_known_minute_source_wait_does_not_restart_heavy_sweep_every_minute(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": False,
+        "minute_residual_allowed": True, "scheduled_reserve_mb": 50})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {"acquisition_mode": "minute_first_tick_residual",
+        "minute_priority": {"pending_known_window_partitions": 0, "due_publication_rechecks": 0,
+                            "next_source_check_at_utc": (NOW+timedelta(hours=2)).isoformat()}})
+    assert refresh_due(tmp_path, now=NOW) == (False, "minute_source_wait_tick_general_debt")
+    assert refresh_due(tmp_path, now=NOW+timedelta(minutes=1))[0] is False
 
 
 def test_exhausted_frontier_is_not_rescanned_every_minute(tmp_path):

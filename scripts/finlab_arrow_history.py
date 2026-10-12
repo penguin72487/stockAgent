@@ -1,4 +1,4 @@
-"""Bounded Arrow acquisition for the three known oversized FinLab tables.
+"""Bounded Arrow acquisition for known oversized FinLab tables.
 
 Use the installed SDK's authenticated metadata flow, not guessed blob URLs.
 Stream bytes to a durable raw object before decoding. Wide metadata is stored
@@ -134,7 +134,7 @@ def acquire_raw(key: str, root: Path, stem: str, *, refresh: bool,
     # A normalization retry can reuse an upstream raw proof only until its
     # provider expiry. Daily fallback must not hide a same-day release slot.
     raw_policy = {**previous, "next_source_check_at_utc": previous.get("provider_expiry_at_utc")}
-    current = previous.get("source_check_mode") == "upstream_forced" and not source_check_due(
+    current = previous.get("source_check_mode") in {"upstream_forced", "upstream_incremental"} and not source_check_due(
         raw_policy, now=datetime.now(UTC), days=1)
     if path and (not refresh or current):
         return path, previous
@@ -142,6 +142,28 @@ def acquire_raw(key: str, root: Path, stem: str, *, refresh: bool,
     from finlab import utils
     from finlab.auth import get_data_status
     from finlab.data.auth import fetch_metadata_batch
+
+    if path and refresh and previous.get("source_check_mode") in {"upstream_forced", "upstream_incremental"}:
+        # Native .recent metadata can affirm the exact acquired generation is
+        # unchanged. Keep its original cache creation clock, not the last
+        # metadata-check time: advancing it could skip an unmerged delta.
+        try:
+            acquired = datetime.fromisoformat(previous.get("raw_acquired_at_utc") or previous["source_checked_at_utc"])
+        except (ValueError, KeyError, TypeError):
+            acquired = None
+        if acquired is not None and acquired.tzinfo is not None and acquired <= datetime.now(UTC):
+            recent = fetch_metadata_batch(OrderedDict([(key+".recent", acquired)])).get(key+".recent")
+            if (recent is not None and not recent.error and recent.data is None and not recent.url
+                    and recent.expiry is not None):
+                checked = datetime.now(UTC)
+                updated = {**previous, "source_checked_at_utc": checked.isoformat(),
+                    "raw_acquired_at_utc": acquired.isoformat(), "source_check_mode": "upstream_incremental",
+                    "provider_expiry_at_utc": recent.expiry.isoformat(),
+                    "source_check_basis": "native_recent_metadata_unchanged; exact_raw_sha256_verified"}
+                _atomic_json(receipt_path, updated)
+                return path, updated
+            # A delta is not interpreted or merged here. Fetch the full native
+            # object below and retain both immutable versions instead.
 
     cache = Path(utils.get_tmp_dir()) / (key.replace(":", "#") + ".feather")
     if not refresh and cache.is_file():
@@ -192,6 +214,7 @@ def acquire_raw(key: str, root: Path, stem: str, *, refresh: bool,
         receipt = _commit_raw(temp, root, stem, key, "upstream_forced", "sdk_authorized_signed_object")
         # Only safe provider publication metadata, never signed URLs or account fields.
         receipt["provider_expiry_at_utc"] = result.expiry.isoformat() if result.expiry else None
+        receipt["raw_acquired_at_utc"] = receipt["source_checked_at_utc"]
         _atomic_json(receipt_path, receipt)
         return root / receipt["raw_path"], receipt
     finally:
@@ -223,6 +246,8 @@ def convert_raw(key: str, raw_path: Path, destination: Path, *, column_batch_siz
         raise ValueError("unsupported FinLab Arrow conversion")
     if key == "broker_transactions":
         return _convert_brokers(raw_path, destination)
+    if key == "inventory":
+        return _convert_inventory(raw_path, destination)
     dataset = ds.dataset(raw_path, format="ipc")
     names = dataset.schema.names
     fields = [name for name in names if name != "date"]
@@ -317,12 +342,98 @@ def _convert_brokers(raw_path: Path, destination: Path) -> dict:
             "index_semantics": "provider_index_unverified"}
 
 
-def prepare_arrow(key: str, root: Path, stem: str, destination: Path, *, refresh: bool) -> dict:
+def _convert_inventory(raw_path: Path, destination: Path) -> dict:
+    """Match SDK process_data + serialize_provider_frame without full pandas.
+
+    Inventory's source is a typed long table, not a wide symbol matrix. Keep
+    order, global RangeIndex strings, canonical symbol + stock_id alias, every
+    raw column and nullable value. A single IPC batch is the memory boundary.
+    """
+    import numpy as np
+
+    rows = observed = non_null = event_rows = 0
+    first_index = last_index = first_event = last_event = None
+    column_counts = {}
+    with pa.memory_map(str(raw_path), "r") as handle:
+        reader = pa.ipc.open_file(handle)
+        source = pa.schema([pa.field(field.name, field.type.value_type if pa.types.is_dictionary(field.type) else field.type,
+                                     nullable=field.nullable) for field in reader.schema])
+        names = source.names
+        required = {"date", "持股分級", "人數", "持有股數", "占集保庫存數比例", "key_date"}
+        ids = [name for name in ("symbol", "stock_id") if name in names]
+        if (not ids or not required <= set(names) or len(names) != len(set(names))
+                or "source_index" in names or not pa.types.is_timestamp(source.field("date").type)):
+            raise ValueError("FinLab inventory source schema changed")
+        # Native SDK sets [symbol,date] as its index, resets those first, and
+        # adds stock_id last. Refuse dual aliases rather than silently reorder.
+        if len(ids) != 1 or not pa.types.is_string(source.field(ids[0]).type):
+            raise ValueError("FinLab inventory symbol contract changed")
+        other = [name for name in names if name not in {ids[0], "date"}]
+        schema = pa.schema([pa.field("source_index", pa.string()), pa.field("symbol", source.field(ids[0]).type),
+            source.field("date"), *[source.field(name) for name in other],
+            pa.field("stock_id", source.field(ids[0]).type)])
+        with pq.ParquetWriter(destination, schema, compression="zstd") as writer:
+            for number in range(reader.num_record_batches):
+                batch = reader.get_batch(number)
+                if batch.nbytes > 256*1024**2:
+                    raise FinlabResourceDeferred("FinLab inventory Arrow batch exceeds memory budget")
+                original = pa.Table.from_arrays([
+                    pc.cast(column, source.field(name).type) if pa.types.is_dictionary(column.type) else column
+                    for name, column in zip(batch.schema.names, batch.columns)], schema=source)
+                arrays = [pc.cast(pa.array(np.arange(rows, rows+len(batch), dtype=np.int64)), pa.string()),
+                          original[ids[0]], original["date"], *[original[name] for name in other], original[ids[0]]]
+                # pandas.to_parquet represents float NaN as null. Raw IPC is
+                # separately retained; this preserves the existing ABI exactly.
+                for index, array in enumerate(arrays):
+                    if pa.types.is_floating(array.type):
+                        arrays[index] = pc.if_else(pc.fill_null(pc.is_nan(array), False), None, array)
+                table = pa.Table.from_arrays(arrays, schema=schema)
+                valid = pa.array(np.zeros(len(batch), dtype=np.bool_))
+                for name in schema.names[1:]:
+                    present = pc.is_valid(table[name])
+                    count = pc.sum(pc.cast(present, pa.int64())).as_py() or 0
+                    column_counts[name] = column_counts.get(name, 0)+count
+                    non_null += count
+                    valid = pc.or_(valid, present)
+                positions = pc.indices_nonzero(valid)
+                if len(positions):
+                    low, high = rows+positions[0].as_py(), rows+positions[-1].as_py()
+                    first_index = low if first_index is None else min(first_index, low)
+                    last_index = high if last_index is None else max(last_index, high)
+                observed += len(positions)
+                dates = table["date"]
+                event_rows += len(dates)-dates.null_count
+                bounds = pc.min_max(dates).as_py()
+                if bounds["min"] is not None:
+                    first_event = bounds["min"] if first_event is None else min(first_event, bounds["min"])
+                    last_event = bounds["max"] if last_event is None else max(last_event, bounds["max"])
+                writer.write_table(table, row_group_size=65536)
+                rows += len(batch)
+    return {"rows": rows, "rows_with_values": observed, "field_columns": len(schema)-1,
+        "non_null_values": non_null, "all_null_source_columns": [name for name, count in column_counts.items() if not count],
+        "column_axis_semantics": "source_instruments_or_dimensions_not_independent_model_features",
+        "source_index_columns": ["source_index"], "source_index_dtype": "int64",
+        "first_non_null_source_index": str(first_index) if first_index is not None else None,
+        "last_non_null_source_index": str(last_index) if last_index is not None else None,
+        "event_time_column": "date", "event_date_rows": event_rows,
+        "first_event_at": first_event.isoformat() if first_event is not None else None,
+        "last_event_at": last_event.isoformat() if last_event is not None else None,
+        "index_semantics": "provider_index_unverified", "storage_layout": "provider_long_arrow",
+        "normalization_contract_version": 2, "processing_engine": "inventory_record_batch_arrow_v1"}
+
+
+def prepare_arrow(key: str, root: Path, stem: str, destination: Path, *, refresh: bool,
+                  previous: dict | None = None) -> dict:
     raw, evidence = acquire_raw(key, root, stem, refresh=refresh)
+    identity = "inventory_record_batch_arrow_v1" if key == "inventory" else "typed_raw_arrow_v1"
+    safe = {k: evidence[k] for k in ["raw_path", "raw_sha256", "raw_bytes", "source_check_mode", "source_checked_at_utc"]}
+    safe.update(next_source_check_at_utc=evidence.get("provider_expiry_at_utc"),
+                last_full_source_bytes=evidence["raw_bytes"], arrow_conversion_contract=identity)
+    if (previous and previous.get("raw_sha256") == evidence["raw_sha256"]
+            and previous.get("arrow_conversion_contract") == identity):
+        return {**safe, "reuse_verified_normalized_object": True}
     stats = convert_raw(key, raw, destination)
-    stats.update({k: evidence[k] for k in ["raw_path", "raw_sha256", "raw_bytes", "source_check_mode", "source_checked_at_utc"]})
-    stats["next_source_check_at_utc"] = evidence.get("provider_expiry_at_utc")
-    stats["last_full_source_bytes"] = evidence["raw_bytes"]
+    stats.update(safe)
     return stats
 
 

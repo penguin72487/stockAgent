@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071019">
+  <title>新聞爬蟲進度｜StockAgent</title>
+  <link rel="stylesheet" href="../shioaji/styles.css?v=6">
+  <link rel="stylesheet" href="../finlab/styles.css?v=3">
+  <link rel="stylesheet" href="../finmind/styles.css?v=10">
+  <link rel="stylesheet" href="styles.css?v=3">
+  <link rel="stylesheet" href="../dashboard-core.css?v=7">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
+</head>
+<body data-acquisition-page="news">
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="../">STOCKAGENT</a>
+    <nav data-dashboard-nav="news" aria-label="公開面板導覽"></nav>
+  </header>
+  <main id="main">
+    <section class="hero" aria-labelledby="page-title">
+      <div><h1 id="page-title">新聞全文抓取</h1><p class="lead">與 FinMind 同一套抓取面板；本頁只讀新聞下載器的本機快照。</p></div>
+      <div class="health-panel"><span>管線狀態</span><strong id="news-health" class="status loading" role="status" aria-live="polite"><i aria-hidden="true"></i>讀取中</strong><p id="news-freshness">正在取得最新觀測…</p><small>公開唯讀 · 正文、原始 HTML 與金鑰不傳到瀏覽器</small></div>
+    </section>
+    <nav class="jump-nav" aria-label="頁內導覽"><a href="#backfill">下載進度</a><a href="#traffic">請求與限流</a><a href="#pipelines">全部媒體</a><a href="#capture">執行摘要</a><a href="#method">口徑</a></nav>
+    <section id="pipeline-alert" class="alert" hidden aria-live="polite"><span>需要注意</span><strong id="alert-title">—</strong><p id="alert-copy">—</p></section>
+    <section id="backfill" class="section-block" aria-labelledby="backfill-title">
+      <header class="section-heading"><span>01</span><div><h2 id="backfill-title">新聞正文下載進度</h2><p>已知網址持續增加；已取得正文與待確認來源分開，不把標題或 metadata 當成全文。</p></div></header>
+      <div class="kpi-grid">
+        <article class="kpi featured"><span>已保存正文</span><strong id="body-count">—</strong><p id="body-bytes">正文 UTF-8 大小待讀取</p></article>
+        <article class="kpi"><span>已清點唯一網址</span><strong id="known-count">—</strong><p>同網址跨股票關聯不重複計數</p></article>
+        <article class="kpi"><span>可回補網址</span><strong id="remaining-count">—</strong><p id="remaining-note">包含等待與待重試；非全部來源</p></article>
+        <article class="kpi"><span>未啟用／待確認</span><strong id="restricted-count">—</strong><p>仍保留於完整來源清冊</p></article>
+      </div>
+      <div class="progress-card"><div class="progress-copy"><div><span>已知網址正文取得比例</span><strong id="download-progress-label">—</strong><p id="download-progress-detail" class="progress-scope">不是全網歷史完整率。</p></div><div class="fleet-eta"><span>全來源完成估時</span><strong id="global-eta">未知</strong><p id="global-eta-basis">部分來源有阻塞；逐來源估時另外列出。</p></div></div><progress id="download-progress" class="progress-track" max="1" aria-label="已保存正文占已清點唯一網址的比例"></progress></div>
+      <details id="original-url-panel" hidden><summary>Google News 轉址清點 <span id="original-url-summary">—</span></summary><div class="progress-card"><div class="progress-copy"><div><span>既有轉址 metadata 已檢查</span><strong id="original-url-count">—</strong><p id="original-url-detail" class="progress-scope">未取得的正文不算完成。</p></div><div class="fleet-eta"><span>本批轉址清點剩餘</span><strong id="original-url-eta">未知</strong><p>只估 metadata 清點，不是正文下載完成。</p></div></div><progress id="original-url-progress" class="progress-track" max="1" aria-label="已檢查轉址 metadata 占本機既有轉址連結的比例"></progress><p class="data-note">原站指標會去重後交回原站佇列；未解 token 保留。解析成功不等於正文、標題或股票關聯已驗證，亦不新增 Google 網路請求。</p></div></details>
+      <div class="completion-estimates">
+        <article class="completion-estimate"><h3>本機清點／追新</h3><strong id="metadata-count">—</strong><p id="discovery-count">待清點工作待讀取</p><small>新 feed 優先，歷史 sitemap 與已知正文交錯；未完成的探索無法估全歷史總量。</small></article>
+        <article class="completion-estimate completion-estimate-central"><h3>已啟用來源回補</h3><strong id="eligible-eta">未知</strong><p id="eligible-eta-basis">依各來源完整 owner 時間及已落盤版本估算。</p><small>各來源同時進行；不能把獨立來源工時直接相加。</small></article>
+        <article class="completion-estimate"><h3>重試／來源問題</h3><strong id="retry-count">—</strong><p id="error-count">阻塞原因待讀取</p><small>403、robots、付費牆、授權、缺正文與署名問題不算完成。</small></article>
+      </div>
+    </section>
+    <section id="traffic" class="section-block" aria-labelledby="traffic-title">
+      <header class="section-heading"><span>02</span><div><h2 id="traffic-title">請求、流量與來源限流</h2><p>以下為目前下載器程序啟動後的累計，不是滾動一小時用量，也不是 FinMind API 配額。</p></div></header>
+      <div class="kpi-grid"><article class="kpi featured"><span>本程序 HTTP 請求</span><strong id="request-count">—</strong><p>含正文與來源清點</p></article><article class="kpi"><span>本程序回應流量</span><strong id="response-bytes">—</strong><p>含 HTML／XML；不是 Parquet 容量</p></article><article class="kpi"><span>本程序平均落盤速度</span><strong id="capture-rate">—</strong><p>正文版本／分鐘，含等待與失敗</p></article><article class="kpi"><span>程序 CPU／經過時間</span><strong id="capture-cpu">—</strong><p id="capture-elapsed">不使用 GPU</p></article></div>
+      <div class="table-scroll finlab-table-scroll"><table class="news-traffic-table"><caption>已配置新聞來源的獨立請求限流與流量</caption><thead><tr><th scope="col">來源</th><th scope="col">請求／回應流量</th><th scope="col">配置間隔／並行</th><th scope="col">實測最小間隔</th><th scope="col">來源拒絕／重試</th></tr></thead><tbody id="traffic-rows"></tbody></table></div>
+      <p class="data-note">官方小時／每日總配額尚未確認，顯示未知，不捏造餘額或重置時間。配置間隔是本站最低間隔；robots 或來源冷卻可要求更慢。</p>
+    </section>
+    <section id="pipelines" class="section-block" aria-labelledby="pipelines-title">
+      <header class="section-heading"><span>03</span><div><h2 id="pipelines-title">所有新聞來源</h2><p id="source-count">完整清冊讀取中；未註冊或未啟用來源也保留。</p></div></header>
+      <p id="source-review-summary" class="data-note">來源審閱讀取中；不等同下載授權。</p>
+      <div class="pipeline-toolbar" role="group" aria-label="篩選新聞來源"><button type="button" class="filter active" data-news-filter="all" aria-pressed="true">全部</button><button type="button" class="filter" data-news-filter="enabled" aria-pressed="false">已啟用</button><button type="button" class="filter" data-news-filter="attention" aria-pressed="false">需注意</button><button type="button" class="filter" data-news-filter="not_enabled" aria-pressed="false">未啟用</button><button type="button" class="filter" data-news-filter="permission" aria-pressed="false">需來源同意</button></div>
+      <div class="news-search"><label for="source-search">搜尋來源</label><input id="source-search" type="search" placeholder="輸入名稱或網域" autocomplete="off"><label for="source-sort">排序</label><select id="source-sort"><option value="state">工作狀態</option><option value="remaining">剩餘網址</option><option value="complete">已完成數</option><option value="name">來源名稱</option></select></div>
+      <p id="source-results" class="data-note" aria-live="polite">讀取中</p><div id="pipeline-grid" class="pipeline-grid"></div><p id="pipeline-empty" class="empty" hidden>沒有符合篩選條件的來源。</p>
+      <nav class="news-pagination" aria-label="新聞來源分頁"><button id="source-previous" type="button" disabled>上一頁</button><span id="source-page">—</span><button id="source-next" type="button" disabled>下一頁</button></nav>
+    </section>
+    <section id="capture" class="section-block" aria-labelledby="capture-title"><header class="section-heading"><span>04</span><div><h2 id="capture-title">實際執行摘要</h2><p>已落盤才增加進度；快照、正文保存與全歷史完整性是不同證據。</p></div></header><dl class="news-facts"><div><dt>目前排程</dt><dd id="capture-next">—</dd></div><div><dt>metadata 關聯列</dt><dd id="association-count">—</dd></div><div><dt>已停用 bulk 候選頁</dt><dd id="disabled-bulk">—</dd></div><div><dt>完整歷史驗收</dt><dd>尚未完成</dd></div></dl><div class="table-scroll finlab-table-scroll"><table><caption>本程序已量測處理階段 · 平行 wall time 可能重疊，不可加總</caption><thead><tr><th scope="col">階段</th><th scope="col">次數</th><th scope="col">累計 wall 秒</th><th scope="col">累計 CPU 秒</th></tr></thead><tbody id="stage-rows"></tbody></table></div></section>
+    <section id="method" class="section-block" aria-labelledby="method-title"><header class="section-heading"><span>05</span><div><h2 id="method-title">統計口徑</h2></div></header><ul class="method-list"><li>已保存正文按唯一網址計數；正文版本、股票關聯列與 metadata 不同，不可混加。網址去重不是跨媒體內容級去重。</li><li>條件估時只外推目前已知可回補網址，使用目前 owner 的完整經過時間與耐久提交版本。新 sitemap、重抓、來源拒絕和未啟用範圍不包含在完成承諾中。</li><li>來源處於冷卻、程序停止或快照過期時不繼續顯示有效 ETA；更新失敗保留最後資料並標示過期。</li><li>正文 UTF-8 大小不是壓縮後容量；完整下載流量與總容量尚未知，不用短期平均冒充精確總量。</li><li>正文與原始 HTML 僅在私人下載工作區；本頁不提供文章、控制下載、觸發來源 API 或自動訓練注入。</li></ul><p class="data-note"><a href="../finmind/">FinMind metadata 管線</a> · <a href="../data-monitor/">全資料總覽</a></p></section>
+  </main>
+  <footer><span>StockAgent · 新聞爬蟲進度</span><span id="updated-at">尚未取得觀測</span></footer>
+  <script src="../dashboard-core.js?v=15"></script><script src="app.js?v=4"></script><script src="../dashboard-acquisition.js?v=6"></script>
+</body>
+</html>

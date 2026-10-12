@@ -25,6 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--reviewed-cleanup-20261006", action="store_true")
+    parser.add_argument("--reviewed-offline-cleanup-20261006", action="store_true")
     args = parser.parse_args()
     if os.geteuid() != 0 or socket.gethostname() != "penguin" or args.evidence.exists():
         raise ValueError("use penguin's root owner and a fresh evidence file")
@@ -42,6 +43,14 @@ def main():
         selected = load_cohort_selection(panel / "scope-selection.json", panel)
         if any(not root.startswith("markets/tw_day_trade_factorized_panel_20261004_v1/") for root in selected):
             raise ValueError("reviewed panel scope may not overlap the retained ablation cohort")
+    if args.reviewed_offline_cleanup_20261006:
+        from scripts.return_remote_legacy_archives import preservation_policy
+        policy = preservation_policy(json.loads((ROOT / "configs/data_sync/vastai_reviewed_offline_return_20261006.json").read_text()))
+        offline = Path("/var/lib/stockagent-vast-reviewed-offline-return-20261006")
+        inventory = json.loads((offline / "inventory.json").read_text())
+        if {r["relative_root"] for r in inventory["items"]} != set(policy["relative_roots"]):
+            raise ValueError("offline retry inventory differs from its explicitly reviewed roots")
+        cohorts["reviewed-offline-20261006"] = str(offline)
     for cohort in cohorts.values():
         for name in ("inventory.json", "progress.json", "archive-catalog.json", "cohort-owner.lock"):
             path = Path(cohort) / name
@@ -78,7 +87,8 @@ def main():
                "existing_cohort_owner_required": True, "inventories_replaced": False,
                "shared_ingress_owner_reused": True, "source_files_deleted_by_install": False,
                "complete_history_verified": False,
-               "reviewed_cleanup_20261006": args.reviewed_cleanup_20261006}
+               "reviewed_cleanup_20261006": args.reviewed_cleanup_20261006,
+               "reviewed_offline_cleanup_20261006": args.reviewed_offline_cleanup_20261006}
     private_json(args.evidence, receipt)
     print(json.dumps(receipt))
 

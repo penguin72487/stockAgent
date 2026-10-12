@@ -88,12 +88,51 @@ def test_independent_config_protects_relative_data_view_without_open_fds(tmp_pat
         child.wait(timeout=5)
 
 
+def test_transitive_training_config_sources_protect_code_even_without_output_reference(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from dataclasses import dataclass
+    from stockagent.config import _load_raw_config
+    @dataclass
+    class Config:
+        unused: str = "default"
+    source=tmp_path/'artifacts/markets/old-measurement/code'
+    source.mkdir(parents=True)
+    base=source/'base.yaml';base.write_text('{}\n')
+    middle=tmp_path/'middle.yaml';middle.write_text('base_config: '+str(base)+'\n')
+    current=tmp_path/'current.yaml';current.write_text('base_config: '+str(middle)+'\n')
+    def load(path, *, source_signatures=None):
+        _load_raw_config(path, source_signatures=source_signatures)
+        return Config()
+    monkeypatch.setattr('stockagent.config.load_config',load)
+    child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)','train.py','--config',str(current)],cwd=tmp_path)
+    try:
+        refs=returns.active_configuration_references(source,tmp_path)
+        assert any('active-config-source:' in r and str(base) in r for r in refs)
+        base.unlink()
+        refs=returns.active_configuration_references(source,tmp_path)
+        assert any('active-config-unreadable' in r for r in refs)
+    finally:
+        child.terminate();child.wait(timeout=5)
+
+
 def test_persistent_handoff_selects_only_the_exact_retained_cohort():
     from scripts.handoff_remote_legacy_archive_worker import legacy_systemd_owner
     assert legacy_systemd_owner(Path("/var/lib/stockagent-vast-legacy-return")) == "stockagent-legacy-return@main.service"
     assert legacy_systemd_owner(Path("/var/lib/stockagent-vast-legacy-return-partitions")) == "stockagent-legacy-return@partitions.service"
+    assert legacy_systemd_owner(Path("/var/lib/stockagent-vast-reviewed-return-20261006")) == "stockagent-legacy-return@reviewed-main-20261006.service"
+    assert legacy_systemd_owner(Path("/var/lib/stockagent-vast-reviewed-partitions-20261006")) == "stockagent-legacy-return@reviewed-panel-20261006.service"
     with pytest.raises(SnapshotError):
         legacy_systemd_owner(Path("/var/lib/unregistered"))
+
+
+def test_handoff_receipt_binds_the_policy_selected_by_the_existing_service():
+    from scripts.handoff_remote_legacy_archive_worker import legacy_policy_path
+    main = Path("/var/lib/stockagent-vast-legacy-return")
+    assert legacy_policy_path(main).name == "vastai_legacy_archive_return.json"
+    assert legacy_policy_path(main, unit_environment='"STOCKAGENT_LEGACY_REVIEWED_20261006=1"').name == "vastai_reviewed_legacy_return_20261006.json"
+    assert legacy_policy_path(main, unit_environment='STOCKAGENT_LEGACY_REVIEWED_20261006=0').name == "vastai_legacy_archive_return.json"
+    assert legacy_policy_path(Path("/var/lib/stockagent-vast-reviewed-return-20261006")).name == "vastai_reviewed_legacy_return_20261006.json"
 
 
 def test_worker_handoff_requires_an_unowned_childless_boundary():
@@ -191,6 +230,71 @@ def test_exact_d_return_retirement_retains_unique_other_data(example, tmp_path):
     result = returns.retire(root, tmp_path, state, ack, apply=True)
     assert result["deleted"] and not source.exists() and result["cold_deleted"] is False
     assert (unrelated / "keep").read_bytes() == b"different source"
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_old_acknowledgements_cannot_expand_to_offline_namespaces(example, tmp_path, version):
+    root, source, state, ack = example
+    ack.pop("identity_sha256")
+    ack.update(contract=f"d_verified_remote_legacy_return_{version}", relative_root="smoke/old",
+               dataset=returns.dataset_name("smoke/old"))
+    if version == "v2":
+        ack["shared_file_policy"] = "unlink_preserved_names_only"
+    ack["identity_sha256"] = returns.identity(ack)
+    with pytest.raises(SnapshotError, match="explicit versioned"):
+        returns.retire(root, tmp_path, state, ack, apply=True)
+    assert source.exists()
+
+
+@pytest.mark.parametrize("problem", [None, "missing-ack-contract", "missing-archive-contract", "source-changed"])
+def test_offline_return_requires_bound_contract_and_exact_recoverable_source(example, tmp_path, monkeypatch, problem):
+    from stockagent.data_sync.legacy_artifact_archive import MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT
+    root, source, state, ack = example
+    target = root / "operations/old-experiment"
+    target.parent.mkdir()
+    source.rename(target)
+    ack.pop("identity_sha256")
+    ack.update(contract="d_verified_remote_legacy_return_v3", relative_root="operations/old-experiment",
+               dataset=returns.dataset_name("operations/old-experiment"),
+               capture_contract=MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT,
+               shared_file_policy="unlink_preserved_names_only")
+    ack["archive_manifest"].update(dataset=ack["dataset"], relative_root=ack["relative_root"],
+                                  capture_contract=MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT)
+    resolved = SimpleNamespace(manifest_sha256=ack["manifest_sha256"], manifest={"metadata": {
+        "legacy_manifest_sha256": ack["legacy_manifest_sha256"], "transport_role": "legacy-quarantine-archive",
+        "source_relative_root": ack["relative_root"], "deployable": "false"}})
+    monkeypatch.setattr(returns, "resolve_packed_snapshot_id", lambda *a, **kw: resolved)
+    if problem == "missing-ack-contract":
+        ack.pop("capture_contract")
+    elif problem == "missing-archive-contract":
+        ack["archive_manifest"].pop("capture_contract")
+    elif problem == "source-changed":
+        before = (target / "unique.bin").stat()
+        (target / "unique.bin").write_bytes(b"X" * before.st_size)
+        os.utime(target / "unique.bin", ns=(before.st_atime_ns, before.st_mtime_ns))
+    ack["identity_sha256"] = returns.identity(ack)
+    if problem:
+        with pytest.raises(SnapshotError):
+            returns.retire(root, tmp_path, state, ack, apply=True)
+        assert target.exists()
+    else:
+        result = returns.retire(root, tmp_path, state, ack, apply=True)
+        assert result["deleted"] and not target.exists() and not result["cold_deleted"]
+
+
+def test_offline_inventory_requires_an_explicit_fixed_root_list(tmp_path, monkeypatch):
+    from stockagent.data_sync.legacy_artifact_archive import MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT
+    for name in ["smoke/reviewed", "smoke/unreviewed", "operations/history"]:
+        (tmp_path / name).mkdir(parents=True)
+        (tmp_path / name / "evidence.json").write_text("{}")
+    monkeypatch.setattr(returns, "artifact_process_references", lambda *a: [])
+    with pytest.raises(SnapshotError, match="unregistered"):
+        returns.inventory_scopes(tmp_path, ["smoke/reviewed"])
+    selected = returns.inventory_scopes(tmp_path, ["smoke/reviewed"], capture_contract=MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT)
+    assert [r["relative_root"] for r in selected["items"]] == ["smoke/reviewed"]
+    assert selected["all_scopes_inventoried"] is False
+    with pytest.raises(SnapshotError, match="disappeared"):
+        returns.inventory_scopes(tmp_path, ["smoke/missing"], capture_contract=MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT)
 
 
 def test_conflicted_configuration_never_permits_retirement(example, tmp_path, monkeypatch):

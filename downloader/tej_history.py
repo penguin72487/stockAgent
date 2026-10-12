@@ -1069,7 +1069,7 @@ class DesktopBridge:
                                 # Still finite; a timeout never resends it.
                                 timeout=30 if wire_request.get('action') in {
                                     'inspect_notices','inspect_source_binding','inspect_query_runtime',
-                                    'confirm_metadata_error_cleared'} else 900)
+                                    'confirm_metadata_error_cleared','ack_source_memory_error'} else 900)
         except UnpermittedWindowsLaunch as exc:
             from downloader.tej_windows_transport import validate_unpermitted
             validate_unpermitted(root, request, exc.evidence)
@@ -1261,11 +1261,13 @@ def commit_evidence(root: Path, task: dict, payload: dict, output: Path, seconds
             con.execute("UPDATE tables SET last_error_code=NULL,state=CASE WHEN grid_rows>0 THEN 'backfilling' ELSE state END WHERE table_id=?", (task["table_id"],))
         if event_id:
             con.execute("UPDATE traffic SET completed_at_utc=?,state='complete' WHERE event_id=?", (complete, event_id))
+        # A successful metadata retry must also release its table window;
+        # otherwise its newly planned downloads would never become eligible.
+        con.execute('DELETE FROM desktop_retry_windows WHERE table_id=? AND task_id=?',
+                    (task['table_id'],task['task_id']))
         if task['kind']=='download':
             con.execute("UPDATE desktop_attempts SET state='adopted',finished_at_utc=? WHERE attempt_id="
                         "(SELECT active_attempt_id FROM tasks WHERE task_id=?)",(complete,task['task_id']))
-            con.execute('DELETE FROM desktop_retry_windows WHERE table_id=? AND task_id=?',
-                        (task['table_id'],task['task_id']))
 
 
 def recover_evidence(root: Path, task_id: str, output: Path) -> None:
@@ -1350,7 +1352,9 @@ def settle_metadata_failure(root: Path, task_id: str, bridge: Any, evidence: Pat
 
 
 def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_request: Path,
-                            *, acknowledge_known_notices: bool = False) -> dict:
+                            *, acknowledge_known_notices: bool = False,
+                            require_fresh_evidence: bool = False,
+                            classify_failure: bool = True) -> dict:
     """Isolate one exact plan; never retry it or adopt its axes.
 
     The original private request must be the complete v4 metadata-only plan.
@@ -1376,9 +1380,21 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
     known = {'MySql:malloc':'vendor_mysql_allocation_failed',
              'Cannot find table 0.':'vendor_source_table_unresolved'}
     evidence_paths, codes = [], []
+    def execute_checked(request):
+        started = datetime.now(UTC)
+        payload, output, seconds = bridge.execute(root, {**task, 'request_json':json.dumps(request)})
+        if require_fresh_evidence:
+            from downloader.tej_operation_clock import source_operation_clock
+            source_operation_clock(payload['observed_at_utc'], started, datetime.now(UTC))
+            if (output.resolve().parent != (root/'raw').resolve()
+                    or output.is_symlink() or not output.name.startswith(task_id+'-')
+                    or output.stat().st_size > 2*1024**2
+                    or json.loads(output.read_text(encoding='utf-8-sig')) != payload):
+                raise ValueError('Fresh private owned metadata recovery readback required')
+        return payload, output, seconds
     for attempt in range(3):
         inspection = {**req, 'action':'inspect_notices'}
-        payload, output, _ = bridge.execute(root, {**task, 'request_json':json.dumps(inspection)})
+        payload, output, _ = execute_checked(inspection)
         if (payload.get('action') != 'inspect_notices' or payload.get('contract_version') != CONTRACT_VERSION
                 or payload.get('task_id') != task_id or payload.get('notice_acknowledged') is not False
                 or payload.get('data_query_repeated') is not False or payload.get('credentials_read') is not False
@@ -1405,7 +1421,7 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
                 or buttons[0].get('name') != 'OK' or buttons[0].get('enabled') is not True):
             raise RuntimeError('unreviewed_metadata_notice_not_acknowledged')
         ack = {**req, 'action':'ack_source_memory_error','error_window':handle,'error_code':code}
-        payload, output, _ = bridge.execute(root, {**task, 'request_json':json.dumps(ack)})
+        payload, output, _ = execute_checked(ack)
         if (payload.get('action') != ack['action'] or payload.get('contract_version') != CONTRACT_VERSION
                 or payload.get('provider') != 'tej_smart_wizard' or payload.get('task_id') != task_id
                 or any(payload.get(k) != req.get(k) for k in ('type','smart_id','table'))
@@ -1414,7 +1430,7 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
             raise ValueError('Exact runtime acknowledgement was not verified')
         evidence_paths.append(output); codes.append(code)
     check = {**req, 'action':'confirm_metadata_error_cleared'}
-    payload, output, _ = bridge.execute(root, {**task, 'request_json':json.dumps(check)})
+    payload, output, _ = execute_checked(check)
     if (payload.get('contract_version') != CONTRACT_VERSION or payload.get('provider') != 'tej_smart_wizard'
             or payload.get('action') != check['action'] or payload.get('task_id') != task_id
             or any(payload.get(k) != req.get(k) for k in ('type','smart_id','table'))
@@ -1430,13 +1446,16 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
              'data_query_repeated':False,'source_axes_adopted':False,'failed_table_still_blocked':True,
              'prepared_request_sha256':hashlib.sha256(prepared_request.read_bytes()).hexdigest(),
              'readback_evidence_sha256':[hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence_paths]}
-    atomic_write_json(root/'diagnostics'/(task_id+'-metadata_isolation-'+uuid.uuid4().hex+'.json'),audit)
-    with closing(connect(root)) as con,con:
-        con.execute("UPDATE tasks SET last_error_code=? WHERE task_id=? AND kind='discover' AND state='blocked'",(code,task_id))
-        con.execute("UPDATE tables SET state='needs_review',last_error_code=? WHERE table_id=?",(code,task['table_id']))
-    atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,'state':code,
-                                               'observed_at_utc':audit['observed_at_utc'],'task_id':task_id})
-    return {'state':code,'failed_table_still_blocked':True,'data_query_repeated':False,'source_axes_adopted':False}
+    audit_path = root/'diagnostics'/(task_id+'-metadata_isolation-'+uuid.uuid4().hex+'.json')
+    atomic_write_json(audit_path,audit,durable=True)
+    if classify_failure:
+        with closing(connect(root)) as con,con:
+            con.execute("UPDATE tasks SET last_error_code=? WHERE task_id=? AND kind='discover' AND state='blocked'",(code,task_id))
+            con.execute("UPDATE tables SET state='needs_review',last_error_code=? WHERE table_id=?",(code,task['table_id']))
+        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,'state':code,
+                                                   'observed_at_utc':audit['observed_at_utc'],'task_id':task_id})
+    return {'state':code,'failed_table_still_blocked':True,'data_query_repeated':False,'source_axes_adopted':False,
+            'audit_path':str(audit_path.relative_to(root))}
 
 
 def recover_desktop_response(root: Path, task_id: str, bridge: Any, *, response: str,
@@ -1835,6 +1854,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
     from downloader.tej_scheduler import remaining_query_interval
     from downloader.tej_desktop_attempts import authorized_replay_policy
     from downloader.tej_startup import startup_policy
+    from downloader.tej_metadata_recovery import metadata_recovery_policy
     remaining_query_interval(config,0.0)  # Reject an invalid limiter before any source action.
     policy = {'contract':BATCH_SCHEDULER_CONTRACT,
               'preview_submission_contract':PREVIEW_SUBMISSION_CONTRACT,
@@ -1851,6 +1871,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'prequery_retry_base_seconds':config.get('prequery_retry_base_seconds',60),
               'prequery_retry_max_seconds':config.get('prequery_retry_max_seconds',900),
               'metadata_failure_isolation':config.get('metadata_failure_isolation',False),
+              'metadata_recovery':metadata_recovery_policy(config),
               'authorized_unknown_replay':authorized_replay_policy(config),
               'desktop_startup':startup_policy(config),
               'acknowledge_known_metadata_runtime_notices':config.get('acknowledge_known_metadata_runtime_notices',False)}
@@ -1918,6 +1939,34 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
     return download
 
 
+def mark_metadata_busy(root: Path) -> None:
+    """Keep this owner's exact unfinished identity when a local commit is busy.
+
+    The annotation ends the attempted call, not its source uncertainty. It
+    neither renews the original query deadline nor grants any source retry.
+    """
+    now = datetime.now(UTC).isoformat()
+    identity = {}
+    try:
+        path = root / 'worker_status.json'
+        if path.is_symlink() or path.stat().st_size > 65536:
+            raise ValueError('Bounded owned worker annotation required')
+        worker = json.loads(path.read_text())
+        ticks = Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(') ', 1)[1].split()[19]
+        if (worker.get('state') in {'running', 'waiting_metadata'}
+                and worker.get('owner_pid') == os.getpid() and worker.get('owner_start_ticks') == ticks):
+            identity = {key: worker[key] for key in (
+                'task_id', 'kind', 'bridge_attempt_id', 'owner_pid', 'owner_start_ticks', 'deadline_at_utc'
+            ) if key in worker}
+            identity['attempted_at_utc'] = worker.get('attempted_at_utc', worker.get('observed_at_utc'))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass  # A foreign/ambiguous old worker is never attributed to this call.
+    atomic_write_json(root / 'worker_status.json', {
+        'contract_version': CONTRACT_VERSION, 'state': 'waiting_metadata',
+        'observed_at_utc': now, 'query_deadline_renewed': False, **identity,
+    }, durable=True)
+
+
 def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str | None=None,
             retry_authorization_id: str | None=None) -> str:
     """Keep source evidence authoritative through bounded metadata contention."""
@@ -1929,8 +1978,7 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
             raise
         # A pending task stays pending; a possibly submitted task stays
         # unresolved. Only exact durable source evidence can clear that state.
-        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
-            'state':'waiting_metadata','observed_at_utc':datetime.now(UTC).isoformat()})
+        mark_metadata_busy(root)
         return 'local_metadata_busy'
 
 
@@ -1990,6 +2038,8 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
         if con.execute("SELECT 1 FROM tasks WHERE state='running' OR (state='blocked' AND last_error_code='unknown_outcome_no_auto_retry' AND task_id!=?) LIMIT 1",
                        (replay['task_id'] if replay else '',)).fetchone():
             return "inflight_requires_recovery"
+        if con.execute("SELECT 1 FROM tasks WHERE state='blocked' AND last_error_code='metadata_preparation_requires_recovery' LIMIT 1").fetchone():
+            return 'metadata_preparation_requires_recovery'
         if kind!='discover' and con.execute("SELECT 1 FROM meta WHERE key='preview_planning_contract'").fetchone():
             from downloader.tej_planning import refill_ready_plans
             refill_ready_plans(con)
@@ -2079,6 +2129,7 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
                                "observed_at_utc": datetime.now(UTC).isoformat(), "task_id": task["task_id"]})
             return state
         code = ('source_key_layout_replan_required' if isinstance(exc,SourceKeyLayoutError)
+                else 'metadata_preparation_requires_recovery' if isinstance(exc,MetadataPreparationError) and policy.get('metadata_recovery')
                 else "unknown_outcome_no_auto_retry" if isinstance(exc, (RuntimeError, subprocess.SubprocessError))
                 else "local_storage_failed" if isinstance(exc, OSError) else "source_validation_failed")
         diagnostic = root/'diagnostics'/(event+'-adoption.json')
@@ -2116,9 +2167,14 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
             # A notice or unstable interface keeps the global barrier intact.
             mark_worker_wait(root,kind='discover',seconds=900,metadata_recovery=True)
             try:
-                result = isolate_failed_metadata(root,task['task_id'],bridge,exc.prepared_request,
-                    acknowledge_known_notices=policy.get('acknowledge_known_metadata_runtime_notices') is True)
-                state = result['state']
+                if policy.get('metadata_recovery'):
+                    from downloader.tej_metadata_recovery import recover_failed_metadata, RETRY_SCHEDULED
+                    result = recover_failed_metadata(root,bridge,policy=policy['metadata_recovery'],task_id=task['task_id'])
+                    state = RETRY_SCHEDULED if result and result['state']==RETRY_SCHEDULED else code
+                else:
+                    result = isolate_failed_metadata(root,task['task_id'],bridge,exc.prepared_request,
+                        acknowledge_known_notices=policy.get('acknowledge_known_metadata_runtime_notices') is True)
+                    state = result['state']
             except (RuntimeError,ValueError,OSError,subprocess.SubprocessError):
                 state = code
     atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": state,

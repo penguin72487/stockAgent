@@ -367,7 +367,7 @@ def test_overnight_preclose_warmup_skips_opening_and_daytrade_proofs(
     )
     monkeypatch.setattr(
         discord_bot,
-        "_warm_or_reuse_tw_mis_opening_receipt",
+        "_warm_tw_opening_sources",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("MIS must be skipped")),
     )
     monkeypatch.setattr(
@@ -535,6 +535,27 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
     monkeypatch.setattr(discord_bot, "_opening_signal_latency_path", lambda: path)
     discord_bot._record_opening_signal_latency(payload)
     assert json.loads(path.read_text(encoding="utf-8"))["signal_id"] == "signal-a"
+
+
+def test_failed_opening_measurement_keeps_work_and_redacts_credentials(monkeypatch):
+    monkeypatch.setenv("TEST_API_KEY", "private-key-fixture")
+    cfg = SimpleNamespace(market="mode-a", timezone="Asia/Taipei", open_time="09:00")
+    timing = {"scheduler_wake_ms": 3.0, "attempt_from_open_ms": 6000.0,
+              "signal_stage": "input_validation", "attempt_elapsed_ms": 100.0,
+              "signal_summary": {"signal_started_at": "2026-10-08T09:00:06+08:00",
+                                 "price_source": "twse_tpex:mis",
+                                 "live_latency": {"quote_fetch_ms": 75.0},
+                                 "opening_input_coverage": {"opens": 33, "no_prints": 0}}}
+    result = discord_bot._opening_signal_latency_record(
+        cfg=cfg, session_date="2026-10-08", schedule_key="a", timing=timing,
+        result=None, error=RuntimeError("source failure private-key-fixture"))
+    assert result["failure_stage"] == "input_validation"
+    assert result["stages"]["signal_quote_fetch_ms"] == 75.0
+    assert result["stages"]["scheduler_wake_ms"] == 3.0
+    assert result["attempt_from_open_ms"] == 6000.0
+    assert result["opening_input_coverage"]["opens"] == 33
+    assert result["error_message"] == "source failure [REDACTED]"
+    assert result["ready_from_open_ms"] is None and result["status"] == "failed"
 
 
 @pytest.mark.parametrize("market", PENGUIN_DAY_TRADE_MARKETS)
@@ -903,6 +924,7 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
         "service_heartbeat",
         "signal_now_job_resumer",
         "preopen_prepare",
+        "opening_source_repair",
         "daily_summary",
         "model_auto_deployment",
     }
@@ -1146,6 +1168,14 @@ def test_final_arm_is_process_scoped_and_requires_opening_source_prewarm(
     assert discord_bot._preopen_market_final_armed_for_session(
         cfg, "2026-08-27"
     )
+
+    source = payload["markets"][cfg.market]["final_arm"]["opening_source_prewarm"]
+    source["source"] = "parallel_opening_sources"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert not discord_bot._preopen_market_final_armed_for_session(cfg, "2026-08-27")
+    source.update(proof="responding_transport_not_opening_price_readiness", providers={"shioaji_shared": {"state": "complete", "ready": True}, "official_mis": {"state": "failed", "ready": False}})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert discord_bot._preopen_market_final_armed_for_session(cfg, "2026-08-27")
 
     payload["markets"][cfg.market]["final_arm"]["run_id"] = "previous-process"
     path.write_text(json.dumps(payload), encoding="utf-8")

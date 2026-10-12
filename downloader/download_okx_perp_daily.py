@@ -37,6 +37,7 @@ from common import (  # noqa: E402
 )
 from artifact_io import archive_run_reports  # noqa: E402
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from candle_columns import numeric_candle_page  # noqa: E402
 from quality_priority import collect_with_quality_priority, prioritize_records  # noqa: E402
 from http_transport import RETRYABLE_NETWORK_ERRORS  # noqa: E402
 from dataset_lock import (  # noqa: E402
@@ -694,6 +695,26 @@ def _fetch_swap_symbols(
 
 
 def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
+    schema = {
+        "ts": pl.Int64, "open": pl.Float64, "max": pl.Float64, "min": pl.Float64,
+        "close": pl.Float64, "okx_volume_contract": pl.Float64,
+        "okx_volume_base": pl.Float64, "okx_volume_quote": pl.Float64, "okx_confirm": pl.Int64,
+    }
+    frame = numeric_candle_page(raw_rows, schema, timestamp="ts", skip_short_rows=False)
+    if frame is None or frame.select(pl.any_horizontal([
+        ~pl.col(name).is_finite() | (pl.col(name) < 0)
+        for name in ("okx_volume_contract", "okx_volume_base", "okx_volume_quote")
+    ]).any()).item():
+        return _normalize_candles_reference(raw_rows)
+    return (frame.with_columns(pl.col("close").alias("adjclose"),
+                               pl.col("okx_volume_quote").alias("Trading_Volume"))
+            .sort("ts").unique(subset=["date"], keep="last").sort("ts")
+            .select([*OUTPUT_COLUMNS, "okx_volume_contract", "okx_volume_base",
+                     "okx_volume_quote", "okx_confirm"]))
+
+
+def _normalize_candles_reference(raw_rows: list[list[str]]) -> pl.DataFrame:
+    """Preserve documented rejection, units and Python conversion semantics."""
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         if len(row) < 9:

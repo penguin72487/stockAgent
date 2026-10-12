@@ -55,9 +55,12 @@ from stockagent.live.quote_provider import (
     load_prices_csv,
     load_symbol_name_map,
     seed_tw_opening_snapshot_cache,
+    tw_session_open_observed_mask,
+    tw_session_no_open_print_mask,
 )
 from stockagent.live.report_formatter import format_signal_message, is_display_position_row
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
+from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
 from stockagent.models.temporal_basis_fit import (
@@ -614,6 +617,21 @@ def _build_panel(
     live_tail: bool = False,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[PanelData, bool, str]:
+    # Fence the cache fingerprint AND every source read, not just the final
+    # entitlement load. An exclusive updater can replace several individually
+    # atomic files; those intermediate files are not a published generation.
+    with live_tw_public_source_read_guard(config.data.parquet_root):
+        return _build_panel_from_stable_source(
+            config, live_tail=live_tail, progress_callback=progress_callback
+        )
+
+
+def _build_panel_from_stable_source(
+    config: ExperimentConfig,
+    *,
+    live_tail: bool = False,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> tuple[PanelData, bool, str]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     external_kwargs = external_panel_data_kwargs(config.data)
     configured_panel_load_workers = int(config.data.panel_load_workers)
@@ -1164,6 +1182,50 @@ def _tw_opening_minimum_coverage() -> float:
     )
 
 
+def _fetch_tw_opening_source(
+    symbols: list[str], fallback: np.ndarray, *, parquet_root: str | Path,
+    fetch_mis: Callable[..., PriceSnapshot],
+) -> tuple[PriceSnapshot, bool]:
+    """Race all available sources; keep successful opening facts on every retry."""
+    from stockagent.live.opening_price_acquisition import OPENING_FAN_IN, configured_opening_providers
+
+    result = OPENING_FAN_IN.fetch(
+        symbols, fallback, parquet_root=parquet_root,
+        providers=configured_opening_providers(parquet_root, broker_fetch=fetch_shared_day_trade_stock_snapshots),
+        minimum_coverage=_tw_opening_minimum_coverage(),
+        cache_reader=lambda: fetch_mis(allow_network=False),
+    )
+    return result, True
+
+
+class TWOpeningInputCoveragePending(RuntimeError):
+    """Retryable input readiness, not an inference or model failure."""
+
+    code = "tw_opening_input_coverage_pending"
+
+    def __init__(self, message: str, coverage: dict[str, Any]):
+        self.coverage = dict(coverage)
+        super().__init__(message)
+
+
+def _require_day_trade_opening_coverage(
+    *, live_session: bool, active: int, opens: int, responses: int,
+    required: int, model_observation: str, no_prints: int = 0,
+) -> None:
+    # A source-proven absence uses the existing open-gap zero sentinel. An
+    # unknown/failed source row never counts as a resolved model input.
+    inputs = responses if model_observation == "latest_quote" else opens + no_prints
+    if not live_session or inputs < required:
+        raise TWOpeningInputCoveragePending(
+            "same-session TW model input coverage is not ready; retry immediately: "
+            f"observed_inputs={inputs} required_inputs={required} "
+            f"observed_quotes={responses} observed_opens={opens} active={active} "
+            f"observed_no_prints={no_prints} basis={model_observation}",
+            {"active": active, "opens": opens, "responses": responses,
+             "required": required, "no_prints": no_prints, "basis": model_observation},
+        )
+
+
 def _merge_tw_opening_shioaji_fallback(
     primary: PriceSnapshot,
     backup: PriceSnapshot,
@@ -1198,28 +1260,7 @@ def _merge_tw_opening_shioaji_fallback(
             accepted_local
         ]
 
-    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
-    backup_exchange_ms = (
-        np.asarray(backup.exchange_timestamps_ms, dtype=np.int64)
-        if backup.exchange_timestamps_ms is not None
-        else np.zeros((len(missing),), dtype=np.int64)
-    )
-    valid_backup_open = np.zeros((len(missing),), dtype=bool)
-    if backup.open_prices is not None:
-        backup_opens = np.asarray(backup.open_prices, dtype=np.float64)
-        valid_backup_open = np.isfinite(backup_opens) & (backup_opens > 0.0)
-        valid_backup_open &= np.asarray(
-            [
-                timestamp_ms > 0
-                and datetime.fromtimestamp(
-                    int(timestamp_ms) / 1000.0,
-                    tz=timezone.utc,
-                ).date()
-                == today
-                for timestamp_ms in backup_exchange_ms
-            ],
-            dtype=bool,
-        )
+    valid_backup_open = tw_session_open_observed_mask(backup)
 
     def merged_float_array(name: str) -> np.ndarray | None:
         primary_values = getattr(primary, name)
@@ -1307,6 +1348,7 @@ def _merge_tw_opening_shioaji_fallback(
         reference_prices=merged_float_array("reference_prices"),
         timestamps_ms=merged_int_array("timestamps_ms"),
         exchange_timestamps_ms=merged_int_array("exchange_timestamps_ms"),
+        no_open_print_timestamps_ms=merged_int_array("no_open_print_timestamps_ms"),
         simtrade_flags=merged_simtrade_flags(),
         transport_timing=(
             dict(backup.transport_timing)
@@ -1537,6 +1579,7 @@ def _price_snapshot(
                 partial.exchange_timestamps_ms,
                 integer=True,
             ),
+            no_open_print_timestamps_ms=expanded(partial.no_open_print_timestamps_ms, integer=True),
             transport_timing=(
                 dict(partial.transport_timing)
                 if isinstance(partial.transport_timing, dict)
@@ -1555,7 +1598,7 @@ def _price_snapshot(
         requested_symbols = [symbols[int(idx)] for idx in indices]
         requested_fallback = np.asarray(fallback_prices, dtype=np.float64)[indices]
 
-        def fetch_mis_opening(*, allow_network: bool = True) -> PriceSnapshot:
+        def fetch_mis_opening(*, allow_network: bool = True, force_missing_retry: bool = False) -> PriceSnapshot:
             return fetch_tw_mis_opening_snapshot(
                 requested_symbols,
                 requested_fallback,
@@ -1586,10 +1629,10 @@ def _price_snapshot(
                     ),
                 ),
                 allow_network=allow_network,
+                force_missing_retry=force_missing_retry,
             )
 
         fallback_errors: list[str] = []
-        shared_opening: PriceSnapshot | None = None
         opening_cache_hit = False
         if require_official_tw_session_open:
             # The paper engine authenticates and resolves Contract V2 at 08:55.
@@ -1597,37 +1640,10 @@ def _price_snapshot(
             # first waiting for a full MIS sweep and then logging in a second
             # Shioaji process. Snapshot.open is accepted by the merge helper
             # only when its exchange timestamp proves today's Taipei session.
-            cached_opening = fetch_mis_opening(allow_network=False)
-            cached_available = (
-                np.asarray(cached_opening.available_mask, dtype=bool)
-                if cached_opening.available_mask is not None
-                else np.zeros((len(requested_symbols),), dtype=bool)
+            snapshot, opening_cache_hit = _fetch_tw_opening_source(
+                requested_symbols, requested_fallback, parquet_root=parquet_root,
+                fetch_mis=fetch_mis_opening,
             )
-            cached_coverage = (
-                float(np.count_nonzero(cached_available)) / len(requested_symbols)
-                if requested_symbols
-                else 0.0
-            )
-            if cached_coverage >= _tw_opening_minimum_coverage():
-                snapshot = cached_opening
-                opening_cache_hit = True
-            else:
-                missing_cached = np.flatnonzero(~cached_available)
-                try:
-                    shared_opening = fetch_shared_day_trade_stock_snapshots(
-                        [requested_symbols[int(idx)] for idx in missing_cached],
-                        requested_fallback[missing_cached],
-                        timeout_seconds=4.0,
-                        purpose="opening_signal",
-                    )
-                    snapshot = _merge_tw_opening_shioaji_fallback(
-                        cached_opening,
-                        shared_opening,
-                        missing_cached,
-                    )
-                except Exception as exc:
-                    fallback_errors.append(f"shared_engine_{type(exc).__name__}")
-                    snapshot = fetch_mis_opening()
         elif force_fresh and (
             float(tw_latest_quote_cache_seconds) > 0.0
             or bool(tw_latest_quote_force_refresh)
@@ -1676,27 +1692,6 @@ def _price_snapshot(
             else 0.0
         )
         minimum_coverage = _tw_opening_minimum_coverage()
-        if (
-            require_official_tw_session_open
-            and shared_opening is not None
-            and source_coverage < minimum_coverage
-        ):
-            # A partial broker response is not enough. Query the independent
-            # official MIS source only on this degraded path. Seed only the
-            # already timestamp-validated broker rows; the opening-cache layer
-            # then requests unresolved symbols and returns the aligned union.
-            seed_tw_opening_snapshot_cache(
-                requested_symbols,
-                snapshot,
-                parquet_root=parquet_root,
-            )
-            snapshot = fetch_mis_opening()
-            observed_mask = np.asarray(snapshot.available_mask, dtype=bool)
-            source_coverage = (
-                float(np.count_nonzero(observed_mask)) / len(requested_symbols)
-                if requested_symbols
-                else 0.0
-            )
         if source_coverage < minimum_coverage:
             missing = np.flatnonzero(~observed_mask)
             if force_fresh and not require_official_tw_session_open:
@@ -1817,6 +1812,7 @@ def _price_snapshot(
                 exchange_timestamps_ms=expanded(
                     snapshot.exchange_timestamps_ms, integer=True
                 ),
+                no_open_print_timestamps_ms=expanded(snapshot.no_open_print_timestamps_ms, integer=True),
                 transport_timing=(
                     dict(snapshot.transport_timing)
                     if isinstance(snapshot.transport_timing, dict)
@@ -1871,33 +1867,43 @@ def _write_outputs_to_dir(result: LiveSignalResult, output_dir: str | Path) -> s
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Publish a small JSON contract without exposing a partially written file."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    """Publish the complete JSON contract; whitespace is not execution data."""
+    _atomic_publish_json(path, payload, allow_nan=True)
 
 
 def _atomic_write_compact_json(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically publish a latency-sensitive local IPC payload."""
+    """Durably publish strict, latency-sensitive local IPC JSON."""
+    _atomic_publish_json(path, payload, allow_nan=False)
+
+
+def _atomic_publish_json(path: Path, payload: dict[str, Any], *, allow_nan: bool,
+                         indent: int | None = None) -> None:
+    """One encoder/writer for signal artifacts and their execution pointer.
+
+    Keep the previous NaN policy of each caller, every field and float value.
+    Flush the file before publishing its name and sync the receiving directory
+    on Linux. A unique owned temporary cannot collide with another publisher.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    encoded = json.dumps(payload, ensure_ascii=False, indent=indent,
+                         separators=(",", ":") if indent is None else None,
+                         allow_nan=allow_nan) + "\n"
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _make_signal_id(market: str, asof_date: str) -> str:
@@ -2003,7 +2009,7 @@ def _opening_price_receipt_timing(
 
     result: dict[str, Any] = {
         "schema_version": 1,
-        "clock": "unix_epoch_ms_local_callback_receipt",
+        "clock": "unix_epoch_ms_local_source_result_receipt",
         "measurement_boundary": "09:00_gate_to_local_quote_coverage_to_signal_ready",
         "observed_count": int(np.count_nonzero(observed_mask)),
         "timestamped_count": 0,
@@ -2198,7 +2204,11 @@ def _day_trade_live_model_window(
             if available is not None
             else np.zeros((panel.num_symbols,), dtype=bool)
         )
-        timestamps = price_snapshot.timestamps_ms
+        # Delivery time measures latency; the source timestamp establishes
+        # the quote session. A newly received yesterday-close is not fresh.
+        timestamps = price_snapshot.exchange_timestamps_ms
+        if timestamps is None:
+            timestamps = price_snapshot.timestamps_ms
         if timestamps is None:
             observed_open &= False
         else:
@@ -3026,8 +3036,8 @@ def prefetch_live_signal_prices(
     started, started_utc = time.perf_counter(), datetime.now(timezone.utc)
     config = load_config(config_path)
     execution_mode = _require_supported_live_execution(config.trading.execution_mode)
-    if execution_mode != "tw_day_trade" or day_trade_model_observation != "latest_quote":
-        raise ValueError("quote prefetch is restricted to intraday day-trade previews")
+    if execution_mode != "tw_day_trade" or day_trade_model_observation not in {"session_open", "latest_quote"}:
+        raise ValueError("quote prefetch is restricted to TW day-trade opening/quote inputs")
     root = Path(output_dir if output_dir is not None else config.runner.output_dir)
     resolved_fold, checkpoint = _resolve_checkpoint(root, fold_id, checkpoint_path)
     payload, checkpoint_key, _hit = _cached_checkpoint(checkpoint)
@@ -3113,9 +3123,18 @@ def generate_live_signal(
     tw_latest_quote_force_refresh: bool = False,
     _panel_override: PanelData | None = None,
     _prefetched_quote: PrefetchedLiveQuote | None = None,
+    _timing_sink: dict[str, Any] | None = None,
 ) -> LiveSignalResult:
     signal_started = time.perf_counter()
     signal_started_wall_utc = datetime.now(timezone.utc)
+    telemetry = _timing_sink if _timing_sink is not None else {}
+    telemetry["signal_summary"] = {
+        "signal_started_at": signal_started_wall_utc.isoformat(timespec="microseconds"),
+        "live_latency": {},
+    }
+    partial_summary = telemetry["signal_summary"]
+    partial_latency = partial_summary["live_latency"]
+    telemetry["signal_stage"] = "prepare"
     quote_latency_ms = 0.0
     inference_latency_ms = 0.0
     progress_total = 17
@@ -3237,6 +3256,8 @@ def generate_live_signal(
 
     panel_prices = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
     quote_started = time.perf_counter()
+    telemetry["signal_stage"] = "quote_fetch"
+    partial_latency["pre_quote_prepare_ms"] = round((quote_started - signal_started) * 1000.0, 3)
     quote_requested_at_text = datetime.now(display_tz).isoformat(
         timespec="microseconds"
     )
@@ -3252,9 +3273,13 @@ def generate_live_signal(
         and _prefetched_quote.request_key == _live_quote_request_key(quote_request)
         and 0.0 <= time.perf_counter() - _prefetched_quote.quote_finished <= 5.0
     )
-    price_snapshot = (
-        _prefetched_quote.snapshot if quote_prefetched else _price_snapshot(**quote_request)
-    )
+    partial_summary["price_request_started_at"] = quote_requested_at_text
+    try:
+        price_snapshot = (
+            _prefetched_quote.snapshot if quote_prefetched else _price_snapshot(**quote_request)
+        )
+    finally:
+        partial_latency["quote_fetch_ms"] = round((time.perf_counter() - quote_started) * 1000.0, 3)
     quote_finished = time.perf_counter()
     quote_received_at_text = datetime.now(display_tz).isoformat(
         timespec="microseconds"
@@ -3267,6 +3292,10 @@ def generate_live_signal(
         quote_requested_at_text = _prefetched_quote.requested_at_utc.astimezone(display_tz).isoformat(timespec="microseconds")
         quote_received_at_text = _prefetched_quote.received_at_utc.astimezone(display_tz).isoformat(timespec="microseconds")
     quote_latency_ms = (quote_finished - quote_started) * 1000.0
+    partial_summary.update({"price_source": price_snapshot.source,
+                            "price_response_received_at": quote_received_at_text})
+    partial_latency["quote_transport"] = price_snapshot.transport_timing
+    telemetry["signal_stage"] = "input_validation"
     if (
         execution_mode == "tw_day_trade"
         and normalized_day_trade_observation == "latest_quote"
@@ -3336,6 +3365,7 @@ def generate_live_signal(
     day_trade_quote_observed_mask = np.zeros((panel.num_symbols,), dtype=bool)
     day_trade_open_coverage: float | None = None
     day_trade_quote_coverage: float | None = None
+    day_trade_active_no_print_count = 0
     if execution_mode == "tw_day_trade":
         base_model_window = _cached_normalized_model_window(
             panel,
@@ -3370,6 +3400,9 @@ def generate_live_signal(
             day_trade_active_open_count = int(
                 np.count_nonzero(active_mask & observed_open)
             )
+            day_trade_active_no_print_count = int(np.count_nonzero(
+                active_mask & tw_session_no_open_print_mask(price_snapshot)
+            ))
             quote_observed = (
                 day_trade_observed_model_price
                 if normalized_day_trade_observation == "latest_quote"
@@ -3397,19 +3430,21 @@ def generate_live_signal(
                 if day_trade_active_symbol_count > 0
                 else 0.0
             )
-            if (
-                not day_trade_live_session
-                or day_trade_active_quote_count < day_trade_required_quote_count
-            ):
-                raise RuntimeError(
-                    "same-session TW quote response coverage is not ready; retry immediately: "
-                    f"observed_quotes={day_trade_active_quote_count} "
-                    f"required_quotes={day_trade_required_quote_count} "
-                    f"observed_opens={day_trade_active_open_count} "
-                    f"active={day_trade_active_symbol_count} "
-                    f"quote_coverage={day_trade_quote_coverage:.4f} "
-                    f"open_coverage={day_trade_open_coverage:.4f}"
-                )
+            partial_summary["opening_input_coverage"] = {
+                "active": day_trade_active_symbol_count, "opens": day_trade_active_open_count,
+                "no_prints": day_trade_active_no_print_count,
+                "responses": day_trade_active_quote_count, "required": day_trade_required_quote_count,
+                "basis": normalized_day_trade_observation,
+            }
+            _require_day_trade_opening_coverage(
+                live_session=day_trade_live_session,
+                active=day_trade_active_symbol_count,
+                opens=day_trade_active_open_count,
+                responses=day_trade_active_quote_count,
+                required=day_trade_required_quote_count,
+                model_observation=normalized_day_trade_observation,
+                no_prints=day_trade_active_no_print_count,
+            )
         if day_trade_live_session:
             panel_date_str = day_trade_decision_time[:10]
             panel_display_date = day_trade_decision_time
@@ -3651,6 +3686,8 @@ def generate_live_signal(
     unconstrained_raw_score_tensor: torch.Tensor | None = None
     unconstrained_raw_score_source: str | None = None
     inference_started = time.perf_counter()
+    telemetry["signal_stage"] = "model_inference"
+    partial_latency["pre_inference_prepare_ms"] = round((inference_started - quote_finished) * 1000.0, 3)
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
         mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
@@ -3682,12 +3719,20 @@ def generate_live_signal(
                 )
         _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
         model_weights = model_weights_t[0].detach().float().cpu().numpy().astype(np.float64)
+        # Quote gaps are independent execution constraints, not an all-model
+        # publication barrier. Keep every model weight/score in weights_rows;
+        # only the executor preview is blocked per symbol. No redistribution.
         if execution_preview_only:
             target_weights = model_weights.copy()
             if execution_mode == "tw_day_trade":
                 if day_trade_live_session:
-                    target_weights[(target_weights > 0.0) & ~can_buy_np] = 0.0
-                    target_weights[(target_weights < 0.0) & ~can_short_open_np] = 0.0
+                    # Retain unsized opening targets. Missing prices block the
+                    # corresponding executor order, not erase the immutable
+                    # model request or redistribute it into another symbol.
+                    target_weights[(target_weights > 0.0) & ~can_buy_np & day_trade_observed_model_price] = 0.0
+                    target_weights[(target_weights < 0.0) & (
+                        ~day_trade_short_allowed | (~can_short_open_np & day_trade_observed_model_price)
+                    )] = 0.0
                     # Eligibility is proven; quote/depth/account/order receipts
                     # still belong to the paper executor, not model inference.
                     execution_constraints_complete = False
@@ -3773,6 +3818,8 @@ def generate_live_signal(
         torch.cuda.synchronize(runtime_device)
     inference_finished = time.perf_counter()
     inference_latency_ms = (inference_finished - inference_started) * 1000.0
+    partial_latency["model_inference_ms"] = round(inference_latency_ms, 3)
+    telemetry["signal_stage"] = "format_and_publish"
     _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
 
     if execution_preview_only:
@@ -3883,6 +3930,7 @@ def generate_live_signal(
 
     weights_rows: list[dict[str, Any]] = []
     raw_score_ranks = _abs_rank(raw_score_values, panel.num_symbols)
+    tw_session_no_print = tw_session_no_open_print_mask(price_snapshot)
     opening_prices = (
         np.asarray(price_snapshot.open_prices, dtype=np.float64)
         if price_snapshot.open_prices is not None
@@ -3929,6 +3977,11 @@ def generate_live_signal(
                 ),
                 "abs_raw_score_rank": int(raw_score_ranks[idx]),
                 "model_weight": float(model_weights[idx]),
+                "opening_price_wait_reason": (
+                    "awaiting_first_trade_print" if tw_session_no_print[idx]
+                    else "opening_price_unavailable"
+                ) if execution_mode == "tw_day_trade" and day_trade_live_session
+                and model_weights[idx] != 0.0 and not day_trade_observed_model_price[idx] else None,
                 "current_weight": current_weight,
                 "target_weight": float(target_weights[idx]),
                 "delta_weight": delta_weight,
@@ -4022,7 +4075,11 @@ def generate_live_signal(
     price_receipt_timing = (
         _opening_price_receipt_timing(
             price_snapshot=price_snapshot,
-            observed_mask=day_trade_quote_observed_mask,
+            observed_mask=(
+                np.asarray(panel.alive_mask[panel_idx], dtype=bool) & day_trade_observed_model_price
+                if normalized_day_trade_observation == "session_open"
+                else day_trade_quote_observed_mask
+            ),
             required_count=day_trade_required_quote_count,
             session_date=panel_date_str,
             display_timezone=display_timezone_name,
@@ -4110,13 +4167,26 @@ def generate_live_signal(
         "price_receipt_timing": price_receipt_timing,
         "opening_price_available_count": opening_price_available_count,
         "opening_price_active_count": day_trade_active_open_count,
-        "opening_price_required_count": 0,
+        "opening_price_required_count": day_trade_required_quote_count if normalized_day_trade_observation == "session_open" else 0,
         "opening_price_active_symbol_count": day_trade_active_symbol_count,
         "opening_price_active_coverage": day_trade_open_coverage,
         "opening_quote_active_count": day_trade_active_quote_count,
         "opening_quote_required_count": day_trade_required_quote_count,
         "opening_quote_active_coverage": day_trade_quote_coverage,
-        "opening_coverage_gate_basis": "same_session_quote_response",
+        "opening_coverage_gate_basis": "same_session_open_or_observed_no_print" if normalized_day_trade_observation == "session_open" else "same_session_latest_quote",
+        "opening_acquisition_contract_version": 4,
+        "opening_no_print_active_count": day_trade_active_no_print_count,
+        "opening_input_resolved_count": day_trade_active_open_count + day_trade_active_no_print_count,
+        "opening_input_required_count": day_trade_required_quote_count,
+        "opening_absent_print_feature_policy": "existing_zero_gap_sentinel_not_an_opening_price",
+        "opening_model_inputs_ready": True if execution_mode == "tw_day_trade" and day_trade_live_session else None,
+        "opening_source_complete": day_trade_active_open_count == day_trade_active_symbol_count if execution_mode == "tw_day_trade" and day_trade_live_session else None,
+        "opening_all_symbols_complete": day_trade_active_open_count == day_trade_active_symbol_count,
+        "opening_missing_symbols": [
+            panel.symbols[int(idx)] for idx in np.flatnonzero(
+                np.asarray(panel.alive_mask[panel_idx], dtype=bool) & ~day_trade_observed_model_price
+            )
+        ] if execution_mode == "tw_day_trade" else [],
         "model_observation_active_count": int(
             np.count_nonzero(day_trade_observed_model_price)
         ),
@@ -4252,6 +4322,8 @@ def generate_live_signal(
             "action",
             "score",
             "raw_score",
+            "model_weight",
+            "opening_price_wait_reason",
             "target_weight",
             "tradable",
             "can_buy",

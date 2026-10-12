@@ -18,6 +18,11 @@ production services keep their existing owners. Run success alone does not prove
 their acceptance. Installation, commands and recovery boundaries are documented
 in [Agent workflow](../agent_workflow.md).
 
+Optional terminal tools and the enrolled-endpoint SSH multiplexing profile are
+documented in [Measured terminal tools](../agent_terminal_tools_2026-10-07.md).
+The current runtime executes through Bash; interactive frontends keep the same
+task/run receipts and formal service owners.
+
 The isolated cross-node engineering role is documented in
 [Control workflow](../control_plane_workflow.md). Its PostgreSQL and Mamba Python role
 are independent of acquisition, CUDA and intraday services. Penguin's registered

@@ -90,9 +90,14 @@ def service_artifact_paths(repo_root: Path) -> list[dict[str, str]]:
         } - {None, ""}
         experiments.update(_str_tuple(selected.get("model_candidate_config_paths")))
         for experiment in sorted(experiments):
+            config_sources = {}
             documents.append(
-                (str(experiment), asdict(load_config(repo_root / experiment)))
+                (str(experiment), asdict(load_config(repo_root / experiment, source_signatures=config_sources)))
             )
+            for source in config_sources:
+                paths.append({"market": market, "document": str(experiment), "field": "config_source",
+                              "configured_path": str(source), "path": str(source.absolute()),
+                              "resolved_path": str(source.resolve(strict=False))})
         for label, document in documents:
             for field, value in _strings(document):
                 if not is_repository_data_path(value):

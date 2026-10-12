@@ -118,13 +118,20 @@
         </div>
         <div>
           <strong>FinMind 免費資料監控</strong>
-          <p>全市場歷史回補、每小時請求額度、逐資料集進度與容量；新聞未排程。</p>
+          <p>全市場歷史回補、每小時請求額度、逐資料集進度與容量；新聞 metadata 與全文分開追蹤。</p>
         </div>
         <dl class="card-stats" aria-label="FinMind 即時摘要">
           <div><dt>本站／官方每小時請求</dt><dd id="finmind-quota">—</dd></div>
           <div><dt>歷史日分區進度</dt><dd id="finmind-progress">—</dd></div>
         </dl>
         <span class="card-action">開啟 FinMind 面板 <b aria-hidden="true">→</b></span>
+      </a>
+
+      <a class="dashboard-card finmind" href="news/">
+        <div class="card-topline"><span class="market">NEWS FULLTEXT</span><span class="health">公開唯讀</span></div>
+        <div><strong>新聞爬蟲進度</strong><p>已保存全文、待抓網址、各媒體限流、來源問題與條件估時；不把標題當全文。</p></div>
+        <dl class="card-stats" aria-label="新聞面板範圍"><div><dt>進度範圍</dt><dd>已清點唯一網址</dd></div><div><dt>頁面更新</dt><dd>每 15 秒讀取快照</dd></div></dl>
+        <span class="card-action">開啟新聞爬蟲面板 <b aria-hidden="true">→</b></span>
       </a>
 
       <a class="dashboard-card finlab" href="tej/">
@@ -192,7 +199,7 @@
     </aside>
   </main>
   <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
-  <script src="dashboard-core.js?v=14" defer></script>
+  <script src="dashboard-core.js?v=15" defer></script>
   <script src="dashboard-acquisition.js?v=3" defer></script>
   <script src="public.js?v=15" defer></script>
 </body>

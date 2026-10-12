@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from datetime import date
 import os
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 import warnings
 
 import numpy as np
@@ -26,6 +26,7 @@ from stockagent.backtest.tw_day_trade_carry import (
     invalidate_day_trade_carry_compiled_caches,
 )
 from stockagent.backtest.tw_day_trade_inventory import _validate_checkpoint_identity
+from stockagent.data.walkforward import period_labels_from_contract
 
 
 def _diagnostic_failure_value(value: Any, device: torch.device) -> Any:
@@ -292,6 +293,23 @@ class PreparedDayTradeCarryBatch:
     packed_transport: bool = False
     transport_symbols: int = 0
 
+    def row_slice(self, begin: int, end: int) -> PreparedDayTradeCarryBatch:
+        """Reuse immutable field-major staging for an exact real-row interval.
+
+        Annual account boundaries change state ownership, not observations.
+        Slicing the existing CPU tape avoids decoding/padding those days again;
+        consumers still reconstruct the ordinary dense session ABI.
+        """
+        if begin < 0 or end <= begin or end > self.count:
+            raise ValueError("physical staging slice requires a nonempty real-row interval")
+        return replace(
+            self,
+            days=self.days[begin:end],
+            tensors={name: tensor[begin:end] for name, tensor in self.tensors.items()},
+            count=end - begin,
+            cpu_sessions=self.cpu_sessions[begin:end] if self.cpu_sessions else (),
+        )
+
     @classmethod
     def from_sessions(
         cls,
@@ -457,13 +475,43 @@ class PreparedDayTradeCarryBatch:
             transport_symbols=symbols,
         )
 
-    def sessions(self, device: torch.device) -> tuple[DayTradeCarrySession, ...]:
+    def sessions(self, device: torch.device, *, transport_block_rows: int | None = None) -> tuple[DayTradeCarrySession, ...]:
         if device.type == "cpu" and self.cpu_sessions:
             return self.cpu_sessions
-        moved = {name: tensor.to(device=device) for name, tensor in self.tensors.items()}
+        block_rows = (int(os.environ.get("STOCKAGENT_DAY_TRADE_TRANSPORT_BLOCK_ROWS", "0"))
+                      if transport_block_rows is None else int(transport_block_rows))
+        if block_rows < 0:
+            raise ValueError("physical transport block rows must be non-negative")
+        transport_fields = {"_transport_exit_flat", "_transport_exit_price", "_transport_exit_capacity"}
+        blocked = (self.packed_transport and block_rows > 0 and all(
+            self.tensors[name].device.type == "cpu" and not self.tensors[name].requires_grad
+            for name in transport_fields))
+        moved = {name: tensor.to(device=device) for name, tensor in self.tensors.items()
+                 if not blocked or name not in transport_fields}
         if self.packed_transport:
             symbols = int(self.transport_symbols)
             exit_size = symbols * 270 * 2
+            if blocked:
+                # Keep the full, unchanged dense session ABI. Only bound the
+                # *temporary* padded transport live set to K rows: allocating
+                # all B padded FP64/index packets before their dense scatter
+                # can consume more VRAM than the final tensors themselves.
+                dense_prices = torch.full((self.count, exit_size + 1), float("nan"),
+                                          device=device, dtype=torch.float64)
+                dense_capacity = torch.zeros_like(dense_prices)
+                for begin in range(0, self.count, block_rows):
+                    end = min(begin + block_rows, self.count)
+                    flat = self.tensors["_transport_exit_flat"][begin:end].to(device=device)
+                    values = self.tensors["_transport_exit_price"][begin:end].to(device=device)
+                    dense_prices[begin:end].scatter_(1, flat, values)
+                    del values
+                    values = self.tensors["_transport_exit_capacity"][begin:end].to(device=device)
+                    dense_capacity[begin:end].scatter_(1, flat, values)
+                    del flat, values
+                moved["exit_prices"] = dense_prices[:, :exit_size].reshape(self.count, symbols, 270, 2)
+                moved["exit_capacity"] = dense_capacity[:, :exit_size].reshape(self.count, symbols, 270, 2)
+                return tuple(DayTradeCarrySession(day=day, **{name: value[i] for name, value in moved.items()})
+                             for i, day in enumerate(self.days))
             flat = moved.pop("_transport_exit_flat").to(dtype=torch.int64)
             exit_values = moved.pop("_transport_exit_price")
             capacity_values = moved.pop("_transport_exit_capacity")
@@ -981,6 +1029,7 @@ def bind_physical_carry_loss(
     prepared_batch: PreparedDayTradeCarryBatch | None = None,
     event_compression: bool = True,
     reset_calendar_year: bool = False,
+    reset_period_contract: Mapping[str, Any] | None = None,
 ) -> Callable:
     """Bind an exact batch; model padding never advances inventory or interest."""
     staged = (
@@ -998,7 +1047,7 @@ def bind_physical_carry_loss(
         staged = source.prepare_batch(
             split, start, end, event_compression=compression_enabled
         )
-    sessions, count = staged.sessions(device), staged.count
+    count = staged.count
     expected_rows = split._valid_indices_cpu[start : start + count].tolist()
     if (
         not expected_rows
@@ -1007,27 +1056,31 @@ def bind_physical_carry_loss(
         raise ValueError("prefetched physical batch differs from the requested interval")
     year_cuts = [0]
     if reset_calendar_year:
-        years = [date.fromordinal(day).year for day in staged.days]
+        def period_years(days):
+            if reset_period_contract is None:
+                return [date.fromordinal(day).year for day in days]
+            dates = np.asarray([date.fromordinal(day) for day in days], dtype="datetime64[D]")
+            return period_labels_from_contract(dates, reset_period_contract).tolist()
+
+        years = period_years(staged.days)
         if start == 0:
-            # The rolling feature window is context, not part of the account
-            # horizon. A calendar-year account must therefore begin on that
-            # year's first physical session. Without this guard a panel that
-            # begins at the first target year silently labels
-            # ``year + lookback`` as a complete annual episode.
+            # Feature warmup must not consume owned account rows. A supplied
+            # full-calendar contract deliberately shifts ownership once; the
+            # historical default still uses calendar-year first sessions.
             first_row = int(expected_rows[0])
             if (
                 first_row > 0
-                and date.fromordinal(source.day_at(first_row - 1)).year
+                and period_years([source.day_at(first_row - 1)])[0]
                 == years[0]
             ):
                 raise ValueError(
-                    "annual training episode begins after the calendar year's "
+                    "annual training episode begins after the configured annual period's "
                     "first physical session; lookback rows may provide feature "
                     "context but may not shift the account boundary"
                 )
         year_cuts.extend(i for i in range(1, count) if years[i] != years[i - 1])
         first_row = int(expected_rows[0])
-        starts_new_year = first_row > 0 and date.fromordinal(source.day_at(first_row - 1)).year != years[0]
+        starts_new_year = first_row > 0 and period_years([source.day_at(first_row - 1)])[0] != years[0]
         if starts_new_year and previous is not None:
             _require_flat_episode_boundary(previous)
             previous = None
@@ -1036,6 +1089,13 @@ def bind_physical_carry_loss(
         first_row = int(split._valid_indices_cpu[start])
         if first_row <= 0 or previous.last_session_day != source.day_at(first_row - 1):
             raise ValueError("physical batch skipped or repeated a source session")
+
+    # A cross-year outer call never consumes a full parent GPU tape. Its exact
+    # chronological children own that tape once, retaining their usual
+    # gradients and state boundaries. Previously the unused parent plus each
+    # re-decoded child coexisted, making larger annual batches needlessly OOM.
+    sessions = (() if reset_calendar_year and len(year_cuts) > 2
+                else staged.sessions(device))
 
     def call(weights, returns, mask, **kwargs):
         if reset_calendar_year and len(year_cuts) > 2:
@@ -1062,6 +1122,7 @@ def bind_physical_carry_loss(
                 bound = bind_physical_carry_loss(
                     loss_fn, source=source, split=split, start=start + offset, end=start + stop,
                     device=device, previous=segment_previous, event_compression=event_compression,
+                    prepared_batch=staged.row_slice(offset, stop),
                 )
                 value = bound(weights[offset:stop], returns[offset:stop], mask[offset:stop], **supplied)
                 total = total + value * ((stop - offset) / count)

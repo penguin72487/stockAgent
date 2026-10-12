@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -64,6 +65,49 @@ def readiness(queue, **changes):
     return value
 
 
+def test_blocked_transport_scan_releases_owner_and_preserves_concurrent_ledger(stream, monkeypatch):
+    queue = stream[0]
+    readiness(queue)
+    scanning, finish = threading.Event(), threading.Event()
+    outcome = {}
+
+    def scan(ledger):
+        scanning.set()
+        assert finish.wait(10), 'test must release the blocked scan'
+
+    def cycle():
+        try:
+            outcome['result'] = queue.cycle()
+        except Exception as error:
+            outcome['error'] = error
+
+    monkeypatch.setattr(queue, 'scan_transport', scan)
+    worker = threading.Thread(target=cycle)
+    worker.start()
+    try:
+        assert scanning.wait(5), 'the source must reach its transport scan'
+        with (queue.state / 'owner.lock').open('a') as owner:
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        pytest.fail('network wait kept the publication owner locked')
+                    time.sleep(0.02)
+            ledger = queue.load_ledger()
+            assert ledger['deliveries'], 'publication must be durable before yielding the owner'
+            ledger['concurrent_owner_evidence'] = 'committed_while_network_scan_waited'
+            module.private_json(queue.ledger_path, ledger)
+    finally:
+        finish.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert 'error' not in outcome, outcome.get('error')
+    assert queue.load_ledger()['concurrent_owner_evidence'] == 'committed_while_network_scan_waited'
+
+
 def test_independent_publication_keeps_sending_during_stale_or_unavailable_nas(stream):
     queue = stream[0]
     queue.config.update(publication_requires_receiver_ready=False, maximum_batch_files=1)
@@ -88,6 +132,20 @@ def test_independent_publication_still_refuses_another_receiver_and_full_source_
     assert not queue.load_ledger()['deliveries']
 
 
+def test_auxiliary_snapshot_failure_exposes_bounded_reason_and_keeps_sources(stream, monkeypatch):
+    queue, cold, source, *_ = stream
+    queue.config['auxiliary'] = {'enabled': True}
+    original = (source / '價格.txt').read_bytes()
+    def failed(_):
+        raise SnapshotError('retain failed staging; auxiliary capacity budget reached')
+    monkeypatch.setattr(queue, 'stage_auxiliary', failed)
+    result = queue.cycle(publish=False)
+    assert result['auxiliary_error'] == 'SnapshotError'
+    assert result['auxiliary_error_detail']['reason'] == 'retain failed staging; auxiliary capacity budget reached'
+    assert (source / '價格.txt').read_bytes() == original and cold.is_dir()
+    assert not queue.load_ledger()['deliveries']
+
+
 def test_delegated_cold_replication_ingests_old_ack_without_new_payload(stream):
     queue = stream[0]
     readiness(queue)
@@ -108,6 +166,22 @@ def test_delegated_cold_replication_ingests_old_ack_without_new_payload(stream):
 def test_cold_delegation_requires_explicit_boolean(stream):
     with pytest.raises(SnapshotError, match='explicit boolean'):
         BackupStream({**stream[0].config, 'cold_object_replication_enabled': 'false'})
+
+
+def test_new_atomic_head_during_catalog_capture_loads_its_exact_manifest(stream, monkeypatch):
+    queue,cold,source,first,second=stream
+    original=Path.glob
+    def before_publication(path,pattern):
+        results=list(original(path,pattern))
+        if path==cold/'manifests' and pattern=='*/*.json':
+            return iter([p for p in results if p!=second.manifest_path])
+        return iter(results)
+    monkeypatch.setattr(Path,'glob',before_publication)
+    catalog=capture_catalog(cold,Path(queue.config['publication_catalog']))
+    assert not catalog['metadata_errors'] and not catalog['missing_objects']
+    assert len(catalog['releases'])==2
+    latest=next(r for r in catalog['releases'] if r['snapshot_id']==second.manifest['snapshot_id'])
+    assert latest['current_head'] and latest['manifest_sha256']==second.manifest_sha256
     with pytest.raises(SnapshotError, match='explicit boolean'):
         BackupStream({**stream[0].config, 'cold_metadata_replication_enabled': 'true'})
 
@@ -195,6 +269,80 @@ def test_fd_capacity_inventory_counts_failed_staging_and_unjournaled_files(strea
     measured=queue.transport_usage()
     assert measured["retained_staging_bytes"] == 91
     assert measured["retained_transport_bytes"] == 91+123+(queue.transport/".stignore").stat().st_size
+
+
+def test_capacity_inventory_restarts_after_concurrent_retirement_without_undercounting(stream, monkeypatch):
+    queue = stream[0]
+    wave = queue.transport / 'wave'
+    wave.mkdir()
+    vanished, retained = wave / 'retiring.bin', wave / 'retained.bin'
+    vanished.write_bytes(b'x' * 91)
+    retained.write_bytes(b'y' * 123)
+    actual_stat = os.stat
+    collided = []
+    def concurrent_unlink(path, *args, **kwargs):
+        if path == 'retiring.bin' and kwargs.get('dir_fd') is not None and not collided:
+            collided.append(True)
+            vanished.unlink()
+            raise FileNotFoundError(2, 'concurrent GC unlink', str(vanished))
+        return actual_stat(path, *args, **kwargs)
+    monkeypatch.setattr(module.os, 'stat', concurrent_unlink)
+    measured = queue.transport_usage()
+    assert collided and not vanished.exists() and retained.read_bytes() == b'y' * 123
+    assert measured['retained_transport_bytes'] == 123 + (queue.transport / '.stignore').stat().st_size
+    assert measured['retained_staging_bytes'] == 0
+
+
+def test_capacity_inventory_keeps_a_wave_renamed_into_staging_during_retry(stream, monkeypatch):
+    queue = stream[0]
+    wave = queue.transport / 'wave'
+    wave.mkdir()
+    (wave / 'payload').write_bytes(b'x' * 91)
+    staging = queue.transport / '.staging'
+    staging.mkdir()
+    actual = queue._transport_usage_once
+    attempts = []
+    def rename_between_scan_and_stat():
+        attempts.append(True)
+        if len(attempts) == 1:
+            wave.rename(staging / 'retiring-wave')
+            raise FileNotFoundError(2, 'concurrent GC rename', str(wave))
+        return actual()
+    monkeypatch.setattr(queue, '_transport_usage_once', rename_between_scan_and_stat)
+    measured = queue.transport_usage()
+    assert len(attempts) == 2 and measured['retained_staging_bytes'] == 91
+    assert measured['retained_transport_bytes'] == 91 + (queue.transport / '.stignore').stat().st_size
+    assert (staging / 'retiring-wave/payload').read_bytes() == b'x' * 91
+
+
+def test_capacity_inventory_repeated_changes_never_return_partial_capacity(stream, monkeypatch):
+    queue, cold, source, *_ = stream
+    original = (source / '價格.txt').read_bytes()
+    attempts = []
+    def unstable():
+        attempts.append(True)
+        raise FileNotFoundError(2, 'continued concurrent changes', str(queue.transport / 'wave'))
+    monkeypatch.setattr(queue, '_transport_usage_once', unstable)
+    with pytest.raises(SnapshotError, match='changed repeatedly'):
+        queue.transport_usage()
+    assert len(attempts) == 3 and cold.is_dir() and (source / '價格.txt').read_bytes() == original
+    assert not queue.load_ledger()['deliveries']
+
+
+def test_capacity_retry_rejects_replaced_authority_and_preserves_both_roots(stream, monkeypatch):
+    queue = stream[0]
+    retained = queue.state / 'original-transport'
+    def replaced():
+        queue.transport.rename(retained)
+        queue.transport.mkdir()
+        (queue.transport / 'unknown.bin').write_bytes(b'preserve replacement')
+        raise FileNotFoundError(2, 'authority replaced', str(queue.transport / 'wave'))
+    monkeypatch.setattr(queue, '_transport_usage_once', replaced)
+    with pytest.raises(SnapshotError, match='authority changed'):
+        queue.transport_usage()
+    assert (retained / '.stignore').is_file()
+    assert (queue.transport / 'unknown.bin').read_bytes() == b'preserve replacement'
+    assert not queue.load_ledger()['deliveries']
 
 
 @pytest.mark.parametrize("kind",("file_link","directory_link","fifo"))

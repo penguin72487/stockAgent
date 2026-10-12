@@ -64,6 +64,93 @@ def test_postprocess_plot_spec_rejects_duplicate_prefixes() -> None:
         )
 
 
+def test_absolute_postprocess_does_not_need_baseline_and_passes_calendar(monkeypatch, tmp_path):
+    plots = _postprocess_plot_specs({'postprocess_plots': [
+        {'split': 'val', 'prefix': 'val', 'comparison_mode': 'absolute',
+         'calendar_receipt': '/accepted/calendar.json'},
+        {'split': 'test', 'prefix': 'paired'}]})
+    available = ablation_module._available_postprocess_plots(tmp_path, plots, None)
+    assert available == plots[:1]
+    commands = []
+    monkeypatch.setattr(ablation_module.subprocess, 'run', lambda command, **k: commands.append(command))
+    _render_postprocess_plots(tmp_path, available, baseline_root=None)
+    assert commands[0][commands[0].index('--comparison-mode') + 1] == 'absolute'
+    assert commands[0][commands[0].index('--calendar-receipt') + 1] == '/accepted/calendar.json'
+    with pytest.raises(ValueError, match='comparison_mode'):
+        _postprocess_plot_specs({'postprocess_plots': [{'split': 'test', 'prefix': 'test',
+                                                       'comparison_mode': 'invent-reference'}]})
+
+
+def _absolute_scheduler_spec(tmp_path):
+    # Portable engineering fixture: the frozen production bundle deliberately
+    # does not include unrelated repository deployment configurations.
+    base = tmp_path / 'engineering-base.yaml'
+    base.write_text(yaml.safe_dump({
+        'experiment_name': 'plot-scheduler-engineering',
+        'runner': {'start_fold': 1},
+        'environment': {'device': 'cpu', 'use_tensor_cores': False, 'amp_dtype': 'fp32'},
+        'data': {'parquet_root': 'engineering-not-read', 'benchmark_name': 'fixture'},
+        'trading': {'frequency': 'daily', 'buy_fee_rate': 0., 'sell_fee_rate': 0., 'long_only': False},
+        'training': {'non_blocking_transfer': False}}))
+    path = tmp_path / 'plots.yaml'
+    path.write_text(yaml.safe_dump({
+        'base_config': str(base),
+        'expected_fold_count': 1,
+        'matrix': {'include_baseline': False, 'dimensions': [
+            {'name': 'learning_rate', 'enabled': True, 'path': 'training.learning_rate',
+             'values': [{'name': 'first', 'value': .0002}, {'name': 'second', 'value': .0003}]}]},
+        'postprocess_plots': [{'split': 'test', 'prefix': 'test', 'comparison_mode': 'absolute'}]}))
+    return path
+
+
+def test_scheduler_refreshes_after_each_completed_variant_and_before_next_worker(tmp_path, monkeypatch):
+    spec = _absolute_scheduler_spec(tmp_path)
+    output = tmp_path / 'output'
+    events = []
+    class CompleteWorker:
+        def __init__(self, command, **k):
+            self.name = Path(command[command.index('-c') + 1]).stem
+            events.append('worker:' + self.name)
+            self.pid = 99900
+            self.returncode = None
+        def poll(self):
+            marker = output / self.name / 'fold_01/fold_complete.json'
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text('{}')
+            self.returncode = 0
+            return 0
+    monkeypatch.setattr(ablation_module.subprocess, 'Popen', CompleteWorker)
+    monkeypatch.setattr(ablation_module, '_render_postprocess_plots',
+                        lambda *a, **k: events.append('plots'))
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--runner', '/bin/true', '--max-folds', '1'])
+    ablation_module.main()
+    assert events == ['worker:learning_rate__first', 'plots', 'worker:learning_rate__second', 'plots']
+    events.clear()
+    ablation_module.main()
+    assert events == ['plots']  # Refresh skipped completed results once, without retraining.
+
+
+def test_shared_plots_only_never_builds_configs_or_rewrites_training_summary(tmp_path, monkeypatch):
+    spec = _absolute_scheduler_spec(tmp_path)
+    output = tmp_path / 'output'
+    output.mkdir()
+    summary = output / 'summary.json'
+    summary.write_text('[{"name":"interrupted","status":"failed"}]')
+    original = summary.read_bytes()
+    calls = []
+    def forbidden(*a, **k):
+        raise AssertionError('plots-only must not write training configs or launch workers')
+    monkeypatch.setattr(ablation_module, '_build_configs', forbidden)
+    monkeypatch.setattr(ablation_module.subprocess, 'Popen', forbidden)
+    monkeypatch.setattr(ablation_module, '_render_postprocess_plots', lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--plots-only'])
+    ablation_module.main()
+    assert len(calls) == 1
+    assert summary.read_bytes() == original
+
+
 def test_temporal_basis_configuration_failure_is_not_a_distributed_retry() -> None:
     assert _failure_kind(
         1,
@@ -81,6 +168,96 @@ def test_deep_merge_preserves_unmodified_nested_values() -> None:
         "training": {"epochs": 10, "model": {"dropout": 0.0, "layers": 2}}
     }
     assert base["training"]["model"]["dropout"] == 0.1
+
+
+@pytest.mark.parametrize("explicit,expected", [(None, 11), (10, 10)])
+def test_scheduler_uses_same_case_fold_for_launch_retry_summary_and_skip(
+    tmp_path: Path, monkeypatch, explicit: int | None, expected: int,
+) -> None:
+    import json
+
+    spec_path = tmp_path / "case_fold.yaml"
+    spec_path.write_text(yaml.safe_dump({
+        "base_config": "configs/markets/tw_day_trade_daily_no_default.yaml",
+        "matrix": {"include_baseline": True,
+                   "fixed_overrides": {"runner": {"start_fold": 11}},
+                   "dimensions": [{"name": "unused", "enabled": False,
+                                   "path": "training.learning_rate", "values": []}]},
+    }))
+    output = tmp_path / "output"
+    old = output / "baseline" / "fold_09" / "fold_complete.json"
+    old.parent.mkdir(parents=True)
+    old.write_text("{}")
+    if explicit is None:
+        wrong = output / "baseline" / "fold_10" / "fold_complete.json"
+        wrong.parent.mkdir()
+        wrong.write_text("{}")
+    commands = []
+
+    class RetryThenComplete:
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+            self.pid = 99_000 + len(commands)
+            self.returncode = None
+            self.attempt = len(commands)
+
+        def poll(self):
+            self.returncode = 1 if self.attempt == 1 else 0
+            if self.returncode == 0:
+                marker = output / "baseline" / f"fold_{expected:02d}" / "fold_complete.json"
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("{}")
+            return self.returncode
+
+    monkeypatch.setattr(ablation_module.subprocess, "Popen", RetryThenComplete)
+    argv = ["run_ablation_experiments.py", "--spec", str(spec_path),
+            "--output-root", str(output), "--runner", "/bin/true",
+            "--max-folds", "1", "--retry-backoff-seconds", "0"]
+    if explicit is not None:
+        argv += ["--start-fold", str(explicit)]
+    monkeypatch.setattr(ablation_module.sys, "argv", argv)
+    ablation_module.main()
+    assert len(commands) == 2
+    assert all(command[command.index("--start-fold") + 1] == str(expected)
+               for command in commands)
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary[0]["folds_complete"] == summary[0]["folds_requested"] == 1
+    assert summary[0]["attempts"] == 2
+    ablation_module.main()
+    assert len(commands) == 2  # Selected fold completed; no third worker.
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary[0]["status"] == "complete"
+
+
+def test_last_fold_selection_uses_canonical_calendar_and_rejects_bad_metadata(tmp_path: Path):
+    import json
+    import numpy as np
+    from dataclasses import replace
+
+    c = load_config(Path(__file__).resolve().parents[1] /
+        "configs/deployments/tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml")
+    path = tmp_path / "manifest.json"
+    dates = np.arange("2014-01-06", "2026-10-03", dtype="datetime64[D]")
+    dates = dates[np.is_busday(dates)].astype(str).tolist()
+    path.write_text(json.dumps({"dates": dates}))
+    c = replace(c, data=replace(c.data, factorized_feature_manifest=str(path)),
+                walk_forward=replace(c.walk_forward, split_start_year=2014,
+                    year_boundary_mode="lookback_shifted", lookback_context="panel_history"))
+    assert ablation_module._last_fold_id(c) == 11
+    assert ablation_module._last_fold_id(replace(c, training=replace(c.training, lookback=256))) == 10
+    for malformed in ([], ["2026-01-02", "2026-01-01"], ["NaT"], [["2026-01-01"]]):
+        path.write_text(json.dumps({"dates": malformed}))
+        with pytest.raises(ValueError, match="strictly increasing"):
+            ablation_module._last_fold_id(c)
+    with pytest.raises(ValueError, match="dated factorized feature manifest"):
+        ablation_module._last_fold_id(replace(c, data=replace(c.data, factorized_feature_manifest=None)))
+
+
+def test_build_configs_rejects_unknown_fold_selection(tmp_path: Path):
+    spec = {"base_config": "configs/markets/tw_day_trade_daily_no_default.yaml",
+            "fold_selection": "guess_2026"}
+    with pytest.raises(ValueError, match="fold_selection"):
+        _build_configs(tmp_path / "spec.yaml", spec, [], tmp_path / "output")
 
 
 def test_deep_merge_replaces_basis_limits_when_family_set_changes() -> None:

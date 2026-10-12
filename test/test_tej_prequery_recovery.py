@@ -1,6 +1,6 @@
 """SQLite interruption cannot erase a structured proof that no query was sent."""
 from contextlib import closing
-from datetime import UTC,datetime
+from datetime import UTC,datetime,timedelta
 import json
 import sqlite3
 import uuid
@@ -24,6 +24,23 @@ def prepare(root,task,*,code='local_date_input_failed_before_preview'):
            'market_data_query_submission_possible':False,'error_code':code,'observed_at_utc':datetime.now(UTC).isoformat()}
     path=root/'raw'/(attempt+'.json.outcome.json');atomic_write_json(path,proof)
     return attempt,path,prepared,proof
+
+
+@pytest.mark.parametrize('offset',[-1.1,1.1,5.1])
+def test_finished_prequery_negative_uses_host_deadline_not_remote_order(ready,offset):
+    from downloader.tej_desktop_attempts import proved_unsent_prequery
+    root,_,_=ready
+    task,outcome,_=exhausted(root)
+    with closing(connect(root)) as con:
+        attempt=con.execute('SELECT * FROM desktop_attempts WHERE attempt_id=?',(task['active_attempt_id'],)).fetchone()
+    value=json.loads(outcome.read_text())
+    value['observed_at_utc']=(datetime.fromisoformat(attempt['finished_at_utc'])+timedelta(seconds=offset)).isoformat()
+    atomic_write_json(outcome,value)
+    with closing(connect(root)) as con:
+        if offset>5:
+            with pytest.raises(ValueError):proved_unsent_prequery(root,con,task,finished=True)
+        else:
+            assert proved_unsent_prequery(root,con,task,finished=True)['attempt_id']==task['active_attempt_id']
 
 
 def test_prequery_crash_recovery_is_evidence_preserving_idempotent_and_uses_shared_budget(ready):

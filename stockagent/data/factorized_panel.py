@@ -10,10 +10,12 @@ zeros, not fabricated raw observations.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -254,9 +256,9 @@ class FactorizedPanelFeatures:
         return FactorizedFeatureTensor(self)
 
     def compact_statistics_rows(self, rows):
-        """Skip proven positive-zero columns in statistical reductions only.
+        """Read a lossless column union for statistics or an admitted stem.
 
-        The model still receives its complete dense feature schema. PCA keeps
+        The logical model schema remains complete. PCA keeps
         the original logical observation count; omitted zeros contribute zero
         to its sums/products. RMS retains the full alive-cell denominator.
         """
@@ -460,7 +462,8 @@ def _reconstruct_transfer_packet(result, packet, layout, queued, base_width, com
         if operation == "base":
             result[..., :base_width].copy_(views[arguments[0]])
         elif operation == "common":
-            result[..., common_start:].copy_(views[arguments[0]][:, None, :])
+            width=views[arguments[0]].size(-1)
+            result[..., common_start:common_start+width].copy_(views[arguments[0]][:, None, :])
         elif operation == "rectangle":
             rows, stocks, payload, indices = arguments
             result[rows[0]:rows[-1]+1, stocks[0]:stocks[-1]+1].index_copy_(
@@ -508,6 +511,117 @@ class FactorizedPanelSlab:
     def pad_end(self,count):
         return FactorizedPanelSlab(self.source,np.concatenate([self.rows,np.repeat(self.rows[-1],count)]),
                                   pin_slabs=self.pin_slabs,device=self.device)
+    def _compact_column_packet(self,start,end):
+        """Pack immutable rectangle views, not a large NumPy column scatter.
+
+        Coordinates are remapped into one static-width column union. The
+        ordinary shared rectangle decoder reconstructs that union on device.
+        Keeping raw packets (rather than expanded unions) lets checkpoint
+        recomputation reuse far more of the same bounded GPU cache.
+        """
+        subset=self.source.subset_symbols(np.arange(start,end))
+        rectangles=list(subset.compact_transfer_rectangles(self.rows))
+        base_width=subset.base.shape[-1]
+        common_width=subset.common.shape[-1]
+        common_logical_start=base_width+len(subset.manifest["individual_channels"])
+        pieces=[np.arange(base_width,dtype=np.int64),
+                np.arange(common_logical_start,common_logical_start+common_width,dtype=np.int64)]
+        pieces.extend(columns for _,_,columns,_ in rectangles)
+        columns=np.unique(np.concatenate(pieces))
+        width=len(columns)
+        bucket=min(self.size(2),1 << (max(1,width)-1).bit_length())
+        if len(self.rows)*(end-start)*bucket*4>self.source.max_slab_bytes:
+            raise MemoryError("compact column bucket exceeds the bounded device budget")
+        if bucket==self.size(2):
+            columns=np.arange(bucket,dtype=np.int64)
+            common_start=common_logical_start
+        else:
+            common_start=width-common_width
+            columns=np.pad(columns,(0,bucket-width),constant_values=self.size(2))
+        values=[columns];queued=[]
+        def queue(value):
+            values.append(value)
+            return len(values)-1
+        if base_width:
+            queued.append(("base",queue(subset.base[
+                self.rows[:,None],subset.symbol_indices[None,:]])))
+        if common_width:
+            queued.append(("common",queue(subset.common[self.rows])))
+        for rows,stocks,logical,value in rectangles:
+            mapped=np.searchsorted(columns,logical).astype(np.int64)
+            payload,indices=queue(value),queue(mapped)
+            if np.all(np.diff(rows)==1) and np.all(np.diff(stocks)==1):
+                queued.append(("rectangle",rows,stocks,payload,indices))
+            else:
+                queued.append(("indexed",queue(rows),queue(stocks),payload,indices))
+        packet,layout=_pack_transfer_payloads(values,pin_memory=self.pin_slabs,
+            budget_bytes=self.source.max_slab_bytes)
+        return packet,layout,(queued,base_width,common_start,bucket)
+    def compact_stock_chunk(self, start, end):
+        """Return exact values/coordinates without reconstructing F-wide zeros.
+
+        Only admitted full-affine contraction consumers may use this method.
+        Cache lifetime and pin/H2D rules match stock_chunk; no optimizer state
+        or transformed observations are cached. A union also handles slabs
+        crossing physical date/symbol rectangles and padded/reordered rows.
+        Power-of-two widths avoid variable-K compiler guards. Padding uses a
+        sentinel F (never a model channel); an admitted consumer masks its
+        affine weights. A full-width bucket reconstructs native dense rows.
+        """
+        key = ("compact_columns", start, end)
+        cached = self._gpu_packets.get(key) if self.device.type == "cuda" else None
+        if self.device.type=="cuda":
+            if cached is not None:
+                packet,layout,metadata=cached
+                self.source.transfer_stats["payload_cache_hits"]+=1
+            else:
+                packet,layout,metadata=self._compact_column_packet(start,end)
+                payload_bytes=packet.numel()
+                packet=packet.to(device=self.device,non_blocking=self.pin_slabs)
+                if self._retain_gpu_packets and torch.is_grad_enabled():
+                    self._remember_gpu_packet(key,packet,layout,metadata)
+                self.source.transfer_stats["host_payload_bytes"]+=payload_bytes
+            queued,base_width,common_start,bucket=metadata
+            result=torch.zeros((len(self.rows),end-start,bucket),dtype=torch.float32,device=self.device)
+            _reconstruct_transfer_packet(result,packet,layout,queued,base_width,common_start)
+            columns=_transfer_packet_views(packet,layout)[0]
+            self.source.transfer_stats["chunks"]+=1
+            self.source.transfer_stats["logical_dense_bytes"]+=len(self.rows)*(end-start)*self.size(2)*4
+            return result,columns
+        if cached is not None:
+            packet, layout, queued = cached
+            packet.record_stream(torch.cuda.current_stream(self.device))
+            columns, values = _transfer_packet_views(packet, layout)
+            self.source.transfer_stats["payload_cache_hits"] += 1
+        else:
+            subset = self.source.subset_symbols(np.arange(start, end))
+            host_columns, host_values = subset.compact_statistics_rows(self.rows)
+            width = len(host_columns)
+            bucket = min(self.size(2), 1 << (max(1, width)-1).bit_length())
+            if bucket != width:
+                padded_bytes = len(self.rows)*(end-start)*bucket*4
+                if padded_bytes > self.source.max_slab_bytes:
+                    raise MemoryError("compact column bucket exceeds the bounded host budget")
+                prepared = np.zeros((*host_values.shape[:-1], bucket), dtype=np.float32)
+                if bucket == self.size(2):
+                    prepared[..., host_columns] = host_values
+                    host_columns = np.arange(bucket, dtype=np.int64)
+                else:
+                    prepared[..., :width] = host_values
+                    host_columns = np.pad(host_columns, (0, bucket-width), constant_values=self.size(2))
+                host_values = prepared
+            packet, layout = _pack_transfer_payloads([host_columns, host_values],
+                pin_memory=self.pin_slabs, budget_bytes=self.source.max_slab_bytes)
+            payload_bytes = packet.numel()
+            packet = packet.to(device=self.device, non_blocking=self.pin_slabs)
+            columns, values = _transfer_packet_views(packet, layout)
+            if (self.device.type == "cuda" and self._retain_gpu_packets
+                    and torch.is_grad_enabled()):
+                self._remember_gpu_packet(key, packet, layout, [])
+            self.source.transfer_stats["host_payload_bytes"] += payload_bytes
+        self.source.transfer_stats["chunks"] += 1
+        self.source.transfer_stats["logical_dense_bytes"] += len(self.rows)*(end-start)*self.size(2)*4
+        return values, columns
     def stock_chunk(self,start,end):
         subset=self.source.subset_symbols(np.arange(start,end))
         logical_bytes=len(self.rows)*(end-start)*self.source.shape[2]*4
@@ -609,18 +723,41 @@ def factorized_member_proofs(manifest: dict) -> list[dict]:
     return proofs
 
 
-def verify_factorized_members(root: Path, manifest: dict) -> None:
-    """Verify every immutable model/raw member without expanding its arrays."""
+def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None = None) -> None:
+    """Verify every immutable model/raw member without expanding its arrays.
+
+    Parallelism is an operational opt-in, not a weaker receipt/cache policy.
+    Each worker retains only one bounded SHA stream; every inventory member,
+    including nullable raw observations, remains mandatory. The launcher's
+    per-rank budget must also include these CPU/I/O workers.
+    """
     root=root.resolve(strict=True)
     proofs=factorized_member_proofs(manifest)
-    for proof in proofs:
+    if workers is None:
+        workers=int(os.environ.get("STOCKAGENT_FEATURE_VERIFY_THREADS", "1"))
+    if workers < 1 or workers > 16:
+        raise ValueError("factorized SHA workers must be in [1,16]")
+    def verify(proof):
         member = (root / proof["path"]).resolve(strict=True)
         if not member.is_relative_to(root) or file_sha256(member) != proof["sha256"]:
-            raise ValueError("factorized member identity mismatch")
+            raise ValueError(f"factorized member identity mismatch: {proof['path']}")
+    if workers == 1:
+        for proof in proofs:
+            verify(proof)
+    else:
+        with ThreadPoolExecutor(max_workers=workers,thread_name_prefix="factorized-sha") as pool:
+            # Python 3.12 Executor.map eagerly submits the inventory, but only
+            # the bounded workers open/read files. Consume every future so a
+            # missing, escaped or corrupt member cannot hide in another task.
+            for _ in pool.map(verify,proofs):
+                pass
 
 
-def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu"):
+def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu",
+                               host_cache_bytes: int | None = None):
     """Attach model-only storage after the ordinary price/rule cache load."""
+    if host_cache_bytes is not None and host_cache_bytes < 1:
+        raise ValueError("factorized host cache budget must be positive")
     path = Path(manifest_path).resolve(strict=True)
     manifest = json.loads(path.read_text())
     if manifest.get("contract") not in SUPPORTED_CONTRACTS or manifest.get("status") != "complete":
@@ -660,7 +797,8 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
     if rows != panel.num_dates:
         raise ValueError("factorized blocks do not cover the full executable calendar")
     features = FactorizedPanelFeatures(root, manifest, panel.features,
-        cache_bytes=int(manifest.get("host_cache_bytes", 512 * 1024**2)),
+        cache_bytes=(int(manifest.get("host_cache_bytes", 512 * 1024**2))
+                     if host_cache_bytes is None else int(host_cache_bytes)),
         max_slab_bytes=int(manifest.get("max_slab_bytes",2*1024**3)),transfer_mode=transfer_mode)
     panel.features, panel.feature_names = features, names
     panel.content_fingerprints = {**(panel.content_fingerprints or {}), "features": features.content_fingerprint}
@@ -673,6 +811,7 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
         f"individual={len(manifest['individual_channels'])}, "
         f"common={len(manifest['common_channels'])}; "
         f"factorized attachment complete, transfer={transfer_mode}, "
+        f"host_cache_bytes_per_rank={features._cache.budget_bytes}, "
         f"research_only=True, historical_point_in_time=False",
         flush=True,
     )

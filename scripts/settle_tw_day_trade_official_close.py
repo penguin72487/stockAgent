@@ -54,17 +54,32 @@ def official_closes(raw_root: Path, day: date, *, exchanges=("twse", "tpex")):
         path = raw_root / f"{exchange}_daily_ohlcv" / f"{day}.json"
         raw = path.read_bytes()
         payload = json.loads(raw)
-        if str(payload.get("date")) != day.strftime("%Y%m%d") or str(payload.get("stat")).lower() != "ok":
+        if (not isinstance(payload, dict)
+                or str(payload.get("date")) != day.strftime("%Y%m%d")
+                or str(payload.get("stat")).lower() != "ok"):
             raise ValueError(f"invalid official report date/status: {path}")
         source = {"path": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
         sources.append(source)
-        for table in payload.get("tables", []):
+        tables = payload.get("tables")
+        if not isinstance(tables, list) or not all(isinstance(t, dict) for t in tables):
+            raise ValueError(f"invalid official report tables: {path}")
+        for table in tables:
+            if "fields" not in table:
+                # TWSE appends a notes-only object to otherwise valid reports.
+                # It is not a close table and supplies no pricing evidence.
+                continue
+            if not isinstance(table.get("fields"), list) or not all(isinstance(f, str) for f in table["fields"]):
+                raise ValueError(f"invalid official report fields: {path}")
             fields = [f.strip() for f in table.get("fields", [])]
             code_key = next((k for k in ("證券代號", "代號") if k in fields), None)
             close_key = next((k for k in ("收盤價", "收盤") if k in fields), None)
             if code_key is None or close_key is None:
                 continue
-            for values in table.get("data", []):
+            if not isinstance(table.get("data"), list):
+                raise ValueError(f"invalid official report data: {path}")
+            for values in table["data"]:
+                if not isinstance(values, list) or len(values) != len(fields):
+                    raise ValueError(f"invalid official close row shape: {path}")
                 row = dict(zip(fields, values))
                 symbol = str(row[code_key]).strip()
                 if symbol in prices:

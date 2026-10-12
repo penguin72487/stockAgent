@@ -150,6 +150,7 @@ from stockagent.data.tw_index_options_daily import (
 from stockagent.data.walkforward import (
     WalkForwardFold, normalize_lookback_context, period_labels_from_contract,
     normalize_year_boundary_mode, year_boundary_offset_sessions,
+    annual_period_years, year_period_contract,
 )
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import (
@@ -164,6 +165,7 @@ from stockagent.models.temporal_basis_fit import (
 )
 from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.training.checkpoint_contract import (
+    day_trade_training_episode_contract,
     _active_model_config,
     _align_panel_to_state_dict_universe,
     _checkpoint_manifest,
@@ -2449,6 +2451,7 @@ class _ExecutionRuntime:
     derivatives_maximum_capital_fraction: float = 0.98
     day_trade_carry_source: PreparedDayTradeCarrySource | None = None
     day_trade_training_annual_episodes: bool = False
+    day_trade_training_period_contract: Mapping[str, Any] | None = None
     # CPU identity references only; resolved exclusively after a crypto error.
     diagnostic_panel_dates: np.ndarray | None = None
     diagnostic_panel_symbols: Sequence[str] | None = None
@@ -2866,6 +2869,12 @@ def _build_execution_runtime(
             else None
         ),
         day_trade_training_annual_episodes=bool(config.training.day_trade_training_annual_episodes),
+        day_trade_training_period_contract=(
+            year_period_contract(panel.dates, year_boundary_offset_sessions(config))
+            if config.training.day_trade_training_annual_episodes
+            and year_boundary_offset_sessions(config)
+            else None
+        ),
     )
 
 
@@ -6660,6 +6669,7 @@ def _write_loss_contract_metadata(
     factor_aug_kwargs: Mapping[str, float] | None,
     day_trade_training_annual_episodes: bool = False,
     day_trade_sub_lot_recovery: bool = False,
+    day_trade_annual_episode_boundary: str = "calendar_year_first_session_fresh_capital_v2",
 ) -> None:
     """Persist which loss components are shared with evaluation versus train-only."""
     if not _distributed_should_write():
@@ -6686,7 +6696,7 @@ def _write_loss_contract_metadata(
         payload["day_trade_training_contract"] = {
             "annual_independent_accounts": bool(day_trade_training_annual_episodes),
             "annual_episode_boundary": (
-                "calendar_year_first_session_fresh_capital_v2"
+                day_trade_annual_episode_boundary
                 if day_trade_training_annual_episodes
                 else None
             ),
@@ -7740,26 +7750,40 @@ def _unwrap_distributed_data_parallel(model: nn.Module) -> nn.Module:
 
 
 def _clip_model_gradients_(model: nn.Module, max_norm: float) -> torch.Tensor | None:
-    params = [param for param in _unwrap_model(model).parameters() if param.grad is not None]
-    if not params:
+    gradients = [param.grad for param in _unwrap_model(model).parameters() if param.grad is not None]
+    if not gradients:
         return None
+    # FP32 parameters can have entirely finite gradients whose squared sum
+    # overflows FP32 (observed at 1.37e25 in the d16 annual DDP trajectory).
+    # Promote only the reduction, not model/gradient storage or AMP. FP64 is
+    # sufficient for the norm of every finite FP32 model gradient tensor.
     try:
-        return torch.nn.utils.clip_grad_norm_(
-            params,
-            max_norm=float(max_norm),
-            error_if_nonfinite=False,
-            foreach=True,
-        )
+        norms = torch._foreach_norm(gradients, 2.0, dtype=torch.float64)
     except RuntimeError as exc:
         message = str(exc).lower()
         if "foreach" not in message and "not implemented" not in message and "not support" not in message:
             raise
-    return torch.nn.utils.clip_grad_norm_(
-        params,
-        max_norm=float(max_norm),
-        error_if_nonfinite=False,
-        foreach=False,
-    )
+        norms = [torch.linalg.vector_norm(gradient, dtype=torch.float64) for gradient in gradients]
+    first_device = gradients[0].device
+    total_norm = torch.linalg.vector_norm(torch.stack([norm.to(first_device) for norm in norms]))
+    coefficient = (float(max_norm) / (total_norm + 1e-6)).clamp(max=1.0)
+    # Keep actual NaN/Inf gradients intact for the existing fail-closed gate.
+    # Do not erase their evidence by multiplying Inf by zero during clipping.
+    coefficient = torch.where(torch.isfinite(total_norm), coefficient, torch.ones_like(coefficient))
+    # Two sqrt-factor multiplies also avoid an FP32 subnormal coefficient
+    # flushing to zero when finite gradients approach the FP32 upper bound.
+    factor = coefficient.sqrt()
+    try:
+        torch._foreach_mul_(gradients, factor)
+        torch._foreach_mul_(gradients, factor)
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "foreach" not in message and "not implemented" not in message and "not support" not in message:
+            raise
+        for gradient in gradients:
+            local_factor = factor.to(device=gradient.device, dtype=gradient.dtype)
+            gradient.mul_(local_factor).mul_(local_factor)
+    return total_norm
 
 
 def _run_gradient_clip_(
@@ -13555,10 +13579,10 @@ def _validate_annual_day_trade_training_boundaries(
     folds: Sequence[WalkForwardFold],
     config: ExperimentConfig,
 ) -> dict[str, Any] | None:
-    """Prove that lookback is context and never shifts an annual account.
+    """Prove every annual account covers exactly its configured owned period.
 
     The annual objective claims one fresh-capital account for every complete
-    target calendar year. Its authoritative rows are therefore the fold's
+    target annual period. Its authoritative rows are therefore the fold's
     owned training sessions, while the rolling window may read older panel
     rows. Comparing the two index sets catches both a delayed first decision
     and an accidental spill into the following year before optimizer state is
@@ -13571,7 +13595,8 @@ def _validate_annual_day_trade_training_boundaries(
         raise ValueError("annual day-trade boundary validation requires tw_day_trade")
 
     panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
-    panel_years = panel_dates.astype("datetime64[Y]").astype(np.int64) + 1970
+    offset = year_boundary_offset_sessions(config)
+    panel_years = annual_period_years(panel_dates, offset)
     groups: list[dict[str, Any]] = []
     seen: set[tuple[int, ...]] = set()
     for fold in folds:
@@ -13598,13 +13623,14 @@ def _validate_annual_day_trade_training_boundaries(
                 actual_end = "none" if actual.size == 0 else str(panel_dates[actual[-1]])
                 raise ValueError(
                     "annual training episode must cover every owned session from "
-                    "the calendar year's first trading day through its last: "
+                    "the configured annual period's first trading day through its last: "
                     f"year={year} expected={panel_dates[expected[0]]}.."
                     f"{panel_dates[expected[-1]]} ({expected.size} rows), "
                     f"actual={actual_start}..{actual_end} ({actual.size} rows). "
                     "Use causal rows before the first target year as panel_history "
-                    "lookback context, or extend the validated panel; do not shift "
-                    "the account by lookback rows."
+                    "lookback context, or select an explicit lookback_shifted "
+                    "annual contract; do not shift the account silently or discard "
+                    "owned sessions."
                 )
             year_reports.append(
                 {
@@ -13627,7 +13653,9 @@ def _validate_annual_day_trade_training_boundaries(
         )
     return {
         "schema_version": 1,
-        "contract": "calendar_year_first_session_fresh_capital_v2",
+        "contract": day_trade_training_episode_contract(config),
+        "year_boundary_mode": normalize_year_boundary_mode(config.walk_forward.year_boundary_mode),
+        "year_boundary_offset_sessions": offset,
         "lookback": int(config.training.lookback),
         "lookback_context": str(config.walk_forward.lookback_context),
         "lookback_role": "causal_feature_context_only",
@@ -20384,6 +20412,7 @@ def _probe_compiled_loss_forward_backward(
                 device=device,
                 previous=None,
                 reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
+                reset_period_contract=execution_runtime.day_trade_training_period_contract,
             )
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = probed_loss_fn(
@@ -21202,6 +21231,10 @@ def _train_epoch_windowed_tensor(
 
     for step_idx, batch_idx in enumerate(batch_order, start=1):
         _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
+        # Backward has consumed the previous exact tape. Release its closure
+        # before constructing the next one: assignment otherwise evaluates the
+        # RHS while the old full FP64 session tensors are still referenced.
+        batch_loss_fn = None
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
@@ -21218,6 +21251,7 @@ def _train_epoch_windowed_tensor(
             loss_fn, source=physical_source, split=split, start=start, end=end,
             device=device, previous=physical_previous,
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
+            reset_period_contract=execution_runtime.day_trade_training_period_contract,
             prepared_batch=prepared_physical_batch))
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
@@ -22112,6 +22146,9 @@ def _train_epoch_windowed_tensor_ddp(
     )
     for step_idx in range(1, num_batches + 1):
         _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
+        # Keep only carried account state, not the previous batch's immutable
+        # source closure, alive while staging the next chronological batch.
+        batch_loss_fn = None
         batch_start = time.perf_counter()
         global_start = (step_idx - 1) * int(batch_size)
         local_start = global_start + rank * local_batch_size
@@ -22130,6 +22167,7 @@ def _train_epoch_windowed_tensor_ddp(
             end=global_start + int(batch_size), device=device,
             previous=physical_previous,
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
+            reset_period_contract=execution_runtime.day_trade_training_period_contract,
             prepared_batch=prepared_physical_batch))
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
@@ -25471,6 +25509,7 @@ def _run_training_impl(
                     factor_aug_kwargs=factor_aug_kwargs,
                     day_trade_training_annual_episodes=config.training.day_trade_training_annual_episodes,
                     day_trade_sub_lot_recovery=config.training.day_trade_sub_lot_recovery,
+                    day_trade_annual_episode_boundary=day_trade_training_episode_contract(config),
                 )
         except BaseException as exc:
             loss_contract_error = exc

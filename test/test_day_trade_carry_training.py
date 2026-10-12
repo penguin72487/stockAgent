@@ -225,6 +225,25 @@ def test_physical_training_prefetches_each_chronological_batch(monkeypatch):
     assert calls == [([0, 1, 2], 2)]
 
 
+@pytest.mark.parametrize("trajectory", [False, True])
+def test_physical_training_releases_prior_tape_before_binding_next(monkeypatch, trajectory):
+    split, runtime, loss_fn = fixture()
+    original_bind = trainer.bind_physical_carry_loss
+    bound_refs = []
+
+    def tracked_bind(*args, **kwargs):
+        assert not bound_refs or bound_refs[-1]() is None
+        bound = original_bind(*args, **kwargs)
+        bound_refs.append(weakref.ref(bound))
+        return bound
+
+    monkeypatch.setattr(trainer, "bind_physical_carry_loss", tracked_bind)
+    actual, timing = train_epoch(split, runtime, loss_fn, Policy(), batch_size=2,
+                                 optimizer_step_per_trajectory=trajectory)
+    assert torch.isfinite(actual) and timing.batches == 3
+    assert len(bound_refs) == 3 and all(ref() is None for ref in bound_refs)
+
+
 def test_nonfinite_trajectory_gradient_fails_before_only_optimizer_step():
     split, runtime, loss_fn = fixture()
     model = Policy()
@@ -642,15 +661,31 @@ def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_accoun
 @pytest.mark.skipif(int(os.environ.get('WORLD_SIZE', '1')) != 2, reason='requires real two-rank torchrun')
 @pytest.mark.parametrize('optimizer_step_per_trajectory', [False, True])
 def test_real_ddp_physical_training_matches_single_device(
-    optimizer_step_per_trajectory,
+    optimizer_step_per_trajectory, monkeypatch,
 ):
     """Real NCCL/autograd/optimizer, not synthetic collective monkeypatches."""
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
+    from train import _configure_cpu_parallelism
+    _configure_cpu_parallelism(
+        cpu_threads=int(os.environ.get("STOCKAGENT_CPU_THREADS", "8")),
+        compile_threads=int(os.environ.get("STOCKAGENT_TORCH_COMPILE_THREADS", "16")),
+        local_world_size=2,
+    )
     rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
     dist.init_process_group('nccl')
     device = f'cuda:{rank}'
+    original_bind = trainer.bind_physical_carry_loss
+    bound_refs = []
+
+    def tracked_bind(*args, **kwargs):
+        assert not bound_refs or bound_refs[-1]() is None
+        bound = original_bind(*args, **kwargs)
+        bound_refs.append(weakref.ref(bound))
+        return bound
+
+    monkeypatch.setattr(trainer, "bind_physical_carry_loss", tracked_bind)
     try:
         split, runtime, loss_fn = fixture(device=device)
         split = trainer._pad_windowed_training_split(split, 2)

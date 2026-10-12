@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, TextIO
 from zoneinfo import ZoneInfo
 
 
@@ -45,6 +45,18 @@ from stockagent.live.tw_public_opening_revision import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def _downgrade_refresh_lock_for_audit(lock_handle: TextIO) -> None:
+    """Fence completed writes while allowing concurrent live panel readers.
+
+    The audit only reads canonical inputs and writes cache/report artifacts.
+    A shared lease still excludes source writers. Lock conversion can yield to
+    a waiting writer, so callers revalidate derived dependencies after it and
+    retain the final exclusive revision/receipt fence before acceptance.
+    """
+
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1198,6 +1210,9 @@ def main() -> int:
                         f"derived_data:{step_name} failed rc={completed.returncode}"
                     )
                     break
+            _downgrade_refresh_lock_for_audit(lock_handle)
+            steps.append({"step": "source_read_lease", "status": "ok", "mode": "shared"})
+            print("[tw-public-0830] source phase=read_only_audit lock=shared", flush=True)
             derived_status_after = _derived_data_status(
                 live_root,
                 expected_latest=expected_latest,

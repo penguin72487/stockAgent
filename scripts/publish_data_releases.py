@@ -192,8 +192,12 @@ def _blockers(entry: Mapping[str, Any], commands: list[tuple[int, str]]) -> list
         # inside its -c program. Match actual script argv, not quoted programs.
         if pattern.endswith(".py") and "/" not in pattern:
             try:
+                argv = shlex.split(command)
                 return any(Path(arg).name == pattern and not any(c.isspace() for c in arg)
-                           for arg in shlex.split(command))
+                           for arg in argv) or any(
+                    arg == '-m' and i + 1 < len(argv)
+                    and argv[i + 1].rsplit('.', 1)[-1] == pattern[:-3]
+                    for i, arg in enumerate(argv))
             except ValueError:
                 return pattern in command  # malformed evidence fails closed
         return pattern in command
@@ -364,6 +368,18 @@ def _publish_entry(
         status = _status(entry, _running_commands(), sync_root=sync_root)
         if not status["publish_ready"]:
             return status, None
+        validation = None
+        validation_guard = None
+        if entry.get('validation_gate'):
+            from scripts.validate_training_sources import validate_catalog_source, verify_unchanged
+            validation = validate_catalog_source(entry, repo_root=REPO_ROOT)
+            validation_guard = lambda: verify_unchanged(entry, validation, repo_root=REPO_ROOT)
+        previous_guard = source_guard
+        if validation_guard is not None:
+            def source_guard():
+                if previous_guard is not None:
+                    previous_guard()
+                validation_guard()
         resolved = publish_packed_snapshot(
             sync_root,
             str(entry["dataset"]),
@@ -378,6 +394,13 @@ def _publish_entry(
             metadata={
                 "role": str(entry["role"]),
                 "catalog_schema": "1",
+                **({'source_validation_contract': str(validation['contract']),
+                    'source_validation_identity': str(validation['identity']),
+                    'source_validation_status': str(validation['result']['status']),
+                    'source_validation_last_date': str(validation['result'].get('end_date',
+                                                        validation['result'].get('last_date', ''))),
+                    'all_source_coverage_complete_claim': str(validation['result'].get('coverage_complete', False)).lower()}
+                   if validation is not None else {}),
                 **({
                     "bybit_materialization_input_files": str(expected_inputs["files"]),
                     "bybit_materialization_input_metadata_sha256": str(expected_inputs["metadata_sha256"]),
@@ -516,7 +539,15 @@ def main(argv: list[str] | None = None) -> int:
         results: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for entry in selected:
-            status, resolved = _publish_entry(entry, args, sync_root)
+            try:
+                status, resolved = _publish_entry(entry, args, sync_root)
+            except (SnapshotError, OSError, ValueError) as exc:
+                if not args.all_ready:
+                    raise
+                skipped.append({"dataset": entry["dataset"], "publish_ready": False,
+                                "validation_or_publication_error": str(exc),
+                                "committed_head_outcome": "unknown_check_current_head"})
+                continue
             if resolved is None:
                 if args.all_ready:
                     skipped.append(status)

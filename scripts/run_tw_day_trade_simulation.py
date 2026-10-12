@@ -44,7 +44,9 @@ from stockagent.live.quote_provider import (  # noqa: E402
     load_local_stock_0901_vwaps,
     observed_0901_minute_volume_lots,
     prepare_tw_price_limit_snapshot,
-    serve_shared_day_trade_quote_requests,
+    SharedDayTradeQuoteBroker,
+    StockQuoteWakeup,
+    set_shioaji_stock_quote_wakeup,
     warm_shioaji_stock_quote_client,
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
@@ -1059,19 +1061,43 @@ def _attach_terminal_official_close_context(quotes, *, engine, specs, configs, o
         ) / "raw"
         by_root.setdefault(root, set()).update(symbols)
     for root, symbols in by_root.items():
-        try:
-            prices, _ = official_closes(root, observed.date())
-        except FileNotFoundError:
-            continue  # Official publication may follow the actual auction.
-        except (ValueError, OSError) as exc:
-            print(f"[tw-day-trade-sim] terminal_close_source_error={type(exc).__name__}: {exc}", flush=True)
-            continue
+        # Exchanges publish independently. A missing/invalid OTC report must
+        # not withhold an already validated listed close (and vice versa).
+        # Keep the strict date/status/SHA parser for each source; this is not a
+        # fallback to yesterday's close or permission to fill unpriced rows.
+        prices = {}
+        for exchange in ("twse", "tpex"):
+            try:
+                source_prices, _ = official_closes(
+                    root, observed.date(), exchanges=(exchange,)
+                )
+            except FileNotFoundError:
+                continue  # Publication may follow the actual auction.
+            except (ValueError, OSError) as exc:
+                print(
+                    f"[tw-day-trade-sim] terminal_close_source_error "
+                    f"exchange={exchange} error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            # Cross-venue duplicate identities are not independent evidence.
+            # Withhold just the conflicting key, not unrelated valid prices.
+            for symbol, row in source_prices.items():
+                if symbol in prices:
+                    prices[symbol] = {}
+                    print(
+                        f"[tw-day-trade-sim] terminal_close_source_conflict symbol={symbol}",
+                        flush=True,
+                    )
+                else:
+                    prices[symbol] = row
         for symbol in symbols:
             row = prices.get(symbol) or {}
             raw_row = row.get("official_row") or {}
             raw_volume = next((raw_row[k] for k in ("成交股數", "成交量") if k in raw_row), None)
             try:
-                has_trade = float(str(raw_volume).replace(",", "")) > 0
+                volume = float(str(raw_volume).replace(",", ""))
+                has_trade = np.isfinite(volume) and volume > 0 and volume.is_integer()
             except (ValueError, TypeError):
                 has_trade = False
             if row.get("price") is None or not has_trade:
@@ -1471,6 +1497,11 @@ def _active_symbols(
     fallback: dict[str, float] = {}
     for mode in engine.state.get("modes", {}).values():
         for symbol, order in (mode.get("pending_entry_orders") or {}).items():
+            if order.get("status") == "waiting_source" and order.get("sizing_pending"):
+                symbols.add(symbol)
+                # Unknown sizing is not a made-up opening price. NaN is a
+                # source-request fallback only and can never authorize a fill.
+                fallback[symbol] = float("nan")
             if order.get("status") == "working" and order.get("remaining_shares", 0) > 0:
                 symbols.add(symbol)
                 fallback[symbol] = float(order["position"]["sizing_open_price"])
@@ -1485,6 +1516,22 @@ def _active_symbols(
                 position.get("last_mark_price") or position.get("entry_price") or 1.0
             )
     return sorted(symbols), fallback
+
+
+def _causal_pending_quote_symbols(modes: Mapping[str, Mapping[str, Any]]) -> set[str]:
+    """Wake real-time pending orders, including not-yet-sized source waits.
+
+    Replay prices keep their own minute clock and never borrow native books.
+    This is a notification subscription, not a fill permission or quote proof.
+    """
+    return {
+        str(order.get("symbol") or symbol)
+        for mode in modes.values()
+        if str(mode.get("entry_fill_policy") or "") == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
+        for symbol, order in (mode.get("pending_entry_orders") or {}).items()
+        if ((order.get("status") == "working" and int(order.get("remaining_shares") or 0) > 0)
+            or (order.get("status") == "waiting_source" and order.get("sizing_pending")))
+    }
 
 
 def _active_quote_due(
@@ -1674,16 +1721,19 @@ class _SignalPointerWatcher:
             except OSError:
                 continue
 
-    def wait(self, timeout_seconds: float) -> bool:
+    def wait(self, timeout_seconds: float, *, additional_fd: int | None = None) -> bool:
         timeout = max(0.0, float(timeout_seconds))
-        if not self.enabled or self._fd is None:
+        descriptors = ([self._fd] if self.enabled and self._fd is not None else [])
+        if additional_fd is not None:
+            descriptors.append(additional_fd)
+        if not descriptors:
             time_module.sleep(timeout)
             return False
         try:
-            ready, _writable, _errors = select.select([self._fd], [], [], timeout)
+            ready, _writable, _errors = select.select(descriptors, [], [], timeout)
             if not ready:
                 return False
-            while True:
+            while self._fd in ready:
                 try:
                     if not os.read(self._fd, 64 * 1024):
                         break
@@ -1905,6 +1955,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     specs: list[ModeSpec] = []
     live_configs: dict[str, LiveMarketConfig] = {}
+    quote_broker = SharedDayTradeQuoteBroker(engine.state_dir)
     last_reload = 0.0
     last_readiness = 0.0
     last_liveness = 0.0
@@ -1918,10 +1969,13 @@ def main(argv: list[str] | None = None) -> int:
     last_benchmark_minute: str | None = None
     last_ledger_mark_minute: str | None = None
     pending_retry_after: dict[str, float] = {}
+    signal_first_detected_at: dict[tuple[str, str], datetime] = {}
     quote_client_warmed_session: str | None = None
     quote_client_prewarm_retry_after = 0.0
     eligibility_prewarmed_session: str | None = None
     signal_watcher = _SignalPointerWatcher()
+    stock_quote_wakeup = StockQuoteWakeup()
+    set_shioaji_stock_quote_wakeup(stock_quote_wakeup)
     missed_opening_prices = _MissedOpeningPriceRecovery(engine.state_dir)
     last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
     non_session_invalidation_attempts: set[tuple[str, str]] = set()
@@ -2145,9 +2199,7 @@ def main(argv: list[str] | None = None) -> int:
         # the window the broker retains its ordinary bounded FIFO behavior.
         broker_started = time_module.perf_counter()
         broker_prelude_ms = (broker_started - loop_started) * 1000.0
-        broker_results = serve_shared_day_trade_quote_requests(
-            state_dir=engine.state_dir,
-            max_requests=1,
+        broker_results = quote_broker.poll(
             allowed_purposes=(
                 {"opening_signal"} if broker_protected_open else None
             ),
@@ -2326,6 +2378,7 @@ def main(argv: list[str] | None = None) -> int:
                 summary, rows = latest
                 detected_at = datetime.now(TAIPEI)
             signal_id = str(summary.get("signal_id") or "")
+            signal_first_detected_at.setdefault((spec.market, signal_id), detected_at)
             if signal_id in set(mode.get("processed_signal_ids") or ()):
                 continue
             if monotonic_now < pending_retry_after.get(spec.market, 0.0):
@@ -2412,8 +2465,9 @@ def main(argv: list[str] | None = None) -> int:
                 or ""
             ) == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
             and any(
-                order.get("status") == "working"
-                and int(order.get("remaining_shares") or 0) > 0
+                (order.get("status") == "working"
+                 and int(order.get("remaining_shares") or 0) > 0)
+                or (order.get("status") == "waiting_source" and order.get("sizing_pending"))
                 for order in (mode.get("pending_entry_orders") or {}).values()
             )
             for mode in engine.state.get("modes", {}).values()
@@ -2427,6 +2481,8 @@ def main(argv: list[str] | None = None) -> int:
         if pending_entry_shares and pending_entry_shares != last_pending_entry_shares:
             entry_fast_until = monotonic_now + 20.0
         last_pending_entry_shares = pending_entry_shares
+        stock_quote_wakeup.arm(_causal_pending_quote_symbols(engine.state.get("modes", {})))
+        pushed_entry_quote_due = stock_quote_wakeup.consume()
         # A fresh signal/fill briefly checks the pushed Quote feed each second.
         # Unchanged intents back off to 30 seconds: they may be illiquid or
         # unfunded, and must not rewrite the full paper ledger indefinitely.
@@ -2434,7 +2490,8 @@ def main(argv: list[str] | None = None) -> int:
         causal_pending_quote_due = bool(
             causal_pending_entry
             and datetime_time(9, 0) <= wall_time < EXIT_LIMIT_TIME
-            and monotonic_now - last_causal_pending_quote_at >= causal_pending_interval
+            and (pushed_entry_quote_due
+                 or monotonic_now - last_causal_pending_quote_at >= causal_pending_interval)
         )
         same_minute_force_exit_retry = (
             bool(active_symbols)
@@ -2795,7 +2852,12 @@ def main(argv: list[str] | None = None) -> int:
                         signal_id=str(summary.get("signal_id") or ""),
                         result=result,
                         summary=summary,
-                        consumer_detected_at=detected_at,
+                        consumer_detected_at=signal_first_detected_at[(spec.market, str(summary.get("signal_id") or ""))],
+                        signal_commit_attempt_at=detected_at,
+                        source_recovery_wait_reason=(
+                            "missed_opening_0901_source" if missed_opening_recovery
+                            else "quote_or_eligibility_retry"
+                        ),
                         ledger_persisted_at=persisted_at,
                         executor_quote_fetch_ms=quote_fetch_ms,
                         eligibility_load_ms=eligibility_ms,
@@ -2882,7 +2944,8 @@ def main(argv: list[str] | None = None) -> int:
                     causal_pending_entry and time_module.monotonic() < entry_fast_until
                 ),
                 has_open_position=bool(active_symbols),
-            )
+            ),
+            additional_fd=stock_quote_wakeup.fd,
         )
 
 

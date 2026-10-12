@@ -125,6 +125,62 @@ def _txo_frame(*, include_future: bool) -> pl.DataFrame:
     )
 
 
+@pytest.mark.parametrize("option_mode", [False, True])
+def test_normalizer_projects_columns_and_keeps_full_read_moments(tmp_path, monkeypatch, option_mode):
+    from stockagent.data import tw_index_derivatives_tick as module
+
+    paths = []
+    frames = []
+    for offset in (0, 12):
+        frame = build_tick_day_frame(
+            _tx_frame(), _txo_frame(include_future=False), trading_date=date(2026, 8, 6),
+            decision_interval_seconds=1, rolling_window_seconds=1, warmup_seconds=1,
+        ).with_columns(pl.lit("large unrelated provenance" * 100).alias("unused_provenance"))
+        # Include sparse/nonfinite moments and a different second day's values.
+        feature = TICK_FEATURE_COLUMNS[0]
+        frame = frame.with_columns((pl.col(feature) + offset).alias(feature))
+        if offset:
+            frame = frame.with_columns(
+                pl.when(pl.int_range(pl.len()) == 0).then(None)
+                .otherwise(pl.col(feature)).alias(feature)
+            )
+        path = tmp_path / f"day-{offset}.parquet"
+        frame.write_parquet(path)
+        paths.append(path)
+        frames.append(frame)
+    dataset = IndexDerivativesTickDataset(
+        root=tmp_path, manifest={}, dates=np.array(["2026-08-06"] * 2, dtype="datetime64[D]"),
+        partition_paths=tuple(paths), verify_partition_sha256=False,
+    )
+    names = dataset.feature_names(option_mode=option_mode)
+    total, total_sq = np.zeros(len(names)), np.zeros(len(names))
+    counts = np.zeros(len(names), dtype=np.int64)
+    for frame in frames:
+        if option_mode:
+            frame = frame.filter(pl.col("option_executable"))
+        values = dataset._raw_features(frame, option_mode=option_mode).reshape(-1, len(names)).astype(np.float64)
+        finite = np.isfinite(values)
+        total += np.where(finite, values, 0.0).sum(axis=0)
+        total_sq += np.where(finite, values * values, 0.0).sum(axis=0)
+        counts += finite.sum(axis=0)
+    mean = total / counts
+    scale = np.sqrt(np.maximum(total_sq / counts - mean * mean, 0.0))
+    scale = np.where(scale > 1e-6, scale, 1.0)
+    read = pl.read_parquet
+    selected = []
+    def projected(path, *, columns):
+        assert "unused_provenance" not in columns
+        assert not any("bid" in name or "ask" in name for name in columns if name not in TICK_FEATURE_COLUMNS)
+        selected.append(columns)
+        return read(path, columns=columns)
+    monkeypatch.setattr(module.pl, "read_parquet", projected)
+    actual = dataset.fit_normalizer([0, 1], option_mode=option_mode)
+    assert len(selected) == 2
+    assert actual.mean.tobytes() == mean.astype(np.float32).tobytes()
+    assert actual.scale.tobytes() == scale.astype(np.float32).tobytes()
+    assert actual.counts.tobytes() == counts.tobytes()
+
+
 def _option_depth(
     *,
     call_bid: float = 99.0,

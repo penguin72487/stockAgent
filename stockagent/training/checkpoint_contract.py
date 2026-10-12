@@ -54,7 +54,9 @@ from stockagent.data.tw_day_trade_execution import (
 )
 from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.data.panel_cache import array_content_fingerprint
-from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
+from stockagent.data.walkforward import (
+    WalkForwardFold, normalize_lookback_context, year_boundary_offset_sessions,
+)
 from stockagent.models.factory import _feature_indices_from_patterns
 from stockagent.models.transformer_base_portfolio import (
     TransformerBasePortfolioModel,
@@ -66,6 +68,13 @@ from stockagent.portfolio_contract import (
     normalize_portfolio_mode,
     normalize_portfolio_output_mode,
 )
+
+
+def day_trade_training_episode_contract(config: ExperimentConfig) -> str:
+    """Keep calendar checkpoints stable; bind opted-in accounts to split periods."""
+    if year_boundary_offset_sessions(config):
+        return "observed_session_shifted_fresh_capital_v1"
+    return "calendar_year_first_session_fresh_capital_v2"
 
 
 def _normalize_risk_objective(loss_type: str) -> str:
@@ -228,6 +237,14 @@ def _project_temporal_basis_model_config(
         projected.pop("candle_projection_fp32", None)
     else:
         projected["candle_projection_precision_contract"] = "fp32_full_feature_joint_stem_v1"
+    if not bool(projected.get("factorized_compact_projection", False)):
+        projected.pop("factorized_compact_projection", None)
+    else:
+        projected["factorized_compact_projection_contract"] = "full_layernorm_affine_zero_column_contraction_v2"
+    if not int(projected.get("factorized_compact_stream_chunk_bytes", 0)):
+        projected.pop("factorized_compact_stream_chunk_bytes", None)
+    else:
+        projected["factorized_compact_stream_contract"] = "bounded_logical_width_stock_stream_v1"
     if int(projected.get("feature_bottleneck_dim", 0) or 0) == 0:
         # Zero is the historical direct-input architecture.  Omit the disabled
         # post-schema field so merely upgrading the runtime cannot invalidate
@@ -310,6 +327,15 @@ def _project_temporal_basis_model_config(
 
 def _factorized_input_graph_contract(config: ExperimentConfig) -> str:
     model = config.training.financial_transformer
+    from stockagent.models.factorized_input import factorized_head_backend_contract
+    if factorized_head_backend_contract(model) != "inductor_v1":
+        # Never resume an optimizer produced by the faulty narrow-head
+        # Inductor adjoint, even when model dimensions and data are unchanged.
+        return "compiled_partition_sm12_narrow_fp32_head_only_aligned_sdpa_adjoint_abi_v9"
+    if bool(getattr(model, "factorized_compact_projection", False)):
+        if int(getattr(model, "factorized_compact_stream_chunk_bytes", 0)):
+            return "compiled_partition_full_affine_bounded_stream_abi_v6"
+        return "compiled_partition_full_affine_compact_static_abi_v5"
     if (config.training.model_name == "financial_transformer"
             and not model.temporal_basis_families
             and not model.feature_svd_components
@@ -326,6 +352,9 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     # not observations, shapes, graph arithmetic or the optimizer trajectory.
     # Exact runtime/config/source receipts still record the selected mode.
     snapshot["data"].pop("factorized_transfer_mode", None)
+    # Decoded immutable FP32 LRU size only changes repeated I/O/decompression.
+    # Keep the budget in runtime receipts, not the semantic optimizer ABI.
+    snapshot["data"].pop("factorized_host_cache_bytes", None)
     # Activation retention changes storage/recomputation, not the compiled
     # encoder mathematics, RNG or optimizer. Exact release/config receipts
     # retain this executor setting; canonical semantic resume stays unchanged.
@@ -769,7 +798,7 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         fold_continuation_contract["day_trade_sub_lot_recovery"] = "one_lot_fifo_utility_v1"
     if training.day_trade_training_annual_episodes:
         fold_continuation_contract["day_trade_training_annual_episodes"] = (
-            "calendar_year_first_session_fresh_capital_v2"
+            day_trade_training_episode_contract(config)
         )
     contract: dict[str, Any] = {
         "seed": int(training.seed),

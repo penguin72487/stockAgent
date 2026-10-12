@@ -12,7 +12,7 @@ import sqlite3
 from statistics import median
 from typing import Any
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 STATUS_CACHE_SECONDS = 4.0
 STATUS_REFRESH_SECONDS = 5
 PROGRESS_CONTRACT = 'tej_native_readback_progress_v1'
@@ -20,14 +20,15 @@ PROGRESS_STAGES = frozenset({'preparing_scope', 'awaiting_preview', 'reading_pre
                             'response_saved', 'validating_and_saving'})
 SCHEDULER_STATES = frozenset({'starting', 'executing', 'between_tasks', 'waiting_local_retry', 'waiting_desktop',
     'waiting_queue', 'waiting_storage', 'waiting_owner', 'waiting_metadata', 'waiting_recovery', 'recovering_response',
-    'replaying_authorized', 'stopped'})
+    'replaying_authorized', 'recovering_metadata', 'stopped'})
 SCHEDULER_REASONS = frozenset({'desktop_interface_recovery_required', 'inflight_requires_recovery',
     'unknown_outcome_no_auto_retry', 'source_validation_failed', 'local_storage_failed',
     'source_key_layout_replan_required', 'date_input_prequery_needs_review',
     'source_period_replan_required',
     'source_capacity_requires_review',
     'list_selection_prequery_needs_review', 'query_activation_prequery_needs_review',
-    'source_binding_prequery_needs_review', 'query_preparation_prequery_needs_review'})
+    'source_binding_prequery_needs_review', 'query_preparation_prequery_needs_review',
+    'metadata_preparation_requires_recovery','metadata_retry_scheduled'})
 METHOD = "Smart Wizard 查詢可能沿用最近一期。v4 另驗證公司／日期介面可用及無錯誤視窗；保存的是來源顯示字串，不是 Excel 底層精度、原生歷史或發布時點證明。舊範圍需重新驗證。"
 TABLE_COLUMNS = ("table_id", "smart_id", "name", "category", "phase", "frequency", "state",
                  "universe_count", "grid_dates", "grid_rows", "last_error_code",
@@ -84,7 +85,7 @@ def _worker_alive(worker: dict, observed: datetime) -> bool:
 
 def _automatic_execution_state(state: str | None) -> str:
     """A live supervisor waiting for resources is not continuous acquisition."""
-    if state in {'waiting_recovery','recovering_response','replaying_authorized'}:
+    if state in {'waiting_recovery','recovering_response','replaying_authorized','recovering_metadata'}:
         return 'automatic_waiting_recovery'
     return 'automatic_running' if state in {'executing','between_tasks'} else 'automatic_waiting'
 
@@ -95,7 +96,7 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
              and value.get('continuous') is True)
     state = value.get('state') if valid and value.get('state') in SCHEDULER_STATES else None
     alive = valid and _owner_alive(value, observed, SCHEDULER_STATES - {'stopped'},
-                                 1800 if state in {'executing','recovering_response','replaying_authorized'} else 300)
+                                 1800 if state in {'executing','recovering_response','replaying_authorized','recovering_metadata'} else 300)
 
     def stamp(key):
         parsed = _stamp(value.get(key)) if valid else None
@@ -104,6 +105,16 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
     def counter(key):
         count = value.get(key) if valid else None
         return count if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 10**12 else None
+
+    readiness = value.get('desktop_readiness') if valid and alive else None
+    readiness_clock = _stamp(readiness.get('observed_at_utc')) if isinstance(readiness,dict) else None
+    readiness_valid = (isinstance(readiness,dict)
+                       and readiness.get('contract')=='owned_source_desktop_transport_readiness_v1'
+                       and readiness_clock and 0 <= (observed-readiness_clock).total_seconds() <= 60
+                       and type(readiness.get('ready')) is bool
+                       and type(readiness.get('recent_interface_check')) is bool)
+    desktop_readiness = ({'ready':readiness['ready'],'recent_interface_check':readiness['recent_interface_check'],
+                          'observed_at_utc':readiness_clock.isoformat()} if readiness_valid else None)
 
     grant = value.get('authorized_unknown_replay') if valid else None
     enabled = (isinstance(grant, dict) and grant.get('enabled') is True
@@ -116,6 +127,38 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
                      'local_disk_headroom_low', 'local_metadata_busy', 'prequery_retry_scheduled',
                      'original_response_recovered'}
     replay = {'enabled': bool(enabled), 'unconditional_retry': False}
+    metadata_grant = value.get('metadata_recovery') if valid else None
+    metadata_enabled = isinstance(metadata_grant,dict) and metadata_grant.get('contract') == 'exact_metadata_only_table_retry_window_v1'
+    metadata_status = _json(root/'metadata_recovery_status.json') if metadata_enabled else {}
+    metadata_clock = _stamp(metadata_status.get('observed_at_utc'))
+    metadata_fresh = (metadata_status.get('contract') == 'exact_metadata_only_table_retry_window_v1'
+                      and metadata_clock and 0 <= (observed-metadata_clock).total_seconds() <= 3600)
+    metadata_state = metadata_status.get('state') if metadata_fresh else None
+    metadata_due = _stamp(metadata_status.get('next_check_at_utc')) if metadata_fresh else None
+    if metadata_state == 'checking_metadata_interface' and (not alive or state != 'recovering_metadata'):
+        metadata_state = 'waiting_metadata_interface'
+    if metadata_state == 'metadata_retry_scheduled':
+        identifier = metadata_status.get('task_id','')
+        try:
+            with closing(_read(root)) as con:
+                row = con.execute('SELECT kind,state,last_error_code FROM tasks WHERE task_id=?',
+                                  (identifier if isinstance(identifier,str) and re.fullmatch(r'[0-9a-f]{24}',identifier) else '',)).fetchone()
+            if row is None or row['kind'] != 'discover':
+                metadata_state = None
+            elif row['state'] == 'pending' and row['last_error_code'] == 'metadata_retry_scheduled':
+                metadata_state = 'metadata_retry_ready' if metadata_due and metadata_due <= observed else metadata_state
+            else:
+                metadata_state = {'running':'metadata_retry_running','complete':'metadata_recovered'}.get(row['state'])
+                metadata_due = None
+        except sqlite3.Error:
+            metadata_state = None
+            metadata_due = None
+    if metadata_due and metadata_due <= observed:
+        metadata_due = None  # An expired eligibility clock is not a future action ETA.
+    metadata = {'enabled':bool(metadata_enabled), 'data_query_repeated':False,
+                'state':metadata_state if metadata_state in {'checking_metadata_interface','waiting_metadata_interface',
+                    'metadata_retry_scheduled','metadata_retry_ready','metadata_retry_running','metadata_recovered'} else None,
+                'next_check_at_utc':metadata_due.isoformat() if metadata_due else None}
     if enabled:
         for key in ('cooldown_base_seconds', 'cooldown_max_seconds', 'max_replays_per_task_hour', 'max_replays_per_hour'):
             limit = grant.get(key)
@@ -139,7 +182,8 @@ def _scheduler_public(root: Path, observed: datetime) -> dict:
             'completed_tasks': counter('completed_tasks'), 'cycles': counter('cycles'),
             'paused_reason': value.get('paused_reason') if valid and value.get('paused_reason') in SCHEDULER_REASONS else None,
             'query_deadline_renewed_by_heartbeat': False, 'unknown_outcome_auto_retry': False,
-            'authorized_unknown_replay': replay}
+            'authorized_unknown_replay': replay, 'metadata_recovery':metadata,
+            'desktop_readiness':desktop_readiness}
 
 
 def _current_task_public(root: Path, task: dict | None, worker: dict, alive: bool,
@@ -199,9 +243,12 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         'desktop_startup_unverified','owned_workbook_context_unavailable','owned_workbook_identity_changed',
         'owned_query_identity_unverified'}
     enabled = startup_config.get('enabled') is True and startup_config.get('contract') == STARTUP_CONTRACT
+    recent_interface_check = desktop_ready(root, now=observed)
+    live_relay_ready = desktop_ready(root, now=observed, require_recent=False) if (root/'desktop_transport_session.json').is_file() else recent_interface_check
     base['desktop_startup'] = {'contract': STARTUP_CONTRACT, 'enabled': enabled,
         'state': startup.get('state') if startup.get('contract') == STARTUP_CONTRACT and startup.get('state') in startup_states else 'desktop_startup_unverified',
-        'observed_at_utc': startup.get('observed_at_utc'), 'ready': desktop_ready(root, now=observed),
+        'observed_at_utc': startup.get('observed_at_utc'), 'ready': live_relay_ready,
+        'recent_interface_check':recent_interface_check,
         'check_interval_seconds': 60, 'requires_windows_user_logon': True,
         'source_receipts_preserved': True, 'windows_autologin_changed': False}
     worker = _json(root / 'worker_status.json')
@@ -279,6 +326,13 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         return {**base, "state": "metadata_unavailable", "catalog": {"tables": None, "fields": None}}
     alive = _worker_alive(worker, observed)
     scheduler = _scheduler_public(root, observed)
+    if not base['desktop_startup']['ready'] and scheduler.get('desktop_readiness'):
+        # Source-owner proof is checked locally, not a request for the website
+        # to access the desktop or relax its process/filesystem hardening.
+        readiness = scheduler['desktop_readiness']
+        base['desktop_startup'].update(ready=readiness['ready'],
+            recent_interface_check=readiness['recent_interface_check'],
+            transport_observed_at_utc=readiness['observed_at_utc'])
     for task in tasks:
         grouped.setdefault(task["table_id"], []).append(task)
     table_samples: dict[str, list[dict]] = {}

@@ -20,6 +20,7 @@ from downloader import download_finmind_complement as complement
 from downloader import download_finmind_free as free
 from downloader import download_finmind_sponsor as sponsor
 from downloader import finmind_batching as batching
+from downloader import finmind_storage_objects as objects
 from downloader.artifact_io import atomic_write_json, atomic_write_text
 from downloader.finmind_observation_dates import PERIOD_DATASETS
 from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS
@@ -111,6 +112,11 @@ def registry() -> dict[str, dict[str, Any]]:
                                  decoded_response_byte_limit=complement.BULK_MAX_RESPONSE_BYTES,
                                  release_hour_taipei=source.release_hour,
                                  contract_version=complement.supplemental.CONTRACT_VERSION)
+            if dataset == 'USStockPriceMinute':
+                contract.update(request_end_date_supported=False, whole_market_query_supported=False,
+                                query_contract_basis='official_single_id_day_and_verified_live_contract_probes',
+                                contract_evidence='artifacts/data_quality/finmind_request_efficiency_2026-10-07/us_minute_contract_probes.json',
+                                source_urls=['https://finmind.github.io/tutor/UnitedStatesMarket/Technical/'])
             if source.universe == 'market' and source.grain == 'day':
                 contract['contract_evidence'] = complement.supplemental.MARKET_DAY_PROOF
         elif dataset in PRODUCT_HISTORY_STARTS:
@@ -311,6 +317,15 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
     observations, queue_states = {}, {}
     for owner in ('sponsor', 'complement'):
         observations[owner], queue_states[owner] = _queue_observations(root / owner / 'queue.sqlite3', now)
+    object_profile = {'state': 'not_observed', 'active_datasets': []}
+    queue = root / 'complement' / 'queue.sqlite3'
+    if queue.is_file():
+        try:
+            with sqlite3.connect(queue.resolve().as_uri() + '?mode=ro', uri=True, timeout=2) as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name='finmind_object_profile'").fetchone():
+                    object_profile = {'state': 'observed', 'active_datasets': sorted(objects.active_datasets(conn))}
+        except sqlite3.Error:
+            object_profile['state'] = 'unavailable'
     delegated = set(statuses['complement'].get('delegated_to_sponsor', []))
     for dataset, row in rows.items():
         row['owner_observations'] = {}
@@ -336,6 +351,20 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
         row['observed_rows'] = primary.get('rows')
         row['known_data_id_count'] = primary.get('known_data_id_count')
         row['count_basis'] = 'primary_owner_only_alias_counts_not_added'
+        row['runtime_contract'] = {'owner': row['primary_owner'], **row['owner_contracts'][row['primary_owner']]}
+        row['runtime_observation'] = primary
+        if dataset in object_profile['active_datasets']:
+            row['runtime_contract'] = {
+                'owner': 'complement', 'query_shape': 'whole_market_day_object',
+                'endpoint': 'storage_objects', 'max_span': 'one_calendar_date_whole_market',
+                'configured_first_date': objects.OBJECT_FIRST[dataset].isoformat(),
+                'source_urls': [objects.DOCUMENTATION[dataset]],
+                'transport_grants_per_partition': 1, 'signed_object_get_is_data_api_call': False,
+                'contract_version': objects.CONTRACT_VERSION,
+                'historical_universe_verified_complete': False,
+                'observation_basis': 'canonical_owner_active_profile_not_current_account_reprobe',
+            }
+            row['runtime_observation'] = row['owner_observations']['complement']
         row['remaining_lower_bound_requests'], row['lowerbound_basis'] = _lower_bound(row)
         row['lower_bound_scope'] = 'conditional_observed_pending_acquisition_only_excludes_refresh_retry_inflight'
         row['release_schedule'] = release_details(dataset)
@@ -357,7 +386,7 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
     alias_count = len(sponsor.SOURCES) + len(complement.ALL_DATASETS) + len(free.SESSION_DATASETS) + 2 + len(sponsor.UNSCHEDULED)
     migrated_alias_count = len(set(PRODUCT_HISTORY_STARTS) & set(complement.ALL_DATASETS))
     return {
-        'schema_version': 3, 'observed_at_utc': now.isoformat(), 'api_requests': 0,
+        'schema_version': 4, 'observed_at_utc': now.isoformat(), 'api_requests': 0,
         'production_queue_writes': 0, 'parquet_scans': 0,
         'global_minimum_requests': None,
         'global_minimum_basis': 'not_proven_contracts_universes_overlap_and_refresh_work_differ',
@@ -368,8 +397,10 @@ def build_inventory(root: Path, now: datetime | None = None) -> dict[str, Any]:
                      'legacy_aliases_are_unique_datasets': False,
                      'explicit_disabled_news_rows': int(rows.get('TaiwanStockNews', {}).get('disabled', False)),
                      'runtime_range_contract_count': len(batching.RANGE_CONTRACTS),
+                     'runtime_object_contract_count': len(object_profile['active_datasets']),
                      'scope': 'configured_registry_union_including_news_not_unknown_provider_products'},
         'queue_observations': queue_states,
+        'storage_object_profile': object_profile,
         'status_observations': {owner: {'state': value.get('state'), 'observed_at_utc': value.get('observed_at_utc')}
                                 for owner, value in statuses.items()},
         'candidate_universe': statuses['complement'].get('candidate_universe'),
@@ -390,7 +421,7 @@ def write_inventory(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
               'pending_due', 'failed_or_blocked', 'excluded_deprecated', 'observation_basis',
               'remaining_lower_bound_requests', 'lowerbound_basis', 'lower_bound_scope',
               'count_basis', 'owner_contracts', 'owner_observations', 'source_urls',
-              'release_schedule', 'next_check_at_utc', 'update_observation')
+              'release_schedule', 'next_check_at_utc', 'update_observation', 'runtime_contract', 'runtime_observation')
     buffer = io.StringIO(newline='')
     writer = csv.DictWriter(buffer, fieldnames=fields)
     writer.writeheader()

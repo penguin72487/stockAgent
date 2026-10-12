@@ -130,6 +130,89 @@ def test_resource_deferral_is_not_permission_or_provider_error():
     assert "broker_transactions" not in history.AUTOMATICALLY_DEFERRED_KEYS
 
 
+def test_inventory_batches_match_native_sdk_normalization_and_nullable_values(tmp_path):
+    import pandas as pd
+    from finlab.data.transform import process_data
+
+    raw_table = pa.table({"stock_id": ["0050", "2330", "2330"],
+        "date": pa.array([datetime(2020, 1, 2), datetime(2020, 1, 3), None], type=pa.timestamp("ns")),
+        "持股分級": ["1", "10", None], "人數": [0, 5, 10], "持有股數": [0, 1000, 1],
+        "占集保庫存數比例": [0.0, float("nan"), None],
+        "key_date": pa.array([datetime(2020, 1, 4)]*3, type=pa.timestamp("ns"))})
+    raw = ipc_file(tmp_path / "inventory.feather", raw_table, batch_size=2)
+    expected, old_stats = history.serialize_provider_frame(process_data("inventory", raw_table.to_pandas()))
+    target = tmp_path / "inventory.parquet"
+    with patch("pandas.read_feather", side_effect=AssertionError("full pandas forbidden")):
+        stats = arrow.convert_raw("inventory", raw, target)
+    pd.testing.assert_frame_equal(pq.read_table(target).to_pandas(), expected.to_pandas())
+    for field in ("rows", "rows_with_values", "field_columns", "non_null_values", "source_index_dtype",
+                  "first_non_null_source_index", "last_non_null_source_index", "first_event_at", "last_event_at"):
+        assert stats[field] == old_stats[field]
+    assert stats["normalization_contract_version"] == 2
+
+
+def test_inventory_dictionary_encoded_cloud_payload_keeps_real_labels_not_codes(tmp_path):
+    table = pa.table({"stock_id": pa.array(["0050", "2330"]).dictionary_encode(),
+        "date": pa.array([datetime(2020, 1, 2)]*2, type=pa.timestamp("ns")),
+        "持股分級": pa.array(["1", "10"]).dictionary_encode(), "人數": [1, 10],
+        "持有股數": [1000, 10000], "占集保庫存數比例": [0.5, 5.0],
+        "key_date": pa.array([datetime(2020, 1, 3)]*2, type=pa.timestamp("ns"))})
+    raw = ipc_file(tmp_path / "cloud.feather", table)
+    target = tmp_path / "out.parquet"
+    arrow.convert_raw("inventory", raw, target)
+    result = pq.read_table(target)
+    assert result["symbol"].to_pylist() == ["0050", "2330"]
+    assert result["持股分級"].to_pylist() == ["1", "10"] and pa.types.is_string(result["持股分級"].type)
+
+
+def test_same_raw_generation_skips_reconversion_only_with_a_verified_normalized_object(tmp_path, monkeypatch):
+    key = "after_market_fixed_price:市場別"
+    raw = ipc_file(tmp_path / "raw.feather", pa.table({"date": [datetime(2020, 1, 2)], "2330 NAME": ["上市"]}))
+    (tmp_path / "raw").mkdir()
+    evidence = arrow._commit_raw(raw, tmp_path, history.safe_stem(key), key, "upstream_forced", "test")
+    monkeypatch.setattr(arrow, "acquire_raw", lambda *a, **kw: (tmp_path/evidence["raw_path"], evidence))
+    first = history.fetch_one(key, tmp_path, refresh=True)
+    with patch.object(arrow, "convert_raw", side_effect=AssertionError("unchanged raw must not decode again")):
+        second = history.fetch_one(key, tmp_path, refresh=True)
+    assert second["last_check_result"] == "unchanged" and second["sha256"] == first["sha256"]
+    (tmp_path/first["parquet_path"]).write_bytes(b"invalid normalized object")
+    with patch.object(arrow, "convert_raw", side_effect=RuntimeError("must rebuild corrupt object")):
+        with pytest.raises(RuntimeError, match="must rebuild"):
+            history.fetch_one(key, tmp_path, refresh=True)
+
+
+def test_raw_recent_metadata_reuses_exact_acquired_clock_without_decoding_or_charge(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from finlab.data import auth
+    import finlab.auth
+
+    raw = ipc_file(tmp_path / "source.feather", pa.table({"date": [datetime(2020, 1, 2)], "2330": ["上市"]}))
+    (tmp_path / "raw").mkdir()
+    key = "after_market_fixed_price:市場別"
+    stem = history.safe_stem(key)
+    old = datetime.now(UTC)-timedelta(days=1)
+    evidence = arrow._commit_raw(raw, tmp_path, stem, key, "upstream_forced", "test")
+    evidence.update(source_checked_at_utc=old.isoformat(), provider_expiry_at_utc=old.isoformat(),
+                    raw_acquired_at_utc=(old-timedelta(hours=1)).isoformat())
+    arrow._atomic_json(tmp_path / "raw_receipts" / (stem+".json"), evidence)
+    requested = []
+
+    def metadata(request):
+        requested.append(request)
+        return {key+".recent": SimpleNamespace(error=None, data=None, url=None,
+                                               expiry=datetime.now(UTC)+timedelta(hours=2))}
+
+    monkeypatch.setattr(auth, "fetch_metadata_batch", metadata)
+    monkeypatch.setattr(finlab.auth, "get_data_status", lambda: pytest.fail("unchanged raw is not a full allocation"))
+    path, checked = arrow.acquire_raw(key, tmp_path, stem, refresh=True)
+    assert path.is_file() and checked["source_check_mode"] == "upstream_incremental"
+    assert checked["raw_acquired_at_utc"] == evidence["raw_acquired_at_utc"]
+    assert requested[0][key+".recent"].isoformat() == evidence["raw_acquired_at_utc"]
+    assert checked["source_checked_at_utc"] != evidence["source_checked_at_utc"]
+    arrow.acquire_raw(key, tmp_path, stem, refresh=True)  # Future expiry, not another metadata request.
+    assert len(requested) == 1
+
+
 @pytest.mark.parametrize("value,status", [(None, "provider_empty"), (float("nan"), "provider_empty"),
                                           (0.0, "normalization_error"), (1.25, "normalization_error")])
 def test_empty_sdk_result_compared_with_raw_values_without_inventing_data(tmp_path, value, status):

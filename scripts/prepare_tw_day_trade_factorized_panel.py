@@ -30,6 +30,7 @@ from scripts.prepare_tw_day_trade_feature_catalog import sha256, write_csv
 from scripts.prepare_tw_day_trade_mixed_frequency import verify_sources, attach_formal_companions
 from scripts.build_tw_release_schedule_dataset import normalize_source
 from stockagent.config import load_config
+from stockagent.storage_layout import admit_output, node_root
 from stockagent.data.factorized_panel import CONTRACT, VALUE_ONLY_CONTRACT, write_array_block
 from stockagent.data.panel import build_panel
 from stockagent.data.tw_day_trade_mixed_frequency import source_clock_lookup, rule_from_spec, PRIVATE_USE, public_coordinate_null_spec, PUBLIC_COORDINATE_NULL_POLICY
@@ -316,7 +317,8 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
 
 def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snapshot_id: str,
             *, max_block_bytes=128*1024**2, base_panel_cache_root: Path | None=None,
-            model_channel_policy="value_available_age_updated"):
+            model_channel_policy="value_available_age_updated", runtime_cache_root: Path | None=None):
+    out = admit_output(out, "prepared")
     if model_channel_policy not in {"value_only", "value_available_age_updated"}:
         raise ValueError("unknown factorized model channel policy")
     channel_count = 1 if model_channel_policy == "value_only" else 4
@@ -330,9 +332,10 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
     pl.scan_parquet(public).select("date","symbol",*rules).sink_parquet(rule_path,compression="zstd")
     if "tw_corporate_action_entitlements.summary.json" in manifest["files"]:attach_formal_companions(source,out,manifest)
     generated={"base_config":str(base_config.resolve()),"experiment_name":"tw-day-trade-nullable-factorized-panel-20261004-v1",
-        "runner":{"output_dir":str((out.parent/"training").resolve()),"resume":False,"post_train_infer":False},
+        "runner":{"output_dir":str(node_root(ROOT)/"artifacts/markets"/out.parent.name/"training"),"resume":False,"post_train_infer":False},
         "data":{"parquet_root":str((source/"stocks").resolve()),"tw_public_feature_path":str(rule_path.resolve()),
             "day_trade_physical_public_feature_path":str(public.resolve()),"day_trade_minute_execution_root":str(minute_root.resolve()),
+            "day_trade_minute_execution_cache_dir":str(admit_output(runtime_cache_root,"cache") if runtime_cache_root is not None else node_root(ROOT)/"artifacts/cache"/out.parent.name/"runtime-cache/physical-source"),
             "panel_cache_root":str((base_panel_cache_root or out/"base_panel_cache").resolve()),"factorized_feature_manifest":str((out/"factorized_manifest.json").resolve()),
             "feature_include":BASE_FEATURES,"feature_exclude":[],"feature_zero_fill":[],
             "feature_shift_next_session":[],"feature_availability_indicators":[]},
@@ -598,12 +601,16 @@ def main():
     for arg in ["source-root","base-config","minute-root"]:p.add_argument("--"+arg,type=Path)
     p.add_argument("--snapshot-id");p.add_argument("--max-block-mib",type=int,default=128)
     p.add_argument("--base-panel-cache-root",type=Path,help="Canonical cache only; original fingerprint gates still apply")
+    p.add_argument("--runtime-cache-root",type=Path,help="Explicit owned cache root for temporary reconstruction; defaults remain unchanged")
     p.add_argument("--model-channel-policy",choices=("value_available_age_updated","value_only"),default="value_available_age_updated")
     p.add_argument("--project-prepared-manifest",type=Path,help="Incrementally derive value-only blocks from an already verified four-channel panel")
     a=p.parse_args()
+    a.output_root = admit_output(a.output_root, "prepared")
+    if a.base_panel_cache_root is not None:
+        a.base_panel_cache_root = admit_output(a.base_panel_cache_root, "cache")
     if a.project_prepared_manifest is not None:
         if a.model_channel_policy != "value_only":p.error("prepared projection requires --model-channel-policy value_only")
-        if any(v is not None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id,a.base_panel_cache_root)):
+        if any(v is not None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id,a.base_panel_cache_root,a.runtime_cache_root)):
             p.error("prepared projection does not download/rebuild provider or execution sources")
         from stockagent.data.factorized_panel_projection import project_factorized_values
         result=project_factorized_values(a.project_prepared_manifest,a.output_root)
@@ -612,7 +619,7 @@ def main():
             p.error("source-root, base-config, minute-root and snapshot-id are required for a new source build")
         result=prepare(a.source_root,a.output_root,a.base_config,a.minute_root,a.snapshot_id,
             max_block_bytes=a.max_block_mib*1024**2,base_panel_cache_root=a.base_panel_cache_root,
-            model_channel_policy=a.model_channel_policy)
+            model_channel_policy=a.model_channel_policy,runtime_cache_root=a.runtime_cache_root)
     print(json.dumps(result,ensure_ascii=False))
 
 

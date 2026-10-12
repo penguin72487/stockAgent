@@ -10,12 +10,43 @@ import pytest
 from scripts.snapshot_finlab_quota import daily_reset_evidence, load_quota_history, persist_observation, quota_observation
 from scripts.download_finlab_history import fetch_one, safe_stem
 from scripts.finlab_release_gate import catalog_readiness
+from stockagent.data.finlab_quota_policy import load_policy, quota_admission
 from stockagent.live.finlab_dashboard import _public_quota_series, _volume_estimate, build_finlab_public_status
 
 
 def _write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_public_minute_priority_separates_actionable_and_blocked_debt(tmp_path):
+    _write(tmp_path / "data_finlab/intraday/market_status.json", {
+        "schema_version": 4, "minute_priority": {
+            "pending_known_window_partitions": 22, "actionable_known_window_partitions": 3,
+            "blocked_known_window_partitions": 19, "publication_recheck_seconds": 600,
+            "private_session": "must_not_escape"}})
+    result = build_finlab_public_status(tmp_path, staged_root=tmp_path / "stage")
+    priority = result["intraday_market"]["minute_priority"]
+    assert priority["actionable_known_window_partitions"] == 3
+    assert priority["blocked_known_window_partitions"] == 19
+    assert priority["publication_recheck_seconds"] == 600
+    assert "private_session" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("worker_floor,current", [(50, True), (500, False)])
+def test_policy_identity_checks_actual_minute_floor_not_fingerprint_alone(tmp_path, monkeypatch, worker_floor, current):
+    now = datetime.fromisoformat("2026-10-09T14:00:00+00:00")
+    policy = load_policy(tmp_path / "configs/finlab_quota_policy.json")
+    minute = quota_admission(kind="tw_minute", now=now, policy=policy)
+    monkeypatch.setattr("stockagent.live.finlab_dashboard.intraday_progress", lambda *a, **kw: {
+        "kind": "tw_minute", "quota_policy": {**minute, "normal_reserve_mb": worker_floor},
+        "pipeline_workers": policy.minute_workers, "range_calendar_days": policy.minute_range_calendar_days,
+        "download_threads": policy.minute_download_threads, "queue_depth": policy.minute_queue_depth,
+        "http_keepalive": policy.minute_http_keepalive,
+    })
+    payload = build_finlab_public_status(tmp_path, now=now, staged_root=tmp_path / "stage")
+    assert payload["intraday_quota_policy"]["worker_policy_current"] is current
+    assert payload["intraday_quota_policy"]["minute"]["normal_reserve_mb"] == 50
 
 
 def test_quota_observation_uses_account_data_limit_and_official_reset_rule():

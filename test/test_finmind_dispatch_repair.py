@@ -91,7 +91,11 @@ def test_dispatch_query_uses_partial_indexes_not_retained_success_scan(tmp_path)
         query = next(row for row in statements if row.startswith('WITH eligible'))
         details = ' '.join(row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query))
         assert 'idx_finmind_outstanding_dispatch' in details
-        assert 'idx_finmind_due_refresh' in details
+        if 'idx_finmind_due_refresh' not in details:
+            # The dominant first pass seeks only priority-zero accepted rows;
+            # the (priority, due, state) index is narrower than all due history.
+            assert 'idx_finmind_complement_queue' in details and 'priority=?' in details
+            assert 'AND priority=0' in query
         # The small eligible CTE is scanned/sorted; both retained-table branches
         # must first SEARCH their partial indexes rather than scan all history.
         assert 'CO-ROUTINE eligible' in details

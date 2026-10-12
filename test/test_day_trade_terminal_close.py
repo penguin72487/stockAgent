@@ -130,3 +130,78 @@ def test_runtime_report_hook_and_independent_close_audit(tmp_path):
     reports(tmp_path, close='990', volume='10')
     with pytest.raises(ValueError, match='source mismatch'):
         _verify_terminal_close_fills(fills, receipt, engine.state['modes'])
+
+
+@pytest.mark.parametrize('missing_exchange', ['twse', 'tpex'])
+@pytest.mark.parametrize('failure', ['missing', 'wrong_date', 'invalid_json', 'invalid_schema'])
+def test_runtime_close_sources_fail_independently(tmp_path, missing_exchange, failure):
+    from types import SimpleNamespace
+    from scripts.run_tw_day_trade_simulation import _attach_terminal_official_close_context
+    from test_day_trade_official_close_settlement import reports
+
+    engine, spec = setup(tmp_path)
+    root = reports(tmp_path, close='995', volume='10')
+    if missing_exchange == 'twse':
+        # Same retained trade, but through the other source's supported schema.
+        listed = json.loads((root / 'twse_daily_ohlcv/2026-08-13.json').read_text())
+        (root / 'tpex_daily_ohlcv/2026-08-13.json').write_text(json.dumps(listed))
+    failed = root / f'{missing_exchange}_daily_ohlcv/2026-08-13.json'
+    if failure == 'missing':
+        failed.unlink()
+    elif failure == 'wrong_date':
+        raw = json.loads(failed.read_text())
+        raw['date'] = '20260812'
+        failed.write_text(json.dumps(raw))
+    elif failure == 'invalid_json':
+        failed.write_text('{invalid')
+    else:
+        failed.write_text('[]')
+    quotes = {}
+    _attach_terminal_official_close_context(
+        quotes, engine=engine, specs=[spec],
+        configs={spec.market: SimpleNamespace(day_trade_rule_data_dir=str(tmp_path))},
+        observed=_now(13, 35),
+    )
+    valid_exchange = 'tpex' if missing_exchange == 'twse' else 'twse'
+    assert quotes['2330']['session_close_evidence']['source'] == f'{valid_exchange}_official_daily_close'
+    engine.process_quotes(quotes=quotes, now=_now(13, 35))
+    assert engine.state['modes'][spec.market]['open_position_count'] == 0
+
+
+@pytest.mark.parametrize('volume', ['0', 'nan', 'inf', '-1', '1.5', 'bad'])
+def test_runtime_close_hook_never_uses_carried_or_invalid_volume(tmp_path, volume):
+    from types import SimpleNamespace
+    from scripts.run_tw_day_trade_simulation import _attach_terminal_official_close_context
+    from test_day_trade_official_close_settlement import reports
+
+    engine, spec = setup(tmp_path)
+    reports(tmp_path, close='995', volume=volume)
+    quotes = {}
+    _attach_terminal_official_close_context(
+        quotes, engine=engine, specs=[spec],
+        configs={spec.market: SimpleNamespace(day_trade_rule_data_dir=str(tmp_path))},
+        observed=_now(13, 35),
+    )
+    assert not quotes
+    engine.process_quotes(quotes=quotes, now=_now(13, 35))
+    assert engine.state['modes'][spec.market]['open_position_count'] == 1
+
+
+def test_runtime_close_conflicting_venue_identity_does_not_authorize_fill(tmp_path):
+    from types import SimpleNamespace
+    from scripts.run_tw_day_trade_simulation import _attach_terminal_official_close_context
+    from test_day_trade_official_close_settlement import reports
+
+    engine, spec = setup(tmp_path)
+    root = reports(tmp_path, close='995', volume='10')
+    duplicate = json.loads((root / 'twse_daily_ohlcv/2026-08-13.json').read_text())
+    (root / 'tpex_daily_ohlcv/2026-08-13.json').write_text(json.dumps(duplicate))
+    quotes = {}
+    _attach_terminal_official_close_context(
+        quotes, engine=engine, specs=[spec],
+        configs={spec.market: SimpleNamespace(day_trade_rule_data_dir=str(tmp_path))},
+        observed=_now(13, 35),
+    )
+    assert not quotes
+    engine.process_quotes(quotes=quotes, now=_now(13, 35))
+    assert engine.state['modes'][spec.market]['open_position_count'] == 1

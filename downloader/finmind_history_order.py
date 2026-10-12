@@ -51,6 +51,26 @@ def metadata() -> dict:
                        for rank, stage in enumerate(HISTORY_STAGES, 1)]}
 
 
+def has_unseeded_frontier(connection: sqlite3.Connection, dataset: str, now: datetime, *, sources=None) -> bool:
+    """A bounded seek into the retained cursor, not an estimated row count."""
+    from downloader.finmind_supplemental import SOURCES, _eligible_anchor
+    from downloader.finmind_storage_objects import effective_sources, identity_clause, forward_identity_clause
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='finmind_source_frontiers'").fetchone():
+        return False
+    sources = sources if sources is not None else effective_sources(connection, SOURCES)
+    source = sources.get(dataset)
+    if source is None or source.grain in {'derived', 'history'}:
+        return False
+    identity = identity_clause(dataset) if source.universe == 'market' else ''
+    if connection.execute('SELECT 1 FROM finmind_source_frontiers WHERE dataset=?'
+                          + identity + ' AND older_than IS NOT NULL LIMIT 1', (dataset,)).fetchone():
+        return True
+    forward = forward_identity_clause(dataset) if source.endpoint == 'storage_objects' else identity
+    return bool(connection.execute('SELECT 1 FROM finmind_source_frontiers WHERE dataset=?'
+                                   + forward + ' AND newer_than<? LIMIT 1',
+                                   (dataset, _eligible_anchor(source, now).isoformat())).fetchone())
+
+
 def first_unfinished_dataset(connection: sqlite3.Connection, now: datetime, *,
                              delegated=frozenset(), datasets=None) -> str | None:
     """Bounded seeks, not an ID x day expansion or a full frontier count.
@@ -59,12 +79,10 @@ def first_unfinished_dataset(connection: sqlite3.Connection, now: datetime, *,
     behind unseeded cursors and cooling failures, until the worker refills the
     same frontier. This read-only guard also applies to status previews.
     """
-    from downloader.finmind_supplemental import SOURCES, _eligible_anchor
-    from downloader.finmind_storage_objects import effective_sources, identity_clause, forward_identity_clause
+    from downloader.finmind_supplemental import SOURCES
+    from downloader.finmind_storage_objects import effective_sources
     sources = effective_sources(connection, SOURCES)
 
-    has_frontiers = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE name='finmind_source_frontiers'").fetchone()
     for stage in HISTORY_STAGES:
         dataset = stage.dataset
         if dataset in delegated or (datasets is not None and dataset not in datasets):
@@ -72,16 +90,6 @@ def first_unfinished_dataset(connection: sqlite3.Connection, now: datetime, *,
         if connection.execute("SELECT 1 FROM tasks WHERE dataset=? "
                               "AND state IN ('pending','failed','inflight') LIMIT 1", (dataset,)).fetchone():
             return dataset
-        if has_frontiers:
-            identity = identity_clause(dataset) if sources[dataset].universe == 'market' else ''
-            # An old cursor may overlap accepted tasks or verified closures;
-            # seeding advances it without calls. Do not silently skip it.
-            if connection.execute('SELECT 1 FROM finmind_source_frontiers WHERE dataset=?'
-                                  + identity + ' AND older_than IS NOT NULL LIMIT 1', (dataset,)).fetchone():
-                return dataset
-            anchor = _eligible_anchor(sources[dataset], now).isoformat()
-            forward = forward_identity_clause(dataset) if sources[dataset].endpoint == 'storage_objects' else identity
-            if connection.execute('SELECT 1 FROM finmind_source_frontiers WHERE dataset=?'
-                                  + forward + ' AND newer_than<? LIMIT 1', (dataset, anchor)).fetchone():
-                return dataset
+        if has_unseeded_frontier(connection, dataset, now, sources=sources):
+            return dataset
     return None

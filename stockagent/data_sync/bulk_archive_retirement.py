@@ -23,7 +23,7 @@ from stockagent.data_sync.artifact_maintenance import artifact_process_reference
 from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references
 from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id, _load_inventory, _validate_inventory
-from stockagent.data_sync.training_return import shared_inode_references
+from stockagent.data_sync.training_return import shared_inode_references, training_hot_retention
 
 
 def consumers(source, repo):
@@ -166,6 +166,10 @@ def observe_preserved_roots(repo, records):
                        and stat.S_IMODE(top.st_mode) == root_row["mode"]
                        and top.st_uid == root_row["uid"] and top.st_gid == root_row["gid"])
             observed = metadata_tree(source)
+            retention = training_hot_retention(source, observed["rows"])
+            if retention["blockers"]:
+                result.update(state="source-protected", blockers=retention["blockers"], hot_retention=retention)
+                continue
             matches = matches and {r["path"] for r in observed["rows"]} == set(expected)
             for row in observed["rows"]:
                 saved = expected.get(row["path"])
@@ -236,6 +240,10 @@ def source_plan(repo, ack):
     if refs:
         return {"source": str(source), "blockers": ["current-consumer"], "references": refs}
     observed = metadata_tree(source)
+    retention = training_hot_retention(source, observed["rows"])
+    if retention["blockers"]:
+        return {"source": str(source), "blockers": retention["blockers"],
+                "hot_retention": retention, "references": []}
     inode_refs = shared_inode_references(observed)
     if inode_refs:
         return {"source": str(source), "blockers": ["shared-inode-in-use"], "references": inode_refs}
@@ -274,6 +282,7 @@ def source_plan(repo, ack):
               "ack_identity_sha256": ack["identity_sha256"],
               "shared_file_policy": ack.get("shared_file_policy", "reject_unknown_names"),
               "manual_immediate": True, "cold_deleted": False}
+    result["hot_retention"] = retention
     result["fingerprint"] = digest(result)
     result["convergence"] = convergence
     return result
@@ -328,7 +337,8 @@ def retire(repo, ack, *, apply=False, state_root=Path("/var/lib/stockagent-legac
         validate_ack(ack)
         transport(ack)
         if (metadata_tree(quarantine)["rows"] != plan["rows"]
-            or consumers(source, repo) or consumers(quarantine, repo) or shared_inode_references(current)):
+            or consumers(source, repo) or consumers(quarantine, repo) or shared_inode_references(current)
+            or training_hot_retention(quarantine, current["rows"])["blockers"]):
             raise SnapshotError("final quarantine/reference gate failed; retained")
         reclaimed = unlink_preserved_file_names(quarantine, current["rows"])
         for row in sorted(current["rows"], key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):

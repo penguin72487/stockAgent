@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json, atomic_write_text
 from scripts.export_data_acquisition_inventory import rows_from_snapshot, enrich_finmind_receipts
 from stockagent.live.data_monitor_inventory import parquet_footer_stats
+from stockagent.storage_layout import admit_output
 
 CONTRACT_VERSION = 2
 KEY_FIELDS = frozenset({
@@ -305,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--recheck-failed-datasets", action="store_true")
     args = parser.parse_args(argv)
-    out = args.output_dir
+    out = admit_output(args.output_dir, "prepared")
     out.mkdir(parents=True, exist_ok=True)
     if args.recheck_failed_datasets:
         with (out / "source_failures.csv").open(newline="") as handle:

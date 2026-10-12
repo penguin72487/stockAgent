@@ -620,6 +620,7 @@ function healthPresentation(value) {
 }
 
 function engineStatusLabel(value) {
+  if (value === "model_ready_waiting_engine") return "模型訊號已發布；等待執行器登帳，尚未確認進場";
   const labels = {
     entry_partial_retrying: "進場部分成交・持續處理剩餘委託",
     waiting_closing_auction_evidence: "等待正式收盤撮合證據（含延後撮合）",
@@ -649,6 +650,7 @@ function engineStatusLabel(value) {
 }
 
 function engineStatusShortLabel(value) {
+  if (value === "model_ready_waiting_engine") return "訊號已產生・待登帳";
   const labels = {
     active: "執行正常",
     ready: "已就緒",
@@ -802,6 +804,7 @@ function renderHeader(data) {
   const blockers = data.modes.filter((mode) => !mode.checkpoint_ready || String(mode.engine_status || "").startsWith("critical") || String(mode.engine_status || "").startsWith("blocked"));
   const catchUps = data.modes.filter((mode) => mode.today_execution_status === "starting");
   const missed = data.modes.filter((mode) => mode.today_execution_status === "missed");
+  const openingWaits = pendingOpeningAttempts(data);
   const hasBenchmarkReplay = (data.benchmarks || []).some((row) => row.counterfactual_open_replay);
   const operationalIssues = Array.isArray(data.operational_issues) ? data.operational_issues : [];
   const overnightHistory = data.historical_replay || {};
@@ -829,8 +832,9 @@ function renderHeader(data) {
       if (!coverage.covered && !currentMissingEligibility.has(venue)) currentMissingEligibility.set(venue, coverage);
     }
   }
-  if (localPaperExecution || operationalIssues.length || hasBenchmarkReplay || overnightHistoryDegraded || liveStaleModes.length || liveIndicativeModes.length || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
+  if (localPaperExecution || openingWaits.length || operationalIssues.length || hasBenchmarkReplay || overnightHistoryDegraded || liveStaleModes.length || liveIndicativeModes.length || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
     const messages = [
+      ...openingWaits.map(row => `${strategyLabel(row)}：${openingWaitDescription(row)}`),
       localPaperExecution ? "目前當沖成交來自本地紙上帳本，Shioaji 只提供行情；尚未接入 Shioaji 模擬委託與 StockDeal 成交回報，不可將紙上成交當作券商 API 成交。" : "",
       liveStaleModes.length ? `盤中 ${number(liveStaleModes.length)} 個當沖模式的持倉估值正在延用舊價格；分鐘曲線仍記錄時間，但不是即時可成交行情，最新損益不可當成即時值。` : "",
       liveIndicativeModes.length ? "部分持倉使用當日參考快照買賣一檔估值；快照未提供非試撮證據，不用於成交、停損或停利。各模型卡片列出參考估值筆數。" : "",
@@ -988,7 +992,8 @@ function renderModes(data) {
       ? Number(account.return_pct)
       : IS_OVERNIGHT && rangeSummary?.cumulative_return_pct != null
         ? Number(rangeSummary.cumulative_return_pct) : null;
-    const status = String(mode.engine_status || "unknown");
+    const status = mode.model_signal_status === "published_waiting_engine" && mode.engine_status === "waiting_signal"
+      ? "model_ready_waiting_engine" : String(mode.engine_status || "unknown");
     const execution = executionStatusPresentation(mode.today_execution_status);
     const fillOutcome = fillOutcomePresentation(mode.today_execution_outcome || mode.entry_fill_outcome);
     const kind = status === "active" ? "good" : status.startsWith("blocked") || status.startsWith("critical") ? "bad" : "warn";
@@ -1100,6 +1105,25 @@ function renderBenchmarks(data) {
       </div>
     </article>`;
   }).join("") || `<article class="panel benchmark-card"><strong>基準尚未建立</strong><small>等待來源與起算價格通過稽核</small></article>`);
+}
+
+function pendingOpeningAttempts(data) {
+  if (IS_OVERNIGHT) return [];
+  const latency = data.opening_signal_latency || {};
+  const ready = new Set(latency.observed_markets || []);
+  return (latency.latest_failures || []).filter(row => !ready.has(row.market));
+}
+
+function openingWaitDescription(row) {
+  if (row.reason_code === "tw_public_source_update_pending") {
+    return "官方來源正在寫入相依資料；等待一致版本，不是訊號已完成";
+  }
+  if (row.reason_code === "tw_opening_input_coverage_pending") {
+    const coverage = row.opening_input_coverage || {};
+    const resolved = Number(coverage.opens || 0) + Number(coverage.no_prints || 0);
+    return `開盤輸入 ${number(resolved)}／門檻 ${number(coverage.required || 0)}；有效開盤價 ${number(coverage.opens || 0)}、明確未成交 ${number(coverage.no_prints || 0)}；仍在取價，不以昨日價格替代`;
+  }
+  return `訊號尚未成功 · ${row.error_type || "來源未就緒"} · ${row.failure_stage || "等待重試"}`;
 }
 
 function renderOvernightOperations(data) {
@@ -1329,10 +1353,15 @@ function renderOperations(data) {
     return `<div class="progress-row opening-latency-row">
       <div class="progress-title"><strong>${esc(strategyLabel(row))}</strong>${badge(`${latencyValue(row.ready_from_0900_ms)} / ${latencyValue(openingGoalMs)}`, kind)}</div>
       ${progress(ratio, kind)}
-      <small>${esc(`行情覆蓋 ${latencyValue(row.source_ready_from_0900_ms)} · 行情就緒到訊號 ${latencyValue(row.source_ready_to_signal_ms)} · ${stagesText}${brokerText}${ledgerText}${publicationText}${historyGuard}${accountingNote}`)}</small>
+      <small>${esc(`${row.delayed_recovery ? "延後恢復的排程訊號；未達開盤時限 · " : ""}行情覆蓋 ${latencyValue(row.source_ready_from_0900_ms)} · 行情就緒到訊號 ${latencyValue(row.source_ready_to_signal_ms)} · ${stagesText}${brokerText}${ledgerText}${publicationText}${historyGuard}${accountingNote}`)}</small>
     </div>`;
-  }).join("") || `<div class="empty-inline">所選日尚無 09:00 自動訊號測速；不以手動或回放資料冒充。</div>`;
-  setHtml("opening-stage-progress", openingStageHtml);
+  }).join("") + pendingOpeningAttempts(data).map(row => {
+    const coverage = row.opening_input_coverage || {};
+    const required = Number(coverage.required || 0);
+    const resolved = Number(coverage.opens || 0) + Number(coverage.no_prints || 0);
+    return `<div class="progress-row opening-latency-row"><div class="progress-title"><strong>${esc(strategyLabel(row))}</strong>${badge("等待資料・自動重試", "warn")}</div>${required > 0 ? progress(Math.min(100, resolved / required * 100), "warn") : ""}<small>${esc(openingWaitDescription(row))} · ${esc(shortTime(row.recorded_at))}</small></div>`;
+  }).join("");
+  setHtml("opening-stage-progress", openingStageHtml || `<div class="empty-inline">所選日尚無 09:00 自動訊號測速；不以手動或回放資料冒充。</div>`);
 
   const openingTrendRows = (openingLatency.trend || []).slice(-7).reverse();
   setHtml("opening-latency-trend", openingTrendRows.map((row) => {
@@ -1724,7 +1753,7 @@ function renderSignals() {
   const target = visibleSummary.target || {};
   const actual = visibleSummary.actual || {};
   const visiblePositions = positionSelectionKey === detailSelectionKey("positions") ? positionRows : [];
-  const positionMap = new Map(visiblePositions.map((row) => [`${row.session_date}\u0000${row.market}\u0000${row.symbol}`, row]));
+  const positionMap = new Map(visiblePositions.map((row) => [`${row.session_date}\u0000${row.market}\u0000${row.symbol}\u0000${row.signal_id || ""}`, row]));
   const modeMap = new Map((snapshot?.modes || []).map((mode) => [mode.market, mode]));
   const directionHtml = [
     ["區間訊號目標", target],
@@ -1752,7 +1781,7 @@ function renderSignals() {
       ? "目前沒有符合篩選的訊號" : "正在讀取符合篩選的訊號…",
     countDetail: acceptedSelection && signalLoadNotice ? ` · ${signalLoadNotice}` : "",
     renderRow: (row) => detailComponents.signalRow(row, {
-      position: positionMap.get(`${row.session_date}\u0000${row.market}\u0000${row.symbol}`),
+      position: row.position || positionMap.get(`${row.session_date}\u0000${row.market}\u0000${row.symbol}\u0000${row.signal_id || ""}`),
       mode: modeMap.get(row.market), sessionDate: snapshot?.session_date,
       selectedKey: featurePanelSignalKey,
     }),

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -26,6 +28,7 @@ from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retr
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
 from urllib3.exceptions import ReadTimeoutError
@@ -52,7 +55,10 @@ from downloader import finmind_news as news
 from downloader import finmind_retry_cohorts as retry_cohorts
 from downloader import finmind_retry_policy as retry_policy
 from downloader import finmind_storage_objects as storage_objects
-from downloader.finmind_history_order import HISTORY_STAGES, first_unfinished_dataset, metadata as history_order_metadata
+from downloader import finmind_object_pipeline as object_pipeline
+from downloader import finmind_json_pipeline as json_pipeline
+from downloader.finmind_history_order import (HISTORY_STAGES, first_unfinished_dataset, has_unseeded_frontier,
+                                             metadata as history_order_metadata)
 from downloader.finmind_catalog import (
     ALL_DATASETS as ALL_DATASETS,
     BULK_GLOBAL_HISTORY,
@@ -80,7 +86,7 @@ BULK_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 BULK_MAX_RESPONSE_ROWS = 1_000_000
 STATUS_INTERVAL_SECONDS = 20
 GOLD_TIMESTAMP_CONTRACT_VERSION = 1
-DISPATCH_CONTRACT_VERSION = 7  # Bounded task failures never re-enter automatic dispatch.
+DISPATCH_CONTRACT_VERSION = 11  # Continuous refill must not starve recent full-history renewals.
 # One shared-quota probe plus hash-verified local replay establishes the upper
 # bound at inclusive midnight, not at the end of that calendar day.
 GOLD_RANGE_PROOF = "artifacts/data_quality/finmind_gold_range_20260927T030804094218Z.json"
@@ -101,6 +107,21 @@ class SourceError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.retry_after = retry_after
+
+
+def _publication_error(exception):
+    """Same allowlisted diagnostics for serial/parallel validation failures."""
+    if isinstance(exception, SourceError):
+        return exception
+    validation_codes = {
+        'news_invalid_timestamp', 'news_response_outside_day', 'news_identity_type_mismatch', 'news_invalid_link',
+        'history_response_outside_range', 'history_wrong_data_id', 'history_duplicate_date',
+        'unexpected_empty_after_nonempty', 'supplemental_partition_before_identity_history_floor',
+        'supplemental_invalid_date', 'supplemental_response_outside_range',
+        'supplemental_missing_market_identity', 'supplemental_wrong_data_id',
+    }
+    code = str(exception) if isinstance(exception, ValueError) and str(exception) in validation_codes else 'storage_or_schema_error'
+    return SourceError(code, retry_after=900)
 
 
 def _now() -> datetime:
@@ -191,7 +212,8 @@ def _snapshot_ids(root: Path, dataset: str, column: str) -> list[str]:
     if parquet_receipt_error(root, receipt):
         return []
     try:
-        table = pq.read_table(path, columns=[column, "type"] if dataset == "TaiwanFutOptDailyInfo" else [column])
+        table = pq.read_table(path, columns=[column, "type"] if dataset == "TaiwanFutOptDailyInfo" else [column],
+                              use_threads=False)
     except (OSError, ValueError, KeyError, pa.ArrowException):
         return []
     rows = table.to_pylist()
@@ -357,8 +379,28 @@ def _repair_taiex_query_dates(connection: sqlite3.Connection, root: Path, now: d
     return repaired
 
 
+def _reconcile_current_supplemental_history(connection: sqlite3.Connection, today: date) -> None:
+    """Separate recent renewable history from immutable historical rechecks.
+
+    A compact source's completed full history can still publish new values.
+    Continuous minute backfill must not starve it just because its original
+    history priority was 2. Older series remain eligible maintenance, not
+    proven inactive or complete; failed and terminal keys are not rewritten.
+    """
+    cutoff = (today - timedelta(days=14)).isoformat()
+    for dataset, source in supplemental.SOURCES.items():
+        if source.grain != 'history' or source.priority == 0:
+            continue
+        connection.execute(
+            "UPDATE tasks SET priority=CASE WHEN last_data_date>=? THEN 0 ELSE ? END "
+            "WHERE dataset=? AND kind='id_history' AND state='complete' "
+            "AND priority!=CASE WHEN last_data_date>=? THEN 0 ELSE ? END",
+            (cutoff, source.priority, dataset, cutoff, source.priority))
+
+
 def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> None:
     _recover_bulk_year_claims(connection)
+    json_pipeline.recover_claims(connection)
     _repair_taiex_query_dates(connection, root, _now())
     jobs: list[tuple[str, str, str, str, int]] = []
     jobs.extend((dataset, "", "latest", "snapshot", 0) for dataset in SNAPSHOTS if dataset not in DERIVATIVE_SNAPSHOTS)
@@ -479,6 +521,7 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
         "us": sorted({canonical_us_id(value) for value in _snapshot_ids(root, "USStockInfo", "stock_id")}),
     }, _now(), day_decision=day_decision, official_sessions=_official_session_calendar(),
        additional_calendars=published_calendar(_now()), include_status=False)
+    _reconcile_current_supplemental_history(connection, today)
     # A completed history is a renewable observation, not a one-off archive.
     # Migrate the former 30-day delay, preserving the last actual fetch clock.
     for dataset, identifier, partition, state, attempted, due, priority, latest in connection.execute(
@@ -584,6 +627,7 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
         excluded += " AND (tasks.priority=0 OR kind='derived')"
     if background_only:
         excluded += ' AND tasks.priority>0'
+    first_history = None
     if not incremental_only:
         first_history = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
         if first_history:
@@ -635,12 +679,12 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
     has_cursor = connection.execute("SELECT 1 FROM sqlite_master WHERE name='dispatch_cursor'").fetchone()
     cursor = ("SELECT priority,last_dataset FROM dispatch_cursor" if has_cursor else
               "SELECT -1 AS priority,'' AS last_dataset WHERE 0")
-    row = connection.execute(
+    query = (
         "WITH eligible AS ("
         "SELECT * FROM tasks WHERE state IN ('pending','failed') AND "
         "((state='pending' AND next_attempt_at_utc IS NULL) OR next_attempt_at_utc<=?) " + early_scope + ' ' +
         "UNION ALL SELECT * FROM tasks WHERE state IN ('complete','observed_empty') "
-        "AND next_attempt_at_utc IS NOT NULL AND next_attempt_at_utc<=?), "
+        "AND next_attempt_at_utc IS NOT NULL AND next_attempt_at_utc<=? {accepted_scope}), "
         "cursors AS (" + cursor + ") "
         "SELECT tasks.dataset,data_id,partition,kind,tasks.priority,state FROM eligible tasks "
         "LEFT JOIN cursors c ON c.priority=tasks.priority WHERE 1=1 "
@@ -666,14 +710,31 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
         # Fairness within a background lane, never across priorities. Repairs
         # still precede ordinary history; tick cannot jump ahead of minute work.
         "CASE WHEN dataset>COALESCE(c.last_dataset,'') THEN 0 ELSE 1 END, dataset, "
-        "COALESCE(next_attempt_at_utc,''), data_id, partition DESC LIMIT 1",
-        (_iso(now), *early_args, _iso(now), *sorted(delegated), *selected, *others,
-         WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL),
-    ).fetchone()
+        "COALESCE(next_attempt_at_utc,''), data_id, partition DESC LIMIT 1")
+    args = (_iso(now), *early_args, _iso(now), *sorted(delegated), *selected, *others,
+            WIDE_INSTITUTIONAL, LONG_INSTITUTIONAL)
+    # Required/repair work and priority-zero renewals strictly precede old
+    # maintenance in the existing CASE order. Seek that dominant set first;
+    # do not sort thousands of accepted histories on every minute-bar call.
+    row = connection.execute(query.format(accepted_scope='AND priority=0'), args).fetchone()
+    if row is None:
+        if first_history and has_unseeded_frontier(connection, first_history, now):
+            return None  # The owner refills; a preview never mutates the cursor.
+        row = connection.execute(query.format(accepted_scope=''), args).fetchone()
     if row and advance_cursor:
         connection.execute('INSERT OR REPLACE INTO dispatch_cursor VALUES (?,?)', (row[4], row[0]))
         connection.commit()
     return Task(*row) if row else None
+
+
+def _refill_current_history(connection, root, now, *, delegated=frozenset(), datasets=None):
+    dataset = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
+    if not dataset or not has_unseeded_frontier(connection, dataset, now):
+        return 0
+    from stockagent.live.market_status import tw_stock_day_decision
+    def day_decision(day):
+        return tw_stock_day_decision(day, parquet_root=root.parents[1] / 'data_tw_public', observed=now)
+    return supplemental.refill_history(connection, dataset, now, day_decision=day_decision)
 
 
 def _sponsor_delegated(root: Path, now: datetime) -> frozenset[str]:
@@ -1014,7 +1075,8 @@ def _request(session: requests.Session, limiter: SharedRateLimiter, root: Path,
     if task.kind == "year" and task.dataset in BULK_GLOBAL_HISTORY and not full_history:
         return _fetch_rows(session, limiter, root, task.dataset, token, params,
                            max_response_bytes=BULK_MAX_RESPONSE_BYTES)
-    return _fetch_rows(session, limiter, root, task.dataset, token, params)
+    return _fetch_rows(session, limiter, root, task.dataset, token, params,
+                       max_response_bytes=BULK_MAX_RESPONSE_BYTES)
 
 
 def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Path,
@@ -1072,6 +1134,37 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
                     if isinstance(value, BaseException)
                 )
         raise SourceError(code) from None
+
+
+def _request_independent(session: requests.Session, limiter: SharedRateLimiter, root: Path,
+                         task: Task, token: str, *, today: date) -> tuple[list[dict[str, Any]], dict]:
+    """Shared serial/parallel path for requests with no overlapping baseline.
+
+    Range coalescing and daily-history merge remain in their existing owner
+    paths. This helper changes neither dates, identity, units nor validation.
+    """
+    metadata = None
+    if task.dataset == news.DATASET:
+        params, metadata = news.request_contract(task.partition)
+        rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
+                           max_response_bytes=BULK_MAX_RESPONSE_BYTES)
+        metadata['validation'] = news.validate_response(task.partition, rows)
+    elif task.dataset in supplemental.SOURCES:
+        endpoint, params, metadata = supplemental.request_contract(task.dataset, task.data_id, task.partition, today)
+        rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
+                           endpoint=endpoint, max_response_bytes=BULK_MAX_RESPONSE_BYTES)
+        supplemental.validate_response(task.dataset, task.data_id, task.partition, today, rows)
+    else:
+        rows = _request(session, limiter, root.parent, task, token, today=today)
+        if task.dataset in PRODUCT_HISTORY_STARTS:
+            metadata = {'query_shape': 'product_history_inclusive_date_range', 'data_id': task.data_id,
+                        'request_start_date': PRODUCT_HISTORY_STARTS[task.dataset].isoformat(),
+                        'request_end_date': today.isoformat(), 'request_end_inclusive': True,
+                        'request_count': 1, 'source_date_semantics': 'expiry_date',
+                        'historical_product_universe_verified_complete': False}
+    if len(rows) > BULK_MAX_RESPONSE_ROWS:
+        raise SourceError('response_row_limit')
+    return rows, metadata or {}
 
 
 def _response_json(response: requests.Response, max_response_bytes: int | None) -> Any:
@@ -1150,6 +1243,12 @@ def _response_rows(response: requests.Response, limiter: SharedRateLimiter,
 
 
 def _dates(rows: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    if isinstance(rows, pa.Table):
+        if 'date' not in rows.column_names or not rows.num_rows:
+            return None, None
+        values = pc.utf8_slice_codeunits(rows['date'], 0, 10)
+        values = pc.filter(values, pc.match_substring_regex(values, r'^\d{4}-\d{2}-\d{2}$'))
+        return pc.min(values).as_py(), pc.max(values).as_py()
     observed = [str(row["date"])[:10] for row in rows
                 if isinstance(row.get("date"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(row["date"])[:10])]
     return (min(observed), max(observed)) if observed else (None, None)
@@ -1168,6 +1267,8 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
            correction: dict[str, Any] | None = None) -> dict[str, Any]:
     if isinstance(rows, storage_objects.StorageObject):
         return _store_storage_object(root, task, rows, now, request_metadata=request_metadata, correction=correction)
+    if isinstance(rows, pa.Table) and (task.kind != 'derived' or task.dataset != 'TaiwanStockTradingDailyReportSecIdAgg'):
+        raise SourceError('unsupported_columnar_publication')
     store_started = time.monotonic()
     transport = getattr(rows, 'observation', None)
     # A current quote can legitimately disappear when its contract expires;
@@ -1234,7 +1335,7 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
         folder = root / "parquet" / task.dataset / id_hash / task.partition
         folder.mkdir(parents=True, exist_ok=True)
         staged = folder / "latest.parquet"
-        table = table_from_records(rows)
+        table = rows if isinstance(rows, pa.Table) else table_from_records(rows)
         field_non_null = {name: table.num_rows - column.null_count
                           for name, column in zip(table.column_names, table.columns)}
         if not any(field_non_null.values()):
@@ -1328,6 +1429,8 @@ def _store_storage_object(root: Path, task: Task, value: storage_objects.Storage
                                         {'volume': 'TWSE_TPEX_lots_emerging_shares'} if task.dataset in storage_objects.CASH_OBJECTS
                                         else {'volume': 'provider_contracts_not_matched_volume_normalized'}),
                 'unit_source': storage_objects.DOCUMENTATION[task.dataset],
+                **(annotate_stock_share_units(task.dataset, [])[1]
+                   if task.dataset in storage_objects.CASH_OBJECTS else {}),
             },
         }
         if correction:
@@ -1380,7 +1483,7 @@ def _derive_wide(root: Path, connection: sqlite3.Connection, task: Task) -> list
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _derive_broker_aggregate(root: Path, task: Task) -> tuple[list[dict], dict]:
+def _derive_broker_aggregate(root: Path, task: Task) -> tuple[list[dict] | pa.Table, dict]:
     from downloader.parquet_integrity import parquet_receipt_error
 
     started = time.monotonic()
@@ -1400,12 +1503,20 @@ def _derive_broker_aggregate(root: Path, task: Task) -> tuple[list[dict], dict]:
             elif parent.get('request', {}).get('endpoint') != 'storage_objects':
                 raise SourceError('unverified_market_broker_parent', retry_after=900)
             yield from rows
-    rows = supplemental.aggregate_brokers(parent_rows())
+    rows = None
+    if not task.data_id and parent.get('request', {}).get('endpoint') == 'storage_objects':
+        from downloader.finmind_broker_aggregation import FIELDS, aggregate_brokers_table
+        table = pq.read_table(root / parent['parquet_path'], columns=list(FIELDS), use_threads=True)
+        rows = aggregate_brokers_table(table)
+    columnar = rows is not None
+    if rows is None:
+        rows = supplemental.aggregate_brokers(parent_rows())
     return rows, {
         'supplemental_contract_version': supplemental.CONTRACT_VERSION,
         'query_shape': 'local_broker_aggregate_from_verified_raw', 'request_count': 0,
         'parent_sha256': parent['sha256'], 'parent_receipt': str(path.relative_to(root)),
         'local_derivation_seconds': time.monotonic() - started,
+        'aggregation_engine': 'arrow_decimal128_table_exact_v2' if columnar else 'python_decimal_reference',
         'price_semantics': 'unrounded_quantity_weighted_average_not_independent_provider_response',
         'contract_probe': 'artifacts/data_quality/finmind_repair_2026-09-29/broker_aggregation_probe.json',
     }
@@ -1600,9 +1711,10 @@ def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, 
     if (task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg' and not task.data_id
             and receipt['status'] == 'complete' and request.get('local_derivation_seconds', 0) > 0):
         connection.execute('INSERT INTO finmind_object_derivation_samples '
-                           '(dataset,partition,seconds,observed_at_utc) VALUES (?,?,?,?)',
+                           '(dataset,partition,seconds,observed_at_utc,engine) VALUES (?,?,?,?,?)',
                            ('TaiwanStockTradingDailyReport', task.partition,
-                            request['local_derivation_seconds'], now.isoformat()))
+                            request['local_derivation_seconds'], now.isoformat(),
+                            request.get('aggregation_engine', 'python_decimal_reference')))
     next_at = _next_refresh(task, now, empty=receipt['status'] == 'observed_empty',
                             latest_date=receipt.get('source_last_date'))
     # Retained history after an empty incremental response is not evidence that
@@ -1757,6 +1869,7 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
 def run_once(root: Path, *, max_requests: int = 0,
              datasets: tuple[str, ...] | None = None,
              required_keys: tuple[tuple[str, str, str], ...] | None = None) -> dict[str, Any]:
+    cycle_started = time.monotonic()
     if required_keys is not None:
         required_keys = tuple(dict.fromkeys(required_keys))
         if (not 0 < len(required_keys) <= 64
@@ -1774,7 +1887,16 @@ def run_once(root: Path, *, max_requests: int = 0,
         raise RuntimeError("FINMIND_TOKEN is required for the complementary all-free catalog")
     completed = 0
     last: dict[str, Any] | None = None
-    with closing(_db(root / "queue.sqlite3")) as connection, connection, requests.Session() as session:
+    pipeline_config = object_pipeline.settings()
+    json_config = json_pipeline.settings(max_requests_per_cycle=max_requests)
+    with closing(_db(root / "queue.sqlite3")) as connection, connection, requests.Session() as session, \
+            json_pipeline.CycleCosts(connection, cycle_started) as cycle_costs, \
+            json_pipeline.Sessions() as json_sessions, \
+            ThreadPoolExecutor(max_workers=json_config['download_workers'], thread_name_prefix='finmind-json-fetch') as json_downloads, \
+            ThreadPoolExecutor(max_workers=pipeline_config['download_workers'], thread_name_prefix='finmind-object-fetch') as downloads, \
+            ProcessPoolExecutor(max_workers=pipeline_config['derivation_workers'],
+                mp_context=multiprocessing.get_context('spawn'), initializer=object_pipeline.initialize_cpu,
+                initargs=(pipeline_config['arrow_threads'],)) as processors:
         try:
             account = verified_account(session, token, root.parent)
             limiter = rate_limiter(account)
@@ -1825,6 +1947,9 @@ def run_once(root: Path, *, max_requests: int = 0,
             task = _next_task(connection, now, delegated=delegated,
                               incremental_only=not budget["allowed"], datasets=datasets, advance_cursor=True,
                               required_keys=required_keys)
+            if (task is None and budget['allowed'] and required_keys is None
+                    and _refill_current_history(connection, root, now, delegated=delegated, datasets=datasets)):
+                task = _next_task(connection, now, delegated=delegated, datasets=datasets, advance_cursor=True)
             if task is None:
                 first_history = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
                 if first_history and connection.execute(
@@ -1843,6 +1968,47 @@ def run_once(root: Path, *, max_requests: int = 0,
             if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
                 _status(connection, root, state="running", active=task, last=last, delegated=delegated)
                 last_status_at = time.monotonic()
+            other_started = time.monotonic()
+            parallel = object_pipeline.run_batch(
+                connection, downloads, processors, root, task, account, budget, reservation, now, limiter, token,
+                config=pipeline_config, max_calls=max_requests-completed if max_requests else pipeline_config['max_batch_requests'],
+                delegated=delegated, datasets=datasets, required_keys=required_keys,
+                heartbeat=lambda active, result: _status(connection, root, state='running', active=active,
+                                                         last=result or last, delegated=delegated))
+            if parallel is not None:
+                completed += parallel['calls']
+                last = parallel['last'] or last
+                reconcile_worker_corrections(connection, root, 'complement', _now())
+                connection.commit()
+                if parallel['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'local_cpu_worker_interrupted'}:
+                    cycle_costs.calibration_invalid = True
+                    return _status(connection, root, state=parallel['state'], last=last, delegated=delegated)
+                _status(connection, root, state='running', last=last, delegated=delegated)
+                last_status_at = time.monotonic()
+                cycle_costs.exclude_elapsed(other_started)
+                continue
+            parallel_json = json_pipeline.run_batch(
+                connection, json_downloads, json_sessions, root, task, account, budget, reservation, now, limiter, token,
+                config=json_config, max_calls=max_requests-completed if max_requests else json_config['max_batch_requests'],
+                delegated=delegated, datasets=datasets, required_keys=required_keys,
+                heartbeat=lambda active, result: _status(connection, root, state='running', active=active,
+                                                         last=result or last, delegated=delegated))
+            if parallel_json is not None:
+                if parallel_json['failed_tasks'] or parallel_json['accepted_requests'] != parallel_json['calls']:
+                    cycle_costs.calibration_invalid = True
+                completed += parallel_json['calls']
+                last = parallel_json['last'] or last
+                reconcile_worker_corrections(connection, root, 'complement', _now())
+                connection.commit()
+                if parallel_json['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'}:
+                    return _status(connection, root, state=parallel_json['state'], last=last, delegated=delegated)
+                if parallel_json['state'] == 'incremental_reserve' and not parallel_json['calls']:
+                    return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
+                if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
+                    _status(connection, root, state='running', last=last, delegated=delegated)
+                    last_status_at = time.monotonic()
+                continue
+            other_started = time.monotonic()
             bulk = None
             try:
                 # Exact-key repair must not claim neighbouring year tasks or
@@ -1858,24 +2024,13 @@ def run_once(root: Path, *, max_requests: int = 0,
                     history_metadata = None
                     if task.dataset == 'TaiwanStockTradingDailyReportSecIdAgg' and task.kind == 'derived':
                         rows, history_metadata = _derive_broker_aggregate(root, task)
-                    elif task.dataset == news.DATASET:
-                        params, history_metadata = news.request_contract(task.partition)
-                        rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
-                                           max_response_bytes=BULK_MAX_RESPONSE_BYTES)
-                        history_metadata['validation'] = news.validate_response(task.partition, rows)
                     elif task.dataset in storage_objects.active_datasets(connection) and not task.data_id:
                         rows, history_metadata = storage_objects.fetch(
                             session, limiter, root, task, token,
                             heartbeat=lambda: _status(connection, root, state='running', active=task,
                                                       last=last, delegated=delegated))
-                    elif task.dataset in supplemental.SOURCES:
-                        endpoint, params, history_metadata = supplemental.request_contract(
-                            task.dataset, task.data_id, task.partition, local.date())
-                        rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
-                                           endpoint=endpoint, max_response_bytes=BULK_MAX_RESPONSE_BYTES)
-                        if len(rows) > BULK_MAX_RESPONSE_ROWS:
-                            raise SourceError("response_row_limit")
-                        supplemental.validate_response(task.dataset, task.data_id, task.partition, local.date(), rows)
+                    elif task.dataset == news.DATASET or task.dataset in supplemental.SOURCES:
+                        rows, history_metadata = _request_independent(session, limiter, root, task, token, today=local.date())
                     elif task.dataset in DAILY_EQUITY and task.kind == "id_history":
                         baseline_error = None
                         try:
@@ -1924,8 +2079,10 @@ def run_once(root: Path, *, max_requests: int = 0,
                         if baseline_error:
                             history_metadata['baseline_recovery'] = baseline_error
                     else:
-                        rows = (_derive_wide(root, connection, task) if task.kind == "derived" else
-                                _request(session, limiter, root.parent, task, token, today=local.date()))
+                        if task.kind == 'derived':
+                            rows = _derive_wide(root, connection, task)
+                        else:
+                            rows, history_metadata = _request_independent(session, limiter, root, task, token, today=local.date())
                     if not rows and ((task.kind == "year" and task.dataset in BULK_GLOBAL_HISTORY)
                                      or task.dataset in PRODUCT_HISTORY_STARTS):
                         previous = connection.execute(
@@ -1963,6 +2120,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 reconcile_worker_corrections(connection, root, 'complement', _now())
                 connection.commit()
             except SourceError as error:
+                cycle_costs.calibration_invalid = True
                 if bulk is not None:
                     _fail_bulk_years(connection, bulk, error, _now())
                 else:
@@ -1973,16 +2131,10 @@ def run_once(root: Path, *, max_requests: int = 0,
                 if error.code in {"rate_limited", "invalid_token", "ip_banned"}:
                     return _status(connection, root, state=error.code, last=last, delegated=delegated)
             except (OSError, ValueError, pa.ArrowException) as exc:
+                cycle_costs.calibration_invalid = True
                 # Only allowlisted parser codes are persisted; arbitrary
                 # exception text can contain credentials or source content.
-                validation_codes = {
-                    'news_invalid_timestamp', 'news_response_outside_day',
-                    'news_identity_type_mismatch', 'news_invalid_link',
-                    'history_response_outside_range', 'history_wrong_data_id',
-                    'history_duplicate_date', 'unexpected_empty_after_nonempty',
-                }
-                code = str(exc) if isinstance(exc, ValueError) and str(exc) in validation_codes else 'storage_or_schema_error'
-                error = SourceError(code, retry_after=900)
+                error = _publication_error(exc)
                 if bulk is not None:
                     _fail_bulk_years(connection, bulk, error, _now())
                 else:
@@ -1994,6 +2146,7 @@ def run_once(root: Path, *, max_requests: int = 0,
             finally:
                 if bulk is not None:
                     _release_bulk_years(connection, bulk)
+                cycle_costs.exclude_elapsed(other_started)
             completed += int(task.kind != "derived")
             if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
                 _status(connection, root, state="running", last=last, delegated=delegated)
@@ -2015,7 +2168,8 @@ def _retry_blocked(root: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("data_finmind/complement"))
-    parser.add_argument("--max-requests", type=int, default=120)
+    parser.add_argument("--max-requests", type=int, default=None,
+                        help="Cycle quantum; default from finmind_json_pipeline.json, 0 means unlimited")
     parser.add_argument("--dataset", action="append", choices=sorted(ALL_DATASETS),
                         help="Dispatch only this existing dataset; repeat to select more than one")
     parser.add_argument("--task-key", nargs=3, action="append",
@@ -2027,6 +2181,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--reopen-exhausted', action='store_true',
                         help='Explicitly reopen exhausted tasks in --dataset scopes, then exit without any API call')
     args = parser.parse_args(argv)
+    if args.max_requests is None:
+        args.max_requests = json_pipeline.settings()['max_requests_per_cycle']
     if args.max_requests < 0:
         parser.error("--max-requests must be nonnegative")
     if args.reopen_exhausted and (not args.dataset or args.loop or args.task_key or args.retry_blocked):
@@ -2038,6 +2194,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.loop or args.retry_blocked or args.dataset:
             parser.error("--task-key is a finite run and cannot be combined with --loop, --retry-blocked or --dataset")
     root = args.root.resolve()
+    # Only this dedicated CLI owns these pools. Object CPU workers retain
+    # their separately configured pools; raw source semantics do not change.
+    object_pipeline.initialize_cpu(1)
     if args.reopen_exhausted and not (root / 'queue.sqlite3').is_file():
         parser.error('--reopen-exhausted requires an existing owner queue')
     root.mkdir(parents=True, exist_ok=True)

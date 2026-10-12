@@ -14,12 +14,12 @@ Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finmind_complement.sh"
 Restart=on-failure
 RestartSec=60s
-Nice=10
-CPUWeight=20
-IOWeight=20
+Nice=0
+CPUWeight=100
+IOWeight=100
 MemoryAccounting=true
-MemoryHigh=2G
-MemoryMax=4G
+MemoryHigh=12G
+MemoryMax=20G
 OOMScoreAdjust=700
 
 [Install]

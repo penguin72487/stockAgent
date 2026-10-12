@@ -34,6 +34,20 @@ def test_source_no_close_is_not_zero_or_previous_close(tmp_path):
         official_closes(root,_now(13,30).date())
 
 
+def test_official_close_parser_accepts_twse_notes_but_rejects_truncated_price_rows(tmp_path):
+    root = reports(tmp_path)
+    path = root / 'twse_daily_ohlcv/2026-08-13.json'
+    payload = json.loads(path.read_text())
+    payload['tables'].append({'notes': ['Exchange report notes, not a price table.']})
+    path.write_text(json.dumps(payload))
+    prices, _ = official_closes(root, _now(13, 30).date())
+    assert prices['2330']['price'] == 999
+    payload['tables'][0]['data'][0].pop()
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match='row shape'):
+        official_closes(root, _now(13, 30).date())
+
+
 def test_today_short_conversion_is_reversed_without_erasing_original_debit(tmp_path):
     engine,spec=setup_account(tmp_path,weight=-.2)
     mode=engine.state["modes"][spec.market]

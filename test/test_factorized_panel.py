@@ -1,5 +1,6 @@
 from dataclasses import replace
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -230,6 +231,39 @@ def test_bounded_reads_common_broadcast_masks_and_fingerprint(tmp_path, capsys):
     assert panel.features._cache.bytes <= panel.features._cache.budget_bytes
     assert panel.features.shape[-1] == len(panel.feature_names) == 10
     assert "[panel-model] features (10): base=2, individual=4, common=4" in capsys.readouterr().out
+
+
+def test_host_cache_budget_changes_io_only_not_source_or_fingerprint(tmp_path):
+    panel, path, dense = example(tmp_path)
+    small = attach_factorized_features(replace(panel), path, host_cache_bytes=1)
+    large = attach_factorized_features(replace(panel), path, host_cache_bytes=dense.nbytes)
+    original_manifest = path.read_bytes()
+    for target in (small, large):
+        np.testing.assert_array_equal(target.features[:], dense)
+        np.testing.assert_array_equal(target.features[:], dense)
+        assert target.features._cache.bytes <= target.features._cache.budget_bytes
+    assert small.features._cache.misses == 2*len(small.features._cache.blocks)
+    assert large.features._cache.misses == len(large.features._cache.blocks)
+    assert large.features._cache.hits == len(large.features._cache.blocks)
+    assert small.features.content_fingerprint == large.features.content_fingerprint
+    assert path.read_bytes() == original_manifest
+    with pytest.raises(ValueError, match="positive"):
+        attach_factorized_features(replace(panel), path, host_cache_bytes=-1)
+
+
+def test_host_cache_config_keeps_semantic_resume_unchanged(tmp_path):
+    from stockagent.config import load_config
+    from stockagent.training.checkpoint_contract import _configuration_fingerprint_snapshot
+    default = load_config("configs/deployments/tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v3.yaml")
+    selected = replace(default, data=replace(default.data, factorized_host_cache_bytes=48*1024**3))
+    assert _configuration_fingerprint_snapshot(default) == _configuration_fingerprint_snapshot(selected)
+    config = tmp_path/"cache.yaml"
+    inherited = str(Path("configs/deployments/tw_day_trade_factorized_values_20261005_gaprepair_v4_no_basis_bf16_v3.yaml").resolve())
+    config.write_text(f"base_config: {inherited}\ndata:\n  factorized_host_cache_bytes: 51539607552\n")
+    assert load_config(config).data.factorized_host_cache_bytes == 48*1024**3
+    config.write_text(f"base_config: {inherited}\ndata:\n  factorized_host_cache_bytes: -2\n")
+    with pytest.raises(ValueError, match="factorized_host_cache_bytes"):
+        load_config(config)
 
 
 def test_canonical_windowed_and_rms_parity(tmp_path):

@@ -1,0 +1,7 @@
+{
+  "contract_version": 1,
+  "focus_provider": "cnyes",
+  "provider_order": "known_urls_desc",
+  "deferred_providers": ["cna"],
+  "retain_running_collectors": true
+}

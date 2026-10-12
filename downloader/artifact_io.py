@@ -115,13 +115,15 @@ def atomic_write_json(
     durable: bool = True,
     ensure_ascii: bool = False,
     sort_keys: bool = False,
+    compact: bool = False,
 ) -> None:
     atomic_write_text(
         path,
         json.dumps(
             payload,
             ensure_ascii=ensure_ascii,
-            indent=2,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
             sort_keys=sort_keys,
         )
         + "\n",

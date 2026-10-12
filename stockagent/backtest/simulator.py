@@ -2382,7 +2382,6 @@ def _prepare_compile_key(
 ) -> tuple:
     return (
         str(weights.device),
-        int(weights.size(0)),
         int(weights.size(1)),
         str(weights.dtype),
         str(tradable_mask.dtype),
@@ -2394,7 +2393,7 @@ def _prepare_compile_key(
         normalize_portfolio_activation(portfolio_activation),
         bool(side_masks_require_tradable),
         bool(symbol_sharded),
-        bool(_compile_dynamic_enabled()),
+        "prepare_dynamic_rows_v1",
     )
 
 
@@ -2465,7 +2464,13 @@ def _resolve_prepare_runner(
     try:
         _PREP_COMPILE_STATS["misses"] += 1
         _configure_inductor_cudagraphs()
-        compile_dynamic = _compile_dynamic_enabled()
+        # Preparation is independent across dates: annual boundaries and final
+        # chunks need not create a new graph for every row count. The recurrent
+        # account scan retains its separate, explicitly selected compile mode.
+        # Do not pad dates or raise Dynamo's global limit to hide these variants.
+        for value in (weights, tradable_mask, can_buy_mask, can_sell_mask):
+            _mark_static_shape(value, [1])
+        compile_dynamic = True
         compiled = torch.compile(
             base_runner,
             fullgraph=True,

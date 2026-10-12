@@ -731,6 +731,10 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
 }
 
 
+class RateLimitWaitCancelled(RuntimeError):
+    """A caller withdrew before issuing a provider request; not a rate error."""
+
+
 class SharedRateLimiter:
     def __init__(
         self,
@@ -949,7 +953,9 @@ class SharedRateLimiter:
                 self._claim_observer_queue.put(None)
             ticket.set()
 
-    def wait(self, cost: float = 1.0) -> None:
+    def wait(self, cost: float = 1.0, *, cancel_event: threading.Event | None = None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RateLimitWaitCancelled()
         claim_cost = self._validated_cost(cost)
         if self.interval_seconds <= 0.0:
             with self._dispatch_condition:
@@ -962,7 +968,19 @@ class SharedRateLimiter:
             self._dispatch_queue.append((ticket, claim_cost))
             self._ensure_dispatcher_locked()
             self._dispatch_condition.notify()
-        ticket.wait()
+        if cancel_event is None:
+            ticket.wait()
+        else:
+            while not ticket.wait(0.05):
+                if cancel_event.is_set():
+                    with self._dispatch_condition:
+                        try:
+                            self._dispatch_queue.remove((ticket, claim_cost))
+                        except ValueError:
+                            pass  # A raced grant is conservatively consumed.
+                    raise RateLimitWaitCancelled()
+            if cancel_event.is_set():
+                raise RateLimitWaitCancelled()
         self._notify_caller_claim()
 
     def _notify_claim(self) -> None:
@@ -1044,6 +1062,34 @@ class SharedRateLimiter:
         delay = max(0.0, float(seconds))
         if delay > 0.0:
             self._defer_process_shared(delay)
+
+    def remaining_delay_seconds(self) -> float:
+        """Read readiness without claiming a slot or changing the schedule.
+
+        This is only a scheduler hint: callers must still use wait(), which
+        checks a racing defer under the process-shared lock.
+        """
+        if fcntl is None:
+            with self._lock:
+                return max(0.0, self._next_time - time.monotonic())
+        try:
+            with self._lock, self._state_path.open("r", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                try:
+                    raw = handle.read().strip()
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except FileNotFoundError:
+            return 0.0
+        try:
+            deadline = float(raw) if raw else 0.0
+        except ValueError:
+            return 0.0
+        delay = deadline - time.monotonic()
+        # Match the grant path's restart/stale-reservation interpretation.
+        if not math.isfinite(delay) or delay > max(300.0, self.interval_seconds * 100_000.0):
+            return 0.0
+        return max(0.0, delay)
 
 
 def parse_retry_after_seconds(

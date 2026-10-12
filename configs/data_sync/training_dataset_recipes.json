@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "contract": "source_pinned_training_recipes_v1",
+  "recipes": [
+    {
+      "recipe": "tw-stock-minute",
+      "description": "永豐原始分鐘 → 官方交易日隔離 → 右標分鐘特徵與下分鐘研究標籤",
+      "inputs": {"minute_source": "tw-minute-source-cold", "public": "tw-public"},
+      "source_range_requirements": [{"input": "public", "at_least": "minute_source"}],
+      "parameters": [],
+      "steps": [["scripts/build_shioaji_tw_minute_dataset.py", "--input-root", "{minute_source}", "--calendar-root", "{public}", "--download-summary", "{minute_source}/download_summary.json", "--output-root", "{output}"], ["scripts/audit_shioaji_tw_minute_dataset.py", "--dataset-root", "{output}", "--all-partitions", "--calendar-root", "{public}", "--output", "{output}/audit.json"]],
+      "semantics": "Asia/Taipei; completed right-labelled bars; next-bar proxy, not broker fills; source gaps remain explicit",
+      "remote_only": true
+    },
+    {
+      "recipe": "tw-factorized-value-only",
+      "description": "共用／個股原生低頻 NULL 觀測 → 發布時鐘／失效／資格 → 最近可知值；模型只取數值",
+      "inputs": {"source": {"prefix": "tw-daytrade-panel-sources-"}, "minute": "tw-minute-train"},
+      "source_range_requirements": [{"input": "minute", "at_least": "source"}],
+      "parameters": ["base_config"],
+      "steps": [["scripts/prepare_tw_day_trade_factorized_panel.py", "--source-root", "{source}", "--snapshot-id", "{source_snapshot_id}", "--minute-root", "{minute}", "--base-config", "{base_config}", "--output-root", "{output}", "--model-channel-policy", "value_only"]],
+      "semantics": "Private personal research; original NULL and clocks retained; no availability/age/update model channels; no basis reduction; financial execution belongs to base_config",
+      "remote_only": true
+    },
+    {
+      "recipe": "tw-factorized-four-channel",
+      "description": "歷史四通道 panel；不是目前值-only訓練的預設",
+      "inputs": {"source": {"prefix": "tw-daytrade-panel-sources-"}, "minute": "tw-minute-train"},
+      "source_range_requirements": [{"input": "minute", "at_least": "source"}],
+      "parameters": ["base_config"],
+      "steps": [["scripts/prepare_tw_day_trade_factorized_panel.py", "--source-root", "{source}", "--snapshot-id", "{source_snapshot_id}", "--minute-root", "{minute}", "--base-config", "{base_config}", "--output-root", "{output}", "--model-channel-policy", "value_available_age_updated"]],
+      "semantics": "Separate historical feature ABI; never donate optimizer to value-only ABI",
+      "remote_only": true
+    },
+    {
+      "recipe": "tw-mixed-frequency",
+      "description": "舊混頻寬表研究版本；不同於 factorized value-only",
+      "inputs": {"source": {"prefix": "tw-daytrade-panel-sources-"}, "minute": "tw-minute-train"},
+      "source_range_requirements": [{"input": "minute", "at_least": "source"}],
+      "parameters": ["base_config"],
+      "steps": [["scripts/prepare_tw_day_trade_mixed_frequency.py", "--source-root", "{source}", "--snapshot-id", "{source_snapshot_id}", "--minute-root", "{minute}", "--base-config", "{base_config}", "--output-root", "{output}"]],
+      "semantics": "Preserve exact feature_specs/cadence/null barriers/source permission; separate research ABI",
+      "remote_only": true
+    },
+    {
+      "recipe": "tw-public-core",
+      "description": "官方公開原生表 → 稀疏個股／共用日特徵；正式與同收盤研究選項由原 config 區分",
+      "inputs": {"public": "tw-public"},
+      "parameters": [],
+      "steps": [["scripts/build_tw_public_training_features.py", "--input-dir", "{public}", "--symbols-root", "{public}/stocks", "--output-path", "{output}/tw_public_stock_daily.parquet"]],
+      "semantics": "Use existing builder; snapshot-only denylist and publication clocks remain enforced",
+      "remote_only": true
+    }
+  ]
+}

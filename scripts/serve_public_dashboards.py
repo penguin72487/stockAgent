@@ -58,6 +58,10 @@ from stockagent.live.finlab_dashboard import (  # noqa: E402
 from stockagent.live.finmind_dashboard import (  # noqa: E402
     build_finmind_public_status,
 )
+from stockagent.live.news_dashboard import (  # noqa: E402
+    build_news_public_status,
+    news_snapshot_revision,
+)
 from stockagent.live.tej_dashboard import (  # noqa: E402
     STATUS_CACHE_SECONDS as TEJ_STATUS_CACHE_SECONDS,
     build_tej_public_status,
@@ -190,6 +194,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/shioaji/api/status",
         "/finlab/api/status",
         "/finmind/api/status",
+        "/news/api/status",
         "/tej/api/status",
         "/tej/api/features",
         "/openbb/api/status",
@@ -213,6 +218,7 @@ _PUBLIC_PAGE_ROUTES: Final[frozenset[str]] = frozenset(
         "/shioaji/",
         "/finlab/",
         "/finmind/",
+        "/news/",
         "/tej/",
         "/openbb/",
         "/data-monitor/",
@@ -1620,6 +1626,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         shioaji_static_root: Path,
         finlab_static_root: Path | None = None,
         finmind_static_root: Path | None = None,
+        news_static_root: Path | None = None,
         tej_static_root: Path | None = None,
         openbb_static_root: Path,
         data_monitor_static_root: Path,
@@ -1638,6 +1645,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.shioaji_static_root = Path(shioaji_static_root)
         self.finlab_static_root = Path(finlab_static_root or repo_root / "services/finlab_dashboard")
         self.finmind_static_root = Path(finmind_static_root or repo_root / "services/finmind_dashboard")
+        self.news_static_root = Path(news_static_root or repo_root / "services/news_dashboard")
         self.tej_static_root = Path(tej_static_root or repo_root / "services/tej_dashboard")
         self.openbb_static_root = Path(openbb_static_root)
         self.data_monitor_static_root = Path(data_monitor_static_root)
@@ -1806,6 +1814,14 @@ class PublicDashboardServer(ThreadingHTTPServer):
             else max(0.0, float(stale_grace_seconds))
         )
         with self._cache_lock:
+            if cache_key.startswith("news-status:"):
+                # News heartbeats create a new file generation every few
+                # seconds. Retain one sanitized snapshot, not hundreds of
+                # obsolete full-source inventories. Other routes are untouched.
+                for key in tuple(self._cache):
+                    if key.startswith("news-status:") and key != cache_key:
+                        expired = self._cache.pop(key)
+                        self._cache_bytes -= expired.response.resident_bytes
             previous = self._cache.pop(cache_key, None)
             if previous is not None:
                 self._cache_bytes -= previous.response.resident_bytes
@@ -3265,6 +3281,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             ("/shioaji/", self.server.shioaji_static_root),
             ("/finlab/", self.server.finlab_static_root),
             ("/finmind/", self.server.finmind_static_root),
+            ("/news/", self.server.news_static_root),
             ("/tej/", self.server.tej_static_root),
             ("/openbb/", self.server.openbb_static_root),
             ("/data-monitor/", self.server.data_monitor_static_root),
@@ -3275,7 +3292,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / "index.html",
                     "text/html; charset=utf-8",
-                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/tej/"} else "public, max-age=60",
+                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/news/", "/tej/"} else "public, max-age=60",
                 )
             elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix == "provider.js") or (
                 prefix in {"/tw-day-trade/", "/tw-overnight/"}
@@ -3289,7 +3306,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / suffix,
                     "text/javascript; charset=utf-8",
-                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/tej/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
+                    "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/news/", "/tej/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
             elif suffix == "styles.css" or (
                 prefix == "/traffic/" and suffix == "performance.css"
@@ -3888,12 +3905,28 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 builder=lambda: build_finlab_public_status(self.server.repo_root),
             )
         if path == "/finmind/api/status":
+            # A minute producer publishes atomically. Invalidate immediately on
+            # its new generation; the normal TTL still coalesces browser reads
+            # of the SAME estimate, without scanning a queue or calling APIs.
+            estimate_path = self.server.repo_root / 'data_finmind/eta_status.json'
+            try:
+                estimate_stat = estimate_path.stat()
+                estimate_revision = f'{estimate_stat.st_ino}:{estimate_stat.st_mtime_ns}:{estimate_stat.st_size}'
+            except OSError:
+                estimate_revision = 'unavailable'
             return self.server.cached_local_json(
-                cache_key="finmind-status",
+                cache_key=f"finmind-status:{estimate_revision}",
                 ttl_seconds=20.0,
                 cache_control="no-store",
                 stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
                 builder=lambda: build_finmind_public_status(self.server.repo_root),
+            )
+        if path == "/news/api/status":
+            return self.server.cached_local_json(
+                cache_key=f"news-status:{news_snapshot_revision(self.server.repo_root)}",
+                ttl_seconds=15.0, cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: build_news_public_status(self.server.repo_root),
             )
         if path == "/tej/api/status":
             return self.server.cached_local_json(
@@ -4079,6 +4112,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "/shioaji",
             "/finlab",
             "/finmind",
+            "/news",
             "/tej",
             "/openbb",
             "/data-monitor",
@@ -4287,6 +4321,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("services/finmind_dashboard"),
     )
     parser.add_argument("--tej-static-root", type=Path, default=Path("services/tej_dashboard"))
+    parser.add_argument("--news-static-root", type=Path, default=Path("services/news_dashboard"))
     parser.add_argument(
         "--openbb-static-root",
         type=Path,
@@ -4332,6 +4367,7 @@ def main(argv: list[str] | None = None) -> int:
         shioaji_static_root=Path(args.shioaji_static_root),
         finlab_static_root=Path(args.finlab_static_root),
         finmind_static_root=Path(args.finmind_static_root),
+        news_static_root=Path(args.news_static_root),
         tej_static_root=Path(args.tej_static_root),
         openbb_static_root=Path(args.openbb_static_root),
         data_monitor_static_root=Path(args.data_monitor_static_root),

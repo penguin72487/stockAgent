@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
@@ -529,13 +529,38 @@ def test_warm_tw_mis_uses_quote_api_when_browser_frontend_fails(monkeypatch) -> 
     assert result["frontend_http_status"] == 502
 
 
+@pytest.mark.parametrize("rows", [[], [{"c": "0050"}], [None]])
+def test_mis_empty_probe_invalidates_previous_readiness_and_closes_session(monkeypatch, rows):
+    closed = []
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.cookies = requests.cookies.RequestsCookieJar()
+
+        def get(self, _url, **_kwargs):
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                   json=lambda: {"msgArray": rows})
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_BOOTSTRAP_AT", time.monotonic())
+    monkeypatch.setattr(quote_provider, "_TW_MIS_BOOTSTRAP_COOKIES", {"old": "stale"})
+    with pytest.raises(RuntimeError, match="no requested probe row"):
+        quote_provider.warm_tw_mis_quote_client(force=True)
+    assert quote_provider._TW_MIS_BOOTSTRAP_AT == 0.0
+    assert quote_provider._TW_MIS_BOOTSTRAP_COOKIES == {}
+    assert closed == [True]
+
+
 def test_tw_mis_opening_snapshot_persists_same_session_observation(
     monkeypatch,
     tmp_path,
+    opening_clock,
 ) -> None:
-    session_timestamp_ms = int(
-        datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000
-    )
+    session_timestamp_ms = int(opening_clock.timestamp() * 1000)
 
     class FakeSession:
         def __init__(self) -> None:
@@ -592,6 +617,24 @@ def test_tw_mis_opening_snapshot_persists_same_session_observation(
     )
     assert status["ready"] is True
     assert status["row_count"] == 1
+
+
+def test_mis_failed_requests_keep_safe_transport_evidence(monkeypatch, tmp_path) -> None:
+    class FailedSession:
+        def __init__(self):
+            self.headers = {}
+        def get(self, *args, **kwargs):
+            raise ConnectionError("private credential and query must not persist")
+    monkeypatch.setattr(quote_provider.requests, "Session", FailedSession)
+    snapshot = fetch_tw_mis_last_prices(
+        ["2330"], np.array([90.0]), parquet_root=tmp_path,
+        empty_chunk_retry_attempts=0, on_progress=lambda *args: None,
+    )
+    assert snapshot.available_count == 0
+    assert snapshot.transport_timing["mis_failed_request_count"] > 0
+    assert snapshot.transport_timing["mis_failure_types"] == ["ConnectionError"]
+    assert "private credential" not in str(snapshot.transport_timing)
+    assert not np.isfinite(snapshot.open_prices).any()
 
 
 def test_fetch_tw_mis_retries_empty_chunks_without_using_last_as_open(monkeypatch, tmp_path) -> None:
@@ -683,10 +726,10 @@ def test_fetch_tw_mis_preserves_official_no_limit_band(monkeypatch, tmp_path) ->
 
 
 def test_tw_opening_snapshot_is_single_flight_and_shared_across_models(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, opening_clock
 ) -> None:
     calls: list[list[str]] = []
-    now_ms = int(time.time() * 1000)
+    now_ms = int(opening_clock.timestamp() * 1000)
 
     def fake_fetch(symbols, fallback_prices, **kwargs):
         del kwargs
@@ -767,10 +810,10 @@ def test_tw_opening_snapshot_does_not_cache_all_empty_preopen_observation(
 
 
 def test_tw_opening_snapshot_retries_only_symbols_whose_open_is_still_missing(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, opening_clock
 ) -> None:
     calls: list[list[str]] = []
-    now_ms = int(time.time() * 1000)
+    now_ms = int(opening_clock.timestamp() * 1000)
 
     def fake_fetch(symbols, fallback_prices, **kwargs):
         calls.append(list(symbols))
@@ -820,9 +863,9 @@ def test_tw_opening_snapshot_retries_only_symbols_whose_open_is_still_missing(
 
 
 def test_tw_opening_snapshot_shares_shioaji_fallback_without_refetch(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, opening_clock
 ) -> None:
-    now_ms = int(time.time() * 1000)
+    now_ms = int(opening_clock.timestamp() * 1000)
     monkeypatch.setenv(
         "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts")
     )
@@ -1131,3 +1174,75 @@ def test_fetch_yahoo_last_prices_falls_back_to_parallel_chart(monkeypatch, tmp_p
     assert max_active <= 4
     assert request_count == len(symbols)
     assert result.source == "yahoo:quote+chart"
+
+
+def test_stock_quote_wakeup_is_pending_only_nontrial_and_coalesced():
+    import select
+    from stockagent.live.quote_provider import StockQuoteWakeup
+
+    wakeup = StockQuoteWakeup()
+    try:
+        if wakeup.fd is None:
+            pytest.skip("nonblocking pipe unavailable")
+        wakeup.arm({"2330"})
+        for symbol, flag in (("0050", False), ("2330", True), ("2330", None)):
+            wakeup.notify(symbol, simtrade=flag)
+        assert select.select([wakeup.fd], [], [], 0)[0] == []
+        assert wakeup.consume() is False
+        for _ in range(100):
+            wakeup.notify("2330", simtrade=False)
+        assert select.select([wakeup.fd], [], [], 0)[0] == [wakeup.fd]
+        assert wakeup.consume() is True
+        assert wakeup.consume() is False
+        assert select.select([wakeup.fd], [], [], 0)[0] == []
+        wakeup.arm(set())
+        wakeup.notify("2330", simtrade=False)
+        assert wakeup.consume() is False
+    finally:
+        wakeup.close()
+
+
+def test_shared_quote_timeout_survives_frozen_wall_clock(monkeypatch, tmp_path):
+    ticks = [0.0]
+
+    def sleep(seconds):
+        ticks[0] += seconds
+
+    # Replace only this module's clock, not the stdlib clock used by pytest or
+    # filesystem mtimes. This models a stalled/corrected WSL wall clock.
+    monkeypatch.setattr(quote_provider, "time", SimpleNamespace(
+        time=lambda: 1234.0, monotonic=lambda: ticks[0],
+        perf_counter=lambda: ticks[0], sleep=sleep,
+    ))
+    with pytest.raises(TimeoutError):
+        quote_provider.fetch_shared_day_trade_stock_snapshots(
+            ["2330"], np.array([100.0]), state_dir=tmp_path,
+            timeout_seconds=0.25,
+        )
+    assert 0.25 <= ticks[0] < 0.27
+
+
+def test_native_book_wakeup_preserves_clock_and_ignores_older_events(monkeypatch):
+    wakeup = quote_provider.StockQuoteWakeup()
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_WAKEUP", wakeup)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STREAM_ROWS", {})
+    exchange = datetime(2026, 10, 12, 9, 0, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    receipt = exchange + timedelta(milliseconds=4)
+    event = SimpleNamespace(code="2330", datetime=exchange, simtrade=False,
+                            bid_price=[100.0], ask_price=[101.0],
+                            bid_volume=[10], ask_volume=[20])
+    try:
+        if wakeup.fd is None:
+            pytest.skip("nonblocking pipe unavailable")
+        wakeup.arm({"2330"})
+        quote_provider._record_stock_stream_event("book", event, received=receipt)
+        assert wakeup.consume() is True
+        row = quote_provider._SHIOAJI_STREAM_ROWS["2330"]["book"]
+        assert row["exchange_at"] == exchange.isoformat()
+        assert row["received_at"] == receipt.isoformat()
+        event.datetime = exchange - timedelta(milliseconds=1)
+        quote_provider._record_stock_stream_event("book", event, received=receipt)
+        assert wakeup.consume() is False
+        assert quote_provider._SHIOAJI_STREAM_ROWS["2330"]["book"] == row
+    finally:
+        wakeup.close()

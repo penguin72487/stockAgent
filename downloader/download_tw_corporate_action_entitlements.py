@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 import polars as pl
@@ -354,6 +355,16 @@ def _public_access_denial_response(content: bytes) -> bool:
     ))
 
 
+def _retain_rejected_source_response(path: Path, content: bytes) -> None:
+    """Keep denial evidence without admitting it to a successful raw manifest."""
+
+    rejected = path.parent / "rejected" / f"{_sha256_bytes(content)}.response"
+    if not rejected.exists():
+        _write_bytes_atomic(rejected, content)
+    elif rejected.read_bytes() != content:
+        raise RuntimeError(f"rejected-response hash collision: {rejected}")
+
+
 def _cached_or_post(
     path: Path,
     *,
@@ -375,11 +386,7 @@ def _cached_or_post(
             # never register it as a successful issuer/source receipt. Retry
             # the canonical endpoint; do not treat cached denial as permanent
             # data or try to bypass the publisher's access controls.
-            rejected = path.parent / "rejected" / f"{_sha256_bytes(content)}.response"
-            if not rejected.exists():
-                _write_bytes_atomic(rejected, content)
-            elif rejected.read_bytes() != content:
-                raise RuntimeError(f"rejected-response hash collision: {rejected}")
+            _retain_rejected_source_response(path, content)
         else:
             _record_raw_receipt_request(path, url=url, data=data, content=content, method=method)
             return content
@@ -420,6 +427,7 @@ def _cached_or_post(
             response.close()
             response = None
             if _mops_throttle_response(candidate) or _public_access_denial_response(candidate):
+                _retain_rejected_source_response(path, candidate)
                 last_error = RuntimeError(
                     "official source returned an HTTP-200 throttle/access-denial page"
                 )
@@ -1295,6 +1303,45 @@ def _mutable_receipt_suffix(*, disclosure_year: int, args: argparse.Namespace) -
     return ""
 
 
+def _entitlement_input_change_errors(
+    reference_receipt: dict[str, Any],
+    universe_receipt: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Reject an optimistic build if either exact input changed during work.
+
+    Canonical coordinators already serialize writers. This second fence also
+    protects a standalone collector from publishing a ledger computed from an
+    obsolete reference/universe after a concurrent source update.
+    """
+
+    errors: list[dict[str, str]] = []
+    for label, expected in (
+        ("reference", reference_receipt),
+        ("universe", universe_receipt),
+    ):
+        try:
+            path = Path(expected["path"])
+            actual = (
+                _verified_reference_receipt(path)
+                if label == "reference"
+                else _file_receipt(path)
+            )
+            keys = (
+                ("size", "sha256", "summary_sha256", "rows")
+                if label == "reference"
+                else ("size", "sha256")
+            )
+            if any(actual.get(key) != expected.get(key) for key in keys):
+                raise ValueError(f"{label} input changed during entitlement build")
+        except (OSError, KeyError, TypeError, ValueError, pl.exceptions.PolarsError) as exc:
+            errors.append({
+                "stage": "input_dependency_changed",
+                "key": label,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return errors
+
+
 def _requested_listing_keys(company_events: pl.DataFrame) -> list[ListingKey]:
     keys: set[ListingKey] = set()
     for row in company_events.select("market", "symbol", "date").iter_rows(named=True):
@@ -1650,6 +1697,7 @@ def _attach_exact_stock_delivery_dates(
             "stock_delivery_detail_elapsed_seconds": 0.0,
         }, False
 
+    disclosure_end_year = datetime.now(ZoneInfo("Asia/Taipei")).year
     listing_keys = sorted(
         {
             ListingKey(
@@ -1659,6 +1707,10 @@ def _attach_exact_stock_delivery_dates(
             )
             for row in candidates
             for year in (row["date"].year, row["date"].year + 1)
+            # An issuer's disclosure-year listing cannot contain a future
+            # year's announcements. Historical following-year evidence stays
+            # in scope; only not-yet-observable requests are excluded.
+            if year <= disclosure_end_year
         },
         key=lambda value: (value.market, value.symbol, value.roc_year),
     )
@@ -1782,6 +1834,7 @@ def _attach_exact_stock_delivery_dates(
         "parsed_stock_delivery_details": len(detail_rows),
         "resolved_stock_delivery_events": resolved,
         "unresolved_stock_delivery_events": len(candidates) - resolved,
+        "stock_delivery_disclosure_through_year": disclosure_end_year,
         "stock_delivery_listing_elapsed_seconds": round(listing_elapsed, 3),
         "stock_delivery_detail_elapsed_seconds": round(detail_elapsed, 3),
     }, bool(detail_limited or listing_limited)
@@ -2043,6 +2096,11 @@ def _run(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         raw_root=raw_root,
     )
+    if complete:
+        failures.extend(
+            _entitlement_input_change_errors(reference_receipt, universe_receipt)
+        )
+        complete = not failures
     # An incomplete smoke/repair never replaces the established production
     # ledger.  Persist its audit summary only.
     if complete:
@@ -2063,6 +2121,7 @@ def _run(args: argparse.Namespace) -> None:
         **stock_delivery_counts,
         "etf_sources": [TWSE_ETF_DIVIDEND_URL, TPEX_ETF_DIVIDEND_URL],
         "etf_parser_contract_version": ETF_PARSER_CONTRACT_VERSION,
+        "source_acquisition_contract": "session_bounded_delivery_years_and_dependency_fence_v1",
         "etf_source_issues": [{"date": str(row["date"]), "symbol": row["symbol"],
                               "issue": row["source_issue"]}
                              for row in etf_rows if row.get("source_issue")],

@@ -73,6 +73,68 @@ def _quantile(values: list[float], fraction: float) -> float | None:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
+def json_service_statistics(root: Path, now: datetime) -> dict[str, Any]:
+    """Bounded accepted JSON request-to-store costs, not object-lane idle time.
+
+    Match a latest observation to its own queue completion clock. Old checks
+    cannot inherit a later retry's completion. No source files, writer migration
+    or provider call; at most 128 recent checks per owner and 32 matched samples.
+    """
+    from downloader.finmind_storage_objects import OBJECT_FIRST
+    from downloader.finmind_updates import DB_NAME
+    samples, priority, datasets, seen = [], [], {}, set()
+    for owner in ('sponsor', 'complement'):
+        try:
+            with _connect(root / owner / DB_NAME) as checks, _connect(root / owner / 'queue.sqlite3') as queue:
+                rows = checks.execute('SELECT request_id,dataset,data_id,partition,metadata_json FROM checks '
+                                      'ORDER BY id DESC LIMIT 128').fetchall()
+                accepted = 0
+                for request_id, dataset, identifier, partition, raw in rows:
+                    if request_id in seen or dataset in OBJECT_FIRST or len(raw) > 65536:
+                        continue
+                    value = json.loads(raw)
+                    start, received = _stamp(value.get('request_started_at_utc')), _stamp(value.get('checked_at_utc'))
+                    if not start or not received or not 0 <= (now - received).total_seconds() <= 86400:
+                        continue
+                    head = queue.execute('SELECT state,last_attempt_at_utc,priority FROM tasks '
+                                         'WHERE dataset=? AND data_id=? AND partition=?',
+                                         (dataset, identifier, partition)).fetchone()
+                    stream = checks.execute('SELECT checked_at_utc FROM streams '
+                                            'WHERE dataset=? AND data_id=? AND partition=?',
+                                            (dataset, identifier, partition)).fetchone()
+                    finish = _stamp(head[1]) if head else None
+                    # Only the latest accepted completion can bound local work;
+                    # a later day's scheduled refresh is not this response.
+                    if (not head or not stream or stream[0] != value.get('checked_at_utc')
+                            or head[0] not in {'complete', 'observed_empty'} or not finish
+                            or not start <= received <= finish <= now
+                            or (finish - received).total_seconds() > 300):
+                        continue
+                    seconds = (finish - start).total_seconds()
+                    if not 0 < seconds <= 600:
+                        continue
+                    seen.add(request_id)
+                    samples.append(seconds)
+                    datasets.setdefault(dataset, []).append(seconds)
+                    if head[2] == 0:
+                        priority.append(seconds)
+                    accepted += 1
+                    if accepted == 32:
+                        break
+        except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+            continue
+
+    def summarize(values):
+        return {'samples': len(values), 'rates': {
+            name: 3600 / seconds if (seconds := _quantile(values, fraction)) else None
+            for name, fraction in (('fastest', 0), ('central', .5), ('slowest', .9))},
+            'basis': 'accepted_json_request_to_own_latest_queue_completion_not_shared_idle_time'}
+    return {'pooled': summarize(samples), 'priority': summarize(priority),
+            'datasets': {dataset: summarize(values) for dataset, values in datasets.items()},
+            'scope': 'recent_24h_latest_matched_requests_not_success_rate_or_parallel_throughput',
+            'provider_calls': 0}
+
+
 def _distribution(bins: list[dict[str, Any]]) -> dict[str, Any]:
     complete = [item for item in bins if item["complete"]]
     active = [float(item["requests_per_hour"]) for item in complete if item["requests"] > 0]
@@ -479,9 +541,17 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
     traffic = _traffic(root, now)
     workers = {owner: _queue_worker(root / owner, owner, now) for owner in ("sponsor", "complement")}
     from downloader.finmind_storage_objects import transfer_statistics
+    from downloader.finmind_json_pipeline import measured_rates as json_pipeline_rates
+    json_pipelines = {}
     try:
         with _connect(root / 'complement' / 'queue.sqlite3') as conn:
             object_transfers = transfer_statistics(conn)
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='finmind_json_pipeline_samples'").fetchone():
+                for (dataset,) in conn.execute('SELECT DISTINCT dataset FROM '
+                                               '(SELECT dataset FROM finmind_json_pipeline_samples ORDER BY id DESC LIMIT 512)'):
+                    measured = json_pipeline_rates(conn, dataset, now)
+                    if measured:
+                        json_pipelines[dataset] = measured
     except (OSError, sqlite3.Error):
         object_transfers = {}
     free = _read_json(root / "status.json")
@@ -498,6 +568,8 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
         "state": "observed" if fresh and limit and traffic["state"] == "observed" else "insufficient_evidence",
         "quota": quota, "traffic": traffic, "workers": workers,
         "object_transfer_statistics": object_transfers,
+        "json_service_statistics": json_service_statistics(root, now),
+        "json_pipeline_statistics": json_pipelines,
         "limitations": [
             "request_starts_are_not_successful_completions",
             "queue_latest_outcomes_are_not_an_append_only_retry_history",

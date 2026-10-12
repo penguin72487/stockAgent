@@ -44,6 +44,38 @@ def test_pending_selected_task_cannot_be_reported_as_complete(registry,tmp_path)
     assert result['completed_download_tasks_audited']==4
 
 
+def test_scoped_exact_original_cell_verification(registry,tmp_path):
+    root,tasks=completed_batch(registry)
+    result=audit(root,tmp_path/'exact',task_ids=tasks[:1],verify_original_cells=True)
+    assert result['accepted'] and result['original_source_cells_verified']
+    assert result['original_source_cells_checked']>0
+
+
+def test_rehashed_changed_source_value_still_fails_exact_cell_verification(registry,tmp_path):
+    import hashlib
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from downloader.artifact_io import atomic_write_json
+    root,tasks=completed_batch(registry)
+    task_id=tasks[0]
+    receipt_path=root/'receipts'/(task_id+'.json')
+    receipt=json.loads(receipt_path.read_text())
+    path=root/receipt['parquet_path']; frame=pq.read_table(path)
+    column=frame.column_names[2];values=frame[column].to_pylist()
+    values[0]=values[0]+'-changed' if isinstance(values[0],str) else values[0]+1
+    frame=frame.set_column(2,frame.schema.field(2),pa.array(values,type=frame[column].type))
+    pq.write_table(frame,path,compression='zstd')
+    receipt['parquet_bytes']=path.stat().st_size
+    receipt['parquet_sha256']=hashlib.sha256(path.read_bytes()).hexdigest()
+    atomic_write_json(receipt_path,receipt)
+    with closing(connect(root)) as con,con:
+        con.execute('UPDATE tasks SET actual_bytes=? WHERE task_id=?',(receipt['raw_bytes']+receipt['parquet_bytes'],task_id))
+    result=audit(root,tmp_path/'changed',task_ids=[task_id],verify_original_cells=True)
+    assert not result['accepted'] and not result['original_source_cells_verified']
+    assert 'original_source_cell_mismatch' in (tmp_path/'changed'/'receipt_integrity.csv').read_text()
+
+
 @pytest.mark.parametrize('selection',[[],['unknown'],['one','one']])
 def test_invalid_selected_scope_fails_before_an_acceptance_artifact(registry,tmp_path,selection):
     root,_=completed_batch(registry)

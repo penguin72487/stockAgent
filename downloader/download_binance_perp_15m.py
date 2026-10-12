@@ -38,6 +38,7 @@ from artifact_io import (  # noqa: E402
     atomic_write_text,
 )
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
+from candle_columns import numeric_candle_page  # noqa: E402
 from quality_priority import collect_with_quality_priority, prioritize_records  # noqa: E402
 from dataset_lock import (  # noqa: E402
     DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -586,6 +587,26 @@ def _validate_candles(frame: pl.DataFrame) -> None:
 
 
 def _normalize_candles(raw_rows: list[list[Any]]) -> pl.DataFrame:
+    schema = {
+        "open_time_ms": pl.Int64, "open": pl.Float64, "max": pl.Float64,
+        "min": pl.Float64, "close": pl.Float64, "binance_volume_base": pl.Float64,
+        "binance_close_time_ms": pl.Int64, "binance_volume_quote": pl.Float64,
+        "binance_trade_count": pl.Int64, "binance_taker_buy_base_volume": pl.Float64,
+        "binance_taker_buy_quote_volume": pl.Float64,
+    }
+    frame = numeric_candle_page(raw_rows, schema, timestamp="open_time_ms", skip_short_rows=True)
+    if frame is None:
+        return _normalize_candles_reference(raw_rows)
+    frame = (frame.with_columns(pl.col("close").alias("adjclose"),
+                               pl.col("binance_volume_base").alias("Trading_Volume"))
+             .sort("open_time_ms").unique(subset=["date"], keep="last", maintain_order=True)
+             .sort("date").select(OUTPUT_COLUMNS))
+    _validate_candles(frame)
+    return frame
+
+
+def _normalize_candles_reference(raw_rows: list[list[Any]]) -> pl.DataFrame:
+    """Scalar compatibility/error oracle for uncommon payload representations."""
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         if len(row) < 11:

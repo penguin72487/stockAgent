@@ -34,12 +34,14 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dict:
+def audit(root: Path, output: Path, *, task_ids: list[str] | None = None,
+          verify_original_cells: bool = False) -> dict:
     """Audit only completed v4 scope receipts captured in one SQL snapshot.
 
     A collector may commit more work after that snapshot. Those later tasks
     are explicitly outside this audit, rather than a mixed current total.
     """
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     if task_ids is not None and (not task_ids or len(set(task_ids)) != len(task_ids)):
@@ -70,6 +72,7 @@ def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dic
                      for r in selected if r['state']=='blocked']
         snapshot_at=datetime.now(UTC).isoformat()
     results=[]; cells=Counter(); failed=0; bound_attempts=0; key3_tasks=0; snapshot_tasks=0; header_mapping_tasks=0; month_key_tasks=0
+    original_cells_checked = 0
     for task in tasks:
         result={'task_id':task['task_id'],'table_name':definitions[task['table_id']]['name'],
                 'completed_at_utc':task['completed_at_utc'],'rows':task['actual_rows'],
@@ -146,6 +149,15 @@ def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dic
                 bound_attempts+=1
             if not len(rows) == receipt['exported_rows'] == task['actual_rows'] == pq.read_metadata(parquet).num_rows:
                 raise ValueError('row_count_mismatch')
+            if verify_original_cells:
+                stored = pq.read_table(parquet, columns=headers)
+                for index, name in enumerate(headers):
+                    values = [row[index] for row in rows]
+                    numeric = all(v is None or isinstance(v,(float,int)) and not isinstance(v,bool) for v in values)
+                    expected = pa.array(values) if numeric else pa.array([None if v is None else str(v) for v in values])
+                    if not stored[name].equals(pa.chunked_array([expected])):
+                        raise ValueError('original_source_cell_mismatch')
+                    original_cells_checked += len(values)
             if (raw.stat().st_size != receipt['raw_bytes'] or parquet.stat().st_size != receipt['parquet_bytes']
                     or raw.stat().st_size+parquet.stat().st_size != task['actual_bytes']):
                 raise ValueError('artifact_size_mismatch')
@@ -161,7 +173,8 @@ def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dic
             # a report. Detailed originals remain in the private source tree.
             safe={'receipt_identity_mismatch','artifact_scope_mismatch','artifact_digest_mismatch',
                   'source_task_mismatch','row_count_mismatch','artifact_size_mismatch','source_count_mismatch',
-                  'source_key_layout_mismatch','desktop_attempt_mismatch','source_header_mapping_mismatch','source_period_key_mismatch'}
+                  'source_key_layout_mismatch','desktop_attempt_mismatch','source_header_mapping_mismatch','source_period_key_mismatch',
+                  'original_source_cell_mismatch'}
             result['error_code']=str(exc) if str(exc) in safe else 'local_receipt_or_source_validation_failed'
             failed+=1
         results.append(result)
@@ -181,7 +194,7 @@ def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dic
                 tick=time.perf_counter(); _ready_task(con,snapshot_at,kind,{'download_burst':4})
                 samples.append(time.perf_counter()-tick)
             timings[kind]={'first_seconds':samples[0],'median_seconds':median(samples),'samples':len(samples)}
-    report={'contract':'tej_local_receipt_integrity_audit_v4','started_at_utc':started.isoformat(),
+    report={'contract':'tej_local_receipt_integrity_audit_v6' if verify_original_cells else 'tej_local_receipt_integrity_audit_v4','started_at_utc':started.isoformat(),
             'sql_snapshot_at_utc':snapshot_at,'finished_at_utc':datetime.now(UTC).isoformat(),
             'provider':'tej_smart_wizard','source_scope_contract':SOURCE_SCOPE_CONTRACT,
             'completed_download_tasks_audited':len(tasks),'local_artifact_failures':failed,
@@ -195,6 +208,8 @@ def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dic
             'audit_scope':'selected_tasks' if selected is not None else 'all_completed_current_contract_tasks',
             'selected_task_ids':sorted(task_ids) if task_ids is not None else None,
             'all_selected_tasks_completed':all_selected_completed,
+            'original_source_cells_verified':verify_original_cells and failed==0 and original_cells_checked>0,
+            'original_source_cells_checked':original_cells_checked if verify_original_cells else None,
             'accepted':bool(tasks) and failed==0 and registry_mismatches in (None,0) and all_selected_completed,
             'exported_rows':sum(r['rows'] or 0 for r in results if r['accepted']),
             'exported_non_null_cells':sum(r['non_null_cells'] or 0 for r in results if r['accepted']),
@@ -204,7 +219,8 @@ def audit(root: Path, output: Path, *, task_ids: list[str] | None = None) -> dic
                       'observed_at_utc':worker.get('observed_at_utc')},
             'task_selection_benchmark':timings,'raw_values_exposed':False,'provider_queries_sent':0,
             'native_history_completeness_verified':False,'publication_timestamps_verified':False,
-            'interpretation':'Local hashes, row/nonempty-cell counts and source key/schema validation only; later commits and vendor-native completeness are outside this snapshot.'}
+            'interpretation':('Local hashes, row/nonempty-cell counts, source key/schema and every original stored source column verified; later commits and vendor-native completeness are outside this snapshot.' if verify_original_cells else
+                              'Local hashes, row/nonempty-cell counts and source key/schema validation only; later commits and vendor-native completeness are outside this snapshot.')}
     output.mkdir(parents=True)
     stream=io.StringIO(newline='');writer=csv.DictWriter(stream,list(results[0]) if results else ['task_id','accepted'])
     writer.writeheader();writer.writerows(results)
@@ -217,6 +233,7 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',type=Path,default=ROOT/'data_tej')
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--verify-original-cells',action='store_true',help='Independently compare every original Parquet cell against raw source readback')
     parser.add_argument('--task-registration',type=Path,
                         help='Audit only the finite tasks in an existing source-bound priority registration')
     args=parser.parse_args(argv)
@@ -228,7 +245,7 @@ def main(argv=None):
                 or _digest(Path(registration['plan_path']))!=registration['plan_sha256']):
             raise ValueError('Priority registration no longer matches its source-bound plan')
         task_ids=[r['task_id'] for r in registration['tasks']]
-    report=audit(args.root,args.output,task_ids=task_ids)
+    report=audit(args.root,args.output,task_ids=task_ids,verify_original_cells=args.verify_original_cells)
     if args.task_registration is not None:
         report['task_registration_sha256']=_digest(args.task_registration)
         atomic_write_json(args.output/'audit.json',report)

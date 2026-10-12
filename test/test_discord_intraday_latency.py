@@ -15,6 +15,77 @@ from services.discord_bot import bot as discord_bot
 from stockagent.live import quote_provider, signal_engine
 
 
+def test_opening_input_wait_records_structured_counts_without_result():
+    cfg = SimpleNamespace(market="test", timezone="Asia/Taipei", open_time="09:00")
+    with pytest.raises(signal_engine.TWOpeningInputCoveragePending) as caught:
+        signal_engine._require_day_trade_opening_coverage(
+            live_session=True, active=2290, opens=1889, no_prints=0,
+            responses=2290, required=2061, model_observation="session_open",
+        )
+    record = discord_bot._opening_signal_latency_record(
+        cfg=cfg, session_date="2026-10-12", schedule_key="fixture", timing={},
+        result=None, error=caught.value,
+    )
+    assert record["status"] == "failed"
+    assert record["error_code"] == "tw_opening_input_coverage_pending"
+    assert record["opening_input_coverage"]["required"] == 2061
+    assert record["signal_id"] is None
+    assert record["ready_from_open_ms"] is None
+
+
+def test_opening_repair_keeps_failed_attempt_and_retries_without_inference(monkeypatch, tmp_path):
+    monkeypatch.setattr(discord_bot, "_day_trade_state_dir", lambda: tmp_path)
+
+    def fail(**kwargs):
+        raise ConnectionError("source unavailable")
+
+    monkeypatch.setattr(discord_bot, "repair_tw_opening_snapshot_receipt", fail)
+    first = discord_bot._opening_source_repair_sync(str(tmp_path), "2026-10-07", 1)
+    assert first["status"] == "failed"
+    assert first["error_type"] == "ConnectionError"
+    monkeypatch.setattr(discord_bot, "repair_tw_opening_snapshot_receipt", lambda **kwargs: {
+        "status": "complete", "valid_open_count": 2294, "missing_open_count": 0,
+    })
+    second = discord_bot._opening_source_repair_sync(str(tmp_path), "2026-10-07", 2)
+    assert second["status"] == "complete"
+    attempts = [__import__("json").loads(line) for line in (tmp_path / "opening_source_repair_latency.jsonl").read_text().splitlines()]
+    assert [row["status"] for row in attempts] == ["failed", "complete"]
+    assert all(not row["inference_performed"] and not row["orders_submitted"] for row in attempts)
+
+
+@pytest.mark.parametrize("busy", [True, False])
+def test_background_opening_repair_runs_between_retries_without_circular_wait(monkeypatch, tmp_path, busy):
+    now = datetime.fromisoformat("2026-10-07T09:00:10+08:00")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("fixture")
+    cfg = SimpleNamespace(day_trade_simulation_enabled=True, config_path=str(cfg_path))
+    calls = []
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_market_configs", lambda: {"test": cfg})
+    monkeypatch.setattr(discord_bot, "_market_enabled", lambda cfg: True)
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *a: (True, "fixture"))
+    monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *a: "retry" if busy else "completed")
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", None)
+    monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_retry_at", {})
+    monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_attempts", {})
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_root", lambda *a: str(tmp_path))
+
+    def repair(*args):
+        calls.append(args)
+        return {"status": "waiting_source", "recovered_count": 0}
+
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_sync", repair)
+    asyncio.run(discord_bot.opening_source_repair.coro())
+    asyncio.run(discord_bot.opening_source_repair.coro())
+    assert len(calls) == 1
+
+
 def test_overlapping_commands_share_work_cancel_independently_and_next_call_is_fresh(monkeypatch):
     calls = []
     release = asyncio.Event()
@@ -88,6 +159,153 @@ def test_quote_io_can_overlap_but_model_runtime_stays_serialized(monkeypatch):
                 for name in ("a", "b")]
         assert [job.result(timeout=3) for job in jobs] == ["a", "b"]
     assert peak == 1
+
+
+def test_scheduled_prefetch_overlaps_and_ready_mode_is_not_held_by_slow_mode(monkeypatch):
+    started = {name: asyncio.Event() for name in ("slow", "fast")}
+    release = asyncio.Event()
+    source_calls = []
+
+    async def prepare(cfg):
+        source_calls.append(cfg.market)
+        started[cfg.market].set()
+        if cfg.market == "slow":
+            await release.wait()
+        return ("tw", cfg.market, False), None, 1.0, cfg.market, {}
+
+    monkeypatch.setattr(discord_bot, "_prepare_scheduled_inputs", prepare)
+
+    async def exercise():
+        due = [(SimpleNamespace(market=name), None, name, False) for name in ("slow", "fast")]
+        tasks = {row[0].market: asyncio.create_task(discord_bot._prepare_scheduled_inputs(row[0])) for row in due}
+        iterator = discord_bot._scheduled_inputs_ready_order(due, tasks)
+        row, inputs = await anext(iterator)
+        assert all(event.is_set() for event in started.values())
+        assert row[0].market == "fast" and inputs[3] == "fast"
+        assert not tasks["slow"].done()
+        release.set()
+        row, inputs = await anext(iterator)
+        assert row[0].market == "slow" and inputs[3] == "slow"
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+
+    asyncio.run(exercise())
+    assert source_calls == ["slow", "fast"]
+
+
+def test_parallel_input_watchdog_tracks_oldest_and_clears_cancelled_tasks(monkeypatch):
+    monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {
+        "slow": {"market": "slow", "started_monotonic": 10.0, "hot": True},
+        "fast": {"market": "fast", "started_monotonic": 11.0, "hot": True},
+    })
+    assert discord_bot._oldest_opening_input_stage()["market"] == "slow"
+
+    async def exercise():
+        blocked = asyncio.Event()
+        slow, fast = (SimpleNamespace(market=name) for name in ("slow", "fast"))
+        tasks = {"slow": asyncio.create_task(blocked.wait()),
+                 "fast": asyncio.create_task(asyncio.sleep(0, result="ready"))}
+        iterator = discord_bot._scheduled_inputs_ready_order(
+            [(slow, None, None, False), (fast, None, None, False)], tasks)
+        row, result = await anext(iterator)
+        assert row[0].market == "fast" and result == "ready"
+        assert set(discord_bot.bot._opening_input_stages) == {"slow"}
+        await iterator.aclose()
+        assert tasks["slow"].cancelled()
+        assert discord_bot._oldest_opening_input_stage() is None
+
+    asyncio.run(exercise())
+
+
+def test_scheduled_source_failure_is_a_value_and_does_not_run_model(monkeypatch):
+    cfg = SimpleNamespace(market="failed", day_trade_simulation_enabled=True)
+
+    async def prepare(_cfg):
+        return ("tw", "verified-status", False), None, 2.0
+
+    def fail(**kwargs):
+        assert kwargs["prepared_status"] == "verified-status"
+        assert discord_bot._MODEL_INFERENCE_LOCK.acquire(blocking=False)
+        discord_bot._MODEL_INFERENCE_LOCK.release()
+        raise ConnectionError("credential=never-persist-this")
+
+    monkeypatch.setattr(discord_bot, "_prepare_scheduled_signal", prepare)
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **kwargs: kwargs)
+    monkeypatch.setattr(discord_bot, "prefetch_live_signal_prices", fail)
+    monkeypatch.setattr(discord_bot, "generate_live_signal", lambda **kw: pytest.fail("preparation must not infer"))
+    prepared, error, prepare_ms, quote, timing = asyncio.run(discord_bot._prepare_scheduled_inputs(cfg))
+    assert prepared[0] == "tw" and prepare_ms == 2.0
+    assert isinstance(error, ConnectionError) and quote is None
+    assert timing["signal_stage"] == "quote_prefetch_outside_model_lock"
+    assert timing["parallel_quote_prefetch_ms"] >= 0
+    assert "never-persist-this" not in str(timing)
+
+
+def test_scheduled_prefetched_quote_is_revalidated_by_canonical_model_owner(monkeypatch):
+    quote = object()
+    monkeypatch.setenv("STOCKAGENT_BOT_PROGRESS", "0")
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **kwargs: kwargs)
+    monkeypatch.setattr(discord_bot, "prefetch_live_signal_prices", lambda **kw: pytest.fail("no duplicate source fetch"))
+
+    def infer(**kwargs):
+        assert kwargs["_prefetched_quote"] is quote
+        return "same-canonical-validation"
+
+    monkeypatch.setattr(discord_bot, "generate_live_signal", infer)
+    assert discord_bot._run_market_signal_sync(
+        market="test", _prefetch_prices=True, _prefetched_quote=quote,
+    ) == "same-canonical-validation"
+
+
+def test_session_open_prefetch_uses_the_same_validated_request(monkeypatch, tmp_path):
+    config = SimpleNamespace(trading=SimpleNamespace(execution_mode="tw_day_trade"), runner=SimpleNamespace(output_dir=str(tmp_path)), training=SimpleNamespace(lookback=1))
+    panel = SimpleNamespace(features=np.zeros((1, 1, 1)))
+    request = dict(source="tw", symbols=["2330"], fallback_prices=np.array([99.0]), require_official_tw_session_open=True)
+    calls = []
+    monkeypatch.setattr(signal_engine, "load_config", lambda *args: config)
+    monkeypatch.setattr(signal_engine, "_resolve_checkpoint", lambda *args: (11, tmp_path / "checkpoint.pt"))
+    monkeypatch.setattr(signal_engine, "_cached_checkpoint", lambda *args: ({"model_state_dict": {}}, "original-checkpoint", True))
+    monkeypatch.setattr(signal_engine, "_build_panel", lambda *args, **kwargs: (panel, True, "memory"))
+    monkeypatch.setattr(signal_engine, "_cached_aligned_panel", lambda *args, **kwargs: (panel, True))
+    monkeypatch.setattr(signal_engine, "_resolve_usable_panel_index", lambda *args: (0, None))
+
+    def quote_request(**kwargs):
+        assert kwargs["observation"] == "session_open"
+        return request
+
+    def source(**kwargs):
+        calls.append(kwargs)
+        return quote_provider.PriceSnapshot(prices=np.array([100.0]), source="fixture:opening")
+
+    monkeypatch.setattr(signal_engine, "_live_quote_request", quote_request)
+    monkeypatch.setattr(signal_engine, "_price_snapshot", source)
+    result = signal_engine.prefetch_live_signal_prices(config_path=tmp_path / "model.yaml", day_trade_model_observation="session_open", price_source="tw")
+    assert result.request_key == signal_engine._live_quote_request_key(request)
+    assert result.snapshot.source == "fixture:opening"
+    assert len(calls) == 1 and calls[0]["require_official_tw_session_open"] is True
+
+
+def test_failed_opening_prefetch_preserves_its_stage_and_does_not_hold_model_lock(monkeypatch):
+    monkeypatch.setenv("STOCKAGENT_BOT_PROGRESS", "0")
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **kwargs: kwargs)
+
+    def failed(**kwargs):
+        acquired = discord_bot._MODEL_INFERENCE_LOCK.acquire(blocking=False)
+        assert acquired
+        discord_bot._MODEL_INFERENCE_LOCK.release()
+        raise TimeoutError("full-market quote source did not reach quorum")
+
+    monkeypatch.setattr(discord_bot, "prefetch_live_signal_prices", failed)
+    monkeypatch.setattr(discord_bot, "generate_live_signal", lambda **kwargs: pytest.fail("source failure cannot run model"))
+    timing = {}
+    error = TimeoutError("source did not reach quorum")
+    with pytest.raises(TimeoutError):
+        discord_bot._run_market_signal_sync(market="test", _prefetch_prices=True, _timing_sink=timing)
+    cfg = SimpleNamespace(market="test", timezone="Asia/Taipei", open_time="09:00")
+    record = discord_bot._opening_signal_latency_record(cfg=cfg, session_date="2026-10-08", schedule_key="test:2026-10-08", timing=timing, result=None, error=error)
+    assert record["failure_stage"] == "quote_prefetch_outside_model_lock"
+    assert record["stages"]["quote_prefetch_outside_model_lock_ms"] >= 0
+    assert record["status"] == "failed"
 
 
 def test_alignment_cache_requires_same_panel_and_checkpoint_and_skips_legacy(monkeypatch):

@@ -19,6 +19,7 @@ const allPages = [
   ["shioaji", "/shioaji/"],
   ["finlab", "/finlab/"],
   ["finmind", "/finmind/"],
+  ["news", "/news/"],
   ["tej", "/tej/"],
   ["openbb", "/openbb/"],
   ["data-monitor", "/data-monitor/"],
@@ -37,6 +38,7 @@ const representativeControls = {
   shioaji: {selector: "button[data-filter='historical']"},
   finlab: {selector: "button[data-pipeline-filter='historical']"},
   finmind: {selector: "button[data-pipeline-filter='session_history']"},
+  news: {selector: "button[data-news-filter='enabled']"},
   openbb: {selector: "button[data-range='1h']", apiPath: "/openbb/api/history"},
   "data-monitor": {selector: "#status-filter", value: "complete"},
   "data-provider": {selector: "#provider-status-filter", value: "complete"},
@@ -112,18 +114,31 @@ async function connect(webSocketUrl) {
   return {socket, send, consoleErrors, pendingApi, failedApi};
 }
 
-async function waitUntilReady(send, pendingApi) {
+async function waitUntilReady(send, pendingApi, {requiredApiPath = null} = {}) {
   const deadline = Date.now() + 30000;
-  let quietSince = null;
+  let initialRequests = null;
   while (Date.now() < deadline) {
     const result = await send("Runtime.evaluate", {
-      expression: "document.readyState",
+      expression: `({state:document.readyState, requiredApiReady:${requiredApiPath
+        ? `(window.StockAgentDashboard?.performanceSnapshot?.() || []).some(row =>
+            row.path === ${JSON.stringify(requiredApiPath)} && row.outcome === 'ok'
+            && row.status >= 200 && row.status < 300)`
+        : "true"}})`,
       returnByValue: true,
     });
-    if (result.result?.value === "complete" && pendingApi.size === 0) {
-      quietSince ??= Date.now();
-      if (Date.now() - quietSince >= 1000) return;
-    } else quietSince = null;
+    if (result.result?.value?.state === "complete") {
+      // Capture the initial request cohort, not every subsequent live poll.
+      // A functioning SSE dashboard may never have a second of network idle.
+      initialRequests ??= new Set(pendingApi.keys());
+      if (result.result.value.requiredApiReady
+          && [...initialRequests].every(id => !pendingApi.has(id))) {
+        await send("Runtime.evaluate", {
+          expression: "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+          awaitPromise: true,
+        });
+        return;
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Page readiness deadline; pending APIs: ${[...pendingApi.values()].join(", ")}`);
@@ -375,7 +390,10 @@ for (const [name, suffix] of pages) {
     maxTouchPoints: emulateMobile ? 5 : 1,
   });
   await send("Page.navigate", {url: `${baseUrl}${suffix}`});
-  await waitUntilReady(send, pendingApi);
+  await waitUntilReady(send, pendingApi, {
+    requiredApiPath: ["tw-day-trade", "tw-overnight"].includes(name)
+      ? `${suffix}api/status` : null,
+  });
   const initialApiResources = await send("Runtime.evaluate", {
     expression: `performance.getEntriesByType('resource')
       .filter(row=>row.name.includes('/api/')&&!row.name.includes('/updates'))

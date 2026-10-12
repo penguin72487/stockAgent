@@ -23,6 +23,9 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Accessibility
+function Compile-TejNativeHelper([string]$AssemblyOutput) {
+    $compileOptions=@{}
+    if($AssemblyOutput){$compileOptions.OutputAssembly=$AssemblyOutput;$compileOptions.OutputType='Library'}
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -567,6 +570,7 @@ public static class TejBridgeNative {
             if(String.IsNullOrEmpty(label)||!seen.Add(label))throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate/empty selection label");
         AssertControlScope(root,target,expectedPid,title);
         WaitSelectedList(root,target,0,null);
+        if(TrySelectListBulk(root,parent,source,target,button,indices,labels,expectedPid,title,companyGeometry))return;
         for(int i=0;i<labels.Length;i++) {
             // All checks remain FRESH before each normal model event/action.
             AssertControlScope(root,source,expectedPid,title);
@@ -614,6 +618,83 @@ public static class TejBridgeNative {
         }
         throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: destination did not acknowledge one Select; expected="+
             expectedCount+" actual="+count+"; no repeated action or query");
+    }
+    public static string LastSelectionMethod="none";
+    public static bool TrySelectListBulk(long root,long parent,long source,long target,long button,
+                                         int[] indices,string[] labels,int expectedPid,string title,bool companyGeometry) {
+        // Ctrl/Shift multiple selection is supported by the vendor. Use the
+        // native multi-list model plus ONE normal Select, not per-field clicks.
+        // Unsupported list styles/order return before any mutation. Once the
+        // one action starts, failure NEVER falls back to a second Select.
+        LastSelectionMethod="owned_single_item_acknowledged_batch_v1";
+        if(indices==null||labels==null||indices.Length!=labels.Length||labels.Length<1||labels.Length>2000)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk selection bound differs");
+        AssertControlScope(root,source,expectedPid,title);
+        long count=VerifyLookupList(root,source);int style=GetWindowLong(new IntPtr(source),-16);
+        var seen=new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+        for(int i=0;i<indices.Length;i++) {
+            if(String.IsNullOrEmpty(labels[i])||!seen.Add(labels[i])||indices[i]<0||indices[i]>=count)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate/invalid bulk selection");
+            if(i>0&&indices[i]<=indices[i-1])return false; // Preserve caller's exact destination order.
+        }
+        if((style&0x808)==0||labels.Length<2)return false;
+        // The vendor nests its listboxes in panels below the named group.
+        // WM_COMMAND goes to the actual native parent, not that logical group.
+        IntPtr nativeParent=GetParent(new IntPtr(source));
+        AssertControlScope(root,parent,expectedPid,title);
+        AssertControlScope(root,nativeParent.ToInt64(),expectedPid,title);
+        if((style&1)==0||!IsChild(new IntPtr(parent),new IntPtr(source))||
+           !IsChild(new IntPtr(parent),new IntPtr(target))||
+           (nativeParent!=new IntPtr(parent)&&!IsChild(new IntPtr(parent),nativeParent))||
+           !IsWindowEnabled(new IntPtr(parent))||!IsWindowEnabled(nativeParent))
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk list parent/notification changed");
+        AssertControlScope(root,target,expectedPid,title);
+        VerifyResolvedButton(root,parent,button,expectedPid,title,"Select");
+        WaitSelectedList(root,target,0,null);
+        if(companyGeometry) {
+            Rect listRect,buttonRect;
+            if(!GetWindowRect(new IntPtr(source),out listRect)||!GetWindowRect(new IntPtr(button),out buttonRect)||buttonRect.Top<listRect.Bottom)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: company list button geometry changed");
+        }
+        // Check ALL requested live names before altering the source selection.
+        for(int i=0;i<indices.Length;i++) {
+            long length=Message(source,0x18A,indices[i],0);IntPtr result;
+            if(length<0||length>4096)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk source label bound differs");
+            var actual=new StringBuilder((int)length+1);
+            if(ReadText(new IntPtr(source),0x189,new IntPtr(indices[i]),actual,2,10000,out result)==IntPtr.Zero||actual.ToString()!=labels[i])
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk source name differs");
+        }
+        if(Message(source,0x185,0,-1)<0)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk clear refused");
+        for(int i=0;i<indices.Length;i++) {
+            AssertControlScope(root,source,expectedPid,title);
+            if(!IsWindowEnabled(new IntPtr(source))||Message(source,0x185,1,indices[i])<0)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk selection refused");
+        }
+        if(Message(source,0x19E,indices[indices.Length-1],0)<0)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk caret refused");
+        // LB_SETSEL alone omits LBN_SELCHANGE. Finish the real normal parent
+        // event so WinForms' SelectedItems cache agrees before its Select handler.
+        NotifyBinding(nativeParent.ToInt64(),source,(GetDlgCtrlID(new IntPtr(source))&65535)|65536);
+        AssertControlScope(root,source,expectedPid,title);
+        AssertControlScope(root,target,expectedPid,title);
+        if(GetParent(new IntPtr(source))!=nativeParent||VerifyLookupList(root,source)!=count||
+           Message(source,0x190,0,0)!=indices.Length)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk native selection changed");
+        for(int i=0;i<indices.Length;i++)
+            if(Message(source,0x187,indices[i],0)<=0)
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: bulk native membership differs");
+        VerifyResolvedButton(root,parent,button,expectedPid,title,"Select");
+        LastSelectionMethod="owned_multi_list_one_select_complete_readback_v1";
+        Message(button,0xF5u,0,0); // The ONLY action. Never repeat on failed readback.
+        WaitSelectedList(root,target,labels.Length,labels[labels.Length-1]);
+        AssertControlScope(root,target,expectedPid,title);
+        string[] actualTarget=Items(target,false);
+        if(actualTarget.Length!=labels.Length)
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: full bulk destination count differs");
+        for(int i=0;i<labels.Length;i++)
+            if(actualTarget[i]!=labels[i])
+                throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: full bulk destination order/name differs");
+        return true;
     }
     private static void DateScope(long root,long edit,long group) {
         IntPtr r=new IntPtr(root),e=new IntPtr(edit),g=new IntPtr(group);uint rp,ep,gp;
@@ -1080,7 +1161,89 @@ public static class TejBridgeNative {
         return cells;
     }
 }
-'@ -ReferencedAssemblies @([Accessibility.IAccessible].Assembly.Location,[Windows.Forms.SendKeys].Assembly.Location)
+'@ -ReferencedAssemblies @([Accessibility.IAccessible].Assembly.Location,[Windows.Forms.SendKeys].Assembly.Location) @compileOptions
+}
+function Initialize-TejNativeHelper([string]$BridgeFile,[string]$CacheDirectory) {
+    # Cache CODE only. No source selection, COM object, query outcome, data,
+    # authorization verdict or mutable helper state survives a PowerShell run.
+    # Bind every generated DLL to the exact bridge, C# and compiler/runtime/
+    # reference bytes. All generations and rejected manifests are retained.
+    $cacheClock=[Diagnostics.Stopwatch]::StartNew();$cacheTimings=@{}
+    $nativeText=[regex]::Match([IO.File]::ReadAllText($BridgeFile),"(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
+    if(-not $nativeText.Success){throw 'Canonical native helper source missing'}
+    function Digest-Text([string]$value) {
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try{return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($value)))).Replace('-','').ToLowerInvariant()}
+        finally{$sha.Dispose()}
+    }
+    function Digest-File([string]$path) {
+        $sha=[Security.Cryptography.SHA256]::Create();$stream=$null
+        try {
+            $stream=[IO.File]::OpenRead($path)
+            return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+        } finally {if($null -ne $stream){$stream.Dispose()};$sha.Dispose()}
+    }
+    $runtime=[Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
+    $references=@([Accessibility.IAccessible].Assembly.Location,[Windows.Forms.SendKeys].Assembly.Location,
+                  [string].Assembly.Location,[Uri].Assembly.Location,[Linq.Enumerable].Assembly.Location)
+    $environment=[ordered]@{powershell=$PSVersionTable.PSVersion.ToString();clr=[Environment]::Version.ToString();
+        process_64bit=[Environment]::Is64BitProcess;
+        compiler_sha256=Digest-File (Join-Path $runtime 'csc.exe');
+        references=@($references|ForEach-Object{Digest-File $_})}
+    $bridgeHash=Digest-File $BridgeFile
+    $sourceHash=Digest-Text $nativeText.Groups[1].Value
+    $fingerprint=Digest-Text (([ordered]@{bridge=$bridgeHash;source=$sourceHash;environment=$environment})|ConvertTo-Json -Depth 5 -Compress)
+    $cacheTimings.fingerprint_seconds=$cacheClock.Elapsed.TotalSeconds
+    $directory=Join-Path $CacheDirectory $fingerprint
+    [void][IO.Directory]::CreateDirectory($directory)
+    if(([IO.File]::GetAttributes($directory) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Native cache directory cannot redirect ownership'}
+    $gate=[Threading.Mutex]::new($false,('Local\StockAgentTEJNativeCompile-'+$fingerprint));$owns=$false
+    try {
+        $owns=$gate.WaitOne(10000);if(-not $owns){throw 'Native compilation owner unavailable'}
+        $manifest=Join-Path $directory 'active.json';$dll=$null;$cacheState='built';$rejection=$null
+        if(Test-Path -LiteralPath $manifest) {
+            try {
+                $info=Get-Item -LiteralPath $manifest
+                if($info.Length -gt 16384 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'manifest_bound_or_redirect'}
+                $saved=Get-Content -LiteralPath $manifest -Raw -Encoding UTF8|ConvertFrom-Json
+                if($saved.contract -cne 'exact_native_code_compilation_cache_v1' -or $saved.fingerprint -cne $fingerprint -or
+                   $saved.bridge_sha256 -cne $bridgeHash -or $saved.source_sha256 -cne $sourceHash -or
+                   (($saved.environment|ConvertTo-Json -Depth 5 -Compress) -cne ($environment|ConvertTo-Json -Depth 5 -Compress)) -or
+                   $saved.dll -cnotmatch '^[0-9a-f]{32}\.dll$' -or $saved.dll_sha256 -cnotmatch '^[0-9a-f]{64}$'){
+                    throw 'manifest_identity'
+                }
+                $candidate=Join-Path $directory $saved.dll;$binary=Get-Item -LiteralPath $candidate
+                if($binary.Length -lt 1 -or $binary.Length -gt 2097152 -or
+                   ($binary.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                   (Digest-File $candidate) -cne $saved.dll_sha256){throw 'binary_bound_or_digest'}
+                $dll=$candidate;$cacheState='hit'
+            }catch{$rejection='cache_identity_or_bytes_rejected';$cacheState='rebuilt';$dll=$null}
+        }
+        if($null -eq $dll) {
+            $name=[Guid]::NewGuid().ToString('N')+'.dll';$dll=Join-Path $directory $name
+            Compile-TejNativeHelper $dll
+            $saved=[ordered]@{contract='exact_native_code_compilation_cache_v1';fingerprint=$fingerprint;
+                bridge_sha256=$bridgeHash;source_sha256=$sourceHash;environment=$environment;dll=$name;
+                dll_sha256=Digest-File $dll;
+                built_at_utc=[DateTime]::UtcNow.ToString('o');rejection=$rejection}
+            $temporary=Join-Path $directory ([Guid]::NewGuid().ToString('N')+'.prepared.json')
+            [IO.File]::WriteAllText($temporary,($saved|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+            if(Test-Path -LiteralPath $manifest){[IO.File]::Replace($temporary,$manifest,($manifest+'.'+[Guid]::NewGuid().ToString('N')+'.retained.json'))}
+            else{[IO.File]::Move($temporary,$manifest)}
+        }
+        # Add-Type -OutputAssembly emits without loading on Windows PowerShell.
+        # Each fresh worker loads exactly one immutable, checked generation.
+        $cacheTimings.prepare_or_compile_seconds=$cacheClock.Elapsed.TotalSeconds-$cacheTimings.fingerprint_seconds
+        if(-not ('TejBridgeNative' -as [type])){Add-Type -LiteralPath $dll}
+        $loaded=('TejBridgeNative' -as [type]).Assembly.Location
+        if([IO.Path]::GetFullPath($loaded) -cne [IO.Path]::GetFullPath($dll) -or
+           (Digest-File $dll) -cne $saved.dll_sha256){throw 'Loaded native code differs from its generation'}
+        $cacheTimings.load_and_verify_seconds=$cacheClock.Elapsed.TotalSeconds-$cacheTimings.fingerprint_seconds-$cacheTimings.prepare_or_compile_seconds
+        return @{contract='exact_native_code_compilation_cache_v1';state=$cacheState;fingerprint=$fingerprint;
+            bridge_sha256=$bridgeHash;source_sha256=$sourceHash;dll_sha256=$saved.dll_sha256;rejection=$rejection;timings=$cacheTimings}
+    } finally {if($owns){$gate.ReleaseMutex()};$gate.Dispose()}
+}
+$nativeCache=Initialize-TejNativeHelper $PSCommandPath (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'StockAgent\TEJSmartWizard\NativeHelpers')
 
 if(Test-Path -LiteralPath $Output){throw 'Refusing to overwrite bridge evidence'}
 $requestDoc=Get-Content -LiteralPath $Request -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1111,6 +1274,7 @@ function Write-FlowTiming {
         $flow=@{contract='tej_monotonic_windows_full_flow_v1';task_id=$requestDoc.task_id;
             query_attempt_id=$requestDoc.query_attempt_id;action=$requestDoc.action;
             observed_at_utc=[DateTime]::UtcNow.ToString('o');phases=$flowTimings;
+            native_helper_cache=$nativeCache;
             windows_bridge_seconds=$bridgeClock.Elapsed.TotalSeconds;
             windows_cpu_seconds=[Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds}
         [IO.File]::WriteAllText(($Output+'.flow.json'),($flow|ConvertTo-Json -Depth 4 -Compress),[Text.UTF8Encoding]::new($false))
@@ -1964,6 +2128,7 @@ try {
     $selectedFields=Items $fieldLists[1].Current.NativeWindowHandle
     if(($selectedFields -join "`t") -cne (@($requestDoc.fields) -join "`t")){throw 'LOCAL_SELECTION_BEFORE_QUERY: selected fields differ; no query'}
     $selectedFieldOrderVerified=$true
+    $fieldBulkSelectionUsed=[TejBridgeNative]::LastSelectionMethod -ceq 'owned_multi_list_one_select_complete_readback_v1'
     Stamp-ScopeTiming 'field_selection'
     $company=Find-QueryGroup 'Company Setting';$companyLists=Lists $company
     if($companyLists.Count -ne 4){throw 'Unreviewed company list layout'}
@@ -2184,9 +2349,11 @@ try {
         $stage.vendor_numeric_scale_selection=$numericScale
         $stage.source_scope_proof=$sourceScopeProof
         $stage.scope_preparation_timings_contract='monotonic_complete_scope_stages_v1'
+        $stage.field_bulk_selection_used=$fieldBulkSelectionUsed
         $stage.scope_preparation_seconds=$scopeTimings
         $stage.fresh_company_selection_reused=$companySelectionAlreadyMatches
         $stage.bridge_initialization_seconds=$initializationSeconds
+        $stage.native_helper_cache=$nativeCache
         $stage.operation_contract='fresh_verified_native_selection_batches_v1'
         $stage.preview_submission_contract=[TejBridgeNative]::SubmissionContract
         $stage.query_attempt_id=$requestDoc.query_attempt_id

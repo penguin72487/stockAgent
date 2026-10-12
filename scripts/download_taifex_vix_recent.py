@@ -13,6 +13,7 @@ import sys
 from typing import Final
 
 import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -21,6 +22,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.common import SharedRateLimiter, resolve_request_interval  # noqa: E402
+from downloader.verified_merge import (  # noqa: E402
+    VerifiedMergeProjection,
+    pandas_timestamp_schema,
+)
 from downloader.http_transport import (  # noqa: E402
     HttpRequestPolicy,
     ResilientHttpTransport,
@@ -98,6 +103,35 @@ def _valid_receipt(
         return payload
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def _merge_vix_shards(root: Path, unique_shards: list[Path], calendar_sha256: str) -> dict:
+    """Keep existing stable last-shard-wins revision semantics, without pandas."""
+    output = root / "normalized" / "taifex_vix_daily_recent.parquet"
+    projection = VerifiedMergeProjection(
+        root / "state" / "merge_projections" / "taifex_vix_daily_recent.json", output,
+        inputs={
+            "merge_contract": 2, "implementation_sha256": sha256_path(Path(__file__)),
+            "helper_sha256": sha256_path(Path(sys.modules[VerifiedMergeProjection.__module__].__file__)),
+            "writer_sha256": sha256_path(Path(sys.modules[_atomic_write_parquet.__module__].__file__)),
+            "runtime": {"polars": pl.__version__, "pyarrow": pa.__version__, "pandas": pd.__version__},
+            "calendar_sha256": calendar_sha256,
+            "shards": [(_relative(path, root), sha256_path(path)) for path in unique_shards],
+        },
+    )
+    cached = projection.load()
+    if cached is not None:
+        return cached
+    table = pa.concat_tables([pq.read_table(path) for path in unique_shards], promote_options="default")
+    frame = (pl.from_arrow(table).sort("date", maintain_order=True, nulls_last=True)
+             .unique(subset=["date"], keep="last", maintain_order=True))
+    _atomic_write_parquet(frame.to_arrow().cast(pandas_timestamp_schema(table.schema)), output)
+    return projection.save({
+        "rows": len(frame), "first_date": frame["date"].min().date().isoformat(),
+        "last_date": frame["date"].max().date().isoformat(),
+        "output_path": _relative(output, root), "output_bytes": output.stat().st_size,
+        "output_sha256": sha256_path(output),
+    })
 
 
 def main() -> int:
@@ -191,17 +225,7 @@ def main() -> int:
     unique_shards = sorted(
         set(unique_shards) | set((root / "shards" / "vix_daily").glob("*/*.parquet"))
     )
-    table = pa.concat_tables(
-        [pq.read_table(path) for path in unique_shards], promote_options="default"
-    )
-    frame = (
-        table.to_pandas()
-        .sort_values("date", kind="stable")
-        .drop_duplicates(subset=["date"], keep="last")
-        .reset_index(drop=True)
-    )
-    output = root / "normalized" / "taifex_vix_daily_recent.parquet"
-    _atomic_write_parquet(frame, output)
+    merged = _merge_vix_shards(root, unique_shards, calendar_sha256)
     manifest = {
         "contract_version": CONTRACT_VERSION,
         "dataset": "taifex_vix_daily_recent",
@@ -210,13 +234,8 @@ def main() -> int:
         "source_page": SOURCE_PAGE,
         "official_public_boundary": "files_currently_listed_on_rolling_recent_page",
         "older_history": "not_exposed_by_this_free_page",
-        "rows": len(frame),
-        "first_date": frame["date"].min().date().isoformat(),
-        "last_date": frame["date"].max().date().isoformat(),
+        **merged,
         "session_calendar_sha256": calendar_sha256,
-        "output_path": _relative(output, root),
-        "output_bytes": output.stat().st_size,
-        "output_sha256": sha256_path(output),
         "completed_at_utc": _utc_now(),
     }
     _write_json(root / "vix_latest.json", manifest)

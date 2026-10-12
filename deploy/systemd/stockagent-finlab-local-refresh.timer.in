@@ -2,6 +2,7 @@
 Description=Refresh licensed FinLab research cache after quota reset and TW opening
 
 [Timer]
+OnCalendar=*-*-* 07:00:05 Asia/Taipei
 OnCalendar=*-*-* 08:00:05 Asia/Taipei
 OnCalendar=*-*-* 08:03:00 Asia/Taipei
 OnCalendar=*-*-* 09:10:05 Asia/Taipei

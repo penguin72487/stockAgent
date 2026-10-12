@@ -163,6 +163,47 @@ def test_startup_public_status_never_exposes_desktop_identity_or_vendor_diagnost
         assert forbidden not in text
 
 
+def test_public_startup_distinguishes_live_relay_from_old_interface_check(registry,monkeypatch):
+    from stockagent.live.tej_dashboard import build_tej_public_status
+    repo,root,_,_=registry
+    replacement(root)
+    status=json.loads((root/'desktop_startup_status.json').read_text())
+    status['observed_at_utc']=(datetime.now(UTC)-timedelta(minutes=10)).isoformat()
+    atomic_write_json(root/'desktop_startup_status.json',status)
+    atomic_write_json(root/'desktop_transport_session.json',{})
+    monkeypatch.setattr('downloader.tej_startup.interactive_transport',lambda _: {'fixture':'live exact relay'})
+    public=build_tej_public_status(repo)['desktop_startup']
+    assert public['ready'] and not public['recent_interface_check']
+    def dead(_):raise ValueError('Dead relay')
+    monkeypatch.setattr('downloader.tej_startup.interactive_transport',dead)
+    assert not build_tej_public_status(repo)['desktop_startup']['ready']
+
+
+def test_hardened_gateway_uses_only_fresh_live_source_owner_readiness(registry,monkeypatch):
+    import os
+    from stockagent.live.tej_dashboard import build_tej_public_status
+    repo,root,_,_=registry
+    replacement(root)
+    monkeypatch.setattr('downloader.tej_startup.desktop_ready',lambda *a,**k:False)
+    now=datetime.now(UTC)
+    ticks=Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(') ',1)[1].split()[19]
+    receipt={'contract':'persistent_serial_evidence_preserving_supervision_v1','continuous':True,
+        'state':'executing','owner_pid':os.getpid(),'owner_start_ticks':ticks,
+        'observed_at_utc':now.isoformat(),'deadline_at_utc':(now+timedelta(seconds=1800)).isoformat(),
+        'desktop_readiness':{'contract':'owned_source_desktop_transport_readiness_v1','ready':True,'observed_at_utc':now.isoformat(),
+                             'recent_interface_check':False,'private_socket':'secret-relay'}}
+    atomic_write_json(root/'scheduler_status.json',receipt)
+    public=build_tej_public_status(repo)
+    assert public['desktop_startup']['ready'] and not public['desktop_startup']['recent_interface_check']
+    assert 'secret-relay' not in json.dumps(public)
+    receipt['desktop_readiness']['observed_at_utc']=(now-timedelta(seconds=61)).isoformat()
+    atomic_write_json(root/'scheduler_status.json',receipt)
+    assert not build_tej_public_status(repo)['desktop_startup']['ready']
+    receipt['desktop_readiness']['observed_at_utc']=now.isoformat();receipt['owner_start_ticks']='foreign-birth'
+    atomic_write_json(root/'scheduler_status.json',receipt)
+    assert not build_tej_public_status(repo)['desktop_startup']['ready']
+
+
 def test_lost_boot_worker_uses_existing_bounded_replay_and_new_source_receipt(abandoned):
     from downloader.tej_history import configure_runtime_policy
     from downloader.tej_scheduler import replay_authorized_unknown
@@ -244,13 +285,25 @@ def test_relay_shutdown_never_marks_a_foreign_or_reused_owner_draining(tmp_path)
         assert path.read_bytes()==original
 
 
-def test_owned_windows_bootstrap_is_not_a_query_or_unknown_launch_retry():
+def test_owned_windows_bootstrap_is_not_a_query_or_unbounded_launcher_retry():
     script=(Path(__file__).resolve().parents[1]/'scripts/start_tej_desktop.ps1').read_text()
     for forbidden in ('SetForegroundWindow','SendWait(','Stop-Process','taskkill','Preview','ActiveWorkbook','Workbooks.Close'):
         assert forbidden not in script
-    for proof in ("state='prepared'", "-cne 'confirmed'", 'Same-Session $previous.new_session $old',
+    for proof in ("state='prepared'", "$previous.state -ceq 'confirmed'", 'Same-Session $previous.new_session $old',
                   'retired_window_absent', 'retired_process_absent', 'AddHours(-1)', '-ge 3', '.retained.json'):
         assert proof in script
+
+
+def test_prepared_desktop_launcher_recovery_requires_fresh_absence_and_keeps_unknown():
+    script=(Path(__file__).resolve().parents[1]/'scripts/start_tej_desktop.ps1').read_text()
+    policy=script.split('function Launcher-RetryBasis',1)[1].split('try {',1)[0]
+    for proof in ('previous.contract', 'previous.windows_boot_at_utc', 'previous.workbook',
+                  'retired_window_absent', 'retired_process_absent', "-cne 'prepared'",
+                  '-not $addinAbsent', '-not $excelReady', 'TotalSeconds -lt 60'):
+        assert proof in policy
+    assert 'original_unknown_intent_preserved=($null -ne $retryBasis)' in script
+    assert 'Get-Process -Name TEJAddin' in script
+    assert '$history.Count -gt 64' in script and '-ge 3' in script
 
 
 def test_windows_startup_installation_requires_readback_and_interactive_logon():

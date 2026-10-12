@@ -236,9 +236,20 @@ def test_complete_synthetic_prepare_raw_null_shared_axis_and_markdown(tmp_path,m
     monkeypatch.setattr(builder,"build_panel",lambda *a,**kw:panel)
     monkeypatch.setattr(builder,"_build_panel_kwargs",lambda config:{})
     config=Path("configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v10_research_143_no_bottleneck.yaml")
+    inherited = tmp_path / 'historical-base.yaml'
+    inherited.write_text(json.dumps({'base_config': str(config.resolve()), 'data': {
+        'day_trade_minute_execution_cache_dir': str(tmp_path / 'artifacts/markets/old/runtime-cache')}}))
+    config = inherited
     out=tmp_path/"prepared"
+    temporary_cache = tmp_path/'owned-trial/runtime-cache' if channel_policy == 'value_only' else None
     result=builder.prepare(source,out,config,tmp_path/"minutes","pinned-synthetic-release",max_block_bytes=128,
-        model_channel_policy=channel_policy)
+        model_channel_policy=channel_policy, runtime_cache_root=temporary_cache)
+    generated = builder.load_config(out / 'training.yaml')
+    assert 'artifacts/markets/' not in generated.data.day_trade_minute_execution_cache_dir
+    if temporary_cache is None:
+        assert '/artifacts/cache/' in generated.data.day_trade_minute_execution_cache_dir
+    else:
+        assert generated.data.day_trade_minute_execution_cache_dir == str(temporary_cache)
     assert result["individual_quantities"]==1+int(native) and result["shared_quantities"]==1+int(native)
     channels = 1 if channel_policy == "value_only" else 4
     expected_width = 6 + channels * (2 + 2 * int(native))

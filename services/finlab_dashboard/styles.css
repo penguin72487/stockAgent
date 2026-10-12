@@ -32,3 +32,14 @@ main{width:min(1180px,calc(100% - 36px))}.finlab-traffic-details{margin-top:18px
 .finlab-stage-state { color: var(--cyan); }
 .finlab-stage-card dl { display: grid; grid-template-columns: 3rem minmax(0, 1fr); gap: .5rem; }
 .finlab-stage-card dd { margin: 0; font-variant-numeric: tabular-nums; }
+.finlab-tick-progress { max-height: none; }
+.finlab-tick-progress table { min-width: 1180px; }
+.finlab-tick-progress td { vertical-align: top; min-width: 130px; line-height: 1.6; }
+.finlab-tick-progress td:first-child { min-width: 170px; }
+.finlab-tick-progress td:last-child { min-width: 225px; }
+.finlab-tick-progress p { margin: 6px 0 0; color: var(--muted); }
+.finlab-tick-progress strong { display: block; color: var(--ink); font-weight: 700; }
+.finlab-tick-progress .tick-scenarios { display: grid; grid-template-columns: 3rem minmax(0,1fr); gap: 5px 8px; margin: 0; }
+.finlab-tick-progress .tick-scenarios dd { margin: 0; overflow-wrap: anywhere; }
+.finlab-tick-progress .progress-track { margin: 8px 0 4px; }
+#tick-eta-summary, #tick-estimation-basis { overflow-wrap: anywhere; }

@@ -1555,6 +1555,9 @@ class DataConfig:
     # Lossless transport only: the compiled model still sees the complete
     # contiguous Float32 feature tensor, with every original value/column.
     factorized_transfer_mode: str = "dense_cpu"
+    # Node-local decoded FP32 LRU budget, per DDP rank. None retains the
+    # immutable manifest's budget; changing this does not alter observations.
+    factorized_host_cache_bytes: int | None = None
     live_tail_panel_rows: int = 0
     # Product-neutral point-in-time feature table.  It uses the same canonical
     # panel join as TW public data, but cannot carry Taiwan execution rules.
@@ -2288,6 +2291,12 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     # Optional stable wide feature stem: normalization/projection/activation
     # stay FP32 when independent stock chunks change GEMM/reduction shapes.
     candle_projection_fp32: bool = False
+    # Lossless zero-column LayerNorm/Linear contraction. No input/parameter is
+    # discarded; reordered FP32 sums opt into a fresh optimizer trajectory.
+    factorized_compact_projection: bool = False
+    # Zero preserves the existing 1 GiB / 128-stock compact stream limit.
+    # Positive values opt into a bounded larger stream, never feature pruning.
+    factorized_compact_stream_chunk_bytes: int = 0
     # Stabilize the compact stock/market attention and allocation head across
     # partitioned compilation and multiple optimizer steps; opt-in only.
     portfolio_blocks_fp32: bool = False
@@ -3498,6 +3507,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["candle_projection_fp32"] = bool(
         financial_transformer["candle_projection_fp32"]
     )
+    financial_transformer["factorized_compact_projection"] = bool(
+        financial_transformer["factorized_compact_projection"]
+    )
+    financial_transformer["factorized_compact_stream_chunk_bytes"] = int(
+        financial_transformer["factorized_compact_stream_chunk_bytes"]
+    )
+    if financial_transformer["factorized_compact_stream_chunk_bytes"] < 0:
+        raise ValueError("factorized_compact_stream_chunk_bytes must be nonnegative")
     financial_transformer["portfolio_blocks_fp32"] = bool(
         financial_transformer["portfolio_blocks_fp32"]
     )
@@ -4023,6 +4040,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("factorized_transfer_mode must be dense_cpu, compact_cuda, compact_cuda_packed or compact_cuda_cached")
     if data["factorized_transfer_mode"] != "dense_cpu" and not data["factorized_feature_manifest"]:
         raise ValueError("compact CUDA transport requires a factorized feature manifest")
+    data["factorized_host_cache_bytes"] = _normalize_optional_positive_int(
+        data["factorized_host_cache_bytes"], field_name="data.factorized_host_cache_bytes"
+    )
     raw_physical_public_path = data["day_trade_physical_public_feature_path"]
     data["day_trade_physical_public_feature_path"] = (
         None

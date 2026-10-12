@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
+
 discord_bot: ModuleType | None = None
 ARTIFACT_OWNER_UNIT = "stockagent-discord-artifact-maintenance.service"
 # Existing owner: 120min start budget + 90s stop grace; reserve controller/queue
@@ -338,6 +340,10 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
         attempted += 1
         try:
             result = discord_bot._run_completed_session_signal_cache_sync(cfg)
+        except TWPublicSourceUpdatePending:
+            # A writer may acquire the lock just after the outer busy check.
+            # Stop this source-dependent pass, not the Gateway or source owner.
+            raise
         except Exception as exc:
             failures += 1
             discord_bot._log_exception(
@@ -360,6 +366,18 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
                 output_dir=str(result.output_dir),
             )
     return attempted, failures
+
+
+def _populate_postclose_signal_caches_or_defer(markets: list[str]) -> tuple[int, int] | None:
+    try:
+        return _populate_postclose_signal_caches(markets)
+    except TWPublicSourceUpdatePending as exc:
+        discord_bot = _load_discord_bot()
+        discord_bot._record_artifact_maintenance_run(
+            "waiting_source", reason="tw_public_refresh_in_progress", deferred=1,
+        )
+        _emit(status="waiting_source", **exc.details)
+        return None
 
 
 def _wait_for_tw_public_refresh() -> bool:
@@ -439,7 +457,10 @@ def run_once(*, signal_cache_only: bool = False) -> int:
 
         markets = discord_bot._artifact_maintenance_markets()
         if signal_cache_only:
-            cache_attempted, cache_failures = _populate_postclose_signal_caches(markets)
+            population = _populate_postclose_signal_caches_or_defer(markets)
+            if population is None:
+                return 0
+            cache_attempted, cache_failures = population
             _emit(
                 status="signal_cache_complete"
                 if cache_failures == 0
@@ -466,7 +487,8 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     reason="postclose_signal_cache_in_progress",
                 )
                 return 0
-            _populate_postclose_signal_caches(markets)
+            if _populate_postclose_signal_caches_or_defer(markets) is None:
+                return 0
 
         attempted = 0
         failures = 0

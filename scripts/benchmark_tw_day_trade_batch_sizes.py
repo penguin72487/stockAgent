@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import runpy
 import signal
 import statistics
 import subprocess
@@ -49,6 +50,8 @@ _FAILURE_PATTERNS = (
     "OutOfMemoryError",
     "CUDA error",
     "ChildFailedError",
+    "hit config.recompile_limit",
+    "hit config.cache_size_limit",
 )
 _FALLBACK_KEYS = (
     "bt_compile_failures",
@@ -199,6 +202,26 @@ def _gpu_memory_summary(path: Path, *, gpu_indices: set[int]) -> dict[str, Any]:
         "max_peak_fraction": max(item["peak_fraction"] for item in per_gpu.values()),
         "min_headroom_gib": min(item["headroom_gib"] for item in per_gpu.values()),
     }
+
+
+def _host_memory_summary(path: Path) -> dict[str, Any]:
+    """Shared cgroup memory, including evictable file cache; not rank RSS."""
+    samples = []
+    if path.is_file():
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    used = int(row["host_memory_used_bytes"])
+                    limit = int(row["host_memory_limit_bytes"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if limit > 0 and 0 <= used <= limit:
+                    samples.append((used, limit))
+    if not samples:
+        return {"observed": False, "scope": "shared_cgroup_including_file_cache"}
+    return {"observed": True, "scope": "shared_cgroup_including_file_cache",
+            "peak_used_gib": max(used for used, _ in samples) / 1024**3,
+            "min_headroom_gib": min(limit-used for used, limit in samples) / 1024**3}
 
 
 def _score_curve(
@@ -384,7 +407,7 @@ def _sample_gpus(stop: threading.Event, path: Path, interval_s: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(fields.split(","))
+        writer.writerow([*fields.split(","), "host_memory_used_bytes", "host_memory_limit_bytes"])
         while not stop.is_set():
             result = subprocess.run(
                 [
@@ -398,9 +421,14 @@ def _sample_gpus(stop: threading.Event, path: Path, interval_s: float) -> None:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            try:
+                host_memory = [Path("/sys/fs/cgroup/memory.current").read_text().strip(),
+                               Path("/sys/fs/cgroup/memory.max").read_text().strip()]
+            except OSError:
+                host_memory = ["", ""]
             for line in result.stdout.splitlines():
                 if line.strip():
-                    writer.writerow([part.strip() for part in line.split(",")])
+                    writer.writerow([*[part.strip() for part in line.split(",")], *host_memory])
             handle.flush()
             stop.wait(interval_s)
 
@@ -438,6 +466,11 @@ def _write_candidate_config(
     start_fold: int,
 ) -> None:
     config = deepcopy(base)
+    data = config.get('data', {})
+    cache = data.get('day_trade_minute_execution_cache_dir')
+    if cache:
+        layout = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'stockagent/storage_layout.py'))
+        data['day_trade_minute_execution_cache_dir'] = str(layout['runtime_cache_path'](cache, ROOT))
     runner = config.setdefault("runner", {})
     training = config.setdefault("training", {})
     runner.update(
@@ -725,6 +758,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
     }
     log_text = log_path.read_text(errors="replace")
     result["failure_patterns"] = [pattern for pattern in _FAILURE_PATTERNS if pattern in log_text]
+    result["host_memory"] = _host_memory_summary(gpu_path)
     if return_code == 0 and status == "ok":
         try:
             from stockagent.training.lifecycle import validate_completed_training_artifacts
@@ -768,6 +802,16 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
     else:
         result["reasons"] = [f"training failed: status={status} return_code={return_code}"]
 
+    # Dynamo can warn and return zero after falling back. Never score that as
+    # a successful compiled throughput candidate, even with complete artifacts.
+    if result["failure_patterns"]:
+        result["ok"] = False
+        result.setdefault("reasons", []).append("observed failure/fallback: " + ", ".join(result["failure_patterns"]))
+    minimum_host = getattr(args, "min_host_headroom_gib", 0.)
+    if minimum_host > 0 and (not result["host_memory"]["observed"]
+                            or result["host_memory"]["min_headroom_gib"] < minimum_host):
+        result["ok"] = False
+        result.setdefault("reasons", []).append("insufficient observed shared-cgroup RAM headroom")
     batch_dir.mkdir(parents=True, exist_ok=True)
     prior_result.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(
@@ -791,7 +835,8 @@ def _select_winner(results: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 def _default_output_root() -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return ROOT / "artifacts/benchmarks" / f"tw_day_trade_daily_batch_power2_{timestamp}"
+    layout = runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))
+    return layout['node_root'](ROOT) / "artifacts/benchmarks" / f"tw_day_trade_daily_batch_power2_{timestamp}"
 
 
 def _resolved_source_config(config_path: Path, project_root: Path) -> dict[str, Any]:
@@ -836,6 +881,8 @@ def main() -> None:
         ),
     )
     parser.add_argument("--batch-size-eval", type=int, default=128)
+    parser.add_argument("--min-host-headroom-gib", type=float, default=0.,
+                        help="optional shared-cgroup RAM acceptance, including file cache")
     parser.add_argument(
         "--expected-execution-mode",
         choices=("tw_day_trade", "naive", "tw_stock_context_futures_portfolio"),
@@ -878,6 +925,11 @@ def main() -> None:
     args.output_root = (
         args.output_root.expanduser().resolve() if args.output_root is not None else _default_output_root()
     )
+    # Admission must not preload the helper checkout's stockagent package:
+    # the trainer/config imports below belong to --project-root.
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))["admit_output"](
+        args.output_root, "benchmark"
+    )
     gpu_ids = [part.strip() for part in args.cuda_visible_devices.split(",") if part.strip()]
     if not gpu_ids or any(not value.isdigit() for value in gpu_ids):
         raise SystemExit("--cuda-visible-devices must be a comma-separated list of numeric GPU indices")
@@ -913,6 +965,8 @@ def main() -> None:
         raise SystemExit("--max-peak-vram-fraction must be in (0, 1]")
     if args.min_vram_headroom_gib < 0:
         raise SystemExit("--min-vram-headroom-gib must be non-negative")
+    if args.min_host_headroom_gib < 0:
+        raise SystemExit("--min-host-headroom-gib must be non-negative")
 
     try:
         _wait_for_idle_gpus(wait=args.wait_for_idle, poll_s=args.idle_poll_s)

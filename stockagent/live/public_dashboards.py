@@ -684,6 +684,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "temporary_day_trade_model_adapter",
             "top_book_capacity_shares",
             "order_limit_price",
+            "position",
             "upper_limit",
             "model_trained_for_overnight",
             "stock_futures",
@@ -691,6 +692,20 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
     )
     # Keep the enrichment DTO bounded just like the surrounding signal row.
     for row in output.get("rows", []):
+        position = row.get("position")
+        if isinstance(position, dict):
+            # Reuse the lifecycle endpoint's public projection. Embedding a
+            # valuation must not expose internal ledger IDs or private fields.
+            projected = sanitize_tw_positions({
+                "simulation_only": True,
+                "production_order_possible": False,
+                "rows": [position],
+            })["rows"][0]
+            if position.get("contract") == "signal_ledger_valuation_v1":
+                projected["contract"] = "signal_ledger_valuation_v1"
+            row["position"] = projected
+        else:
+            row.pop("position", None)
         membership = row.get("stock_futures")
         if isinstance(membership, dict):
             row["stock_futures"] = {key: membership[key] for key in (
@@ -758,6 +773,7 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
             "last_exit_at",
             "last_exit_price",
             "last_mark_price",
+            "last_mark_quote_source",
             "last_quote_at",
             "market",
             "mandatory_exit_phase",

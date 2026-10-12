@@ -201,6 +201,139 @@ def test_nas_receipt_refuses_another_enrolled_source_membership(delivery):
     assert batch.exists() and original.exists()
 
 
+@pytest.fixture
+def catalog_delivery(tmp_path, monkeypatch):
+    import shutil
+    physical, lake, state, receipts = [tmp_path / name for name in ('ingress', 'lake', 'state', 'receipts')]
+    for root in (physical, lake, state, receipts):
+        root.mkdir()
+    (physical / '.staging').mkdir()
+    staging = lake / 'prepared'
+    staging.mkdir()
+    (staging / 'catalog-state.json').write_bytes(b'fixed registry rows and logical identity')
+    manifest = seal(staging, {'kind': 'ducklake_catalog_and_data', 'ducklake_snapshot_id': 7,
+                             'producer_device_id': 'penguin', 'receiver_device_id': 'lab203'})
+    identity = manifest['identity_sha256']
+    source = lake / 'releases' / ('lake-' + identity)
+    source.parent.mkdir()
+    staging.rename(source)
+    batch = physical / 'lakehouse' / source.name
+    batch.parent.mkdir()
+    shutil.copytree(source, batch)
+    c = {'lake_root': str(lake), 'transport_root': str(batch.parent), 'receipt_root': str(receipts),
+         'state_root': str(state), 'transport_cache_retirement': True,
+         'producer_device_id': 'penguin', 'receiver_device_id': 'lab203'}
+    copied = {'contract': ACK, 'delivery_identity_sha256': identity, 'manifest_file_sha256': digest(source / 'manifest.json'),
+              'complete_files': 3, 'complete_bytes': sum(p.stat().st_size for p in source.iterdir()),
+              'all_files_sha256_verified': True, 'exact_file_set_verified': True,
+              'source_unchanged_verified': True, 'command_exit_codes': [0, 0]}
+    enrolled = {'state': 'published', 'snapshot_id': 7, 'delivery_identity_sha256': identity,
+                'delivery_root': str(source), 'transport_root': str(batch), 'replication': copied}
+    atomic_write_json(state / 'export-7.json', enrolled)
+    ack = {**copied, 'producer_device_id': 'penguin', 'receiver_device_id': 'lab203',
+           'restore_command_exit_codes': [0, 0], 'catalog_semantic_restore_verified': True,
+           **{key: True for key in ('nas_independent_restore_verified', 'nas_mount_guard_verified',
+                                    'single_owner_verified', 'runtime_lock_verified')}}
+    atomic_write_json(receipts / (batch.name + '.json'), {**ack, 'identity_sha256': identity_sha256(ack)})
+    monkeypatch.setattr(cache, 'PHYSICAL_TRANSPORT_ROOT', physical)
+    monkeypatch.setattr(cache, 'process_references_many', lambda roots: [])
+    return c, identity, enrolled, source, batch, ack
+
+
+@pytest.mark.parametrize('damage', ['primary', 'transport'])
+def test_enrolled_catalog_nas_proof_survives_local_damage_but_gc_preserves_both(catalog_delivery, damage):
+    c, identity, enrolled, source, batch, ack = catalog_delivery
+    changed = (source if damage == 'primary' else batch) / 'catalog-state.json'
+    changed.write_bytes(b'x' * changed.stat().st_size)
+    proof = lakehouse.acceptance(c, identity, enrolled_catalog=enrolled)
+    assert proof['catalog_semantic_restore_verified']
+    assert proof['admission_basis'] == 'enrolled_closed_catalog_and_paired_nas_restore'
+    if damage == 'primary':
+        with pytest.raises(ValueError, match='full SHA'):
+            lakehouse.acceptance(c, identity)
+    with pytest.raises(ValueError):
+        cache.retire(c, identity, proof, apply=True)
+    assert source.is_dir() and batch.is_dir() and changed.read_bytes().startswith(b'x')
+    assert json.loads((Path(c['receipt_root']) / (batch.name + '.json')).read_bytes())['identity_sha256'] == identity_sha256(ack)
+
+
+@pytest.mark.parametrize('damage', ['snapshot', 'state', 'root', 'manifest_sha', 'bytes', 'boolean_exit_code'])
+def test_catalog_admission_requires_exact_completed_producer_enrollment(catalog_delivery, damage):
+    c, identity, enrolled, source, batch, _ = catalog_delivery
+    wrong = deepcopy(enrolled)
+    if damage == 'snapshot':
+        wrong['snapshot_id'] += 1
+    elif damage == 'state':
+        wrong['state'] = 'publication_prepared'
+    elif damage == 'root':
+        wrong['delivery_root'] = str(source.parent / 'different')
+    elif damage == 'manifest_sha':
+        wrong['replication']['manifest_file_sha256'] = 'f' * 64
+    elif damage == 'bytes':
+        wrong['replication']['complete_bytes'] += 1
+    else:
+        wrong['replication']['command_exit_codes'] = [False, 0]
+    with pytest.raises(ValueError, match='enrolled catalog'):
+        lakehouse.acceptance(c, identity, enrolled_catalog=wrong)
+    assert source.exists() and batch.exists()
+
+
+@pytest.mark.parametrize('damage', ['semantic_restore', 'pairing'])
+def test_catalog_enrollment_never_substitutes_for_paired_nas_native_restore(catalog_delivery, damage):
+    c, identity, enrolled, source, batch, ack = catalog_delivery
+    wrong = deepcopy(ack)
+    wrong['catalog_semantic_restore_verified' if damage == 'semantic_restore' else 'receiver_device_id'] = (
+        False if damage == 'semantic_restore' else 'unknown-peer')
+    atomic_write_json(Path(c['receipt_root']) / (batch.name + '.json'), {**wrong, 'identity_sha256': identity_sha256(wrong)})
+    with pytest.raises(ValueError):
+        lakehouse.acceptance(c, identity, enrolled_catalog=enrolled)
+    assert source.exists() and batch.exists()
+
+
+def test_catalog_admission_refuses_conflicting_enrollment_scopes(catalog_delivery):
+    c, identity, enrolled, *_ = catalog_delivery
+    with pytest.raises(ValueError, match='conflicting enrollment'):
+        lakehouse.acceptance(c, identity, enrolled_catalog=enrolled, enrolled_source={})
+
+
+def test_catalog_enrollment_requires_exact_journal_name_and_ignores_prepared_intents(catalog_delivery):
+    c, identity, enrolled, *_ = catalog_delivery
+    assert lakehouse.catalog_enrollment(c, identity) == enrolled
+    journal = Path(c['state_root']) / 'export-7.json'
+    atomic_write_json(journal, {**enrolled, 'state': 'publication_prepared'})
+    assert lakehouse.catalog_enrollment(c, identity) is None
+    atomic_write_json(journal, enrolled)
+    journal.rename(journal.with_name('export-8.json'))
+    with pytest.raises(ValueError, match='enrollment identity'):
+        lakehouse.catalog_enrollment(c, identity)
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'fifo'])
+def test_catalog_enrollment_refuses_redirected_or_blocking_journals(catalog_delivery, kind):
+    import os
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    c, identity, enrolled, source, batch, _ = catalog_delivery
+    journal = Path(c['state_root']) / 'export-7.json'
+    journal.unlink()
+    unrelated = Path(c['state_root']) / 'unrelated'
+    unrelated.write_bytes(b'preserve unrelated evidence')
+    if kind == 'symlink':
+        journal.symlink_to(unrelated)
+    else:
+        os.mkfifo(journal)
+    with pytest.raises(SnapshotError):
+        lakehouse.catalog_enrollment(c, identity)
+    assert unrelated.read_bytes() == b'preserve unrelated evidence'
+    assert source.exists() and batch.exists()
+
+
+def test_catalog_enrollment_refuses_a_non_mapping_journal(catalog_delivery):
+    c, identity, *_ = catalog_delivery
+    (Path(c['state_root']) / 'export-7.json').write_text('[]')
+    with pytest.raises(ValueError, match='not an enrollment'):
+        lakehouse.catalog_enrollment(c, identity)
+
+
 @pytest.mark.parametrize('damage', ['none', 'wrong_sha', 'source_change'])
 def test_batched_primary_recovery_verification_preserves_sha_and_stability_gates(tmp_path, monkeypatch, damage):
     from stockagent.data_sync import windows_cold_io as native
@@ -435,13 +568,30 @@ def test_independent_source_still_honors_retained_capacity(independent_source):
     assert second['pending_delivery_ids'] == first['pending_delivery_ids']
 
 
-def test_receiver_failure_requeues_exact_bytes_without_overwriting_failed_attempt(independent_source):
+def test_positive_capacity_slack_that_cannot_fit_any_object_reports_backpressure(independent_source):
+    c, entries, ledger_path = independent_source
+    lakehouse.stage_source_wave(c)
+    data = json.loads(ledger_path.read_bytes())
+    next(iter(data['deliveries'].values()))['bytes'] = c['source_replication']['maximum_retained_transport_bytes'] - 1
+    atomic_write_json(ledger_path, data)
+    result = lakehouse.stage_source_wave(c)
+    assert result['state'] == 'waiting_transport_capacity'
+    assert result['publication_capacity_room_bytes'] == 1
+    assert result['unpublished_source_object_count'] == len(entries) - 1
+    assert result['minimum_next_source_object_bytes'] > 1
+    assert len(json.loads(ledger_path.read_bytes())['deliveries']) == 1
+
+
+@pytest.mark.parametrize('structured_request', [False, True])
+def test_receiver_failure_requeues_exact_bytes_without_overwriting_failed_attempt(independent_source, structured_request):
     c, entries, ledger_path = independent_source
     first = lakehouse.stage_source_wave(c)
     original = first['pending_delivery_ids'][0]
     original_root = Path(c['transport_root'])/('lake-'+original)
     before = (original_root/'manifest.json').read_bytes()
-    failed_receiver(c, original)
+    failed_receiver(c, original, **({'jobs': [{'delivery': 'lake-'+original, 'state': 'rejected',
+        'error_type': 'ValueError', 'failure_kind': 'integrity_failure',
+        'transport_action': 'request_redelivery'}]} if structured_request else {}))
     second = lakehouse.stage_source_wave(c)
     rows = json.loads(ledger_path.read_bytes())['deliveries']
     retry = rows[original]['redeliveries'][0]
@@ -478,6 +628,25 @@ def test_incomplete_ingress_or_temporary_nas_wait_keeps_sending_without_duplicat
     assert len(result['pending_delivery_ids']) == 2
     assert not rows[original].get('redeliveries')
     assert len({key for row in rows.values() for key in row['file_keys']}) == 2
+
+
+@pytest.mark.parametrize('state', ['deferred', 'rejected', 'retry_wait'])
+@pytest.mark.parametrize('action', ['wait_for_Syncthing', 'waiting_for_manifest_and_READY'])
+def test_receiver_explicit_transport_wait_keeps_sending_new_data(independent_source, state, action):
+    c, entries, ledger_path = independent_source
+    original = lakehouse.stage_source_wave(c)['pending_delivery_ids'][0]
+    root = Path(c['transport_root'])/('lake-'+original)
+    original_manifest = (root/'manifest.json').read_bytes()
+    original_payloads = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    failed_receiver(c, original, jobs=[{'delivery': 'lake-'+original, 'state': state,
+        'error_type': 'ValueError', 'failure_kind': 'transport_incomplete', 'transport_action': action}])
+    result = lakehouse.stage_source_wave(c)
+    rows = json.loads(ledger_path.read_bytes())['deliveries']
+    assert len(result['pending_delivery_ids']) == 2
+    assert len({key for row in rows.values() for key in row['file_keys']}) == 2
+    assert not rows[original].get('redeliveries') and not rows[original].get('nas_acceptance')
+    assert (root/'manifest.json').read_bytes() == original_manifest
+    assert all((root/p).read_bytes() == body for p, body in original_payloads.items())
 
 
 def test_verified_redelivery_covers_original_keys_without_fabricating_original_ack(independent_source, monkeypatch):

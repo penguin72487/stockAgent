@@ -1442,13 +1442,16 @@ def _validate_inventory(
 
 
 @contextlib.contextmanager
-def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool):
+def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool,
+                        prefer_memory: bool = True):
     """Bound one immutable pack on SSD before ZIP's many small seeks.
 
     Only the guarded canonical-D callers enable this adapter. Every byte is
     hashed against its object ID before ZIP access; no tree/current/lease is
     hydrated. Anonymous scratch is removed when this read context closes.
     """
+    if type(prefer_memory) is not bool:
+        raise SnapshotError("pack read preference requires an explicit boolean")
     if not enabled:
         yield path
         return
@@ -1458,11 +1461,13 @@ def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool):
     if (not stat.S_ISREG(before.st_mode) or path.is_symlink() or before.st_size != expected_bytes):
         raise SnapshotError("native pack input is redirected or its size changed")
     fingerprint = (_source_stat(before), before.st_nlink)
-    # Real two-member 383 KiB pack recovery measured 0.146s via DrvFs vs
-    # 1.764s through native scratch. Bound this path tightly to that small
-    # family; larger or many-member packs retain native sequential recovery.
-    stored_members = int(item.get('stored_file_count', item.get('file_count', 3)))
-    if expected_bytes <= 512 * 1024 and 1 <= stored_members <= 2:
+    # Complete recovery of a real 876 kB / 67-member legacy pack measured
+    # medians of 0.888s in memory, 1.078s via DrvFs ZIP seeks, and 3.093s via
+    # native SSD scratch. Keep this choice bounded to one MiB / 128 members;
+    # unknown counts, larger packs and larger stored subsets stay native.
+    # See docs/vastai1t_storage_cleanup_2026-10-06.md for the interleaved runs.
+    stored_members = int(item.get('stored_file_count', item.get('file_count', 129)))
+    if prefer_memory and expected_bytes <= 1024**2 and 1 <= stored_members <= 128:
         with path.open('rb') as source:
             payload = source.read(expected_bytes + 1)
         if (len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != item['sha256']
@@ -1671,7 +1676,10 @@ def _copy_member_and_verify(
     expected_size: int,
     expected_sha256: str,
     mode: int,
+    durable: bool = True,
 ) -> None:
+    if type(durable) is not bool:
+        raise SnapshotError("member durability requires an explicit boolean")
     digest = hashlib.sha256()
     copied = 0
     with destination.open("xb") as output_stream:
@@ -1680,7 +1688,8 @@ def _copy_member_and_verify(
             digest.update(block)
             output_stream.write(block)
         output_stream.flush()
-        os.fsync(output_stream.fileno())
+        if durable:
+            os.fsync(output_stream.fileno())
     if copied != expected_size or digest.hexdigest() != expected_sha256:
         raise SnapshotError(f"extracted file checksum mismatch: {destination}")
     destination.chmod(mode)
@@ -1933,7 +1942,17 @@ def fetch_packed_snapshot(
     *,
     d_primary_native_blob_reads: bool = False,
     d_primary_native_pack_reads: bool = False,
+    verification_only: bool = False,
 ) -> Path:
+    if type(verification_only) is not bool:
+        raise SnapshotError("private verification reconstruction requires an explicit boolean")
+    if verification_only:
+        parent = materialized_root.absolute()
+        before = parent.lstat()
+        if (parent.resolve() != parent or not stat.S_ISDIR(before.st_mode)
+                or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) != 0o700
+                or any(parent.iterdir())):
+            raise SnapshotError("verification reconstruction requires a fresh private scratch directory")
     sync_root = sync_root.resolve()
     materialized_root = materialized_root.resolve()
     if _paths_overlap(sync_root, materialized_root):
@@ -1985,26 +2004,39 @@ def fetch_packed_snapshot(
                 for row in entries
                 if row["kind"] == "file" and row["storage"]["kind"] == "blob"
             ]
+            blob_groups: dict[str, list[dict[str, Any]]] = {}
             for row in blob_rows:
-                storage = row["storage"]
-                object_item = object_by_hash[str(storage["object_sha256"])]
+                blob_groups.setdefault(str(row["storage"]["object_sha256"]), []).append(row)
+            for object_sha, rows in blob_groups.items():
+                object_item = object_by_hash[object_sha]
                 object_path = _path_under(
                     sync_root, str(object_item["relpath"]), "object relpath"
                 )
-                path = staging.joinpath(*PurePosixPath(row["path"]).parts)
-                if d_primary_native_blob_reads:
-                    from stockagent.data_sync.windows_cold_io import binary_reader
-                    reader = binary_reader(object_path)
-                else:
-                    reader = object_path.open("rb")
-                with reader as input_stream:
-                    _copy_member_and_verify(
-                        input_stream,
-                        path,
-                        expected_size=int(row["size"]),
-                        expected_sha256=str(row["sha256"]),
-                        mode=int(row["mode"]),
-                    )
+                verified_source = None
+                for row in rows:
+                    path = staging.joinpath(*PurePosixPath(row["path"]).parts)
+                    if verified_source is not None:
+                        reader = verified_source.open("rb")
+                    elif d_primary_native_blob_reads:
+                        from stockagent.data_sync.windows_cold_io import binary_reader
+                        reader = binary_reader(object_path)
+                    else:
+                        reader = object_path.open("rb")
+                    with reader as input_stream:
+                        _copy_member_and_verify(
+                            input_stream,
+                            path,
+                            expected_size=int(row["size"]),
+                            expected_sha256=str(row["sha256"]),
+                            mode=int(row["mode"]),
+                            durable=not verification_only,
+                        )
+                    if verified_source is None and int(row["mode"]) & stat.S_IRUSR:
+                        # Reconstruct every logical name and verify its full
+                        # SHA again, but read an identical immutable object
+                        # from cold only once. Copies keep independent modes
+                        # and inodes; no consumer hardlink policy changes.
+                        verified_source = path
             pack_rows: dict[str, list[dict[str, Any]]] = {}
             for row in entries:
                 if row["kind"] == "file" and row["storage"]["kind"] == "pack":
@@ -2028,8 +2060,14 @@ def fetch_packed_snapshot(
                                 expected_size=int(row["size"]),
                                 expected_sha256=str(row["sha256"]),
                                 mode=int(row["mode"]),
+                                durable=not verification_only,
                             )
             _verify_materialized(staging, manifest, entries)
+            if verification_only:
+                # This is an ephemeral, fully SHA-verified reconstruction,
+                # never a managed target/READY. The caller must still decode
+                # and validate all originals before persisting its cold proof.
+                return staging
             os.replace(staging, target)
             _fsync_directory(dataset_root)
         except Exception:

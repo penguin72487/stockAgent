@@ -14,8 +14,10 @@ import os
 from pathlib import Path
 import tempfile
 
-import numpy as np
-import pandas as pd
+import polars as pl
+from scripts.finlab_columnar import (
+    PROCESSING_CONTRACT_VERSION, PROCESSING_ENGINE, to_polars, write_parquet, timestamp_bounds,
+)
 
 from scripts.download_finlab_history import _atomic_json, safe_stem
 from scripts.download_finlab_intraday import (
@@ -69,7 +71,7 @@ def stored_derived_receipt(root: Path, symbol: str, day: date,
     return None
 
 
-def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFrame:
+def ticks_to_minutes(ticks, symbol: str, day: date) -> pl.DataFrame:
     """Regular trades only; actual closing auctions retain their own minute.
 
     Do not fill zero-trade minutes. ``volume`` remains provider-native;
@@ -79,49 +81,60 @@ def ticks_to_minutes(ticks: pd.DataFrame, symbol: str, day: date) -> pd.DataFram
     from 2012-02-20; it is never moved back to 13:30 or treated as its price.
     """
     _validate_frame(ticks, f"tw_tick:{symbol}", day)
+    ticks = to_polars(ticks)
     required = {"close", "volume", "session", "sequence"}
     if not required.issubset(ticks.columns):
         raise ValueError("tick schema lacks price, volume, session or sequence")
-    if (ticks["volume"].isna().any() or ticks["session"].isna().any()
-            or not np.isfinite(ticks["volume"].to_numpy(dtype=float)).all()
+    if (ticks["volume"].null_count() or ticks["session"].null_count()
+            or not ticks["volume"].cast(pl.Float64, strict=False).is_finite().all()
             or (ticks["volume"] < 0).any()):
         raise ValueError("invalid tick volume or session")
-    local = ticks["timestamp"].dt.tz_convert("Asia/Taipei")
-    if not local.dt.date.eq(day).all():
+    local = ticks["timestamp"].dt.convert_time_zone("Asia/Taipei")
+    if not (local.dt.date() == day).all():
         raise ValueError("tick timestamp outside declared trade date")
-    regular = ticks.loc[ticks["session"].eq("regular") & ticks["volume"].gt(0)].copy()
-    if "volume_shares" not in regular:
-        regular["volume_shares"] = pd.Series(pd.NA, index=regular.index, dtype="Int64")
-    if regular.empty:
-        return pd.DataFrame(columns=["stock_id", "trade_date", "timestamp", "session",
-                                     "open", "high", "low", "close", "volume",
-                                     "volume_shares",
-                                     "tick_count", "vwap"])
-    if (regular["close"].isna().any()
-            or not np.isfinite(regular["close"].to_numpy(dtype=float)).all()
+    regular = ticks.filter((pl.col("session") == "regular") & (pl.col("volume") > 0))
+    if "volume_shares" not in regular.columns:
+        regular = regular.with_columns(pl.lit(None, dtype=pl.Int64).alias("volume_shares"))
+    if regular.is_empty():
+        return pl.DataFrame(schema={"stock_id": pl.String, "trade_date": pl.String,
+            "timestamp": ticks.schema["timestamp"], "session": pl.String,
+            **{name: pl.Float64 for name in ("open", "high", "low", "close", "volume", "vwap")},
+            "volume_shares": pl.Int64, "tick_count": pl.Int64})
+    if (regular["close"].null_count()
+            or not regular["close"].cast(pl.Float64, strict=False).is_finite().all()
             or (regular["close"] <= 0).any()):
         raise ValueError("invalid regular trade price")
-    clock = regular["timestamp"].dt.tz_convert("Asia/Taipei").dt.floor("min").dt.time
-    allowed = clock.between(time(9), time(13, 30))
+    clock = regular["timestamp"].dt.convert_time_zone("Asia/Taipei").dt.truncate("1m").dt.time()
+    allowed = clock.is_between(time(9), time(13, 30))
     if day >= DELAYED_CLOSE_RULE_START:
-        allowed |= clock.eq(time(13, 33))
+        allowed |= clock == time(13, 33)
     if not allowed.all():
         raise ValueError("regular tick outside 09:00-13:30 or dated 13:33 closing auction")
-    regular = regular.sort_values(["timestamp", "sequence"], kind="stable")
-    regular["minute"] = regular["timestamp"].dt.floor("min")
-    regular["notional"] = regular["close"] * regular["volume"]
-    bars = regular.groupby("minute", sort=True).agg(
-        open=("close", "first"), high=("close", "max"),
-        low=("close", "min"), close=("close", "last"),
-        volume=("volume", "sum"), tick_count=("close", "size"),
-        volume_shares=("volume_shares", lambda values: values.sum(min_count=len(values))),
-        notional=("notional", "sum"),
-    ).reset_index().rename(columns={"minute": "timestamp"})
-    bars["vwap"] = bars["notional"] / bars["volume"]
-    bars = bars.drop(columns="notional")
-    bars.insert(0, "stock_id", symbol)
-    bars.insert(1, "trade_date", day.isoformat())
-    bars.insert(3, "session", "regular")
+    # SDK partitions are normally already ordered. Prove the full composite
+    # order in O(N), instead of sorting every field of every day again. Null
+    # sequence values retain the legacy nulls-last stable-sort convention.
+    tied_out_of_order = regular.select(
+        ((pl.col("timestamp") == pl.col("timestamp").shift(1))
+         & ((pl.col("sequence") < pl.col("sequence").shift(1))
+            | (pl.col("sequence").is_not_null() & pl.col("sequence").shift(1).is_null())))
+        .fill_null(False).any()).item()
+    if not regular["timestamp"].is_sorted() or tied_out_of_order:
+        regular = regular.sort(["timestamp", "sequence"], maintain_order=True, nulls_last=True)
+    regular = regular.with_columns(
+        pl.col("timestamp").dt.truncate("1m").alias("minute"),
+        (pl.col("close") * pl.col("volume")).alias("notional"))
+    bars = regular.group_by("minute", maintain_order=True).agg(
+        pl.col("close").first().alias("open"), pl.col("close").max().alias("high"),
+        pl.col("close").min().alias("low"), pl.col("close").last().alias("close"),
+        pl.col("volume").sum(), pl.len().cast(pl.Int64).alias("tick_count"),
+        pl.when(pl.col("volume_shares").null_count() == 0).then(pl.col("volume_shares").sum())
+            .otherwise(None).cast(pl.Int64).alias("volume_shares"),
+        pl.col("notional").sum()).rename({"minute": "timestamp"}).with_columns(
+        (pl.col("notional") / pl.col("volume")).alias("vwap"),
+        pl.lit(symbol).alias("stock_id"), pl.lit(day.isoformat()).alias("trade_date"),
+        pl.lit("regular").alias("session")).select(
+            "stock_id", "trade_date", "timestamp", "session", "open", "high", "low", "close",
+            "volume", "tick_count", "volume_shares", "vwap")
     _validate_frame(bars, f"tw_minute:{symbol}", day)
     return bars
 
@@ -153,7 +166,7 @@ def derive_partition(root: Path, symbol: str, day: date,
         tick_path = root / source["parquet_path"]
         if _sha256(tick_path) != source_sha:
             raise ValueError("tick object hash differs from source receipt")
-        ticks = pd.read_parquet(tick_path)
+        ticks = pl.read_parquet(tick_path)
         volume_evidence = {
             "raw_volume_unit": source.get("raw_volume_unit", "provider_native"),
             "canonical_volume_unit": source.get("canonical_volume_unit", "unresolved"),
@@ -164,7 +177,7 @@ def derive_partition(root: Path, symbol: str, day: date,
             "unit_reference_revision": source.get("unit_reference_revision"),
             "unit_resolution_error": source.get("unit_resolution_error"),
         }
-        if ("volume_shares" not in ticks
+        if ("volume_shares" not in ticks.columns
                 or volume_evidence["canonical_volume_unit"] != "shares"):
             from scripts.finlab_volume_units import with_verified_volume_shares
 
@@ -177,6 +190,7 @@ def derive_partition(root: Path, symbol: str, day: date,
         volume_evidence = {"raw_volume_unit": "provider_native",
                            "canonical_volume_unit": "unresolved",
                            "canonical_volume_scope": "regular_session_only"}
+    first_timestamp, last_timestamp = timestamp_bounds(bars) if bars is not None else (None, None)
     payload = {
         "schema_version": DERIVED_RECEIPT_SCHEMA_VERSION,
         "minute_derivation_contract_version": DERIVATION_CONTRACT_VERSION,
@@ -189,14 +203,16 @@ def derive_partition(root: Path, symbol: str, day: date,
         "derived_at_utc": datetime.now(UTC).isoformat(),
         "rows": len(bars) if bars is not None else 0,
         "fields": list(bars.columns) if bars is not None else [],
-        "first_timestamp": str(bars["timestamp"].min()) if bars is not None and len(bars) else None,
-        "last_timestamp": str(bars["timestamp"].max()) if bars is not None and len(bars) else None,
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
         "source_grain": "stock_trade_day_left_labelled_minute",
         "volume_unit": "provider_native",
         **volume_evidence,
         "publication_time_status": "not_verified_for_training",
+        "processing_contract_version": PROCESSING_CONTRACT_VERSION,
+        "processing_engine": PROCESSING_ENGINE,
         "delayed_close_observed": bool(bars is not None and len(bars)
-            and bars["timestamp"].dt.tz_convert("Asia/Taipei").dt.time.eq(time(13, 33)).any()),
+            and (bars["timestamp"].dt.convert_time_zone("Asia/Taipei").dt.time() == time(13, 33)).any()),
     }
     if bars is not None and len(bars):
         objects = root / "intraday/objects"
@@ -205,7 +221,7 @@ def derive_partition(root: Path, symbol: str, day: date,
                                          suffix=".parquet.tmp", delete=False) as handle:
             temporary = Path(handle.name)
         try:
-            bars.to_parquet(temporary, index=False, compression="zstd")
+            write_parquet(bars, temporary)
             digest = _sha256(temporary)
             destination = objects / f"tw_minute_derived-{safe_stem(symbol)}-{day.isoformat()}-{digest[:24]}.parquet"
             if destination.exists():

@@ -1,0 +1,50 @@
+{
+  "contract_version": 1,
+  "root": "artifacts/data_quality/news_goal_stage01_20261009/remaining_v103/private-native-replay",
+  "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
+  "workers": 2, "exclusive_http_owner": true,
+  "request_timeout_seconds": 10, "response_deadline_seconds": 30,
+  "max_response_bytes": 8388608, "max_attempts": 6, "lease_seconds": 300,
+  "min_free_disk_bytes": 26843545600,
+  "batch_articles": 16, "batch_text_bytes": 4194304,
+  "robots_ttl_seconds": 86400, "metadata_refresh_seconds": 900,
+  "recent_article_recheck_seconds": 21600, "recent_article_window_days": 3,
+  "unknown_source_policy": "awaiting_authorization", "collection_purpose": "personal_research",
+  "publish": false, "remote_training_export": false,
+  "providers": [
+    {
+      "id": "taichung_gov", "name": "臺中市政府市政新聞", "domains": ["www.taichung.gov.tw"],
+      "enabled": true, "acquisition_mode": "finite", "allow_reviewed_supplements": true, "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "embedded_article_layout": "taichung_visible_news_v1",
+      "article_path_pattern": "^/([1-9][0-9]*/post|8868/8872/9962/[1-9][0-9]*)$",
+      "article_selectors": ["#cpArticle"], "title_selector": "main#center > header > h2",
+      "require_configured_container": true, "require_author_attribution": true,
+      "authorization": {
+        "kind": "open_license", "license": "Taichung-Main-Website-Open-Data-Attribution",
+        "evidence_url": "https://www.taichung.gov.tw/10179/10185/13599",
+        "scope": "Known locally resolved main-host municipal-news9962 releases for private unchanged own-agency text only. Verify declared og article ID, visible headline, publication day and explicitly labelled reviewed municipal contact organization/office, preserving source spelling. Enforce canonical agreement whenever declared; the observed canonical-absent variant additionally requires the native news9962 breadcrumb and all three matching source-declared share URL pointers. No ID enumeration, media, third-party works, public text endpoint or automatic training export. Labelled business contacts are not narrative or named authors.",
+        "verified_on": "2026-10-12",
+        "rights_restrictions": "Maintain attribution and original dates/values. Exclude separately restricted or third-party materials and media; private raw only, no republication/export. Main-host policy is not inherited by subdomains. Robots/refusals remain authoritative."
+      },
+      "review_url": "https://www.taichung.gov.tw/10179/10185/13599",
+      "note": "Canonical native article adapter; this private configuration is for replay/tests, not a second running collector. Only frozen known URLs; source-declared500-item RSS and JSON history await independent bulk/clock/rights acceptance before activation."
+    },
+    {
+      "id": "changhua_gov", "name": "彰化縣政府新聞公告", "domains": ["www.chcg.gov.tw"],
+      "enabled": true, "acquisition_mode": "finite", "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "embedded_article_layout": "changhua_visible_news_v1",
+      "article_path_pattern": "^/ch2/newsdetail[.]aspx$",
+      "article_selectors": [":scope > article.content"], "title_selector": "#print_parts > .ipdb-title-block > .ipdb-title",
+      "require_configured_container": true, "require_author_attribution": true,
+      "authorization": {
+        "kind": "open_license", "license": "Open-Government-Data-License-Taiwan-1.0",
+        "evidence_url": "https://www.chcg.gov.tw/ch2/copyright.aspx",
+        "scope": "Known main-host bull_id382888 own-agency text, visibly released by 經濟暨綠能發展處, for private research. Match native form/breadcrumb/print ID and complete headline/body; retain exact header date and full publication-period panel. Agency is an organization, not an inferred reporter. No source search, generated IDs, other departments, media, public body endpoint or automatic training export.",
+        "verified_on": "2026-10-12",
+        "rights_restrictions": "Maintain attribution and source values/clock precision; exclude third-party works, restricted materials, personal contact blocks and media. Obey robots including files restrictions; no image requests, no publication seconds or expiry date invented."
+      },
+      "review_url": "https://www.chcg.gov.tw/ch2/copyright.aspx",
+      "note": "Only the frozen locally known release; native identity/publication panel validated because actual original declares no canonical/og URL or NewsArticle. RSS contains mixed short/empty descriptions, not yet a verified full-text source."
+    }
+  ]
+}

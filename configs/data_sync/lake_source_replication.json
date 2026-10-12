@@ -2,7 +2,7 @@
   "decouple_nas_acceptance": true,
   "refresh_source_catalog": true,
   "catalog_refresh_retry_seconds": 600,
-  "maximum_retained_transport_bytes": 274877906944,
+  "maximum_retained_transport_bytes": 240518168576,
   "receiver_requested_redelivery": true,
   "maximum_redelivery_attempts": 3,
   "redelivery_cooldown_seconds": 600,

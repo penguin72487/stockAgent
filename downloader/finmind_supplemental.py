@@ -197,7 +197,7 @@ def seed(connection: sqlite3.Connection, universes: dict[str, list[str]], now: d
                        "(dataset TEXT PRIMARY KEY,fingerprint TEXT)")
     _migrate_market_history(connection, now)
     from downloader.finmind_history_calendar import reconcile_closures
-    from downloader.finmind_storage_objects import effective_sources, identity_clause, forward_identity_clause, limit_benchmark_frontier
+    from downloader.finmind_storage_objects import effective_sources, limit_benchmark_frontier
     sources = effective_sources(connection, SOURCES)
     closures = reconcile_closures(connection, sources, official_sessions, now, day_decision=day_decision,
                                    additional_calendars=additional_calendars)
@@ -260,60 +260,83 @@ def seed(connection: sqlite3.Connection, universes: dict[str, list[str]], now: d
             limit_benchmark_frontier(connection)
         if source.grain == "history":
             continue
-        active = connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset=? AND state IN ('pending','failed','inflight')",
-                                    (dataset,)).fetchone()[0]
-        # New periods take precedence over old periods, but retain the dataset
-        # priority so tick never jumps ahead of missing non-tick observations.
-        # A retained task or a compactly proven closure does not consume room.
-        # Keep at most one additional bounded forward working set. A full
-        # history set must not suppress just-released periods indefinitely.
-        # Bound cursor visits as well as pending work so reconciliation never
-        # holds the writer indefinitely while replaying an old verified range.
-        visits = 0
-        identity_filter = identity_clause(dataset) if source.universe == 'market' else ''
-        for direction in (1, -1):
-            room = (min(WORKING_SET, max(0, WORKING_SET * 2 - active)) if direction == 1
-                    else max(0, WORKING_SET - active))
-            while room and visits < MAX_FRONTIER_VISITS:
-                column = 'newer_than' if direction == 1 else 'older_than'
-                condition = 'newer_than<?' if direction == 1 else 'older_than IS NOT NULL'
-                args = (dataset, anchor.isoformat(), min(room, MAX_FRONTIER_VISITS - visits)) if direction == 1 else (
-                    dataset, min(room, MAX_FRONTIER_VISITS - visits))
-                ordering = 'newer_than,data_id' if direction == 1 else 'older_than DESC,data_id'
-                candidates = connection.execute(
-                    f'SELECT data_id,{column} FROM finmind_source_frontiers '
-                    f"WHERE dataset=?{forward_identity_clause(dataset) if direction == 1 and source.endpoint == 'storage_objects' else identity_filter} "
-                    f'AND {condition} ORDER BY {ordering} LIMIT ?', args).fetchall()
-                if not candidates:
-                    break
-                for identifier, raw in candidates:
-                    day = date.fromisoformat(raw)
-                    if direction == 1:
-                        day = _month_next(day) if source.grain == 'month' else day + timedelta(days=1)
-                    if source.grain == 'day':
-                        day = closures.advance(dataset, day, direction=direction)
-                    item_floor = (source.first.replace(day=1) if source.grain == 'month' else
-                                  source.first if source.universe == 'market' and identifier != 'TAIEX' else
-                                  history_floor(dataset, identifier))
-                    if item_floor <= day <= anchor:
-                        inserted = int(_insert(connection, dataset, identifier, day, source, day_decision=day_decision))
-                        room -= inserted
-                        active += inserted
-                    if direction == 1:
-                        cursor = min(day, anchor).isoformat()
-                    else:
-                        prior = day - timedelta(days=1)
-                        if source.grain == 'month':
-                            prior = prior.replace(day=1)
-                        cursor = prior.isoformat() if prior >= item_floor else None
-                    connection.execute(f'UPDATE finmind_source_frontiers SET {column}=? WHERE dataset=? AND data_id=?',
-                                       (cursor, dataset, identifier))
-                    visits += 1
+        _refill_source(connection, dataset, source, anchor, closures, day_decision=day_decision)
     connection.commit()
     # The worker publishes the same complete frontier immediately afterwards.
     # Do not aggregate all identifiers/tasks twice when the caller discards it.
     # Independent audit callers keep the existing complete return by default.
     return frontier_status(connection, now) if include_status else {}
+
+
+def refill_history(connection: sqlite3.Connection, dataset: str, now: datetime, *, day_decision=None) -> int:
+    """Refill an initialized canonical frontier without another master/API scan.
+
+    The owner has already reconciled calendars, entitlement and universes in
+    seed(). Reuse its persisted closure proofs and exact cursor advancement.
+    New universes/proof revisions still go through seed() every owner cycle.
+    """
+    from downloader.finmind_history_calendar import load_closures
+    from downloader.finmind_storage_objects import effective_sources
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='finmind_source_frontiers'").fetchone():
+        return 0
+    source = effective_sources(connection, SOURCES).get(dataset)
+    if source is None or source.grain not in {'day', 'month'}:
+        return 0
+    inserted = _refill_source(connection, dataset, source, _eligible_anchor(source, now),
+                              load_closures(connection), day_decision=day_decision)
+    connection.commit()
+    return inserted
+
+
+def _refill_source(connection, dataset, source, anchor, closures, *, day_decision=None):
+    """Same bounded forward/older working set for initial seeding and refill."""
+    from downloader.finmind_storage_objects import identity_clause, forward_identity_clause
+    active = connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset=? AND state IN ('pending','failed','inflight')",
+                                (dataset,)).fetchone()[0]
+    visits = inserted_total = 0
+    identity_filter = identity_clause(dataset) if source.universe == 'market' else ''
+    # Forward periods retain precedence and at most one additional working
+    # set. Bound cursor visits as well as pending/in-flight tasks.
+    for direction in (1, -1):
+        room = (min(WORKING_SET, max(0, WORKING_SET * 2 - active)) if direction == 1
+                else max(0, WORKING_SET - active))
+        while room and visits < MAX_FRONTIER_VISITS:
+            column = 'newer_than' if direction == 1 else 'older_than'
+            condition = 'newer_than<?' if direction == 1 else 'older_than IS NOT NULL'
+            args = (dataset, anchor.isoformat(), min(room, MAX_FRONTIER_VISITS - visits)) if direction == 1 else (
+                dataset, min(room, MAX_FRONTIER_VISITS - visits))
+            ordering = 'newer_than,data_id' if direction == 1 else 'older_than DESC,data_id'
+            candidates = connection.execute(
+                f'SELECT data_id,{column} FROM finmind_source_frontiers '
+                f"WHERE dataset=?{forward_identity_clause(dataset) if direction == 1 and source.endpoint == 'storage_objects' else identity_filter} "
+                f'AND {condition} ORDER BY {ordering} LIMIT ?', args).fetchall()
+            if not candidates:
+                break
+            for identifier, raw in candidates:
+                day = date.fromisoformat(raw)
+                if direction == 1:
+                    day = _month_next(day) if source.grain == 'month' else day + timedelta(days=1)
+                if source.grain == 'day':
+                    day = closures.advance(dataset, day, direction=direction)
+                item_floor = (source.first.replace(day=1) if source.grain == 'month' else
+                              source.first if source.universe == 'market' and identifier != 'TAIEX' else
+                              history_floor(dataset, identifier))
+                if item_floor <= day <= anchor:
+                    inserted = int(_insert(connection, dataset, identifier, day, source, day_decision=day_decision))
+                    room -= inserted
+                    active += inserted
+                    inserted_total += inserted
+                if direction == 1:
+                    cursor = min(day, anchor).isoformat()
+                else:
+                    prior = day - timedelta(days=1)
+                    if source.grain == 'month':
+                        prior = prior.replace(day=1)
+                    cursor = prior.isoformat() if prior >= item_floor else None
+                connection.execute(f'UPDATE finmind_source_frontiers SET {column}=? WHERE dataset=? AND data_id=?',
+                                   (cursor, dataset, identifier))
+                visits += 1
+    return inserted_total
 
 
 def _insert(connection: sqlite3.Connection, dataset: str, identifier: str, day: date, source: Source,

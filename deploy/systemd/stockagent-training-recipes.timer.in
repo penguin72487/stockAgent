@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry recipe metadata admission without downloading or assembling datasets
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=stockagent-training-recipes.service
+
+[Install]
+WantedBy=timers.target

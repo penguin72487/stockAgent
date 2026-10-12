@@ -12,6 +12,24 @@ from torch.utils.checkpoint import checkpoint
 from stockagent.models.transformer_base_portfolio import _safe_attention_mask
 
 
+def factorized_head_backend_contract(model) -> str:
+    """Version the narrow FP32 head's compiler policy, not its mathematics."""
+    if (int(getattr(model, "d_model", 32)) < 32
+            and bool(getattr(model, "portfolio_blocks_fp32", False))):
+        return "sm12_narrow_fp32_head_aligned_inductor_v1"
+    return "inductor_v1"
+
+
+def _compact_encoder_static_abi_budget(features: int) -> int:
+    # Power-of-two column buckets plus the full-width native stem, at most
+    # full/tail stock chunks in train/eval. Static width avoids Inductor's
+    # symbolic reduction-tiling failure. This is a finite graph inventory,
+    # not an unbounded global recompile allowance.
+    if features < 1:
+        raise ValueError("compact encoder requires a positive logical width")
+    return 4 * (int(features).bit_length() + 1)
+
+
 def _use_encoder_checkpoint(model, slab, device):
     """Keep the historical policy unless direct encoding safely fits on CUDA.
 
@@ -74,9 +92,31 @@ def _call_partition(model,fn,*args,**kwargs):
         # forward context), changes AOT saved-tensor cardinality. Keep the same
         # compiled graph in both contexts; do not disable DDP or checkpoint
         # validation, change the model, or retain every raw GPU slab.
-        with dynamo_config.patch(optimize_ddp=False), aot_config.patch(backward_pass_autocast="off"):
+        compile_patch = {"optimize_ddp": False}
+        static_budget = getattr(fn, "_stockagent_static_abi_budget", None)
+        if static_budget is not None:
+            compile_patch["recompile_limit"] = max(dynamo_config.recompile_limit, static_budget)
+        with dynamo_config.patch(**compile_patch), aot_config.patch(backward_pass_autocast="off"):
             return fn(*args,**kwargs)
     return fn(*args,**kwargs)
+
+
+def _factorized_stock_chunk_size(model, slab, mask, *, raw_basis=False):
+    """Bound source workspace without tying large batches to a tiny stock cap."""
+    compact = bool(getattr(model, "factorized_compact_projection", False))
+    budget = int(slab.source.manifest.get("stream_chunk_bytes", 512 * 1024**2))
+    rows = (1 if compact else 3) * slab.size(0)
+    cap = 128
+    if compact:
+        selected = int(getattr(model, "factorized_compact_stream_chunk_bytes", 0))
+        if selected:
+            budget = min(selected, slab.source.max_slab_bytes)
+            cap = slab.size(1)
+        else:
+            budget = max(budget, min(slab.source.max_slab_bytes, 1024**3))
+    if raw_basis and not model.temporal_basis_feature_encoder.fp32_contraction:
+        rows += mask.size(0) * model.lookback
+    return max(1, min(cap, budget // max(1, rows * slab.size(2) * 4)))
 
 
 @torch.compiler.disable
@@ -105,6 +145,7 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
     else:symbol_indices=symbol_indices.to(device=device)
     encoder=model.temporal_basis_feature_encoder
     raw_basis=model._raw_temporal_basis_enabled()
+    compact_projection=bool(getattr(model,"factorized_compact_projection",False))
     if encoder is not None and not raw_basis:
         raise ValueError("wide streaming currently admits the selected raw-feature basis ABI only")
     if raw_basis and not encoder.fuse_projection:
@@ -119,9 +160,15 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
             object.__setattr__(model,"_factorized_effective_kernel_fn",kernel_fn)
         # _basis only uses the source's dtype/device, not its observations.
         kernels=_call_partition(model,kernel_fn,encoder.feature_projection.weight.new_empty(()))
-    def encode(raw,stock_mask,stock_ids,kernel):
-        h=model._embed_windowed_from_panel_slab(raw,stock_ids)
-        basis=model._raw_temporal_basis_windows_from_panel_slab(raw)
+    def encode(raw,stock_mask,stock_ids,kernel,columns=None):
+        if compact_projection:
+            projected=model.candle_encoder.forward_compact_columns(raw,columns)
+            h=projected.unfold(0,model.lookback,1).permute(0,3,1,2).contiguous()
+            h=model._add_window_positions(h,int(raw.size(1)),stock_ids)
+            basis=None
+        else:
+            h=model._embed_windowed_from_panel_slab(raw,stock_ids)
+            basis=model._raw_temporal_basis_windows_from_panel_slab(raw)
         temporal=model._apply_temporal_blocks(h,keep_all_steps=False)
         pooled=model._pool_temporal(temporal,stock_mask)
         if raw_basis:
@@ -133,16 +180,16 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
     if encode_fn is None:
         encode_fn=encode
         if device.type=="cuda" and model.factorized_input_compile:
-            encode_fn=torch.compile(encode_fn,dynamic=False,options=_partition_compile_options(model))
+            encode_fn=torch.compile(encode_fn,dynamic=False,
+                fullgraph=compact_projection,options=_partition_compile_options(model))
+            if compact_projection:
+                # Train/eval must share all static bucket ABIs without silently
+                # falling back at Dynamo's eight-variant default. Fullgraph
+                # raises if this finite budget is exceeded; steady epochs must
+                # still report zero new graphs in the full-fold acceptance.
+                encode_fn._stockagent_static_abi_budget = _compact_encoder_static_abi_budget(slab.size(2))
         object.__setattr__(model,"_factorized_encode_fn",encode_fn)
-    budget=int(slab.source.manifest.get("stream_chunk_bytes",512*1024**2))
-    rows=3*slab.size(0)
-    if raw_basis and not encoder.fp32_contraction:
-        # Original einsum can materialize B*L overlapping raw rows. Do not
-        # size its workspace by unique slab rows alone.
-        rows+=mask.size(0)*model.lookback
-    per_stock=rows*slab.size(2)*4
-    chunk=max(1,min(128,budget//max(1,per_stock)))
+    chunk = _factorized_stock_chunk_size(model, slab, mask, raw_basis=raw_basis)
     outputs=[]
     for begin in range(0,slab.size(1),chunk):
         end=min(slab.size(1),begin+chunk)
@@ -150,6 +197,9 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         # Bind loop values: backward recomputation must never use the last
         # chunk's rows, security IDs or masks for an earlier chunk.
         def read_and_encode(m,ids,k,begin=begin,end=end):
+            if compact_projection:
+                values,columns=slab.compact_stock_chunk(begin,end)
+                return _call_partition(model,encode_fn,values,m,ids,k,columns)
             return _call_partition(model,encode_fn,slab.stock_chunk(begin,end),m,ids,k)
         if checkpoint_encoder:
             output=checkpoint(read_and_encode,stock_mask,stock_ids,kernels,use_reentrant=False)
@@ -160,6 +210,12 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
     if head_fn is None:
         head_fn=model._forward_stock_embeddings
         if device.type=="cuda" and model.factorized_input_compile:
-            head_fn=torch.compile(head_fn,dynamic=False,options=_partition_compile_options(model))
+            narrow = factorized_head_backend_contract(model) != "inductor_v1"
+            head_fn=torch.compile(head_fn,dynamic=False,fullgraph=narrow,
+                                  options=_partition_compile_options(model))
+            object.__setattr__(model, "_factorized_head_compile_backend", "inductor")
+            if narrow:
+                print("[model-compile] narrow FP32 head: Inductor fullgraph; "
+                      "logical attention retained with aligned SDPA tiles", flush=True)
         object.__setattr__(model,"_factorized_head_fn",head_fn)
     return _call_partition(model,head_fn,embeddings,mask,temperature=temperature,return_aux=return_aux,portfolio_context=portfolio_context)

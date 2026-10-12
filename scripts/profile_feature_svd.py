@@ -54,7 +54,8 @@ def main():
         assert torch.distributed.get_world_size()==2
         source=verify_source_release(Path(os.environ['STOCKAGENT_CODE_RELEASE_RECEIPT']),ROOT)
         panel=attach_factorized_features(build_panel(config.data.parquet_root,**_build_panel_kwargs(config)),
-            config.data.factorized_feature_manifest,transfer_mode=config.data.factorized_transfer_mode)
+            config.data.factorized_feature_manifest,transfer_mode=config.data.factorized_transfer_mode,
+            host_cache_bytes=getattr(config.data,"factorized_host_cache_bytes",None))
         fold=next(value for value in build_expanding_year_folds(panel.dates,
             min_train_years=config.walk_forward.min_train_years,val_years=config.walk_forward.val_years,
             require_future_test_year=config.walk_forward.require_future_test_year,

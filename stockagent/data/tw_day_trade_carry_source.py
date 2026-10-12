@@ -1720,6 +1720,8 @@ def build_prepared_day_trade_carry_source(
     subscription_right_policy: str = "reference_value_cash",
     sparse_event_slots: int | None = None,
 ) -> PreparedDayTradeCarrySource:
+    from stockagent.storage_layout import admit_output
+    cache_dir = admit_output(Path(cache_dir), 'cache')
     if subscription_right_policy not in {"reference_value_cash", "reject_held"}:
         raise ValueError("unsupported physical subscription right policy")
     sweep_entries = entry_remainder_policy == "frozen_target_until_1320"

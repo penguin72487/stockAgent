@@ -18,6 +18,25 @@ EXPECTED = ('TaiwanStockKBar', 'TaiwanFuturesKBar', 'TaiwanStockTradingDailyRepo
             'TaiwanOptionTick', 'TaiwanFuturesSpreadTick', 'USStockPriceMinute')
 
 
+def test_recent_full_history_renewals_preempt_without_reopening_terminal_or_empty(tmp_path):
+    dataset = 'TaiwanAssetSwapOptionDaily'
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        worker._add_tasks(conn, [(dataset, code, 'history', 'id_history', 2)
+                                for code in ('RECENT', 'OLDER', 'FAILED', 'EMPTY', 'EXHAUSTED')])
+        worker._add_tasks(conn, [('USStockPriceMinute', 'AAPL', '2026-09-25', 'id_day', 8)])
+        conn.execute("UPDATE tasks SET state='complete',last_data_date=?,next_attempt_at_utc=? WHERE data_id='RECENT'",
+                     (NOW.date().isoformat(), NOW.isoformat()))
+        conn.execute("UPDATE tasks SET state='complete',last_data_date='2021-01-01',priority=0 WHERE data_id='OLDER'")
+        for code, state in (('FAILED', 'failed'), ('EMPTY', 'observed_empty'), ('EXHAUSTED', 'retry_exhausted')):
+            conn.execute('UPDATE tasks SET state=?,last_data_date=? WHERE data_id=?', (state, NOW.date().isoformat(), code))
+        worker._reconcile_current_supplemental_history(conn, NOW.date())
+        result = dict(conn.execute('SELECT data_id,priority FROM tasks WHERE dataset=?', (dataset,)))
+        assert result == {'RECENT': 0, 'OLDER': 2, 'FAILED': 2, 'EMPTY': 2, 'EXHAUSTED': 2}
+        assert worker._next_task(conn, NOW).data_id == 'RECENT'
+        conn.execute("UPDATE tasks SET next_attempt_at_utc=? WHERE data_id='RECENT'", ((NOW + timedelta(days=1)).isoformat(),))
+        assert worker._next_task(conn, NOW).dataset == 'USStockPriceMinute'
+
+
 def test_all_nine_in_reverse_insertion_dispatch_exact_sequence_and_preemption(tmp_path):
     with worker._db(tmp_path / 'queue.sqlite3') as conn:
         worker._add_tasks(conn, [(stage.dataset, '' if stage.dataset == 'TaiwanFuturesSpreadTick' else 'ID',
@@ -57,6 +76,35 @@ def test_drained_working_set_does_not_skip_an_unseeded_frontier(tmp_path, direct
         assert worker._next_task(conn, NOW, datasets=('TaiwanFuturesKBar',)).dataset == 'TaiwanFuturesKBar'
         worker._add_tasks(conn, [('TaiwanStockInfo', '', 'latest', 'snapshot', 0)])
         assert worker._next_task(conn, NOW).dataset == 'TaiwanStockInfo'
+
+
+def test_unseeded_history_precedes_old_core_revalidation_and_preview_is_read_only(tmp_path):
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        worker._add_tasks(conn, [('TaiwanAssetSwapOptionDaily', 'OLD', 'history', 'id_history', 2)])
+        conn.execute("UPDATE tasks SET state='complete',next_attempt_at_utc=?", (NOW.isoformat(),))
+        conn.execute('CREATE TABLE finmind_source_frontiers (dataset TEXT,data_id TEXT,older_than TEXT,newer_than TEXT,PRIMARY KEY(dataset,data_id))')
+        conn.execute('INSERT INTO finmind_source_frontiers VALUES (?,?,?,?)', ('USStockPriceMinute', 'AAPL', '2026-09-25', '2026-09-25'))
+        before = conn.total_changes
+        assert worker._next_task(conn, NOW) is None
+        assert conn.total_changes == before
+        assert worker._refill_current_history(conn, tmp_path, NOW) > 0
+        assert worker._next_task(conn, NOW).dataset == 'USStockPriceMinute'
+
+
+def test_primary_seek_avoids_sorting_old_maintenance_but_keeps_fallback(tmp_path):
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        worker._add_tasks(conn, [('TaiwanAssetSwapOptionDaily', str(i), 'history', 'id_history', 2) for i in range(2000)])
+        conn.execute("UPDATE tasks SET state='complete',next_attempt_at_utc=?", (NOW.isoformat(),))
+        worker._add_tasks(conn, [('USStockPriceMinute', 'AAPL', '2026-09-25', 'id_day', 8)])
+        queries = []
+        conn.set_trace_callback(queries.append)
+        assert worker._next_task(conn, NOW).dataset == 'USStockPriceMinute'
+        selections = [query for query in queries if query.startswith('WITH eligible')]
+        assert len(selections) == 1 and 'AND priority=0' in selections[0]
+        conn.execute("UPDATE tasks SET state='complete',next_attempt_at_utc=NULL WHERE dataset='USStockPriceMinute'")
+        queries.clear()
+        assert worker._next_task(conn, NOW).dataset == 'TaiwanAssetSwapOptionDaily'
+        assert len([query for query in queries if query.startswith('WITH eligible')]) == 2
 
 
 def test_cooling_failure_keeps_later_stage_waiting_without_early_retry(tmp_path):

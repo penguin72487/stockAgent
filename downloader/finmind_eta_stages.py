@@ -260,9 +260,29 @@ def ordered_estimate(workload: dict[str, Any], telemetry: dict[str, Any], now: d
                 'rates': rates, 'object_requests': object_calls, 'samples': measured.get('samples', 0),
                 'dependent_processing_samples': measured.get('dependent_processing_samples', 0),
                 'dependent_processing_unknown': measured.get('dependent_processing_unknown', False),
+                'processing_engine': measured.get('processing_engine'),
                 'basis': 'serial_object_and_mandatory_local_processing_plus_separate_legacy_calls',
                 'without_samples': 'quota_only_fastest_lower_bound_central_and_slowest_unknown',
             }
+            if measured.get('parallel_pipeline') and object_calls == total:
+                stage_telemetry['request_processing_rates'].update(measured['parallel_pipeline'])
+                stage_telemetry['request_processing_rates']['basis'] = 'accepted_parallel_transfer_derive_publish_wall'
+        elif scope['summary']['current_plan_requests']:
+            parallel_json = telemetry.get('json_pipeline_statistics', {}).get(scope['dataset'])
+            json_costs = telemetry.get('json_service_statistics', {})
+            own_cost = json_costs.get('datasets', {}).get(scope['dataset'], {})
+            own_measured = own_cost.get('samples', 0) >= 3
+            cost = own_cost if own_measured else json_costs.get('pooled', {})
+            if parallel_json:
+                stage_telemetry['request_processing_rates'] = {
+                    **parallel_json, 'basis': 'accepted_parallel_json_fetch_validate_publish_wall',
+                    'sample_scope': 'dataset_current_configuration_full_batches',
+                }
+            elif cost.get('samples', 0) >= 3:
+                stage_telemetry['request_processing_rates'] = {
+                    **cost, 'capacity_basis': 'accepted_json_own_service_cost',
+                    'sample_scope': 'dataset' if own_measured else 'pooled_json_proxy',
+                }
         if components:
             stage_telemetry['quota']['forecast_recurring_requests_per_hour'] = math.ceil(
                 sum(components.get(phase, 0) for phase in active_phases
@@ -285,6 +305,7 @@ def ordered_estimate(workload: dict[str, Any], telemetry: dict[str, Any], now: d
         item = estimate_completion(scope, stage_telemetry, now, day_is_protected=day_is_protected,
                                    secondary_admission=admission, _project_calendar=False)
         item.update(schema_version=SNAPSHOT_CONTRACT_VERSION, key=key, scope_label=scope['label'],
+                    scenario_projection_contract=1,
                     dataset=scope['dataset'], history_rank=scope['history_rank'],
                     cumulative_planned_requests=scope['cumulative_planned_requests'])
         rates = item['rate_evidence']
@@ -292,6 +313,12 @@ def ordered_estimate(workload: dict[str, Any], telemetry: dict[str, Any], now: d
         priority_middle = _min_rate(priority_cap, rates['gross_requests_per_hour'])
         priority_slow = _min_rate(priority_middle, rates['dispatch_rate_p10'])
         priority_rates = dict(zip(SCENARIOS, (priority_cap, priority_middle, priority_slow), strict=True))
+        priority_cost = telemetry.get('json_service_statistics', {}).get('priority', {})
+        if priority_cost.get('samples', 0) >= 3:
+            priority_rates = {name: _min_rate(priority_cap, priority_cost.get('rates', {}).get(name))
+                              for name in SCENARIOS}
+            rates['priority_cost_basis'] = 'accepted_json_own_service_cost'
+            rates['priority_cost_samples'] = priority_cost['samples']
         independent_requests = scope['summary']['independent_retry_requests']
         independent_inflight = scope['summary']['independent_inflight_tasks']
         independent_work = bool(independent_requests or independent_inflight)
@@ -433,12 +460,20 @@ def ordered_estimate(workload: dict[str, Any], telemetry: dict[str, Any], now: d
     if workload.get('state') == 'observed':
         overall['scope_label'] = 'FinMind 已知待抓＋分階段追新模型（非永久完工）'
     overall['basis'] = '依現行優先順序分階段，共用一個帳號；逐階段計入追新負載、等待與前階段耗時。'
+    # The global result is an ordered sum, not the generic rolling-hour
+    # estimate used to initialize this object. Its prose must describe the
+    # same per-stage capacities as the actual numbers.
+    overall['assumptions'][:3] = [
+        '最快仍受共用帳號限額與各階段實測服務成本限制；不是保證能達到的速度。',
+        '中間逐階段使用近期已接受 JSON 自有成本或本配置完整並行管線的總接受量／總牆鐘耗時；缺少自有樣本才回退實發代理或未知。',
+        '保守逐階段採相同類型的慢端樣本並累加；實發滾動一小時數是歷史流量，不把大型彙總等待套用至小型 JSON。所有完成日均為條件模型。',
+    ]
     overall['assumptions'].append('九類歷史依指定順序逐階段，美股分鐘最後；到期追新及明確有限優先回補可插入，前階段未建候選／重試不算完成。等待期間新增日分區另列模型量。')
     if not fine_forecast and arrivals:
         overall['assumptions'].append('舊追新快照只有大類負載，尚不能分配至九個階段；等待下次每分鐘細分類取樣，不捏造逐類完成日期。')
     if timed_events is not None:
         overall['basis'] = '共用吞吐按階段推進；最高優先追新只在發布／到期時插入，不以日均需求全天扣額度。'
-        overall['assumptions'].append('追新按現有佇列首次到期與成功續期規律，向上取整至分鐘；小型追新採共用帳號實發速度代理，大型來源採下載＋本機處理成本，不把每次追新當大型檔。低優先歷史重驗與新分區仍為階段平均模型。')
+        overall['assumptions'].append('追新按現有佇列首次到期與成功續期規律，向上取整至分鐘；小型追新優先採近期已接受 JSON 自有成本，缺樣本才採實發代理；大型來源採下載＋本機處理成本，不把每次追新當大型檔。低優先歷史重驗與新分區仍為階段平均模型。')
     cash_calendars = forecast.get('new_partition_calendars', {})
     if any(value.get('state') == 'modeled_from_verified_cash_year' for value in cash_calendars.values()):
         overall['assumptions'].insert(0, '現貨新分區依最近一年已驗證實際場次密度推算，非未來精確開休市表；期貨夜盤／海外未知日曆仍用每日上側模型。')

@@ -23,9 +23,14 @@ def worker_code_identity():
              'stockagent/data_sync/immutable_replication.py', 'stockagent/data_sync/offhost_backup.py',
              'stockagent/data_sync/immutable_transport_cache.py',
              'stockagent/data_sync/nas_coverage.py',
+             'stockagent/data_sync/backup_stream.py', 'stockagent/data_sync/testing_disposition.py',
              'stockagent/data_sync/windows_cold_io.py', 'scripts/windows_cold_binary_io.ps1',
              'scripts/manage_lakehouse.py', 'scripts/run_lakehouse_control.sh', 'scripts/runtime_env.sh')
-    return identity_sha256({p: digest(ROOT / p) for p in paths})
+    code = {p: digest(ROOT / p) for p in paths}
+    from stockagent.data_sync.testing_disposition import DEFAULT_POLICY
+    if DEFAULT_POLICY.exists():
+        code[str(DEFAULT_POLICY.relative_to(ROOT))] = digest(DEFAULT_POLICY)
+    return identity_sha256(code)
 
 
 async def temporal(action, c):

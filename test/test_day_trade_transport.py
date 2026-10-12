@@ -25,7 +25,7 @@ def _packed(day, events, *, terminal):
         for field in fields(PackedDayTradeCarrySession)
         if field.name not in {
             "day", "marks", "exit_flat", "exit_price", "exit_capacity",
-            "terminal_liquidation_price",
+            "terminal_liquidation_price", "entry_path", "stop_hits",
         }
     }
     # Noncontiguous views, empty days and unequal event counts are legitimate
@@ -45,8 +45,9 @@ def _packed(day, events, *, terminal):
 
 @pytest.mark.parametrize("event_compression", [False, True])
 @pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("block_rows", [0, 1, 2, 16])
 def test_packed_transport_preserves_every_source_byte_and_dense_cell(
-    event_compression, terminal,
+    event_compression, terminal, block_rows,
 ):
     sources = tuple(
         _packed(730000 + i, n, terminal=terminal)
@@ -62,7 +63,7 @@ def test_packed_transport_preserves_every_source_byte_and_dense_cell(
     )
     assert batch.count == 4 and batch.event_compression == event_compression
     assert batch.tensors["_transport_exit_flat"].shape == (4, 8)
-    rebuilt_sessions = batch.sessions(torch.device("cpu"))
+    rebuilt_sessions = batch.sessions(torch.device("cpu"), transport_block_rows=block_rows)
     for index, (source, rebuilt) in enumerate(zip(sources, rebuilt_sessions, strict=True)):
         for name, original in before[index].items():
             _assert_same_bits(getattr(source, name), original)
@@ -93,3 +94,35 @@ def test_transport_rejects_invalid_event_indices():
     bad = replace(source, exit_flat=torch.tensor([-1, 0, 3]))
     with pytest.raises(ValueError, match="invalid lossless"):
         PreparedDayTradeCarryBatch.from_packed_sessions((bad,), 1, event_compression=True)
+
+
+def test_blocked_transport_rejects_negative_budget_and_preserves_source_autograd():
+    sources = tuple(_packed(730000+i, 3, terminal=False) for i in range(2))
+    for source in sources:
+        source.exit_price.requires_grad_()
+    batch = PreparedDayTradeCarryBatch.from_packed_sessions(sources, 2, event_compression=False)
+    with pytest.raises(ValueError, match="non-negative"):
+        batch.sessions(torch.device("cpu"), transport_block_rows=-1)
+    # Differentiable non-source payloads retain the original tensor/autograd
+    # path even when a bounded immutable transport budget is requested.
+    rebuilt = batch.sessions(torch.device("cpu"), transport_block_rows=1)
+    sum(torch.nan_to_num(s.exit_prices).sum() for s in rebuilt).backward()
+    for source in sources:
+        torch.testing.assert_close(source.exit_price.grad, torch.ones_like(source.exit_price))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_staging_row_slices_reuse_exact_source_views_and_calendar(packed):
+    sources = tuple(_packed(730000+i, i+1, terminal=True) for i in range(4))
+    full = PreparedDayTradeCarryBatch.from_packed_sessions(sources, 4, event_compression=False)
+    if not packed:
+        full = PreparedDayTradeCarryBatch.from_sessions(full.sessions(torch.device("cpu")), 4)
+    sliced = full.row_slice(1, 3)
+    assert sliced.days == full.days[1:3] and sliced.count == 2
+    assert sliced.packed_transport == full.packed_transport
+    for name, tensor in sliced.tensors.items():
+        assert tensor.untyped_storage().data_ptr() == full.tensors[name].untyped_storage().data_ptr()
+        _assert_same_bits(tensor, full.tensors[name][1:3])
+    for begin, end in [(-1, 1), (1, 1), (0, 5)]:
+        with pytest.raises(ValueError, match="real-row interval"):
+            full.row_slice(begin, end)

@@ -14,8 +14,8 @@ import json
 from pathlib import Path
 import re
 
-import pandas as pd
 import polars as pl
+from scripts.finlab_columnar import to_polars
 
 from downloader.download_shioaji_tw_kbars import normalize_kbars
 
@@ -114,38 +114,41 @@ def _reference(symbol: str, day: date, root: Path) -> dict | None:
 
 
 def with_verified_volume_shares(
-    ticks: pd.DataFrame, symbol: str, day: date,
+    ticks, symbol: str, day: date,
     *, reference_root: Path | None = None,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pl.DataFrame, dict]:
     """Keep provider ``volume``; add nullable ``volume_shares`` only if proved."""
 
-    output = ticks.copy()
-    output["volume_shares"] = pd.Series(pd.NA, index=output.index, dtype="Int64")
+    output = to_polars(ticks).with_columns(pl.lit(None, dtype=pl.Int64).alias("volume_shares"))
     evidence = {"raw_volume_unit": "provider_native", "canonical_volume_unit": "unresolved",
                 "canonical_volume_scope": "regular_session_only",
                 "volume_multiplier": None, "volume_unit_reference": None,
                 "unit_resolution_error": None,
                 "volume_unit_contract_version": VOLUME_UNIT_CONTRACT_VERSION,
                 "unit_reference_revision": reference_revision(symbol, day, reference_root)}
-    if output.empty or "volume" not in output or "session" not in output:
+    if output.is_empty() or "volume" not in output.columns or "session" not in output.columns:
         return output, evidence
     reference = _reference(symbol, day, reference_root or DEFAULT_REFERENCE_ROOT)
     if reference is None:
         return output, evidence
-    regular = output.loc[output["session"].eq("regular"), "volume"]
-    if (regular.empty or regular.isna().any()
+    regular = output.filter(pl.col("session") == "regular")["volume"].cast(pl.Float64, strict=False)
+    if (regular.is_empty() or regular.null_count() or not regular.is_finite().all()
             or abs(float(regular.sum()) - reference["regular_raw_volume"]) > 1e-6):
         return output, {**evidence, "unit_resolution_error": "regular_volume_mismatch"}
-    raw = pd.to_numeric(output["volume"], errors="coerce")
-    if raw.isna().any() or (raw < 0).any() or (raw % 1 != 0).any():
+    raw = output["volume"].cast(pl.Float64, strict=False)
+    if raw.null_count() or not raw.is_finite().all() or (raw < 0).any() or (raw % 1 != 0).any():
         return output, {**evidence, "unit_resolution_error": "invalid_raw_volume"}
     factor = reference["multiplier"]
-    if (raw.max() if len(raw) else 0) > (2**63 - 1) // factor:
+    # Float comparison can round INT64_MAX up to 2**63. A checked cast is
+    # required too, before multiplication; an unresolved unit stays nullable.
+    try:
+        integer = output["volume"].cast(pl.Int64, strict=True)
+    except pl.exceptions.PolarsError:
         return output, {**evidence, "unit_resolution_error": "share_volume_overflow"}
-    regular_mask = output["session"].eq("regular")
-    output.loc[regular_mask, "volume_shares"] = (
-        raw.loc[regular_mask].astype("int64") * factor
-    ).astype("Int64")
+    if (integer.max() if len(integer) else 0) > (2**63 - 1) // factor:
+        return output, {**evidence, "unit_resolution_error": "share_volume_overflow"}
+    output = output.with_columns(pl.when(pl.col("session") == "regular")
+        .then(integer * factor).otherwise(None).cast(pl.Int64).alias("volume_shares"))
     return output, {
         **evidence, "canonical_volume_unit": "shares", "volume_multiplier": factor,
         "volume_unit_reference": reference,

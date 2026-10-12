@@ -40,6 +40,7 @@ from common import (
 )
 from artifact_io import archive_run_reports
 from candle_frame_buffer import CandleFrameBuffer
+from candle_columns import numeric_candle_page
 from quality_priority import collect_with_quality_priority, prioritize_records
 from http_transport import RETRYABLE_NETWORK_ERRORS
 from ohlcv_hot_tail import (
@@ -751,6 +752,19 @@ def _fetch_perp_symbols(
 
 
 def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
+    schema = {"ts": pl.Int64, "open": pl.Float64, "max": pl.Float64, "min": pl.Float64,
+              "close": pl.Float64, "bybit_volume": pl.Float64, "bybit_turnover": pl.Float64}
+    frame = numeric_candle_page(raw_rows, schema, timestamp="ts", skip_short_rows=True)
+    if frame is None:
+        return _normalize_candles_reference(raw_rows)
+    return (frame.with_columns(pl.col("close").alias("adjclose"),
+                               pl.col("bybit_volume").alias("Trading_Volume"))
+            .sort("ts").unique(subset=["date"], keep="last").sort("ts")
+            .select([*OUTPUT_COLUMNS, "bybit_volume", "bybit_turnover"]))
+
+
+def _normalize_candles_reference(raw_rows: list[list[str]]) -> pl.DataFrame:
+    """Keep legacy empty/falsey volume and malformed-row behavior unchanged."""
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         if len(row) < 7:

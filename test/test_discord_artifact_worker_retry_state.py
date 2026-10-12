@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import run_discord_artifact_maintenance as runner
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 
 
 @pytest.fixture
@@ -54,6 +55,23 @@ def _pending_job(state: str) -> dict:
         "error_type": "FileNotFoundError" if state == "failed" else None,
         "error_message": "retained source is missing" if state == "failed" else None,
     }
+
+
+@pytest.mark.parametrize("cache_only", [True, False])
+def test_source_writer_race_waits_without_failure_or_false_completion(
+    isolated_worker, monkeypatch, tmp_path, cache_only,
+):
+    status_path, emissions = isolated_worker
+    def updating(_markets):
+        raise TWPublicSourceUpdatePending(tmp_path, tmp_path / "tw-public-refresh.lock")
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", updating)
+    assert runner.run_once(signal_cache_only=cache_only) == 0
+    status = json.loads(status_path.read_text())
+    assert status["maintenance_run"]["status"] == "waiting_source"
+    assert status["maintenance_run"]["reason"] == "tw_public_refresh_in_progress"
+    assert emissions[-1]["status"] == "waiting_source"
+    assert emissions[-1]["producer_lock_held"] and emissions[-1]["retryable"]
+    assert not any(row.get("status") in {"signal_cache_complete", "complete", "degraded"} for row in emissions)
 
 
 @pytest.mark.parametrize("state", ["failed", "ready", "running"])

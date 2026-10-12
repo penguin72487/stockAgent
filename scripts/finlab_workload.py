@@ -33,6 +33,7 @@ from scripts.finlab_stage_schedule import forecast, stage_summary, next_release_
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     QUOTA_POLICY_VERSION, UPSTREAM_CHECK_MODES, attempt_retry_at, incremental_quota_exempt,
     next_source_check, queue_stage, source_check_due, intraday_progress, WORKLOAD_CONTRACT_VERSION, process_owner_alive,
+    last_acquisition_success,
 )
 
 CONTRACT = WORKLOAD_CONTRACT_VERSION
@@ -281,8 +282,9 @@ def _build_workload(root: Path, *, sdk_cache_root: Path, now: datetime,
         # Never mistake a scheduler exclusion or cooldown for a fresh receipt.
         pending = not current
         attempted = timestamp(attempt.get("attempted_at_utc"))
+        successful = last_acquisition_success(receipt)
         failed_after_check = bool(pending and attempt.get("dataset") == key and attempted
-                                  and attempted <= now and (checked is None or attempted > checked))
+                                  and attempted <= now and (successful is None or attempted > successful))
         # Old valid data does not prove the latest source refresh was allowed.
         # A later successful source check supersedes any earlier failure.
         blocked = attempt.get("status") if not valid or failed_after_check else None

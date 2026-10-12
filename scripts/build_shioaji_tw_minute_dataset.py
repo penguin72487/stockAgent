@@ -19,6 +19,7 @@ from downloader.stock_volume_units import (
     stock_volume_multiplier_expr,
 )
 from scripts.shioaji_minute_backfill_state import source_fingerprint
+from stockagent.data_sync.source_validation import canonical_chunk_path
 
 
 NS_PER_MINUTE = 60_000_000_000
@@ -395,12 +396,13 @@ def discover_chunk_groups(
         for chunk in payload.get("chunks", []):
             if chunk.get("status") not in {"ok", "source_gap"}:
                 continue
-            raw_path = chunk.get("data_path")
-            if not raw_path:
+            if int(chunk.get("rows", 0)) == 0:
                 continue
-            path = Path(str(raw_path))
-            if not path.is_file():
-                raise RuntimeError(f"minute chunk is missing: {path}")
+            # Producer paths are provenance, not a read instruction. A remote
+            # reconstruction must never read a coincidentally existing checkout
+            # or escape the explicitly selected, immutable source release.
+            path = canonical_chunk_path(input_root, symbol,
+                                        str(chunk["start_date"]), str(chunk["end_date"]))
             expected = str(chunk.get("data_sha256", ""))
             actual = _sha256(path)
             if not expected or expected != actual:

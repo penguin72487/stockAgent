@@ -33,8 +33,8 @@ def ticks():
 
 def test_derived_bars_keep_sequence_auction_and_only_traded_minutes():
     bars = ticks_to_minutes(ticks(), "2330", DAY)
-    assert bars["timestamp"].dt.strftime("%H:%M").tolist() == ["09:00", "13:30"]
-    first = bars.iloc[0]
+    assert bars["timestamp"].dt.strftime("%H:%M").to_list() == ["09:00", "13:30"]
+    first = bars.row(0, named=True)
     assert (first["open"], first["high"], first["low"], first["close"]) == (100, 102, 100, 101)
     assert (first["volume"], first["tick_count"]) == (6, 3)
     assert first["vwap"] == pytest.approx((100 + 204 + 303) / 6)
@@ -68,8 +68,8 @@ def test_delayed_closing_auction_is_preserved_not_backdated():
     frame = ticks()
     frame.loc[3, "timestamp"] = pd.Timestamp("2026-06-01 13:33:00+08:00")
     bars = ticks_to_minutes(frame, "2330", DAY)
-    assert bars["timestamp"].dt.strftime("%H:%M").tolist() == ["09:00", "13:33"]
-    assert bars.iloc[-1]["close"] == 99
+    assert bars["timestamp"].dt.strftime("%H:%M").to_list() == ["09:00", "13:33"]
+    assert bars[-1, "close"] == 99
     assert bars["volume"].sum() == 10
     for bad_time in ["13:31:00", "13:32:00", "13:34:00"]:
         frame.loc[3, "timestamp"] = pd.Timestamp(f"2026-06-01 {bad_time}+08:00")
@@ -80,7 +80,7 @@ def test_delayed_closing_auction_is_preserved_not_backdated():
 def test_delayed_close_rule_is_dated_and_normal_auction_subseconds_are_valid():
     frame = ticks()
     frame.loc[3, "timestamp"] += pd.Timedelta(microseconds=1)
-    assert ticks_to_minutes(frame, "2330", DAY).iloc[-1]["timestamp"].hour == 13
+    assert ticks_to_minutes(frame, "2330", DAY)[-1, "timestamp"].hour == 13
     early = date(2012, 2, 17)
     frame["trade_date"] = early.isoformat()
     frame["timestamp"] -= pd.Timedelta(days=(DAY-early).days)
@@ -133,9 +133,9 @@ def test_finlab_tick_volume_is_shares_only_after_exact_shioaji_reconciliation(
     )
     assert evidence["canonical_volume_unit"] == "shares"
     assert evidence["volume_multiplier"] == 1000
-    assert normalized["volume_shares"].iloc[:4].tolist() == [1000, 2000, 3000, 4000]
-    assert pd.isna(normalized["volume_shares"].iloc[4])
-    assert normalized["volume_shares"].iloc[5] == 0
+    assert normalized["volume_shares"].head(4).to_list() == [1000, 2000, 3000, 4000]
+    assert normalized[4, "volume_shares"] is None
+    assert normalized[5, "volume_shares"] == 0
     monkeypatch.setattr(data, "get", lambda *args, **kwargs: ticks())
     first_receipt = fetch_partition(
         tmp_path / "finlab", "tw_tick:2330", DAY,
@@ -157,7 +157,7 @@ def test_finlab_tick_volume_is_shares_only_after_exact_shioaji_reconciliation(
     assert bars["volume_shares"].tolist() == [6000, 4000]
     # Provider-minute partitions get the same share contract. A legacy raw
     # minute object remains recoverable after local-only reconciliation.
-    provider_minute = ticks_to_minutes(ticks(), "2330", DAY).drop(columns="volume_shares")
+    provider_minute = ticks_to_minutes(ticks(), "2330", DAY).drop("volume_shares")
     monkeypatch.setattr(data, "get", lambda *args, **kwargs: provider_minute)
     raw_minute = fetch_partition(
         tmp_path / "finlab", "tw_minute:2330", DAY,
@@ -205,13 +205,13 @@ def test_finlab_unit_mismatch_does_not_multiply_raw_volume(tmp_path):
         ticks(), "2330", DAY, reference_root=tmp_path,
     )
     assert evidence["canonical_volume_unit"] == "unresolved"
-    assert normalized["volume"].tolist() == ticks()["volume"].tolist()
-    assert normalized["volume_shares"].isna().all()
+    assert normalized["volume"].to_list() == ticks()["volume"].tolist()
+    assert normalized["volume_shares"].null_count() == len(normalized)
 
 
 def test_partial_share_proof_does_not_create_partial_minute_capacity():
     frame = ticks()
     frame["volume_shares"] = pd.Series([1000, pd.NA, 3000, 4000, pd.NA, 0], dtype="Int64")
     bars = ticks_to_minutes(frame, "2330", DAY)
-    assert pd.isna(bars.iloc[0]["volume_shares"])
-    assert bars.iloc[1]["volume_shares"] == 4000
+    assert bars[0, "volume_shares"] is None
+    assert bars[1, "volume_shares"] == 4000

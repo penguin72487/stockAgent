@@ -314,7 +314,7 @@ def _pending_entry_reason_counts(
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for order in orders.values():
-        if order.get("status") != "working":
+        if order.get("status") not in {"working", "waiting_source"}:
             continue
         reason = str(order.get("last_wait_reason") or "waiting_quote")
         counts[reason] = counts.get(reason, 0) + 1
@@ -566,6 +566,7 @@ def _prepare_entry_plan(
     status = "ready"
     reason: str | None = None
     sizing_price = _finite(quote_values.get("open")) or _finite(row.get("open_price"))
+    pending_opening_price = bool(row.get("opening_price_wait_reason"))
     synthetic_open_fill = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
     )
@@ -626,9 +627,9 @@ def _prepare_entry_plan(
         status, reason = "hold", "zero_target_weight"
     elif not reduce_only and not bool(row.get("tradable")):
         status, reason = "blocked", "model_tradable_mask_false"
-    elif not reduce_only and side == "long" and not bool(row.get("can_buy")):
+    elif not reduce_only and side == "long" and not bool(row.get("can_buy")) and not pending_opening_price:
         status, reason = "blocked", "cannot_buy_open"
-    elif not reduce_only and side == "short" and not bool(row.get("can_sell")):
+    elif not reduce_only and side == "short" and not bool(row.get("can_sell")) and not pending_opening_price:
         status, reason = "blocked", "cannot_sell_open"
     elif not reduce_only and (evidence is None or not evidence.covered):
         status, reason = "blocked", "exact_session_eligibility_missing"
@@ -638,10 +639,15 @@ def _prepare_entry_plan(
         status, reason = "blocked", "sell_first_suspended"
     elif sizing_price is None:
         status, reason = (
-            ("blocked", "official_session_no_trade_print")
+            ("waiting_source" if pending_opening_price else "blocked", "official_session_no_trade_print")
             if bool(quote_values.get("official_session_no_trade_print"))
-            else ("blocked", "official_open_price_unavailable")
+            else ("waiting_source" if pending_opening_price else "blocked", "official_open_price_unavailable")
         )
+    elif pending_opening_price and (
+        side == "long" and _finite(quote_values.get("upper_limit")) == sizing_price
+        or side == "short" and _finite(quote_values.get("lower_limit")) == sizing_price
+    ):
+        status, reason = "blocked", "opening_direction_at_daily_limit"
 
     requested_shares = 0
     filled_shares = 0
@@ -1535,6 +1541,8 @@ class TwDayTradeSimulationEngine:
             if int(mode.get("entry_filled_shares") or 0)
             else "no_fill"
         )
+        if mode.get("pending_entry_source_count"):
+            mode["entry_fill_outcome"] = "partial_waiting_source" if mode.get("entry_filled_shares") else "waiting_source"
         mode["entry_retry_recovery"] = {
             "recovered_at": _iso(),
             "marker_contract": (
@@ -3601,6 +3609,8 @@ class TwDayTradeSimulationEngine:
         result: str,
         summary: Mapping[str, Any],
         consumer_detected_at: datetime,
+        signal_commit_attempt_at: datetime | None = None,
+        source_recovery_wait_reason: str | None = None,
         ledger_persisted_at: datetime,
         executor_quote_fetch_ms: float,
         eligibility_load_ms: float,
@@ -3677,6 +3687,9 @@ class TwDayTradeSimulationEngine:
             "signal_other_compute_ms": signal_other_ms,
             "artifact_publish_ms": _finite(live_latency.get("artifact_publish_ms")),
             "artifact_discovery_ms": elapsed_ms(published_at, consumer_detected_at),
+            "source_recovery_wait_ms": elapsed_ms(
+                consumer_detected_at, signal_commit_attempt_at or consumer_detected_at
+            ),
             "opening_signal_batch_wait_ms": round(
                 max(0.0, opening_signal_batch_wait_ms), 3
             ),
@@ -3717,6 +3730,9 @@ class TwDayTradeSimulationEngine:
                 "consumer_detected_at": consumer_detected_at.isoformat(
                     timespec="microseconds"
                 ),
+                "signal_commit_attempt_at": (signal_commit_attempt_at or consumer_detected_at).isoformat(timespec="microseconds"),
+                "source_recovery_wait_reason": source_recovery_wait_reason,
+                "latency_stage_contract": "first_pointer_detection_then_retry_wait_v2",
                 "ledger_persisted_at": ledger_persisted_at.isoformat(
                     timespec="microseconds"
                 ),
@@ -3893,6 +3909,28 @@ class TwDayTradeSimulationEngine:
         )
         if wall_time < entry_gate or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
+        inputs_ready = summary.get("opening_model_inputs_ready")
+        invalid_coverage = (
+            summary.get("opening_coverage_gate_basis") == "same_session_open_price"
+            and int(summary.get("opening_price_active_count") or 0) < int(summary.get("opening_price_required_count") or 0)
+        )
+        if summary.get("opening_coverage_gate_basis") == "same_session_open_or_observed_no_print":
+            resolved = int(summary.get("opening_input_resolved_count") or 0)
+            active = int(summary.get("opening_price_active_symbol_count") or 0)
+            invalid_coverage = (
+                resolved < int(summary.get("opening_input_required_count") or 0)
+                or resolved != int(summary.get("opening_price_active_count") or 0) + int(summary.get("opening_no_print_active_count") or 0)
+                or not 0 <= resolved <= active
+            )
+        if invalid_coverage or inputs_ready is False or (inputs_ready is None and summary.get("opening_source_complete") is False):
+            # Recoverable acquisition wait, not a model-selected cash day.
+            # Do not consume the signal or create orders from incomplete input.
+            mode["pending_signal_id"] = signal_id
+            mode["engine_status"] = "waiting_opening_source"
+            mode["opening_missing_symbols"] = list(summary.get("opening_missing_symbols") or [])
+            self._persist(observed)
+            return "waiting_source"
+        mode.pop("opening_missing_symbols", None)
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
                 mode, signal_id, "open_feature_not_observed", observed
@@ -4436,6 +4474,14 @@ class TwDayTradeSimulationEngine:
                 and lower is not None
                 and sizing_price is not None
             )
+            # A source-waiting target has an unknown share count, not a zero
+            # target. Persist a private unpriced template and size it exactly
+            # once from a later genuine session open using frozen session NAV.
+            unsized_source_wait = bool(
+                not counterfactual_open_replay
+                and spec.entry_fill_policy in {ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET, ENTRY_FILL_POLICY_CAUSAL_BOOK}
+                and status == "waiting_source" and target_weight != 0.0
+            )
             if (
                 status
                 not in {
@@ -4444,13 +4490,13 @@ class TwDayTradeSimulationEngine:
                     "forced_synthetic_fill",
                 }
                 or entry_price is None
-            ) and not retryable:
+            ) and not retryable and not unsized_source_wait:
                 continue
             # A zero-fill template is private pending-order metadata. It never
             # enters positions/fills until an actual causal quote is consumed.
-            entry_price = entry_price if entry_price is not None else sizing_price
+            entry_price = None if unsized_source_wait else entry_price if entry_price is not None else sizing_price
 
-            upper_bracket = float(
+            upper_bracket = None if upper is None else float(
                 move_price_ticks_numpy(
                     np.asarray([upper], dtype=np.float64),
                     -offset_ticks,
@@ -4458,7 +4504,7 @@ class TwDayTradeSimulationEngine:
                     security_types=security_types_by_symbol[symbol],
                 )[0]
             )
-            lower_bracket = float(
+            lower_bracket = None if lower is None else float(
                 move_price_ticks_numpy(
                     np.asarray([lower], dtype=np.float64),
                     offset_ticks,
@@ -4472,8 +4518,8 @@ class TwDayTradeSimulationEngine:
                 symbol
             ]
             entry_rate = buy_rate if side == "long" else sell_rate
-            entry_gross_fee = filled_shares * entry_price * entry_rate
-            entry_rebate = filled_shares * entry_price * rebate_rate
+            entry_gross_fee = filled_shares * entry_price * entry_rate if filled_shares else 0.0
+            entry_rebate = filled_shares * entry_price * rebate_rate if filled_shares else 0.0
             entry_fee = entry_gross_fee - entry_rebate
             position_id = f"{spec.market}:{observed.date().isoformat()}:{symbol}"
             entry_order_id = f"{position_id}:entry"
@@ -4562,13 +4608,15 @@ class TwDayTradeSimulationEngine:
                     plan["counterfactual_open_price_fill"]
                 ),
             }
-            if retryable:
+            if retryable or unsized_source_wait:
                 mode["pending_entry_orders"][symbol] = {
                     "position": dict(position), "remaining_shares": requested_shares - filled_shares,
                     "last_cumulative_volume_lots": quote.get("cumulative_volume_lots"),
                     "minute": observed.strftime("%Y-%m-%dT%H:%M"),
                     "minute_used_shares": filled_shares,
-                    "status": "working", "sequence": 0,
+                    "status": "waiting_source" if unsized_source_wait else "working", "sequence": 0,
+                    "sizing_pending": unsized_source_wait,
+                    "last_wait_reason": row.get("opening_price_wait_reason") if unsized_source_wait else reason,
                 }
             if filled_shares <= 0:
                 continue
@@ -4777,6 +4825,11 @@ class TwDayTradeSimulationEngine:
             for order in (mode.get("pending_entry_orders") or {}).values()
             if order.get("status") == "working"
         )
+        mode["pending_entry_source_count"] = sum(
+            order.get("status") == "waiting_source" for order in mode["pending_entry_orders"].values()
+        )
+        if mode["pending_entry_source_count"]:
+            entry_fill_outcome = "partial_waiting_source" if entry_fill_count else "waiting_source"
         mode["pending_reduction_shares"] = sum(
             int(order.get("remaining_shares") or 0)
             for order in (mode.get("pending_reduction_orders") or {}).values()
@@ -4846,6 +4899,8 @@ class TwDayTradeSimulationEngine:
                 int(item.get("signed_shares") or 0) != 0
                 for item in mode["positions"].values()
             )
+            else "waiting_opening_source"
+            if mode.get("pending_entry_source_count")
             else "entry_price_missing_no_fill"
             if entry_requested_shares > 0 and entry_fill_count == 0
             else "flat_no_executable_signal"
@@ -5359,6 +5414,61 @@ class TwDayTradeSimulationEngine:
                 timespec="seconds"
             )
 
+    def _size_pending_opening_orders(self, mode, quotes, now):
+        """Resolve only unsized names, retaining the published weights and NAV.
+
+        A private zero-fill template is not inventory. Only a fresh, causal,
+        non-trial source with today's real open and legal limits can turn it
+        into the existing market-order retry path. No inference or fake price.
+        """
+        orders = mode.get("pending_entry_orders") or {}
+        if mode.get("session_date") != now.date().isoformat():
+            return
+        signal_at = _parse_timestamp(mode.get("signal_at"))
+        for symbol, order in orders.items():
+            if order.get("status") != "waiting_source" or not order.get("sizing_pending"):
+                continue
+            if now.time() >= EXIT_LIMIT_TIME:
+                order["status"] = "cancelled_exit_priority"
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            if signal_at is None or not self._fresh_regular_quote(quote, now) or not _quote_after_signal(quote, signal_at):
+                continue
+            opening, upper, lower = (_finite(quote.get(key)) for key in ("open", "upper_limit", "lower_limit"))
+            if opening is None or upper is None or lower is None or not lower <= opening <= upper:
+                continue
+            template = order["position"]
+            side = template["side"]
+            if (side == "long" and opening == upper) or (side == "short" and opening == lower):
+                order["last_wait_reason"] = "opening_direction_at_daily_limit"
+                continue
+            quantity = whole_lot_target_shares(
+                float(template["target_weight"]), float(mode["session_sizing_nav_twd"]),
+                opening, int(template["lot_size"]),
+            )
+            if quantity <= 0:
+                order.update(status="skipped_below_one_board_lot", sizing_pending=False)
+                continue
+            security = template.get("security_type") or "stock"
+            if not bool(price_on_tick_grid_numpy(np.array([opening]), np.array([now.date()]), security_types=security)[0]):
+                order["last_wait_reason"] = "opening_price_off_tick_grid"
+                continue
+            offset = int(template["price_limit_offset_ticks"])
+            top = float(move_price_ticks_numpy(np.array([upper]), -offset, np.array([now.date()]), security_types=security)[0])
+            bottom = float(move_price_ticks_numpy(np.array([lower]), offset, np.array([now.date()]), security_types=security)[0])
+            template.update(
+                requested_shares=quantity, target_unsubmitted_shares=quantity,
+                sizing_open_price=opening, upper_limit=upper, lower_limit=lower,
+                take_profit_price=top if side == "long" else bottom,
+                stop_trigger_price=bottom if side == "long" else top,
+                entry_price=opening, last_mark_price=opening,
+            )
+            order.update(status="working", sizing_pending=False, remaining_shares=quantity,
+                         sized_at=now.isoformat(), sizing_quote_at=quote.get("quote_at"))
+            mode["entry_requested_shares"] = int(mode.get("entry_requested_shares") or 0) + quantity
+            mode["entry_unfilled_shares"] = int(mode.get("entry_unfilled_shares") or 0) + quantity
+        mode["pending_entry_source_count"] = sum(o.get("status") == "waiting_source" for o in orders.values())
+
     def _retry_entry_orders(self, mode, quotes, now):
         """Continue a frozen daily target; never re-infer, re-size, or reopen exits.
 
@@ -5370,6 +5480,7 @@ class TwDayTradeSimulationEngine:
         intent marker quarantines an interrupted append on restart.
         """
         orders = mode.get("pending_entry_orders") or {}
+        self._size_pending_opening_orders(mode, quotes, now)
         entry_fill_policy = str(
             mode.get("configured_entry_fill_policy")
             or mode.get("entry_fill_policy")
@@ -5733,6 +5844,8 @@ class TwDayTradeSimulationEngine:
             if int(mode.get("entry_filled_shares") or 0)
             else "no_fill"
         )
+        if mode.get("pending_entry_source_count"):
+            mode["entry_fill_outcome"] = "partial_waiting_source" if mode.get("entry_filled_shares") else "waiting_source"
         mode.pop("entry_retry_pending_commit", None)
         self._persist(now)
 
@@ -6477,6 +6590,8 @@ class TwDayTradeSimulationEngine:
             return "critical_adverse_limit_exception"
         if int(mode.get("pending_entry_shares") or 0):
             return "entry_partial_retrying"
+        if int(mode.get("pending_entry_source_count") or 0):
+            return "waiting_opening_source"
         return None
 
     def _settle_intraday_auction(self, market, mode, quotes, now) -> None:
@@ -7380,6 +7495,7 @@ class TwDayTradeSimulationEngine:
             - float(mode.get("cumulative_carry_cost_twd") or 0.0)
         )
         flat_status = "flat"
+        source_waiting = int(mode.get("pending_entry_source_count") or 0) > 0
         if str(mode.get("session_date") or "") == now.date().isoformat() and mode.get(
             "entry_completed_at"
         ):
@@ -7423,6 +7539,8 @@ class TwDayTradeSimulationEngine:
                     and open_count
                     else "active"
                     if open_count
+                    else "waiting_opening_source"
+                    if source_waiting
                     else flat_status
                 ),
             }
@@ -7751,6 +7869,7 @@ class TwDayTradeSimulationEngine:
                             "terminal_close_contract",
                             "configured_terminal_close_contract",
                             "pending_entry_shares",
+                            "pending_entry_source_count",
                             "pending_entry_reason_counts",
                             "manual_close_settlement",
                             "closing_auction_pending_count",
@@ -7817,6 +7936,7 @@ class TwDayTradeSimulationEngine:
                             "entry_filled_shares",
                             "entry_unfilled_shares",
                             "pending_entry_shares",
+                            "pending_entry_source_count",
                             "pending_entry_reason_counts",
                             "entry_fill_outcome",
                             "signal_reason_counts",

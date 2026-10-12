@@ -19,6 +19,7 @@ from stockagent.data.factorized_panel import (
     file_sha256, verify_factorized_members, write_array_block,
 )
 from stockagent.data.tw_feature_semantic_report import write_factorized_feature_report
+from stockagent.storage_layout import admit_output
 
 
 def _value_positions(names: list[str]) -> np.ndarray:
@@ -33,6 +34,7 @@ def _value_positions(names: list[str]) -> np.ndarray:
 
 def project_factorized_values(parent_path: Path, output: Path) -> dict:
     """Keep every value bit; emit only value channels and complete provenance."""
+    output = admit_output(output, "prepared")
     started = time.perf_counter()
     parent_path = parent_path.resolve(strict=True)
     root = parent_path.parent

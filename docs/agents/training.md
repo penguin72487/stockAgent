@@ -25,9 +25,16 @@ Use when changing neural runners, distributed execution, resume, checkpoint iden
   `docs/tw_day_trade_v8_ofat_analysis_2026-09-23.md`.
 - `day_trade_training_annual_episodes` and `day_trade_sub_lot_recovery` are
   opt-in research training contracts, each requiring a new artifact root and
-  checkpoint fingerprint. Annual accounts may reset only at a calendar-year
-  boundary with no held inventory or unpaid claims; validation/test retain
-  their original account lifecycle. Sub-lot recovery changes backward only
+  checkpoint fingerprint. Annual accounts reset only at the configured annual
+  boundary with no held inventory or unpaid claims. Calendar mode preserves
+  `calendar_year_first_session_fresh_capital_v2`; an explicit
+  `lookback_shifted` experiment uses the full-panel observed-session period
+  contract for both fold ownership and account resets, with a distinct
+  checkpoint ABI. Never consume the owned first session a second time for
+  lookback warmup. Validation/test retain their account lifecycle (their sample
+  intervals still follow the selected split contract). See
+  [shifted annual ablations](../tw_scale_cash_annual_fold10_selected_2026-10-08.md).
+  Sub-lot recovery changes backward only
   and must reuse source-backed FIFO opportunity/fee math, preserve all exact
   forward values, and remain disabled during evaluation. Never silently add
   either mechanism to an existing directional or architecture ablation. See

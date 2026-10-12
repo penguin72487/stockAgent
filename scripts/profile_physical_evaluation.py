@@ -69,7 +69,8 @@ def main():
     assert config.training.multi_gpu_strategy=="distributed_data_parallel"
     assert config.training.batch_size_train==32 and not config.training.day_trade_sparse_events
     panel=attach_factorized_features(build_panel(config.data.parquet_root,**_build_panel_kwargs(config)),
-        config.data.factorized_feature_manifest,transfer_mode=config.data.factorized_transfer_mode)
+        config.data.factorized_feature_manifest,transfer_mode=config.data.factorized_transfer_mode,
+        host_cache_bytes=getattr(config.data,"factorized_host_cache_bytes",None))
     panel.day_trade_minute_execution=load_tw_day_trade_execution_tape(
         config.data.day_trade_minute_execution_root,panel_dates=panel.dates,panel_symbols=panel.symbols,
         official_open_prices=panel.open_prices,official_close_prices=panel.close_prices,

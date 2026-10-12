@@ -103,6 +103,28 @@ def test_missing_queues_are_unknown_and_inventory_has_no_side_effects(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_runtime_inventory_uses_active_whole_market_objects_without_summing_aliases(tmp_path):
+    dataset = 'TaiwanStockKBar'
+    queue = create_queue(tmp_path, 'complement', [
+        task(dataset, '2024-06-03', 'complete', rows=1000, kind='market_day'),
+        task('USStockPriceMinute', '2024-06-03', 'pending', data_id='AAPL', kind='id_day')])
+    with sqlite3.connect(queue) as conn:
+        conn.execute('CREATE TABLE finmind_object_profile (dataset TEXT,active INTEGER,contract_version INTEGER)')
+        conn.execute('INSERT INTO finmind_object_profile VALUES (?,1,2)', (dataset,))
+    before = queue.read_bytes()
+    report = audit.build_inventory(tmp_path, now=NOW)
+    row = dataset_row(report, dataset)
+    assert report['coverage']['runtime_object_contract_count'] == 1
+    assert row['runtime_contract']['owner'] == 'complement'
+    assert row['runtime_contract']['endpoint'] == 'storage_objects'
+    assert row['runtime_observation']['rows'] == 1000
+    us = dataset_row(report, 'USStockPriceMinute')
+    assert us['runtime_contract']['request_end_date_supported'] is False
+    assert us['runtime_contract']['whole_market_query_supported'] is False
+    assert us['runtime_contract']['endpoint'] != 'storage_objects'
+    assert queue.read_bytes() == before
+
+
 def test_queue_counts_are_partition_observations_not_http_request_claims(tmp_path):
     dataset = "TaiwanBusinessIndicator"
     queue = create_queue(tmp_path, "sponsor", [

@@ -26,6 +26,7 @@ from scripts.prepare_tw_day_trade_feature_catalog import sha256, write_csv
 from scripts.build_tw_release_schedule_dataset import normalize_source
 from scripts.stage_tw_public_research_release import _required_formal_members, _stage_copy
 from stockagent.config import load_config
+from stockagent.storage_layout import admit_output, node_root
 from stockagent.data.tw_day_trade_mixed_frequency import CONTRACT, PRIVATE_USE, rule_from_spec, storage_lookup, source_clock_lookup
 from stockagent.data.tw_public_release_schedule import align_observation_frame, prepare_observation_keys, max_carry_days, ALIGNMENT_CONTRACT, CONTRACT as RELEASE_SCHEDULE_CONTRACT
 from stockagent.training.dataset import execution_feature_lag
@@ -91,6 +92,7 @@ def attach_formal_companions(source: Path, out: Path, manifest: dict | None = No
 
 def prepare(*, source: Path, out: Path, base_config: Path, minute_root: Path,
             snapshot_id: str, chunk_sessions: int = 16) -> dict:
+    out = admit_output(out, "prepared")
     started = time.perf_counter()
     if out.exists():
         raise FileExistsError("use a fresh versioned training view; do not overwrite an accepted build")
@@ -224,12 +226,13 @@ def prepare(*, source: Path, out: Path, base_config: Path, minute_root: Path,
     # owns day-trade rules and physical executor dependencies.
     generated = {
         "base_config": str(base_config.resolve()), "experiment_name": "tw-day-trade-mixed-frequency-20261004-v1",
-        "runner": {"output_dir": str((out.parent/"training").resolve()), "resume": False, "post_train_infer": False},
+        "runner": {"output_dir": str(node_root(ROOT)/"artifacts/markets"/out.parent.name/"training"), "resume": False, "post_train_infer": False},
         "data": {"parquet_root": str((source/"stocks").resolve()),
                  "tw_public_feature_path": str(target.resolve()),
                  "day_trade_physical_public_feature_path": str(public.resolve()),
                  "panel_cache_root": str((out/"panel_cache").resolve()),
                  "day_trade_minute_execution_root": str(minute_root.resolve()),
+                 "day_trade_minute_execution_cache_dir": str(node_root(ROOT)/"artifacts/cache"/out.parent.name/"runtime-cache/physical-source"),
                  "feature_include": ["open_raw", "high_raw", "low_raw", "close_raw", "trading_volume_raw", *channels, "next_session_open_gap_logret"],
                  "feature_availability_indicators": [], "feature_shift_next_session": [], "feature_zero_fill": []},
         "training": {"pretrained_initialization_root": None,
@@ -281,6 +284,7 @@ def main():
     parser.add_argument("--attach-formal-companions-only", action="store_true",
                         help="attach exact formal receipts to an existing feature view without rebuilding its X")
     args=parser.parse_args()
+    args.output_root = admit_output(args.output_root, "prepared")
     if Path("/etc/hostname").read_text().strip() == "penguin":
         parser.error("build training matrices on the remote training node, not penguin")
     if args.attach_formal_companions_only:

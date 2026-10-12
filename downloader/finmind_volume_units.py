@@ -12,6 +12,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
+FINMIND_CASH_INTRADAY_UNIT_CONTRACT = "finmind_cash_intraday_documented_market_units_v1"
+FINMIND_CASH_INTRADAY_UNIT_SOURCE = "https://finmind.github.io/tutor/TaiwanMarket/Technical/"
+FINMIND_CASH_INTRADAY_SHARE_MULTIPLIERS = {"twse": 1000, "tpex": 1000, "emerging": 1}
+
+
 SHARE_FIELDS: dict[str, tuple[str, ...]] = {
     "TaiwanStockPrice": ("Trading_Volume",),
     "TaiwanStockPriceAdj": ("Trading_Volume",),
@@ -126,6 +131,17 @@ def annotate_stock_share_units(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Preserve raw provider values; add only evidence-backed share columns."""
 
+    if dataset in {"TaiwanStockKBar", "TaiwanStockPriceTick"}:
+        # A current StockInfo label is not a dated historical venue proof.
+        # Retain native bytes; normalization joins independently dated evidence.
+        return rows, {
+            "contract": FINMIND_CASH_INTRADAY_UNIT_CONTRACT,
+            "stock_share_unit_status": "mixed_market_lots_or_shares_preserved",
+            "source_volume_units": {"volume": "TWSE_TPEX_lots_emerging_shares"},
+            "documented_share_multipliers_by_market": FINMIND_CASH_INTRADAY_SHARE_MULTIPLIERS,
+            "requires_same_symbol_dated_market_evidence": True,
+            "unit_source": FINMIND_CASH_INTRADAY_UNIT_SOURCE,
+        }
     if dataset == ORDER_BOOK_DATASET:
         return _annotate_order_book_units(rows)
     if dataset == "TaiwanStockLoanCollateralBalance":
@@ -146,9 +162,12 @@ def annotate_stock_share_units(
             "unit_source": "https://finmind.github.io/tutor/TaiwanMarket/Chip/",
         }
     if dataset in SHARE_FIELDS:
-        present = sorted(set(SHARE_FIELDS[dataset]) & {
+        # A validated derived Arrow table does not need a row-by-row field
+        # inventory. Units/values are identical to the existing list path.
+        fields = set(rows.column_names) if hasattr(rows, 'column_names') else {
             field for row in rows for field in row
-        })
+        }
+        present = sorted(set(SHARE_FIELDS[dataset]) & fields)
         return rows, {
             "stock_share_unit_status": "provider_fields_already_shares",
             "source_volume_units": {field: "shares" for field in present},

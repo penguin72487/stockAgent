@@ -24,6 +24,17 @@ from downloader.finmind_scheduling import fixed_incremental_demand
 
 
 PROBES = {
+    'us_minute_datalist': ('datalist', {'dataset': 'USStockPriceMinute'}),
+    # End-date support is dataset-specific. Compare the range with both
+    # independently retrieved days; a successful HTTP response is not proof.
+    'us_minute_one': ('data', {'dataset': 'USStockPriceMinute', 'data_id': 'AAPL',
+                              'start_date': '2024-06-03'}),
+    'us_minute_next': ('data', {'dataset': 'USStockPriceMinute', 'data_id': 'AAPL',
+                               'start_date': '2024-06-04'}),
+    'us_minute_range': ('data', {'dataset': 'USStockPriceMinute', 'data_id': 'AAPL',
+                                'start_date': '2024-06-03', 'end_date': '2024-06-04'}),
+    'us_minute_market': ('data', {'dataset': 'USStockPriceMinute',
+                                 'start_date': '2024-06-03'}),
     'bond_month_boundary': ('data', {'dataset': 'TaiwanStockConvertibleBondMonthlyAnalysis',
                                     'start_date': '2026-05-01', 'end_date': '2026-07-01'}),
     'spread_all_range': ('data', {'dataset': 'TaiwanFuturesSpreadTrading',

@@ -17,6 +17,9 @@ from stockagent.data.finlab_acquisition_contract import (
     UPSTREAM_CHECK_MODES, safe_stem, WORKLOAD_CONTRACT_VERSION, intraday_progress, process_owner_alive,
 )
 from scripts.snapshot_finlab_quota import load_quota_history
+from stockagent.data.finlab_progress import annotate_inventory
+from stockagent.data.finlab_tick_eta import estimate_tick_progress, load_batches
+from stockagent.data.finlab_quota_policy import ACQUISITION_POLICY_VERSION, load_policy, quota_admission
 
 
 STAGE_DATASET = "tw-public-research-finlab-2014-v4"
@@ -200,6 +203,14 @@ def _per_key_estimates(root: Path, datasets: list[dict[str, Any]],
             basis, sample_count = "insufficient_measured_samples", len(group)
         checked = _utc(receipt.get("source_checked_at_utc"))
         row["source_checked_at_utc"] = checked.isoformat() if checked else None
+        warning = receipt.get("history_scope_regression")
+        if isinstance(warning, Mapping):
+            row["history_scope_warning"] = {
+                field: warning[field] for field in (
+                    "omitted_field_count_lower_bound", "non_null_count_decline",
+                    "source_corruption_proven", "all_history_complete",
+                ) if type(warning.get(field)) in (int, bool)
+            }
         relative = Path(str(receipt.get("parquet_path") or ""))
         data_path = (root / "data_finlab" / relative).resolve()
         row["local_bytes"] = (
@@ -469,10 +480,12 @@ def build_finlab_public_status(
     # Raw minute observations remain local. The public 30-day chart keeps
     # every recent minute and one last observation per older 20-minute bucket.
     try:
-        series = _public_quota_series(load_quota_history(quota_root, now=observed), observed)
+        quota_history_raw = load_quota_history(quota_root, now=observed)
+        series = _public_quota_series(quota_history_raw, observed)
         history_state = "available"
     except (OSError, sqlite3.DatabaseError):
         series = []
+        quota_history_raw = []
         history_state = "unavailable"
 
     last_success_age = _age_seconds(acquisition.get("last_receipt_at_utc"), observed)
@@ -497,7 +510,7 @@ def build_finlab_public_status(
     running_receipt = _read_json(root / "data_finlab/runs/latest.json", {})
     market_raw = _read_json(root / "data_finlab/intraday/market_status.json", {})
     market_status = {}
-    if isinstance(market_raw, Mapping) and market_raw.get("schema_version") in (1, 2):
+    if isinstance(market_raw, Mapping) and market_raw.get("schema_version") in (1, 2, 3, 4):
         market_status = {key: market_raw.get(key) for key in (
             "observed_at_utc", "target_start_date", "target_end_date",
             "session_basis", "universe_basis", "universe_symbols",
@@ -507,9 +520,33 @@ def build_finlab_public_status(
             "attempted_this_run", "successes_this_run", "state",
             "completion_eta", "completion_eta_reason", "acquisition_mode",
             "legacy_direct_minute_partitions",
+            "acquisition_policy_version", "active_kind",
         )}
+        priority = market_raw.get("minute_priority", {})
+        market_status["minute_priority"] = {key: priority.get(key) for key in (
+            "pending_known_window_partitions", "due_publication_rechecks", "tick_residual_allowed",
+            "actionable_known_window_partitions", "blocked_known_window_partitions", "publication_recheck_seconds",
+            "older_discovery_is_bounded", "next_source_check_at_utc", "basis")} if isinstance(priority, Mapping) else {}
+        admission = market_raw.get("general_acquisition_admission", {})
+        market_status["general_acquisition_admission"] = {key: admission.get(key) for key in (
+            "supplemental_allowed", "minute_residual_allowed", "actionable_pending",
+            "required_pending", "required_blocked", "scheduled_reserve_mb")} if isinstance(admission, Mapping) else {}
         market_status["by_kind"] = market_raw.get("by_kind", {})
         market_status["daily_price_coverage"] = market_raw.get("daily_price_coverage", {})
+        market_status["progress_contract_version"] = market_raw.get("progress_contract_version")
+        for phase_key in ("coverage_phases", "minute_coverage_phases"):
+            market_status[phase_key] = [
+                {key: row.get(key) for key in (
+                    "id", "label", "start_date", "end_date", "candidate_partitions",
+                    "receipted_partitions", "provider_not_ready_partitions", "other_failed_partitions",
+                    "untested_candidate_partitions", "rows", "local_parquet_bytes",
+                    "candidate_coverage_ratio", "candidate_check_ratio", "state",
+                    "remaining_transfer_bytes_estimate", "finish_at_utc", "reason",
+                )}
+                for row in market_raw.get(phase_key, [])
+                if isinstance(row, Mapping) and row.get("id") in {
+                    "latest_session", "observed_history", "older_discovery"}
+            ]
         market_status["symbols"] = [
             {key: row.get(key) for key in (
                 "key", "market", "security_type", "current", "delisting_date",
@@ -523,6 +560,31 @@ def build_finlab_public_status(
             if isinstance(row, Mapping) and isinstance(row.get("key"), str)
             and row["key"].startswith(("tw_minute:", "tw_tick:"))
         ]
+    market_at = _utc(market_status.get("observed_at_utc"))
+    market_current = bool(market_at and -5 <= (observed-market_at).total_seconds() <= 180)
+    market_status["fresh"] = market_current
+    # Catalogue exemplars must refer to the same all-market receipts as their
+    # detailed rows, not an obsolete two-day sample in the generic monitor.
+    # An old snapshot is still historical evidence, not fresh liveness. Retain
+    # it with its clock instead of jumping back to the obsolete exemplar's two
+    # dates whenever quota waiting makes the all-market snapshot older than 3m.
+    if market_at and (observed-market_at).total_seconds() >= -5:
+        market_by_key = {row["key"]: row for row in market_status.get("symbols", [])}
+        for row in datasets:
+            item = market_by_key.get(row["key"])
+            if item is None:
+                continue
+            row.update(first=item.get("first_data_date"), last=item.get("last_data_date"),
+                       rows=item.get("rows"), local_bytes=item.get("parquet_bytes"),
+                       partition_receipts=item.get("receipted_partitions"),
+                       partition_total=item.get("target_partitions"),
+                       partition_not_ready=item.get("provider_not_ready_partitions"),
+                       partition_other_failed=item.get("other_failed_partitions"),
+                       source_kind=item.get("source_kind"),
+                       partition_snapshot_fresh=market_current,
+                       partition_observed_at_utc=market_at.isoformat(),
+                       partition_basis="canonical_market_candidate_not_published_scope")
+    history_inventory = annotate_inventory(datasets, workload_current=workload.get("state") == "available")
     current_fetch = {}
     general_owner = running_receipt.get("owner") if isinstance(running_receipt, Mapping) else None
     general_live = (isinstance(running_receipt, Mapping) and process_owner_alive(
@@ -539,10 +601,53 @@ def build_finlab_public_status(
                         and not math.isfinite(tick_worker[k]) else tick_worker.get(k)) for k in (
         "run_started_at_utc", "observed_at_utc", "last_success_at_utc", "state", "owner_alive", "age_seconds",
         "active_key", "active_trade_date", "attempt_limit", "attempted", "successful",
-        "scanned_candidates", "cached_skips", "quota_checks", "elapsed_seconds", "sample_count",
+        "scanned_candidates", "cached_skips", "quota_checks", "quota_cache_hits", "elapsed_seconds", "sample_count",
+        "processing_engine", "pipeline_workers", "range_calendar_days", "http_keepalive", "sdk_calls", "window_requests",
+        "data_processing_engine", "processing_threads",
+        "fallback_calls", "inflight_partitions", "download_threads", "http_gets", "http_posts", "http_errors",
+        "http_429s", "http_503s", "http_download_bytes", "http_peak_inflight_per_worker", "source_backoff_until_utc",
+        "queue_depth", "queued_windows", "inflight_windows", "peak_inflight_windows",
+        "http_get_seconds", "http_post_seconds",
+        "authorization_slots", "http_conflicts", "http_conflict_retries", "http_post_queue_seconds",
+        "http_manifests", "http_manifest_seconds", "http_signs", "http_sign_seconds",
+        "sample_window_count", "completed_attempts", "eta_measurement_contract_version", "eta_measurement_basis",
         "seconds_per_attempt_estimate", "remaining_batch_seconds_estimate",
-        "estimated_batch_finish_at_utc", "stop_by_at_utc", "estimate_scope", "batch_eta_state",
+        "estimated_batch_finish_at_utc", "stop_by_at_utc", "estimate_scope", "batch_eta_state", "kind",
     ) if k in tick_worker and (tick_worker[k] is None or isinstance(tick_worker[k], (str, int, float, bool)))}
+    try:
+        quota_settings = load_policy(root / "configs/finlab_quota_policy.json")
+        admission = market_raw.get("general_acquisition_admission", {}) if isinstance(market_raw, Mapping) else {}
+        admission = admission if isinstance(admission, Mapping) else {}
+        intraday_quota_policy = {
+            "state": "available", "contract_version": 1,
+            "minute": quota_admission(kind="tw_minute", now=observed, policy=quota_settings),
+            "tick": quota_admission(kind="tw_tick", now=observed, policy=quota_settings,
+                scheduled_reserve_mb=admission.get("scheduled_reserve_mb", 0)),
+            "quota_sample_interval_seconds": quota_settings.quota_sample_interval_seconds,
+            "quota_sample_max_requests": quota_settings.quota_sample_max_requests,
+            "minute_workers": quota_settings.minute_workers,
+            "minute_range_calendar_days": quota_settings.minute_range_calendar_days,
+            "minute_http_keepalive": quota_settings.minute_http_keepalive,
+            "minute_download_threads": quota_settings.minute_download_threads,
+            "minute_queue_depth": quota_settings.minute_queue_depth,
+            "minute_authorization_slots": quota_settings.minute_authorization_slots,
+            "worker_policy_current": isinstance(tick_worker.get("quota_policy"), Mapping)
+                and tick_worker["quota_policy"].get("configuration_fingerprint") == quota_settings.fingerprint
+                and tick_worker.get("kind") in {"tw_minute", "tw_tick"}
+                and (tick_worker.get("kind") != "tw_minute" or all((
+                    tick_worker.get("pipeline_workers") == quota_settings.minute_workers,
+                    tick_worker.get("range_calendar_days") == quota_settings.minute_range_calendar_days,
+                    tick_worker.get("download_threads", 1) == quota_settings.minute_download_threads,
+                    tick_worker.get("queue_depth", 1) == quota_settings.minute_queue_depth,
+                    tick_worker.get("authorization_slots", tick_worker.get("pipeline_workers"))
+                        == min(quota_settings.minute_workers, quota_settings.minute_authorization_slots),
+                    tick_worker.get("http_keepalive") == quota_settings.minute_http_keepalive)))
+                and tick_worker["quota_policy"].get("normal_reserve_mb") == quota_admission(
+                    kind=tick_worker["kind"], now=observed, policy=quota_settings,
+                    scheduled_reserve_mb=admission.get("scheduled_reserve_mb", 0))["normal_reserve_mb"],
+        }
+    except (OSError, ValueError):
+        intraday_quota_policy = {"state": "unavailable", "contract_version": 1}
     tick_active = public_worker.get("owner_alive") is True and public_worker.get("state") == "running"
     if health == "waiting" and tick_active:
         tick_receipt_age = _age_seconds(public_worker.get("last_success_at_utc"), observed)
@@ -555,17 +660,46 @@ def build_finlab_public_status(
     if current_fetch:
         phase = "general"
     elif tick_active:
-        phase = "tick"
+        phase = "minute" if public_worker.get("kind") == "tw_minute" or str(public_worker.get("active_key") or "").startswith("tw_minute:") else "tick"
         current_fetch = {"key": public_worker.get("active_key"),
                          "trade_date": public_worker.get("active_trade_date"),
                          "started_at_utc": public_worker.get("run_started_at_utc")}
     else:
         phase = "transition" if acquisition.get("service_active") else "idle"
+    # Only bounded local batch/quantity receipts. The browser never causes an
+    # SDK request or reads Tick rows/the acquisition writer's partition index.
+    from scripts.finlab_workload import _opening_policy
+    batches = load_batches(root / "data_finlab")
+    estimate_args = dict(batches=batches, quota=safe_quota,
+        workload=workload, quota_history=quota_history_raw, now=observed,
+        timer_active=acquisition.get("timer_active") is True,
+        opening_policy=_opening_policy(root),
+    )
+    tick_progress = estimate_tick_progress(market_status, reserve_mb=intraday_quota_policy.get(
+        "tick", {}).get("effective_reserve_mb", 500), **estimate_args)
+    minute_configuration = ({"acquisition_policy_version": ACQUISITION_POLICY_VERSION,
+        "configuration_fingerprint": quota_settings.fingerprint,
+        "processing_engine": "rolling_range_process_pool" if quota_settings.minute_queue_depth > 1 else "bounded_range_process_pool" if (
+            quota_settings.minute_workers > 1 or quota_settings.minute_range_calendar_days > 1
+            or quota_settings.minute_download_threads > 1) else "single_stock_day",
+        "pipeline_workers": quota_settings.minute_workers,
+        "range_calendar_days": quota_settings.minute_range_calendar_days,
+        "download_threads": quota_settings.minute_download_threads,
+        "queue_depth": quota_settings.minute_queue_depth,
+        "authorization_slots": min(quota_settings.minute_workers, quota_settings.minute_authorization_slots),
+        "http_keepalive": quota_settings.minute_http_keepalive if (
+            quota_settings.minute_workers > 1 or quota_settings.minute_range_calendar_days > 1
+            or quota_settings.minute_download_threads > 1) else False}
+        if intraday_quota_policy.get("state") == "available" else {})
+    minute_progress = estimate_tick_progress(market_status, kind="tw_minute", measurement_configuration=minute_configuration,
+        reserve_mb=intraday_quota_policy.get(
+        "minute", {}).get("effective_reserve_mb", 50), **estimate_args)
     return {
         "schema_version": 1,
         "generated_at_utc": observed.isoformat(),
         "read_only": True,
         "production_control_possible": False,
+        "intraday_quota_policy": intraday_quota_policy,
         "health": health,
         "monitor_age_seconds": monitor_age,
         "quota_age_seconds": quota_age,
@@ -580,11 +714,14 @@ def build_finlab_public_status(
             "reset_basis": "Official CLI docs state 08:00 Asia/Taipei; reset timestamp is a schedule inference, not a provider response.",
         },
         "acquisition": safe_acquisition,
+        "history_inventory": history_inventory,
+        "tick_progress": tick_progress,
+        "minute_progress": minute_progress,
         "volume_estimate": volume_estimate,
         "workload": workload,
         "current_fetch": current_fetch,
-        "execution": {"phase": phase, "tick": public_worker,
-                      "basis": "canonical_general_run_and_live_tick_owner_not_systemd_active_alone"},
+        "execution": {"phase": phase, "intraday": public_worker, "tick": public_worker,
+                      "basis": "canonical_general_run_and_live_intraday_owner_not_systemd_active_alone"},
         "release_gate": readiness,
         "storage": {
             "raw_current_bytes": raw_bytes,

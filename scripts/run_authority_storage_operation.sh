@@ -4,7 +4,7 @@ set -euo pipefail
 stockagent_operation_script="$(readlink -f "${BASH_SOURCE[0]}")"
 stockagent_operation_root="$(dirname "$(dirname "$stockagent_operation_script")")"
 case "${1:-}" in
-  scripts/audit_node_storage_roles.py|scripts/data_cache.py|scripts/retire_local_offline_artifacts.py|scripts/prune_verified_return_scratch.py|scripts/return_remote_legacy_archives.py|scripts/benchmark_wsl_cold_blob_write.py|scripts/organize_vast_bulk_archives.py|scripts/receive_vast_bulk_archives.py|scripts/install_vast_bulk_return.py|scripts/enroll_vast_legacy_cache_capture.py|scripts/benchmark_remote_cold_transport.py|scripts/benchmark_cold_pack_read.py|scripts/benchmark_legacy_archive_workflow.py|scripts/benchmark_cold_blob_read.py|scripts/handoff_remote_legacy_archive_worker.py) ;;
+  scripts/audit_node_storage_roles.py|scripts/data_cache.py|scripts/retire_local_offline_artifacts.py|scripts/prune_verified_return_scratch.py|scripts/return_remote_legacy_archives.py|scripts/benchmark_wsl_cold_blob_write.py|scripts/organize_vast_bulk_archives.py|scripts/receive_vast_bulk_archives.py|scripts/install_vast_bulk_return.py|scripts/enroll_vast_legacy_cache_capture.py|scripts/benchmark_remote_cold_transport.py|scripts/benchmark_cold_pack_read.py|scripts/benchmark_legacy_archive_workflow.py|scripts/benchmark_cold_blob_read.py|scripts/handoff_remote_legacy_archive_worker.py|scripts/discard_cold_testing_artifacts.py) ;;
   *) printf '%s\n' 'Use an explicitly supported authority storage operation.' >&2; exit 64 ;;
 esac
 if [[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]; then

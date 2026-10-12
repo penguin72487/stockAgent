@@ -570,3 +570,14 @@ def test_parquet_temporal_metadata_uses_footer_bounds(tmp_path) -> None:
         base + 120_000,
         True,
     )
+
+
+def test_shared_readiness_does_not_claim_or_change_reservation(tmp_path):
+    first = SharedRateLimiter(0.03, name="readiness-test", state_dir=tmp_path)
+    second = SharedRateLimiter(0.03, name="readiness-test", state_dir=tmp_path)
+    assert second.remaining_delay_seconds() == 0
+    first.defer(5)
+    original = first._state_path.read_bytes()
+    assert 4 <= second.remaining_delay_seconds() <= 5
+    assert first._state_path.read_bytes() == original
+    assert second.pending_waiters() == 0

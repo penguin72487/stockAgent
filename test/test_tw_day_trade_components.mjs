@@ -81,6 +81,35 @@ test("missed opening replay is not labelled as a live market-order fill", () => 
   assert.doesNotMatch(html, /市價成交/);
 });
 
+test("filled signals use their exact embedded valuation independently of position pagination", () => {
+  const {view} = components();
+  const html = view.signalRow({symbol: "2330", filled_shares: 1000,
+    position: {filled_shares: 1000, signed_shares: 1000, last_mark_price: 103}}, {});
+  assert.match(html, /現在可清算價/);
+  assert.match(html, /估值新鮮/);
+  assert.doesNotMatch(html, /未成交不納入|估值資料未取得/);
+});
+
+test("missing valuation never rewrites a recorded paper fill as unfilled", () => {
+  const {view} = components();
+  const filled = view.signalRow({symbol: "2330", filled_shares: 1000});
+  assert.match(filled, /紙上已成交・估值未取得/);
+  assert.match(filled, /估值資料未取得/);
+  assert.doesNotMatch(filled, /未成交不納入|不計盈虧/);
+  const unfilled = view.signalRow({symbol: "2330", filled_shares: 0});
+  assert.match(unfilled, /未成交不納入/);
+  assert.doesNotMatch(unfilled, /紙上已成交/);
+});
+
+test("Snapshot valuation is not described as an executable liquidation quote", () => {
+  const {view} = components();
+  const html = view.signalRow({symbol: "2330", filled_shares: 1000,
+    position: {filled_shares: 1000, signed_shares: 1000, last_mark_price: 103,
+      last_mark_quote_source: "shioaji:stock_snapshot+prepared_limits"}});
+  assert.match(html, /參考快照估值（非成交證據）/);
+  assert.doesNotMatch(html, /現在可清算價/);
+});
+
 test("one paged-table shell preserves rows during errors and owns loading/count state", () => {
   const {view, byId} = components();
   view.pagedTable({id: "signal", rows: [1], total: 30, loading: true, hasMore: true, error: "<bad>",
@@ -208,6 +237,8 @@ test("opening telemetry shows durable publication subphases without treating the
     strategyLabel: () => "unit", badge: String, progress: () => "",
     $: byId, setHtml: (id, html) => { byId(id).html = html; },
   });
+  vm.runInContext(app.slice(app.indexOf("function pendingOpeningAttempts("),
+    app.indexOf("function renderOvernightOperations(")), context);
   vm.runInContext(source, context);
   const row = {market: "unit", ready_from_0900_ms: 2000, stages: {},
     state_publication: {total_ms: 12.3, projection_fingerprint_ms: 1.2, files: [

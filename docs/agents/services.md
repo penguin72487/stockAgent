@@ -27,6 +27,15 @@ Use the section for the service being changed. Operational acceptance requires f
   eligibility, MIS opening quote, or opening activation for this calculation;
   those remain mandatory only for executable 09:00 paper orders. Never relabel
   an after-close calculation as a fill at that already-completed close.
+- Live TW panel/cache reads share the canonical producer's
+  `tw-public-refresh.lock` across the source read. An exclusive producer means
+  retryable `waiting_source`, not a completed mixed reference/entitlement
+  generation. Once that owner releases, strict SHA/count/dependency checks still
+  reject real corruption. Postclose cache telemetry is owned by the current bot
+  run and may recover after the provisional window only from an accepted
+  official-close signal or a matching deployment's complete existing cache;
+  this does not establish formal-history or broker-fill acceptance. See
+  [2026-10-08 source-coherence repair](../tw_corporate_action_generation_repair_2026-10-08.md).
 - Set the outer systemd watchdog above measured legitimate event-loop stalls.
   Keep the tighter opening path protected by its progress-aware hot/cold
   watchdog so relaxing the outer process watchdog does not relax 09:00 recovery.
@@ -43,6 +52,41 @@ Use the section for the service being changed. Operational acceptance requires f
   symbol durably, and releases each mode from its own source dependencies rather
   than waiting for every mode. Prune only provably zero whole-lot targets using
   frozen session sizing NAV; carried inventory and unknown prices remain in scope.
+- Opening acquisition contract v4 distinguishes positive same-session opens,
+  fresh official zero-volume/no-first-print evidence, and unknown source failures.
+  The existing input quorum may count the first two as resolved observations;
+  response rows alone, stale timestamps, or a ready flag cannot prove readiness.
+  Observed absence uses the existing zero-gap feature sentinel, never a fabricated
+  price. Positive-open completeness remains a separate, truthfully incomplete metric.
+  Preserve accepted opens and retry unknown inputs through the shared source owner.
+  A mode's retry must not starve source repair between actual inference attempts.
+  After publishing the immutable original model weights once, an unpriced target
+  remains a per-symbol unsized `waiting_source` order, not a discarded cash target
+  or a reason to rerun the whole model. Freeze its original session NAV; size only
+  after real same-session price/limits and causal non-trial evidence arrive, and
+  cancel unopened targets when the 13:20 exit window begins. Preserve eligibility,
+  short permissions, lot/tick rules, causal quotes, and the original fill policy.
+  Exchange timestamps and local receipt timestamps remain distinct; a fresh
+  delivery of yesterday's row is not today's opening. See the initial
+  [2026-10-07 repair](../tw_opening_source_recovery_2026-10-07.md) and its
+  [2026-10-08 quorum/pending-target correction](../tw_opening_latency_repair_2026-10-08.md).
+- The opening source owner starts every configured provider over the full model
+  universe concurrently, accepts incremental batches, and persists verified
+  inputs before releasing the existing quorum. Slow/failed providers cannot
+  cancel winners or hold the model mutex; later attempts reuse accepted facts
+  and retry only unresolved deltas. Preserve conflicting raw observations and
+  the complete requested universe. Shared IPC progress is cumulative, and native
+  callback parsing/network waits stay outside the stock-cache and execution locks.
+  The pre-open transport probes are also independent: one proven responding
+  source may warm the model, but cannot bypass actual 09:00 source coverage,
+  eligibility or execution evidence. Daily `*.acquisition.jsonl`, the scheduled
+  opening-attempt log and engine entry telemetry have separate measurement
+  boundaries; a source quorum, paper fill and broker fill are different proofs.
+  Native Shioaji stock Snapshot wall-clock timestamps are localized to Taipei
+  before conversion to UTC milliseconds; do not shift their clock by eight hours
+  or silently rewrite historical receipts. The shared quote worker remains in
+  the existing simulation engine process/session, not another login. See the
+  [multi-source implementation and bounded measurements](../tw_opening_latency_repair_2026-10-08.md#多源平行開盤取價2026-10-08-續作).
 - A current-session Snapshot book may supply explicitly labelled indicative
   valuation only. Unknown `simtrade` remains unknown; these fields must not
   supply execution prices, volume, bracket triggers or non-trial evidence.

@@ -90,6 +90,64 @@ Inventory and operational implications are recorded in
 `docs/penguin_source_only_storage_2026-10-01.md`; the reproducible read-only entry
 point is `scripts/audit_training_source_inventory.py`.
 
+### Training-node placement and completed-result retention
+
+The user's 2026-10-07 placement separates training results from their inputs:
+
+| Role | Node-local location |
+| --- | --- |
+| Training lifecycle, checkpoints, curves and run metadata | `artifacts/markets/<experiment>/` |
+| Source observations and provenance | canonical `data_*` or pinned packed materializations |
+| Prepared panels, features and compiled execution data | `artifacts/data_preparation/<experiment>/` |
+| Reusable working caches | `artifacts/cache/<experiment>/` |
+| Frozen code, wheels and runtime receipts | `artifacts/code_releases/<experiment>/` |
+| Disposable engineering measurements | `artifacts/benchmarks/<experiment>/` |
+| Launch copies and operational evidence | `artifacts/operations/` |
+
+`stockagent.storage_layout.admit_output` reserves `markets` for results in the
+maintained code builder, mixed/factorized preparation, feature-catalog,
+value-projection and benchmark/profile entrypoints. New mutable work must also
+stay outside frozen `code_releases`; builders running inside a frozen source
+tree use the owning checkout for their generated training-output default.
+Their generated physical-cache paths use `artifacts/cache` explicitly instead
+of inheriting a historical `markets` cache from the base configuration.
+Historical frozen code and manifest bytes remain unchanged. Relocate exact,
+inactive paths with `training_layout`, no-overwrite same-filesystem rename and
+complete file/inode metadata proof; container directory bookkeeping size can
+change during rename and is excluded from the post-rename equivalence test.
+Active argv/config inheritance, FD/mmap and cache/code environment references
+remain gates. A newer frozen training config is resolved through that trainer's
+canonical loader in a fresh process; do not strip unfamiliar fields or treat a
+control checkout's old schema as the selected experiment's schema.
+
+The private fixed plan retries under the existing remote-cold-artifact ingress
+owner/timer. Busy paths retry independently; a layout failure does not stop a
+backup wave. A local launch YAML is a separate, receipt-bound copy of the
+completed run's full configuration, updated only for successfully moved paths;
+original source/config/checkpoint provenance is retained. Do not launch it while
+its exact inputs are still waiting for relocation. This engineering copy is not
+new training, changed data semantics or checkpoint-resume acceptance.
+Recheck old cache names after their initial move: a legacy frozen worker may
+recreate them. Enroll recreated generations in private child plans under the
+same coordinator, preserving the canonical destination and each generation's
+no-overwrite rename/recovery journal. Busy generations reopen pending. New
+benchmark launch copies localize the legacy cache setting, and maintained
+minute-tape/physical-carry cache writers reject `markets` before source reads.
+
+`training_return.json` policy v3 sets `minimum_hot_retention_hours: 168`.
+Publication still uses the ten-minute stability floor and may back up immediately.
+Formal result unlink additionally waits at least seven days from the later of
+canonical completion and last source-file write. Both legacy-parent and bulk
+retirement share this floor and recheck it before unlink; an old v2 request gets
+the same minimum. Expiry alone does not authorize deletion: exact independent
+cold recovery, fresh ACK, current consumers, holds and all existing gates still
+apply. Explicitly unwanted smoke/benchmark outputs keep their separate discard
+policy. Namespace migration does not release recovery holds or authorize GC of
+unregistered prepared/code/cache roots.
+
+The restored result, fixed migration and current busy queue are documented in
+[Vast layout and retention](../vastai1t_training_layout_2026-10-07.md).
+
 ### Futures preparation source placement and accidental-deletion recovery
 
 - The user's 2026-10-04 correction places retained futures preparation **raw
@@ -238,6 +296,11 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   Source receipt admission binds the sealed metadata to the already enrolled
   authority keys/SHAs/bytes and exact paired independent NAS recovery proof;
   it need not reread the local payload before admitting unrelated waves.
+  Catalog receipt admission may likewise use its exact completed export journal,
+  producer full-copy proof, fixed snapshot/manifest/set/bytes and paired native
+  NAS restore proof. A prepared export, wrong generation, redirected journal or
+  missing semantic restore cannot use that admission path. This archive proof
+  does not accept a subsequently damaged local materialization.
   Full local set/SHA, primary reconstruction and process checks still precede
   transport retirement. Rejected new catalog refreshes remain explicit and
   retry with backoff while the last committed registry keeps supplying valid
@@ -253,9 +316,24 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   later user-selected policy and deployed retry/capacity behavior.
 - Source ACKs persist before cleanup. `stockagent-lake-transport-gc.timer`
   handles one exact accepted wave per invocation through the shared journal
-  and per-delivery lock. Inventory, primary recovery, process, signatures and
+  and per-delivery lock. Its durable attempt schedule tries untouched/oldest
+  candidates first and backs off each rejected wave independently; interrupted
+  checks also yield to other waves. At source-capacity pressure, larger untouched
+  raw waves precede small catalog copies; ordinary capacity keeps kind
+  alternation. Deferred recovery is not retirement or
+  reclaimed capacity. Inventory, primary recovery, process, signatures and
   exact NAS gates remain mandatory. Only temporary ingress is retired; D/NAS
-  primary objects are retained. Cleanup cannot block the next increment.
+  primary objects are retained. When positive remaining quota cannot hold the
+  smallest unpublished object, source status is `waiting_transport_capacity`,
+  with the remaining and minimum-object bytes. Capacity inventory retries the
+  whole no-follow scan at most three times if concurrent retirement removes an
+  entry; never skip that entry or return partial counts, and reject a replaced
+  authority root between attempts. See the
+  [2026-10-07 source repair](../nas_source_backpressure_repair_2026-10-07.md).
+  The selected source spool limit is 224 GiB within a shared 256 GiB ingress
+  budget; the remaining 32 GiB accommodates staging and Restic metadata/code/SQL.
+  Keep the physical reserve and receiver admission checks. Reducing a quota
+  does not authorize deletion of existing over-quota transport.
 - No snapshot expiration, DuckLake cleanup, NAS deletion, Restic prune or
   formatting is enabled. Direct NAS recovery, reconstruction of NAS-attested
   identical copies, process recovery and physical reboot are separate claims.
@@ -299,7 +377,7 @@ catalog credentials or hard-code an interpreter path.
   caches, cold objects or NAS snapshots. Reuse the existing ingress timer/lock;
   do not put mutable training output trees into Syncthing. See
   [four-node architecture](../four_node_storage_architecture_2026-10-04.md).
-  Policy v2 may unlink only names inside the exact returned run when regular
+  The shared-file policy may unlink only names inside the exact returned run when regular
   files share an inode. Preserve all external names, block external FD/mmap
   consumers by inode identity, bind link counts into the fresh fingerprint,
   account for only controller-owned unlink changes, and reuse canonical final
@@ -318,6 +396,15 @@ catalog credentials or hard-code an interpreter path.
   return channel grants no release publishing authority. Fixed file backup,
   canonical source reconstruction and database restore remain separate proofs.
   See [continuous NAS backup](../continuous_nas_backup_2026-10-04.md).
+  Stop-time private recovery captures may use the same closed-delivery owner
+  and encrypted Restic relay with a distinct `private_vast_recovery_backup`
+  kind; this grants no source-retirement or model-promotion authority. Git
+  history can retain real private configuration even when the public working
+  tree is filtered, so verify its scope before plaintext lake publication.
+  Penguin's explicit `native_windows_io` option reuses the enrolled D adapter
+  for full SHA and restore reads, retaining exact-set, inode and volume gates;
+  the portable receiver default remains dependency-free. See
+  [Vast Stop preservation](../vast_pre_stop_backup_2026-10-10.md).
   For unattended semantic recovery, source-pinned data-only requests may be
   consumed by fixed locally installed code in the existing backup service's
   post hook, under that same owner lock. Never interpret synced commands or
@@ -664,6 +751,36 @@ catalog credentials or hard-code an interpreter path.
   exact release, D guard, current source/consumer/convergence and original proof
   expiry when reacquiring the retirement owner; never refresh a proof from stat
   alone. Worker upgrades remain limited to an unowned childless lock wait.
+- The user's original 2026-10-06 Vast cleanup included offline training smoke tests
+  and repair experiments. The explicit preservation policy v3 named a fixed
+  `smoke`/`operations` root list and binds
+  `manual-vast-offline-artifact-preservation-v1` into the original archive and
+  exact acknowledgement. V1/v2 cannot retire those namespaces. Reuse the same
+  publisher, independent D recovery, ingress owner, quarantine, current
+  consumer/config/FD/mmap/pin/convergence and final-link checks. It neither
+  enrolls future directories nor claims training completion; protected or
+  changed sources remain. The user's latest 2026-10-07 instruction supersedes
+  preservation for unwanted smoke/benchmark/engineering validation outputs,
+  including their cold payloads. The exact signed target list is
+  `configs/data_sync/testing_artifact_disposition_20261007_v2.json` (the original
+  v1 list stays immutable as history); this authorizes
+  discard without independent recovery or a retention wait, while current
+  consumers/configs/FD/mmap, explicit holds, pins, exact paths, dry-run identity,
+  quarantine and final-link accounting remain mandatory. The offline-test
+  preservation timer is disabled and the panel selection excludes testing
+  children. D deletion uses the canonical publication owner and a complete
+  reference graph across all retained manifests, including restricted/history
+  and staged releases. Delete only test-exclusive CAS payloads, retain shared
+  objects and minimal disposition/manifest receipts, and exclude the exact
+  discarded releases from recovery coverage and future source replication.
+  Mixed archives with formal/source members are preserved until independently
+  separated. The consumer gate must include every inherited `base_config`
+  source recorded by canonical `load_config(..., source_signatures=...)`, not
+  only resolved dataclass paths. A live training PID can coexist with deleted
+  configuration dependencies; restore their exact cold-bound bytes and protect
+  the dependency closure before any further deletion. This is no authority for
+  whole-repository NAS prune. See
+  [Vast cleanup evidence](../vastai1t_storage_cleanup_2026-10-06.md).
 - The explicit WSL cleanup may compute a complete source/mirror/D retirement
   dry run outside that mutation owner, under its fixed cohort owner. Only the
   same in-process manual apply may reuse that complete audit for at most
@@ -693,6 +810,21 @@ catalog credentials or hard-code an interpreter path.
   hashes, before/after source signatures, and physical backing-drive admission
   plus a 32 GiB reserve. Keep the 8 KiB mount, logical cold path and source
   metadata unchanged. See [hardware-bound workflow measurements](../four_node_storage_optimization_2026-10-05.md).
+  A real 876 kB, 67-member pack was faster using one full-SHA bounded memory
+  read than launching native SSD scratch. Only packs at most 1 MiB with at
+  most 128 stored members use that path; unknown counts, larger packs and
+  larger subsets retain native admission. Both paths retain complete original
+  reconstruction, CRC/member hashes and immutable source signatures. The
+  interleaved measurement does not establish whole-release throughput.
+  Independent legacy verification may reconstruct into a newly created,
+  empty, owner-private `0700` scratch with `verification_only=True`.
+  These per-member verification writes need no durable file barrier: retain
+  all object/member/original SHA, CRC, decoded sizes, source signatures and
+  physical capacity admission, but return only the private partial tree and
+  publish no target or `READY`. Normal fetch, publication and recovery to a
+  consumer remain durable. Persist a cold proof only after complete recovery;
+  failed scratch stays for diagnosis. The real complete-release check and
+  measured scratch comparison are in the linked Vast cleanup report.
 - Archive encoding scratch is not a cold authority. The four manual legacy
   roots enrolled on 2026-10-03 may use the bounded
   `/var/lib/stockagent-legacy-archive-stage` C-side work area to avoid DrvFs

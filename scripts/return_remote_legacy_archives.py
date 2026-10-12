@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -29,7 +30,11 @@ from scripts.configure_artifact_ingress_syncthing import credentials
 from scripts.manage_packed_edge import _convergence
 from stockagent.data_sync.cold_primary import _check_d_primary_mount
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_json, sha256_file
-from stockagent.data_sync.legacy_artifact_archive import COMPRESSION_PROFILES, DEFAULT_COMPRESSION_PROFILE, LegacyArchiveSpec, load_legacy_specs, prepare_archive, publish_archive, verify_archive_directory, verify_cold_archive
+from stockagent.data_sync.legacy_artifact_archive import (
+    COMPRESSION_PROFILES, DEFAULT_COMPRESSION_PROFILE, LegacyArchiveSpec, load_legacy_specs,
+    prepare_archive, publish_archive, verify_archive_directory, verify_cold_archive,
+    MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT, reviewed_vast_offline_root,
+)
 from stockagent.data_sync.materialized_cache import process_references
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 from stockagent.data_sync.remote_legacy_return import dataset_name, identity, metadata_tree, real
@@ -45,6 +50,7 @@ def private_control_prefix() -> str:
     canonical_archive = (ROOT / "stockagent/data_sync/legacy_artifact_archive.py").read_text()
     code = "import sys, types\n"
     for name, relative in (("stockagent.data_sync.node_roles", "stockagent/data_sync/node_roles.py"),
+                           ("stockagent.data_sync.testing_disposition", "stockagent/data_sync/testing_disposition.py"),
                            ("stockagent.data_sync.artifact_consumers", "stockagent/data_sync/artifact_consumers.py"),
                            ("stockagent.data_sync.training_return", "stockagent/data_sync/training_return.py")):
         code += f"m=types.ModuleType({name!r});m.__file__={'/root/stockAgent/' + relative!r};sys.modules[{name!r}]=m\n"
@@ -65,7 +71,8 @@ def remote(args, request: dict) -> dict:
     code += "\nrequest = json.loads(" + repr(json.dumps(request)) + ")\n"
     code += """
 if request['action'] == 'inventory':
-    result = inventory_scopes(Path('/root/stockAgent/artifacts'), request.get('include_roots'))
+    result = inventory_scopes(Path('/root/stockAgent/artifacts'), request.get('include_roots'),
+                              capture_contract=request.get('capture_contract'))
 elif request['action'] == 'observe':
     result = metadata_tree(real(Path('/root/stockAgent/artifacts') / request['relative_root']))
     result['process_references'] = artifact_process_references(Path('/root/stockAgent/artifacts') / request['relative_root'], Path('/root/stockAgent/artifacts'))
@@ -170,7 +177,7 @@ def archive_one(args, policy: dict, row: dict, spec: LegacyArchiveSpec) -> None:
         # The retained immutable archive may still preserve these same names
         # and bytes. Keep the initial inventory untouched, record a fresh
         # observation and require full D recovery plus full source SHA below.
-        if not (policy.get("schema_version") == 2 and row.get("cold_verified") is True
+        if not (policy.get("schema_version") in {2, 3} and row.get("cold_verified") is True
                 and row.get("private_scratch_removed") is True):
             raise SnapshotError("remote source changed or is in use; inventory again")
         inventory = json.loads(real(args.state_root / "inventory.json").read_text())
@@ -259,22 +266,35 @@ def preservation_policy(policy):
                 "reserve_bytes", "maximum_item_bytes", "archive_only", "retire_verified_source"}
     optional = {"transfer_compression", "archive_compression", "batch_directory_fsync"}
     version = policy.get("schema_version")
-    if version == 2:
+    if version in {2, 3}:
         required.add("shared_file_policy")
+    if version == 3:
+        required.update({"capture_contract", "relative_roots"})
     if (not required.issubset(policy) or set(policy) - required - optional or type(version) is not int
-            or version not in {1, 2} or policy["authority_node_id"] != "penguin"
-            or policy["origin_node_id"] != "vastai1T" or policy["scopes"] != ["markets", "ablations"]
-            or type(policy["minimum_stable_hours"]) not in {int, float} or policy["minimum_stable_hours"] < 12
+            or version not in {1, 2, 3} or policy["authority_node_id"] != "penguin"
+            or policy["origin_node_id"] != "vastai1T"
+            or policy["scopes"] != (["smoke", "operations"] if version == 3 else ["markets", "ablations"])
+            or type(policy["minimum_stable_hours"]) not in {int, float}
+            or not math.isfinite(policy["minimum_stable_hours"]) or policy["minimum_stable_hours"] < 12
             or any(type(policy[name]) is not int or policy[name] <= 0
                    for name in ("reserve_bytes", "maximum_item_bytes"))
             or policy["archive_only"] is not True or type(policy["retire_verified_source"]) is not bool
-            or version == 2 and policy["shared_file_policy"] != "unlink_preserved_names_only"):
+            or version in {2, 3} and policy["shared_file_policy"] != "unlink_preserved_names_only"):
         raise SnapshotError("invalid scoped legacy return preservation policy")
+    if version == 3:
+        roots = policy["relative_roots"]
+        if (policy["capture_contract"] != MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT
+                or not isinstance(roots, list) or not 1 <= len(roots) <= 2000
+                or any(not isinstance(root, str) or not reviewed_vast_offline_root(root) for root in roots)
+                or len(set(roots)) != len(roots)):
+            raise SnapshotError("offline return requires the exact reviewed smoke/operations root list")
     return policy
 
 
 def recovery_ack_contract(policy):
     """Keep the original reject-shared contract unless the cohort opts in."""
+    if policy.get("schema_version") == 3:
+        return "d_verified_remote_legacy_return_v3", 1500
     if policy.get("schema_version", 1) == 2:
         return "d_verified_remote_legacy_return_v2", 1500
     return "d_verified_remote_legacy_return_v1", 240
@@ -361,8 +381,10 @@ def commit_prepared_archive(args, policy, row, spec, before, scratch, source_roo
                        "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256,
                        "legacy_manifest_sha256": resolved.manifest["metadata"]["legacy_manifest_sha256"],
                        "cold_verified": True, "verified_at_epoch": proof["verified_at_epoch"], "archive_manifest": manifest}
-                if ack_contract.endswith("_v2"):
+                if not ack_contract.endswith("_v1"):
                     ack["shared_file_policy"] = policy["shared_file_policy"]
+                if ack_contract.endswith("_v3"):
+                    ack["capture_contract"] = policy["capture_contract"]
                 ack["identity_sha256"] = identity(ack)
                 atomic_write_json(args.state_root / "acknowledgements" / (spec.dataset + ".json"), ack)
                 with phase(args, row, spec, "fresh-source-retirement"):
@@ -473,6 +495,10 @@ def main() -> int:
         if args.command != "archive" or args.include_root:
             raise SnapshotError("use one exact selection only for an existing archive cohort")
         args.include_root = sorted(load_cohort_selection(args.selection, args.state_root))
+    if policy["schema_version"] == 3:
+        if args.command == "partition" or args.include_root and not set(args.include_root).issubset(policy["relative_roots"]):
+            raise SnapshotError("offline capture may use only its fixed reviewed directory roots")
+        args.include_root = args.include_root or list(policy["relative_roots"])
     with cohort_owner(args.state_root, wait=args.wait_for_owner):
         return run_cohort(args, policy)
 
@@ -512,16 +538,22 @@ def run_cohort(args, policy: dict) -> int:
                          "all_scopes_inventoried": False, "partitioned_from": str(args.from_inventory),
                          "captured_at_epoch": retained["captured_at_epoch"], "items": items}
         else:
-            inventory = remote(args, {"action": "inventory", "include_roots": args.include_root})
+            request = {"action": "inventory", "include_roots": args.include_root}
+            if policy["schema_version"] == 3:
+                request["capture_contract"] = policy["capture_contract"]
+            inventory = remote(args, request)
         atomic_write_json(args.state_root / "inventory.json", inventory)
         catalog = {"schema_version": 1, "authority_node_id": "penguin", "archives": []}
         for row in inventory["items"]:
             if row["state"] == "inventoried" and row["files"]:
-                catalog["archives"].append({"dataset": dataset_name(row["relative_root"]),
+                spec = {"dataset": dataset_name(row["relative_root"]),
                     "relative_root": row["relative_root"], "minimum_stable_days": 7,
                     "manual_capture_min_stable_hours": policy["minimum_stable_hours"], "durable_staging": False,
                     "archive_only": True, "compression": getattr(args, "archive_compression", DEFAULT_COMPRESSION_PROFILE),
-                    "stage_root": str(args.state_root / "encoded")})
+                    "stage_root": str(args.state_root / "encoded")}
+                if policy["schema_version"] == 3:
+                    spec["capture_contract"] = policy["capture_contract"]
+                catalog["archives"].append(spec)
         atomic_write_json(args.state_root / "archive-catalog.json", catalog)
         print(json.dumps({"state": "inventory-complete", "all_scopes_inventoried": inventory["all_scopes_inventoried"], "items": len(inventory["items"]),
                           "files": sum(r.get("files", 0) for r in inventory["items"]),
@@ -555,6 +587,12 @@ def run_cohort(args, policy: dict) -> int:
     processed = 0
     for row in ordered_items(ledger["items"], args.order, by_root):
         if args.include_root and row["relative_root"] not in args.include_root:
+            continue
+        # Re-read the exact user disposition at each item boundary, so future
+        # timer rounds never republish explicitly unwanted test artifacts.
+        from stockagent.data_sync.testing_disposition import DEFAULT_POLICY, load_policy, discarded_root
+        if DEFAULT_POLICY.exists() and discarded_root(row["relative_root"], load_policy(DEFAULT_POLICY)):
+            row.update(state="testing-preservation-cancelled-by-user", recovery_claimed=False)
             continue
         if row.get("state") == "remote-source-retired" or row.get("files", 0) == 0:
             if row.get("files", 0) == 0 and row["state"] == "inventoried":

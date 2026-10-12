@@ -488,6 +488,85 @@ class CandleEncoder(nn.Module):
             "candle_embedding": embedding,
         }
 
+    def forward_compact_columns(
+        self, values: torch.Tensor, columns: torch.Tensor,
+    ) -> torch.Tensor:
+        """Contract the full dense stem from lossless positive-zero columns.
+
+        All F parameters, LayerNorm's F-wide moments, and the affine effect of
+        omitted zeros remain present. This is not feature selection, a learned
+        bottleneck, or a sparse attention/execution policy. Only the immutable
+        storage codec may certify omitted columns. A transport bucket pads
+        positive zeros with sentinel F, whose gathered affine weights are zero.
+        Reordered FP32 reductions
+        have a separately versioned experiment contract.
+        """
+        if (not self.projection_fp32 or self.categorical_feature_indices
+                or self.feature_bottleneck_dim or self.feature_svd_components
+                or self.extra_continuous_features
+                or self.causal_feature_window_rms_normalization
+                or self.causal_feature_compression != "none"):
+            raise ValueError("compact projection requires the direct continuous FP32 stem")
+        if values.size(-1) != columns.numel() or columns.dtype != torch.long:
+            raise ValueError("compact values require matching Int64 logical columns")
+        # The verified codec's union is sorted and unique. If it already owns
+        # all F columns there are no zeros to contract, and the native dense
+        # norm preserves its Welford schedule for near-constant large rows.
+        if columns.numel() == self.num_features:
+            return self(values, return_aux=False)[0]
+        with torch.autocast(values.device.type, enabled=False):
+            valid = columns < self.num_features
+            safe_columns = columns.clamp_max(self.num_features-1)
+            x = values.float()
+            if self.sanitize_inputs:
+                x = torch.nan_to_num(x, nan=0., posinf=0., neginf=0.)
+            if self.causal_feature_rms_normalization:
+                scale = self.causal_feature_rms_scale.index_select(0, safe_columns)
+                active = self.causal_feature_active_mask.index_select(0, safe_columns) & valid
+                x = (x / scale) * active
+            norm = self.input_norm
+            gamma = norm.weight.float()
+            projection = self.joint_projection.proj
+            weight = projection.weight.float()
+            selected_gamma = gamma.index_select(0, safe_columns) * valid
+            selected_weight = weight.index_select(1, safe_columns)
+            # Never form E[x²] - E[x]²: that cancels for near-constant rows.
+            # Omitted zeros contribute (F-K)*mean² to centered variance.
+            if isinstance(norm, nn.LayerNorm):
+                mean = x.sum(dim=-1, keepdim=True) / float(self.num_features)
+                centered = x - mean
+                variance = (centered.square().sum(dim=-1, keepdim=True)
+                    + (self.num_features - columns.numel()) * mean.square()) / float(self.num_features)
+                inverse = torch.rsqrt(variance + norm.eps)
+                # Center before GEMM, as the dense LayerNorm does. Subtracting
+                # two large projected means instead would lose significant
+                # digits for near-constant observations, even in FP32.
+                selected = (centered * inverse) * selected_gamma
+                zero_shift = ((weight * gamma).sum(dim=-1)
+                    - (selected_weight * selected_gamma).sum(dim=-1))
+                selected_bias=None
+                if norm.bias is not None:
+                    selected_bias=norm.bias.float().index_select(0,safe_columns)*valid
+                    # Keep observed-column beta inside the same GEMM input as
+                    # dense LayerNorm. Moving every beta outside TF32's input
+                    # rounding unnecessarily amplifies the operation reorder.
+                    selected=selected+selected_bias
+                projected = F.linear(selected, selected_weight)
+                projected = projected - mean * inverse * zero_shift
+                # Beta acts on every logical column, including positive zeros.
+                if norm.bias is not None:
+                    projected = projected + (F.linear(norm.bias.float(),weight)
+                        - F.linear(selected_bias,selected_weight))
+            elif isinstance(norm, PortfolioRMSNorm):
+                variance = x.square().sum(dim=-1, keepdim=True) / float(self.num_features)
+                inverse = torch.rsqrt(variance + norm.eps)
+                projected = F.linear((x * inverse) * selected_gamma, selected_weight)
+            else:
+                raise ValueError("compact projection requires LayerNorm or PortfolioRMSNorm")
+            if projection.bias is not None:
+                projected = projected + projection.bias.float()
+            return self._finish_embedding(self._activate_projected(projected))
+
 
 class TemporalBasisInputFeatureBuilder(nn.Module):
     """Append causal basis coefficients to the ordinary CandleEncoder row.
@@ -996,6 +1075,8 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         temporal_blocks_fp32: bool = False,
         portfolio_blocks_fp32: bool = False,
         candle_projection_fp32: bool = False,
+        factorized_compact_projection: bool = False,
+        factorized_compact_stream_chunk_bytes: int = 0,
         factorized_input_compile: bool = True,
         daily_context_num_features: int = 0,
         daily_context_categorical_feature_indices: Sequence[int] | None = None,
@@ -1006,6 +1087,19 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.factorized_input_compile=bool(factorized_input_compile)
+        self.factorized_compact_projection=bool(factorized_compact_projection)
+        self.factorized_compact_stream_chunk_bytes=int(factorized_compact_stream_chunk_bytes)
+        if self.factorized_compact_stream_chunk_bytes < 0 or (
+            self.factorized_compact_stream_chunk_bytes and not self.factorized_compact_projection
+        ):
+            raise ValueError("compact stream budget requires nonnegative bytes and compact projection")
+        if self.factorized_compact_projection and (
+                not candle_projection_fp32 or self.temporal_basis_families
+                or feature_bottleneck_dim or feature_svd_components
+                or self.categorical_feature_indices or daily_context_num_features
+                or causal_feature_window_rms_normalization
+                or causal_feature_compression != "none"):
+            raise ValueError("factorized compact projection requires no basis/bottleneck, continuous FP32 input")
         if feature_svd_components and self.temporal_basis_families:
             raise ValueError("feature SVD does not append temporal basis banks")
         self.temporal_blocks_fp32 = bool(temporal_blocks_fp32)

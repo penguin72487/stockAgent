@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     TAIPEI, WORKLOAD_CONTRACT_VERSION, quota_cycle_start, utc_time,
 )
+from stockagent.data.finlab_quota_policy import load_policy, quota_admission  # noqa: E402
 
 
 def read(path: Path) -> dict:
@@ -34,6 +35,10 @@ def read(path: Path) -> dict:
 
 
 def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
+    try:
+        policy = load_policy(root / "configs/finlab_quota_policy.json")
+    except (OSError, ValueError):
+        return True, "quota_policy_unverified_recovery"  # Collector fails closed with an explicit error.
     local = now.astimezone(TAIPEI)
     if local.hour == 8 and local.minute < 20:
         return True, "reset_confirmation_window"
@@ -59,6 +64,11 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
             retry = utc_time(row.get("retry_at_utc"))
             if retry is None or retry <= now:
                 return True, "general_work_due"
+    # A provider's shared cooldown applies to intraday work, not unrelated
+    # general releases. Avoid starting an idle process pool every timer tick.
+    retry = utc_time(read(root / "data_finlab/intraday/source_backoff.json").get("retry_at_utc"))
+    if retry is not None and now < retry:
+        return False, "intraday_source_cooldown"
     quota = read(root / "artifacts/live/finlab/quota_latest.json")
     quota_at = utc_time(quota.get("observed_at_utc"))
     remaining = quota.get("remaining_mb")
@@ -74,17 +84,38 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
     kinds = market.get("by_kind")
     tick = kinds.get("tw_tick", {}) if isinstance(kinds, dict) else {}
     tick = tick if isinstance(tick, dict) else {}
-    partitions = tick.get("remaining_partitions", 1)
-    if type(partitions) is not int or partitions < 0:
-        partitions = 1  # unknown scope is not zero remaining work
+    minute_first = (market.get("acquisition_mode") == "minute_first_tick_residual"
+                    or type(core.get("minute_residual_allowed")) is bool)
+    minute = kinds.get("tw_minute", {}) if isinstance(kinds, dict) else {}
+    minute = minute if isinstance(minute, dict) else {}
+    def remaining_work(item):
+        count = item.get("remaining_partitions", 1)
+        return count if type(count) is int and count >= 0 else 1
     checked = utc_time(market.get("observed_at_utc"))
     # A fully searched frontier can only advance after another source cycle;
     # keep unknown history incomplete without rediscovering it every minute.
-    exhausted = (market.get("state") == "frontiers_scanned; retries_due_next_cycle"
+    exhausted = (not minute_first and market.get("state") == "frontiers_scanned; retries_due_next_cycle"
                  and checked and checked >= quota_cycle_start(now))
-    if (core.get("supplemental_allowed") is True and not exhausted
-            and remaining > max(50, reserve) and partitions > 0):
-        return True, "residual_tick_capacity"
+    minute_wait = False
+    if minute_first:
+        priority = market.get("minute_priority", {})
+        priority = priority if isinstance(priority, dict) else {}
+        next_check = utc_time(priority.get("next_source_check_at_utc"))
+        minute_wait = (priority.get("actionable_known_window_partitions", priority.get("pending_known_window_partitions")) == 0
+                       and priority.get("due_publication_rechecks") == 0
+                       and next_check is not None and now < next_check)
+        if minute_wait and core.get("supplemental_allowed") is not True:
+            return False, "minute_source_wait_tick_general_debt"
+    admitted = core.get("minute_residual_allowed", core.get("supplemental_allowed")) is True
+    minute_policy = quota_admission(kind="tw_minute", now=now, policy=policy)
+    if minute_first and admitted and not minute_wait and remaining_work(minute) > 0:
+        if remaining > minute_policy["effective_reserve_mb"]:
+            return True, "minute_pre_reset_drain" if minute_policy["mode"] == "pre_reset_drain" else "minute_first_residual_capacity"
+        return False, "minute_quota_floor_reached"
+    tick_policy = quota_admission(kind="tw_tick", now=now, scheduled_reserve_mb=reserve, policy=policy)
+    if (core.get("supplemental_allowed") is True and not exhausted and remaining_work(tick) > 0
+            and remaining > tick_policy["effective_reserve_mb"]):
+        return True, "tick_pre_reset_drain" if tick_policy["mode"] == "pre_reset_drain" else "residual_tick_capacity"
     return False, "nothing_actionable_now"
 
 

@@ -380,6 +380,26 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
         )
 
 
+def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
+    public = sanitize_tw_signals({
+        "simulation_only": True,
+        "production_order_possible": False,
+        "rows": [{"symbol": "2330", "filled_shares": 1000,
+                  "position": {"contract": "signal_ledger_valuation_v1",
+                               "symbol": "2330", "filled_shares": 1000,
+                               "last_mark_price": 103.0,
+                               "last_mark_quote_source": "shioaji:stock_snapshot",
+                               "reconciled_total_net_pnl_twd": 2520.0,
+                               "position_id": "private-position", "signal_id": "private-signal",
+                               "api_key": "must-not-publish", "unknown_debug": "must-not-publish"}}],
+    })
+    position = public["rows"][0]["position"]
+    assert position == {"contract": "signal_ledger_valuation_v1", "symbol": "2330",
+                        "filled_shares": 1000, "last_mark_price": 103.0,
+                        "last_mark_quote_source": "shioaji:stock_snapshot",
+                        "reconciled_total_net_pnl_twd": 2520.0}
+
+
 def test_tw_signal_nested_scrub_keeps_security_rules_after_key_cache_hits() -> None:
     long_private_key = "x" * 129 + "_path"
     payload = {
@@ -620,7 +640,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=14"' in html
+    assert 'src="dashboard-core.js?v=15"' in html
     assert 'src="public.js?v=15"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
@@ -949,8 +969,8 @@ def test_public_pages_share_visual_tokens() -> None:
         assert "dashboard-core.css?v=6" in html
         assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=14" defer' in html
-        assert html.index("dashboard-core.js?v=14") < html.index(
+        assert 'dashboard-core.js?v=15" defer' in html
+        assert html.index("dashboard-core.js?v=15") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -1330,9 +1350,12 @@ def test_public_gateway_serves_finlab_page_and_assets() -> None:
             if path in {"/finlab/", "/finlab/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
         page = PublicDashboardHandler._static_response(handler, "/finlab/").body
-        assert b'app.js?v=17' in page
+        assert re.search(rb'src="app\.js\?v=\d+"', page)
         assert b'id="volume-progress"' in page
         assert b'id="volume-total"' in page
+        assert b'id="history-overview"' in page
+        assert b'id="dataset-group"' in page
+        assert b'id="dataset-sort"' in page
     finally:
         server.server_close()
 
@@ -1352,6 +1375,34 @@ def test_public_gateway_serves_finmind_page_and_assets() -> None:
             assert needle in response.body
             if path in {"/finmind/", "/finmind/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
+    finally:
+        server.server_close()
+
+
+def test_finmind_cache_reads_new_estimate_generation_before_ttl(tmp_path, monkeypatch):
+    from scripts import serve_public_dashboards as module
+    from downloader.artifact_io import atomic_write_json
+
+    snapshot = tmp_path / 'data_finmind/eta_status.json'
+    snapshot.parent.mkdir()
+    calls = []
+    def status(root):
+        calls.append(root)
+        return {'generated_at_utc': 'safe', 'revision': json.loads(snapshot.read_text())['revision']}
+    monkeypatch.setattr(module, 'build_finmind_public_status', status)
+    server = _test_server()
+    server.repo_root = tmp_path
+    handler = SimpleNamespace(server=server)
+    try:
+        atomic_write_json(snapshot, {'revision': 1})
+        first = PublicDashboardHandler._api_response(handler, '/finmind/api/status', '')
+        again = PublicDashboardHandler._api_response(handler, '/finmind/api/status', '')
+        assert first is again and len(calls) == 1
+        atomic_write_json(snapshot, {'revision': 2})
+        latest = PublicDashboardHandler._api_response(handler, '/finmind/api/status', '')
+        assert json.loads(latest.body)['revision'] == 2
+        assert len(calls) == 2
+        assert latest.cache_control == 'no-store'
     finally:
         server.server_close()
 
@@ -1503,7 +1554,9 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 # Read-only assertions must not depend on Chromium animation frames:
                 # headless WSL may suppress rAF, making scroll_into_view hang.
                 assert page.locator("#volume-progress-label").is_visible()
-                assert page.locator("#volume-progress-label").text_content() == "50.0% · 可估範圍"
+                # General tables have their own denominator; minute history
+                # is a separate workload, not silently included in this bar.
+                assert page.locator("#volume-progress-label").text_content() == "50.0% · 一般表可估範圍（分鐘另列）"
                 assert page.locator("#volume-progress").get_attribute("value") == "0.5"
                 assert page.locator("#workload-time-progress").get_attribute("value") == "0.75"
                 assert "75.0%" in page.locator("#workload-time-ratio").text_content()

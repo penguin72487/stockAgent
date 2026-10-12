@@ -736,6 +736,8 @@ def build_model(
             temporal_blocks_fp32=fin_cfg.temporal_blocks_fp32,
             portfolio_blocks_fp32=fin_cfg.portfolio_blocks_fp32,
             candle_projection_fp32=fin_cfg.candle_projection_fp32,
+            factorized_compact_projection=fin_cfg.factorized_compact_projection,
+            factorized_compact_stream_chunk_bytes=fin_cfg.factorized_compact_stream_chunk_bytes,
             daily_context_num_features=len(daily_context_feature_names or ()),
             daily_context_categorical_feature_indices=(
                 _feature_indices_from_patterns(

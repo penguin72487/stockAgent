@@ -1668,6 +1668,57 @@ def _compiled_cross_attention_requires_blackwell_workaround(
     return int(major) >= 12
 
 
+def _compiled_cross_attention_is_manual(backend,dtype,query_steps,key_steps,workaround):
+    """Select the opt-in last-query FP32 reduction without changing auto.
+
+    Called only at the existing compiled CUDA cross-attention boundary. The
+    extended mode retains manual's half-precision behavior; FP32 uses direct
+    reductions only for one query, not large latent/market-token attentions.
+    """
+    if dtype==torch.float32:
+        return backend=="manual_fp32_last" and query_steps==1
+    if dtype not in {torch.float16,torch.bfloat16}:
+        return False
+    return (backend in {"manual","manual_fp32_last"} or workaround
+            or (backend=="auto" and query_steps*key_steps<=4096))
+
+
+def _aligned_narrow_fp32_sdpa(query, key, value, *, attn_mask=None,
+                              dropout_p=0.0, is_causal=False):
+    """Preserve small-head attention while giving compiled SDPA safe tiles.
+
+    On SM120 the actual d16/H4 FP32 compiled adjoint corrupts K/V gradients
+    with an unaligned long key axis. Padding just channels OR just key rows
+    does not repair it. Pad both physical axes, but retain the logical scale,
+    mask all extra keys, and discard the extra value channels. Normalization
+    and RoPE have already run over the original, unpadded head dimensions.
+    This is still Inductor/native SDPA, with no eager or CPU escape hatch.
+    """
+    if is_causal:
+        raise ValueError("aligned narrow FP32 SDPA is only admitted for non-causal cross attention")
+    logical_dim = int(query.size(-1))
+    key_steps = int(key.size(-2))
+    # Long stock contexts need 128-key tiles. The 16-token latent/market
+    # contexts are already aligned: do not inflate those reads by 8x.
+    key_tile = 128 if key_steps > 128 else 16
+    extra_keys = (-key_steps) % key_tile
+    extra_channels = 16 - logical_dim
+    query = F.pad(query, (0, extra_channels))
+    key = F.pad(key, (0, extra_channels, 0, extra_keys))
+    value = F.pad(value, (0, extra_channels, 0, extra_keys))
+    if attn_mask is None:
+        attn_mask = (torch.arange(key_steps + extra_keys, device=query.device) < key_steps).view(1,1,1,-1)
+    else:
+        # The shared FlashSDPAAttention caller supplies a boolean key mask.
+        attn_mask = F.pad(attn_mask, (0, extra_keys), value=False)
+    result = F.scaled_dot_product_attention(
+        query.contiguous(), key.contiguous(), value.contiguous(),
+        attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False,
+        scale=float(logical_dim) ** -0.5,
+    )
+    return result[..., :logical_dim]
+
+
 class FlashSDPAAttention(nn.Module):
     """Multi-head attention backed by PyTorch SDPA.
 
@@ -1702,6 +1753,10 @@ class FlashSDPAAttention(nn.Module):
             _compiled_cross_attention_requires_blackwell_workaround()
         )
         self.compiled_cross_attention_backend = "auto"
+        # Assigned by the portfolio model only to its latent/market head.
+        # Temporal last-query attention has a different proven fast path;
+        # padding that large stock/time batch is unnecessary workspace.
+        self.compiled_narrow_fp32_portfolio_head = False
 
         self.in_proj = nn.Linear(self.dim, self.dim * 3)
         self.out_proj = nn.Linear(self.dim, self.dim)
@@ -1868,29 +1923,31 @@ class FlashSDPAAttention(nn.Module):
             and context is not None
             and query.device.type == "cuda"
             and _torch_is_compiling()
-            and q.dtype in {torch.float16, torch.bfloat16}
         ):
             # Small temporal last-query attention is faster through the explicit
             # path on Ada, while the large market-token cross-attention benefits
             # from SDPA. Blackwell keeps the conservative workaround because its
             # compiled BF16 cross-attention kernel is unstable in this stack.
-            attention_elements = int(query_steps) * int(key_steps)
             backend = str(self.compiled_cross_attention_backend)
-            if (
-                backend == "manual"
-                or self.compiled_cross_attention_blackwell_workaround
-                or (backend == "auto" and attention_elements <= 4096)
-            ):
+            if _compiled_cross_attention_is_manual(backend,q.dtype,
+                int(query_steps),int(key_steps),self.compiled_cross_attention_blackwell_workaround):
                 use_sdpa_attention = False
 
         if use_sdpa_attention:
+            sdpa = F.scaled_dot_product_attention
+            if (context is not None and q.dtype == torch.float32
+                    and self.head_dim < 8
+                    and self.compiled_narrow_fp32_portfolio_head
+                    and self.compiled_cross_attention_blackwell_workaround
+                    and _torch_is_compiling()):
+                sdpa = _aligned_narrow_fp32_sdpa
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
                 chunks: list[torch.Tensor] = []
                 for start in range(0, int(q.size(0)), self.sdpa_batch_limit):
                     end = min(start + self.sdpa_batch_limit, int(q.size(0)))
                     mask_chunk = attn_mask[start:end] if attn_mask is not None else None
                     chunks.append(
-                        F.scaled_dot_product_attention(
+                        sdpa(
                             q[start:end],
                             k[start:end],
                             v[start:end],
@@ -1901,7 +1958,7 @@ class FlashSDPAAttention(nn.Module):
                     )
                 y = torch.cat(chunks, dim=0)
             else:
-                y = F.scaled_dot_product_attention(
+                y = sdpa(
                     q,
                     k,
                     v,
@@ -2249,8 +2306,8 @@ class TransformerBasePortfolioModel(nn.Module):
         self.amp_native_position_add = bool(amp_native_position_add)
         self.temporal_self_attention_fast_path = bool(temporal_self_attention_fast_path)
         compiled_cross_backend = str(compiled_cross_attention_backend).strip().lower().replace("-", "_")
-        if compiled_cross_backend not in {"auto", "manual", "sdpa"}:
-            raise ValueError("compiled_cross_attention_backend must be 'auto', 'manual', or 'sdpa'")
+        if compiled_cross_backend not in {"auto", "manual", "sdpa", "manual_fp32_last"}:
+            raise ValueError("compiled_cross_attention_backend must be 'auto', 'manual', 'sdpa', or 'manual_fp32_last'")
         self.compiled_cross_attention_backend = compiled_cross_backend
         self.sdpa_batch_limit = int(sdpa_batch_limit)
         self.norm_type = _normalize_norm_type(norm_type)
@@ -2400,6 +2457,10 @@ class TransformerBasePortfolioModel(nn.Module):
             if self.use_market_tokens
             else []
         )
+        for blocks in (self.latent_blocks, self.market_blocks,
+                       self.stock_read_latent_blocks, self.stock_read_market_blocks):
+            for block in blocks:
+                block.attn.compiled_narrow_fp32_portfolio_head = True
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
         self.temporal_basis_feature_encoder = (

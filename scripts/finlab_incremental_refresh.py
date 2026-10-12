@@ -83,7 +83,7 @@ def checked_get(key: str, *, sdk=None) -> tuple[object, dict]:
                     "source_check_mode": "upstream_forced" if forced else "upstream_incremental",
                     "last_payload_bytes": payload_bytes + segment_bytes if saw_payload_event else None,
                     "payload_measurement_basis": "sdk_progress_payload_estimate_not_billing",
-                    "incremental_adapter_version": 1, "normalization_contract_version": 1,
+                    "incremental_adapter_version": 1, "normalization_contract_version": 2,
                     "provider_content_hash": None, "provider_hash_basis": None,
                     "finlab_sdk_version": version("finlab")}
         if compatible:
@@ -96,7 +96,7 @@ def checked_get(key: str, *, sdk=None) -> tuple[object, dict]:
         if (isinstance(marker, tuple) and len(marker) == 2
                 and marker[0] == storage.get_time_created(key) and isinstance(marker[1], dict)):
             content_hash = marker[1].get("content_hash")
-            if (isinstance(content_hash, str) and 8 <= len(content_hash) <= 64
+            if (isinstance(content_hash, str) and 7 <= len(content_hash) <= 64
                     and all(c in "0123456789abcdef" for c in content_hash)):
                 evidence["provider_content_hash"] = content_hash
                 evidence["provider_hash_basis"] = "sdk_validated_publication_v1"

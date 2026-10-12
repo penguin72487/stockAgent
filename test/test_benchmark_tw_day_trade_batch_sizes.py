@@ -322,3 +322,38 @@ def test_score_curve_rejects_unsafe_vram_and_winner_uses_complete_epoch_rate() -
         ]
     )
     assert winner["batch_size"] == 256
+
+
+def test_host_memory_sampler_retains_shared_scope_and_minimum_headroom(tmp_path):
+    path = tmp_path/"memory.csv"
+    path.write_text("index,host_memory_used_bytes,host_memory_limit_bytes\n"
+                    "0,1073741824,4294967296\n"
+                    "1,2147483648,4294967296\n"
+                    "0,,max\n")
+    result = benchmark._host_memory_summary(path)
+    assert result == {"observed": True, "scope": "shared_cgroup_including_file_cache",
+                      "peak_used_gib": 2., "min_headroom_gib": 2.}
+    assert benchmark._host_memory_summary(tmp_path/"absent.csv")["observed"] is False
+
+
+def test_dynamo_cache_fallback_warnings_are_rejections_even_with_exit_zero():
+    assert "hit config.recompile_limit" in benchmark._FAILURE_PATTERNS
+    assert "hit config.cache_size_limit" in benchmark._FAILURE_PATTERNS
+
+
+def test_new_candidate_uses_role_separated_cache_without_changing_original_config(tmp_path, monkeypatch):
+    from copy import deepcopy
+    import yaml
+    monkeypatch.setattr(benchmark, 'ROOT', tmp_path)
+    source = {'data': {'day_trade_minute_execution_cache_dir': str(tmp_path / 'artifacts/markets/formal/runtime-cache/physical-source'),
+                       'parquet_root': '/exact/fixed-source/stocks'},
+              'training': {'optimizer': 'adamw'}, 'trading': {'execution_mode': 'tw_day_trade'}}
+    before = deepcopy(source)
+    target = tmp_path / 'candidate.yaml'
+    benchmark._write_candidate_config(source, path=target, output_dir=tmp_path / 'artifacts/benchmarks/new/training',
+        batch_size=128, batch_size_eval=16, epochs=3, start_fold=11)
+    actual = yaml.safe_load(target.read_text())
+    assert actual['data']['day_trade_minute_execution_cache_dir'] == str(tmp_path / 'artifacts/cache/formal/runtime-cache/physical-source')
+    assert actual['data']['parquet_root'] == source['data']['parquet_root'] and actual['trading'] == source['trading']
+    assert actual['training']['optimizer'] == 'adamw' and source == before
+    assert not (tmp_path / 'artifacts/markets').exists()

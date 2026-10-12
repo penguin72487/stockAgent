@@ -1181,16 +1181,26 @@ source scripts/runtime_env.sh
 run_fintech_python -m downloader.download_tej_history run --max-tasks 100
 ```
 
-已沿用原服務加入[登入後自動恢復與直接搜尋優化](docs/tej_startup_search_2026-10-05.md)：
-WSL 服務自動啟動，Windows 登入後每分鐘核對專用桌面與互動通道；目前登入前的
-WSL 開機任務仍需 Windows 管理員權限。遇到結果不明先按 runbook 收回原結果，
+已沿用原服務加入[完整操作加速與開機恢復](docs/tej_chain_boot_2026-10-09.md)：
+本機 Windows 開機任務已註冊並驗證派送 WSL 原下載服務／API timer；Windows
+登入後每分鐘核對專用桌面與互動通道，不設定自動登入或在 Session 0 操作 GUI。
+未確認的視窗啟動可在精確缺席、正常命令與有界授權下恢復。遇到資料結果不明先按 runbook 收回原結果，
 只有符合既有授權與精確證據的工作才有界重排，原 UNKNOWN 紀錄保留。
 桌面登入不等於獨立 TEJ API 授權；本次沒有新增遠端訓練注入或宣稱全歷史完整。
 
 完整操作、大表讀回的候選比較、真實來源交錯計時及部署驗收見
-[TEJ 全鏈路最快可驗證路徑](docs/tej_chain_fast_paths_2026-10-05.md)。
+[10/09 真實來源 AB／BA 與開機驗收](docs/tej_chain_boot_2026-10-09.md)，
+以及 [10/05 大表唯讀併行候選比較](docs/tej_chain_fast_paths_2026-10-05.md)。
 保留單一 Wizard 條件寫入者，只對大表做有界唯讀併行；不減少欄位或略過驗證。
 速度結論限於實測範圍，不代表官方理論最高速。
+
+10/10 已加入[目錄故障自動恢復與下載驗收](docs/tej_metadata_self_healing_2026-10-10.md)：
+精確未送出證據、逐表持久退避、成功釋放窗口及唯讀網站狀態連動；
+目錄檢查逾時不再讓整個佇列永久停抓，未知 Preview 的原結果與授權邊界仍保留。
+SQLite 忙碌使失敗分類回滾時，會保留原 worker 身分並對帳原負證據；
+同週期接續既有介面恢復，不清佇列、不延長查詢期限或無條件重送。
+10/12 另統一 Windows／WSL 的操作時鐘：固定本機窗口內接受最多 5 秒來源偏差，
+保留原時鐘、scope、SHA 與 deadline；只重新核對舊版本機驗證失敗，來源退避不歸零。
 
 ### 台灣官方資料
 

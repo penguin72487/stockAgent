@@ -1,0 +1,19 @@
+[Unit]
+Description=Reconcile immutable training dataset recipes from audited cold heads (metadata only)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_training_dataset_recipes.sh"
+Nice=15
+CPUWeight=10
+IOWeight=10
+# A metadata publication shares the canonical retention/publication lock with
+# large raw releases. Five minutes killed a healthy waiter during the verified
+# 220k-chunk release; keep the five-minute retry timer, not a five-minute kill.
+TimeoutStartSec=1h

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "minute_reserve_mb": 50,
+  "tick_reserve_mb": 500,
+  "drain_before_reset_minutes": 60,
+  "quota_sample_interval_seconds": 15,
+  "quota_sample_max_requests": 32,
+  "quota_sample_near_floor_mb": 10,
+  "minute_partitions_per_pass": 2048,
+  "maximum_intraday_passes": 4,
+  "catalog_refresh_minutes": 60,
+  "minute_workers": 32,
+  "minute_range_calendar_days": 31,
+  "minute_http_keepalive": true,
+  "minute_download_threads": 1,
+  "minute_queue_depth": 4,
+  "minute_authorization_slots": 32,
+  "general_batch_size": 8,
+  "pre_reset_publication_recheck_minutes": 10,
+  "processing_threads": 1
+}

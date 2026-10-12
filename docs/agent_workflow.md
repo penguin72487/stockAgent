@@ -106,6 +106,19 @@ tmux 使用獨立 `stockagent-agent` socket 與帶 checkout 指紋的 session，
 指令；它會補回準備未完成的視窗。tmux 保留斷線後的程序與終端，主機／WSL
 關閉後需另行恢復。Python shell 已 source 當前 checkout 的 runtime。
 
+重複遠端診斷可使用本機獨立 SSH profile，從現行已登錄 Vast policy 產生：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/prepare_agent_ssh_profile.py
+ssh -F /etc/stockagent/agent-ssh.conf stockagent-vast 'uname -s'
+```
+
+端點變更或重開機後重新 prepare；沿用 identity／known-hosts，連線閒置 60 秒後
+關閉，不改全域 SSH 設定。Herdr 已可作為按需互動介面；目前 repo runtime
+仍由 Bash 執行。zsh／mosh 的相容性、遠端 UDP 條件與完整實測見
+[終端工具比較及使用方式](agent_terminal_tools_2026-10-07.md)。
+
 通過驗收後以當次非空結果文件完成任務：
 
 ```bash

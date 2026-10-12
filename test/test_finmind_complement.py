@@ -29,6 +29,15 @@ def test_exact_key_cli_holds_shared_worker_lock(tmp_path: Path, monkeypatch) -> 
                       "required_keys": (("TaiwanFuturesKBar", "CR1", "2012-08-22"),)}]
 
 
+def test_cli_default_quantum_uses_the_same_fingerprinted_configuration(tmp_path, monkeypatch):
+    from downloader import finmind_json_pipeline
+    calls = []
+    monkeypatch.setattr(complement, 'run_once', lambda root, **kw: calls.append(kw) or {'state': 'current_queue'})
+    monkeypatch.setattr(complement.object_pipeline, 'initialize_cpu', lambda threads: None)
+    assert complement.main(['--root', str(tmp_path)]) == 0
+    assert calls[0]['max_requests'] == finmind_json_pipeline.settings()['max_requests_per_cycle']
+
+
 def test_exact_key_cli_rejects_competing_owner_before_provider_call(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(complement, "run_once", lambda *a, **k: pytest.fail("competing provider call"))
     with (tmp_path / "worker.lock").open("a+") as active:
@@ -443,6 +452,12 @@ def test_request_uses_free_per_id_and_bulk_history_contract(tmp_path: Path) -> N
         def json(self) -> dict:
             return {"status": 200, "msg": "success", "data": []}
 
+        def iter_content(self, chunk_size):
+            yield json.dumps(self.json()).encode()
+
+        def close(self):
+            pass
+
     class Session:
         def __init__(self) -> None:
             self.params: list[dict[str, str]] = []
@@ -486,6 +501,12 @@ def test_client_errors_are_classified_without_automatic_repeat(
 
         def json(self) -> dict:
             return {"status": status, "msg": message}
+
+        def iter_content(self, chunk_size):
+            yield json.dumps(self.json()).encode()
+
+        def close(self):
+            pass
 
     class Session:
         def get(self, *_args: object, **_kwargs: object) -> Response:

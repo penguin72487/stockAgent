@@ -14,6 +14,7 @@ import sqlite3
 import uuid
 
 from downloader.artifact_io import atomic_write_json
+from downloader.tej_operation_clock import source_operation_clock
 
 ATTEMPT_CONTRACT = 'attempt_scoped_preview_v1'
 OPERATOR_REPLAY_CONTRACT = 'exact_unknown_download_operator_replay_v1'
@@ -321,20 +322,23 @@ def proved_unsent_prequery(root: Path, con, task: dict, *, finished: bool = Fals
             raise ValueError('Exact launch admission evidence required')
         validate_unpermitted(root, prepared, evidence)
     try:
-        clocks=[datetime.fromisoformat(value) for value in (registered['started_at_utc'],proof['observed_at_utc'])]
-        if (any(clock.tzinfo is None for clock in clocks)
-                or not 0 <= (clocks[1]-clocks[0]).total_seconds() <= 900):
-            raise ValueError('Prequery outcome is outside the exact attempt deadline')
+        started=datetime.fromisoformat(registered['started_at_utc'])
+        if started.tzinfo is None:
+            raise ValueError('Exact aware local prequery deadline required')
         if finished:
             end=datetime.fromisoformat(registered['finished_at_utc'])
-            if end.tzinfo is None or not clocks[1] <= end <= clocks[0]+timedelta(seconds=900):
+            if end.tzinfo is None or not started <= end <= started+timedelta(seconds=900):
                 raise ValueError('Prequery attempt finished outside its exact deadline')
+        else:
+            end=min(datetime.now(UTC),started+timedelta(seconds=900))
+        clock_evidence=source_operation_clock(proof['observed_at_utc'],started,end)
     except (KeyError,TypeError) as exc:
         raise ValueError('Exact aware prequery outcome clock required') from exc
     return {'attempt_id':attempt,'request':request,'outcome':proof,
             'prepared_path':prepared,'outcome_path':outcome,
             'prepared_request_sha256':hashlib.sha256(prepared.read_bytes()).hexdigest(),
-            'prequery_outcome_sha256':hashlib.sha256(body).hexdigest()}
+            'prequery_outcome_sha256':hashlib.sha256(body).hexdigest(),
+            'source_clock_evidence':clock_evidence}
 
 
 def recover_prequery_outcome(root: Path, task_id: str) -> bool:
@@ -429,9 +433,7 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
     check_started=datetime.now(UTC)
     payload,readback,_=bridge.execute(root,{**task,'request_json':json.dumps(request)})
     try:
-        observed=datetime.fromisoformat(payload['observed_at_utc'].replace('Z','+00:00'))
-        if observed.tzinfo is None or not check_started <= observed <= datetime.now(UTC)+timedelta(seconds=5):
-            raise ValueError('Shared interface readback is not fresh')
+        source_operation_clock(payload['observed_at_utc'],check_started,datetime.now(UTC))
     except (KeyError,TypeError,AttributeError) as exc:
         raise ValueError('Fresh aware interface readback required') from exc
     if (payload.get('contract_version')!=CONTRACT_VERSION or payload.get('provider')!='tej_smart_wizard'
@@ -609,9 +611,8 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
     checked = datetime.now(UTC)
     payload, output, _ = bridge.execute(root, {**task, 'request_json':json.dumps({**request, 'action':'inspect_query_runtime'})})
     if automatic:
-        observed = datetime.fromisoformat(payload.get('observed_at_utc', '').replace('Z', '+00:00'))
-        if (observed.tzinfo is None or not checked <= observed <= datetime.now(UTC) + timedelta(seconds=5)
-                or _read_private(output, root / 'raw', task_id) != payload):
+        source_operation_clock(payload.get('observed_at_utc'),checked,datetime.now(UTC))
+        if (_read_private(output, root / 'raw', task_id) != payload):
             raise ValueError('Fresh exact owned no-query readback required for standing replay')
     expected_true = ('vendor_notices_absent', 'source_binding_stable', 'source_selectors_enabled',
                      'company_group_enabled', 'source_binding_unchanged')
