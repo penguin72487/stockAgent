@@ -1,0 +1,22 @@
+[Unit]
+Description=Preserve enrolled Vast optimizer checkpoints; wait for user-selected recovery target
+Wants=network-online.target stockagent-d-cold-mount.service
+After=network-online.target stockagent-d-cold-mount.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_training_rescue.sh cycle
+UMask=0077
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=2G
+MemoryMax=4G
+TimeoutStartSec=600
+SuccessExitStatus=75
+

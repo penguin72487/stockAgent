@@ -13,12 +13,16 @@ import argparse
 from datetime import date, datetime, time, timedelta
 import json
 import math
+import os
 from pathlib import Path
+import shutil
 import sys
+import time as wall_time
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import polars as pl
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -37,10 +41,99 @@ from stockagent.live.market_config import (  # noqa: E402
     load_market_config,
     resolved_live_output_dir,
 )
-from stockagent.live.signal_engine import _build_panel, generate_live_signal  # noqa: E402
+from stockagent.live.signal_engine import _build_panel, _resolve_checkpoint, generate_live_signal  # noqa: E402
+from stockagent.live.signal_engine import live_tw_public_source_read_guard  # noqa: E402
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def _with_source_wait(operation, *, seconds: float):
+    deadline = wall_time.monotonic() + seconds
+    while True:
+        try:
+            return operation()
+        except TWPublicSourceUpdatePending:
+            if wall_time.monotonic() >= deadline:
+                raise
+            print(json.dumps({"status": "waiting_source", "reason": "canonical_producer_holds_read_guard",
+                              "model_executed": False}), flush=True)
+            wall_time.sleep(min(2.0, max(0.0, deadline-wall_time.monotonic())))
+
+
+def _snapshot_sources(root: Path, sources: dict[str, Path], *, references: dict[str, Path] | None = None) -> dict[str, Path]:
+    """Retain a finite, byte-identical source set for a long isolated replay.
+
+    Caller holds the canonical read guard. This is not a collector or a new
+    data generation: producers may continue publishing after the copy.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    receipt_path = root / "source_snapshot_receipt.json"
+    references = references or {}
+    if receipt_path.exists():
+        receipt = json.loads(receipt_path.read_text())
+        if (receipt.get("contract") != "immutable_byte_identical_replay_inputs_v1"
+                or receipt.get("status") != "verified"
+                or set(receipt.get("sources") or {}) != set(sources)
+                or set(receipt.get("references") or {}) != set(references)):
+            raise ValueError("immutable replay source membership differs")
+        retained = {}
+        for name, source in sources.items():
+            proof = receipt["sources"][name]
+            target = Path(proof["retained"])
+            if (proof["source"] != str(source.resolve()) or not target.resolve().is_relative_to(root.resolve())
+                    or _sha256(target) != proof["sha256"] or target.stat().st_size != proof["bytes"]):
+                raise ValueError(f"retained replay source differs: {target}")
+            retained[name] = target
+        for proof in receipt.get("references", {}).values():
+            if _sha256(Path(proof["path"])) != proof["sha256"]:
+                raise ValueError("immutable replay reference changed")
+        return retained
+    output, proofs = {}, {}
+    for name, source in sources.items():
+        digest = _sha256(source)
+        target = root / f"{name}-{digest}.parquet"
+        if not target.exists():
+            pending = target.with_suffix(f".pending.{os.getpid()}")
+            shutil.copyfile(source, pending)
+            if _sha256(pending) != digest or _sha256(source) != digest:
+                raise ValueError(f"source changed during immutable replay copy: {source}")
+            with pending.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(pending, target)
+        if _sha256(target) != digest:
+            raise ValueError(f"retained replay source differs: {target}")
+        output[name] = target
+        proofs[name] = {"source": str(source.resolve()), "retained": str(target.resolve()),
+                        "sha256": digest, "bytes": target.stat().st_size}
+    _atomic_json(receipt_path, {
+        "contract": "immutable_byte_identical_replay_inputs_v1", "status": "verified",
+        "captured_at": datetime.now(TAIPEI).isoformat(), "sources": proofs,
+        "references": {name: {"path": str(path.resolve()), "sha256": _sha256(path)}
+                       for name, path in references.items()},
+        "source_publication_claim": False})
+    return output
+
+
+def _resume_summary(path: Path, *, identity: dict[str, str], signal_id: str,
+                    provenance: dict[str, Any]) -> dict[str, Any] | None:
+    """Reuse only complete, byte-bound counterfactual paper artifacts."""
+    if not path.exists():
+        return None
+    summary = json.loads(path.read_text())
+    weights = path.parent / "target_weights.parquet"
+    proof = summary.get("counterfactual_artifact_proofs") or {}
+    if (summary.get("signal_id") != signal_id
+            or summary.get("counterfactual_signal_regeneration") is not True
+            or summary.get("simulation_only") is not True
+            or summary.get("production_order_possible") is not False
+            or proof.get("recipe_identity") != identity
+            or summary.get("counterfactual_open_provenance") != provenance
+            or not weights.is_file()
+            or proof.get("weights_sha256") != _sha256(weights)):
+        raise ValueError(f"existing candidate cannot be resumed without exact artifact proof: {path}")
+    return summary
 
 
 def _previous_official_session_date(
@@ -119,6 +212,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--live-output-dir", type=Path, help="Isolated candidate signal root; never overwrite accepted live artifacts.")
+    parser.add_argument("--resume-verified", action="store_true",
+                        help="Resume an isolated candidate only after full recipe/input/weights SHA validation.")
+    parser.add_argument("--source-snapshot-dir", type=Path,
+                        help="Retain byte-identical canonical aggregates/features for a long isolated replay; no producer pause.")
+    parser.add_argument("--source-wait-seconds", type=float, default=0,
+                        help="Bounded wait for the canonical producer before history inference; corruption is never retried.")
     parser.add_argument(
         "--artifact-root",
         type=Path,
@@ -163,9 +262,15 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
+    if not 0 <= args.source_wait_seconds <= 1800:
+        raise ValueError("source wait must be between zero and 1800 seconds")
 
     market_config_path = args.market_config.resolve()
     market_config = load_market_config(market_config_path)
+    if args.resume_verified and args.live_output_dir is None:
+        raise ValueError("--resume-verified requires an isolated --live-output-dir")
+    if args.source_snapshot_dir and args.live_output_dir is None:
+        raise ValueError("source snapshots require an isolated --live-output-dir")
     candidate_artifact_root = args.artifact_root.resolve() if args.artifact_root else None
     if candidate_artifact_root is not None:
         if args.live_output_dir is None:
@@ -194,6 +299,20 @@ def main() -> None:
     for source_path in (twse_path, tpex_path):
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
+    if args.source_snapshot_dir:
+        def capture():
+            with live_tw_public_source_read_guard(experiment.data.parquet_root):
+                references = ({"factorized_manifest": Path(experiment.data.factorized_feature_manifest).resolve(strict=True)}
+                              if experiment.data.factorized_feature_manifest else {})
+                return _snapshot_sources(args.source_snapshot_dir.resolve(),
+                    {"features": feature_path, "twse": twse_path, "tpex": tpex_path}, references=references)
+        retained = _with_source_wait(capture, seconds=args.source_wait_seconds)
+        if experiment.data.factorized_feature_manifest:
+            # Immutable generation identity, never a moving current symlink.
+            snapshot = json.loads((args.source_snapshot_dir / "source_snapshot_receipt.json").read_text())
+            experiment.data.factorized_feature_manifest = snapshot["references"]["factorized_manifest"]["path"]
+        feature_path, twse_path, tpex_path = retained["features"], retained["twse"], retained["tpex"]
+        experiment.data.tw_public_feature_path = str(feature_path)
     requested_tail_rows = int(args.live_tail_panel_rows)
     if requested_tail_rows < int(experiment.training.lookback) + 1:
         raise ValueError(
@@ -206,10 +325,8 @@ def main() -> None:
     experiment.data.live_tail_panel_rows = max(
         int(experiment.data.live_tail_panel_rows or 0), requested_tail_rows
     )
-    panel, panel_cache_hit, panel_cache_tier = _build_panel(
-        experiment,
-        live_tail=True,
-    )
+    panel, panel_cache_hit, panel_cache_tier = _with_source_wait(
+        lambda: _build_panel(experiment, live_tail=True), seconds=args.source_wait_seconds)
 
     input_root = args.input_root.resolve() / market_config.market
     receipt: dict[str, Any] = {
@@ -235,6 +352,26 @@ def main() -> None:
         "sessions": [],
         "skipped": [],
     }
+    _, checkpoint_path = _resolve_checkpoint(
+        candidate_artifact_root or market_config.output_dir or experiment.runner.output_dir,
+        market_config.fold_id,
+        (candidate_artifact_root / f"fold_{int(market_config.fold_id):02d}" / "checkpoint_best.pt"
+         if candidate_artifact_root is not None else market_config.checkpoint_path),
+    )
+    recipe_identity = {"generator_sha256": _sha256(Path(__file__)),
+                       "signal_engine_sha256": _sha256(REPO_ROOT / "stockagent/live/signal_engine.py"),
+                       "model_implementation_sha256": _sha256(REPO_ROOT / "stockagent/models/financial_transformer.py"),
+                       "market_config_sha256": _sha256(market_config_path),
+                       "config_sha256": _sha256(Path(market_config.config_path)),
+                       "checkpoint_sha256": _sha256(checkpoint_path)}
+    if experiment.data.factorized_feature_manifest:
+        recipe_identity["factorized_manifest_sha256"] = _sha256(Path(experiment.data.factorized_feature_manifest))
+    source_hashes = {"feature_path_sha256": _sha256(feature_path),
+                     "twse_daily_ohlcv_sha256": _sha256(twse_path),
+                     "tpex_daily_ohlcv_sha256": _sha256(tpex_path)}
+    receipt.update(recipe_identity=recipe_identity, source_hashes=source_hashes)
+    if args.source_snapshot_dir:
+        receipt["immutable_source_snapshot_receipt"] = str(args.source_snapshot_dir.resolve() / "source_snapshot_receipt.json")
 
     current = start
     while current <= end:
@@ -297,13 +434,6 @@ def main() -> None:
                 checkpoint_path=str(fold_dir / "checkpoint_best.pt"),
                 weights_path=str(fold_dir / "daily_weights.parquet"),
             )
-        kwargs["_panel_override"] = panel
-        result = generate_live_signal(**kwargs)
-        if not result.output_dir:
-            raise RuntimeError(f"{current}: signal writer returned no output_dir")
-        if not bool(result.summary.get("live_session_open_feature_applied")):
-            raise RuntimeError(f"{current}: session-open feature was not applied")
-        summary_path = Path(result.output_dir) / "summary.json"
         provenance = {
             "schema_version": 1,
             "source": "official_daily_session_open",
@@ -314,14 +444,37 @@ def main() -> None:
             "price_limit_path": str(limit_path),
             "price_limit_sha256": _sha256(limit_path),
             "twse_daily_ohlcv_path": str(twse_path),
-            "twse_daily_ohlcv_sha256": _sha256(twse_path),
+            "twse_daily_ohlcv_sha256": source_hashes["twse_daily_ohlcv_sha256"],
             "tpex_daily_ohlcv_path": str(tpex_path),
-            "tpex_daily_ohlcv_sha256": _sha256(tpex_path),
+            "tpex_daily_ohlcv_sha256": source_hashes["tpex_daily_ohlcv_sha256"],
             "feature_path": str(feature_path),
-            "feature_path_sha256": _sha256(feature_path),
+            "feature_path_sha256": source_hashes["feature_path_sha256"],
             "feature_cutoff_date": previous_panel_date.isoformat(),
         }
-        summary = dict(result.summary)
+        expected_dir = Path(kwargs["live_output_dir"]) / effective_at.isoformat(timespec="seconds") / signal_id
+        summary_path = expected_dir / "summary.json"
+        summary = (_resume_summary(summary_path, identity=recipe_identity, signal_id=signal_id,
+                                   provenance=provenance) if args.resume_verified else None)
+        resumed = summary is not None
+        if summary is None:
+            # WSL/WDDM needs driver headroom for a 4.84-GiB dense input plus
+            # the original encoder's FP32 workspaces. Inactive cached blocks
+            # are not financial/model state; release them between wide calls.
+            if experiment.data.factorized_feature_manifest and torch.cuda.is_initialized():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            kwargs["_panel_override"] = panel
+            result = generate_live_signal(**kwargs)
+            if not result.output_dir:
+                raise RuntimeError(f"{current}: signal writer returned no output_dir")
+            if not bool(result.summary.get("live_session_open_feature_applied")):
+                raise RuntimeError(f"{current}: session-open feature was not applied")
+            summary_path = Path(result.output_dir) / "summary.json"
+            summary = dict(result.summary)
+            summary["counterfactual_artifact_proofs"] = {
+                "recipe_identity": recipe_identity,
+                "weights_sha256": _sha256(summary_path.parent / "target_weights.parquet"),
+            }
         summary.update(
             {
                 "counterfactual_signal_regeneration": True,
@@ -351,7 +504,8 @@ def main() -> None:
                 "signal_id": summary.get("signal_id"),
                 "summary_path": str(summary_path),
                 "summary_sha256": _sha256(summary_path),
-                "weights_path": str(Path(result.output_dir) / "target_weights.parquet"),
+                "weights_path": str(summary_path.parent / "target_weights.parquet"),
+                "resumed_verified_artifact": resumed,
                 "input_rows": len(input_rows),
                 "missing_price_limit_rows": missing_limit_rows,
                 "opening_price_available_count": summary.get(
@@ -369,6 +523,10 @@ def main() -> None:
 
     if not receipt["sessions"]:
         raise RuntimeError("no trading sessions were regenerated")
+    if source_hashes != {"feature_path_sha256": _sha256(feature_path),
+                         "twse_daily_ohlcv_sha256": _sha256(twse_path),
+                         "tpex_daily_ohlcv_sha256": _sha256(tpex_path)}:
+        raise RuntimeError("source files changed during the backfill; candidate is not accepted")
     _atomic_json(input_root / "backfill_receipt.json", receipt)
     print(
         json.dumps(

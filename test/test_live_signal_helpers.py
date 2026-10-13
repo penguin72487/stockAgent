@@ -260,6 +260,34 @@ def test_normalized_window_cache_rejects_reused_identity_from_other_schema() -> 
     signal_engine.clear_live_panel_memory_cache()
 
 
+def test_factorized_rolling_window_preserves_bits_and_bounds_cache(monkeypatch):
+    class Features:
+        _stockagent_factorized_features = True
+        def __init__(self):
+            self.values = np.arange(16, dtype=np.float32).reshape(4, 2, 2)
+            self.values[1, 0] = [np.nan, -0.0]
+            self.values[3, 1] = [np.inf, -np.inf]
+            self.reads = []
+        def __getitem__(self, key):
+            self.reads.append(key)
+            return self.values[key].copy()
+    features = Features()
+    panel = SimpleNamespace(features=features, num_symbols=2, feature_names=["a", "b"])
+    monkeypatch.setattr(signal_engine, "_LIVE_MODEL_INPUT_CACHE_MAX_BYTES", 64)
+    signal_engine.clear_live_panel_memory_cache()
+    try:
+        before = signal_engine._cached_normalized_model_window(panel, panel_idx=2, lookback=3)
+        preserved = before.copy()
+        after = signal_engine._cached_normalized_model_window(panel, panel_idx=3, lookback=3)
+        expected = np.nan_to_num(features.values[1:4], nan=0.0, posinf=0.0, neginf=0.0)
+        np.testing.assert_array_equal(after.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_array_equal(before.view(np.uint32), preserved.view(np.uint32))
+        assert features.reads == [slice(0, 3), 3]
+        assert sum(v[1].nbytes for v in signal_engine._LIVE_MODEL_INPUT_CACHE.values()) <= 64
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
+
+
 def test_normalized_window_preserves_values_and_private_live_copy() -> None:
     original = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
     # Advanced feature indexing reproduces checkpoint-alignment strides.

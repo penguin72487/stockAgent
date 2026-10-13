@@ -1,0 +1,12 @@
+[Unit]
+Description=Observe enrolled training recovery state every 30 seconds
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-training-rescue.service
+
+[Install]
+WantedBy=timers.target

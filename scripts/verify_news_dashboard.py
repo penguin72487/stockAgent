@@ -22,6 +22,8 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json  # noqa: E402
 from scripts.probe_browser_runtime import browser_profile_launch_options  # noqa: E402
 
+BODY_PROGRESS_SELECTOR = 'progress.news-provider-progress.mini-progress-track:not([data-news-manifest-progress])'
+
 
 def required_source_role(source: dict | None, *, api_setup: bool = False) -> str:
     """A configured API phase is not an enabled full-text collector."""
@@ -72,10 +74,13 @@ def original_source_inventory_check(status):
 
 def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
            required_api_setup_providers: tuple[str, ...] = (), require_original_url_progress: bool = False,
-           require_source_reviews: bool = False, require_original_source_inventory: bool = False) -> dict:
+           require_source_reviews: bool = False, require_original_source_inventory: bool = False,
+           require_cnyes_list_progress: bool = False) -> dict:
     from playwright.sync_api import expect, sync_playwright
 
     output.mkdir(parents=True, exist_ok=True)
+    if require_cnyes_list_progress and 'cnyes' not in required_providers:
+        raise ValueError('list_progress_acceptance_requires_exact_cnyes_card')
     origin = urlparse(url).netloc
     observations = []
     with sync_playwright() as runtime:
@@ -102,6 +107,10 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     assert status['source_reviews_state'] == 'loaded'
                     assert status['scope']['source_reviews_grant_capture_permission'] is False
                     assert sum(status['source_policy_review_counts'].values()) == len(status['providers'])
+                if require_cnyes_list_progress:
+                    assert status['cnyes_list_progress_projection_contract_version'] == 1
+                    source = next(row for row in status['providers'] if row['id'] == 'cnyes')
+                    assert source['public_index_progress'] and source['history_list_progress']
                 assert response.headers.get("cache-control") == "no-store"
                 assert context.request.head(urljoin(url, "api/status"), timeout=30000).status == 200
                 # Explicitly rejected control request: no crawler operation.
@@ -248,7 +257,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     card = required_provider_card(page, provider)
                     expect(card).to_have_count(1)
                     expect(card.locator(".news-provider-identity small")).to_have_text(provider)
-                    checked = page.evaluate("""id => {
+                    checked = page.evaluate("""({id, bodyProgressSelector}) => {
                         const source = state.latest.providers.find(row => row.id === id);
                         const card = [...document.querySelectorAll('#pipeline-grid .pipeline-card')]
                             .find(node => node.querySelector('.news-provider-identity small')?.textContent === id);
@@ -260,7 +269,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             known_urls: cohort ? cohort.urls : source.known_urls,
                             displayed_counts: displayed,
                             progress_ratio: source.progress_ratio,
-                            displayed_ratio: card.querySelector('progress').value,
+                            displayed_ratio: card.querySelector(bodyProgressSelector).value,
                             finite_supplements: source.finite_supplements,
                             reviewed_nonbody_outside_cohort: cohort && cohort.reviewed_nonbody_outside_cohort,
                             unreviewed_new_urls: cohort && cohort.unreviewed_new_urls,
@@ -286,7 +295,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             origin_probe_clock_visible: !!source.robots_origin_policy_pause?.next_policy_probe_at_utc &&
                                 card.textContent.includes(stamp(source.robots_origin_policy_pause.next_policy_probe_at_utc)),
                             displayed_work_counts: [...card.querySelectorAll('[data-news-work]')].map(node => Number(node.textContent.replaceAll(',', '')))};
-                    }""", provider)
+                    }""", {"id": provider, "bodyProgressSelector": BODY_PROGRESS_SELECTOR})
                     assert checked["displayed_counts"] == [checked["stored_heads"], checked["known_urls"]], checked
                     assert checked["displayed_ratio"] == checked["progress_ratio"], checked
                     checked['verification_role'] = role
@@ -314,6 +323,84 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                         assert checked['displayed_work_counts'] == [work[key] for key in
                             ('no_known_primary_body_urls', 'existing_primary_body_candidates', 'stored_body_recheck_urls')]
                         expect(card).to_contain_text('同 ID 是排程提示，不代表正文相同或已完成')
+                        if selected.get('public_index_progress') or require_cnyes_list_progress:
+                            detail = card.locator('[data-news-list-provider="cnyes"]')
+                            expect(detail).to_have_count(1)
+                            if not detail.get_attribute('open') == '':
+                                detail.locator('summary').click(timeout=10000)
+                            expect(detail).to_have_attribute('open', '')
+                            expect(detail).to_contain_text('不是全部歷史')
+                            expect(detail).to_contain_text('不能當唯一文章數')
+                            expect(detail).to_contain_text('清單只註冊網址，接受正文 0 篇')
+                            expect(detail).to_contain_text('不代表該日全文已齊')
+                            expect(detail.locator('[data-news-list-eta]')).to_contain_text('完成時間未知')
+                            lists = page.evaluate("""() => {
+                                const source = state.latest.providers.find(row => row.id === 'cnyes');
+                                const detail = document.querySelector('[data-news-list-provider="cnyes"]');
+                                const readCounts = selector => Object.fromEntries([...detail.querySelectorAll(selector)]
+                                    .map(node => [node.dataset.newsIndexCount || node.dataset.newsHistoryCount,
+                                        node.textContent === '—' ? null : Number(node.textContent.replaceAll(',', ''))]));
+                                const bounds = [...detail.querySelectorAll('summary,dt,dd,p')].map(node => {
+                                    const rect = node.getBoundingClientRect();
+                                    return {left: rect.left, right: rect.right, width: rect.width, height: rect.height};
+                                });
+                                return {observed_at_utc: state.latest.observed_at_utc,
+                                    index: source.public_index_progress, history: source.history_list_progress,
+                                    displayed_index: readCounts('[data-news-index-count]'),
+                                    displayed_history: readCounts('[data-news-history-count]'),
+                                    index_state: detail.dataset.newsIndexState, bounds,
+                                    phase: source.manifest_phase_progress,
+                                    phase_bars: [...detail.querySelectorAll('[data-news-manifest-progress]')]
+                                        .map(node => ({kind:node.dataset.newsManifestProgress, value:Number(node.value),
+                                            visible:node.getBoundingClientRect().width > 0})),
+                                    phase_eta: detail.querySelector('[data-news-manifest-eta]')?.textContent,
+                                    no_unscoped_metadata_completion_bar: [...detail.querySelectorAll('progress')]
+                                        .every(node => node.hasAttribute('data-news-manifest-progress')),
+                                    document_width: document.documentElement.scrollWidth};
+                            }""")
+                            index, history = lists['index'], lists['history']
+                            assert index and history and lists['index_state'] == 'observed'
+                            assert lists['displayed_index'] == {
+                                'pages': index['verified_pages'], 'rows': index['metadata_rows'],
+                                'dates': index['source_dates_observed'],
+                                'complete_dates': index['dates_all_reported_pages_observed'],
+                                'changed_dates': index['dates_with_changed_source_total']}
+                            assert lists['displayed_history'] == {
+                                'verified': history['verified_list_scopes'],
+                                'waiting': history['current_source_contract_scope_states']['waiting_page_evidence'],
+                                'gaps': history['unresolved_category_scopes'], 'retired': history['retired_gap_receipts']}
+                            assert index['article_bodies_accepted_by_index'] == 0
+                            for metric in (index, history):
+                                assert not metric['all_history_complete']
+                                assert metric['finish_eta_utc'] is metric['progress_ratio'] is None
+                            assert lists['no_unscoped_metadata_completion_bar'] and lists['document_width'] <= width
+                            phase = lists['phase']
+                            if phase:
+                                assert phase['metadata_only'] and not phase['body_completion_claimed'] and not phase['all_history_complete']
+                                expected_bars = {'first_pages': phase['first_pages_observed'] / phase['planned_source_dates']}
+                                if phase['totals_known']:
+                                    expected_bars['pages'] = phase['verified_pages'] / phase['source_reported_total_pages']
+                                assert {row['kind']: row['value'] for row in lists['phase_bars']} == expected_bars
+                                assert all(row['visible'] for row in lists['phase_bars'])
+                                expect(detail).to_contain_text('不是全庫或唯一新聞篇數')
+                                if phase['forecast']['state'] == 'recent_measured':
+                                    assert '情境最短' in lists['phase_eta'] and '不是保證或統計信賴區間' in lists['phase_eta']
+                            else:
+                                assert not lists['phase_bars']
+                            assert all(row['left'] >= 0 and row['right'] <= width + 1
+                                       and row['width'] > 0 and row['height'] > 0 for row in lists['bounds'])
+                            # Same native control closes/reopens, works from the
+                            # keyboard and survives an actual filtered rerender.
+                            detail.locator('summary').click(timeout=10000)
+                            expect(detail).not_to_have_attribute('open', '')
+                            detail.locator('summary').focus()
+                            page.keyboard.press('Enter')
+                            expect(detail).to_have_attribute('open', '')
+                            page.locator('#source-sort').select_option('name')
+                            expect(required_provider_card(page, 'cnyes').locator('[data-news-list-provider="cnyes"]')).to_have_attribute('open', '')
+                            page.locator('#source-sort').select_option('state')
+                            lists['native_toggle_keyboard_and_rerender_preserved'] = True
+                            checked['cnyes_list_progress'] = lists
                     if api_setup:
                         expect(card).to_contain_text('授權 API 待接線')
                         expect(card).to_contain_text('CNA_API_KEY')
@@ -404,6 +491,22 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                 page.locator("#traffic").screenshot(path=str(output / f"{name}-traffic.png"), timeout=10000)
                 refresh_failure = None
                 if name == 'desktop' and original:
+                    phase = None
+                    phase_before = None
+                    if require_cnyes_list_progress:
+                        page.locator('a[href="#acq-catalog"]').click(timeout=10000)
+                        page.locator('[data-news-filter="all"]').click(timeout=10000)
+                        page.locator('#source-search').fill('cnyes')
+                        detail = page.locator('[data-news-list-provider="cnyes"]')
+                        if not detail.evaluate('(node) => node.open'):
+                            detail.locator('summary').click(timeout=10000)
+                        phase = detail.locator('[data-news-manifest-state]')
+                        expect(phase).to_have_count(1)
+                        expect(phase).to_have_attribute('data-news-manifest-display-contract', '2')
+                        phase_before = phase.evaluate("""node => ({
+                            first: node.querySelector('[data-news-manifest-progress="first_pages"]').value,
+                            pages: node.querySelector('[data-news-manifest-progress="pages"]')?.value ?? null
+                        })""")
                     # A read-only local browser transport failure. Let the
                     # page's real timed refresh/retry execute; do not mutate
                     # the collector, status payload or DOM to fake acceptance.
@@ -412,9 +515,30 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     assert page.locator('#original-url-eta').text_content() == '目前暫無有效估時'
                     refresh_failure = {'stale_metadata_eta_invalidated': True,
                                        'collector_state_changed': False, 'browser_status_request_only': True}
+                    if phase is not None:
+                        expect(phase).to_have_attribute('data-news-manifest-state', 'snapshot_stale')
+                        expect(phase.locator('[data-news-manifest-eta]')).to_contain_text('畫面更新暫停')
+                        expect(phase.locator('[data-news-manifest-eta]')).not_to_contain_text('基準預計')
+                        phase_after = phase.evaluate("""node => ({
+                            first: node.querySelector('[data-news-manifest-progress="first_pages"]').value,
+                            pages: node.querySelector('[data-news-manifest-progress="pages"]')?.value ?? null
+                        })""")
+                        assert phase_after == phase_before
+                        expect(detail).to_have_attribute('open', '')
+                        assert page.locator('#source-search').input_value() == 'cnyes'
+                        refresh_failure.update(manifest_phase_eta_withdrawn=True,
+                            retained_verified_phase_bars=phase_after, native_filters_and_details_retained=True)
+                        page.locator('#pipeline-grid').screenshot(path=str(output / f'{name}-phase-status-loss.png'), timeout=10000)
                     page.unroute('**/api/status')
                     page.wait_for_function("() => state.latest?.health !== 'stale' && !state.inFlight", timeout=30000)
                     refresh_failure['native_timed_retry_recovered'] = True
+                    if phase is not None:
+                        expected_state = page.evaluate("() => state.latest.providers.find(row => row.id === 'cnyes').manifest_phase_progress.forecast.state")
+                        expect(phase).to_have_attribute('data-news-manifest-state', expected_state)
+                        expect(detail).to_have_attribute('open', '')
+                        assert page.locator('#source-search').input_value() == 'cnyes'
+                        refresh_failure['manifest_phase_restored_state'] = expected_state
+                        page.locator('#pipeline-grid').screenshot(path=str(output / f'{name}-phase-status-recovered.png'), timeout=10000)
                 assert not errors and not remote_calls and not failed_resources, (errors, remote_calls, failed_resources)
                 observations.append({"viewport": name, "width": width, **facts, "catalog": catalog,
                                      "long_tables_contained": bounds,
@@ -448,6 +572,8 @@ def main() -> int:
                         help='Verify separate review labels, clocks and native permission filter on every viewport')
     parser.add_argument('--require-original-source-inventory', action='store_true',
                         help='Reconcile all decoded original source keys and render metadata-only cards without 0/0 completion')
+    parser.add_argument('--require-cnyes-list-progress', action='store_true',
+                        help='Compare Anue metadata pages and historical scope counts with the same rendered source generation')
     args = parser.parse_args()
     url = args.base_url.rstrip("/") + "/"
     try:
@@ -455,7 +581,8 @@ def main() -> int:
                         required_api_setup_providers=tuple(dict.fromkeys(args.require_api_setup_provider)),
                         require_original_url_progress=args.require_original_url_progress,
                         require_source_reviews=args.require_source_reviews,
-                        require_original_source_inventory=args.require_original_source_inventory)
+                        require_original_source_inventory=args.require_original_source_inventory,
+                        require_cnyes_list_progress=args.require_cnyes_list_progress)
     except Exception as exc:
         result = {"schema_version": 1, "state": "failed", "generated_at_utc": datetime.now(UTC).isoformat(),
                   "page": url, "error_type": type(exc).__name__, "scope": "news dashboard acceptance"}

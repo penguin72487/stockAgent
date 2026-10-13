@@ -39,6 +39,9 @@ include = ["stockagent*", "downloader*", "scripts*"]
 exclude = ["test*", "artifacts*", "data_*", "*.tests*"]
 namespaces = false
 
+[tool.setuptools.package-data]
+scripts = ["*.cu"]
+
 [tool.pytest.ini_options]
 testpaths = ["test"]
 python_files = ["test_*.py"]

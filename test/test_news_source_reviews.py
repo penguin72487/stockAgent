@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import timedelta
 import json
+from pathlib import Path
 
 import pytest
 
@@ -165,3 +166,122 @@ def test_missing_review_configuration_is_explicit_and_does_not_call_publishers(t
     result = build_news_public_status(tmp_path, now=NOW)
     assert result["source_reviews_state"] == "not_configured"
     assert not result["scope"]["publisher_calls_on_page_view"]
+
+
+def test_wantmedia_primary_review_is_permission_work_not_an_implicit_enable():
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews['wantmedia']
+    assert review['capture_decision'] == 'permission_required'
+    assert review['evidence_urls'] == ['https://member.want-media.com/member-term-of-service.htm']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'wantmedia')
+    assert source['enabled'] is False
+    assert source['authorization']['kind'] == 'awaiting_authorization'
+
+
+def test_cmoney_official_metadata_review_never_registers_body_API_or_credentials():
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews['cmoney']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert '30 distinct operations' in review['observation']
+    prefix = 'https://www.cmoney.tw/cm-service/CMService.asmx?op='
+    operations = [url.removeprefix(prefix) for url in review['evidence_urls'] if url.startswith(prefix)]
+    assert len(operations) == 5 and set(operations) == {
+        'GetStockRssNews', 'GetMoreStockRssNews', 'GetDailyHeadlineArticles',
+        'GetStockRssArticles', 'GetStockRssArticlesWithFilterType'}
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'cmoney')
+    assert not any(source.get(key) for key in ('wordpress_apis', 'cnyes_apis', 'fulltext_feeds'))
+
+
+def test_cmoney_owl_RSS_contract_is_metadata_not_forum403_or_original_text_entitlement():
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['cmoney']
+    assert any(url.endswith('API%E8%A6%8F%E6%A0%BC.pdf') for url in review['evidence_urls'])
+    for declaration in ('Microsoft-IIS/8.5', 'kong/3.9.0', '/OwlApi/auth',
+                        '/OwlApi/api/rss/{product}/{count}',
+                        '/OwlApi/api/rss/{product}/{stock}/{count}',
+                        'creation-time', 'not full text', 'No Owl auth/product request sent'):
+        assert declaration in review['observation']
+    source = next(row for row in load_news_configuration(Path('configs/news_fulltext.json'))['providers']
+                  if row['id'] == 'cmoney')
+    assert not any(source.get(key) for key in ('wordpress_apis', 'cnyes_apis', 'fulltext_feeds'))
+
+
+def test_udn_licensed_export_and_archive_clock_review_does_not_grant_capture_or_backdate():
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['udn']
+    assert review['capture_decision'] == 'permission_required'
+    assert 'https://udndata.com/faq/marketing.html' in review['evidence_urls']
+    assert 'https://www.udndata.com/faq/fulltext.html' in review['evidence_urls']
+    for declaration in ('original database licensed export', 'data-analysis application',
+                        'not each article\'s exact original publication', 'Before1999-09-01',
+                        'not calls per hour', 'licensed-export schema', 'candidate adapter disabled'):
+        assert declaration in review['observation']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'udn')
+    assert source['enabled'] is False and source['authorization']['kind'] == 'awaiting_authorization'
+    assert config['remote_training_export'] is False
+
+
+def test_global_voices_review_preserves_missing_byline_gate_and_original_pacing():
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    assert reviews['globalvoices']['capture_decision'] == 'reviewed_existing_scope'
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'globalvoices')
+    assert source['enabled'] and source['interval_seconds'] == 10
+    assert source['require_author_attribution'] and not source['wordpress_apis']
+    assert len(source['fulltext_feeds']) == 2
+
+
+def test_global_voices_actual_embed_refusal_is_not_guessed_byline_or_API_activation():
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews['globalvoices']
+    assert 'rest_cannot_access' in review['observation']
+    assert 'All100 author embeds' in review['observation']
+    assert 'zero embedded names' in review['observation']
+    assert 'no raw mixed-response retention' in review['observation']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'globalvoices')
+    assert source['wordpress_apis'] == [] and source['require_author_attribution'] is True
+
+
+def test_global_voices_editorial_AI_and_native_network_evidence_have_distinct_scopes():
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['globalvoices']
+    assert 'https://globalvoices.org/about/global-voices-policy-on-ai/' in review['evidence_urls']
+    assert 'EHOSTUNREACH' in review['observation']
+    assert 'not a new capture grant' in review['observation']
+    assert 'network recovery is inferred' in review['observation']
+    assert 'strictly post-failure complete captures' in review['observation']
+    assert 'WP embedded-author permission remains refused' in review['observation']
+    assert 'not all-history or all-provider recovery' in review['observation']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'globalvoices')
+    assert source['enabled'] is True and source['authorization']['kind'] == 'open_license'
+    assert config['remote_training_export'] is False
+
+
+def test_ltn_official_rss_permission_does_not_enable_html_or_mislabel_abstract_as_body():
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews['ltn']
+    assert review['capture_decision'] == 'permission_required'
+    assert review['evidence_urls'] == [
+        'https://service.ltn.com.tw/copyright', 'https://service.ltn.com.tw/RSS',
+        'https://news.ltn.com.tw/rss/business.xml', 'https://news.ltn.com.tw/rss/all.xml']
+    assert 'RSS metadata/abstracts, not full articles' in review['observation']
+    assert 'not blanket HTML/full-history/training permission' in review['observation']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'ltn')
+    assert source['enabled'] is False
+    assert source['authorization']['kind'] == 'awaiting_authorization'
+    assert not any(source.get(key) for key in ('fulltext_feeds', 'wordpress_apis', 'cnyes_apis'))
+
+
+def test_money_link_member_contract_review_keeps_anonymous_public_scope_separate():
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews['money_link']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert 'https://ww2.money-link.com.tw/MemberCenter/MemberTerms.aspx?term=4' in review['evidence_urls']
+    assert 'actual member/product contracts' in review['observation']
+    assert 'Anonymous public-news capture scope remains unresolved' in review['observation']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == 'money_link')
+    assert source['enabled'] is False and source['authorization']['kind'] == 'awaiting_authorization'

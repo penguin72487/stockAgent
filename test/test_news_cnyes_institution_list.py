@@ -70,7 +70,7 @@ def test_html_upgrade_preserves_bulk_data_fingerprint(cnyes_config, tmp_path, mo
             return original(value)
         if isinstance(payload, dict) and 'mobile_canonical_html_contract_version' in payload:
             assert payload['mobile_canonical_html_contract_version'] == 41
-            assert payload['verified_empty_html_outcome_contract_version'] == 7
+            assert payload['verified_empty_html_outcome_contract_version'] == 8
             payload['mobile_canonical_html_contract_version'] = 30
             return original(json.dumps(payload, sort_keys=True).encode())
         return original(value)

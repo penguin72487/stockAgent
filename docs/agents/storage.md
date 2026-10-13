@@ -357,6 +357,17 @@ catalog credentials or hard-code an interpreter path.
   Do not change Vast's index-only role, sync raw artifacts, create release heads
   in the ingress folder or auto-activate models. Quarantine acceptance alone
   never authorizes removal of a source copy.
+- Active training rescue is a separate bounded preservation owner, not a
+  completed-output return/deletion ACK. The user selects/confirms a fresh SSH
+  target after fault; never auto-rent/Stop/Destroy. Keep pinned inputs in the
+  existing D cold lake and rebuild prepared/cache views remotely. Exact active
+  optimizer context and frozen code/runtime use private SHA-addressed D
+  objects under `.local-state/training-rescue`, excluded from Syncthing payload
+  mirroring. Preserve its journals/referenced objects and pinned source versions;
+  neither the seven-day hot GC nor legacy-artifact cleanup may retire them.
+  Verify full-byte D readback before ACK; only the exact newly-created verified
+  transport copy may be retired. This does not establish NAS backup or authorize
+  deleting an incomplete run. See [Vast training rescue](../vast_training_rescue_2026-10-13.md).
 - The user's 2026-10-04 four-node policy permits the existing penguin remote
   cold-artifact ingress owner to enroll canonical lifecycle-complete Vast runs
   in `markets`/`ablations` under `configs/data_sync/training_return.json`.

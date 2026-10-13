@@ -42,7 +42,7 @@ const reviewLabels = Object.freeze({permission_required: "需取得來源同意"
   not_reviewed: "尚未審閱", private_public_candidate: "私人研究候選範圍，未自動啟用",
   reviewed_existing_scope: "已核對現有範圍", active_existing_policy: "依現有抓取規則",
   authorized_api_configuration_required: "授權 API 待設定", review_unverified: "審閱時間待驗證"});
-const state = {latest: null, filter: "all", query: "", sort: "state", page: 0, inFlight: false, retry: null, retryDelay: 3000};
+const state = {latest: null, filter: "all", query: "", sort: "state", page: 0, inFlight: false, retry: null, retryDelay: 3000, cnyesListOpen: false};
 const PAGE_SIZE = 24;
 const fetchJson = Dashboard.createJsonFetcher({expectedRoot: "object", cache: "no-store", timeoutMs: 15000});
 
@@ -59,10 +59,14 @@ function duration(value) {
   if (value >= 60) return `約 ${decimal(value / 60)} 分鐘`;
   return `約 ${decimal(value)} 秒`;
 }
-function live(data) {
+function currentSnapshot(data) {
   const at = Date.parse(data?.observed_at_utc);
-  return Number.isFinite(at) && Date.now() - at >= -5000 && Date.now() - at <= 180000
-    && ["running", "idle", "waiting", "inventorying"].includes(data.health);
+  const age = Date.now() - at;
+  return Number.isFinite(at) && age >= -5000 && age <= 180000
+    && !["stale", "unavailable", "invalid", "degraded"].includes(data?.health);
+}
+function live(data) {
+  return currentSnapshot(data) && ["running", "idle", "waiting", "inventorying"].includes(data.health);
 }
 function eta(source, data) {
   return live(data) ? duration(source.conditional_eta_seconds) : "目前階段暫無有效估時";
@@ -86,7 +90,49 @@ function errorLabel(source) {
   return [reason, errors.join("；")].filter(Boolean).join("；") || (!source.enabled ? "未啟用，尚未自動呼叫來源" : source.owner_requests ? "本程序未觀測拒絕" : "尚無本程序請求紀錄");
 }
 
+function cnyesManifestPhase(phase) {
+  if (!phase) return "";
+  const firstRatio = phase.first_pages_observed / phase.planned_source_dates;
+  const pageLabel = phase.totals_known
+    ? `${count(phase.verified_pages)} / ${count(phase.source_reported_total_pages)} 頁（${decimal(phase.progress_ratio * 100)}%）`
+    : `${count(phase.verified_pages)} 頁；總頁數未知`;
+  const pageProgress = phase.totals_known
+    ? `<progress class="news-provider-progress" aria-label="已知超限日期清單頁進度，非全文" max="1" value="${phase.progress_ratio}" data-news-manifest-progress="pages"></progress>` : "";
+  // A browser transport loss does not mean the collector stopped. Preserve
+  // verified counts, but withdraw forecasts until a fresh snapshot arrives.
+  // Other providers' attention state must not suppress this provider's proof.
+  const forecast = currentSnapshot(state.latest) ? phase.forecast : {state: "snapshot_stale"};
+  let eta = "階段估時尚未取得有效觀測";
+  if (forecast?.state === "recent_measured") {
+    const slow = forecast.slowest_seconds == null ? "含零進展視窗，無有限較慢估時" : duration(forecast.slowest_seconds);
+    eta = `近 ${count(forecast.sample_seconds / 60)} 分鐘實際保存 ${count(forecast.verified_pages)} 頁；情境最短 ${duration(forecast.fastest_seconds)}、基準 ${duration(forecast.middle_seconds)}、較慢 ${slow}。基準預計 ${stamp(forecast.middle_finish_at_utc)}；含等待與失敗，不是保證或統計信賴區間。`;
+  } else if (forecast?.state === "snapshot_stale") eta = "畫面更新暫停，保留已驗證清單計數；暫不提供本階段估時。這不代表下載器停止。";
+  else if (forecast?.state === "phase_complete") eta = "此階段來源回報清單頁與資料列已齊；正文仍需另外驗證";
+  else if (forecast?.state === "no_recent_progress") eta = "近期沒有新增清單頁；暫停估時，不持續倒數";
+  else if (forecast?.state === "inactive") eta = "程序停止、暫停或快照過期；暫停估時";
+  else if (!phase.totals_known) eta = "首頁尚未齊或來源總數有異動；不外推總量或完成時間";
+  else if (forecast?.state === "warming") eta = "等待至少 3 個完整分鐘視窗與 10 頁有效觀測，再估此階段時間";
+  return `<section class="news-manifest-phase" aria-label="鉅亨已知超限日期清單階段" data-news-manifest-display-contract="2" data-news-manifest-state="${forecast?.state || "unavailable"}"><p>階段 1 · 日期首頁：<span data-news-manifest-count="first_pages">${count(phase.first_pages_observed)}</span> / <span data-news-manifest-count="planned_dates">${count(phase.planned_source_dates)}</span> 日</p><progress class="news-provider-progress" aria-label="已知超限日期首頁盤點進度" max="1" value="${firstRatio}" data-news-manifest-progress="first_pages"></progress><p>階段 2 · 清單分頁：${pageLabel}</p>${pageProgress}<p class="news-provider-note">來源回報 ${count(phase.source_reported_total_metadata_rows)} 筆清單資料列，已觀測 ${count(phase.observed_metadata_rows)} 筆；只限已知超限日期，不是全庫或唯一新聞篇數。</p><p class="news-provider-note" data-news-manifest-eta>${eta}</p></section>`;
+}
+
+function cnyesListProgress(source) {
+  if (source.id !== "cnyes") return "";
+  const index = source.public_index_progress;
+  const history = source.history_list_progress;
+  const indexState = index ? "observed" : "unavailable";
+  const summary = index ? `清單補漏：已驗證 ${count(index.verified_pages)} 頁 · ${count(index.metadata_rows)} 筆觀測` : "清單補漏：進度尚無有效觀測";
+  const indexFacts = index
+    ? `<dl class="news-provider-facts"><div><dt>公開清單已驗證頁數</dt><dd data-news-index-count="pages">${count(index.verified_pages)}</dd></div><div><dt>清單觀測資料列，非全文</dt><dd data-news-index-count="rows">${count(index.metadata_rows)}</dd></div><div><dt>已觀測發布日</dt><dd data-news-index-count="dates">${count(index.source_dates_observed)}</dd></div><div><dt>當下回報頁數已齊的發布日</dt><dd data-news-index-count="complete_dates">${count(index.dates_all_reported_pages_observed)}</dd></div><div><dt>觀測到來源總數異動的發布日</dt><dd data-news-index-count="changed_dates">${count(index.dates_with_changed_source_total)}</dd></div></dl><p class="news-provider-note">發布日依來源清單的 UTC+8 日界。頁數已齊只限已觀測日期，不是全部歷史；觀測列可能重複收錄同篇，不能當唯一文章數。清單只註冊網址，接受正文 0 篇；全文仍須由原佇列取得並驗證。</p>`
+    : '<p class="news-provider-note">舊快照、未啟用或數量無法核對時，清單進度顯示未知；不補零、不算完成。</p>';
+  const scopes = history?.current_source_contract_scope_states;
+  const historyFacts = history
+    ? `<dl class="news-provider-facts"><div><dt>已驗證分類清單查詢範圍</dt><dd data-news-history-count="verified">${count(history.verified_list_scopes)}</dd></div><div><dt>分類範圍等待頁面證據</dt><dd data-news-history-count="waiting">${count(scopes.waiting_page_evidence)}</dd></div><div><dt>未解分類查詢範圍</dt><dd data-news-history-count="gaps">${count(history.unresolved_category_scopes)}</dd></div><div><dt>已核對退場的缺口收據</dt><dd data-news-history-count="retired">${count(history.retired_gap_receipts)}</dd></div></dl><p class="news-provider-note">分類查詢範圍可能包含父子窗口與重疊分類，不是唯一日期或缺失篇數。公開清單補漏不會自動刪掉分類缺口，也不代表該日全文已齊。</p>`
+    : '<p class="news-provider-note">分類歷史驗證尚無有效快照；缺口數未知，不視為已補齊。</p>';
+  return `<details class="news-provider-list" data-news-list-provider="cnyes" data-news-index-state="${indexState}"${state.cnyesListOpen ? " open" : ""}><summary>${summary}</summary>${cnyesManifestPhase(source.manifest_phase_progress)}${indexFacts}${historyFacts}<p class="news-provider-note" data-news-list-eta>全鉅亨歷史完成時間未知；清單階段估時不含全文，下方條件估時只涵蓋當前可回補正文網址，不包含尚未探索的清單或歷史缺口。</p></details>`;
+}
+
 function renderSources(data) {
+  const restoreListFocus = document.activeElement?.closest?.('[data-news-list-provider="cnyes"]') != null;
   const all = data.providers || [];
   let rows = all.filter(source => (!state.query || `${source.name} ${source.id}`.toLowerCase().includes(state.query))
     && (state.filter === "all" || (state.filter === "enabled" && source.enabled)
@@ -133,10 +179,11 @@ function renderSources(data) {
       : '<p class="news-provider-note news-provider-work">正文工作分類尚未就緒；不以未知數當成零或完成。</p>';
     return `<article class="pipeline-card"><header class="pipeline-card-header"><div class="news-provider-identity"><strong>${escape(source.name)}</strong><small>${escape(source.id)}</small></div><span class="pipeline-status ${badge}">${escape(labels[source.state] || "待觀測")}</span></header>${apiNote}
       <dl class="news-provider-facts"><div><dt>${progressLabel}</dt><dd>${progressCount}</dd></div><div><dt>待回補</dt><dd>${count(source.remaining_urls)}</dd></div><div><dt>正文 UTF-8</dt><dd>${bytes(source.text_bytes)}</dd></div><div><dt>${metadataOnly ? "新增正文速率尚未量測" : source.authorized_api_setup ? "API 新增正文／分鐘，未量測" : forecast ? "近期新增正文／分鐘" : source.forecast_rate_basis === "new_stored_url_heads" ? "本程序新增正文／分鐘" : "舊快照版本速率／分鐘"}</dt><dd data-news-rate="completion">${decimal(displayedRate == null ? null : displayedRate * 60)}</dd></div></dl>
-      ${metadataNote}${workNote}
+      ${metadataNote}${workNote}${cnyesListProgress(source)}
       <progress class="news-provider-progress mini-progress-track" max="1"${source.progress_ratio == null ? "" : ` value="${source.progress_ratio}"`} aria-label="${escape(source.name)} ${cohort ? '固定批次正文比例' : '已完成狀態占已知網址的比例'}"></progress><div class="news-provider-states">${cohort ? '固定批次' : '已知範圍'} ${ratio} · ${escape(statesText || (metadataOnly ? "已有原始網址線索，尚未建立正文工作" : "尚無已發現網址"))}${cohortNote ? `<p>${escape(cohortNote)}</p>` : ''}</div>
       <p class="news-provider-note">剩餘 ${escape(eta(source, data))} · ${escape(finish)}</p>${forecastNote}<p class="news-provider-note">${escape(reviewLabels[source.source_policy_review] || "來源審閱紀錄不可用")}${source.source_reviewed_at_utc ? ` · 核對 ${escape(stamp(source.source_reviewed_at_utc))}` : ""}</p><p class="news-provider-note">${source.authorized_api_setup ? "官方 API 能力檢查已實作，全文管線未啟用" : source.adapter_registered ? "共用下載器已接線" : "來源尚未註冊"} · ${source.adapter_acceptance === "committed_body_heads_observed" ? "已觀測正文入庫" : "尚無正文入庫證據"}${source.source_role === "redirector" ? " · 轉址來源，須找到原始媒體 URL" : ""}</p><p class="news-provider-note">${escape(errorLabel(source))}</p></article>`;
   }).join(""));
+  if (restoreListFocus) $("pipeline-grid").querySelector('[data-news-list-provider="cnyes"] > summary')?.focus({preventScroll: true});
 }
 function renderTraffic(data) {
   const workloadLabels = { cnyes_bulk: "批次正文", wordpress_posts: "批次正文", rss_fulltext: "RSS 正文", article_pdf: "PDF", article_html: "單篇 HTML", mixed: "混合工作，不能當成同工作量測速", metadata: "目錄／索引", unclassified: "舊版未分類量測" };
@@ -244,6 +291,9 @@ $("source-search").addEventListener("input", event => {state.query = event.targe
 $("source-sort").addEventListener("change", event => {state.sort = event.target.value; state.page = 0; if (state.latest) renderSources(state.latest);});
 $("source-previous").addEventListener("click", () => {state.page = Math.max(0, state.page - 1); if (state.latest) renderSources(state.latest);});
 $("source-next").addEventListener("click", () => {state.page += 1; if (state.latest) renderSources(state.latest);});
+$("pipeline-grid").addEventListener("toggle", event => {
+  if (event.target.isConnected && event.target.matches?.('[data-news-list-provider="cnyes"]')) state.cnyesListOpen = event.target.open;
+}, true);
 renderSources = Dashboard.createDeferredRenderer("pipelines", renderSources);
 renderTraffic = Dashboard.createDeferredRenderer("traffic", renderTraffic);
 renderStages = Dashboard.createDeferredRenderer("capture", renderStages);

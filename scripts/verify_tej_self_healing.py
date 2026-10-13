@@ -21,6 +21,9 @@ from downloader.tej_metadata_recovery import (
 )
 from downloader.tej_startup import interactive_transport
 from downloader.tej_operation_clock import CONTRACT as OPERATION_CLOCK_CONTRACT
+from downloader.tej_desktop_attempts import (
+    ANNOTATION_RECONCILIATION_CONTRACT, deferred_unsent_annotation_proof,
+)
 from scripts.audit_tej_history import audit
 
 
@@ -48,7 +51,7 @@ def main(argv=None):
     mode=parser.add_mutually_exclusive_group()
     mode.add_argument('--since',help='Require eight new full-lifecycle downloads STARTED after this UTC clock')
     mode.add_argument('--values-reference-task',help='Independently audit one retained nonempty receipt with the current validation code; not a new download')
-    parser.add_argument('--baseline',type=Path,help='Preserved original metadata failure evidence to verify unchanged')
+    parser.add_argument('--baseline',type=Path,help='Preserved original source failure evidence to verify unchanged')
     parser.add_argument('--reference-values-acceptance',type=Path,
         help='For an entirely explicit-empty cohort, retain a prior nonempty value audit with IDENTICAL capture/ingest code')
     args=parser.parse_args(argv)
@@ -62,7 +65,7 @@ def main(argv=None):
         recent=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='complete' AND kind='download' "
             "AND scope_contract=? AND timing_basis='fresh_end_to_end' ORDER BY completed_at_utc DESC LIMIT 128",(SOURCE_SCOPE_CONTRACT,))]
         retries=[dict(r) for r in con.execute('SELECT table_id,task_id,error_code,consecutive_failures,next_attempt_at_utc FROM desktop_retry_windows')]
-    protected={}; metadata=[]
+    protected={}; metadata=[]; prequery=[]
     for task in [*blocked, *unfinished]:
         if task['kind']!='discover':
             continue
@@ -80,17 +83,39 @@ def main(argv=None):
         except (ValueError,OSError,KeyError,TypeError):
             metadata.append({'task_id':task['task_id'],'negative_outcome_verified':False,
                              'attempted_at_utc':task['attempted_at_utc'],'error_code':task['last_error_code']})
-    result={'contract':'tej_metadata_recovery_production_acceptance_v1','observed_at_utc':datetime.now(UTC).isoformat(),
+    with closing(sqlite3.connect(f'file:{root/"queue.sqlite3"}?mode=ro',uri=True,timeout=2)) as con:
+        con.row_factory=sqlite3.Row
+        for task in blocked:
+            if task['kind'] != 'download':
+                continue
+            try:
+                proof=deferred_unsent_annotation_proof(root,con,task)
+                if proof is None:
+                    continue
+                paths=[proof['prepared_path'],proof['outcome_path'],proof['annotation_path'],proof['bridge_manifest_path']]
+                diagnostic=root/'diagnostics'/(proof['attempt_id']+'.txt')
+                if diagnostic.is_file():
+                    paths.append(diagnostic)
+                protected.update({str(p.relative_to(root)):digest(p) for p in paths})
+                prequery.append({'task_id':task['task_id'],'negative_outcome_verified':True,
+                    'attempt_annotation_unfinished':True,'original_finished_at_utc':proof['finished_at_utc'],
+                    'error_code':task['last_error_code']})
+            except (ValueError,OSError,KeyError,TypeError):
+                prequery.append({'task_id':task['task_id'],'negative_outcome_verified':False,
+                    'error_code':task['last_error_code']})
+    result={'contract':'tej_source_recovery_production_acceptance_v2','observed_at_utc':datetime.now(UTC).isoformat(),
             'mode':'snapshot' if not args.since else 'production_acceptance',
             'failure_commit_reconciliation_contract':RECONCILIATION_CONTRACT,
             'operation_clock_contract':OPERATION_CLOCK_CONTRACT,
-            'original_failure_artifacts':protected,'metadata_failures':metadata,
+            'attempt_annotation_reconciliation_contract':ANNOTATION_RECONCILIATION_CONTRACT,
+            'original_failure_artifacts':protected,'metadata_failures':metadata,'prequery_failures':prequery,
             'blocked_tasks':len(blocked),'retry_windows':retries,'provider_queries_sent':0,
             'all_history_complete':False,'cold_boot_verified':False,
             'code_sha256':{str(p.relative_to(REPO)):digest(p) for p in (
                 REPO/'downloader/tej_history.py',REPO/'downloader/tej_scheduler.py',
                 REPO/'downloader/tej_metadata_recovery.py',REPO/'scripts/tej_smart_wizard_bridge.ps1',
                 REPO/'downloader/tej_operation_clock.py',REPO/'downloader/tej_desktop_attempts.py',
+                REPO/'downloader/tej_planning.py',
                 REPO/'configs/tej_history.json')},
             'latest_download':{k:recent[0][k] for k in ('task_id','completed_at_utc','actual_rows')} if recent else None}
     if args.values_reference_task:
@@ -128,7 +153,7 @@ def main(argv=None):
             raise ValueError('Preserved failure baseline required')
         baseline=json.loads(args.baseline.read_text())
         if not baseline['original_failure_artifacts']:
-            raise ValueError('Original failed metadata proof required in baseline')
+            raise ValueError('Original failed source proof required in baseline')
         for relative,expected in baseline['original_failure_artifacts'].items():
             path=root/relative
             if path.resolve().parent not in {(root/name).resolve() for name in ('requests','raw','launches','diagnostics')} or digest(path)!=expected:

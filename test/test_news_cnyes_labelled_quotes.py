@@ -83,23 +83,23 @@ def test_unknown_numeric_or_malformed_fragments_remain_unresolved(cnyes_config, 
     assert not cnyes_verified_quote_only_body(soup, source(cnyes_config, tmp_path), article, body, page_url=URL)
 
 
-def test_quote6_identity_changes_html_only_not_rights_or_bulk(cnyes_config, tmp_path, monkeypatch):
+def test_quote7_identity_changes_html_only_not_rights_or_bulk(cnyes_config, tmp_path, monkeypatch):
     current = source(cnyes_config, tmp_path)
     original = hashlib.sha256
 
-    def quote5(value):
+    def quote6(value):
         try:
             payload = json.loads(value)
         except (ValueError, TypeError, UnicodeDecodeError):
             return original(value)
         if isinstance(payload, dict) and 'verified_native_quote_only_outcome_contract_version' in payload:
             payload = deepcopy(payload)
-            assert payload['verified_native_quote_only_outcome_contract_version'] == 6
-            payload['verified_native_quote_only_outcome_contract_version'] = 5
+            assert payload['verified_native_quote_only_outcome_contract_version'] == 7
+            payload['verified_native_quote_only_outcome_contract_version'] = 6
             return original(json.dumps(payload, sort_keys=True).encode())
         return original(value)
 
-    monkeypatch.setattr('downloader.news_fulltext_policy.hashlib.sha256', quote5)
+    monkeypatch.setattr('downloader.news_fulltext_policy.hashlib.sha256', quote6)
     previous = source(cnyes_config, tmp_path)
     assert current.data_fingerprint != previous.data_fingerprint
     assert current.authorization_fingerprint == previous.authorization_fingerprint

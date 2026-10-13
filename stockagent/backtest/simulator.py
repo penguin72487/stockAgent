@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -2534,7 +2535,15 @@ def _prepare_scan_inputs(
         symbol_sharded=symbol_sharded,
     )
     try:
-        return runner(weights, tradable_mask, buy_input, sell_input)
+        if _torch_dynamo_is_compiling():
+            return runner(weights, tradable_mask, buy_input, sell_input)
+        # Match the exact ledger's narrow handling of Dynamo's metadata probe.
+        # This framework warning does not read a financial gradient or change
+        # arithmetic; all accounting warnings and compile failures still fail.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning,
+                message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*")
+            return runner(weights, tradable_mask, buy_input, sell_input)
     except Exception as e:
         if _torch_dynamo_is_compiling() or not (
             _compile_prep_enabled()

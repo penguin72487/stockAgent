@@ -60,6 +60,25 @@ def test_legacy_archive_roundtrip_is_non_deployable_and_exact(tmp_path: Path) ->
         restore_archive(spec, sync_root, destination, materialized_root=tmp_path / "restore-cache")
 
 
+def test_selected_restore_keeps_full_archive_verification_and_exact_members(tmp_path):
+    spec, artifact_root, source = _fixture(tmp_path)
+    sync_root = tmp_path / "packed"
+    publish_archive(spec, artifact_root, sync_root, repo_root=tmp_path)
+    destination = tmp_path / "selected"
+    result = restore_archive(spec, sync_root, destination,
+                             materialized_root=tmp_path / "restore-cache",
+                             include_paths=["fold_01/checkpoint_best.pt"])
+    assert result["archive_files_verified"] == 2
+    assert result["files"] == 1
+    assert result["restore_scope"] == "selected_exact_members"
+    assert (destination / "fold_01/checkpoint_best.pt").read_bytes() == (source / "fold_01/checkpoint_best.pt").read_bytes()
+    assert not (destination / "fold_01/holdings.csv").exists()
+    for paths in ([], ["absent"], ["../escape"]):
+        with pytest.raises(SnapshotError):
+            restore_archive(spec, sync_root, tmp_path / "invalid",
+                            materialized_root=tmp_path / "restore-cache", include_paths=paths)
+
+
 def test_adaptive_large_binary_compression_keeps_exact_recovery(tmp_path):
     spec, artifact_root, source = _fixture(tmp_path)
     data = b"uncompressed training tensor\0" * 400_000

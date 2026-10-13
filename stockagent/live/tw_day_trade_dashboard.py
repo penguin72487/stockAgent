@@ -123,7 +123,7 @@ _LATEST_SESSION_BLOCK_CACHE: dict[
 ] = {}
 _LATEST_SESSION_BLOCK_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
-    tuple[int, int, int, int, int], list[dict[str, Any]]
+    tuple[int, int, int, int, int], dict[str, Any]
 ] = {}
 _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ENTRIES: Final[int] = 256
@@ -788,11 +788,11 @@ def _as_path(path: Path, value: Any) -> Path | None:
     return candidate
 
 
-def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
+def _read_signal_feature_record(summary_path: Path) -> dict[str, Any]:
     try:
         signature = summary_path.stat()
     except OSError:
-        return []
+        return {"drivers": []}
     cache_key = (
         signature.st_dev,
         signature.st_ino,
@@ -803,12 +803,16 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
     with _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK:
         cached = _SIGNAL_FEATURE_SUMMARY_CACHE.get(cache_key)
         if cached is not None:
-            return list(cached)
+            return {**cached, "drivers": list(cached["drivers"])}
     try:
         summary = _object(summary_path)
     except (OSError, ValueError, json.JSONDecodeError):
-        return []
+        return {"drivers": []}
+    publication = summary.get("source_publication_contract") or {}
     explanation = summary.get("model_explanation")
+    withheld = (publication.get("feature_proxy_publication_allowed") is False
+                or isinstance(explanation, Mapping)
+                and explanation.get("feature_proxy_publication_allowed") is False)
     raw_drivers = (
         explanation.get("all_feature_drivers")
         if isinstance(explanation, Mapping)
@@ -820,8 +824,8 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
             if isinstance(explanation, Mapping)
             else None
         )
-    if not isinstance(raw_drivers, list):
-        return []
+    if withheld or not isinstance(raw_drivers, list):
+        raw_drivers = []  # Never return private input/proxy values, even from stale summaries.
     drivers: list[dict[str, Any]] = []
     for item in raw_drivers:
         if not isinstance(item, Mapping):
@@ -844,6 +848,13 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
             # Keep legacy fallback behavior for compatibility with older summaries.
             driver["weighted_abs_value"] = 0.0
         drivers.append(driver)
+    record = {"drivers": drivers}
+    if withheld:
+        record.update(feature_proxy_publication_allowed=False,
+                      publication_reason="model_derived_signals_only")
+    for field in ("research_only", "historical_point_in_time_proven"):
+        if type(publication.get(field)) is bool:
+            record[field] = publication[field]
     cacheable = (
         signature.st_size < 64 * 1024 * 1024
         and len(json.dumps(drivers, separators=(",", ":")).encode("utf-8"))
@@ -857,8 +868,12 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
                 _SIGNAL_FEATURE_SUMMARY_CACHE.pop(
                     next(iter(_SIGNAL_FEATURE_SUMMARY_CACHE))
                 )
-            _SIGNAL_FEATURE_SUMMARY_CACHE[cache_key] = list(drivers)
-    return drivers
+            _SIGNAL_FEATURE_SUMMARY_CACHE[cache_key] = record
+    return {**record, "drivers": list(drivers)}
+
+
+def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
+    return _read_signal_feature_record(summary_path)["drivers"]
 
 
 def _signal_row_key(row: Mapping[str, Any]) -> str:
@@ -911,11 +926,15 @@ def _lookup_signal_feature_drivers(
         return output
     for row in rows:
         signal_id = str(row.get("signal_id") or "")
-        if not signal_id or signal_id in output:
+        if not signal_id:
             continue
         session_date = str(row.get("session_date") or "")[:10]
         market = str(row.get("market") or "")
         row_key = _signal_row_key(row)
+        if signal_id in output:
+            if row_key:
+                output.setdefault(row_key, output[signal_id])
+            continue
         candidates: list[Path] = []
         direct_path = _as_path(state_dir, row.get("signal_source_path"))
         if direct_path:
@@ -931,9 +950,8 @@ def _lookup_signal_feature_drivers(
         for candidate in candidates:
             if not candidate.is_file() or candidate.name != "summary.json":
                 continue
-            drivers = _read_signal_feature_drivers(candidate)
-            if drivers:
-                record = {"drivers": drivers}
+            record = _read_signal_feature_record(candidate)
+            if record["drivers"] or record.get("feature_proxy_publication_allowed") is False:
                 output[signal_id] = record
                 if row_key:
                     output.setdefault(row_key, record)
@@ -2383,6 +2401,8 @@ def _opening_signal_latency_summary(
                     coverage = row.get("opening_input_coverage")
                     if row.get("error_type") == "TWPublicSourceUpdatePending":
                         reason_code = "tw_public_source_update_pending"
+                    elif row.get("error_type") == "TWTradingUniversePending":
+                        reason_code = "tw_official_trading_universe_pending"
                     elif message.startswith("same-session TW model input coverage is not ready;"):
                         reason_code = "tw_opening_input_coverage_pending"
                         if not isinstance(coverage, Mapping):
@@ -2390,10 +2410,12 @@ def _opening_signal_latency_summary(
                             coverage = {public: int(value) for source, public in names.items()
                                         if (match := re.search(r"\b" + source + r"=(\d+)\b", message))
                                         and (value := match.group(1)) is not None}
-                    safe_coverage = {name: int(value) for name in ("active", "opens", "responses", "required", "no_prints")
+                    safe_coverage = {name: int(value) for name in ("active", "opens", "responses", "required", "no_prints", "official_trading_count")
                                      if isinstance(coverage, Mapping)
                                      and (value := coverage.get(name)) is not None
                                      and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0}
+                    if isinstance(coverage, Mapping) and coverage.get("denominator_contract") == "official_current_trading_symbols_in_model_v1":
+                        safe_coverage["denominator_contract"] = coverage["denominator_contract"]
                     failures_by_session.setdefault(row_session, []).append(
                         {
                             "market": market,
@@ -7767,6 +7789,8 @@ def build_dashboard_snapshot(
     )
     latency = _latency_summary(latency_rows)
     today_session_date = local_observed.date().isoformat()
+    from stockagent.data.tw_current_trading_universe import public_current_universe
+    current_trading_universe = public_current_universe(today_session_date)
     today_latency_rows = (
         latency_rows
         if selected_session_date == today_session_date
@@ -8210,6 +8234,7 @@ def build_dashboard_snapshot(
         "latency": latency,
         "today_latency": today_latency,
         "opening_signal_latency": opening_signal_latency,
+        "current_trading_universe": current_trading_universe,
         "session_progress": session_progress,
         "modes": modes,
         "benchmarks": benchmarks,
@@ -10021,6 +10046,7 @@ def build_dashboard_summary(
         "latency",
         "today_latency",
         "opening_signal_latency",
+        "current_trading_universe",
         "session_progress",
         "modes",
         "record_counts",

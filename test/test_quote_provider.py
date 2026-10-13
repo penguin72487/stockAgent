@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 import sys
@@ -29,6 +30,7 @@ from stockagent.live.quote_provider import (
 @pytest.fixture(autouse=True)
 def _isolate_opening_quote_receipts(monkeypatch, tmp_path):
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "opening_receipts"))
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_HISTORY_REQUEST_TIMES", deque())
 
 
 def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:
@@ -60,11 +62,11 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
         timestamps_ms=np.array([1_800_000_000_000, 1_800_000_000_001]),
         transport_timing={"snapshot_request_body_ms": 12.5, "snapshot_usage_before_ms": 0.0},
     )
-    monkeypatch.setattr(
-        quote_provider,
-        "fetch_shioaji_stock_snapshots",
-        lambda symbols, fallback_prices, *, cache_ttl_seconds: expected,
-    )
+    def snapshots(symbols, fallback_prices, *, cache_ttl_seconds, prefer_opening_stream=False):
+        assert prefer_opening_stream
+        return expected
+
+    monkeypatch.setattr(quote_provider, "fetch_shioaji_stock_snapshots", snapshots)
     result: list[PriceSnapshot] = []
     errors: list[BaseException] = []
 
@@ -145,7 +147,7 @@ def test_shared_quote_broker_prioritizes_opening_request_in_protected_window(
     monkeypatch.setattr(
         quote_provider,
         "fetch_shioaji_stock_snapshots",
-        lambda symbols, fallback_prices, *, cache_ttl_seconds: expected,
+        lambda symbols, fallback_prices, *, cache_ttl_seconds, prefer_opening_stream=False: expected,
     )
     requests_dir, responses_dir = quote_provider._day_trade_quote_broker_paths(
         tmp_path

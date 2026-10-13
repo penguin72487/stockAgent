@@ -1,0 +1,20 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: sdpa_padded_cross_bf16
+    overrides:
+      training:
+        financial_transformer:
+          compiled_cross_attention_backend: sdpa_padded
+          temporal_blocks_fp32: false
+          portfolio_blocks_fp32: false
+  - name: numa_funding_sdpa_padded_bf16
+    overrides:
+      training:
+        financial_transformer:
+          compiled_cross_attention_backend: sdpa_padded
+          temporal_blocks_fp32: false
+          portfolio_blocks_fp32: false
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1

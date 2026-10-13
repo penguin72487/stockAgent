@@ -961,6 +961,11 @@ def _validate_rebuild(
     allow_current_open_session: bool = False,
     allow_margin_carry: bool = False,
 ) -> dict[str, Any]:
+    from stockagent.live.day_trade_addition import CONTRACT as ADDITION_CONTRACT, validate_addition
+    if _load_object(candidate / "rebuild_receipt.json").get("contract") == ADDITION_CONTRACT:
+        if allow_current_open_session or allow_margin_carry:
+            raise ValueError("additive validation keeps component-specific completed-session contracts")
+        return validate_addition(candidate, expected_markets=expected_markets)
     input_hashes = _promotion_input_hashes(candidate)
     receipt_path = candidate / "rebuild_receipt.json"
     state_path = candidate / "state.json"
@@ -985,8 +990,12 @@ def _validate_rebuild(
         failures.append(f"mode set={sorted(modes)} expected={sorted(expected_markets)}")
     margin_audit = None
     terminal_unlimited = isinstance(replay_contract, dict) and replay_contract.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
+    strict_intraday_audit = None
     if terminal_unlimited and not allow_margin_carry:
-        failures.append("unlimited close requires full source/accounting audit via --allow-margin-carry")
+        from scripts.audit_tw_day_trade_margin_replay import audit
+        strict_intraday_audit = audit(candidate, require_margin_carry=False)
+        if not strict_intraday_audit.get("full_requested_range_passed"):
+            failures.append(f"strict intraday full source/accounting audit failed: {strict_intraday_audit.get('errors')}")
     if allow_margin_carry:
         from scripts.audit_tw_day_trade_margin_replay import audit
         from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
@@ -1409,6 +1418,7 @@ def _validate_rebuild(
         "mode_set": sorted(expected_markets),
         "final_open_positions": final_open_positions,
         "margin_carry_audit": margin_audit,
+        "strict_intraday_audit": strict_intraday_audit,
         "ending_equity_twd": ending_equity,
         "allow_current_open_session": bool(allow_current_open_session),
         "current_open_session": current_open_session,
@@ -1432,7 +1442,7 @@ def _acquire_engine_lock(directory: Path):
 
 
 def _cutover_blockers(
-    live: Path, candidate: Path, expected_markets: set[str]
+    live: Path, candidate: Path, expected_markets: set[str], *, added_markets: set[str] | None = None
 ) -> list[str]:
     """Check the mutable live boundary separately from candidate validity.
 
@@ -1454,7 +1464,10 @@ def _cutover_blockers(
                if row.get("configured_enabled") is False
                and isinstance(live_state.get("enabled_markets"), list)
                and m not in live_state["enabled_markets"]}
-    if set(live_modes) - retired != expected_markets:
+    added = added_markets or set()
+    if not added.issubset(expected_markets) or added & set(live_modes):
+        blockers.append("added modes must be new members of the exact candidate mode set")
+    if set(live_modes) - retired != expected_markets - added:
         blockers.append(
             f"live mode set differs from expected: {sorted(live_modes)}"
         )
@@ -1477,6 +1490,16 @@ def _cutover_blockers(
                 f"{market}: candidate session {candidate_date or 'missing'} "
                 f"precedes live session {live_date}"
             )
+    if added:
+        from stockagent.live.day_trade_addition import CONTRACT as ADDITION_CONTRACT
+        receipt = _load_object(candidate / "rebuild_receipt.json")
+        if receipt.get("contract") != ADDITION_CONTRACT or added != {receipt.get("added_market")}:
+            blockers.append("added-mode cutover requires the matching independently validated additive receipt")
+        else:
+            from stockagent.live.day_trade_addition import evidence_path
+            prior = _load_object(evidence_path(candidate, receipt["prior_state"]))
+            if prior.get("modes") != live_modes:
+                blockers.append("retained live accounts changed after the additive snapshot")
     return blockers
 
 
@@ -1532,12 +1555,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--allow-margin-carry", action="store_true",
                         help="Explicit user-approved carried-history contract; requires full source/accounting audit and a flat old live account.")
+    parser.add_argument("--added-market", action="append", default=[],
+                        help="Explicit independent-mode addition, with retained-account/execution parity proof.")
     return parser
 
 
 def _revalidate_margin_sources(candidate: Path, acceptance: dict[str, Any]) -> None:
     """Recheck the exact source evidence after expensive validation and drain."""
-    audit = acceptance["margin_carry_audit"]
+    audit = acceptance.get("margin_carry_audit") or acceptance.get("strict_intraday_audit")
     for name, digest in audit["source_hashes"].items():
         if _sha256(candidate / name) != digest:
             raise RuntimeError(f"audited carried candidate changed: {name}")
@@ -1564,6 +1589,25 @@ def _revalidate_margin_sources(candidate: Path, acceptance: dict[str, Any]) -> N
             raise RuntimeError(f"audited raw tick source changed: {name}")
 
 
+def _require_added_runtime_policy(candidate: Path, added_markets: set[str]) -> None:
+    """Validation may use disabled staging; actual cutover may not."""
+    from stockagent.live.market_config import load_market_config
+    from stockagent.live.market_status import short_file_fingerprint
+    state = _load_object(candidate / "state.json")
+    for market in added_markets:
+        config = load_market_config(REPO_ROOT / "services/discord_bot/markets" / f"{market}.yaml")
+        mode = state["modes"][market]
+        if (config.market != market or not config.enabled or not config.day_trade_simulation_enabled
+                or not config.day_trade_strict_intraday or config.day_trade_residual_margin_conversion
+                or not config.day_trade_terminal_liquidation_unlimited_capacity
+                or mode.get("terminal_close_contract") != TERMINAL_CLOSE_UNLIMITED_CONTRACT
+                or mode.get("margin_carry_contract") is not None):
+            raise RuntimeError(f"independent runtime paper/strict-close policy differs: {market}")
+        if (not config.checkpoint_path or str(mode.get("checkpoint_fingerprint") or "")
+                != short_file_fingerprint(Path(config.checkpoint_path))):
+            raise RuntimeError(f"independent runtime checkpoint differs from accepted replay: {market}")
+
+
 def main(*, before_exchange: Callable[[], None] | None = None) -> None:
     args = build_parser().parse_args()
     if args.validation_receipt is not None and not args.validate_only:
@@ -1587,7 +1631,8 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
         allow_current_open_session=bool(args.allow_current_open_session),
         allow_margin_carry=bool(args.allow_margin_carry),
     )
-    cutover_blockers = _cutover_blockers(live, candidate, expected_markets)
+    added_markets = set(getattr(args, "added_market", ()) or ())
+    cutover_blockers = _cutover_blockers(live, candidate, expected_markets, added_markets=added_markets)
     if args.validate_only:
         result = {
             "status": "validated" if not cutover_blockers else "validated_not_promotable",
@@ -1622,7 +1667,7 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
         # must never erase a still-open pre-existing live account.
         if acceptance["promotion_input_hashes"] != _promotion_input_hashes(candidate):
             raise RuntimeError("candidate history changed after validation")
-        locked_blockers = _cutover_blockers(live, candidate, expected_markets)
+        locked_blockers = _cutover_blockers(live, candidate, expected_markets, added_markets=added_markets)
         if locked_blockers:
             raise RuntimeError(
                 "replay cutover changed while draining: "
@@ -1630,6 +1675,8 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
             )
         if _sha256(candidate / "state.json") != acceptance["state_sha256"] or _sha256(candidate / "rebuild_receipt.json") != acceptance["rebuild_receipt_sha256"]:
             raise RuntimeError("candidate changed after validation")
+        if added_markets:
+            _require_added_runtime_policy(candidate, added_markets)
         if args.allow_margin_carry:
             _revalidate_margin_sources(candidate, acceptance)
             from stockagent.live.market_config import load_market_config
@@ -1642,6 +1689,13 @@ def main(*, before_exchange: Callable[[], None] | None = None) -> None:
                 if (candidate_mode.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
                         and not config.day_trade_terminal_liquidation_unlimited_capacity):
                     raise RuntimeError(f"runtime terminal close policy not enabled: {market}")
+        elif acceptance.get("strict_intraday_audit") or acceptance.get("new_component_acceptance"):
+            from stockagent.live.day_trade_addition import evidence_path
+            component_acceptance = acceptance.get("new_component_acceptance") or acceptance
+            component = (evidence_path(candidate, _load_object(candidate / "rebuild_receipt.json")["new_mode_component"])
+                         if acceptance.get("new_component_acceptance") else candidate)
+            if component_acceptance.get("strict_intraday_audit"):
+                _revalidate_margin_sources(component, component_acceptance)
         _exchange_directories(live, candidate)
         exchanged = True
         promotion_receipt = {

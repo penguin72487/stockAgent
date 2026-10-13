@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import json
+import os
+import stat
 import threading
 import time
 from types import SimpleNamespace
@@ -163,6 +165,31 @@ def test_observed_no_print_is_explicit_and_never_sized_price(owner, tmp_path):
     assert result.transport_timing["opening_quorum_ready"]
     assert quotes.tw_session_no_open_print_mask(result).tolist() == [False, True]
     assert np.isnan(result.open_prices[1])
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["official"]
+    assert metric["no_print_count"] == 1
+    assert metric["consecutive_source_no_progress"] == 0
+
+
+def test_missing_volume_cannot_reuse_cached_zero_as_a_new_no_print_proof(owner, tmp_path):
+    first = snapshot([np.nan])
+    first.volumes = np.array([0.0])
+    quotes.seed_tw_opening_snapshot_cache(["A"], first, parquet_root=tmp_path)
+    assert quotes.tw_session_no_open_print_mask(first).tolist() == [True]
+    unknown = snapshot([np.nan])
+    assert quotes.tw_session_no_open_print_mask(unknown).tolist() == [False]
+    quotes.seed_tw_opening_snapshot_cache(["A"], unknown, parquet_root=tmp_path)
+    cached = quotes.fetch_tw_mis_opening_snapshot(["A"], np.array([99.0]), parquet_root=tmp_path, allow_network=False)
+    assert quotes.tw_session_no_open_print_mask(cached).tolist() == [False]
+    assert np.isnan(cached.open_prices[0])
+
+
+@pytest.mark.parametrize("invalid", ["stale", "trial", "broker"])
+def test_only_fresh_raw_mis_zero_volume_is_no_print_evidence(owner, invalid):
+    value = snapshot([np.nan], source="shioaji:stock_snapshot" if invalid == "broker" else "twse_tpex:mis",
+                     stale=invalid == "stale", simtrade=invalid == "trial")
+    value.volumes = np.array([0.0])
+    assert not quotes.tw_session_no_open_print_mask(value).any()
 
 
 def test_failed_mis_transport_is_not_complete_and_does_not_cancel_winners(owner, tmp_path):
@@ -188,6 +215,87 @@ def test_stale_source_responses_are_waiting_not_ready(owner, tmp_path):
     assert not result.transport_timing["opening_quorum_ready"]
 
 
+@pytest.mark.parametrize("invalid", ["stale", "trial", "missing_open"])
+def test_responding_source_without_inputs_backs_off_and_other_source_recovers(owner, tmp_path, invalid):
+    calls = []
+
+    def unchanged(symbols, fallback, progress):
+        calls.append(tuple(symbols))
+        return snapshot(
+            [np.nan if invalid == "missing_open" else 100.0] * len(symbols),
+            source="shioaji:unchanged", stale=invalid == "stale", simtrade=invalid == "trial",
+        )
+
+    result = fetch(owner, tmp_path, ["A"], {"unchanged": unchanged})
+    assert owner.wait_idle(timeout_seconds=1)
+    session = next(iter(owner._sessions.values()))
+    metric = session.metrics["unchanged"]
+    assert metric["state"] == "waiting_source"
+    assert metric["response_count"] == 1
+    assert metric["consecutive_source_no_progress"] == 1
+    assert metric["retry_delay_seconds"] == 0.5
+    assert metric["retry_reason"] == "no_same_session_opening_inputs"
+    assert not result.transport_timing["opening_quorum_ready"]
+    fetch(owner, tmp_path, ["A"], {"unchanged": unchanged})
+    assert calls == [("A",)]
+    session.metrics["unchanged"]["retry_after_monotonic"] = 0.0
+    fetch(owner, tmp_path, ["A"], {"unchanged": unchanged})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert metric["consecutive_source_no_progress"] == 2
+    assert metric["retry_delay_seconds"] == 1.0
+    winner = fetch(owner, tmp_path, ["A"], {"unchanged": unchanged, "winner": lambda *a: snapshot([102.0])})
+    assert winner.open_prices.tolist() == [102.0]
+    metric["retry_after_monotonic"] = 0.0
+    recovered = fetch(owner, tmp_path, ["B"], {"unchanged": lambda *a: snapshot([103.0])})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert recovered.open_prices.tolist() == [103.0]
+    assert metric["consecutive_source_no_progress"] == 0
+    assert "retry_reason" not in metric
+    # Repairing B cannot delete A's accepted opening observation.
+    preserved = fetch(owner, tmp_path, ["A"], {})
+    assert preserved.open_prices.tolist() == [102.0]
+
+
+def test_mis_rate_limit_metadata_uses_permission_backoff(owner, tmp_path):
+    def limited(*args):
+        result = snapshot([np.nan])
+        result.available_count = 0
+        result.available_mask[:] = False
+        result.transport_timing = {"mis_failed_request_count": 1, "mis_http_error_statuses": [429]}
+        return result
+
+    result = fetch(owner, tmp_path, ["A"], {"official_mis": limited})
+    metric = result.transport_timing["opening_providers"]["official_mis"]
+    assert metric["state"] == "failed"
+    assert metric["retry_delay_seconds"] == 60.0
+
+
+def test_partial_mis_peer_refusal_keeps_inputs_and_uses_endpoint_backoff(owner, tmp_path):
+    def mis(symbols, fallback, progress):
+        result = snapshot([101., np.nan])
+        result.available_count = 1
+        result.available_mask[:] = [True, False]
+        result.transport_timing = {
+            "mis_failed_request_count": 4, "mis_dispatch_stopped": True,
+            "mis_error_chain_types": ["ConnectionError", "RemoteDisconnected"],
+        }
+        return result
+
+    result = fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    session = next(iter(owner._sessions.values()))
+    metric = session.metrics["official_mis"]
+    assert metric["state"] == "degraded"
+    assert metric["retry_delay_seconds"] == 15.
+    assert metric["retry_reason"] == "source_endpoint_unavailable"
+    # A healthy independent source can resolve B during MIS's quiet interval.
+    result = fetch(owner, tmp_path, ["A", "B"], {
+        "official_mis": lambda *_: pytest.fail("refused MIS source must wait"),
+        "winner": lambda names, *_: snapshot([102.] * len(names)),
+    })
+    assert result.open_prices.tolist() == [101., 102.]
+
+
 def test_overlapping_models_only_request_universe_delta(owner, tmp_path):
     calls = []
     release, first_started = threading.Event(), threading.Event()
@@ -211,6 +319,58 @@ def test_overlapping_models_only_request_universe_delta(owner, tmp_path):
     assert all(quotes.tw_session_open_observed_mask(row).all() for row in results)
 
 
+def test_overlapping_full_and_delta_receipts_keep_job_counts_and_unique_provider_coverage(owner, tmp_path):
+    entered, release = threading.Event(), threading.Event()
+
+    def source(symbols, fallback, progress):
+        if len(symbols) == 3:
+            entered.set()
+            assert release.wait(timeout=2)
+        return snapshot([100.] * len(symbols), source="shioaji:fixture")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        full = pool.submit(fetch, owner, tmp_path, list("ABC"), {"same": source})
+        assert entered.wait(timeout=1)
+        delta = fetch(owner, tmp_path, ["D"], {"same": source})
+        assert delta.open_prices.tolist() == [100.]
+        release.set()
+        assert full.result(timeout=1).open_prices.tolist() == [100., 100., 100.]
+    owner.close()
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat()).with_suffix(".acquisition.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    finished = [row for row in events if row["provider"] == "same" and row["event"] == "finished"]
+    assert sorted(row["requested_count"] for row in finished) == [1, 3]
+    assert sorted(row["response_count"] for row in finished) == [1, 3]
+    assert len({row["job_id"] for row in finished}) == 2
+    aggregate = next(iter(owner._sessions.values())).metrics["same"]
+    assert aggregate["unique_requested_count"] == 4
+    assert aggregate["response_count"] == aggregate["valid_open_count"] == 4
+    observed = [row for row in events if row["event"] == "observations_delta"]
+    assert {item["symbol"] for row in observed for item in row["observations"]} == set("ABCD")
+
+
+def test_quality_transitions_are_receipted_without_erasing_success_on_partial_progress(owner, tmp_path):
+    def source(symbols, fallback, progress):
+        progress(symbols, snapshot([100., 101.], stale=True))
+        progress([symbols[0]], snapshot([100.]))
+        # An incomplete final response may not erase A's earlier valid proof.
+        result = snapshot([np.nan, 101.])
+        result.available_mask[0] = False
+        result.available_count = 1
+        return result
+
+    result = fetch(owner, tmp_path, ["A", "B"], {"source": source}, minimum_coverage=1)
+    owner.close()
+    assert result.open_prices.tolist() == [100., 101.]
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat()).with_suffix(".acquisition.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    changes = [item for row in events if row["event"] == "observations_delta" for item in row["observations"]]
+    assert {item["state"] for item in changes} == {"stale_or_preopen_time", "valid_open"}
+    aggregate = next(iter(owner._sessions.values())).metrics["source"]
+    assert aggregate["valid_open_count"] == 2
+    assert aggregate["last_valid_open_count"] == 1
+
+
 def test_conflict_preserves_first_price_and_both_proofs(owner, tmp_path):
     first = snapshot([100.0])
     second = snapshot([101.0], source="shioaji:second")
@@ -223,6 +383,120 @@ def test_conflict_preserves_first_price_and_both_proofs(owner, tmp_path):
     assert receipt["rows"]["A"]["opening_conflicts"][0]["price"] == 101.0
     quotes.seed_tw_opening_snapshot_cache(["A"], second, parquet_root=tmp_path)
     assert len(quotes._TW_MIS_OPENING_CACHE["A"][1]["opening_conflicts"]) == 1
+
+
+def test_identical_progress_and_existing_scope_do_not_rewrite_receipt(owner, tmp_path, monkeypatch):
+    value = snapshot([100.])
+    writes = []
+    original = quotes._persist_tw_mis_opening_receipt
+
+    def persist(**kwargs):
+        writes.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(quotes, "_persist_tw_mis_opening_receipt", persist)
+    quotes.seed_tw_opening_snapshot_cache(["A"], value, parquet_root=tmp_path)
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    raw, stat = path.read_bytes(), path.stat()
+    for _ in range(5):
+        result = quotes.seed_tw_opening_snapshot_cache(["A"], value, parquet_root=tmp_path)
+        assert result["accepted_count"] == 1
+        quotes.seed_tw_opening_snapshot_cache(["A"], quotes.PriceSnapshot(
+            prices=np.array([99.]), source="opening_request_scope",
+            available_mask=np.zeros(1, dtype=bool)), parquet_root=tmp_path)
+    assert len(writes) == 1
+    assert path.read_bytes() == raw
+    assert path.stat().st_mtime_ns == stat.st_mtime_ns
+    assert not quotes._TW_MIS_OPENING_DIRTY
+
+
+def test_new_scope_is_durable_even_if_provider_has_no_rows(owner, tmp_path):
+    for names in [["A"], ["A", "B"]]:
+        quotes.seed_tw_opening_snapshot_cache(names, quotes.PriceSnapshot(
+            prices=np.full(len(names), 99.), source="opening_request_scope",
+            available_mask=np.zeros(len(names), dtype=bool)), parquet_root=tmp_path)
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    receipt = json.loads(path.read_text())
+    assert receipt["requested_symbols"] == ["A", "B"]
+    assert receipt["rows"] == {}
+
+
+def test_new_receipt_clock_is_not_hidden_by_write_deduplication(owner, tmp_path):
+    first = snapshot([100.])
+    quotes.seed_tw_opening_snapshot_cache(["A"], first, parquet_root=tmp_path)
+    later = snapshot([100.])
+    later.timestamps_ms += 5
+    later.exchange_timestamps_ms += 5
+    quotes.seed_tw_opening_snapshot_cache(["A"], later, parquet_root=tmp_path, persist=False)
+    assert quotes._TW_MIS_OPENING_DIRTY
+    quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path,
+        session_date=acquisition.datetime.now(TAIPEI).date().isoformat())
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    row = json.loads(path.read_text())["rows"]["A"]
+    assert row["timestamp_ms"] == int(later.timestamps_ms[0])
+    assert row["open_timestamp_ms"] == int(first.exchange_timestamps_ms[0])
+
+
+def test_source_receipt_syncs_file_then_directory_before_return(owner, tmp_path, monkeypatch):
+    events = []
+    sync, replace = os.fsync, os.replace
+
+    def synced(fd):
+        events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        sync(fd)
+
+    def replaced(source, dest):
+        events.append("replace")
+        replace(source, dest)
+
+    monkeypatch.setattr(os, "fsync", synced)
+    monkeypatch.setattr(os, "replace", replaced)
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path)
+    assert events == ["file", "replace", "directory"]
+    assert not quotes._TW_MIS_OPENING_DIRTY
+
+
+@pytest.mark.parametrize("failure", ["file", "directory"])
+def test_failed_source_durability_remains_dirty_and_can_recover(owner, tmp_path, monkeypatch, failure):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path)
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    raw = path.read_bytes()
+    sync = os.fsync
+
+    def failed(fd):
+        kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        if kind == failure:
+            raise OSError("injected storage barrier failure")
+        sync(fd)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "fsync", failed)
+        with pytest.raises(OSError, match="storage barrier"):
+            quotes.seed_tw_opening_snapshot_cache(["A", "B"], snapshot([100., 101.]), parquet_root=tmp_path)
+    assert quotes._TW_MIS_OPENING_DIRTY
+    if failure == "file":
+        assert path.read_bytes() == raw
+    quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path,
+        session_date=acquisition.datetime.now(TAIPEI).date().isoformat())
+    assert not quotes._TW_MIS_OPENING_DIRTY
+    assert set(json.loads(path.read_text())["rows"]) == {"A", "B"}
+
+
+def test_float64_fast_conversion_matches_text_contract_bit_for_bit():
+    values = np.random.default_rng(726).lognormal(0., 100., 1000)
+    values = np.r_[values, np.nextafter(0., 1.), np.finfo(np.float64).max, 100.12345678901235]
+    for value in values:
+        expected = float(str(value))
+        assert quotes._float_or_none(value).hex() == expected.hex()
+        assert quotes._quantity_or_none(value).hex() == expected.hex()
+    for value in (np.float64(np.nan), np.float64(np.inf), np.float64(-1.)):
+        assert quotes._float_or_none(value) is None
+        assert quotes._quantity_or_none(value) is None
+    assert quotes._quantity_or_none(np.float64(0.)) == 0.
+    assert quotes._float_or_none(np.float32(100.1)) == float(str(np.float32(100.1)))
+    assert quotes._float_or_none(np.float32(100.1)) != float(np.float32(100.1))
+    assert quotes._quantity_or_none(np.bool_(True)) is None
+    assert quotes._float_or_none(True) is None
 
 
 def test_preopen_and_closed_generation_do_not_query(owner, monkeypatch, tmp_path):

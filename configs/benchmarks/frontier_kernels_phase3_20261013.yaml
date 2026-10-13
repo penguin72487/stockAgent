@@ -1,0 +1,48 @@
+contract: frontier_complete_fold_recipes_v1
+# Microbenchmarks do not prove compatibility with fullgraph, rematerialization
+# or DDP. Every admitted model adapter therefore gets a complete-fold trial.
+full_fold_candidates:
+  - name: native_baseline_after_suite
+    overrides: {}
+  - name: packed_swiglu
+    overrides:
+      training:
+        financial_transformer: {fused_swiglu_projection: true}
+  - name: liger_layernorm
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_norm_backend: liger}
+  - name: quack_layernorm
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_norm_backend: quack_layernorm}
+  - name: liger_swiglu
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_swiglu_backend: liger}
+  - name: cublaslt
+    overrides:
+      training:
+        financial_transformer: {kernel_linear_backend: cublaslt}
+  - name: quack_softmax
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_softmax_backend: quack}
+  - name: quack_compact_bf16
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_linear_backend: quack_compact, compact_projection_compute_dtype: bf16}
+  - name: flash4_temporal_bf16
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_attention_backend: flash4_temporal, temporal_blocks_fp32: false}
+  - name: combined_bf16_retention
+    overrides:
+      training:
+        financial_transformer: {compact_projection_compute_dtype: bf16, temporal_blocks_fp32: false, portfolio_blocks_fp32: false, factorized_encoder_force_retention: true}

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.metadata
 import json
+import os
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
@@ -192,6 +194,28 @@ def _project_temporal_basis_model_config(
     """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
+    if projected.get("compiled_cross_attention_backend") == "sdpa_explicit":
+        projected["sdpa_dispatch_contract"] = "masked_credit_math_only_v2"
+    if projected.get("compiled_cross_attention_backend") == "sdpa_padded":
+        projected["sdpa_dispatch_contract"] = "masked_credit_aligned_key128_channel16_excludes_cudnn_v1"
+    if projected.get("compiled_cross_attention_backend") == "manual_fp32_last":
+        projected["last_query_mask_contract"] = "empty_key_mask_zero_credit_v1"
+    if projected.get("kernel_attention_backend") in {"flash4", "flash4_temporal"}:
+        projected["flash4_unmasked_contract"] = "vendor_forward_backward_custom_op_v2"
+    if projected.get("kernel_linear_backend") == "torchao_fp8":
+        projected["torchao_padding_contract"] = "neutral_mnk16_crop_full_credit_v2"
+    for name, default in {"kernel_norm_backend": "torch", "kernel_linear_backend": "torch",
+            "kernel_swiglu_backend": "torch", "kernel_attention_backend": "torch",
+            "kernel_softmax_backend": "torch",
+            "compact_projection_compute_dtype": "fp32", "factorized_compile_autotune": False,
+            "factorized_cuda_graphs": False, "factorized_portfolio_cuda_graphs": False,
+            "factorized_relaxed_precision_casts": False,
+            "factorized_encoder_force_retention": False,
+            "factorized_encoder_packet_cache": True, "fused_swiglu_projection": False}.items():
+        if projected.get(name, default) == default:
+            projected.pop(name, None)
+        else:
+            projected["training_kernel_contract"] = "explicit_training_kernel_dispatch_v1"
     if not projected.get("temporal_basis_disabled_families"):
         # Empty is the historical all-paths-enabled forward and adds neither
         # parameters nor behavior.  Keep completed pre-switch checkpoints
@@ -348,6 +372,37 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if snapshot["training"]["ddp_broadcast_buffers"]:
+        snapshot["training"].pop("ddp_broadcast_buffers")
+    if snapshot["training"]["ddp_trajectory_gradient_sync"] == "batch":
+        snapshot["training"].pop("ddp_trajectory_gradient_sync")
+    if config.training.model_name == "financial_transformer":
+        model = config.training.financial_transformer
+        backends = {model.kernel_norm_backend, model.kernel_linear_backend,
+            model.kernel_swiglu_backend, model.kernel_attention_backend, model.kernel_softmax_backend}
+        packages = set()
+        if any(name.startswith("quack") for name in backends):
+            packages.update(("quack-kernels", "nvidia-cutlass-dsl"))
+        if "liger" in backends:
+            packages.update(("liger-kernel", "triton"))
+        if any(name.startswith("flash4") for name in backends):
+            packages.update(("flash-attn-4", "nvidia-cutlass-dsl"))
+        if "torchao_fp8" in backends:
+            packages.update(("torchao", "triton"))
+        if "deepgemm_bf16" in backends:
+            packages.add("deep-gemm")
+        if backends.intersection(("te_fp8", "te_nvfp4")):
+            packages.add("transformer-engine")
+        versions = {}
+        for package in sorted(packages):
+            try:
+                versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                # Config inspection is useful before optional installation;
+                # execution itself still requires the package without fallback.
+                versions[package] = "not-installed"
+        if versions:
+            snapshot["training"]["financial_transformer"]["kernel_package_versions"] = versions
     # Bit-preserving CPU/CUDA reconstruction changes transport scheduling,
     # not observations, shapes, graph arithmetic or the optimizer trajectory.
     # Exact runtime/config/source receipts still record the selected mode.
@@ -359,6 +414,24 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     # encoder mathematics, RNG or optimizer. Exact release/config receipts
     # retain this executor setting; canonical semantic resume stays unchanged.
     snapshot["training"].pop("factorized_encoder_checkpoint", None)
+    if normalize_execution_mode(config.trading.execution_mode) == "tw_day_trade":
+        from stockagent.backtest.tw_day_trade_carry import _carry_compile_options
+        options = _carry_compile_options()
+        default = {"triton.cudagraphs": False, "max_fusion_size": 8,
+            "triton.coalesce_tiling_analysis": False}
+        if options != default:
+            # Compiler fusion can alter rounding and its adjoint. The actual
+            # environment is consumed by the shared physical FIFO compiler;
+            # retain native/default checkpoint compatibility only at defaults.
+            snapshot["training"]["physical_fifo_compile_contract"] = {
+                "version": "explicit_physical_fifo_compile_options_v1", "options": options}
+        calendar = {name: str(os.environ.get(name, "0")).lower() not in {"0", "false", "off", "no"}
+            for name in ("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "STOCKAGENT_DAY_TRADE_CALENDAR_COMPILE")}
+        if any(calendar.values()):
+            snapshot["training"]["physical_fifo_calendar_contract"] = {
+                "version": "immutable_cuda_ordinal_and_compiled_restore_v1", "options": calendar}
+        if str(os.environ.get("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "0")).lower() not in {"0", "false", "off", "no"}:
+            snapshot["training"]["physical_fifo_prepare_contract"] = "tensor_gregorian_bucketed_inventory_funding_preparation_v3"
     if not getattr(config.data, "factorized_feature_manifest", ""):
         snapshot["data"].pop("factorized_feature_manifest", None)
     elif config.training.enable_torch_compile:
@@ -752,6 +825,10 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         "auto_batch_size": bool(training.auto_batch_size),
         "train_symbol_compaction": compaction_mode,
     }
+    if not training.ddp_broadcast_buffers:
+        batching_contract["ddp_broadcast_buffers"] = False
+    if training.ddp_trajectory_gradient_sync == "trajectory":
+        batching_contract["gradient_sync"] = "once_per_trajectory_dense_mean_v1"
     if compaction_mode != "none":
         batching_contract["train_symbol_compaction_bucket_size"] = (
             _normalize_train_symbol_compaction_bucket_size(

@@ -2,6 +2,16 @@
 
 Use when changing neural runners, distributed execution, resume, checkpoint identity or completion artifacts. Keep specialized product semantics inside the canonical lifecycle.
 
+Cross-node training recovery uses the original `train.py --resume`, not a second
+trainer. Pin original source/config/runtime and source-release SHAs; preserve
+group-last optimizer/scaler/scheduler/per-rank RNG/normalizer/early-stop state
+with same-epoch curves. Weights-only transfer is not exact resume. A fresh target
+must pass strict initialized CUDA and the original prepared/checkpoint ABI;
+do not change world size/global batch or silently substitute today's builder.
+New full checkpoint progress plus D readback, not Supervisor `running`, proves
+recovery acceptance. User chooses and confirms the destination; fence the old
+worker before launch. Scope and commands: [Vast training rescue](../vast_training_rescue_2026-10-13.md).
+
 ## Trainer Executor Boundaries
 
 - Never guard a distributed phase rendezvous with a mutable shared-file

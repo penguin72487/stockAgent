@@ -284,7 +284,7 @@ class CandleEncoder(nn.Module):
             except (ValueError, RuntimeError) as error:
                 error_msgs.append(f"{prefix}feature SVD: {error}")
 
-    def _normalize_raw_features(self, x: torch.Tensor) -> torch.Tensor:
+    def _normalize_raw_features(self, x: torch.Tensor, *, owned_inference: bool = False) -> torch.Tensor:
         if not self.causal_feature_rms_normalization:
             return x
         scale = self.causal_feature_rms_scale.to(
@@ -295,7 +295,16 @@ class CandleEncoder(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
-        normalized = (x / scale) * active
+        if owned_inference:
+            if (self.training or not torch.is_inference_mode_enabled()
+                    or self.causal_feature_compression != "none"):
+                raise RuntimeError("owned normalization requires plain, inference-only features")
+            # Two ordinary FP32 kernels, in the original order. x is a
+            # caller-owned clone; do not mutate the panel/window or merge the
+            # operations into a differently-rounded contraction.
+            normalized = x.div_(scale).mul_(active)
+        else:
+            normalized = (x / scale) * active
         if self.causal_feature_compression == "none":
             return normalized
         indices = self.causal_feature_compression_index_tensor
@@ -359,10 +368,19 @@ class CandleEncoder(nn.Module):
         model_dtype = self.joint_projection.proj.weight.dtype
         model_device = self.joint_projection.proj.weight.device
         clean_fp32 = x.to(device=model_device, dtype=torch.float32)
+        owned_normalization = bool(
+            not input_is_normalized and self.causal_feature_rms_normalization
+            and self.causal_feature_compression == "none"
+            and not self.training and torch.is_inference_mode_enabled()
+        )
+        if owned_normalization:
+            clean_fp32 = clean_fp32.clone()
         if self.sanitize_inputs:
-            clean_fp32 = torch.nan_to_num(clean_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+            clean_fp32 = (torch.nan_to_num_(clean_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+                          if owned_normalization else
+                          torch.nan_to_num(clean_fp32, nan=0.0, posinf=0.0, neginf=0.0))
         if not input_is_normalized:
-            clean_fp32 = self._normalize_raw_features(clean_fp32)
+            clean_fp32 = self._normalize_raw_features(clean_fp32, owned_inference=owned_normalization)
 
         continuous = self._continuous_features(clean_fp32)
         if not self.categorical_feature_indices:
@@ -395,9 +413,10 @@ class CandleEncoder(nn.Module):
         """
 
         model_dtype = self.joint_projection.proj.weight.dtype
-        continuous = normalized_raw.index_select(
-            -1, self.continuous_feature_index_tensor
-        ).to(dtype=model_dtype)
+        # Without categorical channels this selection is exactly the identity.
+        # Keep the non-contiguous case on its original materializing path.
+        continuous = (normalized_raw if not self.categorical_feature_indices and normalized_raw.is_contiguous()
+                      else normalized_raw.index_select(-1, self.continuous_feature_index_tensor)).to(dtype=model_dtype)
         if self.feature_svd_components:
             if not self._feature_svd_fitted:
                 raise RuntimeError("feature SVD must be fitted on training rows before model forward")
@@ -551,7 +570,7 @@ class CandleEncoder(nn.Module):
                     # dense LayerNorm. Moving every beta outside TF32's input
                     # rounding unnecessarily amplifies the operation reorder.
                     selected=selected+selected_bias
-                projected = F.linear(selected, selected_weight)
+                projected = self._compact_projection_linear(selected, selected_weight)
                 projected = projected - mean * inverse * zero_shift
                 # Beta acts on every logical column, including positive zeros.
                 if norm.bias is not None:
@@ -560,12 +579,20 @@ class CandleEncoder(nn.Module):
             elif isinstance(norm, PortfolioRMSNorm):
                 variance = x.square().sum(dim=-1, keepdim=True) / float(self.num_features)
                 inverse = torch.rsqrt(variance + norm.eps)
-                projected = F.linear((x * inverse) * selected_gamma, selected_weight)
+                projected = self._compact_projection_linear((x * inverse) * selected_gamma, selected_weight)
             else:
                 raise ValueError("compact projection requires LayerNorm or PortfolioRMSNorm")
             if projection.bias is not None:
                 projected = projected + projection.bias.float()
             return self._finish_embedding(self._activate_projected(projected))
+
+    def _compact_projection_linear(self, x, weight):
+        # Statistics, affine zero-column corrections and master parameters stay
+        # FP32. The explicitly versioned trial changes only this GEMM compute.
+        if getattr(self, "compact_projection_compute_dtype", "fp32") == "bf16":
+            x, weight = x.to(torch.bfloat16), weight.to(torch.bfloat16)
+        kernel = getattr(self, "_compact_linear", F.linear)
+        return kernel(x, weight).float()
 
 
 class TemporalBasisInputFeatureBuilder(nn.Module):

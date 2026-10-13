@@ -170,6 +170,11 @@ function healthMessage(snapshot) {
 }
 
 function renderHeader(snapshot) {
+  const quoteNotice = byId("quote-display-notice");
+  if (quoteNotice) {
+    quoteNotice.textContent = snapshot.price_display_policy?.message || "";
+    quoteNotice.classList.toggle("hidden", !snapshot.price_display_policy);
+  }
   const dot = byId("live-dot");
   dot.className = "live-dot";
   const presentation = healthPresentation(snapshot);

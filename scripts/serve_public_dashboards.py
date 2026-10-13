@@ -1312,6 +1312,7 @@ def summarize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
         "execution_records",
         "session_progress",
         "preopen",
+        "current_trading_universe",
     )
     summary = {key: payload[key] for key in allowed if key in payload}
     summary["open_position_count"] = open_count
@@ -2134,7 +2135,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
             f"latest@{display_session}" if display_session else "latest"
         )
         cache_prefix = f"tw-status:{date_scope}:"
-        cache_key = f"{cache_prefix}{revision_token}"
+        from stockagent.data.tw_current_trading_universe import receipt_path, TAIPEI
+        try:
+            registry = receipt_path(datetime.now(TAIPEI).date().isoformat()).stat()
+            registry_token = f"{registry.st_mtime_ns}:{registry.st_size}"
+        except OSError:
+            registry_token = "official_registry_pending"
+        cache_key = f"{cache_prefix}{revision_token}:registry:{registry_token}"
 
         def build_status() -> Mapping[str, Any]:
             payload = sanitize_tw_status(

@@ -1501,6 +1501,26 @@ run_fintech_python scripts/manage_gpu_jobs.py stop us crypto
 `training.multi_gpu_strategy: auto` 配合可見 GPU 數自動選單卡或 DDP。不要另外建立第二套
 loss/backtest executor。
 
+### Vast 故障後換機續訓
+
+先保存固定程式／runtime、完整 optimizer checkpoint 與固定冷資料依賴；
+故障後由你指定新 SSH 並確認，才檢驗新機 CUDA、重建訓練視圖及 `--resume`。
+不自動租機、停止整台 Vast 或 Destroy；不搬網站／服務，也不複製整份資料 snapshot。
+
+```bash
+# 平常查保全狀態；不會啟動訓練
+bash scripts/run_training_rescue.sh status
+
+# 故障後、已選好新機時才發出臨時公鑰；私鑰不外傳
+bash scripts/run_training_rescue.sh key --hours 24
+```
+
+只有登錄的 run 受保護；本次為 `tw-v6-embedding-d128` 的 epoch 121。
+新機真正續訓須等其新完整 checkpoint 回傳 D 才驗收。完整 `capture`、
+`seal-bootstrap`、`verify-sources`、`register`、`plan`、`fence-provider`、
+`fence-guardian`、`recover`、`cycle`、`revoke-key` 的用法和 agent 接手契約，見
+[Vast 訓練救援](docs/vast_training_rescue_2026-10-13.md)。
+
 ### 解釋性分析
 
 ```bash

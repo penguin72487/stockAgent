@@ -1,0 +1,9 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: sdpa_explicit_cross_bf16
+    overrides:
+      training:
+        financial_transformer:
+          temporal_blocks_fp32: false
+          portfolio_blocks_fp32: false
+          compiled_cross_attention_backend: sdpa_explicit

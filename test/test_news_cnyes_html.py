@@ -78,7 +78,7 @@ def test_native_quote_outcome_requires_original_identity_free_clock_and_text(cny
 
 
 @pytest.mark.parametrize('body', ['(OTT) 2.39 : actual prose', '(OTT) 2.39 : 來源敘述',
-                                '(OTT) 2.39', 'Useful brief financial news report', '(1) 2.39 :',
+                                'Useful brief financial news report', '(1) 2.39 :',
                                 '(THG)51.01+0.40: actual prose', '(LIVE)3.25+0.42:中文正文',
                                 '(THG)51.01+0.40-0.50:', '(LIVE)3.25+0.42(10%):',
                                 '(THG)51.01+:', '(THG)51.01+-0.40:'])
@@ -133,7 +133,7 @@ def test_signed_quote_outcome_upgrade_preserves_bulk_checkpoint_identity(cnyes_c
         except (ValueError, TypeError, UnicodeDecodeError):
             return original_sha256(value)
         if isinstance(payload, dict) and 'verified_native_quote_only_outcome_contract_version' in payload:
-            assert payload['verified_native_quote_only_outcome_contract_version'] == 6
+            assert payload['verified_native_quote_only_outcome_contract_version'] == 7
             payload['verified_native_quote_only_outcome_contract_version'] = 1
             return original_sha256(json.dumps(payload, sort_keys=True).encode())
         return original_sha256(value)
@@ -471,6 +471,7 @@ def test_no_short_exception_on_other_provider(cnyes_config, tmp_path):
     cfg = deepcopy(cnyes_config)
     cfg['providers'][0].update(id='other', domains=['example.test'], cnyes_apis=[])
     cfg['providers'][0].pop('cnyes_history_start')
+    cfg['providers'][0].pop('cnyes_public_index', None)
     result = PolicyRegistry(cfg, base=tmp_path).sources['other']
     with pytest.raises(NewsError, match='body_not_found'):
         extract_article(short_page(), result, page_url=URL)

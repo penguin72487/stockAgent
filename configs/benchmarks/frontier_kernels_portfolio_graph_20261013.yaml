@@ -1,0 +1,6 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: portfolio_only_cuda_graphs
+    overrides:
+      training:
+        financial_transformer: {factorized_portfolio_cuda_graphs: true}

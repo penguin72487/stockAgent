@@ -19734,6 +19734,7 @@ def _wrap_distributed_data_parallel_model(
         "output_device": device.index if device.type == "cuda" else None,
         "bucket_cap_mb": int(getattr(config.training, "ddp_bucket_cap_mb", 4)),
         "find_unused_parameters": False,
+        "broadcast_buffers": bool(config.training.ddp_broadcast_buffers),
     }
     try:
         ddp_params = inspect.signature(DistributedDataParallel).parameters
@@ -19741,14 +19742,29 @@ def _wrap_distributed_data_parallel_model(
             ddp_kwargs["gradient_as_bucket_view"] = True
     except (TypeError, ValueError):
         pass
+    if not config.training.ddp_broadcast_buffers and any(
+        isinstance(child, nn.modules.batchnorm._BatchNorm) for child in module.modules()
+    ):
+        raise ValueError("disabling DDP buffer broadcasts requires immutable model buffers")
     try:
-        return DistributedDataParallel(
+        wrapped = DistributedDataParallel(
             module,
-            static_graph=bool(static_graph),
+            static_graph=bool(static_graph) and config.training.ddp_trajectory_gradient_sync != "trajectory",
             **ddp_kwargs,
         )
     except TypeError:
-        return DistributedDataParallel(module, **ddp_kwargs)
+        wrapped = DistributedDataParallel(module, **ddp_kwargs)
+    if not config.training.ddp_broadcast_buffers:
+        # Keep rank-zero initialization authoritative, including fitted
+        # normalizers. Subsequent immutable reads need no per-forward broadcast.
+        with torch.no_grad():
+            for buffer in wrapped.module.buffers():
+                if buffer.numel():
+                    dist.broadcast(buffer, src=0)
+        wrapped._stockagent_immutable_buffer_versions = {
+            name: (buffer, buffer._version) for name, buffer in wrapped.module.named_buffers()
+        }
+    return wrapped
 
 
 def _resolve_host_compilers() -> tuple[str | None, str | None]:
@@ -19786,6 +19802,34 @@ def _resolve_host_compilers() -> tuple[str | None, str | None]:
         return None
 
     return _resolve(cc_candidates), _resolve(cxx_candidates)
+
+
+def _cuda_graph_capture_snapshot(config: ExperimentConfig) -> dict[str, Any]:
+    """Inspect opt-in graph captures; unavailable evidence stays unknown."""
+    settings = config.training.financial_transformer
+    enabled = (getattr(settings, "factorized_cuda_graphs", False)
+        or getattr(settings, "factorized_portfolio_cuda_graphs", False)
+        or os.environ.get("STOCKAGENT_DAY_TRADE_CUDAGRAPHS", "0") == "1")
+    if not enabled:
+        return {}
+    try:
+        from torch._inductor.cudagraph_trees import get_container
+        device = torch.cuda.current_device()
+        manager = get_container(device).tree_manager
+        roots = [node for nodes in manager.roots.values() for node in nodes] if manager is not None else []
+        pending, visited = list(roots), set()
+        while pending:
+            node = pending.pop()
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            pending.extend(child for children in getattr(node, "children", {}).values() for child in children)
+        return {"cuda_graph_root_count_local": len(roots), "cuda_graph_node_count_local": len(visited),
+            "cuda_graph_runtime_inspection_ok": True, "cuda_graph_device_index_local": device}
+    except Exception as exc:
+        return {"cuda_graph_root_count_local": None, "cuda_graph_node_count_local": None,
+            "cuda_graph_runtime_inspection_ok": False,
+            "cuda_graph_runtime_inspection_error": type(exc).__name__}
 
 
 def _dynamo_compile_counter_snapshot() -> dict[str, int]:
@@ -22008,6 +22052,68 @@ def _train_epoch_windowed_tensor(
     ), timing
 
 
+def _defer_trajectory_ddp_sync(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Include every forward/backward in no_sync; reduce before the sole update."""
+    @wraps(function)
+    def run(model: nn.Module, *args: Any, **kwargs: Any) -> Any:
+        deferred = kwargs.get("ddp_trajectory_gradient_sync", "batch") == "trajectory"
+        if not deferred:
+            return function(model, *args, **kwargs)
+        if not kwargs.get("optimizer_step_per_trajectory", False):
+            raise ValueError("deferred DDP synchronization requires trajectory accumulation")
+        if not isinstance(model, DistributedDataParallel) or model.static_graph:
+            raise ValueError("deferred synchronization requires DDP with static_graph=False")
+        with model.no_sync():
+            return function(model, *args, **kwargs)
+    return run
+
+
+def _synchronize_trajectory_gradients(model: nn.Module) -> None:
+    """Average accumulated dense gradients with the same scaling as DDP."""
+    parameters = [(name, parameter) for name, parameter in model.named_parameters()
+        if parameter.requires_grad]
+    if not parameters:
+        return
+    presence = torch.tensor([int(parameter.grad is not None) for _, parameter in parameters],
+        dtype=torch.int32, device=parameters[0][1].device)
+    dist.all_reduce(presence, op=dist.ReduceOp.SUM)
+    counts = presence.cpu().tolist()
+    world_size = _distributed_world_size()
+    if any(count not in (0, world_size) for count in counts):
+        raise RuntimeError("trajectory gradients are absent on only some DDP ranks")
+    groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for (name, parameter), count in zip(parameters, counts, strict=True):
+        if count == 0:
+            continue
+        if parameter.grad.is_sparse:
+            raise RuntimeError(f"trajectory synchronization requires a dense gradient: {name}")
+        gradient = parameter.grad
+        groups.setdefault((gradient.device, gradient.dtype), []).append(gradient)
+    with torch.no_grad():
+        for gradients in groups.values():
+            packed = torch.cat([gradient.reshape(-1) for gradient in gradients])
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            packed.div_(world_size)
+            offset = 0
+            for gradient in gradients:
+                size = gradient.numel()
+                gradient.copy_(packed[offset:offset + size].view_as(gradient))
+                offset += size
+
+
+def _assert_immutable_ddp_buffers(model: nn.Module) -> None:
+    expected = getattr(model, "_stockagent_immutable_buffer_versions", None)
+    if expected is None:
+        return
+    current = dict(model.module.named_buffers())
+    if current.keys() != expected.keys() or any(
+        current[name] is not buffer or buffer._version != version
+        for name, (buffer, version) in expected.items()
+    ):
+        raise RuntimeError("model buffers changed with DDP buffer broadcasts disabled")
+
+
+@_defer_trajectory_ddp_sync
 def _train_epoch_windowed_tensor_ddp(
     model: nn.Module,
     loss_fn: Callable[..., torch.Tensor],
@@ -22062,6 +22168,7 @@ def _train_epoch_windowed_tensor_ddp(
     replicated_ledger_local_metadata: bool = False,
     optimizer_step_per_trajectory: bool = False,
     log_return_weights: torch.Tensor | None = None,
+    ddp_trajectory_gradient_sync: str = "batch",
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -22834,7 +22941,15 @@ def _train_epoch_windowed_tensor_ddp(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    _assert_immutable_ddp_buffers(model)
     if optimizer_step_per_trajectory and steps > 0:
+        if ddp_trajectory_gradient_sync == "trajectory":
+            sync_start = time.perf_counter()
+            _synchronize_trajectory_gradients(model)
+            _maybe_sync_cuda(device, profile_timing)
+            sync_elapsed = time.perf_counter() - sync_start
+            timing.grad_s += sync_elapsed
+            timing.backward_s += sync_elapsed
         _finalize_trajectory_optimizer_step(
             model=model,
             optimizer=optimizer,
@@ -28038,6 +28153,7 @@ def _run_training_impl(
                         train_windowed,
                         active_optimizer,
                         scaler,
+                        ddp_trajectory_gradient_sync=config.training.ddp_trajectory_gradient_sync,
                         batch_size=train_batch_size,
                         device=device,
                         amp_dtype=amp_dtype,
@@ -28673,6 +28789,7 @@ def _run_training_impl(
                                               if math.isfinite(c.best_val_loss)), default=None),
                         "improved": None,
                         **policy_step_payload,
+                        **_cuda_graph_capture_snapshot(config),
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -29335,6 +29452,7 @@ def _run_training_impl(
                                               if math.isfinite(c.best_val_loss)), default=None),
                         "improved": bool(any_fold_improved),
                         **policy_step_payload,
+                        **_cuda_graph_capture_snapshot(config),
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),

@@ -6,6 +6,7 @@ from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch import nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
@@ -221,7 +222,16 @@ class SwiGLUFeedForward(nn.Module):
         self.out_dropout = nn.Dropout(float(dropout))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden = F.silu(self.gate_proj(x)) * self.value_proj(x)
+        if bool(getattr(self, "fused_gate_value_projection", False)):
+            # Same parameters and complete credit paths. Packing two GEMMs
+            # with the same input changes their launch/tile schedule only.
+            weight = torch.cat((self.gate_proj.weight, self.value_proj.weight), dim=0)
+            bias = torch.cat((self.gate_proj.bias, self.value_proj.bias), dim=0)
+            gate, value = F.linear(x, weight, bias).chunk(2, dim=-1)
+        else:
+            gate, value = self.gate_proj(x), self.value_proj(x)
+        kernel = getattr(self, "_kernel_swiglu", None)
+        hidden = F.silu(gate) * value if kernel is None else kernel(gate, value)
         hidden = self.dropout(hidden)
         return self.out_dropout(self.out_proj(hidden))
 
@@ -1675,12 +1685,44 @@ def _compiled_cross_attention_is_manual(backend,dtype,query_steps,key_steps,work
     extended mode retains manual's half-precision behavior; FP32 uses direct
     reductions only for one query, not large latent/market-token attentions.
     """
+    # Legacy sdpa retains its historical Blackwell workaround. A new label
+    # owns explicit dispatch and a distinct checkpoint configuration fingerprint.
+    if backend in {"sdpa_explicit", "sdpa_padded"}:
+        return False
     if dtype==torch.float32:
         return backend=="manual_fp32_last" and query_steps==1
     if dtype not in {torch.float16,torch.bfloat16}:
         return False
     return (backend in {"manual","manual_fp32_last"} or workaround
             or (backend=="auto" and query_steps*key_steps<=4096))
+
+
+def _compiled_padded_sdpa_requires_rejection(device=None):
+    if str(torch.__version__).split("+", 1)[0] != "2.11.0":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if isinstance(device, (torch.device, str)) and torch.device(device).type != "cuda":
+        return False
+    try:
+        capability = torch.cuda.get_device_capability(device)
+    except (AssertionError, RuntimeError):
+        return False
+    return tuple(capability) == (12, 0)
+
+
+def _mask_safe_explicit_sdpa(query, key, value, **kwargs):
+    # Fused BF16 backward on the installed SM120 stack failed exact masked
+    # credit. Scope a MATH-only dispatch to the explicit experiment.
+    with sdpa_kernel(SDPBackend.MATH):
+        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+
+
+def _padded_explicit_sdpa(query, key, value, **kwargs):
+    # Physical padding retains the logical scale and exact source mask. CUDA
+    # credit admission is required on the installed stack before full training.
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        return _aligned_narrow_fp32_sdpa(query, key, value, **kwargs)
 
 
 def _aligned_narrow_fp32_sdpa(query, key, value, *, attn_mask=None,
@@ -1702,7 +1744,7 @@ def _aligned_narrow_fp32_sdpa(query, key, value, *, attn_mask=None,
     # contexts are already aligned: do not inflate those reads by 8x.
     key_tile = 128 if key_steps > 128 else 16
     extra_keys = (-key_steps) % key_tile
-    extra_channels = 16 - logical_dim
+    extra_channels = (-logical_dim) % 16
     query = F.pad(query, (0, extra_channels))
     key = F.pad(key, (0, extra_channels, 0, extra_keys))
     value = F.pad(value, (0, extra_channels, 0, extra_keys))
@@ -1753,6 +1795,7 @@ class FlashSDPAAttention(nn.Module):
             _compiled_cross_attention_requires_blackwell_workaround()
         )
         self.compiled_cross_attention_backend = "auto"
+        self.compiled_padded_sdpa_rejected = _compiled_padded_sdpa_requires_rejection()
         # Assigned by the portfolio model only to its latent/market head.
         # Temporal last-query attention has a different proven fast path;
         # padding that large stock/time batch is unnecessary workspace.
@@ -1781,6 +1824,7 @@ class FlashSDPAAttention(nn.Module):
         module.compiled_cross_attention_blackwell_workaround = (
             _compiled_cross_attention_requires_blackwell_workaround(module.in_proj.weight.device)
         )
+        module.compiled_padded_sdpa_rejected = _compiled_padded_sdpa_requires_rejection(module.in_proj.weight.device)
         return module
 
     def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1851,6 +1895,10 @@ class FlashSDPAAttention(nn.Module):
         key_rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, query_steps, _ = query.shape
+        if (self.compiled_cross_attention_backend == "sdpa_padded"
+                and self.compiled_padded_sdpa_rejected
+                and query.device.type == "cuda" and _torch_is_compiling()):
+            raise RuntimeError("sdpa_padded failed masked-gradient admission on Torch 2.11.0 / SM120")
         key_steps = query_steps if context is None else int(context.size(1))
         if (
             bool(self.single_key_value_fast_path)
@@ -1933,8 +1981,15 @@ class FlashSDPAAttention(nn.Module):
                 int(query_steps),int(key_steps),self.compiled_cross_attention_blackwell_workaround):
                 use_sdpa_attention = False
 
-        if use_sdpa_attention:
-            sdpa = F.scaled_dot_product_attention
+        kernel_attention = getattr(self, "_kernel_attention", None)
+        if kernel_attention is not None:
+            y = kernel_attention(q, k, v, attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0, scale=self.scale)
+        elif use_sdpa_attention:
+            sdpa = (_mask_safe_explicit_sdpa if self.compiled_cross_attention_backend == "sdpa_explicit"
+                else F.scaled_dot_product_attention)
+            if self.compiled_cross_attention_backend == "sdpa_padded":
+                sdpa = _padded_explicit_sdpa
             if (context is not None and q.dtype == torch.float32
                     and self.head_dim < 8
                     and self.compiled_narrow_fp32_portfolio_head
@@ -1979,14 +2034,18 @@ class FlashSDPAAttention(nn.Module):
                         ~attn_mask.squeeze(-2),
                         torch.finfo(scores.dtype).min,
                     )
-                attn = torch.softmax(scores, dim=-1)
+                kernel_softmax = getattr(self, "_kernel_softmax", None)
+                attn = kernel_softmax(scores) if kernel_softmax is not None else torch.softmax(scores, dim=-1)
+                if attn_mask is not None and self.compiled_cross_attention_backend == "manual_fp32_last":
+                    attn = torch.where(attn_mask.squeeze(-2).any(dim=-1, keepdim=True), attn, 0.0)
                 attn = F.dropout(attn, p=self.dropout_p, training=self.training)
                 y = (attn.unsqueeze(-1) * v).sum(dim=-2, keepdim=True)
             else:
                 scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
                 if attn_mask is not None:
                     scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
-                attn = torch.softmax(scores, dim=-1)
+                kernel_softmax = getattr(self, "_kernel_softmax", None)
+                attn = kernel_softmax(scores) if kernel_softmax is not None else torch.softmax(scores, dim=-1)
                 attn = F.dropout(attn, p=self.dropout_p, training=self.training)
                 y = torch.matmul(attn, v)
 
@@ -2306,8 +2365,8 @@ class TransformerBasePortfolioModel(nn.Module):
         self.amp_native_position_add = bool(amp_native_position_add)
         self.temporal_self_attention_fast_path = bool(temporal_self_attention_fast_path)
         compiled_cross_backend = str(compiled_cross_attention_backend).strip().lower().replace("-", "_")
-        if compiled_cross_backend not in {"auto", "manual", "sdpa", "manual_fp32_last"}:
-            raise ValueError("compiled_cross_attention_backend must be 'auto', 'manual', 'sdpa', or 'manual_fp32_last'")
+        if compiled_cross_backend not in {"auto", "manual", "sdpa", "sdpa_explicit", "sdpa_padded", "manual_fp32_last"}:
+            raise ValueError("compiled_cross_attention_backend must be 'auto', 'manual', 'sdpa', 'sdpa_explicit', 'sdpa_padded', or 'manual_fp32_last'")
         self.compiled_cross_attention_backend = compiled_cross_backend
         self.sdpa_batch_limit = int(sdpa_batch_limit)
         self.norm_type = _normalize_norm_type(norm_type)

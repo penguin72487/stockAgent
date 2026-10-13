@@ -63,7 +63,7 @@ def test_bare_price_v3_changes_only_html_outcome_identity(cnyes_config, tmp_path
         except (ValueError, TypeError, UnicodeDecodeError):
             return original(value)
         if isinstance(payload, dict) and 'verified_native_quote_only_outcome_contract_version' in payload:
-            assert payload['verified_native_quote_only_outcome_contract_version'] == 6
+            assert payload['verified_native_quote_only_outcome_contract_version'] == 7
             payload['verified_native_quote_only_outcome_contract_version'] = 2
             return original(json.dumps(payload, sort_keys=True).encode())
         return original(value)

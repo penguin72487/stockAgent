@@ -816,3 +816,78 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
         flush=True,
     )
     return panel
+
+
+class FactorizedDateView:
+    """Bounded live calendar projection of the same lossless trained feature ABI.
+
+    Only source-backed dates are admitted. No forward-fill, interpolation or
+    new feature selection occurs here; release state is built by the canonical
+    causal sweep before this immutable view is published.
+    """
+    _stockagent_factorized_features = True
+    dtype = np.dtype("float32")
+    ndim = 3
+
+    def __init__(self, source, rows):
+        self.source = source
+        self.rows = np.asarray(rows, dtype=np.int64)
+        self.shape = (len(self.rows), *source.shape[1:])
+        self.content_fingerprint = {**source.content_fingerprint,
+            "shape": list(self.shape), "sha256": _digest({
+                "source": source.content_fingerprint, "rows": self.rows.tolist()})}
+
+    def __array__(self, *args, **kwargs):
+        raise TypeError("request a bounded live feature window")
+
+    def __getitem__(self, key):
+        keys = key if isinstance(key, tuple) else (key,)
+        return self.source[(self.rows[keys[0]], *keys[1:])]
+
+    def subset_symbols(self, indices):
+        return FactorizedDateView(self.source.subset_symbols(indices), self.rows)
+
+
+def attach_factorized_live_features(panel, manifest_path: str | Path):
+    """Attach a receipt-bound research-paper projection to a live base panel."""
+    from copy import copy
+    from stockagent.training.checkpoint_contract import subset_panel_symbols
+
+    path = Path(manifest_path).resolve(strict=True)
+    manifest = json.loads(path.read_text())
+    receipt = manifest.get("paper_inference") or {}
+    if (receipt.get("contract") != "factorized_paper_projection_lag1_v1"
+            or receipt.get("status") != "verified"
+            or receipt.get("raw_source_publication") is not False):
+        raise ValueError("factorized paper inference projection receipt is missing")
+    if (manifest.get("contract") not in SUPPORTED_CONTRACTS
+            or manifest.get("status") != "complete"
+            or manifest.get("research_only") is not True
+            or manifest.get("historical_point_in_time") is not False
+            or manifest.get("feature_lag") != 1):
+        raise ValueError("factorized live projection changed the selected research ABI")
+    dates = manifest["dates"]
+    if len(dates) != len(set(dates)) or dates != sorted(dates):
+        raise ValueError("factorized projection has duplicate or unordered dates")
+    panel = subset_panel_symbols(panel, manifest["symbols"], allow_missing_masked=True)
+    from stockagent.data.panel import slice_panel_start
+    panel = slice_panel_start(panel, dates[0])
+    source_rows = {day: i for i, day in enumerate(dates)}
+    panel_days = [str(d)[:10] for d in panel.dates]
+    if any(day not in source_rows for day in panel_days):
+        raise ValueError("factorized projection does not cover the requested live calendar")
+    # Reuse all partition/channel/member checks in the training attachment.
+    # The six-column base remains tiny even with the longer immutable calendar.
+    source_panel = copy(panel)
+    source_panel.dates = np.asarray(dates, dtype="datetime64[D]")
+    base = np.zeros((len(dates), panel.num_symbols, len(panel.feature_names)), dtype=np.float32)
+    rows = np.asarray([source_rows[day] for day in panel_days], dtype=np.int64)
+    base[rows] = panel.features
+    source_panel.features = base
+    source_panel = attach_factorized_features(source_panel, path)
+    result = copy(panel)
+    result.features = FactorizedDateView(source_panel.features, rows)
+    result.feature_names = source_panel.feature_names
+    result.content_fingerprints = {**(panel.content_fingerprints or {}),
+                                   "features": result.features.content_fingerprint}
+    return result

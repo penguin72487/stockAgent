@@ -233,6 +233,32 @@ def test_bounded_reads_common_broadcast_masks_and_fingerprint(tmp_path, capsys):
     assert "[panel-model] features (10): base=2, individual=4, common=4" in capsys.readouterr().out
 
 
+def test_live_date_projection_is_bitwise_equal_and_preserves_base_cache(tmp_path):
+    from stockagent.data.factorized_panel import attach_factorized_live_features
+    from stockagent.data.panel import slice_panel_start
+    panel, path, dense = example(tmp_path)
+    manifest = json.loads(path.read_text())
+    manifest["paper_inference"] = {"contract": "factorized_paper_projection_lag1_v1",
+        "status": "verified", "raw_source_publication": False}
+    path.write_text(json.dumps(manifest))
+    tail = slice_panel_start(panel, "2025-01-05")
+    original_base = tail.features.copy()
+    attached = attach_factorized_live_features(tail, path)
+    np.testing.assert_array_equal(attached.features[:].view(np.uint32), dense[4:].view(np.uint32))
+    np.testing.assert_array_equal(tail.features, original_base)
+    assert tail.feature_names == ["x", "y"]
+    assert attached.features.shape == dense[4:].shape
+    with pytest.raises(TypeError, match="bounded"):
+        np.asarray(attached.features)
+    missing_date = replace(tail, dates=tail.dates + np.timedelta64(20, "D"))
+    with pytest.raises(ValueError, match="calendar"):
+        attach_factorized_live_features(missing_date, path)
+    changed = tmp_path / manifest["blocks"][0]["path"]
+    changed.write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="member"):
+        attach_factorized_live_features(tail, path)
+
+
 def test_host_cache_budget_changes_io_only_not_source_or_fingerprint(tmp_path):
     panel, path, dense = example(tmp_path)
     small = attach_factorized_features(replace(panel), path, host_cache_bytes=1)

@@ -1,7 +1,13 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "focus_provider": "cnyes",
   "provider_order": "known_urls_desc",
   "deferred_providers": ["cna"],
-  "retain_running_collectors": true
+  "retain_running_collectors": true,
+  "background_provider_order": [
+    "cmoney", "udn", "globalvoices", "wantmedia",
+    "money_link", "cmnews", "moneydj", "ltn"
+  ],
+  "background_execution": "parallel_while_focus_waits",
+  "focus_preemption": "return_on_verified_operational_blocker"
 }

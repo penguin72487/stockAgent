@@ -54,6 +54,8 @@ def main() -> int:
     parser.add_argument("--artifact-root", type=Path, default=REPO_ROOT / "artifacts")
     parser.add_argument("--sync-root", type=Path, default=Path("/srv/stockagent-packed"))
     parser.add_argument("--destination", type=Path)
+    parser.add_argument("--include-relative", action="append", default=None,
+                        help="Restore only these exact original members, after full fixed-archive verification.")
     parser.add_argument("--plan-fingerprint")
     parser.add_argument(
         "--cold-only", action="store_true",
@@ -82,6 +84,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        if args.include_relative is not None and args.command != "restore":
+            raise SnapshotError("--include-relative requires restore")
         if args.cold_only and args.command != "verify":
             raise SnapshotError("--cold-only requires verify")
         if args.manual_immediate and args.command not in {"retire-plan", "retire-apply"}:
@@ -215,6 +219,7 @@ def main() -> int:
                 args.sync_root,
                 args.destination,
                 materialized_root=args.restore_cache,
+                include_paths=args.include_relative,
             )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0

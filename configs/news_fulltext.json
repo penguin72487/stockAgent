@@ -275,6 +275,22 @@
         "https://api.cnyes.com/media/api/v1/newslist/category/wd_stock"
       ],
       "cnyes_history_start": "1999-01-01",
+      "cnyes_public_index": {
+        "contract_version": 1,
+        "endpoint": "https://api.cnyes.com/media/api/v1/newslist/all",
+        "seed_scope": "actual_single_source_day_category_gaps",
+        "observed_page_size": 30,
+        "publisher_navigation": {
+          "url": "https://news.cnyes.com/_next/static/chunks/5614-d74726422803d6de.js",
+          "response_sha256": "db04a337c3012490a7a7625c0734e99f585094265c7806c7eb0af8599b05c3b2"
+        },
+        "observed_pages": [
+          {"page": 1, "response_sha256": "8aabafcccac6ad782846bbc3fd6701759db6dae10ca273ca01ac1a5d770ea353"},
+          {"page": 2, "response_sha256": "8708f8a5b37a1f9eec0203daf872436b88f36ed3aed39814605903f56aaf491c"},
+          {"page": 31, "response_sha256": "ba62aad8b46c3a35289e1ce92b5868538ebb1a6692a1d1b43a7a00036dcee317"}
+        ],
+        "note": "Public metadata-only list, not an article API. Actual 2014-09-10 source pages 1/2/31 passed; all endpoint advertises 362 pages, not all pages verified. limit=100 still returned 30. Seed one list per actual overflowing source date, not per category alias. Preserve category gaps, source clocks, receipts, body/byline validation, paid-item exclusions and existing retry deadlines. No hidden search or category-page-limit workaround; stop on source refusal."
+      },
       "cnyes_history_partition_policy": "adaptive_days_v1",
       "discovery_interval_seconds": 300,
       "bulk_text_permission_basis": "Reviewed public publisher content endpoint for user-requested local personal research only; not a publisher license or fair-use verdict. No publication, redistribution, commercial reuse or automatic training injection. Payment items refused; preserve raw source credits and explicitly missing API bylines.",

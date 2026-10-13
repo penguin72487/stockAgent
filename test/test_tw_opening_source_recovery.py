@@ -227,6 +227,13 @@ def test_durable_source_repair_retries_a_completely_missing_response(monkeypatch
     session = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
     first = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
     assert first["status"] == "waiting_source" and first["missing_open_symbols"] == ["B"]
+    cooling = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
+    assert cooling["status"] == "waiting_source"
+    assert requests == [["B"]]
+    # Advance only this source's retry deadline, never freeze the process
+    # clock or bypass the repair owner's durable missing-work list.
+    owner_session = next(iter(acquisition.OPENING_FAN_IN._sessions.values()))
+    owner_session.metrics["official_mis"]["retry_after_monotonic"] = 0.0
     second = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
     assert second["status"] == "complete" and second["valid_open_count"] == 2
     assert requests == [["B"], ["B"]]

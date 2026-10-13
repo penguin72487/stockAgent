@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import threading
@@ -13,6 +14,59 @@ import pytest
 
 from services.discord_bot import bot as discord_bot
 from stockagent.live import quote_provider, signal_engine
+
+
+def test_restart_recovers_original_observed_clock_not_new_process_wake(monkeypatch, tmp_path):
+    now = datetime.fromisoformat("2026-10-13T09:20:00+08:00")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    path = tmp_path / "opening_signal_latency.jsonl"
+    base = {"session_date": "2026-10-13", "market": "test", "schedule_key": "2026-10-13:test", "gate_at": "2026-10-13T09:00:00+08:00"}
+    rows = [
+        {**base, "first_scheduler_observed_at": "2026-10-13T09:17:00+08:00"},
+        {**base, "first_scheduler_observed_at": "2026-10-13T09:00:00.003+08:00"},
+        {**base, "first_scheduler_observed_at": "2026-10-12T09:00:00+08:00"},
+        {**base, "first_scheduler_observed_at": "2026-10-13T09:30:00+08:00"},
+        {**base, "first_scheduler_observed_at": "2026-10-13T09:00:00.001"},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + '\n{"session_date":"2026-10-13",broken\n')
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_opening_signal_latency_path", lambda: path)
+    restored = discord_bot._recover_opening_first_observations("2026-10-13")
+    assert restored == {"2026-10-13:test": datetime.fromisoformat("2026-10-13T09:00:00.003+08:00")}
+    assert discord_bot._recover_opening_first_observations("2026-10-12") == {}
+
+
+@pytest.mark.parametrize("at,active,session_open,state,defer", [
+    ("07:30", None, True, "retry", False),
+    ("09:02", None, True, "retry", True),
+    ("09:20", None, True, "retry", False),
+    ("09:20", 1., True, "retry", True),
+    ("09:20", None, True, "pending_confirmation", True),
+    ("13:20", None, True, "retry", True),
+    ("09:20", None, False, "retry", True),
+])
+def test_cold_owner_can_warm_while_waiting_after_protected_opening(monkeypatch, at, active, session_open, state, defer):
+    cfg = SimpleNamespace(market="test", timezone="Asia/Taipei", day_trade_simulation_enabled=True,
+                          preopen_prepare_time="08:15", open_time="09:00")
+    now = datetime.fromisoformat(f"2026-10-13T{at}:00+08:00")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: [cfg.market])
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda market: cfg)
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *args: (session_open, "fixture"))
+    monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *args: state)
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", active)
+    assert discord_bot._startup_inference_warmup_must_defer() is defer
 
 
 def test_opening_input_wait_records_structured_counts_without_result():
@@ -258,7 +312,7 @@ def test_scheduled_prefetched_quote_is_revalidated_by_canonical_model_owner(monk
 
 
 def test_session_open_prefetch_uses_the_same_validated_request(monkeypatch, tmp_path):
-    config = SimpleNamespace(trading=SimpleNamespace(execution_mode="tw_day_trade"), runner=SimpleNamespace(output_dir=str(tmp_path)), training=SimpleNamespace(lookback=1))
+    config = SimpleNamespace(data=SimpleNamespace(), trading=SimpleNamespace(execution_mode="tw_day_trade"), runner=SimpleNamespace(output_dir=str(tmp_path)), training=SimpleNamespace(lookback=1))
     panel = SimpleNamespace(features=np.zeros((1, 1, 1)))
     request = dict(source="tw", symbols=["2330"], fallback_prices=np.array([99.0]), require_official_tw_session_open=True)
     calls = []
@@ -283,6 +337,59 @@ def test_session_open_prefetch_uses_the_same_validated_request(monkeypatch, tmp_
     assert result.request_key == signal_engine._live_quote_request_key(request)
     assert result.snapshot.source == "fixture:opening"
     assert len(calls) == 1 and calls[0]["require_official_tw_session_open"] is True
+
+
+def test_opening_prefetch_rejects_pending_quorum_with_exact_mode_mask(monkeypatch):
+    now = datetime.fromisoformat("2026-10-13T09:00:02+08:00")
+    sample = quote_provider.PriceSnapshot(
+        prices=np.array([100., 99., 101.]), open_prices=np.array([100., np.nan, 101.]),
+        source="fixture:opening", available_mask=np.ones(3, dtype=bool),
+        available_count=3, requested_count=3,
+        transport_timing={"opening_quorum_ready": False},
+    )
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_MIN_COVERAGE", "0.90")
+    request = {"require_official_tw_session_open": True, "request_mask": np.array([True, True, False])}
+    with pytest.raises(signal_engine.TWOpeningInputCoveragePending) as caught:
+        signal_engine._reject_unready_opening_prefetch(
+            request, sample, workflow_started_utc=now, requested_at_utc=now,
+            received_at_utc=now, pre_quote_prepare_ms=2., quote_fetch_ms=3.,
+        )
+    assert caught.value.coverage == {"active": 2, "opens": 1, "responses": 2, "required": 2, "no_prints": 0, "basis": "session_open"}
+    summary = caught.value.opening_prefetch_summary
+    assert summary["price_source"] == "fixture:opening"
+    assert summary["live_latency"]["quote_fetch_ms"] == 3.
+    # Never use the early guard as a successful validation or weaken the
+    # model owner's original checks for ready or uninstrumented sources.
+    for marker in [True, None]:
+        sample.transport_timing["opening_quorum_ready"] = marker
+        signal_engine._reject_unready_opening_prefetch(
+            request, sample, workflow_started_utc=now, requested_at_utc=now,
+            received_at_utc=now, pre_quote_prepare_ms=2., quote_fetch_ms=3.,
+        )
+
+
+def test_pending_prefetch_records_source_wait_before_any_model_execution(monkeypatch):
+    cfg = SimpleNamespace(market="test", day_trade_simulation_enabled=True)
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **kwargs: kwargs)
+
+    async def prepare(_cfg):
+        return ("tw", SimpleNamespace(), None), None, 1.0
+
+    def pending(**kwargs):
+        assert discord_bot._MODEL_INFERENCE_LOCK.acquire(blocking=False)
+        discord_bot._MODEL_INFERENCE_LOCK.release()
+        error = signal_engine.TWOpeningInputCoveragePending("pending", {"active": 2, "opens": 1, "required": 2})
+        error.opening_prefetch_summary = {"price_source": "fixture", "live_latency": {"quote_fetch_ms": 5.0}}
+        raise error
+
+    monkeypatch.setattr(discord_bot, "_prepare_scheduled_signal", prepare)
+    monkeypatch.setattr(discord_bot, "prefetch_live_signal_prices", pending)
+    monkeypatch.setattr(discord_bot, "generate_live_signal", lambda **kwargs: pytest.fail("pending inputs must not run the model"))
+    _prepared, error, _ms, prefetched, timing = asyncio.run(discord_bot._prepare_scheduled_inputs(cfg))
+    assert isinstance(error, signal_engine.TWOpeningInputCoveragePending)
+    assert prefetched is None
+    assert timing["signal_stage"] == "opening_input_coverage"
+    assert timing["signal_summary"]["price_source"] == "fixture"
 
 
 def test_failed_opening_prefetch_preserves_its_stage_and_does_not_hold_model_lock(monkeypatch):

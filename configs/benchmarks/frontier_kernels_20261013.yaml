@@ -1,0 +1,98 @@
+# Full inventory from the user's frontier-kernel request. A row is not accepted
+# merely because a package imports; kernel, gradient and full-fold evidence are
+# distinct. Numerical/gradient differences are explicitly authorized.
+contract: frontier_kernel_inventory_v1
+numeric_policy: numeric_and_gradient_differences_authorized_v1
+workload: tw_day_trade_factorized_values_scale_separated_cash_annual_fold10
+baseline:
+  global_batch: 256
+  lookback: 32
+  embedding: 32
+  seed: 42
+  epochs: 4
+  steady_epochs: [3, 4]
+  ranks: 2
+  complete_lifecycle: true
+techniques:
+  - {id: panel_slab, owner: stockagent/training/windowed.py, family: data_reuse}
+  - {id: compact_transfer, owner: stockagent/data/factorized_panel.py, family: data_transport}
+  - {id: torch_compile, package: torch, family: compiler}
+  - {id: cublaslt, package: torch, family: gemm}
+  - {id: cutlass, package: nvidia-cutlass-dsl, family: gemm}
+  - {id: quack, package: quack-kernels, family: norm_gemm}
+  - {id: sdpa, package: torch, family: attention}
+  - {id: cudnn_attention, package: torch, family: attention}
+  - {id: flash_attention4, package: flash-attn-4, family: attention}
+  - {id: liger, package: liger-kernel, family: norm_swiglu}
+  - {id: cuda_graphs, package: torch, family: launch_overhead}
+  - {id: fused_adamw, package: torch, family: optimizer}
+  - {id: ddp_overlap, package: torch, family: distributed}
+  - {id: selective_checkpoint, package: torch, family: activation_memory}
+  - {id: bf16_tf32, package: torch, family: precision}
+  - {id: triton, package: triton, family: kernel_dsl}
+  - {id: gluon, package: triton, family: kernel_dsl}
+  - {id: cute_dsl, package: nvidia-cutlass-dsl, family: kernel_dsl}
+  - {id: tilelang, package: tilelang, family: kernel_dsl}
+  - {id: helion, package: helion, family: kernel_dsl}
+  - {id: cutile, package: cuda-tile, family: kernel_dsl}
+  - {id: thunderkittens, repository: https://github.com/HazyResearch/ThunderKittens, family: kernel_cpp}
+  - {id: cublasdx, repository: https://github.com/NVIDIA/CUDALibrarySamples/tree/master/MathDx, family: kernel_cpp}
+  - {id: transformer_engine, package: transformer-engine, family: low_precision}
+  - {id: torchao, package: torchao, family: low_precision}
+  - {id: deepgemm, repository: https://github.com/deepseek-ai/DeepGEMM, family: gemm}
+  - {id: deepep, repository: https://github.com/deepseek-ai/DeepEP, family: moe_communication}
+  - {id: mega_moe, repository: https://github.com/deepseek-ai/DeepGEMM, family: moe_communication}
+  - {id: nvshmem, package: nvidia-nvshmem-cu12, family: distributed}
+  - {id: fsdp2_dtensor, package: torch, family: distributed}
+  - {id: flex_attention, package: torch, family: attention}
+  - {id: cusparselt, package: nvidia-cusparselt-cu12, family: structured_pruning}
+  - {id: flash_linear_attention, repository: https://github.com/fla-org/flash-linear-attention, family: architecture}
+  - {id: sage_attention3, repository: https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell, family: low_precision_attention}
+  - {id: torch_tensorrt, package: torch-tensorrt, family: inference}
+  - {id: flashinfer, package: flashinfer-python, family: inference}
+  - {id: vllm, package: vllm, family: llm_serving}
+  - {id: sglang, package: sglang, family: llm_serving}
+full_fold_candidates:
+  - name: baseline
+    overrides: {}
+  - name: bf16_temporal
+    overrides:
+      training:
+        financial_transformer: {temporal_blocks_fp32: false}
+  - name: bf16_temporal_portfolio
+    overrides:
+      training:
+        financial_transformer: {temporal_blocks_fp32: false, portfolio_blocks_fp32: false}
+  - name: retain_encoder_activations
+    overrides:
+      training: {factorized_encoder_checkpoint: false}
+  - name: bf16_and_retained_activations
+    overrides:
+      training:
+        factorized_encoder_checkpoint: false
+        financial_transformer: {temporal_blocks_fp32: false, portfolio_blocks_fp32: false}
+  - name: compact_uncached_transfer
+    overrides:
+      data: {factorized_transfer_mode: compact_cuda}
+  - name: compact_packed_transfer
+    overrides:
+      data: {factorized_transfer_mode: compact_cuda_packed}
+  - name: compact_bf16_projection
+    overrides:
+      training:
+        financial_transformer: {compact_projection_compute_dtype: bf16}
+  - name: relaxed_precision_casts
+    overrides:
+      training:
+        financial_transformer: {factorized_relaxed_precision_casts: true}
+  - name: maximum_autotune
+    overrides:
+      training:
+        financial_transformer: {factorized_compile_autotune: true}
+  - name: partition_cuda_graphs
+    overrides:
+      training:
+        financial_transformer: {factorized_cuda_graphs: true}
+  - name: ddp_single_bucket
+    overrides:
+      training: {ddp_bucket_cap_mb: 25}

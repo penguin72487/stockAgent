@@ -12,7 +12,11 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import time
+
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text, sha256_file
 from downloader.news_fulltext import load_config
@@ -20,6 +24,94 @@ from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_queue import utc_now
 from downloader.news_fulltext_urls import original_source_inventory
 from stockagent.data.news_source_catalog import adapter_summary
+
+
+ENDPOINT_INVENTORY_CONTRACT_VERSION = 2
+
+
+def endpoint_inventory(registry, *, status=None, owner_matches=False):
+    """Describe every registered capability without reading the URL frontier.
+
+    The independent public list has metadata, not category-API bodies or its
+    thirty-page cap. All counters are owner-observed endpoint-family counters,
+    never a claim of complete history, access permission or official capacity.
+    """
+    status = status or {}
+    controls = (status.get('http_capacity') or {}).get('providers', {}) if owner_matches else {}
+    result, seen = [], set()
+    for provider, source in registry.sources.items():
+        counters = status.get('performance', {}).get('providers', {}).get(provider, {}).get('counts', {}) if owner_matches else {}
+        groups = (
+            ('cnyes_news', source.cnyes_apis), ('wordpress_posts', source.wordpress_apis),
+            ('rss_fulltext', source.fulltext_feeds), ('feed', source.feeds),
+            ('cnyes_public_index', (source.cnyes_index_api,) if source.cnyes_index_api else ()),
+            ('sitemap', source.sitemaps), ('index', source.index_pages),
+        )
+        for kind, urls in groups:
+            for url in dict.fromkeys(urls):
+                if (provider, url) in seen:
+                    continue
+                seen.add((provider, url))
+                family = NewsHTTP.endpoint_kind(source, url)
+                metadata_only = kind in {'feed', 'sitemap', 'index', 'cnyes_public_index'}
+                row = {'provider': provider, 'kind': kind, 'endpoint_or_pattern': url,
+                    'enabled': source.allowed, 'metadata_only': metadata_only,
+                    'history_search_start': source.cnyes_history_start if kind == 'cnyes_news' else None,
+                    'rows_per_request_cap_observed': 30 if kind in {'cnyes_news', 'cnyes_public_index'} else None,
+                    'page_number_cap_observed': 30 if kind == 'cnyes_news' else None,
+                    'maximum_history_window_days_tested': 730 if kind == 'cnyes_news' else None,
+                    'refresh_seconds': source.discovery_interval_seconds,
+                    'actual_client_interval_seconds': controls.get(provider, {}).get('effective_interval_seconds', source.interval_seconds),
+                    'hard_interval_floor_seconds': controls.get(provider, {}).get('hard_interval_floor_seconds'),
+                    'parallelism': controls.get(provider, {}).get('parallelism', source.parallelism),
+                    'runtime_capacity_observed': bool(controls.get(provider)),
+                    'owner_requests_in_endpoint_family': counters.get('endpoint_' + family + '_requests'),
+                    'counter_grain': 'endpoint family; index/article namespaces aggregate paths, not per-URL calls',
+                    'official_rps_limit': None, 'source_maximum_verified': False,
+                    'source_evidence_url': source.authorization.get('evidence_url'), 'history_complete': False}
+                if kind == 'cnyes_public_index':
+                    from downloader.news_fulltext_cnyes_index import MAXIMUM_PAGE
+                    row.update(seed_scope='actual_single_source_day_category_gaps',
+                        metadata_fingerprint=source.cnyes_index_data_fingerprint,
+                        maximum_page_engineering_guard=MAXIMUM_PAGE,
+                        engineering_guard_is_not_source_limit=True,
+                        body_acceptance_by_contract=0,
+                        owner_verified_metadata_pages=counters.get('public_index_pages_verified'))
+                result.append(row)
+        for kind, pattern in (('article_namespace', source.article_path_pattern), ('pdf_namespace', source.pdf_path_pattern)):
+            if pattern:
+                result.append({'provider': provider, 'kind': kind, 'endpoint_or_pattern': pattern,
+                    'enabled': source.allowed, 'metadata_only': False,
+                    'actual_client_interval_seconds': controls.get(provider, {}).get('effective_interval_seconds', source.interval_seconds),
+                    'parallelism': controls.get(provider, {}).get('parallelism', source.parallelism),
+                    'official_rps_limit': None, 'source_maximum_verified': False,
+                    'history_complete': False, 'source_evidence_url': source.authorization.get('evidence_url')})
+    return result
+
+
+def inventory_endpoints_only(config_path: Path) -> dict:
+    """O(configured endpoints), not O(millions of article/alias rows)."""
+    started = time.perf_counter()
+    config, registry, repo = load_config(config_path)
+    root = repo / config['root']
+    with sqlite3.connect(f'file:{root / "queue.sqlite3"}?mode=ro', uri=True) as db:
+        owner_row = db.execute("SELECT value FROM queue_settings WHERE key='current_owner_id'").fetchone()
+    owner = owner_row[0] if owner_row else None
+    try:
+        status = json.loads((root / 'status.json').read_bytes())
+    except (OSError, ValueError):
+        status = {}
+    matches = owner is not None and status.get('owner_id') == owner
+    return {'endpoint_inventory_contract_version': ENDPOINT_INVENTORY_CONTRACT_VERSION,
+        'inventory_scope': 'registered_endpoint_capabilities_only', 'observed_at_utc': utc_now(),
+        'queue_owner_id': owner, 'status_owner_matches': matches,
+        'metric_observed_at_utc': status.get('performance', {}).get('snapshot_at_utc') if matches else None,
+        'config_sha256': sha256_file(config_path), 'provider_inventory_included': False,
+        'endpoints': endpoint_inventory(registry, status=status, owner_matches=matches),
+        'publisher_requests': 0, 'production_queue_writes': False,
+        'body_count_or_history_coverage_claimed': False, 'all_history_complete': False,
+        'inventory_cost': {'wall_seconds': time.perf_counter() - started,
+                           'scope': 'one owner-key read and configured endpoint descriptors; no article-frontier scan'}}
 
 
 def inventory(config_path: Path) -> dict:
@@ -122,38 +214,8 @@ def inventory(config_path: Path) -> dict:
         result["status"] = status
         # Endpoint capability is distinct from discovered URL/page coverage.
         # Article path patterns are namespaces, never invented endpoint URLs.
-        result["endpoints"] = []
-        seen_endpoints = set()
-        for p, source in registry.sources.items():
-            counters = status.get("performance", {}).get("providers", {}).get(p, {}).get("counts", {}) if result["status_owner_matches"] else {}
-            for kind, urls in (("cnyes_news", source.cnyes_apis), ("wordpress_posts", source.wordpress_apis),
-                               ("rss_fulltext", source.fulltext_feeds), ("feed", source.feeds),
-                               ("sitemap", source.sitemaps), ("index", source.index_pages)):
-                for url in dict.fromkeys(urls):
-                    if (p, url) in seen_endpoints:
-                        continue
-                    seen_endpoints.add((p, url))
-                    family = NewsHTTP.endpoint_kind(source, url)
-                    result["endpoints"].append({"provider": p, "kind": kind, "endpoint_or_pattern": url,
-                        "enabled": source.allowed, "history_search_start": source.cnyes_history_start if kind == "cnyes_news" else None,
-                        "rows_per_request_cap_observed": 30 if kind == "cnyes_news" else None,
-                        "page_number_cap_observed": 30 if kind == "cnyes_news" else None,
-                        "maximum_history_window_days_tested": 730 if kind == "cnyes_news" else None,
-                        "refresh_seconds": source.discovery_interval_seconds,
-                        "actual_client_interval_seconds": controls.get(p, {}).get("effective_interval_seconds", source.interval_seconds),
-                        "hard_interval_floor_seconds": controls.get(p, {}).get("hard_interval_floor_seconds"),
-                        "parallelism": controls.get(p, {}).get("parallelism", source.parallelism),
-                        "owner_requests_in_endpoint_family": counters.get("endpoint_" + family + "_requests"),
-                        "counter_grain": "endpoint family; index/article namespaces aggregate paths, not per-URL calls",
-                        "official_rps_limit": None, "source_maximum_verified": False,
-                        "source_evidence_url": source.authorization.get("evidence_url"), "history_complete": False})
-            for kind, pattern in (("article_namespace", source.article_path_pattern), ("pdf_namespace", source.pdf_path_pattern)):
-                if pattern:
-                    result["endpoints"].append({"provider": p, "kind": kind, "endpoint_or_pattern": pattern,
-                        "enabled": source.allowed, "actual_client_interval_seconds": controls.get(p, {}).get("effective_interval_seconds", source.interval_seconds),
-                        "parallelism": controls.get(p, {}).get("parallelism", source.parallelism),
-                        "official_rps_limit": None, "source_maximum_verified": False,
-                        "history_complete": False, "source_evidence_url": source.authorization.get("evidence_url")})
+        result['endpoint_inventory_contract_version'] = ENDPOINT_INVENTORY_CONTRACT_VERSION
+        result['endpoints'] = endpoint_inventory(registry, status=status, owner_matches=result['status_owner_matches'])
         result["inventory_cost"] = {"wall_seconds": time.perf_counter() - wall_started,
                                     "cpu_seconds": time.process_time() - cpu_started,
                                     "scope": "single pinned read-only inventory; no publisher calls"}
@@ -166,7 +228,22 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/news_fulltext.json"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument('--endpoints-only', action='store_true',
+                        help='Refresh registered endpoint capabilities without scanning the article/alias frontier')
     args = parser.parse_args(argv)
+    if args.endpoints_only:
+        result = inventory_endpoints_only(args.config)
+        args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_write_json(args.output, result)
+        buffer = io.StringIO(newline='')
+        fields = list(dict.fromkeys(key for row in result['endpoints'] for key in row))
+        writer = csv.DictWriter(buffer, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(result['endpoints'])
+        atomic_write_text(args.output.with_suffix('.endpoints.csv'), buffer.getvalue(), durable=True)
+        print(json.dumps({'output': str(args.output), 'endpoints': len(result['endpoints']),
+                          'scope': result['inventory_scope'], 'publisher_requests': 0}))
+        return 0
     result = inventory(args.config)
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(args.output, result)

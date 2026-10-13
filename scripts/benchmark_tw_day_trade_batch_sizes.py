@@ -69,6 +69,34 @@ _GENERIC_FAILURE_KEYS = (
 )
 
 
+_DISCARDED_AUTOTUNE_RESOURCE = re.compile(
+    r"^(?P<prefix>[^\n]*torch/_inductor/select_algorithm\.py:\d+\] \[[^\]\n]+\]) "
+    r"Runtime error during autotuning:\s*\n"
+    r"(?P=prefix) No valid triton configs\. OutOfMemoryError: out of resource: "
+    r"(?P<kernel>\w+) Required: (?P<required>\d+) Hardware limit:\s*(?P<limit>\d+) "
+    r"Reducing block sizes or `num_stages` may help\.\.\s*\n"
+    r"(?P=prefix) Ignoring this choice\.\s*$",
+    re.MULTILINE,
+)
+
+
+def _failure_log_evidence(log_text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """Keep fatal errors distinct from explicitly discarded search candidates.
+
+    Triton names a shared-memory/resource-limit rejection OutOfMemoryError.
+    Only the complete, same-prefix Inductor rejection/ignore block is removed
+    from fatal-pattern scanning. Selected-kernel, VRAM and unpaired errors stay
+    failures, and the original log and every discarded candidate stay evidence.
+    """
+    candidates = [
+        {"kernel": match["kernel"], "required_bytes": int(match["required"]),
+         "hardware_limit_bytes": int(match["limit"])}
+        for match in _DISCARDED_AUTOTUNE_RESOURCE.finditer(log_text)
+    ]
+    fatal_text = _DISCARDED_AUTOTUNE_RESOURCE.sub("", log_text)
+    return [pattern for pattern in _FAILURE_PATTERNS if pattern in fatal_text], candidates
+
+
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
@@ -757,7 +785,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         "gpu_samples_path": str(gpu_path),
     }
     log_text = log_path.read_text(errors="replace")
-    result["failure_patterns"] = [pattern for pattern in _FAILURE_PATTERNS if pattern in log_text]
+    result["failure_patterns"], result["discarded_autotune_candidates"] = _failure_log_evidence(log_text)
     result["host_memory"] = _host_memory_summary(gpu_path)
     if return_code == 0 and status == "ok":
         try:
@@ -900,7 +928,8 @@ def main() -> None:
         default="distributed_data_parallel",
         help="production training topology to benchmark",
     )
-    parser.add_argument("--python", type=Path, default=Path(sys.executable).resolve())
+    # Resolving a venv symlink switches site-packages to the base interpreter.
+    parser.add_argument("--python", type=Path, default=Path(sys.executable).absolute())
     parser.add_argument("--cpu-threads", type=int, default=112)
     parser.add_argument("--compile-threads", type=int, default=16)
     parser.add_argument("--profile-timing", action="store_true",

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +16,28 @@ SPEC = importlib.util.spec_from_file_location("benchmark_tw_day_trade_batch_size
 assert SPEC is not None and SPEC.loader is not None
 benchmark = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(benchmark)
+
+
+def test_default_python_preserves_private_venv_package_visibility(tmp_path):
+    private = tmp_path / "kernel-env"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(private)], check=True)
+    python = private / "bin/python"
+    site = Path(subprocess.check_output([str(python), "-c",
+        "import sysconfig;print(sysconfig.get_paths()['purelib'])"], text=True).strip())
+    (site / "frontier_private_marker.py").write_text("VALUE = 'private-only'\n")
+    script = """import argparse, subprocess
+from scripts.benchmark_tw_day_trade_batch_sizes import main
+def capture(parser, *args, **kwargs):
+    action = next(a for a in parser._actions if a.dest == 'python')
+    output = subprocess.check_output([str(action.default), '-c',
+        'import frontier_private_marker;print(frontier_private_marker.VALUE)'], text=True)
+    assert output.strip() == 'private-only'
+    raise SystemExit(0)
+argparse.ArgumentParser.parse_args = capture
+main()
+"""
+    env = dict(os.environ, PYTHONPATH=str(SCRIPT.parents[1]))
+    subprocess.run([str(python), "-c", script], env=env, check=True)
 
 
 def _epoch(epoch: int, *, wall: float, train: float, grad: float = 2.0) -> dict:
@@ -339,6 +364,38 @@ def test_host_memory_sampler_retains_shared_scope_and_minimum_headroom(tmp_path)
 def test_dynamo_cache_fallback_warnings_are_rejections_even_with_exit_zero():
     assert "hit config.recompile_limit" in benchmark._FAILURE_PATTERNS
     assert "hit config.cache_size_limit" in benchmark._FAILURE_PATTERNS
+
+
+def _resource_rejection_log():
+    prefix = "[rank1]:E1012 21:35:24.147000 885948 site-packages/torch/_inductor/select_algorithm.py:3924] [3/0] "
+    return (prefix + "Runtime error during autotuning: \n" + prefix
+        + "No valid triton configs. OutOfMemoryError: out of resource: triton_mm Required: 163840 "
+        + "Hardware limit:101376 Reducing block sizes or `num_stages` may help.. \n"
+        + prefix + "Ignoring this choice.\n")
+
+
+def test_discarded_autotune_shared_memory_choices_are_retained_without_fatal_oom():
+    failures, candidates = benchmark._failure_log_evidence(_resource_rejection_log())
+    assert failures == []
+    assert candidates == [{"kernel": "triton_mm", "required_bytes": 163840,
+        "hardware_limit_bytes": 101376}]
+
+
+@pytest.mark.parametrize("fatal", ["CUDA out of memory", "torch.OutOfMemoryError: allocation failed",
+    "CUDA error: an illegal memory access was encountered", "hit config.recompile_limit"])
+def test_real_failure_is_preserved_beside_a_discarded_autotune_choice(fatal):
+    failures, candidates = benchmark._failure_log_evidence(_resource_rejection_log() + fatal)
+    assert candidates and failures and any(pattern in fatal for pattern in failures)
+
+
+def test_unpaired_or_other_rank_autotune_resource_failure_is_rejected():
+    log = _resource_rejection_log()
+    failures, candidates = benchmark._failure_log_evidence(log.replace("Ignoring this choice.", "Not ignored."))
+    assert failures == ["OutOfMemoryError"] and not candidates
+    failures, candidates = benchmark._failure_log_evidence(log.replace(
+        "[rank1]:E1012 21:35:24.147000 885948 site-packages/torch/_inductor/select_algorithm.py:3924] [3/0] Ignoring",
+        "[rank0]:E1012 21:35:24.147000 885947 site-packages/torch/_inductor/select_algorithm.py:3924] [3/0] Ignoring"))
+    assert failures == ["OutOfMemoryError"] and not candidates
 
 
 def test_new_candidate_uses_role_separated_cache_without_changing_original_config(tmp_path, monkeypatch):

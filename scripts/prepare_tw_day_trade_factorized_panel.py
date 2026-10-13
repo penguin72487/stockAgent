@@ -112,7 +112,20 @@ def causal_report_events(events,definitions,*,period_order=None,current_periods=
 class AnnualObservationEvents:
     """Bound memory by a single year, not the complete multi-source history."""
     def __init__(self,paths):
-        self.paths=sorted(paths)
+        # Filesystem spelling is not a release clock. A relative seed path
+        # sorted after an absolute delta path used to hide the entire past
+        # behind the delta's first future event. Keep the one-file memory
+        # bound, order by actual dates and reject overlapping event streams.
+        ranges=[]
+        for raw_path in paths:
+            path=Path(raw_path).resolve(strict=True)
+            bounds=pl.scan_parquet(path).select(pl.col("date").min().alias("start"),pl.col("date").max().alias("end")).collect()
+            start,end=bounds.row(0)
+            if start is not None:ranges.append((start,end,path))
+        ranges.sort(key=lambda item:(item[0],str(item[2])))
+        if any(current[0]<=previous[1] for previous,current in zip(ranges,ranges[1:])):
+            raise ValueError("annual observation streams overlap; merge by release date before the causal sweep")
+        self.paths=[item[2] for item in ranges]
         periods=pl.scan_parquet(self.paths).select(
             pl.col("period").fill_null(pl.col("date").cast(pl.String)).alias("subject")).unique().collect(engine="streaming")["subject"]
         self.period_order={subject:i for i,subject in enumerate(sorted(periods.to_list()))}

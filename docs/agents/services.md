@@ -70,8 +70,16 @@ Use the section for the service being changed. Operational acceptance requires f
   delivery of yesterday's row is not today's opening. See the initial
   [2026-10-07 repair](../tw_opening_source_recovery_2026-10-07.md) and its
   [2026-10-08 quorum/pending-target correction](../tw_opening_latency_repair_2026-10-08.md).
-- The opening source owner starts every configured provider over the full model
-  universe concurrently, accepts incremental batches, and persists verified
+- The live TW opening source owner starts every configured provider over the
+  current official TWSE/TPEx regular stock/ETF trading universe concurrently.
+  A dated ISIN registry plus official halt/status receipt is refreshed during
+  preopen preparation (final-arm rechecks receipts older than 15 minutes), not
+  fetched under the opening/model lock. Model coverage uses its intersection
+  with that official universe; historical `alive_mask`, positive volume and a
+  fixed count are not current market-membership authorities. Keep the complete
+  checkpoint symbol axis, report official symbols absent from each model, and
+  never backdate a midday registry observation into a historical signal.
+  The owner accepts incremental batches and persists verified
   inputs before releasing the existing quorum. Slow/failed providers cannot
   cancel winners or hold the model mutex; later attempts reuse accepted facts
   and retry only unresolved deltas. Preserve conflicting raw observations and

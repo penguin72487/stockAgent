@@ -1,0 +1,15 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: calendar_cache
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: calendar_restore_compiled
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_COMPILE: 1
+  - name: financial_cuda_graphs
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_CUDAGRAPHS: 1

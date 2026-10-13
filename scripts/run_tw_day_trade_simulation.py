@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule  # noqa: E402
 from stockagent.config import load_config  # noqa: E402
+from stockagent.data.tw_current_trading_universe import load_current_universe  # noqa: E402
 from stockagent.live.market_config import (  # noqa: E402
     LiveMarketConfig,
     load_market_configs,
@@ -1428,47 +1429,6 @@ def _prewarm_live_eligibility(
     return warmed
 
 
-def _eligible_execution_quote_symbols(
-    specs: list[ModeSpec],
-    live_configs: dict[str, LiveMarketConfig],
-    *,
-    trading_date: datetime,
-) -> list[str]:
-    """Resolve every symbol that can legally become an opening candidate.
-
-    Contract V2 lookup is deterministic process-local work.  Moving it to the
-    08:55 prewarm leaves only the actual post-signal Snapshot request on the
-    causal 09:00 path.
-    """
-
-    symbols: set[str] = set()
-    grouped: set[tuple[str, str]] = set()
-    for spec in specs:
-        live = live_configs[spec.market]
-        rule_data_dir = _rule_data_dir(live, spec)
-        key = (str(rule_data_dir.resolve()), str(spec.parquet_root.resolve()))
-        if key in grouped:
-            continue
-        grouped.add(key)
-        universe = sorted(load_symbol_metadata(spec.parquet_root))
-        resolved, coverage = _cached_live_eligibility(
-            rule_data_dir=rule_data_dir,
-            parquet_root=spec.parquet_root,
-            symbols=universe,
-            trading_date=trading_date,
-        )
-        if not all(bool(row.get("covered")) for row in coverage.values()):
-            raise RuntimeError(
-                "cannot prewarm quotes without exact-session eligibility"
-            )
-        symbols.update(
-            symbol
-            for symbol, evidence in resolved.items()
-            if bool(evidence.covered and evidence.eligible)
-        )
-    return sorted(symbols)
-
-
 def _verified_stock_session(
     specs: list[ModeSpec],
     live_configs: dict[str, LiveMarketConfig],
@@ -1587,22 +1547,92 @@ def _stream_rotation_interval_seconds(reconciliation_pending: bool) -> float:
     return 0.1 if reconciliation_pending else 1.0
 
 
+def _opening_stream_watch_due(
+    observed: datetime, *, has_execution_symbols: bool,
+    monotonic_now: float, last_attempt_at: float, reconciliation_pending: bool,
+) -> bool:
+    """Prepare before open; never displace execution or rotate in its hot gate."""
+    clock = observed.timetz().replace(tzinfo=None)
+    window = (datetime_time(8, 55) <= clock < datetime_time(8, 59, 30)
+              or MISSED_OPENING_COMMIT_DEADLINE <= clock < datetime_time(9, 10))
+    return (window and not has_execution_symbols
+            and monotonic_now - last_attempt_at >=
+                _stream_rotation_interval_seconds(reconciliation_pending))
+
+
+def _quote_client_prewarm_due(
+    observed: datetime, *, client_warmed_session: str | None,
+    contracts_warmed_session: str | None, monotonic_now: float, retry_after: float,
+) -> bool:
+    session = observed.date().isoformat()
+    clock = observed.timetz().replace(tzinfo=None)
+    prepare = datetime_time(8, 55) <= clock < datetime_time(8, 59, 30)
+    cold_recovery = client_warmed_session != session and clock >= MISSED_OPENING_COMMIT_DEADLINE
+    return contracts_warmed_session != session and (prepare or cold_recovery) and monotonic_now >= retry_after
+
+
+def _prepare_opening_stream_watch(observed: datetime) -> dict[str, Any]:
+    """Same current official source axis, not historical model/eligibility union.
+
+    Subscription intent is receipted separately from received data. Standard
+    Shioaji capacity is not represented as full-market stream entitlement.
+    """
+    scope = load_current_universe(observed.date().isoformat())
+    symbols = sorted(r["symbol"] for r in scope["records"]
+                     if r["trading_status"] == "listed_for_regular_trading")
+    clock = observed.timetz().replace(tzinfo=None)
+    # Finish reconciling the current target in the final ten preparation
+    # seconds, then keep it untouched until the protected gate has passed.
+    quotes = fetch_shioaji_stock_live_quotes(
+        symbols, trading_date=observed.date(),
+        allow_rotation=not (datetime_time(8, 59, 20) <= clock < MISSED_OPENING_COMMIT_DEADLINE),
+    )
+    pending = any(q.get("stream_reconciliation_pending") for q in quotes.values())
+    return {
+        "proof": "current_official_universe_subscription_intent_not_opening_prices",
+        "official_universe_fingerprint": scope["fingerprint"],
+        "official_trading_count": len(symbols),
+        "subscribed_count": sum(bool(q.get("stream_subscribed")) for q in quotes.values()),
+        "received_fresh_quote_count": sum(bool(q.get("available")) for q in quotes.values()),
+        "stream_reconciliation_pending": pending,
+        "full_market_stream_coverage": all(q.get("stream_subscribed") for q in quotes.values()) if symbols else False,
+        "complete_market_source_policy": "parallel_shioaji_mis_finmind",
+    }
+
+
+def _warm_official_opening_quote_client(observed: datetime) -> dict[str, Any]:
+    """Price transport is independent of downstream day-trade permission.
+
+    A missing contract is not a failed login. Keep the proven client available
+    to healthy sources while separately retrying incomplete contract coverage.
+    """
+    scope = load_current_universe(observed.date().isoformat())
+    symbols = sorted(r["symbol"] for r in scope["records"]
+                     if r["trading_status"] == "listed_for_regular_trading")
+    result = warm_shioaji_stock_quote_client(symbols)
+    return {**result, "authenticated_session_ready": True,
+            "official_universe_fingerprint": scope["fingerprint"],
+            "official_trading_count": len(symbols)}
+
+
 def _loop_sleep_seconds(
     observed: datetime,
     *,
     fast_seconds: float,
     has_pending_signal: bool,
     has_open_position: bool,
+    has_pending_opening_stream: bool = False,
 ) -> float:
     """Use 10 Hz only around latency-critical state transitions."""
 
     wall_time = observed.timetz().replace(tzinfo=None)
     opening_hot_path = datetime_time(8, 59, 30) <= wall_time < datetime_time(9, 10)
+    stream_prearm_hot = has_pending_opening_stream and datetime_time(8, 55) <= wall_time < datetime_time(8, 59, 30)
     exit_hot_path = datetime_time(13, 19, 30) <= wall_time < CLOSING_AUCTION_TIME
     force_exit_hot_path = (
         has_open_position and FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
     )
-    if has_pending_signal or opening_hot_path or exit_hot_path or force_exit_hot_path:
+    if has_pending_signal or stream_prearm_hot or opening_hot_path or exit_hot_path or force_exit_hot_path:
         return max(0.01, float(fast_seconds))
     if wall_time < datetime_time(8, 10) or wall_time >= datetime_time(14, 0):
         # Inotify still wakes immediately for a newly published signal.  Idle
@@ -1971,7 +2001,11 @@ def main(argv: list[str] | None = None) -> int:
     pending_retry_after: dict[str, float] = {}
     signal_first_detected_at: dict[tuple[str, str], datetime] = {}
     quote_client_warmed_session: str | None = None
+    quote_contracts_warmed_session: str | None = None
     quote_client_prewarm_retry_after = 0.0
+    last_opening_stream_attempt_at = 0.0
+    opening_stream_reconciliation_pending = False
+    opening_stream_readiness_identity = None
     eligibility_prewarmed_session: str | None = None
     signal_watcher = _SignalPointerWatcher()
     stock_quote_wakeup = StockQuoteWakeup()
@@ -2221,36 +2255,29 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
-        prewarm_wall_time = observed.timetz().replace(tzinfo=None)
         prewarm_session = observed.date().isoformat()
-        if (
-            quote_client_warmed_session != prewarm_session
-            and prewarm_wall_time >= datetime_time(8, 55)
-            and monotonic_now >= quote_client_prewarm_retry_after
+        if _quote_client_prewarm_due(
+            observed, client_warmed_session=quote_client_warmed_session,
+            contracts_warmed_session=quote_contracts_warmed_session,
+            monotonic_now=monotonic_now, retry_after=quote_client_prewarm_retry_after,
         ):
             prewarm_started = time_module.perf_counter()
             try:
-                quote_symbols = _eligible_execution_quote_symbols(
-                    specs,
-                    live_configs,
-                    trading_date=observed,
-                )
-                quote_warm = warm_shioaji_stock_quote_client(quote_symbols)
-                if not bool(quote_warm.get("ready")):
-                    raise RuntimeError(
-                        "Shioaji Contract V2 prewarm incomplete: "
-                        f"resolved={quote_warm.get('resolved_count')} "
-                        f"requested={quote_warm.get('requested_count')}"
-                    )
+                quote_warm = _warm_official_opening_quote_client(observed)
                 prewarm_elapsed_ms = (
                     time_module.perf_counter() - prewarm_started
                 ) * 1000.0
                 quote_client_warmed_session = prewarm_session
+                contracts_ready = bool(quote_warm.get("ready"))
+                if contracts_ready:
+                    quote_contracts_warmed_session = prewarm_session
+                else:
+                    quote_client_prewarm_retry_after = time_module.monotonic() + 5.0
                 _write_preopen_readiness(
                     engine.state_dir,
                     session_date=prewarm_session,
                     component="shioaji_quote",
-                    status="ready",
+                    status="ready" if contracts_ready else "warming",
                     observed=datetime.now(TAIPEI),
                     elapsed_ms=prewarm_elapsed_ms,
                     details={
@@ -2261,7 +2288,7 @@ def main(argv: list[str] | None = None) -> int:
                     },
                 )
                 print(
-                    "[tw-day-trade-sim] shioaji_prewarm=ready "
+                    f"[tw-day-trade-sim] shioaji_prewarm={'ready' if contracts_ready else 'warming'} "
                     f"contracts={quote_warm.get('resolved_count')}/"
                     f"{quote_warm.get('requested_count')} "
                     f"elapsed_ms={prewarm_elapsed_ms:.3f}",
@@ -2287,6 +2314,42 @@ def main(argv: list[str] | None = None) -> int:
                     f"[tw-day-trade-sim] shioaji_prewarm=failed "
                     f"error={type(exc).__name__}: {exc}",
                     flush=True,
+                )
+
+        if (quote_client_warmed_session == prewarm_session
+                and _opening_stream_watch_due(
+                    observed, has_execution_symbols=False,
+                    monotonic_now=monotonic_now, last_attempt_at=last_opening_stream_attempt_at,
+                    reconciliation_pending=opening_stream_reconciliation_pending,
+                ) and not _active_symbols(engine)[0]):
+            last_opening_stream_attempt_at = monotonic_now
+            stream_started = time_module.perf_counter()
+            try:
+                details = _prepare_opening_stream_watch(observed)
+                opening_stream_reconciliation_pending = details["stream_reconciliation_pending"]
+                identity = (prewarm_session, details["official_universe_fingerprint"],
+                            details["subscribed_count"], opening_stream_reconciliation_pending)
+                if identity != opening_stream_readiness_identity:
+                    _write_preopen_readiness(
+                        engine.state_dir, session_date=prewarm_session,
+                        component="shioaji_opening_stream",
+                        status="warming" if opening_stream_reconciliation_pending else "armed",
+                        observed=datetime.now(TAIPEI),
+                        elapsed_ms=(time_module.perf_counter() - stream_started) * 1000.0,
+                        details=details,
+                    )
+                    opening_stream_readiness_identity = identity
+            except Exception as exc:
+                # Registry/quote failures are local to pre-arm, not a reason to
+                # restart login, remove accepted prices or delay other sources.
+                last_opening_stream_attempt_at = time_module.monotonic() + 4.0
+                opening_stream_readiness_identity = None
+                _write_preopen_readiness(
+                    engine.state_dir, session_date=prewarm_session,
+                    component="shioaji_opening_stream", status="failed",
+                    observed=datetime.now(TAIPEI),
+                    elapsed_ms=(time_module.perf_counter() - stream_started) * 1000.0,
+                    details={"retry_after_seconds": 5.0}, error=type(exc).__name__,
                 )
 
         opening_wall_time = observed.timetz().replace(tzinfo=None)
@@ -2944,6 +3007,7 @@ def main(argv: list[str] | None = None) -> int:
                     causal_pending_entry and time_module.monotonic() < entry_fast_until
                 ),
                 has_open_position=bool(active_symbols),
+                has_pending_opening_stream=opening_stream_reconciliation_pending,
             ),
             additional_fd=stock_quote_wakeup.fd,
         )

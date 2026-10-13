@@ -42,7 +42,7 @@ DEFAULTS = {
 
 WORKLOADS = frozenset({"cnyes_bulk", "rss_fulltext", "wordpress_posts", "article_pdf", "article_html", "unclassified", "mixed", "metadata"})
 MEASUREMENT_CONTRACT_VERSION = 11
-TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION = 2
+TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION = 3
 
 
 def _valid_candidate(candidate, maximum):
@@ -55,6 +55,33 @@ def _valid_candidate(candidate, maximum):
                 and ("comparable_new_heads_per_second" not in candidate
                      or type(candidate["comparable_new_heads_per_second"]) in {int, float}
                      and math.isfinite(candidate["comparable_new_heads_per_second"]) and candidate["comparable_new_heads_per_second"] >= 0))
+
+
+def _completed_resume_pressure(sample):
+    """Reconcile the same terminal failure domain used by live window health.
+
+    A proven isolated host/REP error remains a raw failure, not a publisher-wide
+    pressure result. Require the exact recorded denominators: never infer a
+    missing isolation proof, accept a partial projection, or erase provisional
+    errors. Older windows without isolation retain their conservative raw scope.
+    """
+    keys = {'pressure_transport_or_server_errors', 'pressure_request_results', 'pressure_response_results'}
+    present = keys & sample.keys()
+    isolated_keys = ('isolated_gateway_host_errors', 'isolated_robots_origin_errors', 'provisional_gateway_host_errors')
+    isolated = {key: sample.get(key, 0) for key in isolated_keys}
+    if any(type(value) is not int or value < 0 for value in isolated.values()):
+        return None
+    raw = (sample['requests'], sample['responses'], sample['transport_or_server_errors'])
+    if not present:
+        return raw if not any(isolated.values()) else None
+    if present != keys or any(type(sample[key]) is not int or sample[key] < 0 for key in keys):
+        return None
+    removed = isolated['isolated_gateway_host_errors'] + isolated['isolated_robots_origin_errors']
+    if isolated['provisional_gateway_host_errors'] or removed > min(raw) or raw[1] > raw[0] or raw[2] > raw[0]:
+        return None
+    expected = tuple(value - removed for value in raw)
+    actual = (sample['pressure_request_results'], sample['pressure_response_results'], sample['pressure_transport_or_server_errors'])
+    return actual if actual == expected else None
 
 
 def recent_transport_resume(item, policy, *, workload, maximum, floor, now,
@@ -86,10 +113,12 @@ def recent_transport_resume(item, policy, *, workload, maximum, floor, now,
         numeric = {k: sample.get(k) for k in ('requests', 'responses', 'new_stored_url_heads',
                    'durable_body_versions', 'transport_or_server_errors', 'unusable_http_responses')}
         if (any(type(v) is not int or v < 0 for v in numeric.values())
-                or min(numeric['requests'], numeric['responses']) < policy['minimum_requests']
                 or not numeric['new_stored_url_heads'] or not numeric['durable_body_versions']
-                or numeric['unusable_http_responses']
-                or numeric['transport_or_server_errors'] / numeric['requests'] > policy['maximum_error_fraction']):
+                or numeric['unusable_http_responses']):
+            continue
+        pressure = _completed_resume_pressure(sample)
+        if (pressure is None or min(pressure[:2]) < policy['minimum_requests']
+                or pressure[2] / pressure[0] > policy['maximum_error_fraction']):
             continue
         statuses = sample.get('http_status_counts')
         if (not isinstance(statuses, dict) or any(type(v) is not int or v < 0 for v in statuses.values())
@@ -117,6 +146,8 @@ def recent_transport_resume(item, policy, *, workload, maximum, floor, now,
         'recent_healthy_windows_at_exact_capacity': len(samples), 'latest_evidence_epoch': latest,
         'ranking_median_new_heads_per_second': rate, 'independent_nonoverlapping_windows': True,
         'maximum_evidence_age_seconds': policy['recheck_seconds'], 'capacity_fingerprint': capacity_fingerprint,
+        'health_basis': 'reconciled_completed_pressure_counts; conservative_raw_counts_only_without_isolation',
+        'isolated_events_retained_as_failures': True,
         'throughput_estimate_reused': False, 'provider_permission_changed': False,
     }
 

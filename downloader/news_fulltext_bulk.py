@@ -20,6 +20,11 @@ from downloader.news_fulltext_queue import utc_now
 
 
 BULK_ENVELOPE_CONTINUATION_CONTRACT_VERSION = 2
+CNYES_WINDOW_PARTITION_CONTRACT_VERSION = 2
+# All ten registered overflowing categories were measured with parent, two
+# exact children and a point control: the source groups dates at UTC16, not
+# seconds. This is observed query behavior, not an official timezone promise.
+CNYES_QUERY_DAY_OFFSET_SECONDS = 8 * 3600
 BULK_RESTRICTED_ITEM_ERRORS = frozenset({
     'article_rights_override', 'bulk_post_not_public',
     'bulk_foreign_article_url', 'paywall_or_login',
@@ -81,27 +86,35 @@ def cnyes_unseeded_intervals(low: int, high: int, covered, *, max_days: int = 73
 def cnyes_window_partitions(url: str, pages: int) -> list[str]:
     """Respect the measured page <= 30 rule without assuming uniform density.
 
-    Start with the minimum *estimated* number of day windows. Each child's
+    Start with the minimum *estimated* number of source-day windows. Each child's
     actual total is checked again and dense children subdivide recursively.
     Exact inclusive request bounds are covered without holes; the publisher
     can expand to day boundaries, so cross-window article IDs are deduplicated.
-    A single publication day cannot safely be split into hours without proof
-    that the endpoint respects intraday bounds; that overflow remains a gap.
+    A UTC day can intersect two source dates. Split at the measured UTC16
+    boundary, including partial edge dates, rather than inventing intraday
+    precision. A genuine single source date remains an explicit overflow.
     """
     query = parse_qs(urlsplit(url).query)
     if pages <= 30 or "startAt" not in query:
         return []
     low, high = int(query["startAt"][0]), int(query["endAt"][0])
-    days = math.ceil((high - low + 1) / 86400)
+    first_day = (low + CNYES_QUERY_DAY_OFFSET_SECONDS) // 86400
+    last_day = (high + CNYES_QUERY_DAY_OFFSET_SECONDS) // 86400
+    days = last_day - first_day + 1
     if days <= 1:
         return []
     pieces = min(days, math.ceil(pages / 30))
-    boundaries = [low + (i * days // pieces) * 86400 for i in range(pieces)] + [high + 1]
+    boundaries = [low] + [
+        (first_day + i * days // pieces) * 86400 - CNYES_QUERY_DAY_OFFSET_SECONDS
+        for i in range(1, pieces)
+    ] + [high + 1]
     return [cnyes_url(wordpress_base(url), start=a, end=b - 1) for a, b in zip(boundaries, boundaries[1:])]
 
 
-def cnyes_pagination(response) -> tuple[dict, list[dict]]:
+def cnyes_pagination(response, *, maximum_page: int = 30) -> tuple[dict, list[dict]]:
     """Reject wrong/repeated/truncated pages before accepting their text."""
+    if type(maximum_page) is not int or not 1 <= maximum_page <= 100_000:
+        raise ValueError('invalid reviewed Cnyes pagination budget')
     if "application/json" not in response.headers.get("content-type", ""):
         raise NewsError("bulk_api_not_json")
     try:
@@ -118,7 +131,7 @@ def cnyes_pagination(response) -> tuple[dict, list[dict]]:
         # Accept only this exact empty form (or last_page=1), never a short
         # nonempty page. Retain the reported count instead of retrying absence.
         empty_zero_pages = total == 0 and page == 1 and pages == 0 and items.get("data") == []
-        if (not 0 <= total <= 10_000_000 or not 1 <= size <= 30 or not 1 <= page <= 30 or page != requested_page
+        if (not 0 <= total <= 10_000_000 or not 1 <= size <= 30 or not 1 <= page <= maximum_page or page != requested_page
                 or not empty_zero_pages and (pages != max(1, math.ceil(total / size)) or page > pages)):
             raise ValueError("inconsistent pagination")
         posts = items["data"]

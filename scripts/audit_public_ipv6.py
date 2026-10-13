@@ -11,6 +11,7 @@ probe and writes a machine-readable receipt.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import socket
@@ -32,15 +33,24 @@ def _utc_now() -> str:
 
 
 def _read_json(url: str, *, timeout_seconds: float) -> Any:
-    request = Request(url, headers={"User-Agent": "StockAgent-public-IPv6-audit/1"})
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "StockAgent-public-IPv6-audit/1",
+            "Cache-Control": "no-cache",
+        },
+    )
     with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
         return json.loads(response.read().decode("utf-8"))
 
 
 def _start_probe(hostname: str, *, timeout_seconds: float) -> None:
     request = Request(
-        f"https://internet.nl/site/{hostname}/",
-        headers={"User-Agent": "StockAgent-public-IPv6-audit/1"},
+        f"https://internet.nl/site/{hostname}/?_={time.time_ns()}",
+        headers={
+            "User-Agent": "StockAgent-public-IPv6-audit/1",
+            "Cache-Control": "no-cache",
+        },
     )
     with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
         response.read(1)
@@ -52,6 +62,48 @@ def _resolve_ipv6(hostname: str) -> list[str]:
         for item in socket.getaddrinfo(hostname, 443, socket.AF_INET6, socket.SOCK_STREAM)
     }
     return sorted(values)
+
+
+def _web_ipv6_evidence(report: Any, addresses: list[str]) -> dict[str, Any]:
+    """Assess rated web checks; Celery task success alone is not reachability."""
+    evidence: dict[str, Any] = {
+        "report_done": False,
+        "web_aaaa_good": False,
+        "web_reachable": False,
+        "dns_matches_report": False,
+        "report_addresses": [],
+    }
+    if not isinstance(report, dict) or report.get("name") != "siteipv6":
+        return evidence
+    evidence["report_done"] = report.get("done") is True
+    sections = report.get("details_set")
+    if not isinstance(sections, list) or len(sections) != 1:
+        return evidence
+    section = sections[0]
+    if not isinstance(section, list) or len(section) < 3 or not isinstance(section[2], dict):
+        return evidence
+    checks = section[2]
+    aaaa = checks.get("web_aaaa", {})
+    reach = checks.get("web_reach", {})
+    if not isinstance(aaaa, dict) or not isinstance(reach, dict):
+        return evidence
+    evidence["web_aaaa_good"] = type(aaaa.get("status")) is int and aaaa["status"] == 1
+    evidence["web_reachable"] = type(reach.get("status")) is int and reach["status"] == 1
+    rows = aaaa.get("tech_data")
+    if not isinstance(rows, list):
+        return evidence
+    try:
+        observed: set[str] = set()
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 2 or not isinstance(row[1], list):
+                return evidence
+            observed.update(str(ipaddress.IPv6Address(address)) for address in row[1])
+        current = {str(ipaddress.IPv6Address(address)) for address in addresses}
+    except (ValueError, TypeError):
+        return evidence
+    evidence["report_addresses"] = sorted(observed)
+    evidence["dns_matches_report"] = bool(current) and current == observed
+    return evidence
 
 
 def audit_public_ipv6(
@@ -81,7 +133,13 @@ def audit_public_ipv6(
     probes: list[dict[str, Any]] = []
     timed_out = False
     while True:
-        payload = read_json(probe_url, timeout_seconds=min(poll_seconds + 5.0, 30.0))
+        # Internet.nl's own client uses jQuery cache:false. Without an equivalent
+        # nonce, its HTTP max-age=60 response can repeat the initial done:false
+        # after the external work has finished and falsely time out this audit.
+        payload = read_json(
+            f"{probe_url}?_={time.time_ns()}",
+            timeout_seconds=min(poll_seconds + 5.0, 30.0),
+        )
         if not isinstance(payload, list):
             raise RuntimeError("Internet.nl returned a non-list probe payload")
         probes = [dict(item) for item in payload if isinstance(item, dict)]
@@ -94,9 +152,20 @@ def audit_public_ipv6(
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
     ipv6 = next((item for item in probes if item.get("name") == "ipv6"), {})
-    passed = bool(addresses) and bool(ipv6.get("done")) and bool(ipv6.get("success"))
+    details_url = f"https://internet.nl/site/ipv6/{hostname}/"
+    details = None
+    if addresses and ipv6.get("done") is True and ipv6.get("success") is True:
+        details = read_json(
+            f"{details_url}?_={time.time_ns()}",
+            timeout_seconds=min(poll_seconds + 5.0, 30.0),
+        )
+    web_evidence = _web_ipv6_evidence(details, addresses)
+    passed = all(
+        web_evidence[key]
+        for key in ("report_done", "web_aaaa_good", "web_reachable", "dns_matches_report")
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "hostname": hostname,
         "started_at_utc": started_at,
         "completed_at_utc": _utc_now(),
@@ -109,13 +178,18 @@ def audit_public_ipv6(
             "probe_request_issued": bool(start_probe),
             "result_url": f"https://internet.nl/site/{hostname}/",
             "probe_url": probe_url,
+            "poll_cache_busted": True,
             "ipv6": ipv6,
+            "ipv6_report_url": details_url,
+            "ipv6_report": details,
+            "web_evidence": web_evidence,
         },
         "passed": passed,
         "evidence_boundary": (
-            "Independent external probe plus public DNS; same-host WSL curl is not "
-            "used as WAN or router-hairpin evidence. A reused latest result does "
-            "not prove that a fresh probe ran during this audit."
+            "Rated external web AAAA/reachability checks must match current public "
+            "DNS. Probe task done/success alone is not website reachability. "
+            "Same-host WSL curl is not WAN evidence; issuing a probe request does "
+            "not guarantee a fresh provider job rather than a reused provider result."
         ),
     }
 

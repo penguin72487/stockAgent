@@ -613,7 +613,8 @@ def test_adaptive_windows_cover_exact_bounds_and_respect_date_density(pages, day
     low, high = 1388534400, 1388534400 + days * 86400 - 1
     parent = cnyes_url(BASE, start=low, end=high)
     children = cnyes_window_partitions(parent, pages)
-    assert len(children) == min(days, (pages + 29) // 30)
+    # A UTC-aligned range intersects an extra partial publication date.
+    assert len(children) == min(days + 1, (pages + 29) // 30)
     bounds = [(int(parse_qs(urlsplit(u).query)["startAt"][0]), int(parse_qs(urlsplit(u).query)["endAt"][0])) for u in children]
     assert bounds[0][0] == low and bounds[-1][1] == high
     assert all(a <= b for a, b in bounds)
@@ -663,7 +664,7 @@ def test_existing_page_cap_failure_is_reobserved_only_on_contract_migration(cfg,
         queue.db.execute("INSERT INTO discovery(url,kind,provider,error_code) VALUES (?,'cnyes_news','cnyes','discovery_http_422')", (old31,))
         queue.db.execute("INSERT INTO bulk_api_coverage VALUES (?,'cnyes',1000,34,'2026-10-09')", (cnyes_scope(url),))
         queue.db.execute("UPDATE queue_settings SET value='legacy-monthly-contract' WHERE key='policy_fingerprint'")
-        queue.db.execute("DELETE FROM queue_settings WHERE key='cnyes_window_dispatch_v2:cnyes'")
+        queue.db.execute("DELETE FROM queue_settings WHERE key='cnyes_window_dispatch_v3:cnyes'")
     queue.close()
     queue = NewsQueue(tmp_path, reg)
     try:
@@ -679,14 +680,14 @@ def test_dense_day_migration_restores_permitted_pages_without_resetting_refusal_
     from downloader.news_fulltext import discovery_fingerprint
     reg, _ = registry_http(cfg, tmp_path)
     queue = NewsQueue(tmp_path, reg)
-    low, high = 1388534400, 1388620799
+    low, high = 1388534400 - 28800, 1388620799 - 28800
     first, second, third = (cnyes_url(BASE, page, start=low, end=high) for page in (1, 2, 3))
     scope = cnyes_scope(first)
     future = time.time() + 86400
     retirement = json.dumps({'pending_partition_scope': scope})
     try:
         with queue.db:
-            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v2:cnyes\'')
+            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v3:cnyes\'')
             queue.db.execute('INSERT INTO bulk_api_coverage VALUES (?,\'cnyes\',1000,34,\'original-observation\')', (scope,))
             queue.db.execute('INSERT INTO bulk_page_evidence VALUES (?,1,1000,?,\'original-observation\')', (scope, 'a' * 64))
             queue.db.execute('INSERT INTO discovery(url,kind,provider,due,etag,parser_fingerprint) '
@@ -706,7 +707,7 @@ def test_dense_day_migration_restores_permitted_pages_without_resetting_refusal_
         queue.registry = PolicyRegistry(cfg, base=tmp_path)
         queue.reconcile_policy()
         assert queue.db.execute('SELECT due FROM discovery WHERE url=?', (first,)).fetchone()[0] == future
-        assert queue.db.execute('SELECT value FROM counters WHERE key=\'cnyes_window_v2_permitted_jobs_restored\'').fetchone()[0] == 2
+        assert queue.db.execute('SELECT value FROM counters WHERE key=\'cnyes_window_v3_permitted_jobs_restored\'').fetchone()[0] == 2
     finally:
         queue.close()
 
@@ -714,12 +715,12 @@ def test_dense_day_migration_restores_permitted_pages_without_resetting_refusal_
 def test_dense_day_validated_pagination_seeds_first_missing_page_not_all_or_page31(cfg, tmp_path):
     reg, _ = registry_http(cfg, tmp_path)
     queue = NewsQueue(tmp_path, reg)
-    low, high = 1388534400, 1388620799
+    low, high = 1388534400 - 28800, 1388620799 - 28800
     first = cnyes_url(BASE, start=low, end=high)
     scope = cnyes_scope(first)
     try:
         with queue.db:
-            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v2:cnyes\'')
+            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v3:cnyes\'')
             queue.db.execute('INSERT INTO bulk_api_coverage VALUES (?,\'cnyes\',1000,34,\'original-observation\')', (scope,))
             queue.db.executemany('INSERT INTO bulk_page_evidence VALUES (?,?,1000,?,\'original-observation\')',
                                 [(scope, 1, 'a' * 64), (scope, 2, 'b' * 64)])
@@ -737,9 +738,9 @@ def test_dense_window_migration_does_not_guess_pages_without_source_page_evidenc
     queue = NewsQueue(tmp_path, reg)
     try:
         with queue.db:
-            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v2:cnyes\'')
+            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v3:cnyes\'')
             queue.db.execute('INSERT INTO bulk_api_coverage VALUES (?,\'cnyes\',1000,34,\'original-observation\')',
-                             (cnyes_scope(cnyes_url(BASE, start=1388534400, end=1388620799)),))
+                             (cnyes_scope(cnyes_url(BASE, start=1388534400 - 28800, end=1388620799 - 28800)),))
         queue.migrate_cnyes_window_dispatch()
         assert queue.db.execute('SELECT count(*) FROM discovery').fetchone()[0] == 0
         assert queue.db.execute('SELECT count(*) FROM bulk_window_gaps').fetchone()[0] == 1
@@ -753,7 +754,7 @@ def test_multiday_migration_requests_one_actual_envelope_not_a_conditional_304(c
     url = cnyes_url(BASE, start=1388534400, end=1391212799)
     try:
         with queue.db:
-            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v2:cnyes\'')
+            queue.db.execute('DELETE FROM queue_settings WHERE key=\'cnyes_window_dispatch_v3:cnyes\'')
             queue.db.execute('INSERT INTO discovery(url,kind,provider,due,etag,last_modified) '
                              'VALUES (?,\'cnyes_news\',\'cnyes\',1234,\'cache\',\'old date\')', (url,))
             queue.db.execute('INSERT INTO bulk_api_coverage VALUES (?,\'cnyes\',1000,34,\'original-observation\')', (cnyes_scope(url),))
@@ -771,7 +772,7 @@ def test_dense_single_day_gap_does_not_invent_hourly_coverage_or_request_page31(
     reg, http = registry_http(cfg, tmp_path)
     queue = NewsQueue(tmp_path, reg)
     try:
-        url = cnyes_url(BASE, page=30, start=1388534400, end=1388620799)
+        url = cnyes_url(BASE, page=30, start=1388534400 - 28800, end=1388620799 - 28800)
         with queue.db:
             queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
         task = dict(queue.db.execute("SELECT * FROM discovery").fetchone())

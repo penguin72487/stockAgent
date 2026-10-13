@@ -1324,7 +1324,7 @@ def convert_inventory_to_margin(
         replace(
             state,
             carry_cost=state.carry_cost + charge.sum(),
-            observed_day=state.observed_day.new_tensor(day),
+            observed_day=day.detach().clone() if isinstance(day, Tensor) else state.observed_day.new_tensor(day),
             cohorts=_columns(
                 c,
                 {
@@ -1333,7 +1333,8 @@ def convert_inventory_to_margin(
                     ),
                     F.ACCRUED_THROUGH: torch.where(
                         fresh,
-                        torch.full_like(c[..., F.ACCRUED_THROUGH], day),
+                        torch.zeros_like(c[..., F.ACCRUED_THROUGH]) + day if isinstance(day, Tensor)
+                        else torch.full_like(c[..., F.ACCRUED_THROUGH], day),
                         c[..., F.ACCRUED_THROUGH],
                     ),
                 },
@@ -1376,13 +1377,14 @@ def accrue_inventory_interest(
         replace(
             state,
             carry_cost=state.carry_cost + interest.sum(),
-            observed_day=state.observed_day.new_tensor(day),
+            observed_day=day.detach().clone() if isinstance(day, Tensor) else state.observed_day.new_tensor(day),
             cohorts=_columns(
                 c,
                 {
                     F.ACCRUED_THROUGH: torch.where(
                         active,
-                        torch.full_like(c[..., F.ACCRUED_THROUGH], day),
+                        torch.zeros_like(c[..., F.ACCRUED_THROUGH]) + day if isinstance(day, Tensor)
+                        else torch.full_like(c[..., F.ACCRUED_THROUGH], day),
                         c[..., F.ACCRUED_THROUGH],
                     ),
                 },
@@ -1425,8 +1427,8 @@ def inventory_nav(
 def apply_inventory_action(
     state: DayTradeInventoryState,
     *,
-    event_day: int,
-    as_of_day: int,
+    event_day: int | Tensor,
+    as_of_day: int | Tensor,
     event_mask: Tensor,
     share_ratio: Tensor,
     cash_per_old_share: Tensor,
@@ -1445,7 +1447,15 @@ def apply_inventory_action(
     required; duplicate/revised events are rejected, not silently reapplied.
     """
     valid = _calendar_day(state, as_of_day)
-    if (
+    if isinstance(event_day, Tensor):
+        if event_day.shape != () or event_day.dtype != state.observed_day.dtype or event_day.device != state.observed_day.device:
+            raise ValueError("corporate event day tensor must match the inventory scalar ABI")
+        valid = valid & _require(
+            torch.isfinite(event_day) & (event_day == event_day.round())
+            & (event_day > 0) & (event_day <= as_of_day),
+            "corporate action is not yet effective",
+        )
+    elif (
         not isinstance(event_day, int)
         or isinstance(event_day, bool)
         or event_day > as_of_day
@@ -1586,10 +1596,11 @@ def apply_inventory_action(
                 },
             ),
             claims=torch.cat((state.claims, claim.unsqueeze(0)), dim=0),
-            observed_day=state.observed_day.new_tensor(as_of_day),
+            observed_day=as_of_day.detach().clone() if isinstance(as_of_day, Tensor) else state.observed_day.new_tensor(as_of_day),
             action_cursor=torch.where(
                 mask,
-                torch.full_like(state.action_cursor, event_day),
+                torch.zeros_like(state.action_cursor) + event_day if isinstance(event_day, Tensor)
+                else torch.full_like(state.action_cursor, event_day),
                 state.action_cursor,
             ),
         ),
@@ -1631,7 +1642,7 @@ def release_inventory_stock_deliveries(
                     ),
                 },
             ),
-            observed_day=state.observed_day.new_tensor(day),
+            observed_day=day.detach().clone() if isinstance(day, Tensor) else state.observed_day.new_tensor(day),
         ),
         valid,
     )
@@ -1650,7 +1661,7 @@ def settle_inventory_claims(
         replace(
             state,
             claims=torch.stack((claims[..., 0], claims[..., 1], paid), dim=-1),
-            observed_day=state.observed_day.new_tensor(day),
+            observed_day=day.detach().clone() if isinstance(day, Tensor) else state.observed_day.new_tensor(day),
         ),
         valid,
     )

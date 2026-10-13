@@ -34,6 +34,7 @@ from downloader.news_fulltext_status import STATUS_PROJECTION_CONTRACT_VERSION, 
 
 
 ARTICLE_DISPATCH_CONTRACT_VERSION = 5
+CNYES_WINDOW_DISPATCH_CONTRACT_VERSION = 3
 STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION = 1
 FAILURE_OBSERVATION_CONTRACT_VERSION = 2
 DISCOVERY_FAILURE_OBSERVATION_CONTRACT_VERSION = 1
@@ -392,6 +393,10 @@ class NewsQueue:
             self.db.execute(ABANDONED_WORK_RECOVERY_SQL)
             self.db.commit()
         self.recover_acceptance()
+        from downloader.news_fulltext_cnyes_history import initialize as initialize_cnyes_history
+        initialize_cnyes_history(self)
+        from downloader.news_fulltext_cnyes_index import initialize as initialize_cnyes_index
+        initialize_cnyes_index(self)
         self.reconcile_policy()
         self.reconcile_successful_feed_rechecks()
         try:
@@ -1362,39 +1367,105 @@ class NewsQueue:
                             'http_refusals_requeued': False, 'observed_at_utc': utc_now()}, sort_keys=True)))
             self.counter('cnyes_changed_parser_jobs_requeued', len(repaired))
 
-    def migrate_cnyes_window_dispatch(self):
-        """Repair the old page-cap migration once per source contract.
+    @staticmethod
+    def cnyes_partition_retry_deadline(jobs):
+        from urllib.parse import parse_qs
+        return max((row[1] for row in jobs if row[2] is not None and not (
+            row[2] == 'discovery_http_422' and int(parse_qs(urlsplit(row[0]).query).get('page', ['1'])[0]) > 30)), default=0)
 
-        A dense *day* cannot be partitioned with the verified API contract.
-        It still permits pages 1..30; do not retire those jobs, reset their
-        cooldowns, or repeatedly revalidate page 1 after another site changes.
-        Existing page evidence can seed the first unobserved permitted page.
-        Dense multi-day legacy windows need one fresh page-1 envelope to split;
-        a conditional 304 supplies neither pagination nor replacement bounds.
+    def partition_cnyes_window(self, url, pages, source, *, existing_jobs=None):
+        """Schedule exact source-date children, not a history-completeness proof.
+
+        Keep every old page, outcome, cache validator, attempt and deadline.
+        Failed parent pages defer new children until their existing deadline;
+        only the obsolete page>30 input error is not an access prohibition.
+        Old source totals/pages/gaps remain inspectable after retirement. The
+        caller supplies actual validated pagination, live or retained.
+        Migration passes its one-walk job index, avoiding one category scan per
+        dense day. A single live split uses the existing exact endpoint seek.
         """
-        from downloader.news_fulltext_bulk import cnyes_history_priority, cnyes_scope, cnyes_url, wordpress_base
+        from downloader.news_fulltext_bulk import cnyes_history_priority, cnyes_scope, cnyes_window_partitions, wordpress_base
+        from urllib.parse import parse_qs
+
+        children = cnyes_window_partitions(url, pages)
+        if not children:
+            return []
+        endpoint, scope = wordpress_base(url), cnyes_scope(url)
+        if not source.allowed or endpoint not in source.cnyes_apis:
+            raise NewsError('cnyes_window_partition_unregistered_endpoint')
+        previous = self.db.execute('SELECT child_urls_json FROM bulk_window_splits WHERE scope_url=?', (scope,)).fetchone()
+        if previous:
+            if json.loads(previous[0]) != children:
+                raise NewsError('cnyes_window_partition_conflict')
+            from downloader.news_fulltext_cnyes_history import index_children
+            index_children(self, scope, source.provider, children)
+            return children
+        if existing_jobs is None:
+            query = parse_qs(urlsplit(url).query)
+            existing_jobs = self.db.execute(
+                "SELECT url,due,error_code,superseded_by_windows_json FROM discovery "
+                "WHERE url>=? AND url<? AND kind='cnyes_news' "
+                "AND instr(replace(url,'?','&')||'&',?)>0 AND instr(replace(url,'?','&')||'&',?)>0",
+                (endpoint + '?', endpoint + '@', '&startAt=' + query['startAt'][0] + '&',
+                 '&endAt=' + query['endAt'][0] + '&')).fetchall()
+        owned = [row for row in existing_jobs if cnyes_scope(row[0]) == scope]
+        deferred_until = self.cnyes_partition_retry_deadline(owned)
+        split_json = json.dumps(children)
+        self.db.execute('INSERT INTO bulk_window_splits VALUES (?,?,?,?)', (scope, source.provider, split_json, utc_now()))
+        from downloader.news_fulltext_cnyes_history import index_children
+        index_children(self, scope, source.provider, children)
+        self.db.executemany('UPDATE discovery SET superseded_by_windows_json=? WHERE url=?',
+                            ((split_json, row[0]) for row in owned))
+        self.db.executemany("INSERT INTO discovery(url,kind,provider,priority,due) VALUES (?,'cnyes_news',?,?,?) "
+                            'ON CONFLICT(url) DO UPDATE SET due=max(discovery.due,excluded.due) '
+                            'WHERE discovery.superseded_by_windows_json IS NULL AND discovery.due<excluded.due',
+                            ((child, source.provider, cnyes_history_priority(child), deferred_until) for child in children))
+        # Scheduling is not acquisition: never erase an old gap merely because
+        # its replacement pages are queued. Child coverage is verified later.
+        self.db.execute('INSERT OR IGNORE INTO bulk_window_gaps VALUES (?,?,?,?)',
+                        (scope, source.provider, 'cnyes_publication_day_partition_pending', utc_now()))
+        return children
+
+    def migrate_cnyes_window_dispatch(self):
+        """Once per scheduler/bulk ABI, repair legacy UTC-day cap scopes.
+
+        Actual retained first-page evidence can directly seed date children;
+        no redundant parent fetch, source-body ABI change or refusal reset.
+        Without that evidence require one real parent response. Genuine
+        single source dates retain the old cap and permitted-page recovery.
+        """
+        from downloader.news_fulltext_bulk import (CNYES_WINDOW_PARTITION_CONTRACT_VERSION,
+            cnyes_history_priority, cnyes_scope, cnyes_url, cnyes_window_partitions, wordpress_base)
+        from downloader.news_fulltext_policy import cnyes_bulk_fingerprint
         from urllib.parse import parse_qs
 
         for source in self.registry.sources.values():
             if not source.allowed or not source.cnyes_apis:
                 continue
-            marker = 'cnyes_window_dispatch_v2:' + source.provider
+            marker = f'cnyes_window_dispatch_v{CNYES_WINDOW_DISPATCH_CONTRACT_VERSION}:' + source.provider
+            fingerprint = cnyes_bulk_fingerprint(source) + ':calendar-v' + str(CNYES_WINDOW_PARTITION_CONTRACT_VERSION)
             previous = self.db.execute('SELECT value FROM queue_settings WHERE key=?', (marker,)).fetchone()
-            if previous and previous[0] == source.data_fingerprint:
+            if previous and previous[0] == fingerprint:
                 continue
             scopes = {r[0]: r[1] for r in self.db.execute(
                 'SELECT b.base_url,b.total_pages FROM bulk_api_coverage b '
                 'LEFT JOIN bulk_window_splits s ON b.base_url=s.scope_url '
                 'WHERE b.provider=? AND b.total_pages>30 AND s.scope_url IS NULL', (source.provider,))}
             jobs = {}
+            first_pages = set()
             if scopes:
                 # One indexed provider walk, not one endpoint-wide scan per
                 # dense day, and no scan of millions of article bodies.
-                for row in self.db.execute('SELECT url,error_code,superseded_by_windows_json FROM discovery '
+                for row in self.db.execute('SELECT url,due,error_code,superseded_by_windows_json FROM discovery '
                                            'WHERE provider=? AND kind=\'cnyes_news\'', (source.provider,)):
                     scope = cnyes_scope(row[0])
                     if scope in scopes:
                         jobs.setdefault(scope, []).append(tuple(row))
+                first_pages = {row[0] for row in self.db.execute(
+                    'SELECT p.scope_url FROM bulk_page_evidence p JOIN bulk_api_coverage c ON c.base_url=p.scope_url '
+                    'LEFT JOIN bulk_window_splits s ON c.base_url=s.scope_url '
+                    'WHERE c.provider=? AND c.total_pages>30 AND s.scope_url IS NULL '
+                    'AND p.page=1 AND p.total=c.total_articles', (source.provider,))}
             with self.db:
                 for scope, pages in scopes.items():
                     endpoint = wordpress_base(scope)
@@ -1406,12 +1477,18 @@ class NewsQueue:
                         continue
                     parent = cnyes_url(endpoint, start=low, end=high)
                     owned_retirement = json.dumps({'pending_partition_scope': scope})
-                    if high - low + 1 <= 86400:
-                        for url, error, retirement in jobs.get(scope, []):
+                    partitions = cnyes_window_partitions(parent, pages)
+                    if partitions and scope in first_pages:
+                        self.partition_cnyes_window(parent, pages, source, existing_jobs=jobs.get(scope, []))
+                        self.counter('cnyes_window_v3_retained_scopes_partitioned', 1)
+                        self.counter('cnyes_window_v3_new_publication_day_children', len(partitions))
+                        continue
+                    if not partitions:
+                        for url, due, error, retirement in jobs.get(scope, []):
                             page = int(parse_qs(urlsplit(url).query).get('page', ['1'])[0])
                             if 2 <= page <= 30 and retirement == owned_retirement:
                                 self.db.execute('UPDATE discovery SET superseded_by_windows_json=NULL WHERE url=?', (url,))
-                                self.counter('cnyes_window_v2_permitted_jobs_restored', 1)
+                                self.counter('cnyes_window_v3_permitted_jobs_restored', 1)
                         # Retain the actual source cap, not fake hourly slices
                         # or a completeness assertion from the first 900 rows.
                         self.db.execute('INSERT OR IGNORE INTO bulk_window_gaps VALUES (?,?,?,?)',
@@ -1424,19 +1501,20 @@ class NewsQueue:
                                 child = cnyes_url(endpoint, first_missing, start=low, end=high)
                                 result = self.db.execute('INSERT OR IGNORE INTO discovery(url,kind,provider,priority) '
                                     'VALUES (?,\'cnyes_news\',?,?)', (child, source.provider, cnyes_history_priority(child)))
-                                self.counter('cnyes_window_v2_missing_pages_seeded', result.rowcount)
+                                self.counter('cnyes_window_v3_missing_pages_seeded', result.rowcount)
                         continue  # Leave page-1 validators and due untouched.
-                    for url, error, retirement in jobs.get(scope, []):
+                    retry_deadline = self.cnyes_partition_retry_deadline(jobs.get(scope, []))
+                    for url, due, error, retirement in jobs.get(scope, []):
                         page = int(parse_qs(urlsplit(url).query).get('page', ['1'])[0])
                         if page == 1 and error is None:
-                            self.db.execute('UPDATE discovery SET due=0,etag=NULL,last_modified=NULL WHERE url=?', (url,))
-                            self.counter('cnyes_window_v2_multiday_reobservations', 1)
+                            self.db.execute('UPDATE discovery SET due=?,etag=NULL,last_modified=NULL WHERE url=?', (retry_deadline, url))
+                            self.counter('cnyes_window_v3_missing_evidence_reobservations', 1)
                         elif page > 1 and retirement is None:
                             self.db.execute('UPDATE discovery SET superseded_by_windows_json=? WHERE url=?',
                                             (owned_retirement, url))
-                    self.db.execute('INSERT OR IGNORE INTO discovery(url,kind,provider,priority) VALUES '
-                                    '(?,\'cnyes_news\',?,?)', (parent, source.provider, cnyes_history_priority(parent)))
-                self.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (marker, source.data_fingerprint))
+                    self.db.execute('INSERT OR IGNORE INTO discovery(url,kind,provider,priority,due) VALUES '
+                                    '(?,\'cnyes_news\',?,?,?)', (parent, source.provider, cnyes_history_priority(parent), retry_deadline))
+                self.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (marker, fingerprint))
 
     @staticmethod
     def article_dispatch_statement(*, stored_only: bool = False, undated_only: bool = False,
@@ -1636,6 +1714,16 @@ class NewsQueue:
                     clauses.append("(kind=? AND substr(url,1,instr(url||'?','?')-1) IN (" + ','.join('?' for _ in bases) + "))")
                     parameters.extend((kind, *bases))
         result = '(' + ' OR '.join(clauses) + ')'
+        if source.provider == 'cnyes':
+            from downloader.news_fulltext_cnyes_index import ENDPOINT
+            if getattr(source,'cnyes_index_api',''):
+                result += (" AND (kind!='index' OR substr(url,1,instr(url||'?','?')-1)!=? OR NOT EXISTS "
+                           "(SELECT 1 FROM bulk_endpoint_cooldowns AS circuit WHERE circuit.provider=? "
+                           "AND circuit.endpoint=? AND circuit.data_fingerprint=? AND circuit.not_before>?))")
+                parameters.extend((ENDPOINT,source.provider,ENDPOINT,source.cnyes_index_data_fingerprint,time.time()))
+            else:
+                result += " AND (kind!='index' OR substr(url,1,instr(url||'?','?')-1)!=?)"
+                parameters.append(ENDPOINT)
         if source.cnyes_apis and bulk_allowed and include_circuits:
             result += (" AND (kind!='cnyes_news' OR NOT EXISTS (SELECT 1 FROM bulk_endpoint_cooldowns AS circuit "
                        "WHERE circuit.provider=? AND circuit.endpoint=substr(discovery.url,1,instr(discovery.url||'?','?')-1) "
@@ -2047,6 +2135,13 @@ class NewsQueue:
         if 'cnyes' in providers:
             from downloader.news_fulltext_cnyes_work import progress as cnyes_work_progress
             providers['cnyes']['body_work_progress'] = cnyes_work_progress(self.db)
+            from downloader.news_fulltext_cnyes_history import progress as cnyes_history_progress
+            providers['cnyes']['history_list_progress'] = cnyes_history_progress(self.db, self.registry.sources.get('cnyes'))
+            from downloader.news_fulltext_cnyes_index import progress as cnyes_index_progress
+            index_clock = datetime.fromisoformat(performance['snapshot_at_utc']).timestamp()
+            providers['cnyes']['public_index_progress'] = cnyes_index_progress(
+                self.db, self.registry.sources.get('cnyes'), owner_start_epoch=index_clock - elapsed,
+                now_epoch=index_clock, activity=activity)
         for provider, item in providers.items():
             observed = performance["providers"].get(provider, {}).get("counts", {}).get("durably_accepted_versions", 0)
             owner_rate = observed / elapsed if observed >= 10 and elapsed >= 60 else None
@@ -2079,6 +2174,7 @@ class NewsQueue:
                     registered_bulk_pages += count
         discovery_pending, discovery_errors, discovery_superseded, discovery_archived_errors, all_bulk_pages = summarize_discovery_status(self.db, time.time())
         from downloader.news_fulltext_diagnostics import FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION
+        from downloader.news_fulltext_bulk import CNYES_WINDOW_PARTITION_CONTRACT_VERSION, CNYES_QUERY_DAY_OFFSET_SECONDS
         gap_samples, gap_projection = summarize_bulk_window_gaps(self.db)
         result = {
             "contract_version": CONTRACT_VERSION, "updated_at_utc": utc_now(), "activity": activity,
@@ -2092,6 +2188,9 @@ class NewsQueue:
             "acceptance_receipt_decode_version": ACCEPTANCE_RECEIPT_DECODE_VERSION,
             "nonbody_scope_progress_query_version": NONBODY_SCOPE_PROGRESS_QUERY_VERSION,
             "article_dispatch_contract_version": ARTICLE_DISPATCH_CONTRACT_VERSION,
+            "cnyes_window_dispatch_contract_version": CNYES_WINDOW_DISPATCH_CONTRACT_VERSION,
+            "cnyes_window_partition_contract_version": CNYES_WINDOW_PARTITION_CONTRACT_VERSION,
+            "cnyes_query_day_offset_seconds": CNYES_QUERY_DAY_OFFSET_SECONDS,
             "article_request_deferral_contract_version": REQUEST_DEFERRAL_CONTRACT_VERSION,
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "discovery_failure_observation_contract_version": DISCOVERY_FAILURE_OBSERVATION_CONTRACT_VERSION,

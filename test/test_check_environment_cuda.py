@@ -193,3 +193,27 @@ def test_failed_main_emits_json_and_does_not_write_a_runtime_lock(monkeypatch, c
     assert report['torch']['devices'] == [] and report['failures']
     assert 'Environment check failed' in output.err and 'Traceback' not in output.err
     assert not target.exists()
+
+
+def test_explicit_isolated_runtime_keeps_strict_cuda_checks(monkeypatch, capsys, tmp_path):
+    import json
+
+    prefix, cuda = tmp_path / 'kernel-env', tmp_path / 'cuda'
+    monkeypatch.setattr(check, '_parse_args', lambda: SimpleNamespace(
+        require_cuda=True, strict=True, minimum_cuda_devices=2,
+        expected_runtime_lock=None, runtime_lock_output=None,
+    ))
+    monkeypatch.setattr(check, 'normalize_runtime_env', lambda: (prefix, cuda))
+    monkeypatch.setattr(check, 'runtime_identity', lambda: {'metadata_errors': []})
+    monkeypatch.delenv('CONDA_PREFIX', raising=False)
+    monkeypatch.setenv('FINTECH_ENV_PATH', str(prefix))
+    for name in ('CUDA_PATH', 'CUDA_HOME', 'CUDA_ROOT', 'CUDAToolkit_ROOT'):
+        monkeypatch.setenv(name, str(cuda))
+    probe = Mock(return_value=({'cuda_available': True, 'cuda_compute_verified': True}, []))
+    monkeypatch.setattr(check, '_torch_cuda_report', probe)
+    assert check.main() == 0
+    assert json.loads(capsys.readouterr().out)['failures'] == []
+    assert probe.call_args.kwargs == {'require_cuda': True, 'minimum_devices': 2}
+    probe.return_value = ({'cuda_available': True, 'cuda_compute_verified': False}, ['kernel failed'])
+    assert check.main() == 1
+    assert 'kernel failed' in json.loads(capsys.readouterr().out)['failures']

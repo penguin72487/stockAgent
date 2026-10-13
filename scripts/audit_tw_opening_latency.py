@@ -25,14 +25,101 @@ from stockagent.live import signal_engine
 from stockagent.live.tw_day_trade_simulation import _atomic_json
 
 
+def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str]) -> dict:
+    """Audit retained validation events, not invented exchange/feed clocks.
+
+    A latest receipt's axis is a labelled posthoc scope, not evidence that the
+    same roster existed at 09:00. Retain unknowns and source failures. Native
+    receipt clocks, durable quorum, model publication and fills are separate.
+    """
+    start = datetime.fromisoformat(session_date + "T09:00:00+08:00")
+    requested = set(symbols)
+    if not requested or len(requested) != len(symbols):
+        raise ValueError("opening coverage audit requires a nonempty unique scope")
+    cutoffs = (100, 250, 500, 1000, 2000, 5000)
+    states = {cutoff: {} for cutoff in cutoffs}
+    failures, malformed, known_providers, legacy_events = {}, 0, set(), []
+    if not path.exists():
+        return {"state": "unavailable", "path": str(path), "requested_count": len(symbols)}
+    with path.open() as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("invalid source event")
+                if not isinstance(row.get("session_date"), str) or not row["session_date"]:
+                    raise ValueError("invalid session date")
+                if row.get("session_date") != session_date:
+                    continue
+                at = datetime.fromisoformat(row["observed_at_taipei"])
+                if at.tzinfo is None:
+                    raise ValueError("missing observation timezone")
+                elapsed = (at - start).total_seconds() * 1000
+                provider = row["provider"]
+                if not isinstance(provider, str) or not provider:
+                    raise ValueError("invalid provider")
+                if provider != "merged" and row.get("event") in {"started", "finished", "observations_delta"}:
+                    known_providers.add(provider)
+                if (row.get("event") == "first_batch" and 0 <= elapsed <= max(cutoffs)
+                        and not isinstance(row.get("observation_quality"), dict)):
+                    # Older owners logged counts, not IDs. Lack of the new
+                    # delta schema is missing evidence, NOT zero quotes.
+                    legacy_events.append({key: row.get(key) for key in (
+                        "provider", "observed_at_taipei", "requested_count",
+                        "response_count", "valid_open_count")})
+                if row.get("event") == "finished" and row.get("state") in {"failed", "degraded"}:
+                    failures[provider] = failures.get(provider, 0) + 1
+                if row.get("event") != "observations_delta" or elapsed < 0:
+                    continue
+                for cutoff in cutoffs:
+                    if elapsed > cutoff:
+                        continue
+                    source_states = states[cutoff].setdefault(provider, {"valid": set(), "no_print": set()})
+                    for observation in row.get("observations", []):
+                        symbol, state = observation["symbol"], observation["state"]
+                        if symbol not in requested:
+                            continue
+                        if state == "valid_open":
+                            source_states["valid"].add(symbol)
+                            source_states["no_print"].discard(symbol)
+                        elif state == "observed_no_first_print" and symbol not in source_states["valid"]:
+                            source_states["no_print"].add(symbol)
+            except (KeyError, TypeError, ValueError):
+                malformed += 1
+    milestones = []
+    for cutoff, providers in states.items():
+        for provider in sorted(known_providers):
+            providers.setdefault(provider, {"valid": set(), "no_print": set()})
+        valid = set().union(*(source["valid"] for source in providers.values()))
+        no_print = set().union(*(source["no_print"] for source in providers.values())) - valid
+        milestones.append({"after_open_ms": cutoff, "valid_open_count": len(valid),
+            "observed_no_print_count": len(no_print), "unknown_count": len(requested - valid - no_print),
+            "providers": {name: {"valid_open_count": len(source["valid"]),
+                "observed_no_print_count": len(source["no_print"])} for name, source in providers.items()}})
+    if legacy_events:
+        for row in milestones:
+            row["retained_symbol_event_lower_bounds"] = {key: row[key] for key in ("valid_open_count", "observed_no_print_count")}
+            row.update(valid_open_count=None, observed_no_print_count=None, unknown_count=None,
+                       provider_counts_are_lower_bounds=True)
+    return {"state": "degraded" if malformed else "insufficient_evidence" if legacy_events else "observed", "path": str(path), "session_date": session_date,
+        "requested_count": len(symbols), "scope_basis": "canonical_receipt_posthoc_axis_not_backdated_registry",
+        "measurement_boundary": "source_validation_event_clock_not_durable_quorum_or_broker_fill",
+        "malformed_lines": malformed, "legacy_aggregate_events": legacy_events,
+        "per_symbol_schema_usable": not legacy_events and not malformed,
+        "failed_or_degraded_jobs": failures, "milestones": milestones}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-date", default=datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat())
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--infer", action="store_true")
     parser.add_argument("--runtime", action="store_true", help="Attach current owners, Gateway, execution and source-repair receipts; no mutations")
+    parser.add_argument("--ledger-fingerprints", action="store_true", help="Explicit deep reload audit with --runtime: stream-hash large immutable ledgers; normal health reads do not scan them")
     parser.add_argument("--rounds", type=int, default=2)
     args = parser.parse_args()
+    if args.ledger_fingerprints and not args.runtime:
+        parser.error("--ledger-fingerprints requires --runtime")
     if not 1 <= args.rounds <= 10:
         parser.error("rounds must be 1..10")
     if args.infer and args.session_date != datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat():
@@ -58,9 +145,42 @@ def main() -> int:
             if row["status"] == "ready":
                 stats["ready"].append(row)
     _atomic_json(args.output, report)
+    from stockagent.live import quote_provider as quotes
+    receipt_path = quotes._tw_mis_opening_receipt_path(args.session_date)
+    try:
+        opening_receipt = json.loads(receipt_path.read_text())
+        report["source_coverage_milestones"] = opening_coverage_milestones(
+            receipt_path.with_suffix(".acquisition.jsonl"), args.session_date,
+            opening_receipt["requested_symbols"])
+        report["source_coverage_milestones"]["universe_receipt_sha256"] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        report["source_coverage_milestones"]["official_scope_observed_at"] = opening_receipt.get("official_trading_universe", {}).get("observed_at_taipei")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        report["source_coverage_milestones"] = {"state": "unavailable", "error_type": type(exc).__name__}
+    _atomic_json(args.output, report)
     if args.runtime:
         runtime = {"observed_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
                    "service_restart_performed": False, "broker_orders_submitted": False}
+        clock_started = time.perf_counter()
+        recovered = bot._recover_opening_first_observations(args.session_date)
+        runtime["first_scheduler_observation_recovery_ms"] = round((time.perf_counter() - clock_started) * 1000, 3)
+        runtime["first_scheduler_observations"] = {key: value.isoformat(timespec="microseconds") for key, value in recovered.items()}
+        runtime["scheduler_clock_contract"] = "session_first_observation_across_owner_restarts_v1"
+        runtime["ledger_fingerprints"] = {}
+        runtime["ledger_fingerprints_performed"] = args.ledger_fingerprints
+        for name in (("fills.jsonl", "orders.jsonl", "signals.jsonl") if args.ledger_fingerprints else ()):
+            path = bot._day_trade_state_dir() / name
+            try:
+                before = path.stat()
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                after = path.stat()
+                unchanged = (before.st_ino, before.st_size, before.st_mtime_ns) == (after.st_ino, after.st_size, after.st_mtime_ns)
+                runtime["ledger_fingerprints"][name] = {"state": "observed" if unchanged else "concurrent_change",
+                    "bytes": after.st_size, "sha256": digest.hexdigest() if unchanged else None}
+            except OSError as exc:
+                runtime["ledger_fingerprints"][name] = {"state": "unavailable", "error_type": type(exc).__name__}
         for name, path in {
             "engine": bot._day_trade_state_dir() / "status.json",
             "discord": bot._discord_service_status_path(),

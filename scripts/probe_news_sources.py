@@ -12,11 +12,13 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import hashlib
+from itertools import islice
 import json
 from pathlib import Path
 import re
 import sqlite3
 import time
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from lxml import etree
@@ -115,6 +117,80 @@ def select_current_failure_urls(root, provider, registry, *, maximum=4, now=None
         return urls
     finally:
         db.close()
+
+
+def wordpress_public_metadata_shape(data, headers):
+    """Bounded source declarations, never bodies, credentials or guessed names.
+
+    `_embed=author` can return error objects or omit the relation. Describe
+    that evidence without assuming WordPress core's schema is this site's
+    actual schema, following profile links, or accepting any article. Sample
+    four posts but count the whole bounded page; reject oversized envelopes.
+    """
+    if not isinstance(data, list) or len(data) > 100:
+        raise NewsError('bulk_api_shape_invalid')
+
+    def keys(value):
+        return sorted(str(key)[:80] for key in islice(value, 64))[:32] if isinstance(value, dict) else []
+
+    def author_rows(post):
+        embedded = post.get('_embedded')
+        authors = embedded.get('author') if isinstance(embedded, dict) else None
+        return authors if isinstance(authors, list) else [authors] if isinstance(authors, dict) else []
+
+    def public_credit(value):
+        if not isinstance(value, dict):
+            return {'type': type(value).__name__}
+        return {'keys': keys(value),
+            'id': value.get('id') if type(value.get('id')) is int else None,
+            'name': value.get('name')[:200] if isinstance(value.get('name'), str) else None,
+            'error_code': value.get('code')[:100] if isinstance(value.get('code'), str) else None}
+
+    def post_shape(post):
+        if not isinstance(post, dict):
+            return {'type': type(post).__name__}
+        content, title = post.get('content'), post.get('title')
+        embedded, links = post.get('_embedded'), post.get('_links')
+        link_authors = links.get('author') if isinstance(links, dict) else None
+        link_authors = link_authors if isinstance(link_authors, list) else []
+        head = post.get('yoast_head_json')
+        meta = post.get('meta')
+        return {'id': post.get('id') if type(post.get('id')) is int else None,
+            'keys': keys(post), 'author_type': type(post.get('author')).__name__,
+            'author_id': post.get('author') if type(post.get('author')) is int else None,
+            'title_characters': len(title.get('rendered', '')) if isinstance(title, dict)
+                and isinstance(title.get('rendered', ''), str) else None,
+            'content_characters': len(content.get('rendered', '')) if isinstance(content, dict)
+                and isinstance(content.get('rendered', ''), str) else None,
+            'content_protected': content.get('protected') is True if isinstance(content, dict) else None,
+            'embedded_relations': keys(embedded), 'link_relations': keys(links),
+            'embedded_authors': [public_credit(author) for author in author_rows(post)[:8]],
+            'author_link_embeddable': [link.get('embeddable') is True for link in link_authors[:8]
+                                       if isinstance(link, dict)],
+            'yoast_head_json_keys': keys(head), 'meta_keys': keys(meta),
+            'yoast_declared_author': head.get('author')[:200] if isinstance(head, dict)
+                and isinstance(head.get('author'), str) else None,
+            'custom_credit_field_shapes': {key: {'type': type(value).__name__, 'keys': keys(value)}
+                for key, value in islice(post.items(), 64)
+                if re.search(r'author|creator|coauthor|credit', key, re.I)
+                and key not in {'author', '_embedded', '_links'}}}
+
+    def total(name):
+        value = headers.get(name)
+        return (int(value) if isinstance(value, str) and value.isascii() and value.isdecimal()
+                and len(value) <= 8 and int(value) <= 10_000_000 else None)
+
+    posts = [post for post in data if isinstance(post, dict)]
+    return {'contract_version': 1, 'rows': len(data), 'object_rows': len(posts),
+        'declared_total_posts': total('x-wp-total'), 'declared_total_pages': total('x-wp-totalpages'),
+        'posts_with_embedded_author_name': sum(any(isinstance(author, dict)
+            and isinstance(author.get('name'), str) and bool(author['name'].strip())
+            for author in author_rows(post)) for post in posts),
+        'posts_with_embedded_author_error': sum(any(isinstance(author, dict) and author.get('code')
+            for author in author_rows(post)) for post in posts),
+        'sampled_posts': [post_shape(post) for post in data[:4]],
+        'samples_are_not_all_post_byline_proof': True, 'automatic_profile_requests': 0,
+        'raw_response_retained': False, 'article_body_accepted': False}
 
 
 def probe_provider(http, urls, *, retain=False, output_root=None):
@@ -419,10 +495,20 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                             item['feed_rights_markers'].append({'item_number': number, 'url': entry.findtext('link'),
                                 'rights': entry.findtext('{http://purl.org/dc/elements/1.1/}rights'), 'flags': flags})
             elif response.status == 200 and "json" in response.headers.get("content-type", ""):
-                data = json.loads(response.body)
+                try:
+                    data = json.loads(response.body)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # A bad publisher envelope must not abort diagnosis of
+                    # subsequent explicit endpoints. Keep only its hash and
+                    # error class, never decoder excerpts of rejected text.
+                    raise NewsError('bulk_api_invalid_json') from None
                 item["json_rows"] = len(data) if isinstance(data, list) else None
-                item["json_first_keys"] = sorted(data[0]) if isinstance(data, list) and data else []
-                item["embedded_author_keys"] = list((data[0].get("_embedded") or {})) if isinstance(data, list) and data else []
+                first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+                item["json_first_keys"] = sorted(islice(first, 64))[:32]
+                embedded = first.get('_embedded')
+                item["embedded_author_keys"] = sorted(islice(embedded, 64))[:32] if isinstance(embedded, dict) else []
+                if urlsplit(response.url).path == '/wp-json/wp/v2/posts':
+                    item['wordpress_public_metadata'] = wordpress_public_metadata_shape(data, response.headers)
                 if source.provider == "cnyes" and response.url.split("?", 1)[0] in source.cnyes_apis:
                     from downloader.news_fulltext_bulk import cnyes_pagination, cnyes_records
                     envelope = data.get("items") if isinstance(data, dict) else None

@@ -24,15 +24,37 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 _TELEMETRY_LOCK = threading.Lock()
 
 
-def _source_failure_retry(metric: dict, *, status: int | None = None) -> None:
+def _source_failure_retry(metric: dict, *, status: int | None = None,
+                          endpoint_unavailable: bool = False) -> None:
     """Provider-local failure isolation; accepted rows and other sources continue."""
     failures = int(metric.get("consecutive_source_failures", 0)) + 1
     metric["consecutive_source_failures"] = failures
     delay = 60.0 if status in {401, 402, 403, 429} else min(
         15.0, 0.5 * 2 ** min(failures - 1, 5)
     )
+    if endpoint_unavailable:
+        delay = max(delay, 15.0)
     metric["retry_delay_seconds"] = delay
     metric["retry_after_monotonic"] = time.monotonic() + delay
+    metric["retry_reason"] = "source_endpoint_unavailable" if endpoint_unavailable else "source_failure"
+
+
+def _source_no_progress_retry(metric: dict) -> None:
+    """A responding source is not a fresh input; do not hammer unchanged gaps.
+
+    Keep this distinct from transport failure and from a proven first-print
+    absence. Other providers, accepted facts and the consumer retry continue.
+    """
+    attempts = int(metric.get("consecutive_source_no_progress", 0)) + 1
+    metric["consecutive_source_failures"] = 0
+    metric["consecutive_source_no_progress"] = attempts
+    # A responding source is a short-lived data wait, not an outage. Keep its
+    # next opportunity within one second; transport failures use the separate
+    # longer backoff. Native push observations remain independent of this wait.
+    delay = min(1.0, 0.5 * 2 ** min(attempts - 1, 1))
+    metric["retry_delay_seconds"] = delay
+    metric["retry_after_monotonic"] = time.monotonic() + delay
+    metric["retry_reason"] = "no_same_session_opening_inputs"
 
 
 def _record_source_event(key, provider, event, details) -> bool:
@@ -40,10 +62,13 @@ def _record_source_event(key, provider, event, details) -> bool:
     path = quotes._tw_mis_opening_receipt_path(key[1]).with_suffix(".acquisition.jsonl")
     payload = {"schema_version": 1, "session_date": key[1], "parquet_root": key[0], "provider": provider, "event": event, "observed_at_taipei": datetime.now(TAIPEI).isoformat(timespec="microseconds"), "measurement_boundary": "opening_source_acquisition_not_broker_fill", **details}
     try:
+        # Large per-symbol evidence must not serialize while holding the shared
+        # append lock: a different provider's tiny quorum receipt can be ready.
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n"
         with _TELEMETRY_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
         return True
@@ -57,6 +82,8 @@ class _Session:
     inflight: dict[str, set[str]] = field(default_factory=dict)
     metrics: dict[str, dict] = field(default_factory=dict)
     generation: int = 0
+    provider_symbols: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    observations: dict[str, dict[str, dict]] = field(default_factory=dict)
 
 
 class OpeningPriceFanIn:
@@ -207,11 +234,15 @@ class OpeningPriceFanIn:
                 metric["attempts"] += 1
                 metric["requested_count"] += len(requested)
                 metric["state"] = "running"
-                jobs.append((name, provider, requested, fallback[indices].copy()))
+                scope = session.provider_symbols.setdefault(name, {key: set() for key in ("requested", "responded", "valid", "no_print")})
+                scope["requested"].update(requested)
+                metric["unique_requested_count"] = len(scope["requested"])
+                job_id = f"{name}:{metric['attempts']}"
+                jobs.append((name, provider, requested, fallback[indices].copy(), job_id))
             # Enqueue all sources under a short lock. Workers perform no I/O
             # until the lock is released; a fast winner cannot cancel a loser.
-            for name, provider, requested, values in jobs:
-                self._pool.submit(self._run, session, generation, key, name, provider, requested, values, started)
+            for name, provider, requested, values, job_id in jobs:
+                self._pool.submit(self._run, session, generation, key, name, provider, requested, values, started, job_id)
         deadline = time.monotonic() + max(0.01, timeout_seconds)
         while True:
             with session.condition:
@@ -244,32 +275,81 @@ class OpeningPriceFanIn:
         observed.transport_timing["opening_telemetry_recorded"] = _record_source_event(key, "merged", "quorum" if ready else "waiting_source", {"requested_count": len(symbols), "valid_open_count": int(opens.sum()), "resolved_count": int(resolved.sum()), "required_count": required, "elapsed_ms": observed.transport_timing["opening_quorum_wait_ms"], "background_pending": pending, "providers": metrics})
         return observed
 
-    def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started):
+    def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started, job_id):
         started = time.perf_counter()
+        # Per-request facts must not alias the provider aggregate: a one-symbol
+        # delta used to overwrite the simultaneous 2,293-symbol batch receipt.
+        metric = {"job_id": job_id, "requested_count": len(symbols), "state": "running"}
         with session.condition:
-            metric = session.metrics[name]
             metric["last_started_at_taipei"] = datetime.now(TAIPEI).isoformat(timespec="microseconds")
             metric["last_dispatch_ms"] = round((started - caller_started) * 1000, 3)
-            metric.pop("error_type", None)
-        _record_source_event(key, name, "started", {"requested_count": len(symbols), "requested_symbols_sha256": hashlib.sha256("\n".join(symbols).encode()).hexdigest(), "dispatch_ms": metric["last_dispatch_ms"]})
+            aggregate = session.metrics[name]
+            aggregate["last_started_at_taipei"] = metric["last_started_at_taipei"]
+            aggregate["last_dispatch_ms"] = metric["last_dispatch_ms"]
+            aggregate.pop("error_type", None)
+            aggregate.pop("http_status", None)
+        _record_source_event(key, name, "started", {"job_id": job_id, "requested_count": len(symbols), "requested_symbols_sha256": hashlib.sha256("\n".join(symbols).encode()).hexdigest(), "dispatch_ms": metric["last_dispatch_ms"]})
         last_progress = [None]
+        requested_set = set(symbols)
 
         def progress(requested, snapshot):
+            validation_started = time.perf_counter()
+            if not set(requested).issubset(requested_set) or len(requested) != len(snapshot.prices):
+                raise ValueError("provider progress does not match requested universe")
+            quality, observations = quotes.tw_opening_observation_diagnostics(requested, snapshot, session_date=key[1])
+            diagnostics_ms = (time.perf_counter() - validation_started) * 1000
+            changed = []
             with session.condition:
                 if session.generation != generation or datetime.now(TAIPEI).date().isoformat() != key[1] or self._closed:
                     return
-                if not set(requested).issubset(symbols) or len(requested) != len(snapshot.prices):
-                    raise ValueError("provider progress does not match requested universe")
+                merge_started = time.perf_counter()
                 quotes.seed_tw_opening_snapshot_cache(requested, snapshot, parquet_root=key[0], session_date=key[1], persist=False)
+                merge_ms = (time.perf_counter() - merge_started) * 1000
+                scope = session.provider_symbols[name]
+                observed = session.observations.setdefault(name, {})
+                for row in observations:
+                    symbol, state = row["symbol"], row["state"]
+                    if row["available"]:
+                        scope["responded"].add(symbol)
+                    if state == "valid_open":
+                        scope["valid"].add(symbol)
+                        scope["no_print"].discard(symbol)
+                    elif state == "observed_no_first_print" and symbol not in scope["valid"]:
+                        scope["no_print"].add(symbol)
+                    previous = observed.get(symbol)
+                    # A partial cumulative batch cannot turn an earlier source
+                    # observation into absence. Persist the first observation
+                    # and every reason/open/flag transition, not every tick's
+                    # wall-clock update; successful observations stay intact.
+                    if state == "no_source_observation" and previous is not None:
+                        continue
+                    identity = (state, row["open_price"], row["simtrade"])
+                    before = (previous["state"], previous["open_price"], previous["simtrade"]) if previous is not None else None
+                    observed[symbol] = row
+                    if identity != before:
+                        changed.append(row)
+                aggregate.update(response_count=len(scope["responded"]),
+                                 valid_open_count=len(scope["valid"]), no_print_count=len(scope["no_print"]))
+                metric["observation_quality"] = quality
+                # Nested spans, not extra sequential costs to add to source
+                # total. Preserve slow/failed samples instead of hot-only SLOs.
+                metric["last_diagnostics_ms"] = round(diagnostics_ms, 3)
+                metric["last_cache_merge_ms"] = round(merge_ms, 3)
+                metric["last_validation_ms"] = round((time.perf_counter() - validation_started) * 1000, 3)
                 last_progress[0] = snapshot
                 is_first = "first_batch_ms" not in metric
                 metric.setdefault("first_batch_ms", round((time.perf_counter() - started) * 1000, 3))
-                if quotes.tw_session_open_observed_mask(snapshot, session_date=key[1]).any():
+                aggregate.setdefault("first_batch_ms", metric["first_batch_ms"])
+                if quality["valid_open_count"]:
                     metric.setdefault("first_valid_open_ms", round((time.perf_counter() - started) * 1000, 3))
                     metric.setdefault("first_valid_open_at_taipei", datetime.now(TAIPEI).isoformat(timespec="microseconds"))
+                    aggregate.setdefault("first_valid_open_ms", metric["first_valid_open_ms"])
+                    aggregate.setdefault("first_valid_open_at_taipei", metric["first_valid_open_at_taipei"])
                 session.condition.notify_all()
             if is_first:
-                _record_source_event(key, name, "first_batch", {"requested_count": len(symbols), "response_count": int(snapshot.available_count), "valid_open_count": int(quotes.tw_session_open_observed_mask(snapshot, session_date=key[1]).sum()), "elapsed_ms": metric["first_batch_ms"]})
+                _record_source_event(key, name, "first_batch", {"job_id": job_id, "requested_count": len(symbols), "response_count": int(snapshot.available_count), "valid_open_count": quality["valid_open_count"], "observation_quality": quality, "elapsed_ms": metric["first_batch_ms"], "validation_ms": metric["last_validation_ms"], "diagnostics_ms": metric["last_diagnostics_ms"], "cache_merge_ms": metric["last_cache_merge_ms"]})
+            if changed:
+                metric["observation_telemetry_recorded"] = _record_source_event(key, name, "observations_delta", {"job_id": job_id, "observation_quality": quality, "observations": changed})
         try:
             snapshot = provider(symbols, fallback, progress)
             if last_progress[0] is not snapshot:
@@ -282,14 +362,28 @@ class OpeningPriceFanIn:
                 state = "complete" if valid_opens or no_prints else "waiting_source"
                 if responses == 0:
                     state = "failed" if int(transport.get("mis_failed_request_count", 0)) else "waiting_source"
+                endpoint_unavailable = bool(transport.get("mis_dispatch_stopped"))
+                if endpoint_unavailable and responses:
+                    state = "degraded"
                 metric.update(state=state, valid_open_count=valid_opens,
                               response_count=responses, no_print_count=no_prints,
                               transport_timing=transport)
-                if responses == 0:
-                    _source_failure_retry(metric)
+                aggregate.update(transport_timing=transport, last_response_count=responses,
+                                 last_valid_open_count=valid_opens,
+                                 last_observation_quality=metric.get("observation_quality"))
+                if responses == 0 or endpoint_unavailable:
+                    statuses = transport.get("mis_http_error_statuses", [])
+                    limited = next((code for code in statuses if code in {401, 402, 403, 429}), None)
+                    _source_failure_retry(aggregate, status=limited,
+                                          endpoint_unavailable=endpoint_unavailable)
                 elif valid_opens or no_prints:
-                    metric["consecutive_source_failures"] = 0
-                    metric.pop("retry_delay_seconds", None)
+                    aggregate["consecutive_source_failures"] = 0
+                    aggregate["consecutive_source_no_progress"] = 0
+                    aggregate.pop("retry_after_monotonic", None)
+                    aggregate.pop("retry_delay_seconds", None)
+                    aggregate.pop("retry_reason", None)
+                else:
+                    _source_no_progress_retry(aggregate)
         except Exception as exc:
             # Never write provider exception text/HTTP headers/tokens to receipts.
             with session.condition:
@@ -297,15 +391,21 @@ class OpeningPriceFanIn:
                 metric.update(state="failed", error_type=type(exc).__name__)
                 if status is not None:
                     metric["http_status"] = int(status)
-                _source_failure_retry(metric, status=403 if isinstance(exc, PermissionError) else status)
+                aggregate.update(state="failed", error_type=type(exc).__name__)
+                if status is not None:
+                    aggregate["http_status"] = int(status)
+                _source_failure_retry(aggregate, status=403 if isinstance(exc, PermissionError) else status)
         finally:
             with session.condition:
                 metric["last_total_ms"] = round((time.perf_counter() - started) * 1000, 3)
                 if name.startswith("finmind"):
-                    metric["retry_after_monotonic"] = max(metric.get("retry_after_monotonic", 0), time.monotonic() + 10)
+                    aggregate["retry_after_monotonic"] = max(aggregate.get("retry_after_monotonic", 0), time.monotonic() + 10)
                 elif name.startswith("fugle"):
-                    metric["retry_after_monotonic"] = max(metric.get("retry_after_monotonic", 0), time.monotonic() + 5)
+                    aggregate["retry_after_monotonic"] = max(aggregate.get("retry_after_monotonic", 0), time.monotonic() + 5)
                 session.inflight[name].difference_update(symbols)
+                aggregate["last_total_ms"] = metric["last_total_ms"]
+                aggregate["last_completed_job"] = dict(metric)
+                aggregate["state"] = "running" if session.inflight[name] else metric["state"]
                 should_persist = session.generation == generation and datetime.now(TAIPEI).date().isoformat() == key[1] and not self._closed
                 session.condition.notify_all()
             # Fsync/JSON serialization is not a condition-lock dependency of
@@ -317,7 +417,8 @@ class OpeningPriceFanIn:
             except Exception as exc:
                 with session.condition:
                     metric.update(state="failed", error_type=type(exc).__name__)
-                    _source_failure_retry(metric)
+                    aggregate.update(state="failed", error_type=type(exc).__name__)
+                    _source_failure_retry(aggregate)
             finally:
                 with session.condition:
                     session.condition.notify_all()
@@ -421,7 +522,11 @@ def configured_opening_providers(parquet_root: str | Path, *, broker_fetch=None)
     def mis(symbols, fallback, progress):
         # Return the actual MIS response, not a cache assembled from OTHER
         # providers. This keeps per-provider coverage and provenance truthful.
-        return quotes.fetch_tw_mis_last_prices(symbols, fallback, parquet_root=parquet_root, empty_chunk_retry_attempts=0, max_parallel_requests=int(os.getenv("STOCKAGENT_TW_OPENING_PARALLEL_REQUESTS", "16") or "16"), request_timeout_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_REQUEST_TIMEOUT_SECONDS", "1.5") or "1.5"), on_progress=progress)
+        # MIS's measured 80-channel response can take 2.69s even when a single
+        # symbol takes 52ms. Its own 4s read budget is independent of the
+        # caller's quorum wait; healthy Shioaji/FinMind may release it earlier.
+        # Retain 80-channel batching here to avoid multiplying public requests.
+        return quotes.fetch_tw_mis_last_prices(symbols, fallback, parquet_root=parquet_root, empty_chunk_retry_attempts=0, max_parallel_requests=int(os.getenv("STOCKAGENT_TW_OPENING_PARALLEL_REQUESTS", "16") or "16"), request_timeout_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_REQUEST_TIMEOUT_SECONDS", "4") or "4"), on_progress=progress)
 
     return {"shioaji_shared": broker, "official_mis": mis, **optional_opening_providers()}
 

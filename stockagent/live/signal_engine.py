@@ -61,6 +61,7 @@ from stockagent.live.quote_provider import (
 from stockagent.live.report_formatter import format_signal_message, is_display_position_row
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
+from stockagent.live.feature_source_contract import inspect_live_feature_source, require_live_feature_source
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
 from stockagent.models.temporal_basis_fit import (
@@ -150,6 +151,7 @@ _LIVE_MODEL_CACHE_MAX_ENTRIES = 8
 _LIVE_MODEL_CACHE: OrderedDict[str, torch.nn.Module] = OrderedDict()
 _LIVE_MODEL_CACHE_LOCK = threading.Lock()
 _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES = 8
+_LIVE_MODEL_INPUT_CACHE_MAX_BYTES = 6 * 1024**3
 _LIVE_MODEL_INPUT_CACHE: OrderedDict[
     str, tuple[weakref.ReferenceType[np.ndarray], np.ndarray]
 ] = OrderedDict()
@@ -158,6 +160,7 @@ _LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
     tuple[int, str], tuple[PanelData, PanelData]
 ] = OrderedDict()
 _LIVE_ALIGNED_PANEL_CACHE_LOCK = threading.Lock()
+_LIVE_FACTORIZED_PANEL_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -196,6 +199,7 @@ def clear_live_panel_memory_cache() -> None:
     with _LIVE_PANEL_CACHE_LOCK:
         _LIVE_PANEL_CACHE.clear()
         _LIVE_PANEL_SOURCE_KEY_CACHE.clear()
+        _LIVE_FACTORIZED_PANEL_CACHE.clear()
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         _LIVE_MODEL_INPUT_CACHE.clear()
     with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
@@ -507,17 +511,31 @@ def _cached_normalized_model_window(
             return cached
         if entry is not None:
             _LIVE_MODEL_INPUT_CACHE.pop(key, None)
+        previous_entry = _LIVE_MODEL_INPUT_CACHE.get(
+            f"{id(panel.features)}:{int(panel_idx)-1}:{int(lookback)}")
+        previous = (previous_entry[1] if previous_entry is not None
+                    and previous_entry[0]() is panel.features
+                    and tuple(previous_entry[1].shape) == expected_shape else None)
     start = int(panel_idx) - int(lookback) + 1
-    value = np.nan_to_num(
-        panel.features[start : int(panel_idx) + 1],
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    ).astype(np.float32, copy=False)
+    if previous is not None and getattr(panel.features, "_stockagent_factorized_features", False):
+        # Consecutive historical windows share lookback-1 immutable rows.
+        # Preserve the previous buffer (opening-gap code may still hold it)
+        # and decode/normalize only the genuinely new source row.
+        value = np.empty(expected_shape, dtype=np.float32)
+        value[:-1] = previous[1:]
+        value[-1] = np.nan_to_num(panel.features[int(panel_idx)], nan=0.0,
+                                  posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    else:
+        value = np.nan_to_num(
+            panel.features[start : int(panel_idx) + 1],
+            nan=0.0, posinf=0.0, neginf=0.0,
+        ).astype(np.float32, copy=False)
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         _LIVE_MODEL_INPUT_CACHE[key] = (weakref.ref(panel.features), value)
         _LIVE_MODEL_INPUT_CACHE.move_to_end(key)
-        while len(_LIVE_MODEL_INPUT_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES:
+        while (len(_LIVE_MODEL_INPUT_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES
+               or sum(entry[1].nbytes for entry in _LIVE_MODEL_INPUT_CACHE.values())
+               > _LIVE_MODEL_INPUT_CACHE_MAX_BYTES):
             _LIVE_MODEL_INPUT_CACHE.popitem(last=False)
     return value
 
@@ -617,13 +635,42 @@ def _build_panel(
     live_tail: bool = False,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[PanelData, bool, str]:
+    # Training-only factorized inputs must not become a six-column live panel,
+    # including through a hot/disk cache made for a different checkpoint ABI.
+    require_live_feature_source(config.data)
     # Fence the cache fingerprint AND every source read, not just the final
     # entitlement load. An exclusive updater can replace several individually
     # atomic files; those intermediate files are not a published generation.
     with live_tw_public_source_read_guard(config.data.parquet_root):
-        return _build_panel_from_stable_source(
+        panel, hit, tier = _build_panel_from_stable_source(
             config, live_tail=live_tail, progress_callback=progress_callback
         )
+        if config.data.factorized_feature_manifest:
+            from stockagent.data.factorized_panel import attach_factorized_live_features
+            manifest_path = Path(config.data.factorized_feature_manifest).resolve(strict=True)
+            stat = manifest_path.stat()
+            key = (id(panel), str(manifest_path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            with _LIVE_PANEL_CACHE_LOCK:
+                entry = _LIVE_FACTORIZED_PANEL_CACHE.get(key)
+            if entry is not None and entry[0] is panel and entry[2] == _factorized_member_signatures(manifest_path):
+                panel = entry[1]
+            else:
+                base = panel
+                panel = attach_factorized_live_features(base, manifest_path)
+                signatures = _factorized_member_signatures(manifest_path)
+                with _LIVE_PANEL_CACHE_LOCK:
+                    _LIVE_FACTORIZED_PANEL_CACHE[key] = (base, panel, signatures)
+                    while len(_LIVE_FACTORIZED_PANEL_CACHE) > 2:
+                        _LIVE_FACTORIZED_PANEL_CACHE.popitem(last=False)
+        return panel, hit, tier
+
+
+def _factorized_member_signatures(manifest_path: Path) -> tuple:
+    from stockagent.data.factorized_panel import factorized_member_proofs
+    manifest = json.loads(manifest_path.read_text())
+    members = [manifest_path, *[manifest_path.parent / p["path"] for p in factorized_member_proofs(manifest)]]
+    return tuple((str(path.resolve()), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                 for path in members for s in [path.stat()])
 
 
 def _build_panel_from_stable_source(
@@ -1185,16 +1232,30 @@ def _tw_opening_minimum_coverage() -> float:
 def _fetch_tw_opening_source(
     symbols: list[str], fallback: np.ndarray, *, parquet_root: str | Path,
     fetch_mis: Callable[..., PriceSnapshot],
+    tw_trading_universe: dict[str, Any] | None = None,
 ) -> tuple[PriceSnapshot, bool]:
     """Race all available sources; keep successful opening facts on every retry."""
     from stockagent.live.opening_price_acquisition import OPENING_FAN_IN, configured_opening_providers
 
+    source_symbols, source_fallback = symbols, fallback
+    if tw_trading_universe is not None:
+        source_symbols = list(tw_trading_universe["symbols"])
+        prices = dict(zip(symbols, fallback))
+        source_fallback = np.asarray([prices.get(s, np.nan) for s in source_symbols], dtype=np.float64)
+    def read_scope():
+        if tw_trading_universe is None:
+            return fetch_mis(allow_network=False)
+        return fetch_tw_mis_opening_snapshot(source_symbols, source_fallback, parquet_root=parquet_root, allow_network=False)
     result = OPENING_FAN_IN.fetch(
-        symbols, fallback, parquet_root=parquet_root,
+        source_symbols, source_fallback, parquet_root=parquet_root,
         providers=configured_opening_providers(parquet_root, broker_fetch=fetch_shared_day_trade_stock_snapshots),
         minimum_coverage=_tw_opening_minimum_coverage(),
-        cache_reader=lambda: fetch_mis(allow_network=False),
+        cache_reader=read_scope,
     )
+    if tw_trading_universe is not None:
+        scoped = fetch_mis(allow_network=False)
+        scoped.transport_timing = {**(result.transport_timing or {}), "official_trading_universe": tw_trading_universe}
+        return scoped, True
     return result, True
 
 
@@ -1373,6 +1434,7 @@ def _price_snapshot(
     force_fresh: bool = False,
     tw_latest_quote_cache_seconds: float = 0.0,
     tw_latest_quote_force_refresh: bool = False,
+    tw_trading_universe: dict[str, Any] | None = None,
 ) -> PriceSnapshot:
     source_norm = str(source).strip().lower()
     if source_norm == "panel":
@@ -1643,6 +1705,7 @@ def _price_snapshot(
             snapshot, opening_cache_hit = _fetch_tw_opening_source(
                 requested_symbols, requested_fallback, parquet_root=parquet_root,
                 fetch_mis=fetch_mis_opening,
+                **({"tw_trading_universe": tw_trading_universe} if tw_trading_universe is not None else {}),
             )
         elif force_fresh and (
             float(tw_latest_quote_cache_seconds) > 0.0
@@ -2988,20 +3051,30 @@ def _live_quote_request(
     prices_csv: str | Path | None, yahoo_chunk_size: int,
     tw_latest_quote_cache_seconds: float, tw_latest_quote_force_refresh: bool,
 ) -> dict[str, Any]:
-    return dict(
+    request_mask = (np.asarray(panel.alive_mask[panel_idx], dtype=bool)
+                    if execution_mode == "tw_day_trade" else None)
+    universe = None
+    if (execution_mode == "tw_day_trade"
+            and price_source.lower() in {"tw", "twse", "tpex", "mis", "tw_mis", "shioaji"}):
+        from stockagent.data.tw_current_trading_universe import official_scope_required, opening_scope
+        if official_scope_required(config.data.parquet_root):
+            request_mask, universe = opening_scope(panel.symbols, datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat())
+    request = dict(
         source=price_source,
         symbols=panel.symbols,
         fallback_prices=np.asarray(panel.close_prices[panel_idx], dtype=np.float64),
         parquet_root=config.data.parquet_root,
         prices_csv=prices_csv,
         yahoo_chunk_size=yahoo_chunk_size,
-        request_mask=(np.asarray(panel.alive_mask[panel_idx], dtype=bool)
-                      if execution_mode == "tw_day_trade" else None),
+        request_mask=request_mask,
         require_official_tw_session_open=(execution_mode == "tw_day_trade" and observation == "session_open"),
         force_fresh=(execution_mode == "tw_day_trade" and observation == "latest_quote"),
         tw_latest_quote_cache_seconds=float(tw_latest_quote_cache_seconds),
         tw_latest_quote_force_refresh=bool(tw_latest_quote_force_refresh),
     )
+    if universe is not None:
+        request["tw_trading_universe"] = universe
+    return request
 
 
 def _live_quote_request_key(request: dict[str, Any]) -> str:
@@ -3035,6 +3108,7 @@ def prefetch_live_signal_prices(
     """
     started, started_utc = time.perf_counter(), datetime.now(timezone.utc)
     config = load_config(config_path)
+    require_live_feature_source(config.data)
     execution_mode = _require_supported_live_execution(config.trading.execution_mode)
     if execution_mode != "tw_day_trade" or day_trade_model_observation not in {"session_open", "latest_quote"}:
         raise ValueError("quote prefetch is restricted to TW day-trade opening/quote inputs")
@@ -3067,9 +3141,16 @@ def prefetch_live_signal_prices(
     try:
         quote_started, requested = time.perf_counter(), datetime.now(timezone.utc)
         snapshot = _price_snapshot(**request)
+        quote_finished, received = time.perf_counter(), datetime.now(timezone.utc)
+        _reject_unready_opening_prefetch(
+            request, snapshot, workflow_started_utc=started_utc,
+            requested_at_utc=requested, received_at_utc=received,
+            pre_quote_prepare_ms=(quote_started - started) * 1000.0,
+            quote_fetch_ms=(quote_finished - quote_started) * 1000.0,
+        )
         result = PrefetchedLiveQuote(
             key, snapshot, started, started_utc,
-            quote_started, time.perf_counter(), requested, datetime.now(timezone.utc),
+            quote_started, quote_finished, requested, received,
         )
         future.set_result(result)
         return result
@@ -3080,6 +3161,59 @@ def prefetch_live_signal_prices(
         with _LIVE_QUOTE_INFLIGHT_LOCK:
             if _LIVE_QUOTE_INFLIGHT.get(key) is future:
                 _LIVE_QUOTE_INFLIGHT.pop(key, None)
+
+
+def _reject_unready_opening_prefetch(
+    request: dict[str, Any], snapshot: PriceSnapshot, *,
+    workflow_started_utc: datetime, requested_at_utc: datetime,
+    received_at_utc: datetime, pre_quote_prepare_ms: float, quote_fetch_ms: float,
+) -> None:
+    """Reject a canonical pending quorum before entering the model mutex.
+
+    This is only an early rejection, never a ready shortcut. The model owner
+    keeps its original clock, fingerprint, eligibility and coverage validation.
+    Counts are scoped to this exact mode mask, not another source's universe.
+    """
+    transport = snapshot.transport_timing or {}
+    if not request.get("require_official_tw_session_open") or transport.get("opening_quorum_ready") is not False:
+        return
+    size = len(snapshot.prices)
+    mask = request.get("request_mask")
+    active = np.ones(size, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    if active.shape != (size,):
+        raise ValueError("opening prefetch active mask must have shape [symbols]")
+    opens = (np.asarray(snapshot.open_prices, dtype=np.float64)
+             if snapshot.open_prices is not None else np.full(size, np.nan))
+    if opens.shape != (size,):
+        raise ValueError("opening prefetch prices must have shape [symbols]")
+    observed_open = np.isfinite(opens) & (opens > 0.0)
+    active_count = int(active.sum())
+    try:
+        _require_day_trade_opening_coverage(
+            live_session=True, active=active_count,
+            opens=int(np.count_nonzero(active & observed_open)),
+            responses=int(np.count_nonzero(active & _day_trade_same_session_quote_observed_mask(snapshot, observed_open))),
+            required=max(1, int(np.ceil(active_count * _tw_opening_minimum_coverage()))),
+            model_observation="session_open",
+            no_prints=int(np.count_nonzero(active & tw_session_no_open_print_mask(snapshot))),
+        )
+    except TWOpeningInputCoveragePending as exc:
+        if request.get("tw_trading_universe") is not None:
+            exc.coverage.update(denominator_contract="official_current_trading_symbols_in_model_v1",
+                                official_trading_count=request["tw_trading_universe"]["official_trading_count"])
+        exc.opening_prefetch_summary = {
+            "signal_started_at": workflow_started_utc.isoformat(timespec="microseconds"),
+            "price_source": snapshot.source,
+            "price_request_started_at": requested_at_utc.isoformat(timespec="microseconds"),
+            "price_response_received_at": received_at_utc.isoformat(timespec="microseconds"),
+            "opening_input_coverage": dict(exc.coverage),
+            "live_latency": {
+                "pre_quote_prepare_ms": round(pre_quote_prepare_ms, 3),
+                "quote_fetch_ms": round(quote_fetch_ms, 3),
+                "quote_transport": dict(transport),
+            },
+        }
+        raise
 
 
 def generate_live_signal(
@@ -3141,6 +3275,7 @@ def generate_live_signal(
     progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
     _emit_progress(progress_callback, label=progress_name, step=1, total=progress_total, message="load config")
     config = load_config(config_path)
+    require_live_feature_source(config.data)
     execution_mode = _require_supported_live_execution(config.trading.execution_mode)
     normalized_day_trade_observation = str(
         day_trade_model_observation or "session_open"
@@ -3389,7 +3524,8 @@ def generate_live_signal(
             model_observation=normalized_day_trade_observation,
         )
         if not str(price_snapshot.source).startswith("panel"):
-            active_mask = np.asarray(panel.alive_mask[panel_idx], dtype=bool)
+            active_mask = np.asarray(quote_request.get("request_mask") if quote_request.get("request_mask") is not None
+                                     else panel.alive_mask[panel_idx], dtype=bool)
             day_trade_active_symbol_count = int(np.count_nonzero(active_mask))
             observed_open = (
                 np.isfinite(np.asarray(price_snapshot.open_prices, dtype=np.float64))
@@ -3436,6 +3572,11 @@ def generate_live_signal(
                 "responses": day_trade_active_quote_count, "required": day_trade_required_quote_count,
                 "basis": normalized_day_trade_observation,
             }
+            if quote_request.get("tw_trading_universe") is not None:
+                partial_summary["official_trading_universe"] = quote_request["tw_trading_universe"]
+                partial_summary["opening_input_coverage"].update(
+                    denominator_contract="official_current_trading_symbols_in_model_v1",
+                    official_trading_count=quote_request["tw_trading_universe"]["official_trading_count"])
             _require_day_trade_opening_coverage(
                 live_session=day_trade_live_session,
                 active=day_trade_active_symbol_count,
@@ -3914,7 +4055,10 @@ def generate_live_signal(
         symbol_names=symbol_names,
         top_n=min(8, max(1, int(top_n))),
     )
-    all_feature_drivers = _feature_driver_summary(
+    source_contract = inspect_live_feature_source(config.data)
+    private_source = any(notice.get("code") == "factorized_private_raw_source"
+                         for notice in source_contract.get("notices", ()))
+    all_feature_drivers = [] if private_source else _feature_driver_summary(
         panel.feature_names,
         x_np[-1],
         target_weights,
@@ -4174,7 +4318,9 @@ def generate_live_signal(
         "opening_quote_required_count": day_trade_required_quote_count,
         "opening_quote_active_coverage": day_trade_quote_coverage,
         "opening_coverage_gate_basis": "same_session_open_or_observed_no_print" if normalized_day_trade_observation == "session_open" else "same_session_latest_quote",
-        "opening_acquisition_contract_version": 4,
+        "opening_acquisition_contract_version": 5 if quote_request.get("tw_trading_universe") is not None else 4,
+        "official_trading_universe": quote_request.get("tw_trading_universe"),
+        "opening_coverage_denominator_contract": "official_current_trading_symbols_in_model_v1" if quote_request.get("tw_trading_universe") is not None else "panel_alive_mask_v1",
         "opening_no_print_active_count": day_trade_active_no_print_count,
         "opening_input_resolved_count": day_trade_active_open_count + day_trade_active_no_print_count,
         "opening_input_required_count": day_trade_required_quote_count,
@@ -4184,7 +4330,7 @@ def generate_live_signal(
         "opening_all_symbols_complete": day_trade_active_open_count == day_trade_active_symbol_count,
         "opening_missing_symbols": [
             panel.symbols[int(idx)] for idx in np.flatnonzero(
-                np.asarray(panel.alive_mask[panel_idx], dtype=bool) & ~day_trade_observed_model_price
+                np.asarray(quote_request["request_mask"], dtype=bool) & ~day_trade_observed_model_price
             )
         ] if execution_mode == "tw_day_trade" else [],
         "model_observation_active_count": int(
@@ -4265,11 +4411,16 @@ def generate_live_signal(
         "market_notice": str(market_notice) if market_notice else None,
         "recent_performance": recent_performance,
         "model_explanation": {
-            "source": "score logits, trading constraints, target weights, and weighted latest-feature proxy",
+            "source": (
+                "score logits, trading constraints and target weights; private raw feature proxies withheld"
+                if private_source else
+                "score logits, trading constraints, target weights, and weighted latest-feature proxy"
+            ),
             "confidence_proxy_score_std": confidence_proxy,
             "top_score_drivers": score_drivers,
             "top_feature_drivers": feature_drivers,
             "all_feature_drivers": all_feature_drivers,
+            "feature_proxy_publication_allowed": not private_source,
             "decision_rows": int(len(decision_rows)),
             "actionable_decision_rows": int(len(actionable_decisions)),
             "action_counts": decision_action_counts,
@@ -4279,6 +4430,15 @@ def generate_live_signal(
         "rebalance": rebalance_rows[: max(0, int(top_n))],
         "decision_explanations": actionable_decisions[: max(0, int(top_n))],
     }
+    if source_contract.get("required"):
+        summary["source_publication_contract"] = {
+            "contract": "model_derived_paper_signals_only_v1",
+            "raw_source_publication": False,
+            "feature_proxy_publication_allowed": not private_source,
+            "research_only": True,
+            "historical_point_in_time_proven": False,
+            "logical_feature_count": len(panel.feature_names),
+        }
     if write:
         if live_output_dir is not None:
             output_root = Path(live_output_dir)

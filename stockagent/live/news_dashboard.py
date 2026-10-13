@@ -78,6 +78,193 @@ def _body_work_progress(value: Any, ready: int | None) -> dict[str, Any] | None:
             'no_known_primary_includes_unclassified': True}
 
 
+def _cnyes_public_index_progress(value: Any) -> dict[str, Any] | None:
+    """Project receipted metadata counts, never a body/history denominator.
+
+    Dates with every currently reported page are only the dates already
+    observed by this endpoint. No queue scan, inferred total or saved ETA.
+    """
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or raw.get('enabled') is not True
+            or type(raw.get('article_bodies_accepted_by_index')) is not int
+            or raw['article_bodies_accepted_by_index'] != 0
+            or raw.get('all_history_complete') is not False
+            or raw.get('finish_eta_utc') is not None
+            or raw.get('source_total_is_not_unique_story_count') is not True
+            or raw.get('category_gaps_preserved') is not True):
+        return None
+    fields = ('source_dates_observed', 'verified_pages', 'metadata_rows',
+              'public_ID_row_observations', 'dates_all_reported_pages_observed',
+              'dates_with_changed_source_total')
+    counts = {key: _count(raw.get(key)) for key in fields}
+    if any(value is None for value in counts.values()):
+        return None
+    dates, pages, rows = (counts[key] for key in fields[:3])
+    if (pages < dates or (not dates and pages)
+            or rows > pages * 30 or counts['public_ID_row_observations'] > rows
+            or counts['dates_all_reported_pages_observed'] + counts['dates_with_changed_source_total'] > dates):
+        return None
+    return {'contract_version': 1, 'enabled': True, **counts,
+            'article_bodies_accepted_by_index': 0, 'all_history_complete': False,
+            'finish_eta_utc': None, 'progress_ratio': None,
+            'source_total_is_not_unique_story_count': True, 'category_gaps_preserved': True}
+
+
+def _cnyes_category_gap_count(value: Any) -> int | None:
+    """Read the full owner projection, not its truncated private URL sample."""
+    raw = _object(value)
+    groups = raw.get('groups')
+    total = _count(raw.get('total_gaps'))
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or total is None or not isinstance(groups, list) or len(groups) > 4096
+            or raw.get('all_gap_details_preserved') is not True
+            or raw.get('historical_completeness_verified') is not False):
+        return None
+    seen, counted, cnyes = set(), 0, 0
+    for item in groups:
+        group = _object(item)
+        provider, reason, scopes = group.get('provider'), group.get('error_code'), _count(group.get('scopes'))
+        if (not isinstance(provider, str) or not _ID.fullmatch(provider)
+                or not isinstance(reason, str) or not 0 < len(reason) <= 160
+                or scopes is None or (provider, reason) in seen):
+            return None
+        seen.add((provider, reason))
+        counted += scopes
+        if provider == 'cnyes':
+            cnyes += scopes
+    return cnyes if counted == total else None
+
+
+def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
+                                   now: datetime, live: bool, current_owner: Any) -> dict[str, Any] | None:
+    """A source-reported finite metadata phase, separate from all-history ETA.
+
+    Page views only validate/project the existing owner snapshot. Recompute
+    ratios and scenario times from typed counts; never open the queue, read
+    publisher originals, extrapolate unseen dates, or expose scope URLs.
+    """
+    index = _cnyes_public_index_progress(value)
+    raw = _object(_object(value).get('manifest_phase'))
+    if (index is None or type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or raw.get('scope') != 'actual_category_overflow_source_dates'
+            or not isinstance(raw.get('scope_fingerprint'), str)
+            or re.fullmatch(r'[0-9a-f]{64}', raw['scope_fingerprint']) is None
+            or raw.get('metadata_only') is not True or raw.get('body_completion_claimed') is not False
+            or raw.get('all_history_complete') is not False
+            or type(raw.get('totals_known')) is not bool or type(raw.get('phase_complete')) is not bool):
+        return None
+    fields = ('planned_source_dates', 'first_pages_observed', 'first_pages_remaining',
+              'verified_pages', 'observed_metadata_rows', 'dates_with_changed_source_total')
+    counts = {key: _count(raw.get(key)) for key in fields}
+    if any(item is None for item in counts.values()):
+        return None
+    planned, first, missing, pages, rows, changed = (counts[key] for key in fields)
+    if (not planned or first + missing != planned or first > index['source_dates_observed']
+            or pages < first or pages > index['verified_pages'] or rows > min(pages * 30, index['metadata_rows'])
+            or changed > min(planned, index['dates_with_changed_source_total'])):
+        return None
+    total_pages = _count(raw.get('source_reported_total_pages'))
+    total_rows = _count(raw.get('source_reported_total_metadata_rows'))
+    remaining = _count(raw.get('remaining_pages'))
+    ratio = _number(raw.get('progress_ratio'))
+    known = raw['totals_known']
+    complete = raw['phase_complete']
+    if known:
+        if (missing or changed or total_pages is None or total_rows is None or remaining is None
+                or total_pages < max(planned, pages) or total_rows < rows or total_rows > total_pages * 30
+                or remaining != total_pages - pages or ratio is None
+                or abs(ratio - pages / total_pages) > 1e-12
+                or complete != (not remaining and rows == total_rows)):
+            return None
+    elif (complete or any(raw.get(key) is not None for key in (
+            'source_reported_total_pages', 'source_reported_total_metadata_rows', 'remaining_pages', 'progress_ratio'))):
+        return None
+    forecast = {'contract_version': 1, 'state': 'unavailable', 'sample_seconds': None,
+        'sample_count': None, 'verified_pages': None, 'pages_per_second': None,
+        'fastest_seconds': None, 'middle_seconds': None, 'slowest_seconds': None,
+        'middle_finish_at_utc': None, 'scenario_not_confidence_interval': True,
+        'metadata_only': True, 'all_history_complete': False}
+    if not live:
+        forecast['state'] = 'inactive'
+    elif not known:
+        forecast['state'] = 'unknown_denominator'
+    elif complete:
+        forecast['state'] = 'phase_complete'
+    else:
+        saved = _object(raw.get('forecast'))
+        clock, metric_clock = _stamp(saved.get('observed_at_utc')), _stamp(metrics.get('snapshot_at_utc'))
+        elapsed = _number(metrics.get('owner_elapsed_seconds'))
+        owner = metrics.get('owner_id')
+        bound = (type(metrics.get('snapshot_clock_contract_version')) is int
+            and metrics['snapshot_clock_contract_version'] == 1
+            and clock is not None and metric_clock is not None and elapsed is not None
+            and isinstance(owner, str) and re.fullmatch(r'[0-9a-f]{32}', owner) is not None
+            and owner == current_owner and abs((clock - metric_clock).total_seconds()) <= .001
+            and 0 <= (now - clock).total_seconds() <= MAX_AGE_SECONDS)
+        if (type(saved.get('contract_version')) is int and saved['contract_version'] == 1
+                and saved.get('scenario_not_confidence_interval') is True
+                and saved.get('metadata_only') is True and saved.get('all_history_complete') is False and bound):
+            sample_count, seconds, measured = (_count(saved.get(key)) for key in
+                ('sample_count', 'sample_seconds', 'verified_pages'))
+            bins = saved.get('window_page_counts')
+            valid_bins = (sample_count is not None and 3 <= sample_count <= 5
+                and seconds == sample_count * 60 and seconds <= elapsed + .001
+                and measured is not None and measured <= pages and isinstance(bins, list)
+                and len(bins) == sample_count and all(_count(count) is not None for count in bins)
+                and sum(bins) == measured)
+            if saved.get('state') == 'warming' and (not valid_bins or measured < 10):
+                forecast['state'] = 'warming'
+            elif valid_bins and saved.get('state') == 'no_recent_progress' and bins[-1] == 0:
+                forecast.update(state='no_recent_progress', sample_count=sample_count,
+                    sample_seconds=seconds, verified_pages=measured)
+            elif valid_bins and bins[-1] > 0 and measured >= 10 and saved.get('state') == 'recent_measured' and remaining:
+                rate = measured / seconds
+                fast, middle = remaining * 60 / max(bins), remaining / rate
+                slow = remaining * 60 / min(bins) if min(bins) else None
+                finish = clock + timedelta(seconds=middle)
+                supplied = {key: _number(saved.get(key)) for key in
+                    ('pages_per_second', 'fastest_seconds', 'middle_seconds', 'slowest_seconds')}
+                expected = {'pages_per_second': rate, 'fastest_seconds': fast,
+                            'middle_seconds': middle, 'slowest_seconds': slow}
+                saved_finish = _stamp(saved.get('middle_finish_at_utc'))
+                if (all(supplied[key] is None if val is None else supplied[key] is not None
+                        and math.isclose(supplied[key], val, rel_tol=1e-10, abs_tol=1e-9)
+                        for key, val in expected.items()) and saved_finish is not None
+                        and abs((saved_finish - finish).total_seconds()) <= .001):
+                    forecast.update(state='recent_measured', sample_count=sample_count,
+                        sample_seconds=seconds, verified_pages=measured, **expected,
+                        middle_finish_at_utc=finish.isoformat())
+    return {'contract_version': 1, 'scope': 'actual_category_overflow_source_dates', **counts,
+        'totals_known': known, 'source_reported_total_pages': total_pages,
+        'source_reported_total_metadata_rows': total_rows, 'remaining_pages': remaining,
+        'progress_ratio': pages / total_pages if known else None, 'phase_complete': complete,
+        'metadata_only': True, 'body_completion_claimed': False, 'all_history_complete': False,
+        'forecast': forecast}
+
+
+def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None:
+    """Only current-contract scope counts; scopes can overlap across dates."""
+    raw = _object(value)
+    states = raw.get('current_source_contract_scope_states')
+    allowed = ('list_complete', 'list_complete_by_page_ID_equivalence',
+               'partition_list_complete', 'waiting_page_evidence')
+    retired = _count(raw.get('retired_gap_receipts'))
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or not isinstance(states, Mapping) or set(states) - set(allowed)
+            or retired is None or raw.get('list_coverage_is_not_body_coverage') is not True
+            or raw.get('all_history_complete') is not False or raw.get('finish_eta_utc') is not None):
+        return None
+    counts = {key: _count(states.get(key, 0)) for key in allowed}
+    if any(value is None for value in counts.values()) or sum(counts.values()) > 2**53 - 1:
+        return None
+    return {'contract_version': 1, 'current_source_contract_scope_states': counts,
+            'verified_list_scopes': sum(counts[key] for key in allowed[:3]),
+            'retired_gap_receipts': retired, 'unresolved_category_scopes': _cnyes_category_gap_count(gaps),
+            'list_coverage_is_not_body_coverage': True, 'all_history_complete': False,
+            'finish_eta_utc': None, 'progress_ratio': None}
+
+
 def _read(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as stream:
@@ -502,6 +689,10 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "known_urls": known, "complete_urls": complete, "remaining_urls": ready,
             "original_metadata": original_sources.get(identifier),
             "body_work_progress": _body_work_progress(raw.get('body_work_progress'), ready) if identifier == 'cnyes' else None,
+            "public_index_progress": _cnyes_public_index_progress(raw.get('public_index_progress')) if identifier == 'cnyes' else None,
+            "manifest_phase_progress": _cnyes_manifest_phase_progress(raw.get('public_index_progress'), metrics,
+                now, live and raw.get('automatic_collection_enabled') is True, status.get('owner_id')) if identifier == 'cnyes' else None,
+            "history_list_progress": _cnyes_history_list_progress(raw.get('history_list_progress'), status.get('bulk_gap_projection')) if identifier == 'cnyes' else None,
             "blocked_urls": blocked, "states": counts, 'growth_waiting_urls': growth_waiting,
             'acquisition_mode': mode, 'finite_cohort': cohort, 'finite_supplements': supplement,
             "progress_ratio": cohort['progress_ratio'] if cohort else complete / known if known else None,
@@ -600,6 +791,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                       'publisher_requests': 0}
     return {
         "schema_version": 1, "nonbody_source_outcome_progress_contract_version": 1,
+        "cnyes_list_progress_projection_contract_version": 1,
+        "cnyes_manifest_phase_projection_contract_version": 1,
         "original_source_inventory_contract_version": 1,
         "original_source_inventory": original_inventory,
         "source_policy_review_contract_version": 1,

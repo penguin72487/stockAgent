@@ -2826,10 +2826,68 @@ def cnyes_verified_image_only_body(soup, source, article, *, page_url, identity=
         return False
 
 
+def _cnyes_same_empty_native_view(container, full_content, source, reveal):
+    """Prove both bounded whole forests are blank, not missing/hidden media.
+
+    Empty DIV/P nesting and NBSP are formatting, not prose. No attributes,
+    scripts, comments, unknown tags or text are stripped to manufacture blank
+    content. The single native SECTION wrapper is the observed renderer.
+    """
+    from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+
+    if not isinstance(full_content, str) or len(full_content) > 2048:
+        return False
+    current = BeautifulSoup(html.unescape(full_content), source.html_parser)
+    if current.head is not None:
+        return False
+
+    counts = [0, 0]
+
+    def blank(nodes, native, depth=0):
+        if depth > 8:
+            raise ValueError('unknown_blank_depth')
+        result = []
+        for node in nodes:
+            counts[native] += 1
+            if counts[native] > 32 or isinstance(node, Comment):
+                raise ValueError('unknown_blank_node')
+            if isinstance(node, NavigableString):
+                if str(node).strip():
+                    raise ValueError('native_blank_contains_text')
+                continue
+            if not isinstance(node, Tag):
+                raise ValueError('unknown_blank_node')
+            if node.name not in {'div', 'p', 'br'} or node.attrs:
+                raise ValueError('unknown_blank_structure')
+            if native:
+                _cnyes_visible_after_completed_stream(node, reveal)
+            result.append((node.name, blank(node.contents, native, depth + 1)))
+        return tuple(result)
+
+    try:
+        _cnyes_visible_after_completed_stream(container, reveal)
+        roots = list(container.contents)
+        if (not 2 <= len(roots) <= 16 or not isinstance(roots[0], Tag) or roots[0].name != 'section'
+                or roots[0].attrs != {'style': 'margin-top:30px'} or not isinstance(roots[1], Tag)
+                or roots[1].name != 'p' or roots[1].attrs or roots[1].contents):
+            return False
+        _cnyes_visible_after_completed_stream(roots[1], reveal)
+        combined = []
+        for root in (roots[0], *roots[2:]):
+            if not isinstance(root, Tag) or root.name != 'section' or root.attrs != {'style': 'margin-top:30px'}:
+                return False
+            _cnyes_visible_after_completed_stream(root, reveal)
+            combined.extend(root.contents)
+        expected = blank((current.body or current).contents, False)
+        return bool(expected and expected == blank(combined, True))
+    except (NewsError, ValueError):
+        return False
+
+
 def cnyes_verified_empty_body(soup, source, article, *, page_url):
     """Distinguish observed empty public templates from extraction failures.
 
-    This is failure-outcome contract v7, not a new accepted-body contract.
+    This is failure-outcome contract v8, not a new accepted-body contract.
     A metadata shell, hidden body, video or guessed URL is never a full article.
     Require matching public identity and an aware declared publication clock,
     an actually empty visible container and the same current free declaration.
@@ -2876,6 +2934,9 @@ def cnyes_verified_empty_body(soup, source, article, *, page_url):
                            '<p>\xa0</p>\n<div>\n<p>\xa0</p>\n</div>')
                            if declared_body == '' else
                            isinstance(content, str) and html.unescape(content) in ('null', '<p>null</p>'))
+        if not content_matches and declared_body == '':
+            reveal = _cnyes_completed_stream_wrapper(soup, container.find_parent('article'))
+            content_matches = _cnyes_same_empty_native_view(container, content, source, reveal)
         return bool(data and type(data.get('payment')) is int and data['payment'] == 0
                     and content_matches and data.get('video', '') == ''
                     and data.get('title') == headline and normalize_url(data.get('url', '')) == expected
@@ -3320,7 +3381,42 @@ def cnyes_verified_quote_only_body(soup, source, article, body, *, page_url):
             '[id^="div-gpt-ad-cnyes_news_article_"]'), parser=source.html_parser)
         unsigned_ticker = rf'{symbol_stub}\s+{number}\s+{number}\({number}%\)\s*:'
         if re.fullmatch(unsigned_ticker, visible.strip()) is None:
-            return False
+            # Source JSON-LD joins adjacent prices; only the entire actual
+            # visible/current value can prove a separator. These are literal
+            # quote fragments, not repaired prices or successful news bodies.
+            unsigned_quote = rf'{number}\s+{number}\({number}%\)'
+            company = r'[A-Za-z][A-Za-z0-9.&\x27-]{0,49}'
+            unsigned_label = rf'{unsigned_quote}\s*[:：]\s*(?:{symbol_stub}|{company}(?:\s*{symbol_stub})?)'
+            symbol_price = rf'{symbol_stub}\s+{number}(?:\s*-)?'
+            annotated_symbol = rf'{symbol_stub}\s+{number}\s*:\s*(?:[A-Z]|\.{{1,8}}|[0-9]{{1,2}},\s*[0-9]{{4}}\.)'
+            extra_opening_change = rf'\({symbol_stub}\s+{number}\s+[+-]{number}\s*:'
+            price_symbol = rf'{number}\s*[:：]\s*{symbol_stub}'
+            symbol_list = rf'{bare_quote}\s*[:：]\s*{symbol_stub}(?:,\s*[A-Z][A-Z0-9.-]{{0,15}}){{1,8}}\.'
+            if not any(re.fullmatch(pattern, visible.strip()) for pattern in (
+                    unsigned_quote, unsigned_label, symbol_price, annotated_symbol,
+                    extra_opening_change, price_symbol, symbol_list)):
+                return False
+            # Corroborate actual whitespace without inventing the boundary
+            # lost by JSON-LD, and reject media/scripts/unknown quote markup.
+            from bs4 import BeautifulSoup, Comment
+            from downloader.news_fulltext_policy import _plain_text
+            match = re.fullmatch(r'/news/id/([0-9]+)', urlsplit(page_url).path)
+            data = _cnyes_current_article_data(soup, int(match[1]), verify_video=True) if match else None
+            if not data or data.get('video', '') != '' or not isinstance(data.get('content'), str):
+                return False
+            current = BeautifulSoup(html.unescape(data['content']), source.html_parser)
+            current_root = current.body or current
+            native_nodes = scope[1].find_all(True)
+            if (current.head is not None or len(current_root.find_all(True)) > 8 or len(native_nodes) > 8
+                    or any(node.name != 'p' or node.attrs for node in current_root.find_all(True))
+                    or current_root.find(string=lambda node: isinstance(node, Comment)) is not None
+                    or scope[1].find(string=lambda node: isinstance(node, Comment)) is not None
+                    or any(not (node.name == 'p' and not node.attrs or node.name == 'section'
+                        and node.attrs == {'style': 'margin-top:30px'}) for node in native_nodes)):
+                return False
+            normalized = lambda text: re.sub(r'\s+', ' ', text).strip()
+            if normalized(_plain_text(html.unescape(data['content']), parser=source.html_parser)) != normalized(visible):
+                return False
     if cnyes_verified_short_body(soup, source, article, body, page_url=page_url) is None:
         return False
     if re.fullmatch(symbol_only, body.strip()):

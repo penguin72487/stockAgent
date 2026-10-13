@@ -19,16 +19,20 @@ TILING_CONTRACT = 'minimum_uniform_company_date_rectangles_v1'
 CAPACITY_CONTRACT = 'native_row_capacity_replanning_v1'
 OPERATOR_GEOMETRY_CONTRACT = 'operator_unknown_record_geometry_prior_v1'
 LOCAL_CAPACITY_CONTRACT = 'native_preview_full_local_capacity_v1'
+SELECTOR_CONTRACT = 'bounded_source_selector_geometry_v1'
+MAX_SELECTOR_LABELS = 2000  # ExactListIndices / SelectListBatch / TrySelectListBulk.
 
 
-def rectangle_queries(companies: int, dates: int, rows: int, size: int, keys: int) -> int:
+def rectangle_queries(companies: int, dates: int, rows: int, size: int, keys: int,
+                      date_cap: int | None = None) -> int:
     groups, tail = divmod(companies, size)
-    return groups * (1 if keys == 1 else math.ceil(dates / (rows // size))) + (
-        (1 if keys == 1 else math.ceil(dates / (rows // tail))) if tail else 0)
+    def count(width):
+        return 1 if keys == 1 else math.ceil(dates / min(rows // width, date_cap or rows))
+    return groups * count(size) + (count(tail) if tail else 0)
 
 
 def company_batch_size(companies: int, dates: int, rows: int, cap: int, keys: int,
-                       *, optimize: bool = False) -> int:
+                       *, optimize: bool = False, date_cap: int | None = None) -> int:
     """Minimum call count among bounded uniform rectangular tilings.
 
     This does not claim the unrestricted global packing optimum. Enumerating
@@ -38,10 +42,12 @@ def company_batch_size(companies: int, dates: int, rows: int, cap: int, keys: in
     maximum = min(cap, rows)
     if type(maximum) is not int or maximum < 1 or maximum > 1024:
         raise ValueError('Invalid bounded company tiling cap')
+    if date_cap is not None and (type(date_cap) is not int or not 1 <= date_cap <= MAX_SELECTOR_LABELS):
+        raise ValueError('Invalid bounded source date selector cap')
     if not optimize or keys == 1 or companies == 0:
         return maximum
     return min(range(1, min(maximum, companies) + 1),
-               key=lambda size: (rectangle_queries(companies, dates, rows, size, keys), -size))
+               key=lambda size: (rectangle_queries(companies, dates, rows, size, keys, date_cap), -size))
 
 
 def _ranges(indices: list[int]) -> list[list[int]]:
@@ -57,6 +63,9 @@ def _ranges(indices: list[int]) -> list[list[int]]:
 def build_plan(request: dict, companies: list[str], dates: list[str], config: dict,
                completed: list[dict]) -> dict:
     fields=request['fields']; limit=config.get('preview_max_columns',MAX_PREVIEW_COLUMNS)
+    selector = config.get('query_selector_contract')
+    if selector not in (None, SELECTOR_CONTRACT):
+        raise ValueError('Unreviewed source selector geometry contract')
     tiling = config.get('query_tiling_contract')
     if tiling not in (None, TILING_CONTRACT):
         raise ValueError('Unreviewed company/date tiling contract')
@@ -93,6 +102,8 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
               'segments':segments,'total_queries':queries,'remaining_work_rows':total_rows,
               'total_work_rows':total_rows,'completed_work_rows':0,
               'field_batches':math.ceil(len(fields)/width),'preview_max_columns':limit}
+        if selector:
+            core['query_selector_contract'] = selector
         return {**core,'fingerprint':hashlib.sha256(json.dumps(core,sort_keys=True,ensure_ascii=False).encode()).hexdigest()}
     coverage=[]
     for done in completed:
@@ -114,7 +125,8 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
         if rows < 1:
             raise ValueError('Preview partition exceeds output bound')
         company_size=company_batch_size(len(companies),len(dates),rows,config['max_companies_per_export'],keys,
-                                        optimize=tiling == TILING_CONTRACT)
+                                        optimize=tiling == TILING_CONTRACT,
+                                        date_cap=MAX_SELECTOR_LABELS if selector else None)
         if isinstance(company_size,bool) or company_size < 1:
             raise ValueError('Invalid local company batch bound')
         for c in range(0,len(companies),company_size):
@@ -133,7 +145,10 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
                 missing_count,ranges=missing_cache[covered]
                 if not missing_count:
                     continue
-                date_size=max(1,rows//len(indices)); chunks=math.ceil(missing_count/date_size)
+                date_size=max(1,rows//len(indices))
+                if selector:
+                    date_size=min(date_size,MAX_SELECTOR_LABELS)
+                chunks=math.ceil(missing_count/date_size)
                 segments.append({'field_range':[begin,stop],'companies':indices,
                                  'date_ranges':ranges,'dates_per_task':date_size,
                                  'queries':chunks,'query_end':query_count+chunks})
@@ -145,6 +160,8 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
           'field_batches':math.ceil(len(fields)/width),'preview_max_columns':limit}
     if tiling:
         core['query_tiling_contract'] = tiling
+    if selector:
+        core['query_selector_contract'] = selector
     return {**core,'fingerprint':hashlib.sha256(json.dumps(core,sort_keys=True,ensure_ascii=False).encode()).hexdigest()}
 
 
@@ -274,6 +291,73 @@ def refill_ready_plans(con) -> int:
         con.execute('UPDATE download_plans SET next_query=next_query+1 WHERE table_id=?',(row['table_id'],))
         generated+=1
     return generated
+
+
+def repartition_selector_pending(con, root, row) -> bool:
+    """Split only an unsubmitted pending fragment, before native UI work.
+
+    Reuse the canonical rectangular planner. Original plans/failed attempts and
+    every field/company/date remain; no successful or unknown scope is reset.
+    The selector's reviewed bound is not a provider rate limit or row count.
+    """
+    from datetime import UTC, datetime
+    import uuid
+    from downloader.artifact_io import atomic_write_json
+    from downloader.tej_history import SOURCE_SCOPE_CONTRACT, expand_request, compact_request, stable_id
+    from downloader.tej_key_layout import key_count
+    if row['kind'] != 'download' or row['state'] != 'pending' or row['scope_contract'] != SOURCE_SCOPE_CONTRACT:
+        return False
+    definition=dict(con.execute('SELECT * FROM tables WHERE table_id=?',(row['table_id'],)).fetchone())
+    request=expand_request(json.loads(row['request_json']),definition,row['table_id'])
+    if max(len(request['company_labels']),len(request['date_labels'])) <= MAX_SELECTOR_LABELS:
+        return False
+    if row['active_attempt_id']:
+        from downloader.tej_desktop_attempts import proved_unsent_prequery
+        proved_unsent_prequery(root,con,dict(row),finished=True)
+    elif row['attempted_at_utc'] is not None:
+        raise ValueError('Previously attempted selector scope requires an exact unsent proof')
+    if any(row[k] is not None for k in ('actual_rows','completed_at_utc','receipt_path','output_path')):
+        raise ValueError('Selector repartition cannot replace observed source data')
+    if len(request['fields'])+key_count(request)>MAX_PREVIEW_COLUMNS:
+        raise ValueError('Selector geometry cannot substitute for field partitioning')
+    config={'preview_max_columns':MAX_PREVIEW_COLUMNS,'query_tiling_contract':TILING_CONTRACT,
+        'query_selector_contract':SELECTOR_CONTRACT,
+        'max_companies_per_export':min(len(request['company_labels']),1024)}
+    plan=build_plan(request,request['company_labels'],request['date_labels'],config,[])
+    children=[]
+    for index in range(plan['total_queries']):
+        selected=next_request(plan,index)
+        part={**request,**{k:selected[k] for k in ('company_labels','date_labels','start','end')},
+            'selector_partition':{'contract':SELECTOR_CONTRACT,'parent_task_id':row['task_id'],
+                'plan_fingerprint':plan['fingerprint'],'max_labels_per_axis':MAX_SELECTOR_LABELS}}
+        expected=len(part['company_labels'])*(1 if key_count(part)==1 else len(part['date_labels']))
+        children.append((stable_id([row['table_id'],part]),part,expected))
+    work=sum(count for _,_,count in children)
+    if (len(children)<2 or work!=row['expected_rows'] or work!=(row['work_expected_rows'] or row['expected_rows'])
+            or any(con.execute('SELECT 1 FROM tasks WHERE task_id=?',(identifier,)).fetchone()
+                   for identifier,_,_ in children)):
+        raise ValueError('Exact new disjoint selector work and unchanged denominator required')
+    retry=con.execute('SELECT * FROM desktop_retry_windows WHERE table_id=?',(row['table_id'],)).fetchone()
+    if retry is not None and retry['task_id'] != row['task_id']:
+        raise ValueError('Another original fragment owns the table retry window')
+    audit_path=root/'selector_replanning'/(row['task_id']+'-'+uuid.uuid4().hex+'.json')
+    audit={'contract':SELECTOR_CONTRACT,'state':'prepared','observed_at_utc':datetime.now(UTC).isoformat(),
+        'original_task':dict(row),'original_request_sha256':hashlib.sha256(json.dumps(request,sort_keys=True).encode()).hexdigest(),
+        'plan':plan,'replacement_task_ids':[identifier for identifier,_,_ in children],
+        'work_rows_before':row['work_expected_rows'] or row['expected_rows'],'work_rows_after':work,
+        'provider_queries_sent':0,'source_rows_adopted':False,'original_attempt_preserved':True,
+        'retry_budget_reset':False,'table_retry_window_preserved':dict(retry) if retry else None}
+    atomic_write_json(audit_path,audit,durable=True)
+    con.execute("UPDATE tasks SET state='superseded_selector_geometry_v1' WHERE task_id=?",(row['task_id'],))
+    for identifier,part,expected in children:
+        con.execute('INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract,'
+            'work_expected_rows,safe_prequery_retries,next_attempt_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            (identifier,row['table_id'],'download',row['phase'],row['priority'],
+             json.dumps(compact_request(part,definition),ensure_ascii=False,separators=(',',':')),
+             expected,SOURCE_SCOPE_CONTRACT,expected,row['safe_prequery_retries'],row['next_attempt_at_utc']))
+    if retry is not None:
+        con.execute('UPDATE desktop_retry_windows SET task_id=? WHERE table_id=?',(children[0][0],row['table_id']))
+    return True  # Caller commits the queue; durable intent is not a download receipt.
 
 
 def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) -> dict:

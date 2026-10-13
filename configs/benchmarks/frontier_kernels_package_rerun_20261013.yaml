@@ -1,0 +1,18 @@
+contract: frontier_complete_fold_recipes_v1
+# Original failures were interpreter routing failures, not package admission.
+full_fold_candidates:
+  - name: liger_layernorm
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_norm_backend: liger}
+  - name: quack_layernorm
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_norm_backend: quack_layernorm}
+  - name: liger_swiglu
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_swiglu_backend: liger}

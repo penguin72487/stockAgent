@@ -288,7 +288,7 @@ def test_unqualified_peak_does_not_hide_repeated_recent_capacity(config, tmp_pat
         state = _observe_html(http, controller, clock)
         assert (state['state'], state['interval_seconds'], state['parallelism']) == ('verifying', .5, 2)
         proof = state['transport_resume_evidence']
-        assert proof['contract_version'] == 2 and proof['independent_nonoverlapping_windows']
+        assert proof['contract_version'] == 3 and proof['independent_nonoverlapping_windows']
         assert proof['eligible_repeated_capacity_groups'] == 1
         assert proof['recent_healthy_windows_at_exact_capacity'] == 2
         assert not proof['throughput_estimate_reused'] and not proof['provider_permission_changed']

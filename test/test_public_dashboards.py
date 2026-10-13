@@ -367,8 +367,13 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                 "bid": None,
                 "counterfactual_overnight_replay": True,
                 "sizing_capital_twd": 10_000_000.0,
-                "sizing_open_price": 100.0,
+                "sizing_open_price": None,
                 "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
+                "public_price_display": {
+                    "contract": "public_quote_display_v1",
+                    "withheld_fields": ["sizing_open_price"],
+                    "visible_fields": {},
+                },
             }
         ],
     }
@@ -395,9 +400,14 @@ def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
     })
     position = public["rows"][0]["position"]
     assert position == {"contract": "signal_ledger_valuation_v1", "symbol": "2330",
-                        "filled_shares": 1000, "last_mark_price": 103.0,
+                        "filled_shares": 1000, "last_mark_price": None,
                         "last_mark_quote_source": "shioaji:stock_snapshot",
-                        "reconciled_total_net_pnl_twd": 2520.0}
+                        "reconciled_total_net_pnl_twd": 2520.0,
+                        "public_price_display": {
+                            "contract": "public_quote_display_v1",
+                            "withheld_fields": ["last_mark_price"],
+                            "visible_fields": {},
+                        }}
 
 
 def test_tw_signal_nested_scrub_keeps_security_rules_after_key_cache_hits() -> None:
@@ -674,6 +684,9 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
         "session_date": "2026-08-13",
         "modes": [{"market": "tw"}, {"market": "tw_cash"}],
         "execution_records": {"executed_count": 2, "mode_count": 2},
+        "current_trading_universe": {"status": "ready", "listed_count": 2311,
+                                     "halted_count": 8, "trading_count": 2303,
+                                     "observed_at_taipei": "2026-10-13T10:10:25+08:00"},
         "positions": [
             {"signed_shares": 1000, "valuation_stale": True},
             {"signed_shares": 0, "valuation_stale": False},
@@ -685,6 +698,7 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
     assert summary["open_position_count"] == 1
     assert summary["stale_position_count"] == 1
     assert summary["execution_records"] == {"executed_count": 2, "mode_count": 2}
+    assert summary["current_trading_universe"] == tw["current_trading_universe"]
     assert not ({"positions", "marks", "orders"} & set(summary))
 
     overview = build_public_overview(
@@ -966,7 +980,8 @@ def test_public_pages_share_visual_tokens() -> None:
     }
     for relative, dashboard_id in pages.items():
         html = (root / relative).read_text(encoding="utf-8")
-        assert "dashboard-core.css?v=6" in html
+        core_version = 7 if "quote-display-notice" in html else 6
+        assert f"dashboard-core.css?v={core_version}" in html
         assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
         assert 'dashboard-core.js?v=15" defer' in html
@@ -2321,7 +2336,7 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         assert build_started.wait(1.0)
         release_build.set()
         deadline = time.monotonic() + 1.0
-        while "tw-status:latest:revision-2" not in server._cache:
+        while not any(key.startswith("tw-status:latest:revision-2:registry:") for key in server._cache):
             assert time.monotonic() < deadline
             time.sleep(0.01)
         refreshed = json.loads(server.tw_status().body)
@@ -2329,6 +2344,36 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         assert calls == 2
     finally:
         release_build.set()
+        server.server_close()
+
+
+def test_tw_status_registry_generation_invalidates_cache_without_engine_commit(tmp_path, monkeypatch):
+    server = _test_server()
+    registry_root = tmp_path / "official_registry"
+    registry_root.mkdir()
+    monkeypatch.setenv("STOCKAGENT_TW_TRADING_UNIVERSE_ROOT", str(registry_root))
+    server.tw_revision = lambda: server.cached_local_json(
+        cache_key="stable-engine-revision", ttl_seconds=60, cache_control="no-store",
+        builder=lambda: {"revision_token": "engine-unchanged"})
+    calls = []
+    def build_snapshot(**_kwargs):
+        calls.append(True)
+        return {"simulation_only": True, "production_order_possible": False, "modes": []}
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", build_snapshot)
+    try:
+        server.tw_status()
+        before = {key for key in server._cache if key.startswith("tw-status:")}
+        from stockagent.data.tw_current_trading_universe import receipt_path, TAIPEI
+        from datetime import datetime
+        receipt_path(datetime.now(TAIPEI).date().isoformat()).write_text('{"new_source_generation": true}')
+        server.tw_status()
+        deadline = time.monotonic() + 1.0
+        while len(calls) < 2:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        after = {key for key in server._cache if key.startswith("tw-status:")}
+        assert any(key not in before for key in after)
+    finally:
         server.server_close()
 
 

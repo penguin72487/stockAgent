@@ -1,9 +1,11 @@
-# TEJ 目錄故障自動恢復與下載驗收
+# TEJ 目錄、下載故障自動恢復與驗收
 
-2026-10-10 初稿，2026-10-12 更新，Asia/Taipei。10/10 凌晨修復的停滯不是程序停止，而是
+2026-10-10 初稿，2026-10-13 更新，Asia/Taipei。10/10 凌晨修復的停滯不是程序停止，而是
 目錄準備失敗後，介面檢查也逾時，被誤歸為未知資料查詢，使整個佇列永久等待。
 10/10 下午重新盤點時，再重現 SQLite 忙碌導致失敗分類回滾、工作永久留在 `running`
 的第二條路徑；已補上負證據本機對帳及原 worker 身分保留。
+10/13 再修復「失敗分類已提交、次要操作註記卻回滾」的停止路徑，並在送往
+桌面前拆分超出來源選取器容量的範圍，避免原封不動重試必定失敗的操作。
 修復沿用同一個下載器、SQLite 佇列、Windows 操作鎖、開機 owner 與唯讀網站。
 不清空佇列、不改來源值，也不把失敗、來源空回或重試列成歷史下載完成。
 
@@ -36,6 +38,8 @@ Windows 通知逾時不能直接證明事件未送達。因此恢復必須另驗
 | 已送出或未知 Preview | 仍先採納原結果；原有明確授權重排須核對來源與 idle 介面，每筆滾動一小時最多 2 次、全域 6 次，不新增無條件重送。 |
 | 正式驗證入庫 | 只有來源、scope、鍵、schema 與收據檢查通過才增加完成量。成功的目錄重試會釋放表級窗口，否則新產生的下載會一直被該窗口擋住。 |
 | 失敗分類提交 | SQLite 忙碌時保留原 owner、task、attempt 與原截止時間。重新驗證原負證據和例外紀錄，只補交原失敗分類；再沿原介面核對及逐表重試，不清空佇列或把工作改成已取得。 |
+| 次要操作註記提交 | 失敗分類已提交但 attempt 結束註記回滾時，另驗證原忙碌註記、唯一失敗 traffic、原 request／負證據及 bridge SHA，只補回原結束時間與未送出狀態；不重送查詢、不重設重試預算。 |
+| 來源選取維度 | `bounded_source_selector_geometry_v1` 在資料查詢前檢查公司／日期輸入容量，沿用矩形規劃器拆分完整範圍，保留原欄位分區、工作量、失敗紀錄與表級退避；不是調高官方配額或本機原生上限。 |
 | 操作時鐘 | Windows 來源觀測與 WSL 提交時間分屬不同時鐘，僅對精確操作窗口接受最多 5 秒偏差；本機檔案順序、唯一 request、原程式 SHA、原截止時間與 Preview 邊界仍照原契約核對。 |
 | 網頁 | schema 16。顯示目錄自動恢復、逐表等待及真正的任務狀態；網站只讀取本機去識別化資料，不操作桌面或呼叫來源 API。 |
 
@@ -157,6 +161,102 @@ TEJ API 試用支線另於 10/12 09:37:35 正常結束，timer 持續啟用，�
 `waiting_quota`。本機保守預算已記錄 50,000 列，並非程序崩潰；官方用量快照
 仍是舊資料，不能把本機計數當成已驗證的官方當日用量。本次不繞過配額或
 另開 API 管線。
+
+## 失敗已提交、操作註記回滾後的自動對帳
+
+10/13 初查時，服務自 10/12 23:38:47 持續存活，最後下載收據卻停在
+10/12 **15:03:08**，排程為 `waiting_recovery`。這次不是前述時鐘偏差；
+卡住的是 `Contract Adjustment of Stock Futures` 的 download 工作
+`49908d89036e011453f1a7f8`。
+
+10/12 **15:03:44**，Windows 已保存 `LOCAL_SELECTION_BEFORE_QUERY: lookup batch
+bound differs`，證明尚未送出 Preview；15:03:55 的原忙碌註記要求將 attempt
+結束為 `proven_not_submitted`。15:03:58 的失敗 traffic 與 task 分類已成功提交，
+但次要 attempt 更新遇到 SQLite 忙碌而回滾，仍為 `prepared`、結束時間為空。
+原恢復器只處理未分類的進行中工作；另一條逐表退避則要求 attempt 已結束。
+因此兩條路徑互相等待，即使資料庫恢復可寫也不會前進。
+
+新增 `exact_unsent_attempt_annotation_reconciliation_v1` 在原 owner 的鎖內
+核對五種原始證據：精確 request、來源未送出 outcome、原忙碌註記、唯一已提交
+失敗 traffic，以及不可變 bridge manifest／release SHA。原本機開始／結束／
+提交順序與來源跨時鐘窗口也必須一致，不能只用沒有輸出檔推定未送出。
+只補回原 attempt 的未送出狀態與**原結束時間**，不把恢復當下時間冒充操作時間。
+舊註記沒有獨立結束欄位時使用原註記的時間，新註記直接保存原結束時間。
+
+對帳是冪等的；提交再次忙碌會保留原狀態與持久 intent，下次繼續核對。
+後續仍沿原來源介面讀回、逐表退避與資料價值排程。已用完的立即重試預算
+不歸零，未知或已跨 Preview 的結果不會被這個修正盲目重送。
+正式 owner 在 10/13 **12:26:02** 自行完成對帳並解除全域暫停；原表的失敗
+計數保留為 **444**，原任務的下次資格時間為 **12:41:02**，不是人工改 SQLite。
+
+## 超出原生選取器容量的完整範圍拆分
+
+同一筆工作的原範圍為 1 個公司、9 個欄位、10,000 個日期。
+Preview 的 10,000 列輸出容量不等於輸入選取容量：原生 bridge 的
+`ExactListIndices`、`SelectListBatch`、`TrySelectListBulk` 每批均限制
+**2,000 個輸入標籤**。重試相同 10,000 個日期無法排除這個確定性失敗。
+
+`query_selector_contract=bounded_source_selector_geometry_v1` 把此容量納入
+既有矩形規劃器，並在 source claim／桌面操作前檢查既有 pending fragment。
+1 × 10,000 日期可完整拆成 **5 個 1 × 2,000 工作**；在此單公司、相同欄位與
+固定輸入上限下，5 次是覆蓋所有日期所需的最少批次，不代表全來源吞吐量最優。
+不刪欄、不縮日期、不把空回補成數值，也不調高原生上限。
+
+替代子工作保留原 field partition、Key1／Key3 語意、密度與列／儲存格容量，
+工作分母相加必須與原範圍完全相同；原 pending 標記為版本化 superseded，
+原 request、attempt 與已下載資料均保留。已嘗試工作必須先證明原查詢未送出，
+未知結果或已入庫範圍不可直接拆分。原表級窗口只移交子工作 owner，不重設
+444 次失敗計數或下次資格時間；原 lazy plan 在子工作結束後接續，不另建管線。
+`selector_replanning` 的 `prepared` 是持久 intent，須另核對 SQLite 原工作與
+子工作才可判定交易已提交，不能把 intent 當作下載完成收據。
+
+含選取容量規劃的最後版本於 **12:36:10** 安全重啟，原生 Windows bridge
+未更動。新工作由原序列 owner 執行；重試到期仍須等目前操作及較高價值工作，
+不為驗收強改優先級、清除退避或重設操作期限。
+
+正式排程於 **12:42:42** 自行提交原工作的 5 個子工作；
+[`selector_repartition_acceptance.json`](../artifacts/data_quality/tej_attempt_annotation_2026-10-13/selector_repartition_acceptance.json)
+於 **12:43:39** 獨立核對 SQLite 與原 intent，確認全部 10,000 個公司／日期
+位置各覆蓋一次，9 個欄位及原欄位分區完整保留，沒有把原立即重試預算歸零。
+第一個子工作 `32cdb453a3bcc8388d307569` 於 **12:43:34** 提交完成收據；
+成功後原表級等待窗口才依既有契約釋放，原 444 次失敗紀錄仍在原 audit 中。
+另外 4 個子工作在此快照中尚未全部完成，不把排入佇列當成抓齊。
+
+後續 5 個子工作於 **12:45:19** 全部完成；
+[`selector-all-five-receipts/audit.json`](../artifacts/data_quality/tej_attempt_annotation_2026-10-13/selector-all-five-receipts/audit.json)
+獨立核對全部 5 份收據及原 attempt／Preview／Parquet 綁定，全部通過，
+本機 artifact 錯誤為 0。這是原 10,000 個查詢位置完成，而不是 10,000 列
+有值資料：5 份仍均為明確來源空回，新增 0 列／0 個原始儲存格。
+
+[`selector-first-child-receipt/audit.json`](../artifacts/data_quality/tej_attempt_annotation_2026-10-13/selector-first-child-receipt/audit.json)
+沿用 canonical receipt audit 核對第一個子工作的原 request／attempt SHA、
+Preview 提交、來源結果、鍵／schema、Parquet 與收據一致，沒有本機 artifact
+錯誤。這筆仍為明確來源空回、0 列，不是假造非空值；證明原本因輸入容量而
+無法送出的工作，拆分後確實跨過查詢與正式驗證入庫鏈路。
+
+## 10/13 正式驗收與剩餘邊界
+
+最後完整 TEJ 回歸為 **1,846 passed、1 skipped**，另有 **16 項前端測試通過**。
+包含真實 SQLite 讀鎖造成次要操作註記回滾、解除後自動對帳、對帳再次回滾後
+恢復、冪等與原時鐘保留、錯誤 scope／SHA／事件拒絕恢復，以及選取分區完整
+且不重複、原欄位分區與 Key1／Key3 原生列語意不變。
+
+本輪證據位於
+[`tej_attempt_annotation_2026-10-13/`](../artifacts/data_quality/tej_attempt_annotation_2026-10-13/)。
+[`production_acceptance.json`](../artifacts/data_quality/tej_attempt_annotation_2026-10-13/production_acceptance.json)
+於 **12:40:05** 通過：8 個工作均在最後部署之後真正啟動並完成查詢／驗證／入庫，
+原 request、來源負證據、忙碌註記、bridge manifest 與原診斷的 SHA 全部未變。
+當時排程為 `executing`、唯讀網站為 `running`，沒有全域暫停。
+8 份皆為明確的 `explicit_empty_scope`，取得 0 列／0 個原始儲存格，不能當成
+新增非空資料。[`retained_value_reference.json`](../artifacts/data_quality/tej_attempt_annotation_2026-10-13/retained_value_reference.json)
+另以目前 capture／ingest 程式核對既有 32 列／416 個原始儲存格，不計入新下載量。
+驗收工具本身發送 0 次 provider 查詢。
+
+這輪恢復的是兩種可證明原因的停止／重試路徑，不代表全歷史抓齊。
+驗收時 22 個舊隔離工作仍保留，`Catalog axis exceeds reviewed bound` 等
+目錄容量問題與這次每批 2,000 個**輸入**標籤的問題不同，未藉此宣稱一併修好。
+未驗證實體冷開機、全歷史完整性或 TEJ 顯示值以外的底層精度。試用 API
+在 12:26 核對時為保守配額等待，timer 仍啟用；不清零、繞過配額或另開管線。
 
 ## 網頁誤判修正
 

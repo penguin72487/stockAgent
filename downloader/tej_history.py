@@ -1870,6 +1870,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'prequery_recovery_contract':config.get('prequery_recovery_contract'),
               'prequery_retry_base_seconds':config.get('prequery_retry_base_seconds',60),
               'prequery_retry_max_seconds':config.get('prequery_retry_max_seconds',900),
+              'query_selector_contract':config.get('query_selector_contract'),
               'metadata_failure_isolation':config.get('metadata_failure_isolation',False),
               'metadata_recovery':metadata_recovery_policy(config),
               'authorized_unknown_replay':authorized_replay_policy(config),
@@ -1885,6 +1886,9 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
     if (policy['prequery_failure_isolation'] and
             policy['prequery_recovery_contract'] != 'exact_unsent_table_retry_window_v1'):
         raise ValueError('Explicit proved-unsent retry contract required')
+    from downloader.tej_planning import SELECTOR_CONTRACT
+    if policy['query_selector_contract'] not in (None, SELECTOR_CONTRACT):
+        raise ValueError('Unreviewed source selector geometry contract')
     if (any(type(policy[k]) is not int for k in ('prequery_retry_base_seconds','prequery_retry_max_seconds'))
             or not 5 <= policy['prequery_retry_base_seconds'] <= policy['prequery_retry_max_seconds'] <= 3600):
         raise ValueError('Invalid bounded table retry window')
@@ -2048,6 +2052,9 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
         if not row:
             return "idle"
         if replay is None and row['kind']=='download':
+            from downloader.tej_planning import SELECTOR_CONTRACT, repartition_selector_pending
+            if policy.get('query_selector_contract') == SELECTOR_CONTRACT and repartition_selector_pending(con,root,row):
+                return 'selector_scope_repartitioned'
             from downloader.tej_api_ownership import repartition_pending
             if repartition_pending(con, root, row):
                 # This is a source-allocation transition, not a desktop query

@@ -38,6 +38,16 @@ def _use_encoder_checkpoint(model, slab, device):
     Reserve two full-width FP32 slabs, narrow temporal activations and the
     configured VRAM margin. Basis/window-normalization paths are not admitted.
     """
+    if bool(getattr(model, "factorized_encoder_force_retention", False)):
+        candle = model.candle_encoder
+        if (device.type != "cuda" or model.temporal_basis_feature_encoder is not None
+                or model._input_basis_enabled()
+                or bool(getattr(candle, "feature_svd_components", 0))
+                or bool(getattr(candle, "causal_feature_window_rms_normalization", False))):
+            raise ValueError("forced activation retention requires the no-basis CUDA stream")
+        # An explicit capacity experiment. The complete-fold launcher's VRAM
+        # sampling/OOM gate admits it; do not silently revert to recomputation.
+        return False
     if bool(getattr(model, "factorized_encoder_checkpoint", True)):
         return True
     candle = model.candle_encoder
@@ -61,8 +71,12 @@ def _use_encoder_checkpoint(model, slab, device):
     return required > free + reusable
 
 
-def _partition_compile_options(model):
-    options = {"triton.cudagraphs": False}
+def _partition_compile_options(model, *, stage="encoder"):
+    graphs = (bool(getattr(model, "factorized_cuda_graphs", False)) or
+        (stage == "head" and bool(getattr(model, "factorized_portfolio_cuda_graphs", False))))
+    options = {"triton.cudagraphs": graphs}
+    if bool(getattr(model, "factorized_compile_autotune", False)):
+        options["max_autotune"] = True
     if (bool(getattr(model.temporal_basis_feature_encoder, "fp32_contraction", False))
             or bool(getattr(getattr(model, "candle_encoder", None), "feature_svd_components", 0))
             or bool(getattr(getattr(model, "candle_encoder", None), "projection_fp32", False))
@@ -72,7 +86,8 @@ def _partition_compile_options(model):
         # Fusion must retain each operation's declared BF16/FP32 rounding.
         # Otherwise a graph cut can change allocation weights even with the
         # same parameters, FP32 basis, and correct backward autocast contract.
-        options["emulate_precision_casts"] = True
+        if not bool(getattr(model, "factorized_relaxed_precision_casts", False)):
+            options["emulate_precision_casts"] = True
     return options
 
 
@@ -135,9 +150,19 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
     slab=slab.to(device=device)
     checkpoint_encoder = (model.training and torch.is_grad_enabled()
                           and _use_encoder_checkpoint(model, slab, device))
+    if (not bool(getattr(model, "factorized_encoder_checkpoint", True))
+            or bool(getattr(model, "factorized_encoder_force_retention", False))):
+        key = (model.training, torch.is_grad_enabled(), tuple(slab.shape), checkpoint_encoder)
+        observed = model.__dict__.setdefault("_encoder_storage_receipts", set())
+        if key not in observed:
+            observed.add(key)
+            print(f"[encoder-storage] shape={tuple(slab.shape)} training={model.training} "
+                  f"checkpoint={checkpoint_encoder} force_retention="
+                  f"{bool(getattr(model, 'factorized_encoder_force_retention', False))}", flush=True)
     # Retained activations need no source reread on backward. Do not also keep
     # redundant compact GPU packets in that case (or during no-grad evaluation).
-    slab._retain_gpu_packets = checkpoint_encoder
+    slab._retain_gpu_packets = (checkpoint_encoder
+        and bool(getattr(model, "factorized_encoder_packet_cache", True)))
     mask=mask.to(device=device,dtype=torch.bool)
     safe_mask=_safe_attention_mask(mask)
     if symbol_indices is None:
@@ -199,6 +224,17 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         def read_and_encode(m,ids,k,begin=begin,end=end):
             if compact_projection:
                 values,columns=slab.compact_stock_chunk(begin,end)
+                key = (values.size(1), columns.numel())
+                observed = model.__dict__.setdefault("_compact_bucket_receipts", set())
+                if key not in observed:
+                    observed.add(key)
+                    dense_bucket = columns.numel() == slab.size(2)
+                    compute_dtype = ("fp32" if dense_bucket else
+                        getattr(model.candle_encoder, "compact_projection_compute_dtype", "fp32"))
+                    print(f"[compact-execution] rows={values.size(0)} stocks={values.size(1)} "
+                          f"bucket={columns.numel()} logical_features={slab.size(2)} "
+                          f"dense_bucket={dense_bucket} compute_dtype={compute_dtype} "
+                          f"packet_cache={slab._retain_gpu_packets}", flush=True)
                 return _call_partition(model,encode_fn,values,m,ids,k,columns)
             return _call_partition(model,encode_fn,slab.stock_chunk(begin,end),m,ids,k)
         if checkpoint_encoder:
@@ -212,10 +248,17 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         if device.type=="cuda" and model.factorized_input_compile:
             narrow = factorized_head_backend_contract(model) != "inductor_v1"
             head_fn=torch.compile(head_fn,dynamic=False,fullgraph=narrow,
-                                  options=_partition_compile_options(model))
+                                  options=_partition_compile_options(model, stage="head"))
             object.__setattr__(model, "_factorized_head_compile_backend", "inductor")
             if narrow:
                 print("[model-compile] narrow FP32 head: Inductor fullgraph; "
                       "logical attention retained with aligned SDPA tiles", flush=True)
         object.__setattr__(model,"_factorized_head_fn",head_fn)
-    return _call_partition(model,head_fn,embeddings,mask,temperature=temperature,return_aux=return_aux,portfolio_context=portfolio_context)
+    result = _call_partition(model,head_fn,embeddings,mask,temperature=temperature,return_aux=return_aux,portfolio_context=portfolio_context)
+    if bool(getattr(model, "factorized_portfolio_cuda_graphs", False)):
+        # Annual training retains several forwards before a single backward.
+        # Preserve caller-owned outputs across subsequent graph replays.
+        from torch.utils._pytree import tree_map
+        result = tree_map(lambda value: value.clone()
+            if isinstance(value, torch.Tensor) and value.is_cuda else value, result)
+    return result

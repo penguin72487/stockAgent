@@ -3,7 +3,7 @@ import {readFileSync} from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-function components() {
+function components(options = {}) {
   const context = vm.createContext({});
   for (const file of ["presentation.js", "detail-components.js"]) {
     vm.runInContext(readFileSync(new URL(`../services/tw_day_trade_dashboard/${file}`, import.meta.url), "utf8"), context);
@@ -23,15 +23,53 @@ function components() {
   format.badge = (text) => `<span>${escapeHtml(text)}</span>`;
   format.pnlClass = () => "positive";
   format.signalReasonLabel = presentation.signalReasonLabel;
+  Object.assign(format, options.formatOverrides || {});
   const view = context.StockAgentTwDetailComponents.create({
     Dashboard: {byId, escapeHtml, setTrustedHtml: (id, html) => { byId(id).html = html; }},
     strategyLabel: (row) => presentation.strategyLabel(row, modes),
     signalRowKey: (row) => `stable-key-${row.symbol}`,
     resolvedPositionPnl: () => ({signedShares: 1000, realized: 0, unrealized: 100, total: 100}),
     format,
+    product: options.product || "tw_day_trade",
   });
   return {view, presentation, modes, byId};
 }
+
+test("withheld public quotes remain pending without inventing zero notional or unfilled trades", () => {
+  const {view} = components({formatOverrides: {money: (value) => value == null ? "—" : `NT$ ${value}`}});
+  const hidden = {withheld_fields: ["entry_price", "execution_price", "sizing_open_price", "last_mark_price", "bid", "ask"]};
+  const html = view.signalRow({symbol: "2330", target_weight: 0.1, requested_shares: 1000, filled_shares: 1000,
+    execution_price: null, sizing_open_price: null, public_price_display: hidden,
+    position: {filled_shares: 1000, signed_shares: 1000, entry_price: null, last_mark_price: null,
+      public_price_display: hidden}}, {});
+  assert.match(html, /等待可公開來源/);
+  assert.match(html, /名目 —/);
+  assert.doesNotMatch(html, /名目 NT\$ 0|未成交不納入|0 股紙上成交/);
+  assert.doesNotMatch(html, /class="negative">開盤計價/);
+});
+
+test("price withholding does not turn a closed day-trade or overnight position into an open position", () => {
+  for (const product of ["tw_day_trade", "tw_overnight"]) {
+    const {view} = components({product});
+    const html = view.positionRow({symbol: "2330", status: "closed", filled_shares: 1000,
+      entry_price: null, exit_price: null, last_exit_price: null,
+      public_price_display: {withheld_fields: ["entry_price", "exit_price", "last_exit_price"]}});
+    assert.match(html, /已平倉・等待可公開來源/);
+    assert.doesNotMatch(html, /持倉中|等待實際開盤/);
+  }
+});
+
+test("public market source clocks are visible and escaped, while withheld raw values never render", () => {
+  const {view} = components({formatOverrides: {sourceNumber: (value) => String(value ?? "—")}});
+  const visible = view.eventRow({price: 112.5, public_price_display: {visible_fields: {
+    price: {source: '<img onerror="x">', observed_at: "2026-10-13T09:00:01+08:00"}}}});
+  assert.match(visible, /112.5/);
+  assert.match(visible, /公開行情 &lt;img/);
+  assert.doesNotMatch(visible, /<img/);
+  const hidden = view.eventRow({price: 12345.67, public_price_display: {withheld_fields: ["price"]}});
+  assert.match(hidden, /等待可公開來源/);
+  assert.doesNotMatch(hidden, /12345.67/);
+});
 
 test("all detail rows use the active strategy label, not the immutable account ID", () => {
   const {view, modes} = components();
@@ -237,7 +275,7 @@ test("opening telemetry shows durable publication subphases without treating the
     strategyLabel: () => "unit", badge: String, progress: () => "",
     $: byId, setHtml: (id, html) => { byId(id).html = html; },
   });
-  vm.runInContext(app.slice(app.indexOf("function pendingOpeningAttempts("),
+  vm.runInContext(app.slice(app.indexOf("function officialUniverseDescription("),
     app.indexOf("function renderOvernightOperations(")), context);
   vm.runInContext(source, context);
   const row = {market: "unit", ready_from_0900_ms: 2000, stages: {},

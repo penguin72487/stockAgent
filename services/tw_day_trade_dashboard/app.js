@@ -233,19 +233,20 @@ const signalRowKey = (row = {}) => {
   return signalAt ? `${sessionDate}|${market}|${symbol}|${signalAt}` : `${sessionDate}|${market}|${symbol}`;
 };
 const selectedSignalRow = () => signalRows.find((row) => signalRowKey(row) === featurePanelSignalKey) || null;
-const resolveSignalFeatureDrivers = (row = null, rowKey = "") => {
+const resolveSignalFeatureRecord = (row = null, rowKey = "") => {
   const candidates = [];
   if (rowKey) candidates.push(rowKey);
-  if (row) candidates.push(signalRowKey(row));
+  if (row) candidates.push(signalRowKey(row), row.signal_id);
   candidates.push(featurePanelSignalKey);
   for (const candidate of candidates) {
     if (!candidate) continue;
     const value = signalFeatureDrivers[candidate];
-    if (Array.isArray(value)) return value;
-    if (value && Array.isArray(value.drivers)) return value.drivers;
+    if (Array.isArray(value)) return {drivers: value};
+    if (value && Array.isArray(value.drivers)) return value;
   }
-  return [];
+  return {drivers: []};
 };
+const resolveSignalFeatureDrivers = (row = null, rowKey = "") => resolveSignalFeatureRecord(row, rowKey).drivers;
 const featureDriversSummaryText = () => featurePanelScopeText
   ? `特徵資料來源：${featurePanelScopeText}`
   : "目前只顯示本次訊號載入頁面可對應到的特徵資料。";
@@ -794,6 +795,11 @@ function renderOverview(data) {
 }
 
 function renderHeader(data) {
+  const quoteNotice = $("quote-display-notice");
+  if (quoteNotice) {
+    quoteNotice.textContent = data.price_display_policy?.message || "";
+    quoteNotice.classList.toggle("hidden", !data.price_display_policy);
+  }
   const health = $("health");
   const presentation = healthPresentation(data.health);
   health.textContent = presentation.label;
@@ -1107,6 +1113,17 @@ function renderBenchmarks(data) {
   }).join("") || `<article class="panel benchmark-card"><strong>基準尚未建立</strong><small>等待來源與起算價格通過稽核</small></article>`);
 }
 
+function officialUniverseDescription(scope) {
+  if (!scope || scope.status !== "ready") {
+    return {value: "等待官方名冊", note: "不以模型歷史或成交量推定可交易標的", kind: "warn"};
+  }
+  return {
+    value: `${number(scope.trading_count)} 檔`,
+    note: `上市／上櫃股票與 ETF ${number(scope.listed_count)} 檔 − 停止交易 ${number(scope.halted_count)} 檔 · 觀測 ${shortTime(scope.observed_at_taipei)}；非當日原始訊號覆蓋率`,
+    kind: "good",
+  };
+}
+
 function pendingOpeningAttempts(data) {
   if (IS_OVERNIGHT) return [];
   const latency = data.opening_signal_latency || {};
@@ -1117,6 +1134,9 @@ function pendingOpeningAttempts(data) {
 function openingWaitDescription(row) {
   if (row.reason_code === "tw_public_source_update_pending") {
     return "官方來源正在寫入相依資料；等待一致版本，不是訊號已完成";
+  }
+  if (row.reason_code === "tw_official_trading_universe_pending") {
+    return "官方當日交易名冊尚未完整驗收；等待來源自動重試，不退回歷史模型清單";
   }
   if (row.reason_code === "tw_opening_input_coverage_pending") {
     const coverage = row.opening_input_coverage || {};
@@ -1283,8 +1303,10 @@ function renderOperations(data) {
     ["開盤最大階段", openingBottleneck, slowestOpeningMode ? strategyLabel(slowestOpeningMode) : noLatency ? "等待實測" : "來自執行帳本樣本"],
     ["失敗嘗試", number(openingLatency.failure_count || 0), openingLatency.failure_count ? "錯誤類型已寫入測速帳本" : "所選日沒有測速失敗紀錄"],
   ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join(""));
+  const officialUniverse = officialUniverseDescription(data.current_trading_universe);
   setHtml("operation-kpis", [
     ["所選日流程／成交", `${number(execution.executed_count || 0)} 已處理 · ${number(execution.filled_mode_count || 0)} 完整成交`, `${number(execution.partial_mode_count || 0)} 部分、${number(execution.zero_fill_mode_count || 0)} 零成交、${number(execution.no_order_mode_count || 0)} 無合法委託、${number(execution.failed_mode_count || 0)} 阻擋`, execution.all_modes_filled ? "good" : "bad"],
+    ["當前官方可交易標的", officialUniverse.value, officialUniverse.note, officialUniverse.kind],
     ["盤前預熱", `${readyModes}/${totalModes || 0} 模型 READY`, `模擬執行 ${simulationWarm.status || "pending"}`, warmKind],
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
     ["引擎心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `最後完整提交 ${duration(data.source_commit_age_seconds)} 前`, heartbeatKind],
@@ -1805,7 +1827,18 @@ function renderSignalFeaturePanel() {
     return;
   }
 
-  const drivers = resolveSignalFeatureDrivers(row);
+  const featureRecord = resolveSignalFeatureRecord(row);
+  const drivers = featureRecord.drivers;
+  if (featureRecord.feature_proxy_publication_allowed === false) {
+    panel.classList.add("empty");
+    setHtml(body, "");
+    scope.textContent = `${strategyLabel(row)} ${row.symbol} ${row.session_date} · 僅公開模型衍生訊號`;
+    empty.classList.remove("hidden");
+    const researchNotice = featureRecord.research_only === true && featureRecord.historical_point_in_time_proven === false
+      ? " 歷史資料未證明完整 point-in-time；回放績效不是可實現券商績效。" : "";
+    empty.textContent = "此模式不公開私有原始訓練特徵或數值代理；模型分數、目標權重與模擬執行紀錄仍正常提供。這不是資料載入失敗。" + researchNotice;
+    return;
+  }
   if (!drivers.length) {
     panel.classList.add("empty");
     setHtml(body, "");

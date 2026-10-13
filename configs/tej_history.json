@@ -9,6 +9,7 @@
   "preview_max_columns": 30,
   "download_planning_contract": "preview_30_columns_lazy_fields_v1",
   "query_tiling_contract": "minimum_uniform_company_date_rectangles_v1",
+  "query_selector_contract": "bounded_source_selector_geometry_v1",
   "query_capacity_contract": "native_preview_full_local_capacity_v1",
   "capture_method": "native_msaa_preview_full",
   "source_value_representation": "vendor_display_strings_not_underlying_excel_values",

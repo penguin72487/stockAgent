@@ -1,0 +1,16 @@
+contract: frontier_complete_fold_recipes_v1
+# First measured interaction: data locality plus launch/financial fusion.
+full_fold_candidates:
+  - name: numa_funding_v3
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: numa_funding_v3_cpu1
+    cpu_threads: 1
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1

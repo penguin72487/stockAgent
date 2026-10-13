@@ -115,6 +115,7 @@ from stockagent.live.signal_engine import (
 )
 from stockagent.live.service_notify import notify_systemd
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
+from stockagent.data.tw_current_trading_universe import TWTradingUniversePending
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
 
@@ -178,6 +179,47 @@ def _day_trade_state_dir() -> Path:
 
 def _opening_signal_latency_path() -> Path:
     return _day_trade_state_dir() / "opening_signal_latency.jsonl"
+
+
+def _recover_opening_first_observations(session_date: str) -> dict[str, datetime]:
+    """Recover measured session clocks once at startup, never invent a wake.
+
+    The append-only attempt log is already the owner of these observations.
+    Malformed, other-session and future-clock records cannot become evidence.
+    No scan or filesystem I/O is added to the hot scheduled-signal loop.
+    """
+    recovered: dict[str, datetime] = {}
+    zone = ZoneInfo("Asia/Taipei")
+    now = datetime.now(zone)
+    try:
+        with _opening_signal_latency_path().open(encoding="utf-8") as handle:
+            for line in handle:
+                if session_date not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    if row.get("session_date") != session_date:
+                        continue
+                    key = row["schedule_key"]
+                    if key != f"{session_date}:{row['market']}":
+                        continue
+                    text = row.get("first_scheduler_observed_at") or row.get("scheduler_observed_at")
+                    first = datetime.fromisoformat(text)
+                    gate = datetime.fromisoformat(row["gate_at"])
+                    if first.tzinfo is None or gate.tzinfo is None:
+                        continue
+                    first, gate = first.astimezone(zone), gate.astimezone(zone)
+                    if first.date().isoformat() != session_date or not gate <= first <= now:
+                        continue
+                    if key not in recovered or first < recovered[key]:
+                        recovered[key] = first
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+    except (OSError, UnicodeError):
+        # Missing evidence remains a new owner's observation, not an inferred
+        # original wake time. Startup and the execution owner keep running.
+        pass
+    return recovered
 
 
 def _opening_gate_at(cfg: LiveMarketConfig, session_date: str) -> datetime:
@@ -307,6 +349,8 @@ def _opening_signal_latency_record(
         "attempt_finished_at": timing.get("attempt_finished_at"),
         "attempt_elapsed_ms": timing.get("attempt_elapsed_ms"),
         "first_scheduler_observed_at": timing.get("first_scheduler_observed_at"),
+        "first_scheduler_observation_recovered": timing.get("first_scheduler_observation_recovered", False),
+        "first_scheduler_observation_contract": "session_first_observation_across_owner_restarts_v1",
         "attempt_from_open_ms": timing.get("attempt_from_open_ms"),
         "failure_stage": timing.get("signal_stage") if error is not None else None,
         "last_progress": timing.get("last_progress"),
@@ -1444,8 +1488,18 @@ def _warm_or_reuse_tw_mis_opening_receipt(
 def _warm_tw_opening_sources(*, parquet_root, session_date, force_probe=False):
     """Prove a responding source, not a price or executable book before 09:00."""
     from stockagent.live.opening_price_acquisition import OPENING_FAN_IN, configured_transport_probes
+    from stockagent.data.tw_current_trading_universe import official_scope_required, refresh_current_universe
+    universe = None
+    if official_scope_required(parquet_root):
+        # Daily official membership belongs in preopen preparation, never the
+        # 09:00 quote/model mutex path. Final-arm probes reuse a fresh daily
+        # registry; single-flight refresh rejects incomplete source responses.
+        universe = refresh_current_universe(session_date, max_age_seconds=900 if force_probe else None, parquet_root=parquet_root)
     probes = configured_transport_probes(mis_probe=lambda: _warm_or_reuse_tw_mis_opening_receipt(parquet_root=parquet_root, session_date=session_date, force_probe=force_probe), force=force_probe)
-    return OPENING_FAN_IN.warm_transports(parquet_root=parquet_root, session_date=session_date, probes=probes, force=force_probe)
+    result = OPENING_FAN_IN.warm_transports(parquet_root=parquet_root, session_date=session_date, probes=probes, force=force_probe)
+    if universe is not None:
+        result["official_trading_universe"] = {k: universe[k] for k in ("contract", "fingerprint", "listed_count", "trading_count", "halted_count", "observed_at_taipei")}
+    return result
 
 
 def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
@@ -3146,6 +3200,7 @@ class StockAgentBot(discord.Client):
         self._scheduled_retry_after: dict[str, float] = {}
         self._scheduled_failure_counts: dict[str, int] = {}
         self._opening_first_observed_at: dict[str, datetime] = {}
+        self._opening_restored_clock_keys: set[str] = set()
         self._scheduled_error_notice_keys: set[str] = set()
         self._preopen_retry_after: dict[str, float] = {}
         self._preopen_failure_counts: dict[str, int] = {}
@@ -3183,6 +3238,12 @@ class StockAgentBot(discord.Client):
         # also preserves the 09:00 scheduler while making an exact-13:30
         # restart choose cache preparation first.
         _rotate_error_log_if_needed()
+        restored = await asyncio.to_thread(
+            _recover_opening_first_observations,
+            datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat(),
+        )
+        self._opening_first_observed_at.update(restored)
+        self._opening_restored_clock_keys.update(restored)
         postclose_fast_arm.start()
         postclose_fast_cache.start()
         scheduled_signal.start()
@@ -3796,7 +3857,12 @@ def _write_postclose_fast_cache_status_best_effort(
 
 
 def _startup_inference_warmup_must_defer() -> bool:
-    """Only prewarm before a verified trading session's 08:15 preparation."""
+    """Prewarm before 08:15, or recover a cold owner waiting on opening inputs.
+
+    Keep the protected opening window and active signal attempt first. After
+    that window, a restart must not stay model-cold until tomorrow's 07:00.
+    Recovery uses the existing no-quote/no-publication warmup under its mutex.
+    """
 
     warm_window_open = False
     for market in _scheduled_markets():
@@ -3823,6 +3889,11 @@ def _startup_inference_warmup_must_defer() -> bool:
             and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"
         ):
             return True
+        if (open_minutes + 5 < now_minutes < EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+                and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"):
+            if bot._opening_attempt_started_monotonic is not None:
+                return True
+            warm_window_open = True
     return not warm_window_open
 
 
@@ -11361,6 +11432,11 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
             )
         except Exception as exc:
             error = exc
+            if isinstance(exc, TWOpeningInputCoveragePending):
+                timing["signal_stage"] = "opening_input_coverage"
+                timing["signal_summary"] = dict(getattr(exc, "opening_prefetch_summary", {}))
+            elif isinstance(exc, TWTradingUniversePending):
+                timing["signal_stage"] = "official_trading_universe"
         finally:
             timing["parallel_quote_prefetch_ms"] = round(
                 (time.perf_counter() - started) * 1000.0, 3
@@ -11584,6 +11660,7 @@ async def scheduled_signal() -> None:
                         3,
                     ),
                     "first_scheduler_observed_at": first_observed.isoformat(timespec="microseconds"),
+                    "first_scheduler_observation_recovered": key in bot._opening_restored_clock_keys,
                     "attempt_from_open_ms": round((now - gate).total_seconds() * 1000.0, 3),
                     "preopen_catch_up_ms": 0.0,
                     "mode_dispatch_queue_ms": round(
@@ -11644,7 +11721,7 @@ async def scheduled_signal() -> None:
                 _prefetch_prices=day_trade_simulation,
                 _prefetched_quote=prefetched_quote,
             )
-        except (TWPublicSourceUpdatePending, TWOpeningInputCoveragePending) as exc:
+        except (TWPublicSourceUpdatePending, TWOpeningInputCoveragePending, TWTradingUniversePending) as exc:
             attempt_error = exc
             retry_delay = _mark_signal_retry(
                 bot._scheduled_retry_after,

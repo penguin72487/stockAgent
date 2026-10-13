@@ -34,6 +34,7 @@ PROGRESS_STATES = frozenset({
     "source_validation_failed_deferred",
     "prequery_failure_deferred",
     "api_scope_repartitioned",
+    "selector_scope_repartitioned",
     "metadata_retry_scheduled",
 })
 SAFETY_STATES = frozenset({

@@ -25,7 +25,6 @@ from downloader.artifact_io import atomic_write_parquet, atomic_write_json, tabl
 from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_bulk import (cnyes_history_priority, cnyes_pagination, cnyes_records, cnyes_scope, cnyes_url,
                                           BULK_ENVELOPE_CONTINUATION_CONTRACT_VERSION, BULK_RESTRICTED_ITEM_ERRORS,
-                                          cnyes_window_partitions,
                                           cnyes_unseeded_intervals,
                                           wordpress_base, wordpress_page, wordpress_records, wordpress_url)
 from downloader.news_fulltext_policy import (CONTRACT_VERSION, NewsError, PolicyRegistry, capture_usage,
@@ -317,12 +316,28 @@ def seed_discovery(queue: NewsQueue):
                 # path/layout contract changes; otherwise yesterday's filtered
                 # links can hide old years until the next daily scan. Refusal
                 # and transient retry deadlines are never reset here.
-                queue.db.execute("UPDATE discovery SET due=0 WHERE provider=? AND kind='index' AND error_code IS NULL "
-                                 "AND parser_fingerprint IS NOT NULL AND parser_fingerprint!=?",
-                                 (source.provider, discovery_fingerprint(source)))
+                index_where = "provider=? AND kind='index' AND error_code IS NULL AND parser_fingerprint IS NOT NULL"
+                index_parameters = (source.provider, discovery_fingerprint(source))
+                generic_index_filter = ""
+                if source.provider == 'cnyes':
+                    from downloader.news_fulltext_cnyes_index import ENDPOINT
+                    # The public API has its own metadata ABI. Comparing it
+                    # with the body/index-HTML ABI makes every maintenance
+                    # requeue successful pages and starves unseen history.
+                    # Disabled metadata work retains its prior deadline too.
+                    generic_index_filter = " AND substr(url,1,instr(url||'?','?')-1)!=?"
+                    index_parameters += (ENDPOINT,)
+                    if getattr(source, 'cnyes_index_api', ''):
+                        queue.db.execute('UPDATE discovery SET due=0 WHERE ' + index_where
+                                         + " AND parser_fingerprint!=? AND substr(url,1,instr(url||'?','?')-1)=?",
+                                         (source.provider, source.cnyes_index_data_fingerprint, ENDPOINT))
+                queue.db.execute('UPDATE discovery SET due=0 WHERE ' + index_where
+                                 + ' AND parser_fingerprint!=?' + generic_index_filter, index_parameters)
                 queue.db.executemany("INSERT OR IGNORE INTO discovery(url,kind,provider,priority) VALUES (?,'wordpress_posts',?,1)",
                                      ((wordpress_url(base), source.provider) for base in source.wordpress_apis))
                 if source.cnyes_apis:
+                    from downloader.news_fulltext_cnyes_index import seed_gap_dates
+                    seed_gap_dates(queue,source)
                     from datetime import datetime, timedelta, timezone
                     from downloader.news_fulltext_cnyes_seed import CONTRACT_VERSION as seed_version, planned_intervals
                     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -404,12 +419,17 @@ def discovery_fingerprint(source):
 
 def fetch_discovery(http: NewsHTTP, task: dict):
     source = http.registry.require(task["url"])
+    from downloader.news_fulltext_cnyes_index import is_index_task, parse_index, validate_request
+    index_task = is_index_task(task)
+    if index_task:
+        validate_request(task['url'],source)  # Reject before the HTTP owner.
     registered = {"wordpress_posts": source.wordpress_apis, "cnyes_news": source.cnyes_apis,
                   "rss_fulltext": source.fulltext_feeds}
     if task["kind"] in registered and wordpress_base(task["url"]) not in registered[task["kind"]]:
         raise NewsError("unregistered_bulk_api")  # reject before a network request
     headers = {}
-    compatible = task.get("parser_fingerprint") == discovery_fingerprint(source)
+    fingerprint = source.cnyes_index_data_fingerprint if index_task else discovery_fingerprint(source)
+    compatible = task.get("parser_fingerprint") == fingerprint
     if task["etag"] and compatible:
         headers["If-None-Match"] = task["etag"]
     if task["last_modified"] and compatible:
@@ -419,6 +439,10 @@ def fetch_discovery(http: NewsHTTP, task: dict):
         raise NewsError("discovery_http_" + str(response.status))
     if response.status == 304 and (not compatible or not headers):
         raise NewsError("unverifiable_discovery_not_modified", retry=True, delay=60)
+    if index_task:
+        with http.metrics.measure('public_index_metadata_extraction',source.provider):
+            links = parse_index(response,source)[2] if response.status == 200 else []
+        return response, links, [], []
     if task["kind"] == "rss_fulltext":
         with http.metrics.measure("bulk_extraction", source.provider):
             records, errors = feed_records(response, http, source) if response.status == 200 else ([], [])
@@ -451,6 +475,11 @@ def fetch_discovery(http: NewsHTTP, task: dict):
 
 def accept_discovery(queue: NewsQueue, task: dict, response, links, records, errors):
     source = queue.registry.sources[task["provider"]]
+    from downloader.news_fulltext_cnyes_index import accept_index, is_index_task
+    if is_index_task(task):
+        if records or errors:
+            raise NewsError('cnyes_index_cannot_accept_article_bodies')
+        return accept_index(queue,task,response,links,source)
     bulk = task["kind"] in {"wordpress_posts", "cnyes_news", "rss_fulltext"}
     cnyes_page_info = None
     rss_page_info = None
@@ -579,6 +608,10 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
         for record in accepted:
             record["source_response_article_id"] = accepted[0]["article_id"]
         queue.accept(accepted)
+    history_artifact = None
+    if cnyes_page_info and 'startAt=' in task['url']:
+        from downloader.news_fulltext_cnyes_history import retain_response
+        history_artifact = retain_response(queue, response, source, accepted=accepted, restricted=restricted_page)
     with queue.db:
         if rss_page_info:
             # RSS publishes no history total. Observe one actual page at a time,
@@ -601,32 +634,14 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
                 queue.metrics.count(source.provider, "bulk_exact_duplicate_rows_observed", cnyes_page_info["duplicate_rows"])
                 from urllib.parse import parse_qs
                 query = parse_qs(urlsplit(task["url"]).query)
-                partitions = cnyes_window_partitions(task["url"], pages)
+                partitions = queue.partition_cnyes_window(task["url"], pages, source)
                 if partitions:
-                    split_json = json.dumps(partitions)
-                    queue.db.execute("INSERT OR REPLACE INTO bulk_window_splits VALUES (?,?,?,?)",
-                                     (base, source.provider, split_json, utc_now()))
-                    # Supersede, never delete, the old cap failures/checkpoints.
-                    # Indexed category prefix + exact bound tokens: do not
-                    # scan every category/page after each dense-window split.
-                    endpoint = wordpress_base(task["url"])
-                    rows = queue.db.execute("SELECT url FROM discovery WHERE url>=? AND url<? AND kind='cnyes_news' "
-                                            "AND instr(replace(url,'?','&')||'&',?)>0 AND instr(replace(url,'?','&')||'&',?)>0",
-                                            (endpoint + "?", endpoint + "@", "&startAt=" + query["startAt"][0] + "&",
-                                             "&endAt=" + query["endAt"][0] + "&")).fetchall()
-                    for row in rows:
-                        if cnyes_scope(row[0]) == base:
-                            queue.db.execute("UPDATE discovery SET superseded_by_windows_json=? WHERE url=?",
-                                             (split_json, row[0]))
-                    queue.db.executemany("INSERT OR IGNORE INTO discovery(url,kind,provider,priority) VALUES (?,'cnyes_news',?,?)",
-                                         ((url, source.provider, cnyes_history_priority(url)) for url in partitions))
                     queue.metrics.count(source.provider, "historical_windows_partitioned")
-                    queue.db.execute("DELETE FROM bulk_window_gaps WHERE scope_url=?", (base,))
                 elif "startAt" in query and pages > 30:
                     queue.db.execute("INSERT OR REPLACE INTO bulk_window_gaps VALUES (?,?,?,?)",
                                      (base, source.provider, "cnyes_single_day_page_cap", utc_now()))
-                elif "startAt" in query:
-                    queue.db.execute("DELETE FROM bulk_window_gaps WHERE scope_url=?", (base,))
+                # First-page success or queued children is not full list
+                # coverage. Only the durable ID/date proof retires a gap.
                 if "startAt" in query and not partitions and page_number < min(pages, 30):
                     next_url = cnyes_url(wordpress_base(task["url"]), page_number + 1,
                                          start=int(query["startAt"][0]), end=int(query["endAt"][0]))
@@ -635,6 +650,9 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
                 if cnyes_page_info["total"]:
                     queue.db.execute("INSERT OR REPLACE INTO bulk_page_evidence VALUES (?,?,?,?,?)",
                                      (base, page_number, total, cnyes_page_info["ids_sha256"], utc_now()))
+                if history_artifact is not None:
+                    from downloader.news_fulltext_cnyes_history import record_page
+                    record_page(queue, response, cnyes_page_info, posts, source, history_artifact)
                 queue.metrics.count(source.provider, "bulk_pages_validated")
                 queue.metrics.count(source.provider, "bulk_article_ids_validated", len(posts))
             else:
@@ -686,7 +704,16 @@ def fail_discovery(queue: NewsQueue, task: dict, error: NewsError):
     with queue.db:
         queue.db.execute("UPDATE discovery SET due=?,attempts=?,error_code=?,last_checked_at_utc=? WHERE url=?",
                          (time.time() + delay, attempts, error.code, utc_now(), task["url"]))
-        if error.code in {"bulk_all_items_unusable", "bulk_pagination_no_progress", "bulk_pagination_totals_invalid"}:
+        from downloader.news_fulltext_cnyes_index import ENDPOINT, is_index_task
+        if is_index_task(task):
+            source = queue.registry.sources[task['provider']]
+            fingerprint = getattr(source,'cnyes_index_data_fingerprint','')
+            if fingerprint:
+                queue.db.execute('INSERT INTO bulk_endpoint_cooldowns VALUES (?,?,?,?,?,?) '
+                    'ON CONFLICT(provider,endpoint) DO UPDATE SET data_fingerprint=excluded.data_fingerprint,'
+                    'not_before=max(not_before,excluded.not_before),error_code=excluded.error_code,request_url=excluded.request_url',
+                    (source.provider,ENDPOINT,fingerprint,time.time()+delay,error.code,task['url']))
+        elif error.code in {"bulk_all_items_unusable", "bulk_pagination_no_progress", "bulk_pagination_totals_invalid"}:
             source = queue.registry.sources[task["provider"]]
             if task["kind"] == "cnyes_news" and source.cnyes_apis:
                 queue.db.execute("INSERT INTO bulk_endpoint_cooldowns VALUES (?,?,?,?,?,?) "
@@ -721,6 +748,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     last_cached_replay = started - 10
     last_metadata_replay = started
     next_cnyes_work_backfill = started
+    next_cnyes_history_backfill = started
     last_original_resolution = started - config['original_url_resolution_interval_seconds']
     pending_records, futures = [], {}
     pending_bytes, pending_raw_bytes, last_flush, last_status = 0, 0, time.monotonic(), 0
@@ -773,6 +801,14 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 result = backfill_cnyes_work(queue, stop=http.stop)
                 next_cnyes_work_backfill = time.monotonic() + maintenance_delay(result)
             if (continuous_budgets and not draining and not low_disk
+                    and 'cnyes' in active and now >= next_cnyes_history_backfill):
+                from downloader.news_fulltext_cnyes_history import backfill as backfill_cnyes_history
+                # Bound writer time, not fast metadata rows to four per second.
+                # This is local evidence maintenance; HTTP pacing and source
+                # refusal deadlines remain governed by the existing owner.
+                result = backfill_cnyes_history(queue, stop=http.stop, limit=128, max_seconds=.05)
+                next_cnyes_history_backfill = time.monotonic() + (300 if result['exhausted'] else 2)
+            if (continuous_budgets and not draining and not low_disk
                     and now - last_original_resolution >= config['original_url_resolution_interval_seconds']):
                 from downloader.news_fulltext_urls import backfill_original_urls, sync_original_url_routes
                 options = {'limit': config['original_url_resolution_batch'],
@@ -813,7 +849,8 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 historical_bulk = bool(task and (
                     task["kind"] == "rss_fulltext" and feed_page(task["url"]) > 1
                     or task["kind"] == "wordpress_posts" and wordpress_page(task["url"]) > 1
-                    or task["kind"] == "cnyes_news" and "startAt=" in task["url"]))
+                    or task["kind"] == "cnyes_news" and "startAt=" in task["url"]
+                    or task['kind'] == 'index' and task['url'].startswith('https://api.cnyes.com/media/api/v1/newslist/all?')))
                 if (historical_bulk and max_articles > 0 and (continuous_budgets or article_budget_used < max_articles)
                         and http.bulk_since_article.get(provider, 0) >= config.get("bulk_article_burst", 16)):
                     # Efficient bulk remains the main history lane. A bounded

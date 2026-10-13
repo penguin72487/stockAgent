@@ -137,6 +137,8 @@ class SourcePolicy:
     allow_reviewed_supplements: bool = False
     cnyes_bulk_data_fingerprint: str = ""
     fulltext_feed_data_fingerprint: str = ""
+    cnyes_index_api: str = ""
+    cnyes_index_data_fingerprint: str = ""
 
 
 def cnyes_bulk_fingerprint(source: SourcePolicy) -> str:
@@ -414,19 +416,24 @@ class PolicyRegistry:
                 history_start = datetime.strptime(cnyes_start, "%Y-%m-%d")
                 if not 1999 <= history_start.year <= datetime.now(timezone.utc).year or history_start.date() > datetime.now(timezone.utc).date():
                     raise ValueError("invalid Cnyes history start")
+            from downloader.news_fulltext_cnyes_index import reviewed_index
+            cnyes_index_api, index_fingerprint = reviewed_index(entry, provider, auth)
+            # Public list metadata has its own ABI. Enabling that list must
+            # not invalidate millions of verified bodies/category pages.
+            capture_entry = {key:value for key,value in entry.items() if key != 'cnyes_public_index'}
             fingerprint_payload = {"version": CONTRACT_VERSION, "capture_policy_version": CAPTURE_POLICY_VERSION,
                                                         "collection_purpose": config.get("collection_purpose", "personal_research"),
                                                         "html_parser": html_parser,
-                                                        "entry": entry, "authorization": auth}
+                                                        "entry": capture_entry, "authorization": auth}
             if cnyes_apis:
                 fingerprint_payload["cnyes_adapter_contract_version"] = 8
                 fingerprint_payload["reviewed_cnyes_endpoint_inventory"] = cnyes_inventory
             if provider == 'cnyes':
                 fingerprint_payload['verified_short_html_body_contract_version'] = 5
                 fingerprint_payload['mobile_canonical_html_contract_version'] = 41
-                fingerprint_payload['verified_empty_html_outcome_contract_version'] = 7
-                fingerprint_payload['verified_native_quote_only_outcome_contract_version'] = 6
-                fingerprint_payload['verified_native_image_only_outcome_contract_version'] = 2
+                fingerprint_payload['verified_empty_html_outcome_contract_version'] = 8
+                fingerprint_payload['verified_native_quote_only_outcome_contract_version'] = 7
+                fingerprint_payload['verified_native_image_only_outcome_contract_version'] = 3
             if fulltext_feeds:
                 fingerprint_payload['fulltext_feed_rights_contract_version'] = 2
             if pdf_pattern:
@@ -498,6 +505,8 @@ class PolicyRegistry:
                 supplements,
                 bulk_fingerprint,
                 feed_fingerprint,
+                cnyes_index_api,
+                index_fingerprint,
             )
 
     def match(self, url: str) -> SourcePolicy | None:

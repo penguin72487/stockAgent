@@ -1,0 +1,37 @@
+contract: frontier_complete_fold_recipes_v1
+# Run after package/runtime measurements; these are planned, not accepted gains.
+full_fold_candidates:
+  - name: native_fp32_last_query_reduction
+    overrides:
+      training:
+        financial_transformer: {compiled_cross_attention_backend: manual_fp32_last}
+  - name: numa_funding_v3_fp32_last_query_reduction
+    overrides:
+      training:
+        financial_transformer: {compiled_cross_attention_backend: manual_fp32_last}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: numa_funding_v3_batch384
+    batch_size: 384
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: numa_funding_v3_bf16_batch512
+    batch_size: 512
+    # Bounded memory-saturation research; retain full rows and lifecycle.
+    min_vram_headroom_gib: 0.125
+    max_peak_vram_fraction: 0.999
+    overrides:
+      training:
+        financial_transformer:
+          compact_projection_compute_dtype: bf16
+          temporal_blocks_fp32: false
+          portfolio_blocks_fp32: false
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1

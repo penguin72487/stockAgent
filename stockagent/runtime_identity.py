@@ -120,7 +120,7 @@ def validate_runtime_lock(expected: Mapping[str, Any], actual: Mapping[str, Any]
 def source_identity(root: Path, *, allow_tracked_deletions: bool = False) -> dict[str, Any]:
     """Hash code and deployment inputs; refuse changing or external files."""
     root = root.resolve()
-    patterns = ["stockagent/*.py", "downloader/*.py", "scripts/*.py", "scripts/*.sh",
+    patterns = ["stockagent/*.py", "downloader/*.py", "scripts/*.py", "scripts/*.cu", "scripts/*.sh",
                 "scripts/*.ps1", "services/*.py", "services/public_dashboards/*",
                 "services/*.html", "services/*.css", "services/*.js", "services/*.mjs", "services/*.ts",
                 "deploy/systemd/*.in",

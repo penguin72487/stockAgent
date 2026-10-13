@@ -2247,6 +2247,20 @@ class TransformerBasePortfolioModelConfig:
 
 @dataclass(slots=True)
 class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
+    # Opt-in research kernels; defaults retain the historical compute contract.
+    kernel_norm_backend: str = "torch"
+    kernel_linear_backend: str = "torch"
+    kernel_swiglu_backend: str = "torch"
+    kernel_attention_backend: str = "torch"
+    kernel_softmax_backend: str = "torch"
+    compact_projection_compute_dtype: str = "fp32"
+    factorized_compile_autotune: bool = False
+    factorized_cuda_graphs: bool = False
+    factorized_portfolio_cuda_graphs: bool = False
+    factorized_relaxed_precision_casts: bool = False
+    factorized_encoder_force_retention: bool = False
+    factorized_encoder_packet_cache: bool = True
+    fused_swiglu_projection: bool = False
     candle_dropout: float = 0.0
     # Optional learned low-rank mixer over every continuous raw feature before
     # the multi-basis expansion. Zero preserves historical checkpoints. A
@@ -2461,6 +2475,8 @@ class TrainingConfig:
     seed: int = 42
     multi_gpu_strategy: str = "auto"
     ddp_bucket_cap_mb: int = 4
+    ddp_broadcast_buffers: bool = True
+    ddp_trajectory_gradient_sync: str = "batch"
     # Keep the policy model time-sharded under DDP, then transpose the action
     # and execution tensors to contiguous symbol shards for the recurrent
     # carrying ledger. PyTorch functional collectives own autograd; there is no
@@ -3027,6 +3043,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
+    training["ddp_broadcast_buffers"] = bool(training["ddp_broadcast_buffers"])
+    trajectory_sync = str(training["ddp_trajectory_gradient_sync"]).strip().lower()
+    if trajectory_sync not in {"batch", "trajectory"}:
+        raise ValueError("training.ddp_trajectory_gradient_sync must be batch or trajectory")
+    if trajectory_sync == "trajectory" and not any(training[key] for key in (
+        "futures_portfolio_optimizer_step_per_trajectory",
+        "day_trade_optimizer_step_per_trajectory", "crypto_optimizer_step_per_trajectory",
+    )):
+        raise ValueError("trajectory DDP synchronization requires a full-trajectory optimizer update")
+    training["ddp_trajectory_gradient_sync"] = trajectory_sync
     training["temporal_basis_covariance_lag_batch_size"] = int(
         training["temporal_basis_covariance_lag_batch_size"]
     )
@@ -5545,6 +5571,8 @@ def load_config(
             seed=training_raw["seed"],
             multi_gpu_strategy=training_raw["multi_gpu_strategy"],
             ddp_bucket_cap_mb=training_raw["ddp_bucket_cap_mb"],
+            ddp_broadcast_buffers=training_raw["ddp_broadcast_buffers"],
+            ddp_trajectory_gradient_sync=training_raw["ddp_trajectory_gradient_sync"],
             distributed_symbol_sharded_ledger=training_raw[
                 "distributed_symbol_sharded_ledger"
             ],

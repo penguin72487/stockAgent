@@ -11,6 +11,10 @@ import csv
 import io
 import json
 from pathlib import Path
+import sys
+
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text, sha256_file
 
@@ -65,6 +69,10 @@ def implementation_plan(item, provider, entry, review):
         ("bulk_json", "cnyes_apis"), ("wordpress_json", "wordpress_apis"),
         ("fulltext_feed", "fulltext_feeds"), ("feed", "feeds"),
         ("sitemap", "sitemaps"), ("index", "index_pages")) if entry.get(key)}
+    if entry.get('cnyes_public_index') is not None:
+        from downloader.news_fulltext_cnyes_index import reviewed_index
+        endpoint, _ = reviewed_index(entry, provider, entry.get('authorization', {}))
+        endpoints['public_metadata_index'] = [endpoint]
     family = ("declared_bulk_json" if entry.get("cnyes_apis") else
               "declared_wordpress_full_content" if entry.get("wordpress_apis") else
               "declared_fulltext_feed" if entry.get("fulltext_feeds") else "source_scoped_html")
@@ -92,6 +100,7 @@ def implementation_plan(item, provider, entry, review):
         "value_basis": "topic relevance heuristic; not measured predictive alpha; no source excluded by ranking",
         "implementation_action": action, "collector_family": family,
         "known_endpoints_json": json.dumps(endpoints, ensure_ascii=False, sort_keys=True),
+        "endpoint_listing_contract_version": 2,
         "article_path_pattern": entry.get("article_path_pattern", ""),
         "body_selectors_json": json.dumps(entry.get("article_selectors", []), ensure_ascii=False),
         "requires_separate_service": False,
@@ -120,11 +129,14 @@ def apply_work_order(rows, policy):
     """
     required = {'contract_version', 'focus_provider', 'provider_order',
                 'deferred_providers', 'retain_running_collectors'}
-    if not isinstance(policy, dict) or set(policy) != required:
+    parallel_fields = {'background_provider_order', 'background_execution', 'focus_preemption'}
+    if not isinstance(policy, dict) or type(policy.get('contract_version')) is not int:
+        raise ValueError('explicit complete work-order policy required')
+    version = policy['contract_version']
+    if version not in {1, 2} or set(policy) != (required | parallel_fields if version == 2 else required):
         raise ValueError('explicit complete work-order policy required')
     focus, deferred = policy['focus_provider'], policy['deferred_providers']
-    if (type(policy['contract_version']) is not int or policy['contract_version'] != 1
-            or not isinstance(focus, str) or not focus
+    if (not isinstance(focus, str) or not focus
             or policy['provider_order'] != 'known_urls_desc'
             or not isinstance(deferred, list) or any(not isinstance(p, str) or not p for p in deferred)
             or len(set(deferred)) != len(deferred) or focus in deferred
@@ -132,17 +144,43 @@ def apply_work_order(rows, policy):
         raise ValueError('invalid selected work-order policy')
     if focus not in {row['provider'] for row in rows}:
         raise ValueError('focus provider absent from complete inventory')
+    background = policy.get('background_provider_order', [])
+    if version == 2:
+        providers = {row['provider'] for row in rows}
+        if (not isinstance(background, list) or not background
+                or any(not isinstance(p, str) or not p or p not in providers for p in background)
+                or len(set(background)) != len(background)
+                or focus in background or set(background).intersection(deferred)
+                or policy['background_execution'] != 'parallel_while_focus_waits'
+                or policy['focus_preemption'] != 'return_on_verified_operational_blocker'):
+            raise ValueError('invalid selected background work-order policy')
+    background_ranks = {provider: rank for rank, provider in enumerate(background)}
     for row in rows:
         provider = row['provider']
-        row['work_phase'] = (3 if provider in deferred else 0 if provider == focus
-                             else 1 if row['known_urls'] or row['literal_metadata_links'] else 2)
+        if version == 2:
+            row['work_phase'] = (4 if provider in deferred else 0 if provider == focus
+                                 else 1 if provider in background_ranks
+                                 else 2 if row['known_urls'] or row['literal_metadata_links'] else 3)
+            # This is engineering attention, not a global HTTP gate. Running
+            # collectors stay independently paced, even while focus is healthy.
+            row['engineering_execution'] = ('deferred_by_user' if provider in deferred else
+                'priority_focus' if provider == focus else
+                'parallel_while_focus_waits' if provider in background_ranks else
+                'after_selected_background_order')
+            row['background_attention_rank'] = (background_ranks[provider] + 1
+                                                 if provider in background_ranks else None)
+        else:
+            row['work_phase'] = (3 if provider in deferred else 0 if provider == focus
+                                 else 1 if row['known_urls'] or row['literal_metadata_links'] else 2)
         row['implementation_state'] = (
             'deferred_by_user' if provider in deferred else
             'repair_or_backfill_known_urls' if row['missing_body_urls'] else
             'review_literal_original_links' if row['unqueued_literal_link_work'] else
             'maintenance_only' if row['known_urls'] else 'review_discovery_after_known_urls')
-        row['implementation_order_basis'] = 'selected_focus_first_then_known_url_count_descending'
-    rows.sort(key=lambda row: (row['work_phase'], -row['known_urls'], row['provider']))
+        row['implementation_order_basis'] = ('selected_focus_with_ordered_parallel_background'
+            if version == 2 else 'selected_focus_first_then_known_url_count_descending')
+    rows.sort(key=lambda row: (row['work_phase'], background_ranks.get(row['provider'], 0),
+                              -row['known_urls'], row['provider']))
     work = [row for row in rows if row['implementation_state'] not in {'deferred_by_user', 'maintenance_only'}]
     ranks = {row['provider']: rank for rank, row in enumerate(work, 1)}
     for row in rows:
@@ -150,8 +188,15 @@ def apply_work_order(rows, policy):
         row['body_downloader_candidate'] = (
             row['implementation_state'] == 'repair_or_backfill_known_urls'
             and row['source_role'] not in {'redirector', 'aggregator', 'social_or_video'})
+    parallel = ({
+        'background_attention_order': list(background),
+        'background_waits_for_focus_completion': False,
+        'focus_preemption': policy['focus_preemption'],
+        'dispatch_scope': 'engineering_only_existing_collectors_remain_independent',
+        'background_access_is_not_granted_by_priority': True,
+    } if version == 2 else {})
     return {
-        'work_order_contract_version': 1, 'selected_work_order': policy,
+        'work_order_contract_version': version, 'selected_work_order': policy, **parallel,
         'implementation_order': [row['provider'] for row in work],
         'body_downloader_implementation_order': [row['provider'] for row in work if row['body_downloader_candidate']],
         'deferred_source_keys': sorted(row['provider'] for row in rows if row['provider'] in deferred),
@@ -249,7 +294,8 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
     counts = Counter(row["strategy"] for row in rows)
     ordering = apply_work_order(rows, work_order) if work_order is not None else {}
     return {
-        "contract_version": 6 if work_order is not None else 5,
+        "contract_version": (7 if work_order is not None and work_order['contract_version'] == 2
+                             else 6 if work_order is not None else 5),
         **ordering, "input_observed_at_utc": inventory["observed_at_utc"],
         "queue_owner_id": inventory.get("queue_owner_id"),
         "small_threshold_urls": small_threshold,
@@ -275,7 +321,7 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, help="Existing canonical source recipes, no publisher requests")
     parser.add_argument("--reviews", type=Path, help="Explicit primary-source review observations, never runtime authorization")
-    parser.add_argument("--work-order", type=Path, help="Selected focus and descending known-URL implementation order; no HTTP or queue mutation")
+    parser.add_argument("--work-order", type=Path, help="Selected engineering focus and optional parallel background order; no HTTP or queue mutation")
     args = parser.parse_args(argv)
     before = sha256_file(args.inventory)
     entries, reviews, inputs = {}, {}, {}

@@ -12,6 +12,11 @@ POLICY = {'contract_version': 1, 'focus_provider': 'cnyes',
           'provider_order': 'known_urls_desc', 'deferred_providers': ['cna'],
           'retain_running_collectors': True}
 
+PARALLEL_POLICY = {**POLICY, 'contract_version': 2,
+                  'background_provider_order': ['medium', 'small', 'large'],
+                  'background_execution': 'parallel_while_focus_waits',
+                  'focus_preemption': 'return_on_verified_operational_blocker'}
+
 
 def inventory():
     def source(known, stored=0, role='publisher_or_other_unverified', **extra):
@@ -70,7 +75,65 @@ def test_work_order_preserves_source_facts_grain_and_all_keys():
 
 
 def test_config_matches_user_selected_order():
-    assert json.loads(Path('configs/news/work_order.json').read_bytes()) == POLICY
+    assert json.loads(Path('configs/news/work_order.json').read_bytes()) == {
+        **PARALLEL_POLICY, 'background_provider_order': [
+            'cmoney', 'udn', 'globalvoices', 'wantmedia', 'money_link', 'cmnews', 'moneydj', 'ltn']}
+
+
+def test_parallel_background_order_is_attention_not_permission_or_global_http_gate():
+    before = inventory()
+    original = deepcopy(before)
+    result = plan_sources(before, work_order=PARALLEL_POLICY)
+    assert result['contract_version'] == 7 and result['work_order_contract_version'] == 2
+    assert result['background_attention_order'] == ['medium', 'small', 'large']
+    assert [row['provider'] for row in result['sources'][:4]] == ['cnyes', 'medium', 'small', 'large']
+    assert not result['background_waits_for_focus_completion']
+    assert result['focus_preemption'] == 'return_on_verified_operational_blocker'
+    assert result['dispatch_scope'] == 'engineering_only_existing_collectors_remain_independent'
+    assert result['background_access_is_not_granted_by_priority']
+    assert not result['running_collectors_stopped'] and not result['work_order_grants_source_access']
+    assert before == original and result['source_count'] == len(before['providers'])
+    assert result['publisher_requests'] == 0 and not result['queue_writes']
+    assert result['sources'][-1]['provider'] == 'cna'
+    for rank, row in enumerate(result['sources'][1:4], 1):
+        assert row['engineering_execution'] == 'parallel_while_focus_waits'
+        assert row['background_attention_rank'] == rank
+        assert not row['enabled']  # Ordering a disabled source never enables it.
+
+
+def test_parallel_policy_preserves_every_legacy_source_fact_and_completed_maintenance():
+    legacy = {row['provider']: row for row in plan_sources(inventory())['sources']}
+    result = plan_sources(inventory(), work_order=PARALLEL_POLICY)
+    for row in result['sources']:
+        assert all(row[key] == value for key, value in legacy[row['provider']].items())
+    remaining = [row for row in result['sources'] if row['work_phase'] == 2]
+    assert [row['known_urls'] for row in remaining] == sorted(
+        (row['known_urls'] for row in remaining), reverse=True)
+    assert 'all_stored' not in result['implementation_order']
+    assert not result['all_history_complete'] and not result['plan_is_acquisition_acceptance']
+
+
+@pytest.mark.parametrize('field,value', [
+    ('background_provider_order', []), ('background_provider_order', 'small'),
+    ('background_provider_order', ['small', 'small']), ('background_provider_order', ['cna']),
+    ('background_provider_order', ['cnyes']), ('background_provider_order', ['absent']),
+    ('background_provider_order', [True]), ('background_execution', 'wait_until_complete'),
+    ('focus_preemption', False), ('focus_preemption', 'cancel_inflight_requests'),
+    ('retain_running_collectors', False), ('contract_version', True),
+])
+def test_invalid_parallel_policy_rejected(field, value):
+    with pytest.raises(ValueError):
+        plan_sources(inventory(), work_order={**PARALLEL_POLICY, field: value})
+
+
+@pytest.mark.parametrize('field', ['background_provider_order', 'background_execution', 'focus_preemption'])
+def test_parallel_semantics_must_be_complete_and_never_ignored(field):
+    incomplete = dict(PARALLEL_POLICY)
+    incomplete.pop(field)
+    with pytest.raises(ValueError):
+        plan_sources(inventory(), work_order=incomplete)
+    with pytest.raises(ValueError):
+        plan_sources(inventory(), work_order={**POLICY, field: PARALLEL_POLICY[field]})
 
 
 @pytest.mark.parametrize('field,value', [
