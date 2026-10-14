@@ -30,6 +30,90 @@ def source_at(tmp_path, rows=None, **kwargs):
     return OfficialDailyQuoteSource(tmp_path, **kwargs)
 
 
+def tpex_row(**overrides):
+    return {"date": DAY, "代號": "6168", "開盤": "28.00", "最高": "29.20",
+            "最低": "27.80", "收盤": "28.20", "均價": "28.1234",
+            "最後買價": "28.15", "最後賣價": "28.20", "次日參考價": "28.20",
+            "次日漲停價": "31.00", "次日跌停價": "25.40",
+            "成交股數": "18,000", "成交金額(元)": "506,221", "成交筆數": "18",
+            "_dataset": "tpex_daily_ohlcv", "_source": "TPEx",
+            "_downloaded_at_utc": "2026-09-21T06:10:00+00:00",
+            "_url": "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date=2026/09/21",
+            **overrides}
+
+
+@pytest.mark.parametrize("sanitize", [public.sanitize_tw_signals, public.sanitize_tw_positions,
+                                      public.sanitize_tw_events, public.sanitize_tw_status])
+def test_official_tpex_reference_fields_share_all_endpoints_with_exact_units(tmp_path, sanitize):
+    pq.write_table(pa.Table.from_pylist([tpex_row()]), tmp_path / "tpex_daily_ohlcv.parquet")
+    source = OfficialDailyQuoteSource(tmp_path)
+    original = {"symbol": "6168", "session_date": DAY, "bid": 28.15, "ask": 28.2,
+                "upper_limit": 31., "lower_limit": 25.4, "next_upper_limit": 31.,
+                "reconciled_total_net_pnl_twd": 120.15, "filled_shares": 0}
+    before = deepcopy(original)
+    result = sanitize(payload(original), quote_source=source)
+    out = result["positions" if sanitize is public.sanitize_tw_status else "rows"][0]
+    quote = out["official_daily_quote"]
+    assert quote["projection_contract"] == "official_daily_quote_v2"
+    assert quote["quote_context"] == "official_after_close_not_realtime"
+    assert quote["limit_scope"] == "next_exchange_session_published_bounds"
+    assert {key: quote[key] for key in ("last_bid", "last_ask", "average_price", "next_reference_price",
+                                     "next_upper_limit", "next_lower_limit")} == {
+        "last_bid": 28.15, "last_ask": 28.2, "average_price": 28.1234,
+        "next_reference_price": 28.2, "next_upper_limit": 31., "next_lower_limit": 25.4,
+    }
+    assert (quote["volume_shares"], quote["turnover"], quote["trade_count"]) == (18000, 506221, 18)
+    for field in ("last_bid", "last_ask", "next_upper_limit", "next_lower_limit"):
+        proof = quote["public_price_display"]["visible_fields"][field]
+        assert proof["grain"] == "daily"
+        assert proof["session_date"] == DAY
+        assert proof["license_reference"] == "https://data.gov.tw/dataset/11370"
+    # Identical numbers do not turn AFTER-CLOSE or NEXT-session facts into a
+    # current session's executable bid/ask or limit.
+    for field in ("bid", "ask", "upper_limit", "lower_limit", "next_upper_limit"):
+        assert out.get(field) is None  # Endpoint allowlists may omit the field entirely.
+        assert public_quote_display_policy().observation(original, field, original[field], now=NOW) is None
+    assert original == before
+    if sanitize in (public.sanitize_tw_positions, public.sanitize_tw_status):
+        assert out["reconciled_total_net_pnl_twd"] == 120.15
+
+
+def test_official_next_bounds_preserve_no_limit_sentinels_and_actual_zero_volume(tmp_path):
+    pq.write_table(pa.Table.from_pylist([tpex_row(次日漲停價="9,999.95", 次日跌停價="0.01",
+        成交股數="0", 成交筆數="0", **{"成交金額(元)": "0"})]), tmp_path / "tpex_daily_ohlcv.parquet")
+    quote = OfficialDailyQuoteSource(tmp_path).session(DAY)["6168"]
+    assert (quote["next_upper_limit"], quote["next_lower_limit"]) == (9999.95, 0.01)
+    assert (quote["volume_shares"], quote["turnover"], quote["trade_count"]) == (0, 0, 0)
+
+
+def test_optional_columns_do_not_authorize_unlicensed_twse_final_quotes(tmp_path):
+    quote = source_at(tmp_path, [official_row(最後揭示買價="2475", 最後揭示賣價="2480",
+        成交股數="1,000", 成交金額="2,480,000", 成交筆數="1")]).session(DAY)["2330"]
+    assert "last_bid" not in quote and "last_ask" not in quote
+    assert (quote["volume_shares"], quote["turnover"], quote["trade_count"]) == (1000, 2480000, 1)
+
+
+@pytest.mark.parametrize("change", [
+    {"_downloaded_at_utc": DAY + "T04:59:00Z"},
+    {"_downloaded_at_utc": "2099-01-01T00:00:00Z"},
+    {"_url": "https://tpex.org.tw.attacker.example/afterTrading/otc"},
+])
+def test_unverified_tpex_receipts_cannot_leak_extra_prices_or_measures(tmp_path, change):
+    pq.write_table(pa.Table.from_pylist([tpex_row(**change)]), tmp_path / "tpex_daily_ohlcv.parquet")
+    assert OfficialDailyQuoteSource(tmp_path).session(DAY) == {}
+
+
+def test_missing_and_nonfinite_optional_values_are_not_fabricated(tmp_path):
+    pq.write_table(pa.Table.from_pylist([tpex_row(均價="NaN", 最後買價="--", 最後賣價="0",
+        次日參考價=None, 次日漲停價="inf", 次日跌停價="-1", 成交股數=None,
+        成交筆數="-1", **{"成交金額(元)": "NaN"})]), tmp_path / "tpex_daily_ohlcv.parquet")
+    quote = OfficialDailyQuoteSource(tmp_path).session(DAY)["6168"]
+    for field in ("average_price", "last_bid", "last_ask", "next_reference_price", "next_upper_limit",
+                  "next_lower_limit", "volume_shares", "turnover", "trade_count"):
+        assert quote[field] is None
+    assert quote["close"] == 28.2
+
+
 def payload(row):
     return {"simulation_only": True, "production_order_possible": False,
             "session_date": DAY, "rows": [row], "positions": [row]}
@@ -254,6 +338,55 @@ def test_empty_strategy_still_has_reference_prices_without_any_fake_signal(tmp_p
     assert reference["role"] == "reference_only"
     row = next(item for item in reference["quotes"] if item["symbol"] == "2330")
     assert row["official_daily_quote"]["close"] == 2480.
+
+
+def test_live_view_retains_prior_official_reference_without_replacing_today_prices(tmp_path, monkeypatch):
+    from stockagent.live import public_daily_quotes as module
+
+    today = "2026-09-22"
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(today + "T20:00:00+08:00").astimezone(tz)
+    monkeypatch.setattr(module, "datetime", Clock)
+    source = source_at(tmp_path)
+    row = {"symbol": "2330", "session_date": today, "sizing_open_price": 2445.,
+           "last_mark_price": 2480., "bid": 2480.}
+    out = public.sanitize_tw_signals({**payload(row), "session_date": today}, quote_source=source)["rows"][0]
+    daily = out["official_daily_quote"]
+    assert daily["session_date"] == DAY
+    assert daily["requested_session_date"] == today
+    assert daily["prior_session_reference_only"] is True
+    assert daily["close"] == 2480.
+    assert out["sizing_open_price"] is None
+    assert out.get("last_mark_price") is None  # Signal DTO intentionally omits valuation fields.
+    assert out["bid"] is None
+    # Historical absence cannot quietly inherit an unrelated prior day.
+    assert "official_daily_quote" not in source.enrich({"symbol": "2330", "session_date": "2026-09-23"})
+
+
+def test_status_reference_date_is_actual_source_date_not_requested_live_session(tmp_path):
+    source = source_at(tmp_path)
+    today = "2026-09-22"
+    out = public.sanitize_tw_status({"simulation_only": True, "production_order_possible": False,
+        "session_date": today, "positions": [], "signals": []}, quote_source=source)
+    assert out["session_date"] == today
+    ref = out["official_price_reference"]
+    assert ref["session_date"] == DAY and ref["requested_session_date"] == today
+    assert ref["quotes"][1]["official_daily_quote"]["session_date"] == DAY
+    assert out["positions"] == out["signals"] == []
+
+
+def test_prior_date_cache_is_bounded_and_invalidated_with_canonical_source(tmp_path):
+    source = source_at(tmp_path, maximum_sessions=2)
+    assert source.prior_completed_session("2026-09-22") == DAY
+    assert source.prior_completed_session("2026-09-23") == DAY
+    assert source.prior_completed_session("2026-09-24") == DAY
+    assert len(source._prior_sessions) == 2
+    replacement = tmp_path / "replacement.parquet"
+    pq.write_table(pa.Table.from_pylist([official_row(date="2026-09-18")]), replacement)
+    replacement.replace(tmp_path / "twse_daily_ohlcv.parquet")
+    assert source.prior_completed_session("2026-09-22") == "2026-09-18"
 
 
 def test_price_publication_changes_ui_revision_but_not_large_history_revision(tmp_path, monkeypatch):

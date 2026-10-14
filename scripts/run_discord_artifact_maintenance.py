@@ -117,6 +117,34 @@ def _retry_dispatch_state_path() -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def _factorized_source_updater_receipt() -> Path:
+    return ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/updater_status.json"
+
+
+def _deferred_factorized_source_request() -> dict | None:
+    """A bounded wakeup hint, never acceptance of source/data/model readiness."""
+    state = _read_retry_json(_factorized_source_updater_receipt())
+    if state.get("status") != "cache_warming_required":
+        return None
+    from stockagent.data.annual_cache_admission import CONTRACT
+
+    admission = state.get("admission")
+    if (state.get("error_type") != "AnnualCacheBuildDeferred"
+            or not isinstance(admission, dict) or admission.get("contract") != CONTRACT
+            or state.get("last_good_generation_retained") is not True):
+        raise ValueError("unverified factorized warming request cannot invoke the source owner")
+    return state
+
+
+def _owns_factorized_source_updater(cfg) -> bool:
+    target = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
+    for item in (getattr(cfg, "completed_session_command", ()) or ()):
+        path = Path(str(item))
+        if (path if path.is_absolute() else ROOT / path).absolute() == target:
+            return True
+    return False
+
+
 def retry_probe(*, observed: datetime | None = None) -> dict:
     """Advisory wakeup only; the canonical worker still owns every readiness gate.
 
@@ -205,7 +233,8 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
                 raise ValueError("artifact retry deadline must be timezone-aware")
             if deadline <= observed:
                 candidates.append((key, market))
-    if not candidates:
+    warming = _deferred_factorized_source_request()
+    if not candidates and warming is None:
         return finish()
 
     # Reuse the lightweight canonical YAML loader, never load the trading/model
@@ -246,13 +275,22 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
         fallback = os.environ.get("STOCKAGENT_DEFAULT_MARKET", "default")
         if (all_markets or fallback in selection) and enabled_override(fallback, True):
             enabled.add(fallback)
-    result["due_keys"] = sorted(key for key, market in candidates if market in enabled)
+    due_jobs = {key: jobs[key] for key, market in candidates if market in enabled}
+    if warming is not None:
+        # Headroom is a resource snapshot, not a source generation. Coalesce
+        # an unchanged warming request; committed source hints and the full
+        # worker retain the publication/resource gates and last-good proof.
+        admission = warming["admission"]
+        hint = {"phase": warming.get("phase"), "admission": {key: admission.get(key) for key in
+                ("contract", "source", "immutable_seed", "required_headroom_bytes", "reason")}}
+        for name, cfg in configs.items():
+            if name in enabled and _owns_factorized_source_updater(cfg):
+                due_jobs[f"source_cache_warming:{name}"] = hint
+    result["due_keys"] = sorted(due_jobs)
     result["due"] = bool(result["due_keys"])
     result["reason"] = "retry_due" if result["due"] else "no_due_scheduled_retry"
     if result["due"]:
-        result["wakeup_fingerprint"] = _retry_wakeup_fingerprint(
-            {key: jobs[key] for key in result["due_keys"]}, markets_dir
-        )
+        result["wakeup_fingerprint"] = _retry_wakeup_fingerprint(due_jobs, markets_dir)
     return finish()
 
 
@@ -329,7 +367,43 @@ def _emit(**payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
+def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> bool:
+    """Let the existing isolated owner recover a gateway-denied cold cache.
+
+    Run only the configured canonical updater, after an accepted official close.
+    Do not require the derived panel to already be fresh: that is the missing
+    artifact this operation repairs. Ordinary cache passes incur no new source
+    command or memory probe. Opening and producer-lock gates remain with the
+    surrounding worker and source owner.
+    """
+    expected = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
+    if not _owns_factorized_source_updater(cfg):
+        return True
+    state = _deferred_factorized_source_request()
+    if state is None:
+        return True
+    if not allow_warming:
+        _emit(status="factorized_cache_warming_deferred", market=cfg.market,
+              reason="isolated_source_owner_required", owner_unit=ARTIFACT_OWNER_UNIT,
+              model_executed=False)
+        return False
+    bot = _load_discord_bot()
+    status = bot._ensure_signal_ready(cfg)
+    if status.market_open or not bot._completed_session_publication_ready(status):
+        _emit(status="factorized_cache_warming_deferred", market=cfg.market,
+              reason="accepted_official_close_required", model_executed=False)
+        return False
+    _emit(status="factorized_cache_warming_started", market=cfg.market,
+          owner=ARTIFACT_OWNER_UNIT, source_owner=str(expected), model_executed=False)
+    bot._run_completed_session_command(cfg, bypass_cache=True)
+    if _read_retry_json(_factorized_source_updater_receipt()).get("status") not in {"verified", "already_current"}:
+        raise RuntimeError("canonical factorized source recovery has no accepted receipt")
+    _emit(status="factorized_cache_warming_verified", market=cfg.market,
+          source_owner=str(expected), model_executed=False)
+    return True
+
+
+def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int]:
     discord_bot = _load_discord_bot()
     attempted = 0
     failures = 0
@@ -339,6 +413,9 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
             continue
         attempted += 1
         try:
+            if not _recover_deferred_factorized_source(cfg, allow_warming=allow_source_warming):
+                failures += 1
+                continue
             result = discord_bot._run_completed_session_signal_cache_sync(cfg)
         except TWPublicSourceUpdatePending:
             # A writer may acquire the lock just after the outer busy check.
@@ -368,9 +445,10 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
     return attempted, failures
 
 
-def _populate_postclose_signal_caches_or_defer(markets: list[str]) -> tuple[int, int] | None:
+def _populate_postclose_signal_caches_or_defer(
+        markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int] | None:
     try:
-        return _populate_postclose_signal_caches(markets)
+        return _populate_postclose_signal_caches(markets, allow_source_warming=allow_source_warming)
     except TWPublicSourceUpdatePending as exc:
         discord_bot = _load_discord_bot()
         discord_bot._record_artifact_maintenance_run(
@@ -457,7 +535,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
 
         markets = discord_bot._artifact_maintenance_markets()
         if signal_cache_only:
-            population = _populate_postclose_signal_caches_or_defer(markets)
+            population = _populate_postclose_signal_caches_or_defer(markets, allow_source_warming=False)
             if population is None:
                 return 0
             cache_attempted, cache_failures = population

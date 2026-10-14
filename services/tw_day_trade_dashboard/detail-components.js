@@ -44,10 +44,29 @@
 
     function dailyReference(row) {
       const daily = row?.official_daily_quote;
-      if (!daily || (daily.open == null && daily.close == null)) return "";
-      const source = daily.public_price_display?.visible_fields?.open || daily.public_price_display?.visible_fields?.close;
+      if (!daily) return "";
+      const proofs = daily.public_price_display?.visible_fields || {};
+      const visible = (key) => daily[key] != null && proofs[key] && !withheld(daily, key);
+      const groups = [
+        [["open", "開"], ["close", "收"]],
+        [["high", "高"], ["low", "低"], ["average_price", "均"]],
+        [["last_bid", "盤後最後買"], ["last_ask", "盤後最後賣"]],
+        [["next_reference_price", "次一交易日參考"], ["next_upper_limit", "次一交易日申報上界"], ["next_lower_limit", "下界"]],
+      ];
+      const source = groups.flat().filter(([key]) => visible(key)).map(([key]) => proofs[key])[0];
       if (!source) return "";
-      return `<small class="public-daily-quote" data-daily-session="${esc(daily.session_date)}">官方日行情 ${esc(daily.session_date)} · 開 ${sourceNumber(daily.open)}／收 ${sourceNumber(daily.close)}</small><small>來源 ${esc(source.source)} · 取得 ${sourceClock(daily.received_at)}（臺北） · 非分鐘成交</small>`;
+      const lines = groups.map(group => group.filter(([key]) => visible(key))
+        .map(([key, label]) => `${label} ${sourceNumber(daily[key])}`).join("／")).filter(Boolean);
+      const measures = [["volume_shares", "成交股數", "股"], ["trade_count", "成交筆數", "筆"], ["turnover", "成交金額", "（來源單位）"]]
+        .filter(([key]) => daily[key] != null && Number.isFinite(Number(daily[key])) && Number(daily[key]) >= 0)
+        .map(([key, label, unit]) => `${label} ${key === "turnover" ? sourceNumber(daily[key]) : number(daily[key])}${unit}`);
+      if (measures.length) lines.push(measures.join("／"));
+      const prior = daily.prior_session_reference_only
+        ? ` · ${esc(daily.requested_session_date)} 日行情待發布，非當日報價` : "";
+      const overview = `<small class="public-daily-quote" data-daily-session="${esc(daily.session_date)}">官方日行情 ${esc(daily.session_date)} · ${lines.shift()}${prior}</small>`;
+      const details = lines.length
+        ? `<details class="daily-reference-details"><summary>完整官方日資料${visible("next_upper_limit") || visible("next_lower_limit") ? "／次日界線" : ""}</summary>${lines.map(line => `<small>${line}</small>`).join("")}</details>` : "";
+      return `${overview}${details}<small>來源 ${esc(source.source)} · 取得 ${sourceClock(daily.received_at)}（臺北） · 非分鐘成交</small>`;
     }
 
     function priceNoticeText(data) {
@@ -64,7 +83,9 @@
         ? "永豐分鐘／即時價格公開展示授權待確認。" : "";
       const reports = data.price_display_policy?.paper_transaction_reports === true
         ? "進出場價為使用者公開的模擬帳本成交，非券商成交。" : "";
-      return `${reports}官方日行情 ${reference.session_date}：${values.join("；")}。來源：${sources.join("／")}。${permission}日行情不是分鐘成交或即時買賣價；模型與帳本原值不變。`;
+      const prior = reference.requested_session_date && reference.requested_session_date !== reference.session_date
+        ? `${reference.requested_session_date} 日行情待發布或待驗收，以下為前一份已取得的官方資料。` : "";
+      return `${reports}${prior}官方日行情 ${reference.session_date}：${values.join("；")}。來源：${sources.join("／")}。${permission}日行情不是分鐘成交或即時買賣價；模型與帳本原值不變。`;
     }
 
     function futuresBadge(membership) {

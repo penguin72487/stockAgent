@@ -36,7 +36,7 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
     requested = set(symbols)
     if not requested or len(requested) != len(symbols):
         raise ValueError("opening coverage audit requires a nonempty unique scope")
-    cutoffs = (100, 250, 500, 1000, 2000, 5000)
+    cutoffs = (100, 250, 500, 1000, 2000, 5000, 10000, 20000, 30000)
     states = {cutoff: {} for cutoff in cutoffs}
     failures, malformed, known_providers, legacy_events = {}, 0, set(), []
     if not path.exists():
@@ -109,6 +109,65 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
         "failed_or_degraded_jobs": failures, "milestones": milestones}
 
 
+def opening_publication_slo(session_date: str, attempts: dict, expected_markets: list[str]) -> dict:
+    """Opening gate to ALL immutable execution pointers, not hot inference.
+
+    Recompute from original timezone-aware clocks. A missing mode or an invalid
+    clock cannot earn a stage, and repeat publication cannot move the first
+    accepted pointer. The caller supplies a labelled mode roster, not a claim
+    that today's config proves a historical deployment.
+    """
+    if not expected_markets or len(set(expected_markets)) != len(expected_markets):
+        raise ValueError("opening publication SLO requires a nonempty unique mode roster")
+    gate = datetime.fromisoformat(session_date + "T09:00:00+08:00")
+    modes = {}
+    for market in expected_markets:
+        stats = attempts.get(market, {})
+        accepted, invalid = [], 0
+        for row in stats.get("ready", []):
+            try:
+                if (row.get("status") != "ready" or row.get("session_date") != session_date
+                        or row.get("market") != market or not row.get("signal_id")):
+                    raise ValueError("wrong publication identity")
+                original_gate = datetime.fromisoformat(row["gate_at"])
+                ready = datetime.fromisoformat(row["signal_ready_at"])
+                published = datetime.fromisoformat(row["artifact_published_at"])
+                if any(at.tzinfo is None for at in (original_gate, ready, published)):
+                    raise ValueError("missing clock timezone")
+                if original_gate != gate or not gate <= ready <= published:
+                    raise ValueError("invalid publication clock order")
+                accepted.append((published, row))
+            except (KeyError, TypeError, ValueError):
+                invalid += 1
+        accepted.sort(key=lambda item: item[0])
+        published, row = accepted[0] if accepted else (None, {})
+        modes[market] = {
+            "state": "published" if published else "unavailable",
+            "attempt_count": stats.get("attempt_count", 0),
+            "failed_count": stats.get("failed_count", 0),
+            "invalid_ready_records": invalid,
+            "signal_id": row.get("signal_id"),
+            "artifact_published_at": row.get("artifact_published_at"),
+            "published_from_open_ms": round((published - gate).total_seconds() * 1000, 3) if published else None,
+        }
+    latencies = [row["published_from_open_ms"] for row in modes.values() if row["state"] == "published"]
+    complete = len(latencies) == len(expected_markets)
+    all_published_ms = max(latencies) if complete else None
+    stages = [{"target_ms": target, "passed": complete and all_published_ms <= target,
+               "state": "incomplete" if not complete else "passed" if all_published_ms <= target else "missed"}
+              for target in (30000, 20000, 10000, 5000, 1000)]
+    return {
+        "contract": "all_enabled_mode_immutable_publication_stages_v1",
+        "measurement_boundary": "09:00_gate_to_all_mode_durable_execution_pointers_not_broker_fills",
+        "scope_basis": "caller_supplied_mode_roster_not_historical_deployment_proof",
+        "state": "observed" if complete else "incomplete",
+        "expected_mode_count": len(expected_markets), "published_mode_count": len(latencies),
+        "first_mode_published_from_open_ms": min(latencies) if latencies else None,
+        "all_modes_published_from_open_ms": all_published_ms,
+        "stages": stages, "modes": modes,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-date", default=datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat())
@@ -130,6 +189,12 @@ def main() -> int:
               "observed_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
               "simulation_only": True, "ledger_modified": False, "signal_published": False,
               "orders_submitted": False, "real_opening_attempts": {}, "receipt_only_model_probes": []}
+    report["code_sha256"] = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (Path(__file__), ROOT / "services/discord_bot/bot.py", ROOT / "stockagent/live/quote_provider.py",
+                     ROOT / "stockagent/live/signal_engine.py", ROOT / "stockagent/live/opening_price_acquisition.py",
+                     ROOT / "stockagent/live/tw_day_trade_simulation.py", ROOT / "stockagent/live/opening_execution_latency.py",
+                     ROOT / "scripts/run_tw_day_trade_simulation.py")}
+    report["code_identity_scope"] = "audit_current_disk_not_loaded_owner_attestation"
     path = bot._opening_signal_latency_path()
     with path.open() as handle:
         for line in handle:
@@ -144,6 +209,12 @@ def main() -> int:
             stats["last"] = row
             if row["status"] == "ready":
                 stats["ready"].append(row)
+    expected_markets = sorted(cfg.market for cfg in bot._market_configs().values()
+        if cfg.day_trade_simulation_enabled and bot._market_enabled(cfg))
+    report["opening_publication_slo"] = opening_publication_slo(
+        args.session_date, report["real_opening_attempts"], expected_markets,
+    )
+    report["opening_publication_slo"]["scope_basis"] = "current_enabled_mode_roster_not_historical_deployment_proof"
     _atomic_json(args.output, report)
     from stockagent.live import quote_provider as quotes
     receipt_path = quotes._tw_mis_opening_receipt_path(args.session_date)
@@ -202,6 +273,37 @@ def main() -> int:
         runtime["current_session_engine_registered"] = {
             market: mode.get("session_date") == args.session_date
             for market, mode in (runtime.get("engine", {}).get("modes") or {}).items()}
+        # Reuse the dashboard's canonical executor-clock projection. A replay
+        # fill's 09:01 economic timestamp is never a real registration clock.
+        from stockagent.live.tw_day_trade_dashboard import _tail, _opening_signal_latency_summary
+        execution_summary = _opening_signal_latency_summary(
+            [*(row for stats in report["real_opening_attempts"].values() for row in stats["ready"]),
+             *_tail(bot._day_trade_state_dir() / "latency.jsonl", 2000)],
+            expected_markets=expected_markets, session_date=args.session_date,
+        )
+        runtime["paper_ledger_registration"] = {
+            "measurement_boundary": "09:00_gate_to_real_paper_ledger_registration_not_full_target_fill_or_broker_fill",
+            "read_scope": "canonical_executor_projection_last_2000_retained_rows",
+            **{key: execution_summary.get(key) for key in (
+                "session_date", "ledger_complete", "ledger_observed_mode_count",
+                "ledger_missing_markets", "first_ledger_ms", "final_ledger_ms",
+            )},
+            "modes": [{key: row.get(key) for key in (
+                "market", "signal_id", "consumer_detected_at", "ledger_persisted_at",
+                "ledger_from_0900_ms", "ready_to_ledger_ms", "stages", "bottleneck_stage",
+            )} for row in execution_summary.get("modes", ())],
+        }
+        from stockagent.live.opening_execution_latency import opening_execution_slo
+        execution_path = bot._day_trade_state_dir() / "execution_latency.jsonl"
+        report["opening_execution_slo"] = opening_execution_slo(
+            args.session_date, report["opening_publication_slo"],
+            runtime.get("engine", {}).get("modes") or {}, _tail(execution_path, 5000),
+            observed_at=datetime.now(ZoneInfo("Asia/Taipei")),
+        )
+        report["opening_execution_slo"].update(
+            source_path=str(execution_path), read_scope="last_5000_progress_rows_missing_clocks_never_assumed_complete",
+            scope_basis="current_enabled_mode_roster_not_historical_deployment_proof",
+        )
         runtime["opening_slo_success_claim"] = False
         report["runtime_verification"] = runtime
         _atomic_json(args.output, report)

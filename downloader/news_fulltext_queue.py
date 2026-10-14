@@ -66,10 +66,47 @@ CNYES_UNKNOWN_BODY_RECHECK_SECONDS = 300
 ARTICLE_PATH_ADMISSION_CONTRACT_VERSION = 1
 ACCEPTANCE_RECEIPT_DECODE_VERSION = 2
 ACCEPTANCE_RECEIPT_INPUT_VERSION = 1
+PARSER_REPAIR_IDENTITY_CONTRACT_VERSION = 1
 ABANDONED_WORK_RECOVERY_SQL = (
     "UPDATE articles SET state='retry',due=0,lease_owner=NULL,lease_until=NULL,"
     "error_code='owner_restart' WHERE state='inflight'"
 )
+
+
+def parser_repair_identity(source):
+    """Attest only the registry's complete current capture, not a legacy alias."""
+    if (source.data_fingerprint != source.parser_repair_capture_fingerprint
+            or not re.fullmatch(r'[0-9a-f]{64}', source.data_fingerprint)
+            or not re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_fingerprint)):
+        return None
+    return {'contract_version': PARSER_REPAIR_IDENTITY_CONTRACT_VERSION,
+            'data_fingerprint': source.data_fingerprint,
+            'parser_fingerprint': source.parser_repair_fingerprint}
+
+
+def parser_repair_changed(source, previous_capture, previous_identity):
+    """Suppress a replay only with matched, versioned old/new parser proofs.
+
+    Pre-contract queues and replaced legacy capture identities retain the
+    original repair behavior. Missing/malformed/mismatched evidence is never
+    interpreted as proof that an actual parser change can be skipped.
+    """
+    if previous_capture == source.data_fingerprint:
+        return False
+    current = parser_repair_identity(source)
+    if current and isinstance(previous_identity, str) and len(previous_identity) <= 512:
+        try:
+            old = json.loads(previous_identity)
+        except (TypeError, ValueError):
+            old = None
+        if (isinstance(old, dict) and set(old) == set(current)
+                and type(old['contract_version']) is int
+                and old['contract_version'] == PARSER_REPAIR_IDENTITY_CONTRACT_VERSION
+                and isinstance(previous_capture, str) and re.fullmatch(r'[0-9a-f]{64}', previous_capture)
+                and old['data_fingerprint'] == previous_capture
+                and old['parser_fingerprint'] == current['parser_fingerprint']):
+            return False
+    return True
 
 
 def discovery_selection_sql(statement, readiness_rows):
@@ -858,7 +895,6 @@ class NewsQueue:
 
     def reconcile_policy(self):
         self.migrate_cnyes_window_dispatch()
-        self.recheck_rss_metadata_parser()
         # Policy/expiry is evaluated by the registry on every owner start.
         # Unchanged policy does not justify rescanning millions of URL rows.
         fingerprint = hashlib.sha256(json.dumps([
@@ -868,16 +904,38 @@ class NewsQueue:
         previous = self.db.execute("SELECT value FROM queue_settings WHERE key='policy_fingerprint'").fetchone()
         prior_sources = dict(self.db.execute("SELECT key,value FROM queue_settings WHERE key LIKE 'source_capture_fingerprint:%'"))
         prior_allowed = dict(self.db.execute("SELECT key,value FROM queue_settings WHERE key LIKE 'source_capture_allowed:%'"))
+        prior_parsers = dict(self.db.execute("SELECT key,value FROM queue_settings WHERE key LIKE 'source_parser_repair_fingerprint:%'"))
+        parser_settings = []
+        for provider, source in self.registry.sources.items():
+            identity = parser_repair_identity(source)
+            if identity is not None:
+                key = 'source_parser_repair_fingerprint:' + provider
+                value = json.dumps(identity, sort_keys=True)
+                if prior_parsers.get(key) != value:
+                    parser_settings.append((key, value))
+        scheduling_only_changes = frozenset(
+            provider for provider, source in self.registry.sources.items()
+            if prior_sources.get('source_capture_fingerprint:' + provider) != source.data_fingerprint
+            and not parser_repair_changed(source, prior_sources.get('source_capture_fingerprint:' + provider),
+                                         prior_parsers.get('source_parser_repair_fingerprint:' + provider)))
+        # Discovery migrations have separate versioned ABIs. Keep their
+        # normal upgrade behavior, but do not treat scheduling/review-only
+        # capture changes as a new XML/mixed-page parser to replay.
+        self.recheck_rss_metadata_parser(skip_providers=scheduling_only_changes)
         self.recheck_cnyes_mobile_identity_views(prior_sources.get('source_capture_fingerprint:cnyes'))
         self.recheck_cnyes_mobile_body_declarations(prior_sources.get('source_capture_fingerprint:cnyes'))
         self.recheck_cnyes_native_v6_views(prior_sources.get('source_capture_fingerprint:cnyes'))
         self.recheck_cnyes_native_v7_titles(prior_sources.get('source_capture_fingerprint:cnyes'))
         self.recheck_cnyes_native_empty_signature(prior_sources.get('source_capture_fingerprint:cnyes'))
         self.recheck_cnyes_native_v16_declarations(prior_sources.get('source_capture_fingerprint:cnyes'))
-        self.recheck_changed_cnyes_parser(prior_sources.get('source_capture_fingerprint:cnyes'))
-        self.recheck_changed_feed_parser(prior_sources)
-        self.recheck_restricted_bulk_pages()
+        self.recheck_changed_cnyes_parser(prior_sources.get('source_capture_fingerprint:cnyes'),
+                                         prior_parsers.get('source_parser_repair_fingerprint:cnyes'))
+        self.recheck_changed_feed_parser(prior_sources, prior_parsers)
+        self.recheck_restricted_bulk_pages(skip_providers=scheduling_only_changes)
         if previous and previous[0] == fingerprint:
+            if parser_settings:
+                with self.db:
+                    self.db.executemany('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', parser_settings)
             if any(prior_sources.get("source_capture_fingerprint:" + p) != s.data_fingerprint
                    or prior_allowed.get("source_capture_allowed:" + p) != str(int(s.allowed))
                    for p, s in self.registry.sources.items()):
@@ -895,6 +953,9 @@ class NewsQueue:
             for host, provider in hosts:
                 source = self.registry.match("https://" + host + "/")
                 capture_changed = bool(source and prior_sources.get("source_capture_fingerprint:" + source.provider) != source.data_fingerprint)
+                parser_changed = bool(source and parser_repair_changed(
+                    source, prior_sources.get('source_capture_fingerprint:' + source.provider),
+                    prior_parsers.get('source_parser_repair_fingerprint:' + source.provider)))
                 target = source.provider if source else "unregistered:" + host
                 if (provider == target and source and not capture_changed
                         and prior_allowed.get("source_capture_allowed:" + source.provider) == str(int(source.allowed))):
@@ -907,13 +968,14 @@ class NewsQueue:
                                     "AND metadata_order_day IS NULL AND metadata_date_raw LIKE '____-__-__%'", (host,))
                     self.db.execute("UPDATE articles SET state='pending',due=0,error_code=NULL "
                                     "WHERE host=? AND state='awaiting_authorization'", (host,))
-                    if capture_changed and source.provider != 'cnyes':
-                        # Retry only parser failures after a changed capture
-                        # contract. Denials/paywalls/source absence stay intact.
+                    if parser_changed and source.provider != 'cnyes':
+                        # Retry parser failures only after a parser repair,
+                        # not changed scheduling/review prose. Access and the
+                        # complete capture contract are evaluated separately.
                         self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 "
                                         "WHERE host=? AND state IN ('body_not_found','article_attribution_not_verified',"
                                         "'article_title_not_verified')", (host,))
-                    if capture_changed and source.provider == 'nownews' and source.embedded_article_layout == 'nownews_visible_article_v1':
+                    if parser_changed and source.provider == 'nownews' and source.embedded_article_layout == 'nownews_visible_article_v1':
                         from downloader.news_fulltext_public_originals import NOWNEWS_V1_CAPTURE_FINGERPRINT
                         if prior_sources.get('source_capture_fingerprint:nownews') == NOWNEWS_V1_CAPTURE_FINGERPRINT:
                             # Only this pinned parser concatenated the current
@@ -932,7 +994,7 @@ class NewsQueue:
                                     'urls_sha256': hashlib.sha256('\n'.join(url for _, url in failures).encode()).hexdigest(),
                                     'observed_at_utc': utc_now(), 'source_refusals_or_stored_heads_reset': False}, sort_keys=True)))
                             self.metrics.count(source.provider, 'pinned_v1_published_updated_clock_rechecked', len(failures))
-                    if capture_changed and source.provider == "cnews" and source.embedded_article_layout == "cnews_visible_article_v1":
+                    if parser_changed and source.provider == "cnews" and source.embedded_article_layout == "cnews_visible_article_v1":
                         from downloader.news_fulltext_cnews_cmmedia import (
                             CNEWS_V1_SCOPE_CLASSIFICATION_FINGERPRINT,
                             CNEWS_V2_CREDIT_CLASSIFICATION_FINGERPRINT,
@@ -976,13 +1038,13 @@ class NewsQueue:
                                     "observed_at_utc": utc_now(),
                                     "source_refusals_or_stored_heads_reset": False}, sort_keys=True)))
                             self.metrics.count(source.provider, "pinned_v2_original_credit_outcomes_rechecked", len(failures))
-                    if capture_changed and source.embedded_article_layout == "einfo_next_post_v1":
+                    if parser_changed and source.embedded_article_layout == "einfo_next_post_v1":
                         # v2 verifies the old source's explicit reporter role
                         # and matching visible names. Do not retry exclusions,
                         # missing CC markers, paywalls or outside writers.
                         self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 "
                                         "WHERE host=? AND state='article_rights_not_verified'", (host,))
-                    if capture_changed and source.provider == "fed_board" and source.pdf_path_pattern:
+                    if parser_changed and source.provider == "fed_board" and source.pdf_path_pattern:
                         # Independently verified PDF Accept negotiation fixes
                         # only this representation-specific 406. Preserve the
                         # old outcome as error_code until acceptance; source
@@ -991,7 +1053,7 @@ class NewsQueue:
                         for key, url in failures:
                             if re.fullmatch(source.pdf_path_pattern, urlsplit(url).path):
                                 self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 WHERE id=?", (key,))
-                    if capture_changed and (source.provider == 'inside' or source.source_not_found_paths or source.allow_short_configured_body):
+                    if parser_changed and (source.provider == 'inside' or source.source_not_found_paths or source.allow_short_configured_body):
                         # Reviewed namespace/soft-404 and exact short-body
                         # parser repairs only, not a source-error reset.
                         # Preserve all source refusals, paywalls, missing URLs
@@ -1004,7 +1066,7 @@ class NewsQueue:
                         for key, url in failures:
                             if source.article_path_pattern and re.search(source.article_path_pattern, urlsplit(url).path):
                                 self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 WHERE id=?", (key,))
-                    if capture_changed and source.provider == "cnyes" and source.cnyes_apis:
+                    if parser_changed and source.provider == "cnyes" and source.cnyes_apis:
                         # Policy changes repair only these verified parser/path
                         # outcomes, never source denials, rights or paywalls.
                         failures = self.db.execute("SELECT id,url,state,body_sha256 FROM articles WHERE host=? AND state IN "
@@ -1031,6 +1093,7 @@ class NewsQueue:
                                 (("source_capture_fingerprint:" + p, s.data_fingerprint) for p, s in self.registry.sources.items()))
             self.db.executemany("INSERT OR REPLACE INTO queue_settings VALUES (?,?)",
                                 (("source_capture_allowed:" + p, str(int(s.allowed))) for p, s in self.registry.sources.items()))
+            self.db.executemany('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', parser_settings)
         self.migrate_parser_repair_lanes()
         self.migrate_unknown_cnyes_body_rechecks()
         self.migrate_unknown_cnyes_identity_rechecks()
@@ -1148,7 +1211,31 @@ class NewsQueue:
                     'http_refusals_or_unobserved_first_downloads_changed': False}, sort_keys=True)))
                 self.metrics.count(source.provider, 'observed_parser_repairs_moved_to_retry_lane', count)
 
-    def recheck_rss_metadata_parser(self):
+    def record_scheduling_only_discovery_guard(self, marker, source, parser, error):
+        """Durably skip the unchanged parser across later owner restarts.
+
+        The current discovery ABI remains part of the marker: a real later
+        XML/envelope ABI upgrade still gets its original migration. No source
+        request, successful parse or body acceptance is asserted here.
+        """
+        previous = self.db.execute('SELECT value FROM queue_settings WHERE key=?',
+            ('source_capture_fingerprint:' + source.provider,)).fetchone()
+        identity = self.db.execute('SELECT value FROM queue_settings WHERE key=?',
+            ('source_parser_repair_fingerprint:' + source.provider,)).fetchone()
+        if (not previous or not identity or previous[0] == source.data_fingerprint
+                or parser_repair_changed(source, previous[0], identity[0])):
+            raise ValueError('proven_scheduling_only_discovery_migration_required')
+        with self.db:
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'new_discovery_fingerprint': parser, 'jobs': [], 'previous_error': error,
+                'old_source_fingerprint': previous[0], 'new_source_fingerprint': source.data_fingerprint,
+                'parser_repair_identity_before': json.loads(identity[0]),
+                'parser_repair_identity_after': parser_repair_identity(source),
+                'scheduling_only_capture_change': True, 'source_capture_contract_changed': True,
+                'source_requests_or_acceptance_asserted': False, 'article_or_source_outcomes_reset': False,
+                'http_refusals_requeued': False, 'observed_at_utc': utc_now()}, sort_keys=True)))
+
+    def recheck_rss_metadata_parser(self, *, skip_providers=()):
         """One retry of registered invalid XML jobs under the new discovery ABI.
 
         The article capture contract did not change: do not re-fetch already
@@ -1164,6 +1251,9 @@ class NewsQueue:
             parser = discovery_fingerprint(source)
             marker = 'rss_xml_controls_parser_recheck:' + source.provider + ':' + parser
             if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+                continue
+            if source.provider in skip_providers:
+                self.record_scheduling_only_discovery_guard(marker, source, parser, 'invalid_feed')
                 continue
             repaired = []
             with self.db:
@@ -1183,7 +1273,7 @@ class NewsQueue:
                     'observed_at_utc': utc_now()}, sort_keys=True)))
                 self.counter('rss_xml_controls_parser_jobs_requeued', len(repaired))
 
-    def recheck_restricted_bulk_pages(self):
+    def recheck_restricted_bulk_pages(self, *, skip_providers=()):
         """Once per discovery ABI, resume a mixed page's permitted identities.
 
         Keep the old outcome/deadline/attempts as evidence. No body policy,
@@ -1203,6 +1293,9 @@ class NewsQueue:
             parser = discovery_fingerprint(source)
             marker = 'mixed_bulk_scope_continuation:' + source.provider + ':' + parser
             if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+                continue
+            if source.provider in skip_providers:
+                self.record_scheduling_only_discovery_guard(marker, source, parser, 'bulk_response_contains_restricted_text')
                 continue
             repaired = []
             with self.db:
@@ -1229,7 +1322,7 @@ class NewsQueue:
                     'http_refusals_requeued': False, 'observed_at_utc': utc_now()}, sort_keys=True)))
                 self.counter('mixed_bulk_scope_pages_requeued', len(repaired))
 
-    def recheck_changed_feed_parser(self, prior_sources):
+    def recheck_changed_feed_parser(self, prior_sources, prior_parsers=None):
         """Re-evaluate failed RSS rights parsing once per changed contract.
 
         A prose word such as 'paywall' used to reject a whole public feed page.
@@ -1242,7 +1335,8 @@ class NewsQueue:
         for source in self.registry.sources.values():
             previous = prior_sources.get('source_capture_fingerprint:' + source.provider)
             if (not source.allowed or not source.fulltext_feeds or not previous
-                    or previous == source.data_fingerprint):
+                    or not parser_repair_changed(source, previous,
+                        (prior_parsers or {}).get('source_parser_repair_fingerprint:' + source.provider))):
                 continue
             marker = 'rss_parser_recheck:' + source.provider + ':' + source.data_fingerprint
             if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
@@ -1307,7 +1401,7 @@ class NewsQueue:
                                     (url, source.provider, recovery_time))
                     self.counter('rss_resolved_stale_item_errors', len(old))
 
-    def recheck_changed_cnyes_parser(self, previous_fingerprint):
+    def recheck_changed_cnyes_parser(self, previous_fingerprint, previous_parser_identity=None):
         """One retry of old parser failures; preserve source refusal evidence.
 
         Only an old circuit's exact failed job is due under a genuinely changed
@@ -1316,7 +1410,7 @@ class NewsQueue:
         """
         source = self.registry.sources.get('cnyes')
         if (not source or not source.allowed or not previous_fingerprint
-                or previous_fingerprint == source.data_fingerprint):
+                or not parser_repair_changed(source, previous_fingerprint, previous_parser_identity)):
             return
         repaired = []
         with self.db:

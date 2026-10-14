@@ -8,6 +8,7 @@ No source raw envelope, article, byline, failure or retry clock is relabelled.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 import time
@@ -25,6 +26,8 @@ from downloader.news_fulltext_policy import NewsError, cnyes_bulk_fingerprint
 
 CONTRACT_VERSION = 1
 COMPLETE_STATES = ('list_complete', 'list_complete_by_page_ID_equivalence', 'partition_list_complete')
+SCOPE_KEY_CACHE_SIZE = 4096
+SCOPE_KEY_CACHE_MAX_URL_CHARS = 2048
 
 
 def now():
@@ -40,13 +43,32 @@ def digest(value):
 
 
 def scope_key(url):
+    """Cache only immutable URL arithmetic, never source rows or evidence.
+
+    Heartbeats and index seeding revisit more scopes than urlsplit's own
+    small cache holds. The offset is part of the key; a changed date rule
+    cannot borrow an old result. Unusual/oversized inputs retain the original
+    parser and its exceptions, without occupying persistent cache space.
+    """
+    if (type(url) is str and len(url) <= SCOPE_KEY_CACHE_MAX_URL_CHARS
+            and type(CNYES_QUERY_DAY_OFFSET_SECONDS) is int):
+        return _cached_scope_key(url, CNYES_QUERY_DAY_OFFSET_SECONDS)
+    return _parse_scope_key(url, CNYES_QUERY_DAY_OFFSET_SECONDS)
+
+
+@lru_cache(maxsize=SCOPE_KEY_CACHE_SIZE)
+def _cached_scope_key(url, query_day_offset):
+    return _parse_scope_key(url, query_day_offset)
+
+
+def _parse_scope_key(url, query_day_offset):
     query = parse_qs(url.split('?', 1)[1]) if '?' in url else {}
     if not {'startAt', 'endAt'} <= query.keys():
         return None
     low, high = int(query['startAt'][0]), int(query['endAt'][0])
     if high < low or query.get('limit') != ['30']:
         return None
-    first, last = ((value + CNYES_QUERY_DAY_OFFSET_SECONDS) // 86400 for value in (low, high))
+    first, last = ((value + query_day_offset) // 86400 for value in (low, high))
     return wordpress_base(url), first, last
 
 

@@ -106,10 +106,19 @@ def test_opening_repair_keeps_failed_attempt_and_retries_without_inference(monke
     attempts = [__import__("json").loads(line) for line in (tmp_path / "opening_source_repair_latency.jsonl").read_text().splitlines()]
     assert [row["status"] for row in attempts] == ["failed", "complete"]
     assert all(not row["inference_performed"] and not row["orders_submitted"] for row in attempts)
+    assert all(row["observer_policy"] == "shared_provider_backoff_no_source_wait_starvation_v1" for row in attempts)
+    assert second["minimum_observer_retry_delay_seconds"] == 60.0
 
 
 @pytest.mark.parametrize("busy", [True, False])
-def test_background_opening_repair_runs_between_retries_without_circular_wait(monkeypatch, tmp_path, busy):
+@pytest.mark.parametrize("started,stage,expected_calls", [
+    (None, None, 1), (1.0, "preopen_catch_up", 1),
+    (1.0, "realtime_prepare", 1), (1.0, "inference", 0),
+    (1.0, "started", 0), (1.0, None, 0),
+])
+def test_background_opening_repair_runs_between_retries_without_circular_wait(
+    monkeypatch, tmp_path, busy, started, stage, expected_calls,
+):
     now = datetime.fromisoformat("2026-10-07T09:00:10+08:00")
 
     class Clock(datetime):
@@ -126,7 +135,8 @@ def test_background_opening_repair_runs_between_retries_without_circular_wait(mo
     monkeypatch.setattr(discord_bot, "_market_enabled", lambda cfg: True)
     monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *a: (True, "fixture"))
     monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *a: "retry" if busy else "completed")
-    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", None)
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", started)
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_stage", stage)
     monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_retry_at", {})
     monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_attempts", {})
     monkeypatch.setattr(discord_bot, "_opening_source_repair_root", lambda *a: str(tmp_path))
@@ -138,7 +148,24 @@ def test_background_opening_repair_runs_between_retries_without_circular_wait(mo
     monkeypatch.setattr(discord_bot, "_opening_source_repair_sync", repair)
     asyncio.run(discord_bot.opening_source_repair.coro())
     asyncio.run(discord_bot.opening_source_repair.coro())
-    assert len(calls) == 1
+    assert len(calls) == expected_calls
+
+
+@pytest.mark.parametrize("at,status,progress,attempt,expected", [
+    ("09:00:00", "not_started", 0, 1, 1.0),
+    ("09:05:00", "not_started", 0, 20, 1.0),
+    ("09:00:59", "waiting_source", 0, 20, 0.5),
+    ("09:00:59", "failed", 0, 20, 0.5),
+    ("09:01:00", "waiting_source", 0, 20, 30.0),
+    ("09:01:00", "awaiting_first_print", 1, 20, 0.5),
+    ("09:00:10", "complete", 0, 1, 60.0),
+])
+def test_opening_source_observer_delay_does_not_compound_provider_backoff(
+    at, status, progress, attempt, expected,
+):
+    result = {"status": status, "recovered_count": 0, "recovered_input_count": progress}
+    now = datetime.fromisoformat(f"2026-10-14T{at}+08:00")
+    assert discord_bot._opening_source_repair_delay(result, attempt, now) == expected
 
 
 def test_overlapping_commands_share_work_cancel_independently_and_next_call_is_fresh(monkeypatch):
@@ -268,6 +295,142 @@ def test_parallel_input_watchdog_tracks_oldest_and_clears_cancelled_tasks(monkey
         await iterator.aclose()
         assert tasks["slow"].cancelled()
         assert discord_bot._oldest_opening_input_stage() is None
+
+    asyncio.run(exercise())
+
+
+def test_persistent_input_poll_retries_fast_mode_without_waiting_or_restarting_slow_job(monkeypatch):
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {})
+    monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {})
+    monkeypatch.setattr(discord_bot.bot, "_opening_first_observed_at", {})
+    monkeypatch.setattr(discord_bot, "_preopen_market_final_armed_for_session", lambda *_: True)
+    now = datetime.fromisoformat("2026-10-14T09:00:00.004+08:00")
+    cfgs = [SimpleNamespace(market=m, day_trade_simulation_enabled=True,
+                            overnight_simulation_enabled=False) for m in ("slow", "fast")]
+    calls = {"slow": 0, "fast": 0}
+
+    async def exercise():
+        release = asyncio.Event()
+
+        async def prepare(row, stage):
+            market = row[0].market
+            calls[market] += 1
+            if market == "slow":
+                await release.wait()
+            return market, None, 0., None, {}
+
+        monkeypatch.setattr(discord_bot, "_prepare_scheduled_attempt_inputs", prepare)
+        due = [(cfg, now, cfg.market + ":session", False) for cfg in cfgs]
+        slow_task = None
+        for attempt in range(3):
+            poll_due, jobs = discord_bot._scheduled_input_poll_jobs(due)
+            if slow_task is None:
+                slow_task = jobs["slow"]
+            assert jobs["slow"] is slow_task
+            ready = []
+            async for row, result in discord_bot._scheduled_inputs_ready_order(
+                    poll_due, jobs, poll_timeout=.001, cancel_pending=False):
+                ready.append(row[0].market)
+                assert result[0] == "fast"
+                discord_bot.bot._scheduled_input_jobs.pop(row[0].market)
+            assert ready == ["fast"]
+            assert not slow_task.done()
+            assert "slow" in discord_bot.bot._opening_input_stages
+        assert calls == {"slow": 1, "fast": 3}
+        assert discord_bot.bot._opening_first_observed_at["fast:session"] == now
+        release.set()
+        await slow_task
+        rows, jobs = discord_bot._scheduled_input_poll_jobs([due[0]])
+        ready = [row[0].market async for row, _ in discord_bot._scheduled_inputs_ready_order(
+            rows, jobs, poll_timeout=0, cancel_pending=False)]
+        assert ready == ["slow"]
+        assert not discord_bot.bot._opening_input_stages
+
+    asyncio.run(exercise())
+
+
+def test_stale_session_or_config_job_is_drained_before_replacement_not_cancelled(monkeypatch):
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {})
+    monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {})
+    monkeypatch.setattr(discord_bot.bot, "_opening_first_observed_at", {})
+    monkeypatch.setattr(discord_bot, "_preopen_market_final_armed_for_session", lambda *_: False)
+    old_cfg = SimpleNamespace(market="mode", day_trade_simulation_enabled=True,
+                              overnight_simulation_enabled=False, checkpoint="old")
+    new_cfg = SimpleNamespace(**{**vars(old_cfg), "checkpoint": "new"})
+    now = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+
+    async def exercise():
+        release = asyncio.Event()
+        calls = []
+
+        async def prepare(row, stage):
+            calls.append(row[0].checkpoint)
+            await release.wait()
+            return row[0].checkpoint
+
+        monkeypatch.setattr(discord_bot, "_prepare_scheduled_attempt_inputs", prepare)
+        _, jobs = discord_bot._scheduled_input_poll_jobs([(old_cfg, now, "old-session", True)])
+        original = jobs["mode"]
+        await asyncio.sleep(0)
+        assert discord_bot._scheduled_input_poll_jobs([(new_cfg, now, "new-session", True)]) == ([], {})
+        assert calls == ["old"] and not original.cancelled()
+        release.set()
+        await original
+        rows, jobs = discord_bot._scheduled_input_poll_jobs([(new_cfg, now, "new-session", True)])
+        assert rows[0][0] == new_cfg and jobs["mode"] is not original
+        assert await jobs["mode"] == "new"
+        assert calls == ["old", "new"]
+        discord_bot._scheduled_input_poll_jobs([])
+        assert not discord_bot.bot._scheduled_input_jobs
+
+    asyncio.run(exercise())
+
+
+def test_catchup_error_keeps_original_error_timing_and_does_not_prepare_model(monkeypatch):
+    def fail(_cfg):
+        raise OSError("source-owner-failure")
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_sync", fail)
+    monkeypatch.setattr(discord_bot, "_prepare_scheduled_inputs", lambda *_: pytest.fail("source failed"))
+    stage = {"started_monotonic": 1.}
+    result = asyncio.run(discord_bot._prepare_scheduled_attempt_inputs(
+        (SimpleNamespace(market="failed"), None, "session", True), stage))
+    assert isinstance(result[1], OSError)
+    assert result[4]["signal_stage"] == "preopen_catch_up"
+    assert result[4]["preopen_catch_up_ms"] >= 0
+    assert stage["phase"] == "preopen_catch_up"
+
+
+def test_scheduled_report_and_chat_queue_preserves_order_without_blocking_retries(monkeypatch):
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_delivery_task", None)
+    events = []
+
+    async def exercise():
+        release = asyncio.Event()
+
+        async def send(deliveries, errors):
+            name = deliveries[0]
+            events.append(("started", name))
+            if name == "first":
+                await release.wait()
+            events.append(("finished", name))
+
+        monkeypatch.setattr(discord_bot, "_deliver_scheduled_results", send)
+        discord_bot._enqueue_scheduled_results(["first"], [])
+        await asyncio.sleep(0)
+        original = discord_bot.bot._scheduled_delivery_task
+        discord_bot._enqueue_scheduled_results(["second"], [])
+        latest = discord_bot.bot._scheduled_delivery_task
+        await asyncio.sleep(0)
+        assert events == [("started", "first")]
+        assert not original.done() and not latest.done()
+        # More source/scheduler work can run while the observer is stuck.
+        events.append(("retry", "model"))
+        release.set()
+        await latest
+        await asyncio.sleep(0)
+        assert events == [("started", "first"), ("retry", "model"), ("finished", "first"),
+                          ("started", "second"), ("finished", "second")]
+        assert discord_bot.bot._scheduled_delivery_task is None
 
     asyncio.run(exercise())
 

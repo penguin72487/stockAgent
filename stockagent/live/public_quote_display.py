@@ -29,7 +29,8 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 _POLICY_PATH = Path(__file__).resolve().parents[2] / "configs/public_quote_display.json"
 _QUOTE_FIELDS = frozenset({
     "price", "prices", "open", "high", "low", "close", "bid", "ask", "mid",
-    "last", "upper_limit", "lower_limit", "daily_return_previous_close",
+    "last", "upper_limit", "lower_limit", "next_upper_limit", "next_lower_limit",
+    "daily_return_previous_close",
 })
 # These are immutable paper/accounting prices, not replaceable live quotations.
 _ACCOUNTING_FIELDS = frozenset({
@@ -326,9 +327,9 @@ def public_quote_display_notice(*, include_paper_reports: bool = False) -> dict[
         "contract": CONTRACT,
         "policy": "verified_public_source_only",
         "pending_label": "等待可公開來源",
-        "message": "官方日行情已接通；行情日期與取得時間分開標示。永豐分鐘／即時價格的公開展示授權尚未確認，不代表沒有取得價格；不以日價替代分鐘成交。模型、帳本與損益原值不變。",
+        "message": "官方日行情及櫃買盤後最後買賣價、次日參考／申報價格界限依來源接通；次日欄位不當作當日漲跌停或即時價格。永豐分鐘／即時行情展示授權尚待確認，不代表沒有取得價格；模型、帳本與損益原值不變。",
         "broker_public_display_permission": "unverified",
-        "usage_rules_reviewed_on": "2026-10-13",
+        "usage_rules_reviewed_on": "2026-10-14",
         "usage_rules_references": [
             "https://www.sinotrade.com.tw/newweb/signCenter/S_openAPI/",
             "https://www.twse.com.tw/zh/products/information/qa.html",
@@ -342,7 +343,7 @@ def public_quote_display_notice(*, include_paper_reports: bool = False) -> dict[
         notice["paper_transaction_reports"] = True
         notice["message"] = (
             "已記錄的進出場價按使用者意願公開，標示為模擬帳本成交，不是券商成交。"
-            "官方日行情另列日期與來源；永豐原始分鐘／即時行情公開展示授權尚未確認。"
+            "官方日行情、盤後買賣價與次日申報界限另列日期與來源，不冒充即時行情；永豐原始分鐘／即時行情公開展示授權尚未確認。"
             "交易紀錄公開不等於行情轉載授權；模型、帳本與損益原值不變。"
         )
     return notice

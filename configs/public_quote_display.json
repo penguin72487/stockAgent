@@ -43,12 +43,15 @@
         "open": ["open"], "high": ["high"], "low": ["low"], "close": ["close"],
         "sizing_open_price": ["open"], "entry_price": ["open", "close"],
         "exit_price": ["open", "close"], "last_exit_price": ["open", "close"], "last_mark_price": ["close"],
-        "daily_return_previous_close": ["close"], "daily_return_reference_price": ["close"]
+        "daily_return_previous_close": ["close"], "daily_return_reference_price": ["close"],
+        "last_bid": ["last_bid"], "last_ask": ["last_ask"], "average_price": ["average_price"],
+        "next_reference_price": ["next_reference_price"],
+        "next_upper_limit": ["next_upper_limit"], "next_lower_limit": ["next_lower_limit"]
       }
     }
   ],
   "usage_rules_review": {
-    "reviewed_on": "2026-10-13",
+    "reviewed_on": "2026-10-14",
     "scope": "public website price display; API entitlement and noncommercial intent are not a verified redistribution grant",
     "sources": [
       {
@@ -70,10 +73,34 @@
         "references": ["https://www.sinotrade.com.tw/newweb/signCenter/F_openApi/"]
       },
       {
+        "source_id": "mis_live_quotes",
+        "status": "public_display_permission_unverified",
+        "finding": "The official MIS website supplies free viewing, but this does not extend the named Government Open Data daily grants to live ticks or order-book quotations. Existing internal acquisition is unchanged; no blanket public quote grant is established by browser visibility or noncommercial intent.",
+        "references": ["https://mis.twse.com.tw/stock/fibest.jsp", "https://www.twse.com.tw/zh/products/information/qa.html", "https://www.twse.com.tw/zh/terms/use.html"]
+      },
+      {
         "source_id": "tw_official_open_daily",
         "status": "verified_open_dataset",
-        "finding": "The registered TWSE and TPEx daily OHLC datasets carry Government Open Data License v1. This applies to the identified daily datasets, not all broker minute/tick quotations. Keep attribution, market date and acquisition time distinct.",
+        "finding": "TWSE 11549 licenses daily OHLC, share volume, turnover and trade count, but does not list full-universe final Bid/Ask. TPEx 11370 additionally lists average, final Bid/Ask, next reference and next upper/lower bounds. Scope applies only to these named fields and daily datasets, not broker minute/tick quotations. Preserve attribution, market date, units and acquisition time; next-session bounds are not today's limits.",
         "references": ["https://data.gov.tw/dataset/11549", "https://data.gov.tw/dataset/11370", "https://data.gov.tw/license", "https://www.twse.com.tw/zh/terms/use.html"]
+      },
+      {
+        "source_id": "finmind",
+        "status": "original_source_license_required",
+        "finding": "FinMind's July 2026 disclaimer states service access does not include external redistribution. Government-open-data records may follow the original open license; historical or delayed status alone is not a blanket permission. Public prices currently use independently verified canonical official files, not a relabeled FinMind quote.",
+        "references": ["https://finmind.github.io/Disclaimer/", "https://finmind.github.io/PrivacyPolicy/"]
+      },
+      {
+        "source_id": "finlab",
+        "status": "account_and_dataset_display_rights_unverified",
+        "finding": "The existing Free/VIP entitlement and data-download success do not establish raw-data external-display rights. The public acquisition page exposes sanitized quota, progress and catalog metadata, not raw FinLab tables. Keep this separate from the official-source price projection.",
+        "references": ["https://finlab.finance/"]
+      },
+      {
+        "source_id": "tej",
+        "status": "actual_product_contract_required",
+        "finding": "TEJ E-Shop terms restrict external disclosure of subscribed products. The local Smart Wizard product/account contract must be checked separately; do not assume an E-Shop clause is the user's complete Smart Wizard agreement. Publish acquisition metadata, not a raw vendor-data mirror.",
+        "references": ["https://eshop.tej.com.tw/E-Shop/order_terms"]
       }
     ]
   }

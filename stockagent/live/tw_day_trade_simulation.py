@@ -78,6 +78,9 @@ from stockagent.live.benchmark_accounting import (
     settle_roll_wealth,
 )
 from stockagent.live.quote_provider import PriceSnapshot
+from stockagent.live.opening_execution_latency import (
+    OpeningExecutionObserver, signal_registration_committed, unsized_target_count,
+)
 from stockagent.live.tw_day_trade_monitor_projection import build_shioaji_monitor_projection
 from stockagent.live.tw_day_trade_service_sync import (
     SERVICE_SYNC_FILENAME,
@@ -1361,6 +1364,7 @@ class TwDayTradeSimulationEngine:
         self.benchmark_marks_path = self.state_dir / "benchmark_marks.jsonl"
         self.events_path = self.state_dir / "events.jsonl"
         self.latency_path = self.state_dir / "latency.jsonl"
+        self.execution_latency_path = self.state_dir / "execution_latency.jsonl"
         self.final_settlement_path = Path(final_settlement_path)
         self._tx_final_settlement_error: str | None = None
         self._corporate_action_reference_path: Path | None = None
@@ -1389,6 +1393,7 @@ class TwDayTradeSimulationEngine:
         self._restore_position_artifact_paths()
         if stock_benchmarks_migrated or tx_benchmark_migrated or entry_retry_recovered:
             _atomic_json(self.state_path, self.state)
+        self._opening_execution_observer = OpeningExecutionObserver(self.state.get("modes", {}))
 
     @staticmethod
     def _ledger_rows_for_order_ids(
@@ -7771,6 +7776,12 @@ class TwDayTradeSimulationEngine:
                 "engine_run_id": self._engine_run_id,
                 "updated_at": observed.isoformat(timespec="seconds"),
                 "health": health,
+                "opening_execution_observer": {
+                    "contract": "state_fsync_then_paper_target_progress_v1",
+                    "progress_path": str(self.execution_latency_path),
+                    "unchanged_state_emits_no_rows": True,
+                    "broker_fill_measurement": False,
+                },
                 "shioaji_monitor_projection": build_shioaji_monitor_projection(
                     self.state, self.state_path, state_revision=revision,
                 ),
@@ -7899,7 +7910,8 @@ class TwDayTradeSimulationEngine:
                             "rebalance_reduction_fill_count",
                             "ledger_state_divergence",
                         )
-                    }
+                    } | {"unsized_entry_target_count": unsized_target_count(item),
+                         "signal_registration_committed": signal_registration_committed(item)}
                     for item in mode_rows
                 },
             },
@@ -7962,6 +7974,27 @@ class TwDayTradeSimulationEngine:
             "projection_fingerprint_ms": round((fingerprint_completed - persist_started) * 1000.0, 3),
             "files": writes,
         }
+        # This observer follows the committed state, not the economic event's
+        # 09:01 replay timestamp. It never changes a fill or readiness gate.
+        observer_started = perf_counter()
+        try:
+            samples = self._opening_execution_observer.samples(
+                self.state.get("modes", {}),
+                committed_at=_now_taipei(self._publication_clock() if self._publication_clock else now),
+                state_revision=revision, engine_run_id=self._engine_run_id,
+                clock_basis=("engine_publication_clock_not_economic_event" if self._publication_clock
+                             else "offline_event_clock_not_live_latency"),
+            )
+            if samples:
+                _append_jsonl_many(self.execution_latency_path, samples)
+                self._opening_execution_observer.acknowledge(self.state.get("modes", {}))
+            self.last_persist_metrics["execution_observer_rows"] = len(samples)
+        except Exception as exc:
+            # Losing telemetry must not interrupt liquidation or rewrite the
+            # economic state as failed. Preserve the observer error for audits.
+            self.last_persist_metrics["execution_observer_error"] = type(exc).__name__
+        self.last_persist_metrics["execution_observer_ms"] = round(
+            (perf_counter() - observer_started) * 1000, 3)
 
 
 __all__ = [

@@ -60,7 +60,7 @@ def _metadata_feed_progress(value, *, now):
     fields = ('registered_feeds', 'verified_feeds', 'latest_feed_item_observations',
               'latest_feed_response_bytes', 'feeds_with_errors', 'poll_interval_seconds')
     numbers = {key: _count(raw.get(key)) for key in fields}
-    if (type(raw.get('contract_version')) is not int or raw.get('contract_version') != 1
+    if (type(raw.get('contract_version')) is not int or raw.get('contract_version') not in {1, 2}
             or raw.get('enabled') is not True
             or any(item is None for item in numbers.values())
             or not 1 <= numbers['registered_feeds'] <= 14
@@ -74,7 +74,7 @@ def _metadata_feed_progress(value, *, now):
     next_check = _stamp(raw.get('next_check_at_utc'))
     last_check = _stamp(raw.get('last_check_at_utc'))
     # The canonical queue's due=0 means ready, not a January 1970 appointment.
-    return {'contract_version': 1, 'enabled': True, **numbers,
+    return {'contract_version': raw['contract_version'], 'enabled': True, **numbers,
         'next_check_ready': bool(next_check and next_check <= now),
         'next_check_at_utc': next_check.isoformat() if next_check and next_check.timestamp() > 0 else None,
         'last_check_at_utc': last_check.isoformat() if last_check else None,

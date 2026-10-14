@@ -36,6 +36,7 @@ from stockagent.remote_build import observe_node  # noqa: E402
 
 CONTRACT = "five_mode_complete_live_base_panel_cutoff_v1"
 SOURCE_CACHE = ROOT / "downloader/live_tail_source_cache.py"
+ORIGINAL_CALLERS_HELPER = ROOT / "scripts/canonical_live_tail_cache_oracle.py"
 MODE_CONFIGS = {
     "v8": "configs/deployments/tw_day_trade_v8_annual_log_cash_fold10.yaml",
     "multi22": "configs/deployments/tw_day_trade_multi_basis_22_fold11.yaml",
@@ -201,6 +202,15 @@ def child(config: dict) -> dict:
     for name in ("_lazy_init", "is_available", "synchronize", "empty_cache"):
         setattr(torch.cuda, name, forbidden)
     from stockagent.live import signal_engine as engine
+    original_callers = config.get("original_callers")
+    if original_callers:
+        from scripts.canonical_live_tail_cache_oracle import original_callers_identity, original_stable_tail_builder
+        if original_callers_identity(Path(original_callers)) != config["original_callers_identity"]:
+            raise ValueError("original canonical callers changed before worker")
+        if config["mode"] == "baseline":
+            engine._build_panel_from_stable_source = original_stable_tail_builder(Path(original_callers))
+    os.environ["STOCKAGENT_LIVE_RAW_TAIL_CACHE_BYTES"] = (
+        str(config["source_cache_bytes"]) if config["mode"] == "canonical_table_cache_candidate" else "0")
     fixture = Path(config["fixture"])
     if sha256_file(fixture / "fixture.json") != config["fixture_sha256"]:
         raise ValueError("full workload manifest changed before worker")
@@ -216,7 +226,7 @@ def child(config: dict) -> dict:
         from stockagent.data import panel as panel_module
         source_cache = LiveTailSourceCache(max_bytes=config["source_cache_bytes"])
         def cached_symbol_tail(path, *, tail_rows, tradable_mode="tradable",
-                               trading_volume_policy="auto", raw_input_features=False):
+                               trading_volume_policy="auto", raw_input_features=False, raw_tail_reader=None):
             table = source_cache.read(path, tail_rows=tail_rows)
             return panel_module._symbol_arrays_from_arrow_table(table, path,
                 tradable_mode=tradable_mode, trading_volume_policy=trading_volume_policy,
@@ -230,6 +240,8 @@ def child(config: dict) -> dict:
     os.environ["STOCKAGENT_LIVE_PANEL_DISK_CACHE"] = "1"
     os.environ["STOCKAGENT_LIVE_PANEL_LOAD_WORKERS"] = str(config["workers"])
     engine.clear_live_panel_memory_cache()
+    if config["mode"] == "canonical_table_cache_candidate":
+        source_cache = engine._live_raw_tail_source_cache()
 
     def execute():
         results = []
@@ -246,13 +258,16 @@ def child(config: dict) -> dict:
     if (torch.cuda.is_initialized() or fence(fixture, manifest) != before
             or sha256_file(fixture / "fixture.json") != config["fixture_sha256"]):
         raise ValueError("GPU initialization or source drift in CPU-only benchmark")
+    if original_callers and original_callers_identity(Path(original_callers)) != config["original_callers_identity"]:
+        raise ValueError("original canonical callers changed during worker")
     result.update(polars_threads=pl.thread_pool_size(), arrow_threads=pa.cpu_count(),
                   panel_workers=config["workers"], cuda_initialized=False,
                   source_cache_stats=None if source_cache is None else source_cache.stats())
     return result
 
 
-def independent_reference(receipt: Path, fixture: Path, manifest: dict, codes: dict) -> dict:
+def independent_reference(receipt: Path, fixture: Path, manifest: dict, codes: dict,
+                          original_callers: Path | None = None) -> dict:
     """Reuse the original full oracle after a benchmark-only extension.
 
     The saved original controller is bound to its accepted four-trial report.
@@ -274,17 +289,28 @@ def independent_reference(receipt: Path, fixture: Path, manifest: dict, codes: d
             or control["fixture_sha256"] != sha256_file(fixture / "fixture.json")
             or manifest["code_sha256"] != control["code_sha256"]):
         raise ValueError("original complete panel controller/source/oracle identity changed")
-    if set(codes) != set(control["code_sha256"]) | {str(SOURCE_CACHE)}:
+    callers = None
+    extensions = {str(SOURCE_CACHE)}
+    allowed = {self_name}
+    if original_callers is not None:
+        from scripts.canonical_live_tail_cache_oracle import original_callers_identity, verify_unmodified_helpers
+        callers = original_callers_identity(original_callers)
+        verify_unmodified_helpers(callers)
+        extensions.add(str(ORIGINAL_CALLERS_HELPER))
+        allowed.update(callers["proofs"])
+        allowed.add(str(SOURCE_CACHE))  # Scoped cache owner/comment identity is separately fenced.
+    if set(codes) != set(control["code_sha256"]) | extensions:
         raise ValueError("unexpected code extension outside the scoped cache owner")
     if any(codes[name] != digest for name, digest in control["code_sha256"].items()
-           if name != self_name):
+           if name not in allowed):
         raise ValueError("canonical computation changed since independent full oracle")
     expected = control["trials"][0]["result"]
     if any(trial["result"] != expected for trial in control["trials"]):
         raise ValueError("independent full original oracle is inconsistent")
     return {"receipt_sha256": sha256_file(receipt), "control": str(control_path),
             "control_sha256": capture["control_sha256"], "saved": str(saved),
-            "saved_sha256": capture["saved_sha256"], "expected": expected}
+            "saved_sha256": capture["saved_sha256"], "expected": expected,
+            "original_callers": callers}
 
 
 def benchmark(args) -> dict:
@@ -293,8 +319,10 @@ def benchmark(args) -> dict:
     manifest = json.loads((fixture / "fixture.json").read_bytes())
     if manifest.get("contract") != CONTRACT or manifest.get("state") != "prepared_full_canonical_base_panel_fixture":
         raise ValueError("requires complete canonical base-panel fixture")
-    codes = {str(path): sha256_file(path) for path in CODE}
-    reference = (independent_reference(args.reference, fixture, manifest, codes)
+    callers = getattr(args, "original_callers", None)
+    measured_code = CODE + ([ORIGINAL_CALLERS_HELPER] if callers is not None else [])
+    codes = {str(path): sha256_file(path) for path in measured_code}
+    reference = (independent_reference(args.reference, fixture, manifest, codes, callers)
                  if args.reference else None)
     if ((reference is None and manifest["code_sha256"] != codes)
             or codes[str(READER)] != manifest["baseline_sha256"]):
@@ -313,7 +341,8 @@ def benchmark(args) -> dict:
              "cache_state": "fresh process and private disk panel cache; OS cache uncontrolled; nice 19 on a live host"}
     atomic_write_json(output, value)
     expected = None if reference is None else reference["expected"]
-    candidate = "table_cache_candidate" if args.candidate == "table_cache" else "cutoff_candidate"
+    candidate = {"table_cache": "table_cache_candidate", "canonical_table_cache": "canonical_table_cache_candidate",
+                 "cutoff": "cutoff_candidate"}[args.candidate]
     try:
         for number, mode in enumerate(("baseline", candidate, candidate, "baseline")):
             config = {"fixture": str(fixture), "mode": mode, "threshold": args.threshold,
@@ -321,6 +350,9 @@ def benchmark(args) -> dict:
                       "fixture_sha256": value["fixture_sha256"],
                       "source_cache_bytes": args.source_cache_bytes,
                       "cache": str(fixture / f"{output.stem}-trial-{number}-cache")}
+            if callers is not None:
+                config.update(original_callers=str(callers.resolve(strict=True)),
+                              original_callers_identity=reference["original_callers"])
             process_started = time.perf_counter()
             cpu_before = resource.getrusage(resource.RUSAGE_CHILDREN)
             result = subprocess.run([sys.executable, str(Path(__file__)), "--child", json.dumps(config)],
@@ -346,7 +378,7 @@ def benchmark(args) -> dict:
             atomic_write_json(output, value)
             print({"mode": mode, "trial": number, "wall": trial["workflow_seconds"],
                    "cpu": trial["cpu_seconds"], "peak_rss": trial["peak_rss_bytes"]}, flush=True)
-        if (codes != {str(path): sha256_file(path) for path in CODE}
+        if (codes != {str(path): sha256_file(path) for path in measured_code}
                 or fence(fixture, manifest) != source_fence
                 or sha256_file(fixture / "fixture.json") != value["fixture_sha256"]):
             raise ValueError("code or complete workload changed during ABBA")
@@ -371,9 +403,10 @@ def main():
     parser.add_argument("--threads", type=int, choices=range(1, 33), default=2)
     parser.add_argument("--workers", type=int, choices=range(1, 17), default=8)
     parser.add_argument("--threshold", type=int, default=256)
-    parser.add_argument("--candidate", choices=("cutoff", "table_cache"), default="cutoff")
+    parser.add_argument("--candidate", choices=("cutoff", "table_cache", "canonical_table_cache"), default="cutoff")
     parser.add_argument("--source-cache-bytes", type=int, default=64 * 1024**2)
     parser.add_argument("--reference", type=Path, help="retained accepted original controller/oracle")
+    parser.add_argument("--original-callers", type=Path, help="immutable actual original engine/panel caller receipt")
     parser.add_argument("--child")
     args = parser.parse_args()
     if args.child:
@@ -385,8 +418,10 @@ def main():
         print({"state": value["state"], "stock_files": value["stock_files"], "bytes": value["source_bytes"]})
     elif args.output is None:
         parser.error("new output required")
-    elif args.candidate == "table_cache" and args.reference is None:
+    elif args.candidate in {"table_cache", "canonical_table_cache"} and args.reference is None:
         parser.error("raw cache probe requires the independent original full oracle")
+    elif args.candidate == "canonical_table_cache" and args.original_callers is None:
+        parser.error("canonical raw cache probe requires the saved actual original callers")
     else:
         print(json.dumps(benchmark(args)["medians"]))
 

@@ -606,6 +606,70 @@ def test_latency_separates_first_artifact_detection_from_source_recovery(tmp_pat
     assert record["simulation_only"] is True
 
 
+def test_execution_progress_follows_durable_state_and_unchanged_marks_do_not_fsync(tmp_path, monkeypatch):
+    import stockagent.live.tw_day_trade_simulation as module
+    spec = _spec(tmp_path)
+    clock = _now(11, 5)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state", publication_clock=lambda: clock)
+    engine.update_readiness([spec], now=_now(8, 59))
+    mode = engine.state["modes"][spec.market]
+    mode.update(signal_id="new-signal", session_date=clock.date().isoformat(),
+                processed_signal_ids=["new-signal"], entry_completed_at=_now(9, 1).isoformat(),
+                entry_requested_shares=1000, entry_filled_shares=1000, entry_unfilled_shares=0,
+                pending_entry_shares=0, pending_entry_source_count=0, pending_entry_orders={},
+                entry_fill_outcome="filled", entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    original_append = module._append_jsonl_many
+    writes = []
+
+    def append(path, rows):
+        if path == engine.execution_latency_path:
+            # Actual commit order: ledger/state first, measured observer second.
+            durable = json.loads(engine.state_path.read_text())
+            assert durable["state_revision"] == rows[0]["state_revision"]
+            assert durable["modes"][spec.market]["entry_filled_shares"] == 1000
+            writes.append(len(rows))
+        original_append(path, rows)
+
+    monkeypatch.setattr(module, "_append_jsonl_many", append)
+    engine._persist(_now(9, 1))
+    record = json.loads(engine.execution_latency_path.read_text().strip())
+    assert record["recorded_at"] == clock.isoformat(timespec="microseconds")
+    assert record["clock_basis"] == "engine_publication_clock_not_economic_event"
+    assert record["all_target_complete"] is True
+    assert record["first_fill_observed_this_commit"] is True
+    engine._persist(_now(9, 2))
+    assert writes == [1]
+    assert mode["entry_filled_shares"] == 1000
+    assert engine.last_persist_metrics["execution_observer_rows"] == 0
+
+
+def test_execution_observer_failure_cannot_fail_committed_accounting_or_liquidation(tmp_path, monkeypatch):
+    import stockagent.live.tw_day_trade_simulation as module
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state", publication_clock=lambda: _now(11, 5))
+    engine.update_readiness([spec], now=_now(8, 59))
+    mode = engine.state["modes"][spec.market]
+    mode.update(signal_id="new-signal", session_date="2026-08-13",
+                processed_signal_ids=["new-signal"], entry_completed_at=_now(9, 1).isoformat(),
+                entry_requested_shares=1000, entry_filled_shares=1000, entry_unfilled_shares=0,
+                pending_entry_shares=0, pending_entry_source_count=0, pending_entry_orders={},
+                entry_fill_outcome="filled", entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    original_append = module._append_jsonl_many
+
+    def fail_observer(path, rows):
+        if path == engine.execution_latency_path:
+            raise OSError("observer-disk-error")
+        original_append(path, rows)
+
+    monkeypatch.setattr(module, "_append_jsonl_many", fail_observer)
+    engine._persist(_now(9, 1))
+    assert engine.last_persist_metrics["execution_observer_error"] == "OSError"
+    assert json.loads(engine.state_path.read_text())["modes"][spec.market]["entry_filled_shares"] == 1000
+    monkeypatch.setattr(module, "_append_jsonl_many", original_append)
+    engine._persist(_now(9, 2))
+    assert len(engine.execution_latency_path.read_text().splitlines()) == 1
+
+
 def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")

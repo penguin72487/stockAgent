@@ -1112,7 +1112,7 @@ def test_event_driven_postclose_service_never_runs_formal_history(
     monkeypatch.setattr(
         runner,
         "_populate_postclose_signal_caches",
-        lambda markets: calls.append(tuple(markets)) or (1, 0),
+        lambda markets, **_kwargs: calls.append(tuple(markets)) or (1, 0),
     )
     monkeypatch.setattr(
         runner.discord_bot,
@@ -1201,7 +1201,7 @@ def test_artifact_maintenance_rechecks_public_writer_between_markets(
         ),
     )
     monkeypatch.setattr(
-        runner, "_populate_postclose_signal_caches", lambda _markets: (0, 0)
+        runner, "_populate_postclose_signal_caches", lambda _markets, **_kwargs: (0, 0)
     )
     monkeypatch.setattr(
         runner.discord_bot, "_artifact_backfill_key", lambda *_args: "key"

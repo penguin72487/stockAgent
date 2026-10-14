@@ -2550,10 +2550,15 @@ def _load_symbol_arrays_pyarrow_tail(
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
     raw_input_features: bool = False,
+    raw_tail_reader: Callable[..., Any] | None = None,
 ) -> _SymbolPanelArrays:
-    from downloader.ohlcv_hot_tail import read_logical_parquet
-
-    table = read_logical_parquet(path, tail_rows=tail_rows).to_arrow()
+    if raw_tail_reader is None:
+        from downloader.ohlcv_hot_tail import read_logical_parquet
+        table = read_logical_parquet(path, tail_rows=tail_rows).to_arrow()
+    else:
+        # The live owner supplies a bounded raw-Arrow cache under its source
+        # lease. Policy-specific fields are still derived by the one converter.
+        table = raw_tail_reader(path, tail_rows=tail_rows)
     return _symbol_arrays_from_arrow_table(
         table,
         path,
@@ -4072,8 +4077,11 @@ def build_tail_panel(
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    raw_tail_reader: Callable[..., Any] | None = None,
 ) -> PanelData:
     """Build a panel from only the last rows of each symbol file for live inference."""
+    if raw_tail_reader is not None and not callable(raw_tail_reader):
+        raise TypeError("raw tail reader must be a callable returning original Arrow rows")
     parquet_root = Path(parquet_root).resolve()
     external_feature_path = _resolve_external_data_path(
         external_feature_path,
@@ -4182,6 +4190,7 @@ def build_tail_panel(
                 tradable_mode=tradable_mode,
                 trading_volume_policy=trading_volume_policy,
                 raw_input_features=raw_input_features,
+                **({"raw_tail_reader": raw_tail_reader} if raw_tail_reader is not None else {}),
             )
             if int(arrays.dates.size) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")

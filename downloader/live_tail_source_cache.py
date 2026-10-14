@@ -3,8 +3,9 @@
 This does not accept a source generation or change features/units/causal masks.
 The live caller must hold its canonical source read lease; offline callers must
 own a frozen fixture. Generation checks are defense in depth, not a substitute
-for that writer/reader contract. Currently used by the isolated CPU benchmark;
-production adoption requires the complete panel equality/performance receipt.
+for that writer/reader contract. The live engine lazily owns one cache and
+releases it through the existing serialized idle/deployment eviction path;
+native loaded-code adoption remains distinct from offline output acceptance.
 """
 from __future__ import annotations
 

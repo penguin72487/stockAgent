@@ -841,6 +841,79 @@ def test_reused_opening_snapshot_does_not_report_negative_transport_latency() ->
     assert timing["coverage_to_quote_response_ms"] is None
     assert timing["coverage_to_signal_ready_ms"] == pytest.approx(1100.0)
 
+
+def test_opening_input_receipt_clock_includes_proven_no_print_without_making_a_price() -> None:
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    stamps = np.array([int(gate.timestamp() * 1000) + n for n in (100, 350, 0)])
+    snapshot = PriceSnapshot(prices=np.array([10.0, np.nan, np.nan]),
+        open_prices=np.array([10.0, np.nan, np.nan]), source="opening:shared_opening_snapshot",
+        available_mask=np.array([True, True, False]), timestamps_ms=stamps,
+        exchange_timestamps_ms=stamps, no_open_print_timestamps_ms=np.array([0, stamps[1], 0]))
+    original = snapshot.open_prices.copy()
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True, False, False]),
+        no_print_mask=np.ones(3, dtype=bool), required_count=2, session_date="2026-10-14",
+        display_timezone="Asia/Taipei", quote_requested_at="2026-10-14T09:00:00.050+08:00",
+        quote_received_at="2026-10-14T09:00:01+08:00", signal_ready_at="2026-10-14T09:00:01.300+08:00",
+    )
+    assert timing["quality"] == "observed"
+    assert timing["observed_count"] == 1 and timing["observed_no_print_count"] == 1
+    assert timing["resolved_input_count"] == timing["timestamped_count"] == 2
+    assert timing["coverage_receipt_from_open_ms"] == 350
+    assert timing["coverage_to_signal_ready_ms"] == 950
+    np.testing.assert_array_equal(snapshot.open_prices, original)
+
+
+@pytest.mark.parametrize("absence_at", ["2026-10-13T09:00:00+08:00", "2026-10-14T08:59:59+08:00", None])
+def test_unproved_stale_or_premarket_absence_does_not_fill_receipt_coverage(absence_at) -> None:
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    stamp = int(gate.timestamp() * 1000) + 100
+    absence = int(datetime.fromisoformat(absence_at).timestamp() * 1000) if absence_at else 0
+    snapshot = PriceSnapshot(prices=np.array([10.0, np.nan]), open_prices=np.array([10.0, np.nan]),
+        source="opening:shared_opening_snapshot", available_mask=np.ones(2, dtype=bool),
+        timestamps_ms=np.array([stamp, stamp]), exchange_timestamps_ms=np.array([stamp, stamp]),
+        no_open_print_timestamps_ms=np.array([0, absence]))
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True, False]), no_print_mask=np.ones(2, dtype=bool),
+        required_count=2, session_date="2026-10-14", display_timezone="Asia/Taipei",
+        quote_requested_at="2026-10-14T09:00:00+08:00", quote_received_at="2026-10-14T09:00:01+08:00",
+        signal_ready_at="2026-10-14T09:00:01.300+08:00",
+    )
+    assert timing["quality"] == "insufficient_timestamped_coverage"
+    assert timing["resolved_input_count"] == 1
+    assert timing["coverage_receipt_from_open_ms"] is None
+
+
+@pytest.mark.parametrize("offset,received,ready", [
+    (-1, "09:00:01", "09:00:02"), (2000, "09:00:01", "09:00:02"),
+    (500, "09:00:01", "09:00:00.999"),
+])
+def test_invalid_receipt_clock_does_not_report_negative_or_future_latency(offset, received, ready) -> None:
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    snapshot = PriceSnapshot(prices=np.array([10.0]), source="fixture",
+        timestamps_ms=np.array([int(gate.timestamp() * 1000) + offset]))
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True]), required_count=1,
+        session_date="2026-10-14", display_timezone="Asia/Taipei",
+        quote_requested_at="2026-10-14T09:00:00+08:00", quote_received_at=f"2026-10-14T{received}+08:00",
+        signal_ready_at=f"2026-10-14T{ready}+08:00",
+    )
+    assert timing["quality"] == "invalid_receipt_clock_order"
+    assert timing["coverage_receipt_from_open_ms"] is None
+
+
+@pytest.mark.parametrize("timestamps", [np.array(["bad-clock"]), np.array([np.iinfo(np.int64).max])])
+def test_corrupt_telemetry_timestamp_is_unavailable_not_a_signal_failure(timestamps) -> None:
+    snapshot = PriceSnapshot(prices=np.array([10.0]), source="fixture", timestamps_ms=timestamps)
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True]), required_count=1,
+        session_date="2026-10-14", display_timezone="Asia/Taipei",
+        quote_requested_at="2026-10-14T09:00:00+08:00", quote_received_at="2026-10-14T09:00:01+08:00",
+        signal_ready_at="2026-10-14T09:00:02+08:00",
+    )
+    assert timing["quality"] == "invalid_receipt_timestamps"
+    assert timing["coverage_receipt_from_open_ms"] is None
+
 def test_period_title_ends_at_price_timestamp_when_live_quote_falls_back() -> None:
     message = format_signal_message(
         {

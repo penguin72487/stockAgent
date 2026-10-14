@@ -119,6 +119,7 @@ from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 from stockagent.data.tw_current_trading_universe import TWTradingUniversePending
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
+from services.discord_bot.source_watchdog import SourceOperationRegistry
 
 
 MIN_DISCORD_ROWS = 10
@@ -151,6 +152,7 @@ _ARTIFACT_ROWS_CACHE_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_AT: dict[tuple[str, ...], float] = {}
 _PRE_SIGNAL_FAILURE_AT: dict[tuple[str, ...], tuple[float, str]] = {}
 _PRE_SIGNAL_RUN_LOCKS: dict[tuple[str, ...], threading.Lock] = {}
+_PRE_SIGNAL_SOURCE_OPERATIONS = SourceOperationRegistry()
 _PREWARM_RUN_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _PREWARM_RESULTS: dict[tuple[str, str], LiveSignalResult] = {}
 _LATEST_SIGNAL_CACHE: dict[
@@ -2442,21 +2444,24 @@ def _wait_for_existing_tw_data_update(command: list[str], *, timeout_seconds: in
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             return False
 
-        deadline = time.monotonic() + max(1, int(timeout_seconds))
-        while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise BotUserError(
-                        f"TW data update is still running after {timeout_seconds}s; "
-                        f"lock=`{_display_path(lock_path)}`"
-                    )
-                time.sleep(1.0)
-                continue
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            print("[pre-signal] existing TW data update completed; reusing its outputs", flush=True)
-            return True
+        with _PRE_SIGNAL_SOURCE_OPERATIONS.watch_writer_lock(
+            command, handle, timeout_seconds=max(1, int(timeout_seconds))
+        ) as operation:
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    _PRE_SIGNAL_SOURCE_OPERATIONS.observe_blocked(operation)
+                    if time.monotonic() >= operation.deadline:
+                        raise BotUserError(
+                            f"TW data update is still running after {timeout_seconds}s; "
+                            f"lock=`{_display_path(lock_path)}`"
+                        )
+                    time.sleep(1.0)
+                    continue
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                print("[pre-signal] existing TW data update completed; reusing its outputs", flush=True)
+                return True
     finally:
         handle.close()
 
@@ -2559,7 +2564,10 @@ def _run_pre_signal_command_serialized(
     stream_thread = threading.Thread(target=stream_output, name=f"pre-signal-{cfg.market}", daemon=True)
     stream_thread.start()
     try:
-        returncode = proc.wait(timeout=timeout_seconds)
+        with _PRE_SIGNAL_SOURCE_OPERATIONS.watch_process(
+            command, proc, timeout_seconds=timeout_seconds
+        ):
+            returncode = proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
         proc.kill()
         stream_thread.join(timeout=5)
@@ -3224,7 +3232,11 @@ class StockAgentBot(discord.Client):
         self._opening_attempt_progress_message: str | None = None
         self._opening_attempt_market: str | None = None
         self._opening_attempt_hot = False
+        self._opening_attempt_stage: str | None = None
+        self._opening_attempt_source_operation_id: int | None = None
         self._opening_input_stages: dict[str, dict[str, Any]] = {}
+        self._scheduled_input_jobs: dict[str, dict[str, Any]] = {}
+        self._scheduled_delivery_task: asyncio.Task[None] | None = None
         self._startup_inference_warmup_complete = False
         self._startup_inference_warmup_terminal = False
         self._startup_inference_warmup_failure_count = 0
@@ -3365,10 +3377,39 @@ def _opening_attempt_timeout_seconds(*, hot: bool) -> float:
     return max(floor, _env_float(name, floor))
 
 
-def _oldest_opening_input_stage() -> dict[str, Any] | None:
+def _oldest_opening_input_stage(*, now_monotonic: float | None = None) -> dict[str, Any] | None:
     """Read-only watchdog coverage while inputs wait outside the model owner."""
     stages = list(bot._opening_input_stages.values())
+    if now_monotonic is not None:
+        # A legitimate long source owner must not hide an unrelated stalled
+        # quote job behind it. Inspect all overdue input jobs, not only oldest.
+        stalled = [row for row in stages
+                   if now_monotonic - row["started_monotonic"] > _opening_attempt_timeout_seconds(hot=row["hot"])
+                   and _opening_source_operation(now_monotonic, input_stage=row) is None]
+        if stalled:
+            stages = stalled
     return min(stages, key=lambda row: row["started_monotonic"]) if stages else None
+
+
+def _opening_source_operation(now_monotonic: float, *, input_stage=None) -> dict[str, Any] | None:
+    """Use actual source liveness only in this market's catch-up phase.
+
+    Shared prewarm/run locks may be owned by another scheduler thread. Resolve
+    the same command so its *existing* child's fixed timeout is respected; a
+    missing/dead/expired owner does not excuse an idle attempt. Quote and model
+    stages always retain their original hot/cold no-progress watchdog.
+    """
+    phase = input_stage.get("phase") if input_stage else bot._opening_attempt_stage
+    market = input_stage.get("market") if input_stage else bot._opening_attempt_market
+    started = input_stage.get("started_monotonic") if input_stage else bot._opening_attempt_started_monotonic
+    if phase != "preopen_catch_up" or started is None or not market:
+        return None
+    if input_stage and "source_command" in input_stage:
+        command = input_stage["source_command"]
+    else:
+        cfg = _resolve_market(market)
+        command = _resolve_pre_signal_command(cfg.pre_signal_command)
+    return _PRE_SIGNAL_SOURCE_OPERATIONS.snapshot(command, now=now_monotonic)
 
 
 class _ConsoleProgress:
@@ -6020,6 +6061,14 @@ def _write_discord_service_status() -> dict[str, Any]:
         "updated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "discord_connected": bool(bot.is_ready()),
         "core_health": "ready" if bot.is_ready() else "waiting",
+        "opening_input_dispatch": {
+            "policy": "session_fenced_single_flight_bounded_poll_v1",
+            "scheduler_interval_seconds": 0.1,
+            "input_poll_timeout_seconds": 0.05,
+            "inflight_mode_count": sum(not row["task"].done() for row in bot._scheduled_input_jobs.values()),
+            "scheduled_delivery_pending": bool(bot._scheduled_delivery_task is not None
+                                               and not bot._scheduled_delivery_task.done()),
+        },
         "background_maintenance": _artifact_backfill_health_summary(),
         "interactive_signal_jobs": _signal_now_job_health_summary(),
         # Process-local CUDA/checkpoint caches are a performance domain, not a
@@ -11392,7 +11441,7 @@ async def service_heartbeat() -> None:
 
     notify_systemd("WATCHDOG=1")
     attempt_started = bot._opening_attempt_started_monotonic
-    input_stage = _oldest_opening_input_stage() if attempt_started is None else None
+    input_stage = _oldest_opening_input_stage(now_monotonic=time.monotonic()) if attempt_started is None else None
     if input_stage is not None:
         attempt_started = input_stage["started_monotonic"]
     if attempt_started is not None:
@@ -11404,7 +11453,35 @@ async def service_heartbeat() -> None:
         timeout_seconds = _opening_attempt_timeout_seconds(
             hot=input_stage["hot"] if input_stage else bot._opening_attempt_hot,
         )
-        if idle_elapsed > timeout_seconds:
+        source_operation = (
+            _opening_source_operation(now_monotonic, input_stage=input_stage)
+            if idle_elapsed > timeout_seconds else None
+        )
+        if source_operation is not None:
+            operation_id = source_operation["operation_id"]
+            prior_operation_id = (input_stage.get("source_operation_id") if input_stage
+                                  else bot._opening_attempt_source_operation_id)
+            source_market = input_stage["market"] if input_stage else bot._opening_attempt_market
+            if prior_operation_id != operation_id:
+                if input_stage:
+                    input_stage["source_operation_id"] = operation_id
+                else:
+                    bot._opening_attempt_source_operation_id = operation_id
+                print(
+                    f"[scheduled-watchdog] market={source_market} "
+                    f"idle={idle_elapsed:.3f}s action=wait_bounded_source "
+                    f"kind={source_operation['kind']} pid={source_operation['pid']} "
+                    f"operation_id={operation_id} "
+                    f"remaining={source_operation['remaining_seconds']:.3f}s "
+                    "source_ready=false",
+                    flush=True,
+                )
+            notify_systemd(
+                f"STATUS=Opening source preparation still waiting "
+                f"({source_market}, {source_operation['kind']}, "
+                f"{source_operation['remaining_seconds']:.1f}s remaining); not source-ready"
+            )
+        elif idle_elapsed > timeout_seconds:
             market = input_stage["market"] if input_stage else bot._opening_attempt_market or "unknown"
             progress = "parallel_readonly_inputs" if input_stage else bot._opening_attempt_progress_message or "none"
             print(
@@ -11539,7 +11616,8 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
     return prepared, error, prepare_ms, prefetched, timing
 
 
-async def _scheduled_inputs_ready_order(due, preparations):
+async def _scheduled_inputs_ready_order(due, preparations, *, poll_timeout=None,
+                                        cancel_pending=True):
     """Release each ready mode immediately; slow inputs have no head-of-line gate."""
     remaining = {preparations[row[0].market]: row for row in due
                  if row[0].market in preparations}
@@ -11547,7 +11625,10 @@ async def _scheduled_inputs_ready_order(due, preparations):
         while remaining:
             completed, _pending = await asyncio.wait(
                 remaining, return_when=asyncio.FIRST_COMPLETED,
+                timeout=poll_timeout,
             )
+            if not completed:
+                break
             # Preserve the original priority among simultaneously ready modes.
             for row in due:
                 task = preparations.get(row[0].market)
@@ -11559,11 +11640,81 @@ async def _scheduled_inputs_ready_order(due, preparations):
             if row[0].market not in preparations:
                 yield row, None
     finally:
-        for task, row in remaining.items():
-            bot._opening_input_stages.pop(row[0].market, None)
-            task.cancel()
-        if remaining:
-            await asyncio.gather(*remaining, return_exceptions=True)
+        if cancel_pending:
+            for task, row in remaining.items():
+                bot._opening_input_stages.pop(row[0].market, None)
+                task.cancel()
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
+
+
+async def _prepare_scheduled_attempt_inputs(row, stage):
+    """A single owned input job; slow catch-up never holds the retry scheduler.
+
+    Cancelling a to_thread await does not stop its source builder. Keep this
+    job alive across scheduler polls, including config/session invalidation;
+    discard its result only after the owned work really finishes.
+    """
+    cfg, _now, _key, catch_up = row
+    catch_up_ms = 0.0
+    if catch_up:
+        started = time.perf_counter()
+        stage["phase"] = "preopen_catch_up"
+        try:
+            await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
+        except Exception as exc:
+            return None, exc, 0.0, None, {
+                "signal_stage": "preopen_catch_up",
+                "preopen_catch_up_ms": round((time.perf_counter() - started) * 1000, 3),
+            }
+        catch_up_ms = (time.perf_counter() - started) * 1000
+    stage.update(phase="realtime_prepare", started_monotonic=time.monotonic())
+    prepared, error, prepare_ms, quote, timing = await _prepare_scheduled_inputs(cfg)
+    return prepared, error, prepare_ms, quote, {
+        **timing, "preopen_catch_up_ms": round(catch_up_ms, 3),
+        "input_owner_policy": "session_fenced_single_flight_bounded_poll_v1",
+    }
+
+
+def _scheduled_input_poll_jobs(due):
+    """Reuse inflight inputs; never spawn duplicate uncancellable builders.
+
+    A completed stale-config/session result is consumed but not dispatched.
+    Existing inference revalidates the source/checkpoint and quote fingerprint.
+    Only input I/O is concurrent; inference remains serialized by its owner.
+    """
+    wanted = {row[0].market: row for row in due}
+    for market, job in list(bot._scheduled_input_jobs.items()):
+        current = wanted.get(market)
+        same = (current is not None and job["row"][2] == current[2]
+                and job["row"][0] == current[0])
+        if not same and job["task"].done():
+            if not job["task"].cancelled():
+                job["task"].exception()  # Retrieve errors, never infer from stale inputs.
+            bot._scheduled_input_jobs.pop(market, None)
+            bot._opening_input_stages.pop(market, None)
+    rows, tasks_by_market = [], {}
+    for row in due:
+        cfg, now, key, catch_up = row
+        if not (cfg.day_trade_simulation_enabled or cfg.overnight_simulation_enabled):
+            rows.append(row)
+            continue
+        job = bot._scheduled_input_jobs.get(cfg.market)
+        if job is None:
+            stage = {"market": cfg.market, "started_monotonic": time.monotonic(),
+                     "phase": "preopen_catch_up" if catch_up else "realtime_prepare",
+                     "source_command": _resolve_pre_signal_command(getattr(cfg, "pre_signal_command", ())),
+                     "hot": _preopen_market_final_armed_for_session(cfg, now.date().isoformat())}
+            if cfg.day_trade_simulation_enabled:
+                bot._opening_first_observed_at.setdefault(key, now)
+                bot._opening_input_stages[cfg.market] = stage
+            job = {"row": row, "task": asyncio.create_task(
+                _prepare_scheduled_attempt_inputs(row, stage))}
+            bot._scheduled_input_jobs[cfg.market] = job
+        if job["row"][2] == key and job["row"][0] == cfg:
+            rows.append(job["row"])
+            tasks_by_market[cfg.market] = job["task"]
+    return rows, tasks_by_market
 
 
 @lru_cache(maxsize=32)
@@ -11580,10 +11731,16 @@ def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> d
         result = {"status": "failed", "error_type": type(exc).__name__, "error": str(exc)}
         result["last_known_source_coverage"] = tw_mis_opening_receipt_status(parquet_root=root, session_date=session_date)
     result.update({
-        "schema_version": 1, "session_date": session_date, "parquet_root": root,
+        "schema_version": 1, "run_id": _BOT_RUN_ID,
+        "session_date": session_date, "parquet_root": root,
         "attempt": attempt, "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
         "observed_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="milliseconds"),
         "simulation_only": True, "inference_performed": False, "orders_submitted": False,
+        "observer_policy": "shared_provider_backoff_no_source_wait_starvation_v1",
+        "observer_loop_interval_seconds": 1.0,
+        "minimum_observer_retry_delay_seconds": _opening_source_repair_delay(
+            result, attempt, datetime.now(ZoneInfo("Asia/Taipei")),
+        ),
     })
     path = _day_trade_state_dir() / "opening_source_repair.json"
     _write_durable_json(path, result)
@@ -11595,13 +11752,40 @@ def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> d
     return result
 
 
+def _opening_source_repair_must_defer() -> bool:
+    """Source I/O may overlap source/preparation waits, not model execution."""
+    return bool(
+        bot._opening_attempt_started_monotonic is not None
+        and bot._opening_attempt_stage not in {"preopen_catch_up", "realtime_prepare"}
+    )
+
+
+def _opening_source_repair_delay(result: dict[str, Any], attempt: int, now: datetime) -> float:
+    """Observer cadence only; the shared fan-in owns each provider's cooldown.
+
+    An absent receipt is not a completed acquisition. During the first minute,
+    do not compound provider backoff with an unrelated 30/60-second sleep.
+    Explicit no-first-print evidence advances model inputs without making up a
+    price, so it counts as progress alongside newly accepted opening prices.
+    """
+    if result.get("status") == "complete":
+        return 60.0
+    if result.get("status") == "not_started":
+        return 1.0
+    if (result.get("recovered_input_count", 0) > 0
+            or result.get("recovered_count", 0) > 0
+            or (now.hour == 9 and now.minute == 0)):
+        return 0.5
+    return min(30.0, 0.5 * (2 ** min(max(attempt - 1, 0), 6)))
+
+
 @tasks.loop(seconds=1)
 async def opening_source_repair() -> None:
     """Finish pending source rows even after every model has published.
 
-    Signal retries own the protected input path. Once they finish, this
-    background observer repairs only receipt gaps through MIS, off the event
-    loop and completely separate from execution/ledger ownership.
+    Signal retries own the protected input path. This background observer
+    repairs only receipt gaps through the shared multi-source fan-in, off the
+    event loop and completely separate from execution/ledger ownership.
     """
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     if not (9 <= now.hour < 14) or (now.hour == 13 and now.minute >= 30):
@@ -11611,9 +11795,10 @@ async def opening_source_repair() -> None:
                and _market_enabled(cfg) and _scheduled_market_session_day(cfg, now)[0]]
     # A pending retry is exactly when source repair is needed. Deferring until
     # every signal succeeds creates a circular dependency and can starve the
-    # repair owner for the whole session. Only an actual critical-path attempt
-    # has priority; its bounded retry gaps allow this source-only worker to run.
-    if bot._opening_attempt_started_monotonic is not None:
+    # repair owner for the whole session. Source construction and realtime
+    # preparation can also wait minutes: do not let them starve acquisition.
+    # The fan-in still deduplicates provider calls and enforces source backoff.
+    if _opening_source_repair_must_defer():
         return
     roots: set[str] = set()
     for cfg in configs:
@@ -11633,10 +11818,9 @@ async def opening_source_repair() -> None:
         bot._opening_source_repair_attempts[key] = attempt
         try:
             result = await asyncio.to_thread(_opening_source_repair_sync, root, now.date().isoformat(), attempt)
-            status = result.get("status")
-            delay = 60.0 if status in {"complete", "not_started"} else min(30.0, 0.5 * (2 ** min(attempt - 1, 6)))
-            if result.get("recovered_count", 0) > 0:
-                delay = 0.5
+            delay = result.get("minimum_observer_retry_delay_seconds")
+            if delay is None:
+                delay = _opening_source_repair_delay(result, attempt, now)
             bot._opening_source_repair_retry_at[key] = time.monotonic() + delay
         except Exception as exc:
             bot._opening_source_repair_retry_at[key] = time.monotonic() + 5.0
@@ -11719,19 +11903,10 @@ async def scheduled_signal() -> None:
             continue
         due.append((cfg, now, key, _scheduled_signal_requires_preopen_catch_up(cfg, now)))
 
-    bot._opening_input_stages.update({
-        cfg.market: {"market": cfg.market, "started_monotonic": time.monotonic(),
-                     "hot": _preopen_market_final_armed_for_session(cfg, now.date().isoformat())}
-        for cfg, now, _key, catch_up in due
-        if not catch_up and bool(cfg.day_trade_simulation_enabled)
-    })
-    preparations = {
-        cfg.market: asyncio.create_task(_prepare_scheduled_inputs(cfg))
-        for cfg, _now, _key, catch_up in due
-        if not catch_up
-        and bool(cfg.day_trade_simulation_enabled or cfg.overnight_simulation_enabled)
-    }
-    async for (cfg, now, key, catch_up), prepared_inputs in _scheduled_inputs_ready_order(due, preparations):
+    poll_due, preparations = _scheduled_input_poll_jobs(due)
+    async for (cfg, now, key, catch_up), prepared_inputs in _scheduled_inputs_ready_order(
+            poll_due, preparations, poll_timeout=0.05, cancel_pending=False):
+        bot._scheduled_input_jobs.pop(cfg.market, None)
         market = cfg.market
         day_trade_simulation = bool(cfg.day_trade_simulation_enabled)
         latency_critical_simulation = bool(day_trade_simulation or cfg.overnight_simulation_enabled)
@@ -11768,13 +11943,17 @@ async def scheduled_signal() -> None:
             bot._opening_attempt_last_progress_monotonic = attempt_started
             bot._opening_attempt_progress_message = "scheduled attempt started"
             bot._opening_attempt_market = market
+            bot._opening_attempt_stage = "started"
+            bot._opening_attempt_source_operation_id = None
             bot._opening_attempt_hot = _preopen_market_final_armed_for_session(
                 cfg, now.date().isoformat()
             )
             notify_systemd(f"STATUS=09:00 opening signal in progress: {market}")
         try:
-            if catch_up:
+            if catch_up and prepared_inputs is None:
                 attempt_timing["signal_stage"] = "preopen_catch_up"
+                if latency_critical_simulation:
+                    bot._opening_attempt_stage = "preopen_catch_up"
                 # A restart may have missed both the pre-open preparation and
                 # the exact scheduled signal minute.  Reuse the complete
                 # pre-open contract so same-session eligibility and price
@@ -11788,6 +11967,8 @@ async def scheduled_signal() -> None:
                         3,
                     )
             attempt_timing["signal_stage"] = "realtime_prepare"
+            if latency_critical_simulation:
+                bot._opening_attempt_stage = "realtime_prepare"
             prepare_started = time.perf_counter()
             prefetched_quote = None
             if prepared_inputs is None:
@@ -11802,6 +11983,8 @@ async def scheduled_signal() -> None:
             if prepare_error is not None:
                 raise prepare_error
             resolved_price_source, prepared_status, _ = prepared
+            if latency_critical_simulation:
+                bot._opening_attempt_stage = "inference"
             result = await _run_market_signal(
                 market=market,
                 scheduled=True,
@@ -11890,6 +12073,8 @@ async def scheduled_signal() -> None:
                 bot._opening_attempt_progress_message = None
                 bot._opening_attempt_market = None
                 bot._opening_attempt_hot = False
+                bot._opening_attempt_stage = None
+                bot._opening_attempt_source_operation_id = None
         if result is None:
             # Both exception branches continue above.  Keep this assertion as
             # a fail-closed guard if that control flow is changed later.
@@ -11915,6 +12100,34 @@ async def scheduled_signal() -> None:
 
     if not deliveries and not error_messages:
         return
+    _enqueue_scheduled_results(deliveries, error_messages)
+
+
+def _enqueue_scheduled_results(deliveries, error_messages):
+    """Keep canonical reports/chat ordered without blocking opening retries."""
+    previous = bot._scheduled_delivery_task
+
+    async def deliver():
+        if previous is not None:
+            try:
+                await asyncio.shield(previous)
+            except Exception as exc:
+                _log_exception("scheduled_signal:previous_delivery", exc)
+        await _deliver_scheduled_results(deliveries, error_messages)
+
+    task = asyncio.create_task(deliver())
+    bot._scheduled_delivery_task = task
+
+    def finished(done):
+        if bot._scheduled_delivery_task is done:
+            bot._scheduled_delivery_task = None
+        if not done.cancelled() and done.exception() is not None:
+            _log_exception("scheduled_signal:delivery_worker", done.exception())
+
+    task.add_done_callback(finished)
+
+
+async def _deliver_scheduled_results(deliveries, error_messages):
     # All due execution contracts are already atomically visible. Do not make
     # model N+1 wait for model N's Parquet/Markdown/explanation report writes.
     for cfg, result, _key in deliveries:

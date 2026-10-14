@@ -119,10 +119,10 @@ def test_pansci_supplement_opt_in_does_not_release_unreviewed_metadata_growth(re
         queue.close()
 
 
-def test_new_sources_reuse_finite_shared_collector_and_keep_refused_gbi_disabled(registry):
+def test_new_sources_reuse_shared_collector_and_keep_refused_gbi_disabled(registry):
     for provider in ('genetinfo', 'pansci'):
         source = registry.sources[provider]
-        assert source.allowed and source.acquisition_mode == 'finite'
+        assert source.allowed and source.acquisition_mode == ('continuous' if provider == 'genetinfo' else 'finite')
         assert source.require_author_attribution and source.html_parser == 'lxml'
         assert not source.feeds and not source.sitemaps and not source.index_pages
         assert source.authorization['kind'] == 'personal_research'

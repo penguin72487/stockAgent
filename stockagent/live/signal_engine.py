@@ -165,6 +165,9 @@ _LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
 ] = OrderedDict()
 _LIVE_ALIGNED_PANEL_CACHE_LOCK = threading.Lock()
 _LIVE_FACTORIZED_PANEL_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
+_LIVE_RAW_TAIL_SOURCE_CACHE: Any = None
+_LIVE_RAW_TAIL_SOURCE_CACHE_LOCK = threading.Lock()
+_LIVE_RAW_TAIL_SOURCE_CACHE_MAX_BYTES = 64 * 1024**2
 _LIVE_COMPLETED_SOURCE_IDENTITIES: dict[str, str] = {}
 
 
@@ -218,6 +221,30 @@ def _live_panel_load_workers(configured_workers: int) -> int:
     return min(configured, live_cap)
 
 
+def _live_raw_tail_source_cache():
+    """Lazily share verified original rows across policy-specific live panels.
+
+    No import/I/O/GPU work while idle. Operational capacity is not a model or
+    panel semantic setting, so the callback stays outside cache-key kwargs.
+    """
+    global _LIVE_RAW_TAIL_SOURCE_CACHE
+    raw = os.getenv("STOCKAGENT_LIVE_RAW_TAIL_CACHE_BYTES", str(_LIVE_RAW_TAIL_SOURCE_CACHE_MAX_BYTES))
+    try:
+        capacity = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("raw tail cache capacity must be an integer byte count") from exc
+    if not 0 <= capacity <= _LIVE_RAW_TAIL_SOURCE_CACHE_MAX_BYTES:
+        raise ValueError("raw tail cache capacity must be between 0 and 64 MiB")
+    with _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK:
+        cache = _LIVE_RAW_TAIL_SOURCE_CACHE
+        if cache is None or cache.max_bytes != capacity:
+            from downloader.live_tail_source_cache import LiveTailSourceCache
+            if cache is not None:
+                cache.clear()
+            _LIVE_RAW_TAIL_SOURCE_CACHE = LiveTailSourceCache(max_bytes=capacity)
+        return _LIVE_RAW_TAIL_SOURCE_CACHE
+
+
 def clear_live_panel_memory_cache() -> None:
     with _LIVE_PANEL_CACHE_LOCK:
         _LIVE_PANEL_CACHE.clear()
@@ -227,6 +254,11 @@ def clear_live_panel_memory_cache() -> None:
         _LIVE_MODEL_INPUT_CACHE.clear()
     with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
         _LIVE_ALIGNED_PANEL_CACHE.clear()
+    with _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK:
+        if _LIVE_RAW_TAIL_SOURCE_CACHE is not None:
+            # Increment its epoch too: an in-flight decode may return to its
+            # caller but cannot repopulate buffers released by idle eviction.
+            _LIVE_RAW_TAIL_SOURCE_CACHE.clear()
 
 
 def clear_live_inference_memory_cache() -> None:
@@ -834,6 +866,7 @@ def _build_panel_from_stable_source(
         panel = build_tail_panel(
             config.data.parquet_root,
             tail_rows=live_tail_rows,
+            raw_tail_reader=_live_raw_tail_source_cache().read,
             benchmark_name=config.data.benchmark_name,
             usd_only_trading_pairs=config.data.usd_only_trading_pairs,
             tradable_mode=config.data.tradable_mode,
@@ -2142,14 +2175,19 @@ def _opening_price_receipt_timing(
     quote_requested_at: str,
     quote_received_at: str,
     signal_ready_at: str,
+    no_print_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Measure causal local quote receipt without pretending it is venue RTT."""
 
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "clock": "unix_epoch_ms_local_source_result_receipt",
         "measurement_boundary": "09:00_gate_to_local_quote_coverage_to_signal_ready",
+        "receipt_scope": "current_snapshot_local_receipts_not_first_session_quorum",
+        "input_coverage_basis": "same_session_open_or_observed_no_print" if no_print_mask is not None else "observed_quotes",
         "observed_count": int(np.count_nonzero(observed_mask)),
+        "observed_no_print_count": 0,
+        "resolved_input_count": int(np.count_nonzero(observed_mask)),
         "timestamped_count": 0,
         "required_count": max(0, int(required_count)),
         "quality": "unavailable",
@@ -2163,11 +2201,30 @@ def _opening_price_receipt_timing(
         "coverage_to_quote_response_ms": None,
         "coverage_to_signal_ready_ms": None,
     }
-    values = price_snapshot.timestamps_ms
     normalized_mask = np.asarray(observed_mask, dtype=bool)
-    if values is None or normalized_mask.ndim != 1:
+    if normalized_mask.ndim != 1:
         return result
-    timestamps = np.asarray(values, dtype=np.int64)
+    if no_print_mask is not None:
+        candidate = np.asarray(no_print_mask, dtype=bool)
+        if candidate.shape != normalized_mask.shape:
+            result["quality"] = "invalid_no_print_mask"
+            return result
+        # Use exactly the canonical input proof, never absence of a price or
+        # volume alone. This changes timing only, not sizing/execution masks.
+        absence = candidate & ~normalized_mask & tw_session_no_open_print_mask(
+            price_snapshot, session_date=session_date,
+        )
+        result["observed_no_print_count"] = int(np.count_nonzero(absence))
+        normalized_mask = normalized_mask | absence
+        result["resolved_input_count"] = int(np.count_nonzero(normalized_mask))
+    values = price_snapshot.timestamps_ms
+    if values is None:
+        return result
+    try:
+        timestamps = np.asarray(values, dtype=np.int64)
+    except (TypeError, ValueError, OverflowError):
+        result["quality"] = "invalid_receipt_timestamps"
+        return result
     if timestamps.shape != normalized_mask.shape:
         return result
     ordered = np.sort(timestamps[normalized_mask & (timestamps > 0)])
@@ -2194,12 +2251,16 @@ def _opening_price_receipt_timing(
         result["quality"] = "invalid_wall_clock"
         return result
 
-    first = datetime.fromtimestamp(int(ordered[0]) / 1000.0, tz=timezone.utc)
-    coverage = datetime.fromtimestamp(
-        int(ordered[required - 1]) / 1000.0,
-        tz=timezone.utc,
-    )
-    last = datetime.fromtimestamp(int(ordered[-1]) / 1000.0, tz=timezone.utc)
+    try:
+        first = datetime.fromtimestamp(int(ordered[0]) / 1000.0, tz=timezone.utc)
+        coverage = datetime.fromtimestamp(int(ordered[required - 1]) / 1000.0, tz=timezone.utc)
+        last = datetime.fromtimestamp(int(ordered[-1]) / 1000.0, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        result["quality"] = "invalid_receipt_timestamps"
+        return result
+    if not (gate <= first <= coverage <= last <= received <= ready and requested <= received):
+        result["quality"] = "invalid_receipt_clock_order"
+        return result
     reused_snapshot = coverage < requested
 
     def milliseconds(later: datetime, earlier: datetime) -> float:
@@ -4414,7 +4475,7 @@ def generate_live_signal(
         _opening_price_receipt_timing(
             price_snapshot=price_snapshot,
             observed_mask=(
-                np.asarray(panel.alive_mask[panel_idx], dtype=bool) & day_trade_observed_model_price
+                active_mask & day_trade_observed_model_price
                 if normalized_day_trade_observation == "session_open"
                 else day_trade_quote_observed_mask
             ),
@@ -4424,6 +4485,7 @@ def generate_live_signal(
             quote_requested_at=quote_requested_at_text,
             quote_received_at=quote_received_at_text,
             signal_ready_at=signal_ready_at_text,
+            no_print_mask=active_mask if normalized_day_trade_observation == "session_open" else None,
         )
         if execution_mode == "tw_day_trade"
         and day_trade_live_session

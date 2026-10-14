@@ -146,10 +146,39 @@ class SourcePolicy:
     metadata_feed_fingerprint: str = ''
     metadata_feed_interval_seconds: int = 0
     cnyes_index_compatibility: tuple[str, str] = ()
+    http_capacity_source_fingerprint: str = ''
+    parser_repair_fingerprint: str = ''
+    parser_repair_capture_fingerprint: str = ''
 
     @property
     def request_enabled(self) -> bool:
         return self.allowed or bool(self.metadata_feeds)
+
+
+def parser_repair_fingerprint(payload: dict[str, Any]) -> str:
+    """Separate parser repairs from known-URL scheduling and review prose.
+
+    This identity only controls replay of failed parsing. It never replaces
+    the complete capture/authorization identity or grants access. Retain all
+    machine-enforced scope, attribution, selectors, paths and parser versions.
+    Copy the nested mappings so the original capture payload stays identical.
+    """
+    normalized = dict(payload)
+    entry = dict(payload['entry'])
+    for field in ('acquisition_mode', 'private_known_url_scope', 'note',
+                  'interval_seconds', 'parallelism', 'discovery_interval_seconds',
+                  'official_min_interval_seconds', 'official_rate_limit_evidence_url'):
+        entry.pop(field, None)
+    for field in ('entry', 'authorization'):
+        authorization = dict(entry.get('authorization', {}) if field == 'entry' else payload['authorization'])
+        authorization.pop('scope', None)
+        authorization.pop('reviewed_on', None)
+        if field == 'entry':
+            entry['authorization'] = authorization
+        else:
+            normalized['authorization'] = authorization
+    normalized['entry'] = entry
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
 
 
 def cnyes_bulk_fingerprint(source: SourcePolicy) -> str:
@@ -276,7 +305,9 @@ class PolicyRegistry:
                               and domains in {("nownews.com",), ("www.nownews.com",)}
                               and auth.get("kind") == "personal_research"
                               and auth.get("evidence_url") == "https://www.nownews.com/copyright"
-                              and entry.get("acquisition_mode") == "finite"
+                              and (entry.get("acquisition_mode") == "finite"
+                                   or entry.get("acquisition_mode") == "continuous"
+                                   and entry.get("private_known_url_scope") == "personal_noncommercial_originals_v1")
                               and entry.get("require_configured_container") is True
                               and entry.get("require_author_attribution") is True)
             ftv_layout = (embedded == "ftv_visible_article_v1" and provider == "ftvnews"
@@ -284,7 +315,9 @@ class PolicyRegistry:
                               ("www.ftvnews.com.tw", "finance.ftvnews.com.tw", "sport.ftvnews.com.tw", "health.ftvnews.com.tw")}
                           and auth.get("kind") == "personal_research"
                           and auth.get("evidence_url") == "https://www.ftvnews.com.tw/news/detail/2026317W0044"
-                          and entry.get("acquisition_mode") == "finite"
+                          and (entry.get("acquisition_mode") == "finite"
+                               or entry.get("acquisition_mode") == "continuous"
+                               and entry.get("private_known_url_scope") == "personal_noncommercial_originals_v1")
                           and entry.get("require_configured_container") is True
                           and entry.get("require_author_attribution") is True)
             voa_layout = (embedded in {"voa_original_article_v1", "voa_reviewed_private_article_v2"}
@@ -469,6 +502,7 @@ class PolicyRegistry:
                 fingerprint_payload["reviewed_cnyes_endpoint_inventory"] = cnyes_inventory
             if provider == 'cnyes':
                 fingerprint_payload['verified_short_html_body_contract_version'] = 5
+                fingerprint_payload['verified_native_prose_spacing_contract_version'] = 1
                 fingerprint_payload['mobile_canonical_html_contract_version'] = 43
                 fingerprint_payload['verified_empty_html_outcome_contract_version'] = 8
                 fingerprint_payload['verified_native_quote_only_outcome_contract_version'] = 7
@@ -503,10 +537,20 @@ class PolicyRegistry:
             if provider == 'moneyweekly':
                 fingerprint_payload['moneyweekly_source_identity_contract_version'] = 2
             data_fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True).encode()).hexdigest()
+            capacity_fingerprint = ''
+            if provider == 'cnyes':
+                # Only the new word-spacing parser ABI is not HTTP policy.
+                # Keep the exact previous pacing/refusal identity, including
+                # every original scope, authorization, endpoint and config
+                # field. Other HTML ABI/policy changes still invalidate it.
+                capacity_payload = dict(fingerprint_payload)
+                capacity_payload.pop('verified_native_prose_spacing_contract_version')
+                capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
             bulk_fingerprint = ""
             if cnyes_apis:
                 bulk_payload = dict(fingerprint_payload)
                 bulk_payload.pop('verified_short_html_body_contract_version', None)
+                bulk_payload.pop('verified_native_prose_spacing_contract_version', None)
                 bulk_payload.pop('mobile_canonical_html_contract_version', None)
                 bulk_payload.pop('verified_empty_html_outcome_contract_version', None)
                 bulk_payload.pop('verified_native_quote_only_outcome_contract_version', None)
@@ -521,7 +565,20 @@ class PolicyRegistry:
                 feed_payload.pop('verified_small_html_body_contract_version', None)
                 feed_fingerprint = hashlib.sha256(json.dumps(feed_payload, sort_keys=True).encode()).hexdigest()
             supplements = entry.get("allow_reviewed_supplements", False)
-            if type(supplements) is not bool or supplements and acquisition_mode != "finite":
+            # These known-URL scopes may retain their immutable historical
+            # supplement flag/receipts. Every new supplement admission still
+            # independently requires finite mode in news_fulltext_cohorts;
+            # retaining the flag must not freeze normal private URL dispatch.
+            retained_private_supplements = (
+                acquisition_mode == "continuous"
+                and entry.get("private_known_url_scope") == "personal_noncommercial_originals_v1"
+                and auth.get("kind") == "personal_research"
+                and (ftv_layout or provider == "genetinfo" and domains == ("genetinfo.com",)
+                     and auth.get("evidence_url") == "https://www.genetinfo.com/"
+                     and entry.get("require_configured_container") is True
+                     and entry.get("require_author_attribution") is True))
+            if (type(supplements) is not bool
+                    or supplements and acquisition_mode != "finite" and not retained_private_supplements):
                 raise ValueError("reviewed supplements require an explicit finite scope")
             self.sources[provider] = SourcePolicy(
                 provider, entry.get("name", provider), domains, allowed, fingerprint,
@@ -549,6 +606,9 @@ class PolicyRegistry:
                 tuple(incremental_indexes),
                 metadata_urls, metadata_auth, metadata_fingerprint, metadata_interval,
                 cnyes_index_compatibility=index_compatibility,
+                http_capacity_source_fingerprint=capacity_fingerprint,
+                parser_repair_fingerprint=parser_repair_fingerprint(fingerprint_payload),
+                parser_repair_capture_fingerprint=data_fingerprint,
             )
 
     def match(self, url: str) -> SourcePolicy | None:
@@ -1146,6 +1206,16 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
             nontrivial_text_missing = False  # At least eight actually observed words, not a word-count exemption.
             article['article_identity_basis'] = 'canonical_url_newsId_free_payment0; declared_clock_and_whole_visible_container_match_full_content'
             article['body_completeness'] = ('verified_publisher_short_body; '
+                                          'whole_visible_container_matches_current_full_prose_spacing')
+    if (source.provider == 'cnyes' and method == 'jsonld_article_body'
+            and len(body) >= 100 and nontrivial_text_missing):
+        from downloader.news_fulltext_publishers import cnyes_verified_prose_spacing
+        spaced_body = cnyes_verified_prose_spacing(soup, source, article, body, page_url=expected_url)
+        if spaced_body is not None:
+            body, method = spaced_body, 'cnyes_visible_prose_spacing_v1'
+            nontrivial_text_missing = False  # The whole observed prose has at least eight words.
+            article['article_identity_basis'] = 'canonical_url_newsId_free_payment0; declared_clock_and_whole_visible_container_match_full_content'
+            article['body_completeness'] = ('verified_publisher_body; '
                                           'whole_visible_container_matches_current_full_prose_spacing')
     if (source.provider == 'cnyes' and method == 'jsonld_article_body'
             and 0 < len(body) < 100 and not nontrivial_text_missing):

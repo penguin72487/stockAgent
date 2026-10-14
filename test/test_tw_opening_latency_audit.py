@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from scripts.audit_tw_opening_latency import opening_coverage_milestones
+from scripts.audit_tw_opening_latency import opening_coverage_milestones, opening_publication_slo
 
 
 def event(provider, elapsed_ms, observations=(), **overrides):
@@ -39,6 +39,8 @@ def test_asof_counts_keep_scope_unknown_and_no_first_print_distinct(tmp_path):
     assert samples[1000]["valid_open_count"] == samples[5000]["valid_open_count"] == 2
     assert samples[5000]["unknown_count"] == 1
     assert samples[5000]["providers"]["finmind_snapshot"]["valid_open_count"] == 0
+    assert samples[10000]["valid_open_count"] == samples[20000]["valid_open_count"] == samples[30000]["valid_open_count"] == 3
+    assert samples[30000]["unknown_count"] == 0
     assert path.read_bytes() == before
 
 
@@ -83,3 +85,61 @@ def test_legacy_aggregate_without_ids_is_not_reported_as_zero_quotes(tmp_path):
 def test_audit_rejects_invalid_scope(tmp_path, symbols):
     with pytest.raises(ValueError, match="nonempty unique"):
         opening_coverage_milestones(tmp_path / "missing", "2026-10-13", symbols)
+
+
+def publication(market_name, elapsed_ms, **overrides):
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    return {"status": "ready", "session_date": "2026-10-14", "market": market_name,
+        "signal_id": market_name + "-immutable", "gate_at": gate.isoformat(),
+        "signal_ready_at": (gate + timedelta(milliseconds=elapsed_ms - 1)).isoformat(),
+        "artifact_published_at": (gate + timedelta(milliseconds=elapsed_ms)).isoformat(),
+        "published_from_open_ms": 0, **overrides}
+
+
+def test_staged_slo_uses_all_mode_original_clocks_not_cached_milliseconds():
+    attempts = {"fast": {"attempt_count": 1, "failed_count": 0, "ready": [publication("fast", 250)]},
+        "slow": {"attempt_count": 4, "failed_count": 3, "ready": [publication("slow", 30001), publication("slow", 20000)]}}
+    result = opening_publication_slo("2026-10-14", attempts, ["fast", "slow"])
+    assert result["state"] == "observed"
+    assert result["first_mode_published_from_open_ms"] == 250
+    assert result["all_modes_published_from_open_ms"] == 20000
+    assert [row["passed"] for row in result["stages"]] == [True, True, False, False, False]
+    assert result["modes"]["slow"]["failed_count"] == 3
+
+
+def test_missing_mode_cannot_earn_a_stage_from_fast_subset():
+    result = opening_publication_slo("2026-10-14", {"fast": {"ready": [publication("fast", 250)]}}, ["fast", "missing"])
+    assert result["state"] == "incomplete"
+    assert result["published_mode_count"] == 1
+    assert result["all_modes_published_from_open_ms"] is None
+    assert all(not row["passed"] and row["state"] == "incomplete" for row in result["stages"])
+
+
+@pytest.mark.parametrize("overrides", [
+    {"artifact_published_at": "2026-10-14T09:00:00.500"},
+    {"artifact_published_at": "2026-10-14T08:59:59+08:00"},
+    {"artifact_published_at": "2026-10-14T09:00:00.498+08:00"},
+    {"signal_ready_at": "2026-10-14T08:59:59+08:00"},
+    {"gate_at": "2026-10-14T08:59:00+08:00"},
+    {"session_date": "2026-10-13"}, {"market": "other"}, {"signal_id": None},
+    {"status": "failed"}, {"artifact_published_at": None},
+])
+def test_invalid_or_backdated_publication_cannot_pass_slo(overrides):
+    result = opening_publication_slo("2026-10-14", {"mode": {"ready": [publication("mode", 500, **overrides)]}}, ["mode"])
+    assert result["modes"]["mode"]["invalid_ready_records"] == 1
+    assert result["all_modes_published_from_open_ms"] is None
+    assert not any(row["passed"] for row in result["stages"])
+
+
+def test_equivalent_utc_clocks_preserve_the_publication_boundary():
+    row = publication("mode", 1000, signal_ready_at="2026-10-14T01:00:00.999+00:00",
+        artifact_published_at="2026-10-14T01:00:01+00:00")
+    result = opening_publication_slo("2026-10-14", {"mode": {"ready": [row]}}, ["mode"])
+    assert result["all_modes_published_from_open_ms"] == 1000
+    assert all(stage["passed"] for stage in result["stages"])
+
+
+@pytest.mark.parametrize("markets", [[], ["mode", "mode"]])
+def test_publication_slo_requires_explicit_unique_scope(markets):
+    with pytest.raises(ValueError, match="nonempty unique"):
+        opening_publication_slo("2026-10-14", {}, markets)

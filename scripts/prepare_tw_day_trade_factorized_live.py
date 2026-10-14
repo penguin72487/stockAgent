@@ -27,10 +27,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from downloader.artifact_io import atomic_write_json
 from scripts.build_tw_release_schedule_dataset import normalize_source
-from scripts.prepare_tw_day_trade_factorized_panel import AnnualObservationEvents, causal_state_blocks, OBS_SCHEMA
+from scripts.prepare_tw_day_trade_factorized_panel import (
+    AnnualObservationEvents, annual_preparation_identity, causal_state_blocks, OBS_SCHEMA,
+)
 from stockagent.config import load_config
 from stockagent.data.factorized_panel import VALUE_ONLY_CONTRACT, file_sha256, write_array_block, verify_factorized_members
 from stockagent.data.finlab_acquisition_contract import read_receipt_bound_source
+from stockagent.data.annual_cache_admission import MemoryAdmittedObservationCache
 from stockagent.data.panel import build_panel
 from stockagent.data.tw_day_trade_mixed_frequency import source_clock_lookup, rule_from_spec
 from stockagent.data.tw_public_features import _exchange_session_dates
@@ -39,6 +42,18 @@ from stockagent.live.market_status import tw_stock_day_decision, TW_HOLIDAY_SCHE
 from stockagent.storage_layout import admit_output
 from stockagent.training.checkpoint_contract import subset_panel_symbols
 from train import _build_panel_kwargs
+
+
+class AdmittedAnnualObservationEvents(AnnualObservationEvents):
+    """Same causal stream, with resource policy only on actual cache misses."""
+
+    def __init__(self, paths, *, cache_root=None, seed_paths=()):
+        # Canonical chronology/period parsing stays with the parent. The
+        # protected cache dependency is its deliberate specialization point;
+        # no source precedence, causal sweep or content key is copied here.
+        super().__init__(paths)
+        if cache_root is not None:
+            self._cache = MemoryAdmittedObservationCache(cache_root, seed_sources=seed_paths)
 
 
 def publish_link(root: Path, target: Path) -> None:
@@ -68,8 +83,28 @@ def _next_projection_session(public: Path, completed: date):
     raise ValueError("official calendar has no next scheduled session within 31 days")
 
 
+def _native_context_identity(native_source: Path, manifest: dict) -> dict:
+    """Publication bounds/known uploads are inputs, not cache implementation."""
+    paths = {"source_manifest.json", "finlab/known_uploads.parquet"}
+    bounds = manifest.get("source_repairs", {}).get("publication_lower_bounds")
+    if bounds:
+        candidate = native_source / bounds
+        if not candidate.resolve(strict=True).is_relative_to(native_source.resolve()):
+            raise ValueError("publication bound escaped its original source root")
+        paths.add(bounds)
+    return {name: file_sha256(native_source / name) if (native_source / name).is_file() else None
+            for name in sorted(paths)}
+
+
+def _verify_preparation_inputs(config_path, native_source, source_manifest, identity):
+    if (file_sha256(config_path) != identity["config_sha"]
+            or _native_context_identity(native_source, source_manifest) != identity["native_context"]):
+        raise ValueError("configuration/publication context changed during projection; last good generation retained")
+
+
 def prepare(*, config_path: Path, parent_path: Path, native_source: Path,
-            public: Path, finlab: Path, output: Path, start_date: str) -> dict:
+            public: Path, finlab: Path, output: Path, start_date: str,
+            annual_cache_root: Path | None = None) -> dict:
     output = admit_output(output, "prepared")
     output.mkdir(parents=True, exist_ok=True)
     with (output / "prepare.lock").open("a") as lock:
@@ -77,10 +112,11 @@ def prepare(*, config_path: Path, parent_path: Path, native_source: Path,
         with live_tw_public_source_read_guard(public / "stocks"):
             return _prepare(config_path=config_path, parent_path=parent_path,
                             native_source=native_source, public=public, finlab=finlab,
-                            output=output, start_date=start_date)
+                            output=output, start_date=start_date, annual_cache_root=annual_cache_root)
 
 
-def _prepare(*, config_path, parent_path, native_source, public, finlab, output, start_date):
+def _prepare(*, config_path, parent_path, native_source, public, finlab, output, start_date,
+             annual_cache_root=None):
     started = time.perf_counter()
     parent_sha = file_sha256(parent_path)
     parent = json.loads(parent_path.read_text())
@@ -104,7 +140,11 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
     sessions = sorted(set(day for day in sessions if day <= completed) | {decision})
     calendar_inputs = {name: file_sha256(public / name) for name in (
         TW_HOLIDAY_SCHEDULE_NAME, "twse_taiex_ohlc.parquet", "twse_taiex_ohlc.summary.json")}
-    source_manifest = json.loads((native_source / "source_manifest.json").read_text())
+    source_manifest_bytes = (native_source / "source_manifest.json").read_bytes()
+    source_manifest = json.loads(source_manifest_bytes)
+    native_context = _native_context_identity(native_source, source_manifest)
+    if native_context["source_manifest.json"] != hashlib.sha256(source_manifest_bytes).hexdigest():
+        raise ValueError("native publication manifest changed while capturing projection inputs")
     source_specs = {d.get("dataset"): d for d in source_manifest["feature_specs"] if d.get("source") == "FinLab"}
     captured = {}
     for d in all_defs:
@@ -126,12 +166,16 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
         "finlab": {key: receipt["sha256"] for key, (_, receipt) in captured.items()},
         "builder_sha": file_sha256(Path(__file__)),
         "sweep_sha": file_sha256(ROOT / "scripts/prepare_tw_day_trade_factorized_panel.py"),
+        "annual_preparation": annual_preparation_identity(),
+        "writer_sha": file_sha256(Path(write_array_block.__code__.co_filename)),
+        "config_sha": file_sha256(config_path), "native_context": native_context,
     }
     generation = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     target = output / "generations" / generation
     if (target / "factorized_manifest.json").is_file():
         manifest = json.loads((target / "factorized_manifest.json").read_text())
         verify_factorized_members(target, manifest)
+        _verify_preparation_inputs(config_path, native_source, source_manifest, identity)
         publish_link(output, target)
         return {"status": "already_current", "manifest": str(target / "factorized_manifest.json"),
                 "decision_session": str(decision), "wall_seconds": time.perf_counter()-started}
@@ -237,8 +281,10 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
                 lifecycle[date_map[day], s] = start.toordinal()
     lifecycle[-1] = lifecycle[-2]
     sweep_dates = dates + [decision]
+    individual_events = AdmittedAnnualObservationEvents(
+        paths, cache_root=annual_cache_root, seed_paths=seed_paths)
     blocks = []
-    for begin, values, _ in causal_state_blocks(sweep_dates, panel.symbols, individual, AnnualObservationEvents(paths), lifecycle, resets=resets,
+    for begin, values, _ in causal_state_blocks(sweep_dates, panel.symbols, individual, individual_events, lifecycle, resets=resets,
                                               column_blocks=True, max_block_bytes=1024**3, model_channel_policy="value_only"):
         keep = min(values.shape[0], len(dates)-begin)
         if keep <= 0:
@@ -251,7 +297,9 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
             parts.append(proof)
         blocks.append({"start": begin, "shape": [keep, len(panel.symbols), len(individual)], "symbol_blocks": parts})
         print(f"[factorized-live] committed {begin}:{begin+keep}", flush=True)
-    common_parts = [values[:, 0] for _, values, _ in causal_state_blocks(sweep_dates, ["*"], common, AnnualObservationEvents(paths), None, model_channel_policy="value_only")]
+    common_events = AdmittedAnnualObservationEvents(
+        paths, cache_root=annual_cache_root, seed_paths=seed_paths)
+    common_parts = [values[:, 0] for _, values, _ in causal_state_blocks(sweep_dates, ["*"], common, common_events, None, model_channel_policy="value_only")]
     shared = np.concatenate(common_parts)[:len(dates)]
     np.save(out / "common.npy", shared, allow_pickle=False)
     os.link(dictionary_path, out / "feature_dictionary.json")
@@ -278,10 +326,12 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
         raise ValueError("public source changed during projection; last good generation retained")
     if any(file_sha256(public / name) != digest for name, digest in calendar_inputs.items()):
         raise ValueError("official decision calendar changed during projection; last good generation retained")
+    _verify_preparation_inputs(config_path, native_source, source_manifest, identity)
     os.replace(out, target)
     publish_link(output, target)
     return {"status": "verified", "manifest": str(target / "factorized_manifest.json"), "decision_session": str(decision),
-            "dates": len(dates), "features": parent["logical_model_channels"], "wall_seconds": time.perf_counter()-started}
+            "dates": len(dates), "features": parent["logical_model_channels"], "wall_seconds": time.perf_counter()-started,
+            "annual_cache": {"individual": individual_events.cache_stats(), "common": common_events.cache_stats()}}
 
 
 def main():
@@ -293,10 +343,13 @@ def main():
     parser.add_argument("--finlab-root", type=Path, default=ROOT / "data_finlab")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--start-date", default="2026-07-01")
+    parser.add_argument("--annual-cache-root", type=Path,
+                        help="Optional verified derived event cache; raw source and model ABI unchanged")
     args = parser.parse_args()
     print(json.dumps(prepare(config_path=args.config, parent_path=args.parent_manifest,
                             native_source=args.native_source, public=args.public_root, finlab=args.finlab_root,
-                            output=args.output_root, start_date=args.start_date), ensure_ascii=False))
+                            output=args.output_root, start_date=args.start_date,
+                            annual_cache_root=args.annual_cache_root), ensure_ascii=False))
 
 
 if __name__ == "__main__":

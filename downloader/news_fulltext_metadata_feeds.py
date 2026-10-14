@@ -11,19 +11,23 @@ import hashlib
 import json
 import re
 import time
+from itertools import islice
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file, table_from_records
 
-VERSION = 1
+VERSION = 2
 FAILURE_DIAGNOSTIC_VERSION = 1
+XML_VALUE_PRESERVATION = 'literal_ascii_controls_in_declared_item_values_v1'
+_XML_CONTROLS = re.compile(rb'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+_MAXIMUM_XML_CONTROLS = 256
 LTN_FEEDS = tuple('https://news.ltn.com.tw/rss/' + name + '.xml' for name in
     ('all', 'politics', 'society', 'life', 'opinion', 'world', 'business', 'sports',
      'entertainment', 'art', 'def', 'local', 'people', 'novelty'))
 
 
-def reviewed_policy(entry, config):
+def reviewed_policy(entry, config, *, data_version=VERSION):
     """No inference from an enabled article adapter or a user purpose label."""
     from downloader.news_fulltext_policy import normalize_url
     raw = entry.get('metadata_feed_policy')
@@ -48,9 +52,97 @@ def reviewed_policy(entry, config):
         expiry = datetime.fromisoformat(auth['valid_until'].replace('Z', '+00:00'))
         if expiry.tzinfo is None:
             raise ValueError('metadata authorization expiry must include timezone')
-    fingerprint = hashlib.sha256(json.dumps({'version': VERSION, 'layout': raw['layout'],
-        'urls': urls, 'authorization': auth}, sort_keys=True).encode()).hexdigest()
+    if data_version not in {1, VERSION}:
+        raise ValueError('unsupported metadata feed data contract')
+    payload = {'version': data_version, 'layout': raw['layout'], 'urls': urls, 'authorization': auth}
+    if data_version == 2:
+        payload['xml_value_preservation'] = XML_VALUE_PRESERVATION
+    fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return tuple(urls) if raw['enabled'] else (), dict(auth), fingerprint, delay
+
+
+def compatible_fingerprints(source):
+    """Only this exact policy's stricter v1; never retag its native receipts."""
+    current = source.metadata_feed_fingerprint
+    if not source.metadata_feeds or not source.metadata_feed_authorization:
+        return (current,)
+    payload = {'version': VERSION, 'layout': 'ltn_rss_information_v1',
+               'urls': list(source.metadata_feeds), 'authorization': source.metadata_feed_authorization,
+               'xml_value_preservation': XML_VALUE_PRESERVATION}
+    expected = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    if current != expected:
+        return (current,)
+    payload.pop('xml_value_preservation')
+    payload['version'] = 1
+    return current, hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def access_policy_fingerprint(source):
+    # Parser representation changes cannot erase an identical source policy's
+    # measured pacing/refusals. The original key is the strict-v1 policy hash.
+    return compatible_fingerprints(source)[-1]
+
+
+def _xml_tree(body):
+    """Strict fast path; lossless fallback ONLY in declared item value text.
+
+    No recover mode, deletion, URL/date repair, entity expansion or changed
+    source bytes. Unique tokens allow strict XML parsing then exact restoration;
+    every token must appear exactly once in an item title/description text.
+    """
+    try:
+        return ET.fromstring(body), []
+    except ET.ParseError as original:
+        failure = original
+    controls = list(islice(_XML_CONTROLS.finditer(body), _MAXIMUM_XML_CONTROLS + 1))
+    if not controls or len(controls) > _MAXIMUM_XML_CONTROLS:
+        raise failure
+    try:
+        body.decode('utf-8')
+    except UnicodeDecodeError:
+        raise failure from None
+    declaration_body = body[3:] if body.startswith(b'\xef\xbb\xbf') else body
+    declaration = re.match(br'\s*<\?xml\s+[^?]*encoding\s*=\s*[\'"]([^\'"]+)', declaration_body, re.I)
+    if declaration and declaration[1].lower() not in {b'utf-8', b'utf8'}:
+        raise failure
+    prefix = 'SA_XML_C0_' + hashlib.sha256(body).hexdigest() + '_'
+    if prefix.encode() in body:
+        raise failure
+    codes = {}
+    def token(match):
+        identifier = prefix + str(len(codes)) + '__'
+        codes[identifier] = match[0][0]
+        return identifier.encode()
+    try:
+        tree = ET.fromstring(_XML_CONTROLS.sub(token, body))
+    except ET.ParseError:
+        raise failure from None
+    permitted = {id(node): (number, node.tag) for number, item in enumerate(tree.findall('./channel/item'))
+                 for node in item if node.tag in {'title', 'description'}}
+    pattern = re.compile(re.escape(prefix) + r'[0-9]+__')
+    restored = set()
+    detail = []
+    for node in tree.iter():
+        if (prefix in node.tag or prefix in (node.tail or '')
+                or any(prefix in k or prefix in v for k, v in node.attrib.items())):
+            raise failure
+        if prefix not in (node.text or ''):
+            continue
+        if id(node) not in permitted:
+            raise failure
+        number, field = permitted[id(node)]
+        def restore(match):
+            identifier = match[0]
+            if identifier not in codes or identifier in restored:
+                raise failure
+            restored.add(identifier)
+            detail.append({'item_index': number, 'field': field, 'codepoint': codes[identifier]})
+            return chr(codes[identifier])
+        node.text = pattern.sub(restore, node.text)
+    if len(restored) != len(codes):
+        # Controls in ignored comments/PI/markup must not silently disappear.
+        raise failure
+    return tree, detail
 
 
 def require_request(registry, url, feed_url):
@@ -86,7 +178,7 @@ def _representation_error(response, source, feed_url, stage, *, xml_error=None, 
     }
     if xml_error is not None:
         detail.update(xml_error_code=xml_error.code, xml_error_position=list(xml_error.position),
-                      xml10_forbidden_ascii_control_count=len(re.findall(br'[\x00-\x08\x0b\x0c\x0e-\x1f]', response.body)))
+                      xml10_forbidden_ascii_control_count=sum(1 for _ in _XML_CONTROLS.finditer(response.body)))
     if root is not None:
         detail.update(rss_root=root.tag == 'rss', rss_version_2=root.get('version') == '2.0')
     if channel_count is not None:
@@ -99,7 +191,7 @@ def _representation_error(response, source, feed_url, stage, *, xml_error=None, 
     return error
 
 
-def parse(response, source, feed_url):
+def _parse(response, source, feed_url):
     from downloader.news_fulltext_policy import NewsError, normalize_url
     if (response.url != feed_url or feed_url not in source.metadata_feeds or response.status != 200
             or response.headers.get('content-type', '').split(';', 1)[0].lower().strip()
@@ -107,7 +199,7 @@ def parse(response, source, feed_url):
             or re.search(br'<!\s*(?:DOCTYPE|ENTITY)\b', response.body, re.I)):
         raise _representation_error(response, source, feed_url, 'response_envelope')
     try:
-        rss = ET.fromstring(response.body)
+        rss, restored_controls = _xml_tree(response.body)
     except ET.ParseError as error:
         raise _representation_error(response, source, feed_url, 'xml_syntax', xml_error=error) from None
     if rss.tag != 'rss' or rss.get('version') != '2.0':
@@ -140,7 +232,14 @@ def parse(response, source, feed_url):
                      'publication_raw': fields['pubDate'], 'publication_aware': published,
                      'publisher_credit': source.metadata_feed_authorization['publisher_credit'],
                      'author': None, 'content_kind': 'rss_information_not_fulltext'})
-    return rows
+    preservation = {'contract_version': 1, 'control_count': len(restored_controls),
+                    'controls': restored_controls, 'original_values_restored': True,
+                    'source_raw_bytes_modified': False} if restored_controls else None
+    return rows, preservation
+
+
+def parse(response, source, feed_url):
+    return _parse(response, source, feed_url)[0]
 
 
 def failure_key(source, feed_url):
@@ -222,17 +321,24 @@ def accept(queue, task, response, rows, records, errors):
     previous = queue.db.execute('SELECT * FROM metadata_feed_heads WHERE provider=? AND feed_url=?',
                                  (source.provider, task['url'])).fetchone()
     if response.status == 304:
-        if (rows or previous is None or task.get('parser_fingerprint') != fingerprint
-                or previous['parser_fingerprint'] != fingerprint
+        if (rows or previous is None or task.get('parser_fingerprint') not in compatible_fingerprints(source)
+                or previous['parser_fingerprint'] != task.get('parser_fingerprint')
                 or task.get('response_sha256') != previous['response_sha256']):
             raise NewsError('unverifiable_metadata_feed_not_modified', retry=True, delay=60)
         receipt = json.loads((queue.root / previous['receipt_path']).read_bytes())
-        if sha256_file(queue.root / receipt['parquet_path']) != receipt['sha256']:
+        fingerprint = previous['parser_fingerprint']  # Never relabel strict-v1 evidence on 304.
+        version = VERSION if fingerprint == source.metadata_feed_fingerprint else 1
+        if (sha256_file(queue.root / receipt['parquet_path']) != receipt['sha256']
+                or receipt['metadata_fingerprint'] != fingerprint or receipt['contract_version'] != version
+                or receipt['response_sha256'] != previous['response_sha256']
+                or receipt['feed_url'] != task['url'] or receipt['provider'] != source.provider
+                or receipt['article_bodies_accepted'] != 0 or receipt['publish'] is not False
+                or receipt['remote_training_export'] is not False):
             raise NewsError('metadata_feed_receipt_mismatch')
     elif response.status == 200:
         if rows:
             raise NewsError('metadata_feed_cannot_accept_preparsed_or_invented_rows')
-        rows = parse(response, source, task['url'])  # Exactly one XML parse, on the canonical writer.
+        rows, preservation = _parse(response, source, task['url'])  # One healthy XML parse, canonical writer.
         digest = hashlib.sha256(response.body).hexdigest()
         feed_id = hashlib.sha256(task['url'].encode()).hexdigest()
         relative = f'metadata_feeds/{fingerprint}/{feed_id}/{digest}.parquet'
@@ -252,6 +358,7 @@ def accept(queue, task, response, rows, records, errors):
                 'contract_version': VERSION, 'parquet_path': relative, 'sha256': sha256_file(target),
                 'response_sha256': digest, 'feed_url': task['url'], 'provider': source.provider,
                 'metadata_fingerprint': fingerprint, 'rows': len(rows), 'response_bytes': len(response.body),
+                'xml_value_preservation': preservation,
                 'article_bodies_accepted': 0, 'publish': False, 'remote_training_export': False,
             }, durable=True)
         target.chmod(0o600)
@@ -283,11 +390,12 @@ def accept(queue, task, response, rows, records, errors):
 def progress(db, source):
     """At most the registered feed count; no article scan or publisher call."""
     jobs, rows = [], []
+    fingerprints = compatible_fingerprints(source)
     for url in source.metadata_feeds:
         row = db.execute('SELECT * FROM metadata_feed_heads WHERE provider=? AND feed_url=?', (source.provider, url)).fetchone()
         job = db.execute('SELECT due,error_code,last_checked_at_utc FROM discovery WHERE url=? AND kind=?',
                          (url, 'metadata_feed')).fetchone()
-        if row is not None and row['parser_fingerprint'] == source.metadata_feed_fingerprint:
+        if row is not None and row['parser_fingerprint'] in fingerprints:
             rows.append(dict(row))
         if job is not None:
             jobs.append(dict(job))

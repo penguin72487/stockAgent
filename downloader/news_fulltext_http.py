@@ -501,6 +501,12 @@ class NewsHTTP:
         host = urlsplit(url).hostname
         request_headers = {"User-Agent": self.config["user_agent"],
                            "Accept": "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9"}
+        if endpoint in {"feed", "rss_fulltext", "metadata_feed"}:
+            # application/xml does not match the distinct RSS/Atom media
+            # types. Declare our existing feed parsers only on registered
+            # endpoints; this changes neither access nor retry permission.
+            request_headers["Accept"] = ("application/rss+xml,application/atom+xml,text/xml,"
+                                         + request_headers["Accept"])
         registered_pdf = bool(source.pdf_path_pattern and re.fullmatch(source.pdf_path_pattern, urlsplit(url).path))
         if registered_pdf:
             # HTTP 406 is content negotiation, not missing source data. Ask for

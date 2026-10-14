@@ -10,6 +10,7 @@ import argparse
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import subprocess
@@ -20,6 +21,29 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.probe_browser_runtime import browser_profile_launch_options
+
+
+def verify_official_reference_fields(quote: dict, canonical: dict) -> int:
+    """Check every published daily field against an independent raw-file read."""
+    assert quote["projection_contract"] == "official_daily_quote_v2"
+    proofs = quote.get("public_price_display", {}).get("visible_fields", {})
+    measures = {"volume_shares", "turnover", "trade_count"}
+    count = 0
+    for field, value in canonical.items():
+        assert quote.get(field) == value, f"official reference differs from canonical field {field}"
+        if value is not None and field not in measures:
+            proof = proofs.get(field, {})
+            assert proof.get("grain") == "daily"
+            assert proof.get("session_date") == quote["session_date"]
+            assert proof.get("source_field") == field
+            expected_license = "11370" if quote["venue"] == "TPEX" else "11549"
+            assert proof.get("license_reference") == f"https://data.gov.tw/dataset/{expected_license}"
+        count += 1
+    if quote["venue"] == "TWSE":
+        assert "last_bid" not in quote and "last_ask" not in quote
+    elif "next_upper_limit" in canonical or "next_lower_limit" in canonical:
+        assert quote["limit_scope"] == "next_exchange_session_published_bounds"
+    return count
 
 
 def snapshot_contract_digest(payload: dict) -> str:
@@ -107,18 +131,39 @@ def main() -> None:
     before_contracts = snapshot_contracts()
     expected = {}
     def fact(day, symbol, venue):
-        key = (day, symbol, venue)
+        key = (day, venue)
         if key not in expected:
-            dataset, code, columns = (("twse_daily_ohlcv", "證券代號", {"open": "開盤價", "close": "收盤價"})
+            dataset, code, columns = (("twse_daily_ohlcv", "證券代號", {
+                "open": "開盤價", "high": "最高價", "low": "最低價", "close": "收盤價",
+                "volume_shares": "成交股數", "turnover": "成交金額", "trade_count": "成交筆數"})
                                      if venue == "TWSE" else
-                                     ("tpex_daily_ohlcv", "代號", {"open": "開盤", "close": "收盤"}))
-            rows = pq.read_table(ROOT / f"data_tw_public/{dataset}.parquet",
-                                 columns=list(columns.values()),
-                                 filters=[("date", "==", day), (code, "==", symbol)]).to_pylist()
-            if len(rows) != 1:
-                raise ValueError("canonical quote is missing or ambiguous")
-            expected[key] = {k: float(str(rows[0][v]).replace(",", "")) for k, v in columns.items()}
-        return expected[key]
+                                     ("tpex_daily_ohlcv", "代號", {
+                "open": "開盤", "high": "最高", "low": "最低", "close": "收盤", "average_price": "均價",
+                "last_bid": "最後買價", "last_ask": "最後賣價", "next_reference_price": "次日參考價",
+                "next_upper_limit": "次日漲停價", "next_lower_limit": "次日跌停價",
+                "volume_shares": "成交股數", "turnover": "成交金額(元)", "trade_count": "成交筆數"}))
+            path = ROOT / f"data_tw_public/{dataset}.parquet"
+            available = set(pq.read_schema(path).names)
+            columns = {key: value for key, value in columns.items() if value in available}
+            rows = pq.read_table(path, columns=[code, *columns.values()], filters=[("date", "==", day)]).to_pylist()
+            facts, duplicates = {}, set()
+            for row in rows:
+                values = {}
+                for field, column in columns.items():
+                    try:
+                        number = float(str(row[column]).replace(",", "").strip())
+                        valid = (number >= 0 if field in {"volume_shares", "turnover", "trade_count"} else number > 0)
+                        values[field] = number if math.isfinite(number) and valid else None
+                    except (TypeError, ValueError):
+                        values[field] = None
+                if row[code] in facts:
+                    duplicates.add(row[code])
+                facts[row[code]] = values
+            expected[key] = (facts, duplicates)
+        facts, duplicates = expected[key]
+        if symbol in duplicates or symbol not in facts:
+            raise ValueError("canonical quote is missing or ambiguous")
+        return facts[symbol]
     try:
         originals = {}
         for day in (args.session_date, args.history_date):
@@ -143,7 +188,10 @@ def main() -> None:
         ):
             url = f"{args.url.rstrip('/')}/{product}/api/{endpoint}?date={day}"
             if endpoint != "status":
-                url += "&limit=100"
+                # Use the same calendar RANGE contract as the frontend. A
+                # single-date selector correctly rejects a date absent from
+                # this product's retained sessions; a range reports that gap.
+                url = f"{args.url.rstrip('/')}/{product}/api/{endpoint}?start_date={day}&end_date={day}&limit=100"
             timings = []
             for _ in range(3):
                 start = time.perf_counter()
@@ -155,15 +203,18 @@ def main() -> None:
             if product == "tw-day-trade" or endpoint == "status":
                 assert quotes, "expected public official quotes are absent"
             # Independent direct Arrow read, not the new source adapter.
-            for quote in quotes[:3]:
+            checked_fields = 0
+            for quote in quotes:
                 ref = fact(quote["session_date"], quote["symbol"], quote["venue"])
-                for field in ("open", "close"):
-                    assert quote[field] == ref[field], "public price differs from canonical official value"
+                checked_fields += verify_official_reference_fields(quote, ref)
             receipt["api"].append({"product": product, "endpoint": endpoint, "date": day,
                 "timings_ms": timings, "returned": len(rows), "official_daily_quotes": len(quotes),
                 "visible_entry_prices": sum(row.get("entry_price") is not None for row in rows),
                 "visible_exit_prices": sum(row.get("exit_price") is not None for row in rows),
-                "health": data.get("health"), "independent_price_checks": min(3, len(quotes))})
+                "health": data.get("health"), "independent_price_checks": len(quotes),
+                "independent_reference_field_checks": checked_fields,
+                "selected_ledger_sessions": data.get("session_dates"),
+                "selected_session_recorded": bool(data.get("session_dates")) if endpoint != "status" else None})
             if endpoint == "status":
                 policy = data["price_display_policy"]
                 assert policy["broker_public_display_permission"] == "unverified"
@@ -232,7 +283,7 @@ def main() -> None:
                             f"0050 開 {price_text(reference['open'])}／收 {price_text(reference['close'])}")
                         expect(notice).to_contain_text("公開展示授權待確認")
                         expect(notice).to_contain_text("模擬帳本成交，非券商成交")
-                        for asset, minimum in (("app.js", 101), ("detail-components.js", 13)):
+                        for asset, minimum in (("app.js", 101), ("detail-components.js", 16)):
                             versions = [int(parse_qs(urlparse(url).query).get("v", ["0"])[0])
                                         for url in assets if urlparse(url).path.endswith("/" + asset)]
                             assert versions and max(versions) >= minimum, "old immutable frontend asset is still referenced"
@@ -249,6 +300,17 @@ def main() -> None:
                             expect(quote.locator("..")).to_contain_text("（臺北）", timeout=10_000)
                             expect(quote.locator("..")).to_contain_text("模擬帳本成交", timeout=10_000)
                             expect(quote.locator("..")).to_contain_text("非券商成交", timeout=10_000)
+                            reference_summary = page.locator("#position-body .daily-reference-details summary").filter(has_text="次日界線").first
+                            reference_summary.wait_for(state="visible", timeout=20_000)
+                            reference_summary.scroll_into_view_if_needed()
+                            reference_summary.click()
+                            reference_details = reference_summary.locator("..")
+                            expect(reference_details).to_have_attribute("open", "")
+                            expect(reference_details).to_contain_text("次一交易日申報上界")
+                            expect(reference_details).to_contain_text("盤後最後買")
+                            expect(reference_details).to_contain_text("盤後最後賣")
+                            reference_screenshot = args.output_dir / f"{product}-official-details-{width}.png"
+                            page.screenshot(path=str(reference_screenshot))
                         dimensions = page.evaluate("() => ({viewport: innerWidth, document: document.documentElement.scrollWidth})")
                         assert dimensions["document"] <= dimensions["viewport"], "page-level horizontal overflow"
                         if product == "tw-day-trade":
@@ -258,7 +320,8 @@ def main() -> None:
                         receipt["browser"].append({"product": product, "viewport": [width, height],
                             "official_notice_visible_ms": visible_ms, "notice": notice.inner_text(),
                             "page_errors": errors, "dimensions": dimensions, "screenshot": str(screenshot),
-                            "frontend_assets": assets})
+                            "frontend_assets": assets,
+                            "reference_details_click_verified": product == "tw-day-trade"})
                         page.close()
             finally:
                 browser.close()

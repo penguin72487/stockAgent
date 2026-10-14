@@ -4193,6 +4193,14 @@ def repair_tw_opening_snapshot_receipt(
         _mask, official_scope = opening_scope([], session_date)
         requested = official_scope["symbols"]
     missing = [symbol for symbol in requested if symbol not in rows or not _opening_row_has_open(rows[symbol][1], session_date)]
+    resolved_before = {
+        symbol for symbol in requested if symbol in rows and (
+            _opening_row_has_open(rows[symbol][1], session_date)
+            or _same_taipei_open_timestamp(
+                int(rows[symbol][1].get("no_open_print_observed_ms") or 0), session_date,
+            )
+        )
+    }
     if official_scope is not None:
         # A scope-only correction also needs publication when every open is
         # already present; retain the prior receipt as immutable evidence.
@@ -4218,6 +4226,7 @@ def repair_tw_opening_snapshot_receipt(
     no_print = [symbol for symbol in remaining if symbol in rows and _same_taipei_open_timestamp(
         int(rows[symbol][1].get("no_open_print_observed_ms") or 0), session_date,
     )]
+    resolved_after = (set(requested) - set(remaining)) | set(no_print)
     return {
         "status": "awaiting_first_print" if remaining and len(no_print) == len(remaining) else "waiting_source" if remaining else "complete",
         "session_date": session_date, "requested_count": len(requested),
@@ -4226,6 +4235,8 @@ def repair_tw_opening_snapshot_receipt(
         "reported_no_open_print_count": len(no_print), "reported_no_open_print_symbols": no_print,
         "unresolved_source_count": len(remaining) - len(no_print),
         "newly_requested_count": len(missing), "recovered_count": len(missing) - len(remaining),
+        "resolved_input_count": len(resolved_after),
+        "recovered_input_count": len(resolved_after - resolved_before),
         "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
         "opening_acquisition": source_timing,
         **({"official_trading_universe": official_scope} if official_scope is not None else {}),

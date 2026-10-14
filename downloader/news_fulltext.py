@@ -301,11 +301,14 @@ def seed_discovery(queue: NewsQueue):
     with queue.db:
         for source in queue.registry.sources.values():
             if source.metadata_feeds:
+                from downloader.news_fulltext_metadata_feeds import compatible_fingerprints as metadata_fingerprints
+                fingerprints = metadata_fingerprints(source)
                 queue.db.executemany("INSERT INTO discovery(url,kind,provider,priority) VALUES (?,'metadata_feed',?,0) "
                     "ON CONFLICT(url) DO UPDATE SET kind='metadata_feed',priority=0,"
                     "due=CASE WHEN error_code IS NULL THEN 0 ELSE due END "
-                    "WHERE kind!='metadata_feed' OR (parser_fingerprint IS NOT NULL AND parser_fingerprint!=?)",
-                    ((url, source.provider, source.metadata_feed_fingerprint) for url in source.metadata_feeds))
+                    "WHERE kind!='metadata_feed' OR (parser_fingerprint IS NOT NULL AND parser_fingerprint NOT IN ("
+                    + ','.join('?' for _ in fingerprints) + '))',
+                    ((url, source.provider, *fingerprints) for url in source.metadata_feeds))
             if source.allowed and source.acquisition_mode != "finite":
                 queue.db.executemany("INSERT OR IGNORE INTO discovery(url,kind,provider) VALUES (?,?,?)",
                                      ((url, kind, source.provider) for kind, urls in (("feed", source.feeds), ("sitemap", source.sitemaps))
@@ -449,6 +452,9 @@ def fetch_discovery(http: NewsHTTP, task: dict):
     fingerprint = (source.metadata_feed_fingerprint if metadata else
                    source.cnyes_index_data_fingerprint if index_task else discovery_fingerprint(source))
     compatible = task.get("parser_fingerprint") == fingerprint
+    if metadata:
+        from downloader.news_fulltext_metadata_feeds import compatible_fingerprints as metadata_fingerprints
+        compatible = task.get('parser_fingerprint') in metadata_fingerprints(source)
     if index_task:
         from downloader.news_fulltext_cnyes_index import compatible_fingerprints
         compatible = task.get('parser_fingerprint') in compatible_fingerprints(source)

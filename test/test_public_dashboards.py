@@ -13,6 +13,7 @@ import pytest
 
 from scripts import snapshot_data_refresh_services as snapshot_service
 from scripts.serve_public_dashboards import (
+    DashboardSessionUnavailable,
     InvalidPublicRequest,
     PublicRouteNotFound,
     PublicDashboardHandler,
@@ -49,6 +50,27 @@ def _keys(value: object) -> set[str]:
         for item in value:
             found.update(_keys(item))
     return found
+
+
+@pytest.mark.parametrize("product", ["tw-day-trade", "tw-overnight"])
+def test_unrecorded_session_is_not_reported_as_a_service_failure(monkeypatch, product):
+    def unavailable(*args, **kwargs):
+        raise DashboardSessionUnavailable("private source path and source internals must stay private")
+    monkeypatch.setattr(PublicDashboardHandler, "_api_response", unavailable)
+    server = _test_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        connection.request("GET", f"/{product}/api/signals?date=2026-10-13")
+        response = connection.getresponse()
+        assert response.status == 404
+        assert json.loads(response.read()) == {"health": "waiting", "error": "session_unavailable", "data_complete": False}
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_taifex_history_has_one_refresh_owner_not_stacked_stale_cache() -> None:

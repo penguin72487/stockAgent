@@ -3,12 +3,14 @@ from datetime import date
 import os
 from pathlib import Path
 import subprocess
+import sys
 import pytest
 
 from scripts import update_tw_day_trade_factorized_live as updater
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 from stockagent.live.market_status import TwStockDayDecision
 from scripts import prepare_tw_day_trade_factorized_live as builder
+from stockagent.data.annual_cache_admission import AnnualCacheBuildDeferred, CONTRACT
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native WSL direct executable entrypoint")
@@ -18,6 +20,65 @@ def test_native_updater_is_executable_and_help_does_not_launch_the_data_owner():
     result = subprocess.run([str(path), "--help"], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert "--phase {preopen,completed}" in result.stdout
+
+
+@pytest.mark.parametrize("threads", [2, 3])
+def test_fresh_source_entrypoint_configures_both_actual_pools_without_cuda(threads):
+    script = """
+import json, os, runpy, sys
+sys.argv = [sys.argv[1], '--help']
+try:
+    runpy.run_path(sys.argv[0], run_name='__main__')
+except SystemExit as exc:
+    assert exc.code == 0
+else:
+    raise AssertionError('help did not exit before invoking the data owner')
+import polars as pl, pyarrow as pa, torch
+visible = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+expected = min(int(os.environ['STOCKAGENT_FACTORIZED_PREP_THREADS']), visible)
+assert pl.thread_pool_size() == pa.cpu_count() == expected
+assert os.environ['CUDA_VISIBLE_DEVICES'] == '' and not torch.cuda.is_initialized()
+print(json.dumps({'polars': pl.thread_pool_size(), 'arrow': pa.cpu_count(), 'expected': expected}))
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(Path(updater.__file__).resolve())],
+        env={**os.environ, "STOCKAGENT_FACTORIZED_PREP_THREADS": str(threads),
+             "POLARS_MAX_THREADS": "64", "OMP_NUM_THREADS": "64"},
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout.splitlines()[-1])
+    assert observed["polars"] == observed["arrow"] == observed["expected"]
+
+
+@pytest.mark.parametrize("phase", ["preopen", "completed"])
+def test_scheduled_entrypoint_uses_the_canonical_cache_and_records_actual_pools(tmp_path, monkeypatch, phase):
+    monkeypatch.setattr(updater, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", [str(updater.__file__), "--phase", phase])
+    pools = {"polars_observed_threads": 2, "arrow_observed_threads": 2,
+             "process_cpu_quota": False}
+    commands, preparation = [], []
+
+    def source_command(command, *, cwd, check):
+        assert cwd == tmp_path and check is True
+        commands.append(command)
+
+    def prepare(**kwargs):
+        preparation.append(kwargs)
+        return {"status": "verified", "decision_session": "2026-10-14"}
+
+    monkeypatch.setattr(updater.subprocess, "run", source_command)
+    monkeypatch.setattr(updater, "prepare", prepare)
+    monkeypatch.setattr(updater, "_processing_pools", lambda: pools)
+    updater.main()
+    assert len(commands) == len(preparation) == 1
+    expected_script = ("activate_tw_public_opening_data.py" if phase == "preopen"
+                       else "finalize_tw_public_completed_session.py")
+    assert commands[0][:2] == [sys.executable, str(tmp_path / "scripts" / expected_script)]
+    assert preparation[0]["annual_cache_root"] == tmp_path / "artifacts/cache/tw_factorized_live/annual"
+    assert preparation[0]["start_date"] == "2025-12-01"
+    receipt = tmp_path / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/updater_status.json"
+    status = json.loads(receipt.read_text())
+    assert status["status"] == "verified" and status["phase"] == phase
+    assert status["attempt"] == 1 and status["processing_pools"] == pools
 
 
 def _clock(monkeypatch):
@@ -79,6 +140,35 @@ def test_corruption_is_not_treated_as_a_busy_writer(tmp_path, monkeypatch):
     assert status["status"] == "failed_retryable"
     assert status["attempt"] == 2
     assert status["error_type"] == "ValueError"
+    assert "source_wait_expired" not in status
+
+
+@pytest.mark.parametrize("phase", ["preopen", "completed"])
+def test_denied_cache_build_records_the_existing_owner_without_repeating(tmp_path, monkeypatch, phase):
+    clock = _clock(monkeypatch)
+    calls = []
+    details = {"contract": CONTRACT, "reason": "insufficient_memory_headroom",
+               "source": str(tmp_path / "2025.parquet"), "immutable_seed": True,
+               "required_headroom_bytes": 26 << 30, "observed_headroom_bytes": 23 << 30}
+    failure = AnnualCacheBuildDeferred(details)
+
+    def operation():
+        calls.append(clock[0])
+        raise failure
+
+    receipt = tmp_path / "status.json"
+    with pytest.raises(AnnualCacheBuildDeferred) as error:
+        updater._prepare_with_retry(operation, receipt_path=receipt, phase=phase,
+                                    attempts=4, source_wait_seconds=600)
+    assert error.value is failure
+    assert calls == [0.0] and clock[0] == 0.0
+    status = json.loads(receipt.read_text())
+    assert status["status"] == "cache_warming_required"
+    assert status["phase"] == phase and status["attempt"] == 1
+    assert status["admission"] == details
+    assert status["retry_owner"] == "stockagent-discord-artifact-maintenance.service"
+    assert status["model_executed"] is False
+    assert status["last_good_generation_retained"] is True
     assert "source_wait_expired" not in status
 
 

@@ -236,6 +236,7 @@ def test_durable_source_repair_retries_a_completely_missing_response(monkeypatch
     owner_session.metrics["official_mis"]["retry_after_monotonic"] = 0.0
     second = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
     assert second["status"] == "complete" and second["valid_open_count"] == 2
+    assert second["resolved_input_count"] == 2 and second["recovered_input_count"] == 1
     assert requests == [["B"], ["B"]]
     receipt = json.loads(quotes._tw_mis_opening_receipt_path(session).read_text())
     assert receipt["requested_count"] == 2 and receipt["missing_open_symbols"] == []
@@ -266,6 +267,28 @@ def test_mis_zero_volume_with_no_open_is_waiting_print_not_transport_failure(mon
     assert result["reported_no_open_print_count"] == 1
     assert result["unresolved_source_count"] == 0
     assert result["valid_open_count"] == 0
+    assert result["resolved_input_count"] == 1 and result["recovered_input_count"] == 0
+
+
+def test_new_no_first_print_is_input_progress_without_becoming_an_execution_price(monkeypatch, tmp_path):
+    quotes.seed_tw_opening_snapshot_cache(
+        ["A", "B"], snapshot([100.0, np.nan], available=[True, False]), parquet_root=tmp_path,
+    )
+    no_print = snapshot([np.nan])
+    no_print.volumes = np.zeros(1)
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", lambda *a, **k: no_print)
+    session = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    result = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
+    assert result["status"] == "awaiting_first_print"
+    assert result["recovered_count"] == 0
+    assert result["recovered_input_count"] == 1
+    assert result["resolved_input_count"] == 2
+    assert result["valid_open_count"] == 1
+    assert result["missing_open_symbols"] == ["B"]
+    cached = quotes.fetch_tw_mis_opening_snapshot(
+        ["B"], np.array([99.0]), parquet_root=tmp_path, allow_network=False,
+    )
+    assert np.isnan(cached.open_prices[0])
 
 
 @pytest.mark.parametrize("raw,expected", [(0, 0.0), ("0", 0.0), ("1,000", 1000.0), (None, None), ("-", None), (-1, None)])

@@ -39,7 +39,7 @@ def test_verified_moneyweekly_exact_original_body_byline_and_date_only(source):
     assert json.loads(article['authors_json']) == ['理周投研部']
     assert article['published_at_raw'] == '2026/10/8'
     assert article['extraction_method'] == 'css:.div_Article_Info[itemprop=articleBody]'
-    assert source.allowed and source.acquisition_mode == 'finite'
+    assert source.allowed and source.acquisition_mode == 'continuous'
     assert source.authorization['kind'] == 'personal_research'
     assert not source.feeds and not source.sitemaps and not source.index_pages
 

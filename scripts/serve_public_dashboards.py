@@ -94,6 +94,7 @@ from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
     page_from_source_rows,
 )
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
+    DashboardSessionUnavailable,
     DEFAULT_MAX_SOURCE_AGE_SECONDS,
     DEFAULT_OPENING_GATE_PATH,
     build_dashboard_event_page,
@@ -4179,6 +4180,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": "invalid_request"},
+                    head_only=head_only,
+                )
+                return
+            except DashboardSessionUnavailable:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"health": "waiting", "error": "session_unavailable", "data_complete": False},
                     head_only=head_only,
                 )
                 return

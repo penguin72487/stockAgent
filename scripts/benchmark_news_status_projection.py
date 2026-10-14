@@ -54,7 +54,8 @@ def scan_discovery_status(db, now):
 
 
 def profile_current_status(root, registry, repetitions=5, *, compare_discovery_summary=False,
-                           compare_bulk_error_summary=False, compare_discovery_transactional=False):
+                           compare_bulk_error_summary=False, compare_discovery_transactional=False,
+                           compare_scope_cache=False):
     """Replay the canonical whole heartbeat without an owner or source writes.
 
     The only publisher is replaced with exact JSON serialization in this
@@ -64,7 +65,8 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
     """
     if not 3 <= repetitions <= 15:
         raise ValueError('bounded_repetition_count_required')
-    if sum((compare_discovery_summary, compare_bulk_error_summary, compare_discovery_transactional)) > 1:
+    if sum((compare_discovery_summary, compare_bulk_error_summary, compare_discovery_transactional,
+            compare_scope_cache)) > 1:
         raise ValueError('one_projection_comparison_per_snapshot_required')
     payload = (root / 'status.json').read_bytes()
     published = json.loads(payload)
@@ -129,6 +131,13 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                 summary_seeded_in_temporary_table = True
             if bulk_item_error_count(db) != bulk_error_rows:
                 raise ValueError('bulk_error_incremental_count_mismatch')
+        from downloader import news_fulltext_cnyes_history as history
+        scope_parser = history.scope_key
+        uncached_scope_parser = lambda url: history._parse_scope_key(url, history.CNYES_QUERY_DAY_OFFSET_SECONDS)
+        if compare_scope_cache:
+            # Only this isolated reader's pure parse cache is cleared. Live
+            # evidence, source rows and the acquisition owner's cache are not.
+            history._cached_scope_key.cache_clear()
         observed, epoch, monotonic = utc_now(), time.time(), time.monotonic()
         projectors = ({'legacy': (scan_discovery_status, bulk_item_error_count),
                        'summary': (summarize_discovery_status, bulk_item_error_count)}
@@ -139,6 +148,9 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                       {'legacy': (summarize_discovery_status, legacy_bulk_item_error_count),
                        'summary': (summarize_discovery_status, bulk_item_error_count)}
                       if compare_bulk_error_summary else
+                      {'legacy': (summarize_discovery_status, bulk_item_error_count),
+                       'summary': (summarize_discovery_status, bulk_item_error_count)}
+                      if compare_scope_cache else
                       {'current': (summarize_discovery_status, bulk_item_error_count)})
         measurements, identities = {name: [] for name in projectors}, {name: set() for name in projectors}
         sizes = {}
@@ -149,12 +161,18 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                 order = list(projectors) if number % 2 == 0 else list(reversed(projectors))
                 for name in order:
                     discovery_projector, error_projector = projectors[name]
+                    cache_before = history._cached_scope_key.cache_info()._asdict() if compare_scope_cache else None
                     with (patch('downloader.news_fulltext_queue.summarize_discovery_status', discovery_projector),
-                          patch('downloader.news_fulltext_queue.bulk_item_error_count', error_projector)):
+                          patch('downloader.news_fulltext_queue.bulk_item_error_count', error_projector),
+                          patch.object(history, 'scope_key', uncached_scope_parser
+                                      if compare_scope_cache and name == 'legacy' else scope_parser)):
                         started_wall, started_cpu = time.perf_counter(), time.process_time()
                         view.status(activity='read_only_projection_replay')
                         measurements[name].append({'wall_seconds': time.perf_counter() - started_wall,
                                                    'cpu_seconds': time.process_time() - started_cpu})
+                    if compare_scope_cache:
+                        measurements[name][-1].update(scope_cache_before=cache_before,
+                            scope_cache_after=history._cached_scope_key.cache_info()._asdict())
                     output = serialized.pop()
                     sizes[name] = len(output)
                     identities[name].add(hashlib.sha256(output).hexdigest())
@@ -188,7 +206,12 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                 'profiler_time_basis': 'explicit process CPU clock; profiled run excluded from timing medians',
                 'speedups': {unit: medians['legacy'][unit] / medians['summary'][unit]
                              for unit in ('wall_seconds', 'cpu_seconds')}
-                             if compare_discovery_summary or compare_bulk_error_summary or compare_discovery_transactional else None,
+                             if compare_discovery_summary or compare_bulk_error_summary or compare_discovery_transactional or compare_scope_cache else None,
+                **({'scope_parse_cache': {'maximum_entries': history.SCOPE_KEY_CACHE_SIZE,
+                    'maximum_url_chars': history.SCOPE_KEY_CACHE_MAX_URL_CHARS,
+                    'first_summary_trial_includes_cold_cache': True,
+                    'source_rows_cached': False, 'date_offset_in_cache_key': True}}
+                   if compare_scope_cache else {}),
                 'discovery_summary_seeded_in_temporary_tables': discovery_seeded_in_temporary_tables,
                 'discovery_temporary_seed_wall_seconds': discovery_seed_seconds,
                 'discovery_deadline_groups': discovery_groups,
@@ -280,20 +303,23 @@ def main(argv=None):
     parser.add_argument('--compare-discovery-summary', action='store_true')
     parser.add_argument('--compare-bulk-error-summary', action='store_true')
     parser.add_argument('--compare-discovery-transactional', action='store_true')
+    parser.add_argument('--compare-scope-cache', action='store_true')
     args = parser.parse_args(argv)
     if not 3 <= args.repeat <= 15:
         parser.error("bounded repetition count required")
-    if (args.compare_discovery_summary or args.compare_bulk_error_summary or args.compare_discovery_transactional) and not args.profile_current_status:
+    if (args.compare_discovery_summary or args.compare_bulk_error_summary or args.compare_discovery_transactional or args.compare_scope_cache) and not args.profile_current_status:
         parser.error('projection comparison requires --profile-current-status')
-    if sum((args.compare_discovery_summary,args.compare_bulk_error_summary,args.compare_discovery_transactional)) > 1:
+    if sum((args.compare_discovery_summary,args.compare_bulk_error_summary,args.compare_discovery_transactional,
+            args.compare_scope_cache)) > 1:
         parser.error('select one projection comparison')
     config, registry, repo = load_config(args.config)
     result = (profile_current_status(repo / config['root'], registry, args.repeat,
                                     compare_discovery_summary=args.compare_discovery_summary,
                                     compare_bulk_error_summary=args.compare_bulk_error_summary,
-                                    compare_discovery_transactional=args.compare_discovery_transactional)
+                                    compare_discovery_transactional=args.compare_discovery_transactional,
+                                    compare_scope_cache=args.compare_scope_cache)
               if args.profile_current_status else benchmark(repo / config["root"], registry, args.repeat))
-    result["implementation_sha256"] = {str(path): sha256_file(path) for path in (Path(__file__), Path("downloader/news_fulltext_queue.py"), Path('downloader/news_fulltext_status.py'))}
+    result["implementation_sha256"] = {str(path): sha256_file(path) for path in (Path(__file__), Path("downloader/news_fulltext_queue.py"), Path('downloader/news_fulltext_status.py'), Path('downloader/news_fulltext_cnyes_history.py'))}
     atomic_write_json(args.output, result)
     print(json.dumps({key: result[key] for key in ("accepted", "coverage_scopes", "source_endpoints", "serialized_projection_bytes", "serialized_status_bytes", "medians", "scope") if key in result}))
     return 0 if result["accepted"] else 1

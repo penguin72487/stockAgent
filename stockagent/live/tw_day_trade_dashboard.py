@@ -5037,6 +5037,10 @@ def _available_session_dates(
     return list(result)
 
 
+class DashboardSessionUnavailable(ValueError):
+    """Valid date selection with no retained session, not a service failure."""
+
+
 def _select_session_date(requested: str | None, available: list[str]) -> str:
     text = str(requested or "").strip()
     if text:
@@ -5045,10 +5049,10 @@ def _select_session_date(requested: str | None, available: list[str]) -> str:
         except ValueError as exc:
             raise ValueError(f"invalid dashboard session date: {text}") from exc
         if text not in available:
-            raise ValueError(f"dashboard session date is unavailable: {text}")
+            raise DashboardSessionUnavailable(f"dashboard session date is unavailable: {text}")
         return text
     if not available:
-        raise ValueError("dashboard has no available session dates")
+        raise DashboardSessionUnavailable("dashboard has no available session dates")
     return available[0]
 
 
@@ -5062,7 +5066,7 @@ def _select_session_range(
     """Resolve calendar boundaries over the actual retained trading sessions."""
 
     if not available:
-        raise ValueError("dashboard has no available session dates")
+        raise DashboardSessionUnavailable("dashboard has no available session dates")
     if session_date and not start_date and not end_date:
         selected_end = _select_session_date(session_date, available)
         selected_start = selected_end

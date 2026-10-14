@@ -3300,6 +3300,18 @@ def globalvoices_verified_nontext_body(soup, source, *, page_url):
 def cnyes_verified_short_body(soup, source, article, body, *, page_url, restore_source_spacing=False):
     """Confirm a short, already-declared public body; never supply new text.
 
+    Keep the original short-body boundary. Long spacing recovery shares the
+    identity proof below but cannot extend short/table/quote acceptance.
+    """
+    if source.provider != 'cnyes' or not 0 < len(body) < 100 or article.get('@type') != 'NewsArticle':
+        return None
+    return _cnyes_verified_visible_current_body(soup, source, article, body, page_url=page_url,
+                                               restore_source_spacing=restore_source_spacing)
+
+
+def _cnyes_verified_visible_current_body(soup, source, article, body, *, page_url, restore_source_spacing=False):
+    """Whole declared, visible and current body proof; not a length heuristic.
+
     Actual Cnyes flash reports have 35--78 characters. A length threshold is
     not completeness evidence. Require the canonical identity, JSON-LD clock,
     whole visible container/tables and current free/full-content declaration to
@@ -3309,7 +3321,7 @@ def cnyes_verified_short_body(soup, source, article, body, *, page_url, restore_
     """
     from downloader.news_fulltext_policy import _plain_text, _plain_text_node, normalize_url, _NON_BODY_TAGS
 
-    if source.provider != 'cnyes' or not 0 < len(body) < 100 or article.get('@type') != 'NewsArticle':
+    if source.provider != 'cnyes' or not body or article.get('@type') != 'NewsArticle':
         return None
     try:
         expected = normalize_url(page_url)
@@ -3395,15 +3407,24 @@ def cnyes_verified_short_body(soup, source, article, body, *, page_url, restore_
 
 
 def cnyes_verified_short_prose_spacing(soup, source, article, body, *, page_url):
+    """Original short-only caller; share proof without extending its scope."""
+    if not isinstance(body, str) or not 0 < len(body) < 100:
+        return None
+    return cnyes_verified_prose_spacing(soup, source, article, body, page_url=page_url)
+
+
+def cnyes_verified_prose_spacing(soup, source, article, body, *, page_url):
     """Cheap candidate gate before full native identity/current-content proof.
 
     The existing eight-word guard stays in force on the actual source prose.
     Tiny/quote-only/unknown bodies do not parse the native stream again. This
     repairs a representation loss, not a missing publication or article body.
+    4888694's long English JSON-LD also removes every space. Recover only the
+    whole visible/current text's actual spacing, never invented word breaks.
     """
     from downloader.news_fulltext_policy import _plain_text_node
 
-    if (source.provider != 'cnyes' or not isinstance(body, str) or not 0 < len(body) < 100
+    if (source.provider != 'cnyes' or not isinstance(body, str) or not body
             or re.search(r'[\u3400-\u9fff]', body)):
         return None
     scope = _cnyes_visible_article_scope(soup)
@@ -3413,7 +3434,8 @@ def cnyes_verified_short_prose_spacing(soup, source, article, body, *, page_url)
         '[id^="div-gpt-ad-cnyes_news_article_"]'), parser=source.html_parser)
     if len(visible.split()) < 8 or not re.search(r'[A-Za-z]', visible):
         return None
-    return cnyes_verified_short_body(soup, source, article, body, page_url=page_url, restore_source_spacing=True)
+    return _cnyes_verified_visible_current_body(soup, source, article, body, page_url=page_url,
+                                               restore_source_spacing=True)
 
 
 def cnyes_verified_quote_only_body(soup, source, article, body, *, page_url):

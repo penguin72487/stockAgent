@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import math
 from pathlib import Path
@@ -19,17 +19,35 @@ from stockagent.live.public_quote_display import PROTECTED_OBSERVATIONS_KEY, TAI
 
 
 DAILY_QUOTE_FIELD = "official_daily_quote"
+DAILY_PROJECTION_CONTRACT = "official_daily_quote_v2"
 _SPECS = (
     ("twse_daily_ohlcv", "TWSE", "證券代號", "TWSE", ("twse.com.tw",),
      {"open": "開盤價", "high": "最高價", "low": "最低價", "close": "收盤價"}),
     ("tpex_daily_ohlcv", "TPEX", "代號", "TPEx", ("tpex.org.tw",),
      {"open": "開盤", "high": "最高", "low": "最低", "close": "收盤"}),
 )
+# These are the exchange's published AFTER-CLOSE fields, not live Bid/Ask.
+# Optional columns preserve older canonical schemas without dropping OHLC.
+_OPTIONAL_PRICES = {
+    # Dataset 11549 does not license the full-universe final Bid/Ask fields.
+    # The canonical MI_INDEX file has them, but availability is not a grant.
+    "TWSE": {},
+    "TPEX": {"last_bid": "最後買價", "last_ask": "最後賣價", "average_price": "均價",
+             "next_reference_price": "次日參考價", "next_upper_limit": "次日漲停價",
+             "next_lower_limit": "次日跌停價"},
+}
+_OPTIONAL_MEASURES = {
+    "TWSE": {"volume_shares": "成交股數", "turnover": "成交金額", "trade_count": "成交筆數"},
+    "TPEX": {"volume_shares": "成交股數", "turnover": "成交金額(元)", "trade_count": "成交筆數"},
+}
 
 
 def _day(value: Any) -> str | None:
+    text = str(value)
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        return None
     try:
-        return datetime.strptime(str(value), "%Y-%m-%d").date().isoformat()
+        return date.fromisoformat(text).isoformat()
     except ValueError:
         return None
 
@@ -40,6 +58,16 @@ def _price(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) and result > 0 else None
+
+
+def _measure(value: Any) -> int | float | None:
+    try:
+        result = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result) or result < 0:
+        return None
+    return int(result) if result.is_integer() else result
 
 
 def _closing_clock(value: Any) -> bool:
@@ -63,6 +91,7 @@ class OfficialDailyQuoteSource:
         self._lock = threading.RLock()
         self._signature: tuple[Any, ...] = ()
         self._sessions: OrderedDict[str, dict[str, dict[str, Any]]] = OrderedDict()
+        self._prior_sessions: OrderedDict[str, str | None] = OrderedDict()
 
     def signature(self) -> tuple[Any, ...]:
         values = []
@@ -85,9 +114,12 @@ class OfficialDailyQuoteSource:
         for dataset, venue, symbol_column, source, domains, columns in _SPECS:
             path = self.public_root / f"{dataset}.parquet"
             try:
+                available = set(pq.read_schema(path).names)
+                optional_prices = {key: col for key, col in _OPTIONAL_PRICES[venue].items() if col in available}
+                measures = {key: col for key, col in _OPTIONAL_MEASURES[venue].items() if col in available}
                 rows = pq.read_table(path, filters=[("date", "==", session)], columns=[
                     "date", symbol_column, *columns.values(), "_dataset", "_source",
-                    "_downloaded_at_utc", "_url",
+                    "_downloaded_at_utc", "_url", *optional_prices.values(), *measures.values(),
                 ]).to_pylist()
             except (OSError, ValueError, KeyError):
                 # A broken source cannot manufacture prices or stop the other venue.
@@ -104,15 +136,25 @@ class OfficialDailyQuoteSource:
                     and any(host == domain or host.endswith("." + domain) for domain in domains)
                     and _session(clock) is not None
                 )
+                if verified:
+                    received = datetime.fromisoformat(str(clock).replace("Z", "+00:00"))
+                    verified = (datetime.fromisoformat(f"{session}T13:30:00+08:00")
+                                <= received <= datetime.now(TAIPEI))
                 if not verified:
                     ambiguous.add(symbol)
                     continue
-                prices = {field: _price(row.get(column)) for field, column in columns.items()}
+                prices = {field: _price(row.get(column)) for field, column in {**columns, **optional_prices}.items()}
                 if not any(value is not None for value in prices.values()):
                     continue  # Official no-trade markers are not zero prices.
                 item = {"symbol": symbol, "session_date": session, "venue": venue,
                         "dataset_id": dataset, "grain": "daily", "received_at": clock,
-                        **prices}
+                        "projection_contract": DAILY_PROJECTION_CONTRACT,
+                        "quote_context": "official_after_close_not_realtime",
+                        **prices, **{key: _measure(row.get(col)) for key, col in measures.items()}}
+                if "next_upper_limit" in prices or "next_lower_limit" in prices:
+                    # Retain official no-limit sentinels verbatim. Do not call
+                    # these today's prices or infer a universal +/-10% rule.
+                    item["limit_scope"] = "next_exchange_session_published_bounds"
                 prior = result.get(symbol)
                 if prior and (prior["venue"] != venue or any(prior[k] != item[k] for k in prices)):
                     ambiguous.add(symbol)
@@ -129,6 +171,7 @@ class OfficialDailyQuoteSource:
             signature = self.signature()
             if signature != self._signature:
                 self._sessions.clear()
+                self._prior_sessions.clear()
                 self._signature = signature
             if session not in self._sessions:
                 items = self._load(session)
@@ -140,6 +183,43 @@ class OfficialDailyQuoteSource:
                     self._sessions.popitem(last=False)
             self._sessions.move_to_end(session)
             return self._sessions[session]
+
+    def prior_completed_session(self, session: str) -> str | None:
+        """Latest verified source day strictly before a current-session view.
+
+        This is reference-only. It does not derive an exchange calendar or
+        promise that a published NEXT-session bound is today's executable limit.
+        Filtered date-column scans stay bounded; both caches share invalidation.
+        """
+        import pyarrow.parquet as pq
+
+        if _day(session) is None:
+            return None
+        with self._lock:
+            signature = self.signature()
+            if signature != self._signature:
+                self._sessions.clear()
+                self._prior_sessions.clear()
+                self._signature = signature
+            if session not in self._prior_sessions:
+                start = (datetime.fromisoformat(session) - timedelta(days=45)).date().isoformat()
+                days: set[str] = set()
+                for path in self.paths:
+                    try:
+                        values = pq.read_table(path, columns=["date"], filters=[
+                            ("date", ">=", start), ("date", "<", session),
+                        ]).column("date").unique().to_pylist()
+                        days.update(str(value) for value in values if _day(value))
+                    except (OSError, ValueError, KeyError):
+                        continue
+                latest = next((day for day in sorted(days, reverse=True) if self.session(day)), None)
+                if self.signature() != signature:
+                    return None  # Never retain a date from mixed file generations.
+                self._prior_sessions[session] = latest
+                while len(self._prior_sessions) > self.maximum_sessions:
+                    self._prior_sessions.popitem(last=False)
+            self._prior_sessions.move_to_end(session)
+            return self._prior_sessions[session]
 
     @staticmethod
     def _observation(fact: Mapping[str, Any], field: str, source_field: str) -> dict[str, Any]:
@@ -158,11 +238,23 @@ class OfficialDailyQuoteSource:
             return record
         fact = self.session(session).get(symbol)
         output = dict(record)
+        prior_reference = False
+        if fact is None and session == datetime.now(TAIPEI).date().isoformat():
+            # During the live session today's after-close report is not yet
+            # available. Show the last VERIFIED daily report separately, never
+            # use it to validate or overwrite today's quotes/fills/TP/SL.
+            prior_day = self.prior_completed_session(session)
+            fact = self.session(prior_day).get(symbol) if prior_day else None
+            prior_reference = fact is not None
         if fact is not None:
             daily = dict(fact)
+            if prior_reference:
+                daily["requested_session_date"] = session
+                daily["prior_session_reference_only"] = True
             daily[PROTECTED_OBSERVATIONS_KEY] = {
-                key: self._observation(fact, key, key) for key in ("open", "high", "low", "close")
-                if fact[key] is not None
+                key: self._observation(fact, key, key)
+                for key in ("open", "high", "low", "close", *_OPTIONAL_PRICES[fact["venue"]])
+                if fact.get(key) is not None
             }
             output[DAILY_QUOTE_FIELD] = daily
         protected = record.get(PROTECTED_OBSERVATIONS_KEY)

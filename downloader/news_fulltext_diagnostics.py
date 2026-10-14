@@ -34,6 +34,19 @@ from downloader.news_fulltext_failure_focus import RECEIPT_CONTRACT_VERSION as F
 
 FAILURE_DIAGNOSTIC_CONTRACT_VERSION = 6
 FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION = 3
+RAW_SCOPE_OBSERVATION_CONTRACT_VERSION = 1
+CNYES_RAW_SCOPE_REASONS = frozenset({
+    'not_cnyes_or_not_success', 'request_identity_not_verified',
+    'response_identity_or_mime_not_verified', 'native_identity_not_verified',
+    'excluded_article_title', 'unreviewed_query', 'canonical_identity_not_verified',
+    'visible_article_layout_not_verified', 'current_article_data_not_verified',
+    'current_free_payment_not_verified', 'current_publication_epoch_type_not_verified',
+    'current_title_type_not_verified', 'current_url_identity_not_verified',
+    'visible_current_title_not_verified', 'schema_json_not_verified',
+    'matching_schema_not_found', 'schema_clock_or_title_or_access_not_verified',
+    'scope_check_exception', 'native_current_public_scope_proved',
+    'canonical_current_public_scope_proved',
+})
 DAILY_PROVIDER_ATTEMPTS = 2
 HOURLY_BUCKET_ATTEMPTS = 1
 HOURLY_EVIDENCE_PROVIDERS = frozenset({'cnyes', 'globalvoices'})
@@ -170,17 +183,29 @@ def _reserve_evidence(queue, provider, clock, stage):
             'budget_attempt_limit': limit, 'daily_bucket_attempt_limit': DAILY_PROVIDER_ATTEMPTS}
 
 
-def _public_cnyes_scope(context, source):
+def _observe_raw_scope(observation, allowed, reason):
+    """Static private reason only: no text, permission grant or body acceptance."""
+    if reason not in CNYES_RAW_SCOPE_REASONS:
+        raise ValueError('unknown_cnyes_raw_scope_reason')
+    if observation is not None:
+        observation.update(contract_version=RAW_SCOPE_OBSERVATION_CONTRACT_VERSION,
+                           raw_scope_proved=allowed, first_failed_check=None if allowed else reason,
+                           proof_basis=reason if allowed else None)
+    return allowed
+
+
+def _public_cnyes_scope(context, source, observation=None):
     """Public identity only, never treat the diagnostic as article acceptance."""
     if source.provider != 'cnyes' or context.response.status != 200:
-        return False
+        return _observe_raw_scope(observation, False, 'not_cnyes_or_not_success')
     parts = urlsplit(context.requested_url)
     match = re.fullmatch(r'/news/id/([0-9]+)', parts.path)
-    if (parts.fragment or parts.hostname not in {'news.cnyes.com', 'm.cnyes.com'} or not match
-            or normalize_url(context.response.url) != normalize_url(context.requested_url)
+    if parts.fragment or parts.hostname not in {'news.cnyes.com', 'm.cnyes.com'} or not match:
+        return _observe_raw_scope(observation, False, 'request_identity_not_verified')
+    if (normalize_url(context.response.url) != normalize_url(context.requested_url)
             or context.response.headers.get('content-type', '').split(';')[0].strip().lower()
             not in {'text/html', 'application/xhtml+xml'}):
-        return False
+        return _observe_raw_scope(observation, False, 'response_identity_or_mime_not_verified')
     from bs4 import BeautifulSoup
     from downloader.news_fulltext_policy import _objects, public_article_document
     from downloader.news_fulltext_publishers import (
@@ -196,25 +221,38 @@ def _public_cnyes_scope(context, source):
         # not another request, renderer, hidden body or extra daily allowance.
         soup = public_article_document(context.response.body, source, page_url=context.requested_url)
         identity = _cnyes_native_article_identity(soup, source, page_url=context.requested_url)
-        return bool(identity is not None and not (
-            source.excluded_article_title_pattern
-            and re.search(source.excluded_article_title_pattern, identity.current_data['title'])))
+        if identity is None:
+            return _observe_raw_scope(observation, False, 'native_identity_not_verified')
+        if (source.excluded_article_title_pattern
+                and re.search(source.excluded_article_title_pattern, identity.current_data['title'])):
+            return _observe_raw_scope(observation, False, 'excluded_article_title')
+        return _observe_raw_scope(observation, True, 'native_current_public_scope_proved')
     if parts.query:
-        return False  # Unknown/secret query parameters retain metadata only.
+        # Unknown/secret query parameters retain metadata only.
+        return _observe_raw_scope(observation, False, 'unreviewed_query')
 
     soup = BeautifulSoup(context.response.body, source.html_parser)
     canonical = soup.select('link[rel="canonical"]')
     scope = _cnyes_visible_article_scope(soup)
-    if (len(canonical) != 1 or normalize_url(canonical[0].get('href', '')) != normalize_url(context.requested_url)
-            or scope is None):
-        return False
+    if len(canonical) != 1 or normalize_url(canonical[0].get('href', '')) != normalize_url(context.requested_url):
+        return _observe_raw_scope(observation, False, 'canonical_identity_not_verified')
+    if scope is None:
+        return _observe_raw_scope(observation, False, 'visible_article_layout_not_verified')
     data = _cnyes_current_article_data(soup, int(match[1]))
-    if (not data or type(data.get('payment')) is not int or data['payment'] != 0
-            or type(data.get('publishAt')) is not int or not isinstance(data.get('title'), str)
-            or normalize_url(data.get('url', '')) != normalize_url(context.requested_url)
-            or re.sub(r'\s+', '', scope[0].get_text(' ', strip=True)) != re.sub(r'\s+', '', data['title'])
-            or source.excluded_article_title_pattern and re.search(source.excluded_article_title_pattern, data['title'])):
-        return False
+    if not data:
+        return _observe_raw_scope(observation, False, 'current_article_data_not_verified')
+    if type(data.get('payment')) is not int or data['payment'] != 0:
+        return _observe_raw_scope(observation, False, 'current_free_payment_not_verified')
+    if type(data.get('publishAt')) is not int:
+        return _observe_raw_scope(observation, False, 'current_publication_epoch_type_not_verified')
+    if not isinstance(data.get('title'), str):
+        return _observe_raw_scope(observation, False, 'current_title_type_not_verified')
+    if normalize_url(data.get('url', '')) != normalize_url(context.requested_url):
+        return _observe_raw_scope(observation, False, 'current_url_identity_not_verified')
+    if re.sub(r'\s+', '', scope[0].get_text(' ', strip=True)) != re.sub(r'\s+', '', data['title']):
+        return _observe_raw_scope(observation, False, 'visible_current_title_not_verified')
+    if source.excluded_article_title_pattern and re.search(source.excluded_article_title_pattern, data['title']):
+        return _observe_raw_scope(observation, False, 'excluded_article_title')
     declarations = []
     for script in soup.select('script[type="application/ld+json"]'):
         try:
@@ -222,18 +260,18 @@ def _public_cnyes_scope(context, source):
                                 if node.get('@type') == 'NewsArticle'
                                 and normalize_url(node.get('url', '')) == normalize_url(context.requested_url))
         except (NewsError, ValueError, TypeError, RecursionError):
-            return False
+            return _observe_raw_scope(observation, False, 'schema_json_not_verified')
     if not declarations:
-        return False
+        return _observe_raw_scope(observation, False, 'matching_schema_not_found')
     for node in declarations:
         try:
             clock = datetime.fromisoformat(node.get('datePublished', '').replace('Z', '+00:00'))
             if (clock.tzinfo is None or clock.timestamp() != data['publishAt'] or node.get('headline') != data['title']
                     or str(node.get('isAccessibleForFree', 'true')).lower() == 'false'):
-                return False
+                return _observe_raw_scope(observation, False, 'schema_clock_or_title_or_access_not_verified')
         except (ValueError, TypeError, AttributeError, OverflowError):
-            return False
-    return True
+            return _observe_raw_scope(observation, False, 'schema_clock_or_title_or_access_not_verified')
+    return _observe_raw_scope(observation, True, 'canonical_current_public_scope_proved')
 
 
 def _licensed_globalvoices_scope(context, source):
@@ -433,9 +471,10 @@ def retain_failure_response(queue, row, error):
             target = queue.root / 'diagnostics' / day / provider / (stamp + '.parquet')
         if budget is None:
             return
+        scope_observation = {}
         try:
             retention_basis = ('matching_current_public_payment0_identity_and_aware_clock'
-                               if _public_cnyes_scope(context, source) else
+                               if _public_cnyes_scope(context, source, scope_observation) else
                                'matching_current_native_article_CC_license_authors_and_aware_clock'
                                if _licensed_globalvoices_scope(context, source) else
                                'metadata_only_no_body_scope_inferred')
@@ -443,6 +482,7 @@ def retain_failure_response(queue, row, error):
         except (NewsError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
             raw_allowed = False  # Broken evidence permits metadata only.
             retention_basis = 'metadata_only_no_body_scope_inferred'
+            _observe_raw_scope(scope_observation, False, 'scope_check_exception')
         raw = context.response.body
         response_sha = response_sha if focus is not None else hashlib.sha256(raw).hexdigest()
         requested_display, final_display = _display_url(row['url']), _display_url(context.response.url)
@@ -472,6 +512,7 @@ def retain_failure_response(queue, row, error):
             'diagnostic_only': True, 'accepted_as_article': False, 'publish': False,
             'remote_training_export': False, 'raw_response_retained': raw_allowed,
             'retention_basis': retention_basis,
+            **({'raw_scope_observation': scope_observation} if provider == 'cnyes' else {}),
         }
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         atomic_write_parquet(target, table_from_records([{**identity, 'raw_response_body': raw if raw_allowed else None}]),

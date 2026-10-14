@@ -331,8 +331,13 @@ def sanitize_tw_status(
     if quote_source is not None:
         # Independent public reference stays useful even when a strategy has
         # no signals. It is not a position, fill, valuation or readiness proof.
+        selected_session = str(payload.get("session_date") or "")
+        reference_session = selected_session
+        if not quote_source.session(selected_session):
+            reference_session = quote_source.prior_completed_session(selected_session) or selected_session
         projected["official_price_reference"] = {
-            "session_date": payload.get("session_date"), "role": "reference_only",
+            "session_date": reference_session, "requested_session_date": selected_session,
+            "role": "reference_only",
             "quotes": [{"symbol": symbol} for symbol in ("0050", "2330")],
         }
     for key in ("signals", "orders", "fills", "events"):

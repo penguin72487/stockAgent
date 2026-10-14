@@ -1,4 +1,4 @@
-from scripts.verify_public_price_projection import snapshot_contract_digest, verify_transaction_report
+from scripts.verify_public_price_projection import snapshot_contract_digest, verify_transaction_report, verify_official_reference_fields
 from pathlib import Path
 import re
 import pytest
@@ -28,7 +28,7 @@ def test_public_price_frontend_advances_both_immutable_asset_versions():
     html = (root / "services/tw_day_trade_dashboard/index.html").read_text()
     # v10/v100 predate the daily price producer and its shared renderer. Keep
     # the release floor, not a permanently pinned current frontend version.
-    for asset, minimum in (("detail-components.js", 11), ("app.js", 101)):
+    for asset, minimum in (("detail-components.js", 16), ("app.js", 101)):
         match = re.search(rf'src="{re.escape(asset)}\?v=(\d+)"', html)
         assert match is not None and int(match[1]) >= minimum
 
@@ -50,3 +50,27 @@ def test_owner_report_acceptance_compares_exact_private_values_and_never_calls_i
         }}}
         with pytest.raises(AssertionError):
             verify_transaction_report(invalid, original)
+
+
+def test_acceptance_checks_official_reference_units_and_does_not_authorize_twse_bid_ask():
+    canonical = {"open": 28.2, "volume_shares": 18000, "next_upper_limit": 31.0}
+    quote = {**canonical, "projection_contract": "official_daily_quote_v2", "venue": "TPEX",
+             "session_date": "2026-09-21", "limit_scope": "next_exchange_session_published_bounds",
+             "public_price_display": {"visible_fields": {key: {"grain": "daily", "session_date": "2026-09-21",
+                 "source_field": key, "license_reference": "https://data.gov.tw/dataset/11370"}
+                 for key in ("open", "next_upper_limit")}}}
+    assert verify_official_reference_fields(quote, canonical) == 3
+    with pytest.raises(AssertionError):
+        verify_official_reference_fields({**quote, "volume_shares": 18000000}, canonical)
+    with pytest.raises(AssertionError):
+        verify_official_reference_fields({**quote, "venue": "TWSE", "last_bid": 28.2}, canonical)
+
+
+def test_session_gap_and_date_range_remain_distinct_contracts():
+    from stockagent.live.tw_day_trade_dashboard import DashboardSessionUnavailable, _select_session_date, _select_session_range
+    with pytest.raises(DashboardSessionUnavailable, match="unavailable"):
+        _select_session_date("2026-10-13", ["2026-10-14"])
+    # Valid interval with no retained session is an honest empty query,
+    # not a fake archived session or a failed service.
+    assert _select_session_range(start_date="2026-10-13", end_date="2026-10-13",
+        session_date=None, available=["2026-10-14"]) == ("2026-10-13", "2026-10-13", [])

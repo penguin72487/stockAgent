@@ -19,6 +19,7 @@ import time
 from downloader.artifact_io import atomic_write_json
 from downloader.news_fulltext_diagnostics import FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION, HOURLY_EVIDENCE_PROVIDERS
 from downloader.news_fulltext_metrics import endpoint_workload
+from downloader.news_fulltext_metadata_feeds import access_policy_fingerprint
 from downloader.news_fulltext_cnyes_work import CONTRACT_VERSION as CNYES_WORK_DISPATCH_VERSION
 from downloader.news_fulltext_cnyes_seed import CONTRACT_VERSION as CNYES_SCOPE_SEED_VERSION
 from downloader.news_fulltext_queue import (ARTICLE_RECHECK_DAY_CONTRACT_VERSION, ARTICLE_DISPATCH_CONTRACT_VERSION,
@@ -218,18 +219,19 @@ class PublisherCapacity:
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "stored_body_retry_burst": config.get('stored_body_retry_burst', 8),
             "cnyes_unknown_body_recheck_contract_version": CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION,
-            "providers": {p: {"source": s.data_fingerprint, "authorization": s.authorization_fingerprint,
+            "providers": {p: {"source": s.http_capacity_source_fingerprint or s.data_fingerprint, "authorization": s.authorization_fingerprint,
                                "maximum_parallelism": http.maximum_parallelism[p]}
                           for p, s in http.registry.sources.items() if s.request_enabled},
         }, sort_keys=True).encode()).hexdigest()
         self.provider_fingerprints = {p: hashlib.sha256(json.dumps({"measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
-            "policy": self.policy, "source": s.data_fingerprint, "authorization": s.authorization_fingerprint,
+            "policy": self.policy, "source": s.http_capacity_source_fingerprint or s.data_fingerprint, "authorization": s.authorization_fingerprint,
             "article_recheck_day_contract_version": ARTICLE_RECHECK_DAY_CONTRACT_VERSION,
             "article_dispatch_contract_version": ARTICLE_DISPATCH_CONTRACT_VERSION,
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "stored_body_retry_burst": config.get('stored_body_retry_burst', 8),
             "maximum_parallelism": http.maximum_parallelism[p],
-            **({'metadata_feed_fingerprint': s.metadata_feed_fingerprint} if not s.allowed and s.metadata_feeds else {}),
+            **({'metadata_feed_fingerprint': access_policy_fingerprint(s)}
+               if not s.allowed and s.metadata_feeds else {}),
             **({'cnyes_body_value_dispatch_contract': CNYES_WORK_DISPATCH_VERSION,
                 'cnyes_unknown_body_recheck_contract_version': CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION,
                 'cnyes_scope_seed_maintenance_contract': CNYES_SCOPE_SEED_VERSION,

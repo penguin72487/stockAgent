@@ -20,6 +20,7 @@ function view(product = "tw_day_trade") {
 const daily = {session_date: "2026-09-21", open: 2445, close: 2480,
   received_at: "2026-09-22T09:13:47Z", public_price_display: {visible_fields: {
     open: {source: "臺灣證券交易所", grain: "daily", session_date: "2026-09-21"},
+    close: {source: "臺灣證券交易所", grain: "daily", session_date: "2026-09-21"},
   }}};
 
 for (const product of ["tw_day_trade", "tw_overnight"]) {
@@ -41,6 +42,48 @@ test("daily source labels escape markup and hidden daily facts do not render", (
     public_price_display: {visible_fields: {open: {source: "<script>alert(1)</script>"}}}}});
   assert.ok(!html.includes("<script>"));
   assert.ok(html.includes("&lt;script>"));
+  assert.ok(!html.includes("收 2480"), "one field's proof cannot expose another field");
+});
+
+for (const product of ["tw_day_trade", "tw_overnight"]) {
+  test(`${product} labels official after-close prices and next-session bounds distinctly`, () => {
+    const values = {last_bid: 96.1, last_ask: 96.2, average_price: 96.15,
+      next_reference_price: 96.2, next_upper_limit: 105.5, next_lower_limit: 86.6};
+    const quote = {...daily, ...values, open: null, close: null, volume_shares: 0, trade_count: 0,
+      public_price_display: {visible_fields: Object.fromEntries(Object.keys(values)
+        .map(key => [key, {source: "證券櫃檯買賣中心", grain: "daily"}]))}};
+    const html = view(product).dailyReference({official_daily_quote: quote});
+    assert.match(html, /盤後最後買 96\.1／盤後最後賣 96\.2/);
+    assert.match(html, /次一交易日參考 96\.2／次一交易日申報上界 105\.5／下界 86\.6/);
+    assert.match(html, /成交股數 0股／成交筆數 0筆/);
+    assert.match(html, /<summary>完整官方日資料／次日界線<\/summary>/);
+    assert.ok(!html.includes("當日漲停"));
+    assert.ok(!html.includes("undefined"));
+    quote.next_upper_limit = 9999.95;
+    quote.next_lower_limit = 0.01;
+    assert.match(view(product).dailyReference({official_daily_quote: quote}), /上界 9999\.95／下界 0\.01/);
+  });
+}
+
+test("daily fields require their own proof and unknown proof keys do not create rows", () => {
+  const render = view();
+  const quote = {...daily, last_bid: 91.2, next_upper_limit: 120};
+  const html = render.dailyReference({official_daily_quote: quote});
+  assert.ok(!html.includes("91.2"));
+  assert.ok(!html.includes("120"));
+  quote.public_price_display = {visible_fields: {arbitrary: {source: "not a price"}}};
+  quote.arbitrary = 1;
+  assert.equal(render.dailyReference({official_daily_quote: quote}), "");
+});
+
+test("prior official references cannot be mistaken for today's prices", () => {
+  const render = view();
+  const quote = {...daily, prior_session_reference_only: true, requested_session_date: "2026-09-22"};
+  assert.match(render.dailyReference({official_daily_quote: quote}), /2026-09-22 日行情待發布，非當日報價/);
+  const notice = render.priceNoticeText({official_price_reference: {session_date: "2026-09-21",
+    requested_session_date: "2026-09-22", quotes: [{symbol: "2330", official_daily_quote: quote}]}});
+  assert.match(notice, /2026-09-22 日行情待發布或待驗收/);
+  assert.match(notice, /官方日行情 2026-09-21：2330 開 2445／收 2480/);
 });
 
 test("daily proof shows market day instead of pretending the acquisition clock is a tick", () => {

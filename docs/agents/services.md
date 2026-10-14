@@ -63,10 +63,24 @@ Use the section for the service being changed. Operational acceptance requires f
 - Set the outer systemd watchdog above measured legitimate event-loop stalls.
   Keep the tighter opening path protected by its progress-aware hot/cold
   watchdog so relaxing the outer process watchdog does not relax 09:00 recovery.
+  During `preopen_catch_up`, respect the existing source timeout only while
+  that resolved shared command has a real live child or a recently verified
+  blocked writer-lock wait. Its deadline must not slide, and waiting is not
+  data readiness/model progress. Quote/model/input stages retain their original
+  watchdog. Evidence and bounded owner checks are in the
+  [2026-10-14 source-watchdog repair](../running_service_optimization_2026-10-13.md#0900-開盤現場入口權限與來源-watchdog-修復).
 - Bound and rotate traceback logs. Service acceptance requires the Gateway to
   be connected, command sync to succeed or be explicitly deferred, all enabled
   TW modes to acknowledge the engine revision with zero lag, and logs
   since the current restart to contain no watchdog or fatal error.
+- Scheduled latency-critical input work uses one session/config-fenced job per
+  mode across bounded scheduler polls. A slow source preparation cannot prevent
+  another mode's existing retry; cancelling a `to_thread` await is not proof
+  its builder stopped, so do not replace a running job with a duplicate. Discard
+  stale results after completion and retain canonical inference revalidation.
+  Reports/chat run in their original delivery order after immutable publication,
+  outside the input-retry loop. See the measured
+  [opening dispatch and execution boundaries](../tw_opening_latency_stages_2026-10-14.md).
 - GPU residency follows the same verified session/preparation window as model
   warmup, not a separate hard-coded 07:00 retention rule. Successful serialized
   idle eviction invalidates the process-hot flag; it does not change signals,
@@ -79,6 +93,12 @@ Use the section for the service being changed. Operational acceptance requires f
 
 - The ledger/execution loop owns watchdog liveness. Historical-query progress
   may publish status, but must not keep a stalled execution loop falsely alive.
+- Opening execution timing observes changed target quantities only after the
+  canonical state/projections are durably committed. Original publication,
+  registration, first paper fill and full-target completion are separate clocks.
+  Replay event times, cash-only modes, cancelled unsized targets and completion
+  found after restore cannot manufacture live opening SLO success. Observer I/O
+  failure stays visible without blocking liquidation or changing the ledger.
 - Missed-open source recovery runs off the ledger loop, publishes each resolved
   symbol durably, and releases each mode from its own source dependencies rather
   than waiting for every mode. Prune only provably zero whole-lot targets using

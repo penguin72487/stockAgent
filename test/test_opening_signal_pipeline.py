@@ -180,7 +180,17 @@ def test_scheduler_prepares_together_publishes_before_reports_and_isolates_failu
     monkeypatch.setattr(discord_bot, "_send_subscription_notifications", noop)
     monkeypatch.setattr(discord_bot, "_enrich_signal_performance_for_discord", lambda cfg, result, **kw: result)
     monkeypatch.setattr(discord_bot, "_signal_sanity_issues", lambda *a: [])
-    asyncio.run(discord_bot.scheduled_signal.coro())
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {})
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_delivery_task", None)
+
+    async def exercise():
+        await discord_bot.scheduled_signal.coro()
+        # Only the observer is awaited by this test. The scheduler returns
+        # after immutable publication, not after report/chat completion.
+        if discord_bot.bot._scheduled_delivery_task is not None:
+            await discord_bot.bot._scheduled_delivery_task
+
+    asyncio.run(exercise())
     published = [m for phase, m in events if phase == "publish"]
     # Ready modes may overtake slower independent inputs, but never duplicate
     # a signal or publish the failed preparation.
