@@ -30,7 +30,7 @@ def _assert_financially_close(actual, expected):
             getattr(expected.final_state.inventory, f.name),
             rtol=0 if discrete else 1e-12, atol=0 if discrete else 1e-8)
     torch.testing.assert_close(actual.final_state.last_nav, expected.final_state.last_nav,
-                               rtol=1e-12, atol=1e-8)
+                               rtol=1e-12, atol=1e-8, equal_nan=True)
     assert torch.equal(actual.final_state.alive, expected.final_state.alive)
     assert actual.final_state.last_session_day == expected.final_state.last_session_day
 

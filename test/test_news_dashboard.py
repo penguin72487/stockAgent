@@ -343,7 +343,8 @@ def test_finite_cohort_denominator_growth_and_unresolved_eta(tmp_path):
     _save(tmp_path, status)
     result = build_news_public_status(tmp_path, now=NOW)
     source = next(p for p in result['providers'] if p['id'] == 'cnyes')
-    assert source['state'] == 'finite_complete'
+    assert source['state'] == 'waiting_cohort'
+    assert source['conditional_eta_seconds'] is source['conditional_finish_at_utc'] is None
     assert source['progress_ratio'] == 1 and source['blocked_urls'] == 0
     assert source['finite_cohort']['new_urls_outside_cohort'] == 4
     assert result['acquisition']['growth_waiting_urls'] == 4
@@ -387,7 +388,8 @@ def test_reviewed_supplement_progress_preserves_original_denominator_and_privacy
     assert source['growth_waiting_urls'] == 3
     assert source['finite_supplements'] == {'scopes': 1, 'urls': 1, 'stored_bodies': 1,
         'remaining_missing_bodies': 0, 'progress_ratio': 1, 'all_supplement_bodies_stored': True}
-    assert source['state'] == 'finite_complete'
+    assert source['state'] == 'waiting_cohort'
+    assert source['conditional_eta_seconds'] is source['conditional_finish_at_utc'] is None
     assert all(secret not in json.dumps(result) for secret in ('PRIVATE_TOKEN', 'PRIVATE_HTML', str(tmp_path)))
 
 

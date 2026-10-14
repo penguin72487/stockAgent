@@ -24,13 +24,14 @@ from stockagent.live.public_quote_display import (
     public_quote_display_policy,
 )
 from stockagent.live.public_daily_quotes import DAILY_QUOTE_FIELD, OfficialDailyQuoteSource
+from stockagent.live.public_price_metrics import public_entry_distances
 
 
 PUBLIC_MAX_EVENT_ROWS: Final[int] = 250
 PUBLIC_INITIAL_POSITION_ROWS: Final[int] = 100
 PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES: Final[int] = 2
 _TW_PUBLIC_POSITION_FIELDS: Final[set[str]] = {
-    "closing_auction_limit_price", "closing_auction_order_status",
+    "closing_auction_limit_price", "closing_auction_order_status", "closing_auction_order_submitted_at",
     "counterfactual_open_replay", "counterfactual_0901_price_fill",
     "entry_at", "entry_exchange_at", "entry_fee_twd", "entry_price",
     "entry_price_source", "entry_completion_broker_fill",
@@ -46,7 +47,7 @@ _TW_PUBLIC_POSITION_FIELDS: Final[set[str]] = {
     "opening_exit_limit_price", "opening_exit_order_session_date",
     "opening_exit_order_status", "opening_exit_submitted_at",
     "realized_net_pnl_twd", "reconciled_total_net_pnl_twd", "requested_shares",
-    "session_date", "side", "signed_shares", "simulation_replay",
+    "session_date", "security_type", "side", "signed_shares", "simulation_replay",
     "source_signal_at", "status", "stop_order_status", "stop_trigger_price",
     "symbol", "take_profit_price", "target_weight", "target_unsubmitted_shares",
     "temporary_day_trade_model_adapter", "total_net_pnl_twd",
@@ -162,6 +163,10 @@ def _scrub_public_value(
             if is_quote_price_field(key):
                 permitted = quote_policy.observation(value, key, item)
                 if permitted is None and record_kind is not None:
+                    permitted = quote_policy.strategy_report_price(
+                        value, key, item, record_kind=record_kind,
+                    )
+                if permitted is None and record_kind is not None:
                     permitted = quote_policy.transaction_report_price(
                         value, key, item, record_kind=record_kind,
                     )
@@ -188,6 +193,12 @@ def _scrub_public_value(
                 "withheld_reasons": withheld_reasons,
                 "visible_fields": visible,
             }
+        if record_kind == "paper_position":
+            # Derived movements must never expose a withheld valuation. The
+            # canonical dated grid is consulted only on the already-public DTO.
+            distances = public_entry_distances(output)
+            if distances:
+                output["entry_price_distances"] = distances
         return output
     if isinstance(value, list):
         return [_scrub_public_value(item, quote_source=quote_source, session_date=session_date,
@@ -367,6 +378,7 @@ def sanitize_tw_status(
             "counterfactual_overnight_replay",
             "closing_auction_limit_price",
             "closing_auction_order_status",
+            "closing_auction_order_submitted_at",
             "entry_at",
             "entry_exchange_at",
             "entry_fee_twd",
@@ -403,6 +415,7 @@ def sanitize_tw_status(
             "reconciled_total_net_pnl_twd",
             "requested_shares",
             "session_date",
+            "security_type",
             "side",
             "signed_shares",
             "simulation_replay",

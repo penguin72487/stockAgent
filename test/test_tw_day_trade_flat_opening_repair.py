@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 from datetime import date, datetime, time, timedelta
 import json
 from pathlib import Path
@@ -45,6 +46,33 @@ def test_outcome_keeps_economics_but_not_new_audit_identity():
     assert repair._outcome(first) == repair._outcome(second)
     second["positions"]["p"]["entry_fee_twd"] += 1
     assert repair._outcome(first) != repair._outcome(second)
+
+
+def _clock_failed_replay() -> dict:
+    return {**_flat(), "entry_requested_shares": 4000, "entry_unfilled_shares": 4000,
+            "simulation_replay": True, "counterfactual_open_replay": True,
+            "entry_fill_contract": repair.REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+            "signal_reason_counts": {"quote_not_after_signal": 1, "below_one_board_lot": 2,
+                                     "zero_target_weight": 2754}}
+
+
+def test_original_signal_repair_accepts_only_the_explicit_never_filled_clock_failure():
+    mode = _clock_failed_replay()
+    repair._require_empty_target(mode, preserve_original_signal=True)
+    with pytest.raises(RuntimeError):
+        repair._require_empty_target(mode)
+
+
+@pytest.mark.parametrize("change", [
+    {"entry_filled_shares": 1000}, {"entry_unfilled_shares": 3000},
+    {"simulation_replay": False}, {"counterfactual_open_replay": False},
+    {"entry_fill_contract": "live"}, {"signal_reason_counts": {"price_limit_unavailable": 1}},
+    {"positions": {"closed": {"signed_shares": 0}}},
+    {"pending_entry_orders": {"order": {"remaining_shares": 4000}}},
+])
+def test_original_signal_repair_cannot_bypass_existing_fills_or_unrelated_source_failures(change):
+    with pytest.raises(RuntimeError):
+        repair._require_empty_target({**_clock_failed_replay(), **change}, preserve_original_signal=True)
 
 
 def test_curves_require_all_270_right_labelled_minutes(tmp_path):
@@ -128,11 +156,13 @@ def test_chart_keeps_replay_provenance_first_seen_after_inference_prefix(tmp_pat
 
 
 @pytest.mark.parametrize("weight", [0.025, 0.0001])
-def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_path, monkeypatch, weight):
+@pytest.mark.parametrize("strict_intraday", [False, True])
+@pytest.mark.parametrize("postclose", [False, True])
+def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_path, monkeypatch, weight, strict_intraday, postclose):
     class FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
-            return datetime(2026, 10, 7, 11, 0, tzinfo=repair.TAIPEI)
+            return datetime(2026, 10, 7, 14 if postclose else 11, 0, tzinfo=repair.TAIPEI)
     monkeypatch.setattr(repair, "datetime", FixedDateTime)
     monkeypatch.setattr(repair, "_close_quotes", lambda *a, **kw: ({}, {}))
     spec = ModeSpec(market="m", label="test", initial_capital_twd=10_000_000,
@@ -141,6 +171,7 @@ def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_p
                     fee_schedule=TaiwanFeeSchedule(commission_discount=0.2),
                     entry_fill_policy=repair.ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
                     entry_price_offset_ticks=0, price_limit_offset_ticks=1,
+                    strict_intraday=strict_intraday,
                     terminal_liquidation_unlimited_capacity=True)
     other = {"positions": {"untouched": {"signed_shares": 1000}}, "custom": "keep"}
     prior = {**_flat(), "terminal_curve_mark": ["2026-10-06", 12_000_000, 2_000_000, 0, 0, 0,
@@ -150,7 +181,7 @@ def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_p
     engine = TwDayTradeSimulationEngine(tmp_path, publication_clock=lambda: FixedDateTime.now())
     before_other = deepcopy(engine.state["modes"]["other"])
     sessions = []
-    for day, end in [(date(2026, 10, 6), time(13, 30)), (date(2026, 10, 7), time(9, 2))]:
+    for day, end in [(date(2026, 10, 6), time(13, 30)), (date(2026, 10, 7), time(13, 30) if postclose else time(9, 2))]:
         observed = datetime.combine(day, time(9, 1), tzinfo=repair.TAIPEI)
         bars = {"2330": {}}
         for offset, close, high, volume in [(0, 102, 102, 2000), (1, 104, 104, 4000), (2, 110, 110, 10000)]:
@@ -176,7 +207,7 @@ def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_p
                              symbol="2330", venue="twse", security_type="stock", eligible=True,
                              short_open=True, covered=True, source_date=str(day))},
                          "coverage": {}, "bars": bars, "end_at": end, "rule_data_dir": tmp_path})
-    accepted = repair._execute(engine, spec, sessions, reason=repair.CONTRACT)
+    accepted = repair._execute(engine, spec, sessions, reason=repair.ORIGINAL_SIGNAL_CONTRACT if postclose else repair.CONTRACT)
     shares = 3000 if weight == 0.025 else 0
     assert accepted[0]["entry_requested_shares"] == shares
     assert accepted[0]["entry_filled_shares"] == shares
@@ -186,16 +217,18 @@ def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_p
     assert engine.state["modes"]["other"] == before_other
     mode = engine.state["modes"]["m"]
     assert mode["source_signal_at"] == "2026-10-07T09:00:02+08:00"
-    assert mode["opening_repair"]["recorded_at"] == "2026-10-07T11:00:00+08:00"
+    assert mode["opening_repair"]["recorded_at"] == FixedDateTime.now().isoformat()
     assert set(_flat()["processed_signal_ids"]) <= set(mode["processed_signal_ids"])
-    assert [p["unique_minute_points"] for p in repair._curve_proof(engine.marks_path, "m", sessions)] == [270, 2]
-    assert engine.state["updated_at"] == "2026-10-07T11:00:00+08:00"
+    assert [p["unique_minute_points"] for p in repair._curve_proof(engine.marks_path, "m", sessions)] == [270, 270 if postclose else 2]
+    assert engine.state["updated_at"] == FixedDateTime.now().isoformat()
+    assert mode["entry_post_0901_minute_price_fill_count"] == (1 if shares else 0)
     restarted = TwDayTradeSimulationEngine(tmp_path)
     assert repair._outcome(restarted.state["modes"]["m"]) == repair._outcome(mode)
     assert not restarted.state["modes"]["m"].get("ledger_state_divergence")
 
 
 def test_apply_failure_restarts_owner_and_preserves_audit_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(repair, "control_lease", lambda **kw: nullcontext())
     mode = _flat()
     state = {"modes": {"m": mode, "other": {"positions": {"p": {"signed_shares": 1000}}}}}
     repair._atomic_json(tmp_path / "state.json", state)

@@ -23,6 +23,9 @@ if str(ROOT) not in sys.path:
 
 from downloader.artifact_io import atomic_write_json
 from downloader.download_tw_public_data import EXTENDED_DATASETS
+from stockagent.live.public_quote_display import (
+    PAPER_REPORT_CONTRACT, STRATEGY_REPORT_CONTRACT, STRATEGY_POSITION_CLOCKS,
+)
 
 # These are documented aliases for the existing daily canonical collectors;
 # dataset registration is not a license for every column of MI_INDEX.
@@ -106,9 +109,25 @@ def build_inventory(*, policy: dict, catalog: dict, metadata: dict[str, dict], r
                 errors.append({"source_id": name, "state": record.get("state", "metadata_unavailable"),
                                "unverified_fields": absent})
         datasets.append(row)
-    return {"contract": "public_source_display_audit_v1", "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+    owner_scopes = []
+    for key, contract, fields in (
+        ("owner_transaction_reports", PAPER_REPORT_CONTRACT,
+         {"paper_position": ["entry_price", "inventory_basis_price", "exit_price", "last_exit_price"],
+          "paper_signal": ["execution_price"], "paper_event": ["price (recorded fill only)"]}),
+        ("owner_strategy_reports", STRATEGY_REPORT_CONTRACT,
+         {"paper_position": sorted(STRATEGY_POSITION_CLOCKS), "paper_signal": ["order_limit_price"],
+          "paper_event": ["price (persisted limit/stop instruction only)"]}),
+    ):
+        scope = policy.get(key)
+        enabled = (isinstance(scope, dict) and scope.get("enabled") is True and scope.get("contract") == contract
+                   and scope.get("record_scope") == "tw_day_trade_and_overnight_paper_ledger")
+        owner_scopes.append({"source_id": key, "contract": contract, "enabled": enabled,
+                             "fields_by_trusted_record_context": fields,
+                             "raw_quote_grant": False, "broker_execution_verified": False})
+    return {"contract": "public_source_display_audit_v2", "observed_at_utc": datetime.now(timezone.utc).isoformat(),
             "scope": "all registered source families and TW canonical collector specs; not all data on the internet",
             "source_families": families, "official_datasets": datasets, "government_metadata": metadata,
+            "owner_report_scopes": owner_scopes,
             "summary": {"registered_families": len(catalog["sources"]), "reviewed_and_registered_entries": len(families),
                         "official_datasets": len(datasets), "display_basis_counts": dict(Counter(row["public_display_basis"] for row in datasets)),
                         "grant_errors": errors},

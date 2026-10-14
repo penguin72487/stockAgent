@@ -271,6 +271,8 @@ def test_only_hourly_evidence_measurement_identities_change_not_source_capture(c
     globalvoices = deepcopy(next(p for p in config['providers'] if p['id'] == 'globalvoices'))
     globalvoices.update(feeds=[], sitemaps=[], wordpress_apis=[], index_pages=[])
     cfg['providers'].append(globalvoices)
+    taiwanhot = deepcopy(next(p for p in config['providers'] if p['id'] == 'taiwanhot'))
+    cfg['providers'].append(taiwanhot)
     cfg['providers'][0]['interval_seconds'] = .01
     http, session = http_fixture(cfg, tmp_path, {})
     try:

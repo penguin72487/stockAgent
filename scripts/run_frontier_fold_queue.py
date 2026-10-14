@@ -24,6 +24,12 @@ def main():
     parser.add_argument("--after-exit", type=Path)
     parser.add_argument("--kernel-python", type=Path)
     args = parser.parse_args()
+    # Children execute from a frozen code directory, so operational paths must
+    # be bound before changing cwd.
+    for key in ("spec", "baseline_config", "output", "after_exit", "kernel_python"):
+        value = getattr(args, key)
+        if value is not None:
+            setattr(args, key, value.resolve())
     if args.after_exit:
         while not args.after_exit.exists():
             time.sleep(10)
@@ -41,7 +47,7 @@ def main():
         if python is None:
             raise ValueError("kernel-dependent recipe needs --kernel-python")
         code = Path(recipe.get("code_root", ROOT)).resolve()
-        command = [str(python), str(ROOT / "scripts/run_frontier_training_trial.py"),
+        command = [str(python), str(code / "scripts/run_frontier_training_trial.py"),
             "--code-root", str(code), "--source-receipt", str(code.parent / "release.json"),
             "--baseline-config", str(args.baseline_config), "--output", str(args.output / name),
             "--name", name, "--overrides", str(overrides), "--runtime-overrides", str(runtime),
@@ -50,7 +56,8 @@ def main():
             "--compile-threads", str(recipe.get("compile_threads", 16)),
             "--min-vram-headroom-gib", str(recipe.get("min_vram_headroom_gib", 1.5)),
             "--max-peak-vram-fraction", str(recipe.get("max_peak_vram_fraction", 0.96)),
-            "--epochs", str(recipe.get("epochs", 4)), "--timeout-s", str(recipe.get("timeout_s", 2400))]
+            "--epochs", str(recipe.get("epochs", 4)), "--fold", str(recipe.get("fold", 10)),
+            "--timeout-s", str(recipe.get("timeout_s", 2400))]
         if recipe.get("profile_timing"):
             command.append("--profile-timing")
         if recipe.get("nsys_trace"):

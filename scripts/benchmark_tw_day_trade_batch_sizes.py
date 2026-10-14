@@ -264,6 +264,7 @@ def _score_curve(
     min_headroom_gib: float,
     strict_compiled_backtest: bool = True,
     world_size: int = 1,
+    annual_ownership: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -336,7 +337,16 @@ def _score_curve(
     epoch_wall = [float(row[epoch_wall_key]) for row in steady]
     train_wall = [float(row[train_wall_key]) for row in steady]
     train_batches = [int(row.get("train_batches", 0) or 0) for row in steady]
-    expected_batches = math.ceil(train_rows / global_batch_size)
+    ownership_validation = None
+    if annual_ownership is not None:
+        from stockagent.training.episode_parallel import validate_annual_episode_receipt
+        try:
+            ownership_validation = validate_annual_episode_receipt(annual_ownership,
+                train_rows=train_rows, global_batch_rows=global_batch_size, world_size=world_size)
+        except (ValueError, TypeError, KeyError) as exc:
+            return {"ok": False, "reasons": [str(exc)], "memory": memory}
+    expected_batches = (ownership_validation["reporting_rank_batches"] if ownership_validation
+                        else math.ceil(train_rows / global_batch_size))
     if any(value != expected_batches for value in train_batches):
         return {
             "ok": False,
@@ -350,7 +360,8 @@ def _score_curve(
 
     median_epoch_wall = _median(epoch_wall)
     median_train_wall = _median(train_wall)
-    padded_slots = expected_batches * global_batch_size
+    padded_slots = (ownership_validation["padded_slots"] if ownership_validation
+                    else expected_batches * global_batch_size)
     return {
         "ok": True,
         "steady_epochs": [int(row.get("epoch", 0) or 0) for row in steady],
@@ -360,6 +371,7 @@ def _score_curve(
         "train_batches": expected_batches,
         "padded_slots": padded_slots,
         "padding_fraction": (padded_slots - train_rows) / padded_slots,
+        "annual_ownership_validation": ownership_validation,
         "median_epoch_wall_s": median_epoch_wall,
         "timing_scope": "maximum_rank" if max_rank or trajectory_max_rank else "legacy_reporting_rank",
         "epoch_wall_field": epoch_wall_key,
@@ -803,6 +815,9 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
             rows = _read_jsonl(curve_path)
             train_rows = _parse_train_rows(log_path)
             memory = _gpu_memory_summary(gpu_path, gpu_indices=args.gpu_indices)
+            annual_ownership = None
+            if base.get("training", {}).get("day_trade_annual_episode_sharding", False):
+                annual_ownership = json.loads((curve_path.parent / "annual_episode_ownership.json").read_text())
             score = _score_curve(
                 rows,
                 skip_epochs=args.skip_epochs,
@@ -816,6 +831,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                     args.expected_execution_mode == "tw_day_trade"
                 ),
                 world_size=args.world_size,
+                annual_ownership=annual_ownership,
             )
             result.update(score)
             result["epoch_curve"] = str(curve_path)

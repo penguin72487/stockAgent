@@ -206,6 +206,12 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
     encoder=model.temporal_basis_feature_encoder
     raw_basis=model._raw_temporal_basis_enabled()
     compact_projection=bool(getattr(model,"factorized_compact_projection",False))
+    sparse_projection=bool(getattr(model,"factorized_sparse_projection",False))
+    sparse_embeddings=None
+    if sparse_projection:
+        from stockagent.models.factorized_sparse_projection import project_factorized_sparse_rows
+        slab._retain_gpu_packets=False
+        sparse_embeddings=project_factorized_sparse_rows(model,slab)
     if encoder is not None and not raw_basis:
         raise ValueError("wide streaming currently admits the selected raw-feature basis ABI only")
     if raw_basis and not encoder.fuse_projection:
@@ -222,7 +228,8 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         kernels=_call_partition(model,kernel_fn,encoder.feature_projection.weight.new_empty(()))
     def encode(raw,stock_mask,stock_ids,kernel,columns=None):
         if compact_projection:
-            projected=model.candle_encoder.forward_compact_columns(raw,columns)
+            projected=(raw if sparse_projection else
+                model.candle_encoder.forward_compact_columns(raw,columns))
             h=projected.unfold(0,model.lookback,1).permute(0,3,1,2).contiguous()
             h=model._add_window_positions(h,int(raw.size(1)),stock_ids)
             basis=None
@@ -250,13 +257,20 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
                 encode_fn._stockagent_static_abi_budget = _compact_encoder_static_abi_budget(slab.size(2))
         object.__setattr__(model,"_factorized_encode_fn",encode_fn)
     chunk = _factorized_stock_chunk_size(model, slab, mask, raw_basis=raw_basis)
+    if sparse_projection:
+        # Bound temporal workspace by its narrow input, rather than F-wide
+        # source storage. All stocks/dates/model dimensions remain selected.
+        per_stock=max(1,mask.size(0)*model.lookback*model.d_model*4*8)
+        chunk=max(1,min(512,(2*1024**3)//per_stock))
     outputs=[]
     for begin in range(0,slab.size(1),chunk):
         end=min(slab.size(1),begin+chunk)
         stock_mask=safe_mask[:,begin:end];stock_ids=symbol_indices[begin:end]
         # Bind loop values: backward recomputation must never use the last
         # chunk's rows, security IDs or masks for an earlier chunk.
-        def read_and_encode(m,ids,k,begin=begin,end=end):
+        def read_and_encode(m,ids,k,narrow=None,begin=begin,end=end):
+            if sparse_projection:
+                return _call_partition(model,encode_fn,narrow,m,ids,k)
             if compact_projection:
                 values,columns=slab.compact_stock_chunk(begin,end)
                 key = (values.size(1), columns.numel())
@@ -272,7 +286,11 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
                           f"packet_cache={slab._retain_gpu_packets}", flush=True)
                 return _call_partition(model,encode_fn,values,m,ids,k,columns)
             return _call_partition(model,encode_fn,slab.stock_chunk(begin,end),m,ids,k)
-        if checkpoint_encoder:
+        if sparse_projection:
+            narrow=sparse_embeddings[:,begin:end]
+            output=(checkpoint(read_and_encode,stock_mask,stock_ids,kernels,narrow,use_reentrant=False)
+                if checkpoint_encoder else read_and_encode(stock_mask,stock_ids,kernels,narrow))
+        elif checkpoint_encoder:
             output=checkpoint(read_and_encode,stock_mask,stock_ids,kernels,use_reentrant=False)
         else:output=read_and_encode(stock_mask,stock_ids,kernels)
         outputs.append(output)

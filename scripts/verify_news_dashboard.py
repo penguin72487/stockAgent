@@ -265,10 +265,10 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                         const displayed = card.querySelector('.news-provider-facts dd').textContent
                             .replaceAll(',', '').split('/').map(part => Number(part.trim()));
                         return {provider: id, observed_at_utc: state.latest.observed_at_utc,
-                            stored_heads: cohort ? cohort.stored_bodies : source.complete_urls,
-                            known_urls: cohort ? cohort.urls : source.known_urls,
+                            stored_heads: source.stored_body_counter_available ? source.stored_body_urls : cohort ? cohort.stored_bodies : source.complete_urls,
+                            known_urls: source.stored_body_counter_available ? source.known_urls : cohort ? cohort.urls : source.known_urls,
                             displayed_counts: displayed,
-                            progress_ratio: source.progress_ratio,
+                            progress_ratio: source.stored_body_counter_available ? source.stored_body_progress_ratio : source.progress_ratio,
                             displayed_ratio: card.querySelector(bodyProgressSelector).value,
                             finite_supplements: source.finite_supplements,
                             reviewed_nonbody_outside_cohort: cohort && cohort.reviewed_nonbody_outside_cohort,
@@ -367,7 +367,9 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                                 'changed_dates': index['dates_with_changed_source_total']}
                             assert lists['displayed_history'] == {
                                 'verified': history['verified_list_scopes'],
-                                'waiting': history['current_source_contract_scope_states']['waiting_page_evidence'],
+                                'waiting': history.get('waiting_list_scopes', history['current_source_contract_scope_states']['waiting_page_evidence']),
+                                'inconsistent': history.get('inconsistent_source_scopes'),
+                                'page_cap': history.get('page_cap_exceeded_scopes'),
                                 'gaps': history['unresolved_category_scopes'], 'retired': history['retired_gap_receipts']}
                             assert index['article_bodies_accepted_by_index'] == 0
                             for metric in (index, history):

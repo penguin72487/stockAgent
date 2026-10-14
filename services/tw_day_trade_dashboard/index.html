@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股多模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=25">
+  <link rel="stylesheet" href="styles.css?v=26">
   <link rel="stylesheet" href="../dashboard-core.css?v=7">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
   <link rel="stylesheet" href="../vendor/uplot/uPlot.min.css?v=1.6.32">
@@ -41,10 +41,10 @@
     <a href="#audit">資料稽核</a>
     <a href="#tw-public-status">台股官方公開資料</a>
     <a href="#signal-feature-panel">訊號特徵明細</a>
+    <a href="#price-sources">資料來源</a>
   </nav>
 
   <main id="main-content">
-    <p id="quote-display-notice" class="quote-display-notice hidden" role="status"></p>
     <section id="alert" class="alert hidden" role="alert" aria-live="assertive"></section>
 
     <div id="operations" class="section-intro">
@@ -195,12 +195,22 @@
       <div class="tw-public-monitor-kpis"><div id="tw-public-monitor-fetch-state">等待更新</div></div>
       <div id="tw-public-monitor-list" class="tw-public-monitor-list"><div class="tw-public-empty">資料尚未載入，請稍後重整。</div></div>
     </section>
+    <section id="price-sources" class="panel price-sources-panel" aria-labelledby="price-sources-title">
+      <div class="panel-head"><div><h2 id="price-sources-title">資料來源與計算說明</h2><p>統一列出本頁價格來源、資料日期與取得時間；以下清冊涵蓋目前已載入的資料。</p></div></div>
+      <div class="price-sources-body">
+        <p id="quote-display-notice" class="quote-display-notice hidden" role="status"></p>
+        <ul id="price-source-list" class="price-source-list"></ul>
+        <p class="price-distance-explanation">「距進場」是價格變動：(清算或出場價 ÷ 進場價 − 1) × 100%，不反轉空方符號，也不包含費用；交易損益另看已／未實現損益。Tick 依該價格交易日的商品級距跨區間累計，均價不在合法報價格點時標「約」；缺少可公開價格或已驗證規則不補造。已平倉的清算欄優先顯示帳本出場均價，缺少均價時顯示末次出場價；未平倉使用帳本清算估值。</p>
+        <div id="execution-source-contract"></div>
+        <details id="price-reference-details"><summary>完整官方日資料 <span id="price-reference-count">0</span> 筆</summary><ul id="price-reference-list" class="price-reference-list"></ul></details>
+      </div>
+    </section>
   </main>
   <script src="../dashboard-core.js?v=15" defer></script>
   <script src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32" defer></script>
   <script src="presentation.js?v=4" defer></script>
-  <script src="detail-components.js?v=16" defer></script>
+  <script src="detail-components.js?v=19" defer></script>
   <script src="chart-renderer.js?v=6" defer></script>
-  <script src="app.js?v=101" defer></script>
+  <script src="app.js?v=103" defer></script>
 </body>
 </html>

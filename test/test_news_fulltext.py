@@ -23,6 +23,11 @@ def config():
     config = json.loads(Path("configs/news_fulltext.json").read_text())
     config.pop("provider_catalog", None)  # Standalone synthetic publisher fixture.
     config.pop("failure_diagnostic_focus", None)  # This fixture has no real Cnyes URL scope.
+    # Standalone fixtures cannot inherit live opt-ins requiring a reviewed
+    # Cnyes cohort; keep the paired configuration explicit rather than weaken
+    # production validation when its focus is missing.
+    config["failure_diagnostic_metadata_identity_upgrade"] = False
+    config["retained_cnyes_failure_replay_enabled"] = False
     source = config["providers"][0]
     source.update({"id": "publisher", "domains": ["publisher.test"], "interval_seconds": 0.001,
                    "feeds": [], "sitemaps": [], "wordpress_apis": [], "fulltext_feeds": [], "index_pages": [], "index_path_pattern": "",
@@ -492,8 +497,12 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     assert {p.provider for p in registry.sources.values() if p.allowed} == {
         "globalvoices", "fed_board", "cnyes", "cmoney", "cmnews", "einfo", "moneyweekly",
         "ftvnews", "nownews", "genetinfo", "pansci", "cmmedia", "abmedia", "peopo", "cnews", "tainan_gov", "kmdn", "macau_gov",
-        "voa_chinese", "voa_cantonese", "tfc_taiwan", "nccu", "taichung_gov", "changhua_gov"}
-    assert registry.sources['abmedia'].acquisition_mode == registry.sources['peopo'].acquisition_mode == 'finite'
+        "voa_chinese", "voa_cantonese", "tfc_taiwan", "nccu", "taichung_gov", "changhua_gov", "taiwanhot"}
+    assert registry.sources['abmedia'].acquisition_mode == 'finite'
+    peopo = registry.sources['peopo']
+    assert peopo.acquisition_mode == ('continuous' if peopo.known_url_only else 'finite')
+    assert peopo.authorization['kind'] == 'open_license'
+    assert peopo.required_license_url_prefix == 'http://creativecommons.org/licenses/'
     assert not registry.sources['pts'].allowed
     assert registry.sources["cnyes"].authorization["kind"] == "personal_research"
     assert registry.sources["cmoney"].authorization.get("license") is None
@@ -522,7 +531,9 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     assert registry.sources["voa_cantonese"].allow_reviewed_supplements
     assert registry.sources["kmdn"].authorization["kind"] == "personal_research"
     assert registry.sources["kmdn"].authorization.get("license") is None
-    assert registry.sources["cnews"].acquisition_mode == registry.sources["cmmedia"].acquisition_mode == "finite"
+    assert registry.sources['cnews'].acquisition_mode == 'finite'
+    cmmedia = registry.sources['cmmedia']
+    assert cmmedia.acquisition_mode == ('continuous' if cmmedia.known_url_only else 'finite')
     assert registry.sources["cnews"].authorization["kind"] == registry.sources["cmmedia"].authorization["kind"] == "personal_research"
     assert not registry.sources["line_today"].allowed
     assert not config["publish"] and not config["remote_training_export"]

@@ -31,6 +31,9 @@ if str(REPO_ROOT) not in sys.path:
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
 from scripts.check_tw_day_trade_preopen_readiness import _session_contract  # noqa: E402
 from stockagent.data.tw_public_features import _release_feature_content_receipt  # noqa: E402
+from stockagent.data.tw_public_source_receipts import (  # noqa: E402
+    DERIVED_INPUT_RECEIPTS,
+)
 from scripts.watch_tw_public_publication_group import (  # noqa: E402
     _latest_completed_taiex_session,
     _preopen_acceptance_errors,
@@ -821,21 +824,14 @@ def _derived_data_status(
         _receipt_dependency_errors(
             reference_summary_path,
             live_root=live_root,
-            keys=("source_receipts",),
+            keys=DERIVED_INPUT_RECEIPTS["corporate_action_reference"][1],
         )
     )
     errors["stock_panel"].extend(
         _receipt_dependency_errors(
             stock_summary_path,
             live_root=live_root,
-            keys=(
-                "source_receipts",
-                "fallback_source_receipts",
-                "legacy_source_receipts",
-                "lifecycle_source_receipts",
-                "session_calendar_receipt",
-                "session_calendar_summary_receipt",
-            ),
+            keys=DERIVED_INPUT_RECEIPTS["stock_panel"][1],
         )
     )
     # The complete entitlement ledger is a derived historical projection, not
@@ -861,14 +857,14 @@ def _derived_data_status(
         _receipt_dependency_errors(
             entitlement_summary_path,
             live_root=live_root,
-            keys=("reference_receipt", "universe_receipt", "raw_receipt_manifest"),
+            keys=DERIVED_INPUT_RECEIPTS["corporate_action_entitlements"][1],
         )
     )
     errors["public_features"].extend(
         _receipt_dependency_errors(
             feature_summary_path,
             live_root=live_root,
-            keys=("source_receipts",),
+            keys=DERIVED_INPUT_RECEIPTS["public_features"][1],
         )
     )
     return {

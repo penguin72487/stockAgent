@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, time as wall_time, timezone
+from datetime import date, datetime, time as wall_time, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -136,6 +136,51 @@ def _deferred_factorized_source_request() -> dict | None:
     return state
 
 
+def _stale_factorized_projection_request() -> dict | None:
+    """A no-model wakeup hint for a preopen projection after an accepted close.
+
+    A decision-session label is not proof its calendar includes that session's
+    close. Only the canonical owner may extend the receipt-bound projection;
+    this bounded reader cannot accept features, fabricate dates, or run a model.
+    """
+    completed_path = Path(os.environ.get(
+        "STOCKAGENT_TW_COMPLETED_SESSION_RECEIPT",
+        "artifacts/data_refresh/tw_public/completed_session/latest.json"))
+    completed = _read_retry_json(completed_path if completed_path.is_absolute() else ROOT / completed_path)
+    if completed.get("status") != "ok" or (completed.get("after") or {}).get("current") is not True:
+        return None
+    expected = completed.get("expected_date")
+    if not isinstance(expected, str) or date.fromisoformat(expected).isoformat() != expected:
+        raise ValueError("completed projection refresh date must be a canonical date")
+    if date.fromisoformat(expected) > datetime.now(ZoneInfo("Asia/Taipei")).date():
+        raise ValueError("future completed projection refresh is not observable")
+    root = ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1"
+    pointer = root / "current/factorized_manifest.json"
+    if not pointer.is_file():
+        return None
+    path = pointer.resolve(strict=True)
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError("factorized projection pointer escapes the canonical source root")
+    manifest = _read_retry_json(path)
+    paper = manifest.get("paper_inference") or {}
+    if (manifest.get("status") != "complete" or manifest.get("research_only") is not True
+            or manifest.get("historical_point_in_time") is not False or manifest.get("feature_lag") != 1
+            or paper.get("contract") != "factorized_paper_projection_lag1_v1"
+            or paper.get("status") != "verified" or paper.get("raw_source_publication") is not False):
+        raise ValueError("unverified factorized projection cannot request source recovery")
+    dates = manifest.get("dates")
+    if (not isinstance(dates, list) or not dates
+            or any(not isinstance(day, str) or date.fromisoformat(day).isoformat() != day for day in dates)
+            or len(dates) != len(set(dates)) or dates != sorted(dates)):
+        raise ValueError("factorized projection dates must be unique ordered canonical dates")
+    if dates[-1] >= expected:
+        return None
+    return {"status": "projection_refresh_required", "expected_completed_session": expected,
+            "projection_end": dates[-1], "manifest": str(path),
+            "advisory_only": True, "model_executed": False,
+            "contract": "factorized_paper_projection_lag1_v1"}
+
+
 def _owns_factorized_source_updater(cfg) -> bool:
     target = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
     for item in (getattr(cfg, "completed_session_command", ()) or ()):
@@ -233,7 +278,7 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
                 raise ValueError("artifact retry deadline must be timezone-aware")
             if deadline <= observed:
                 candidates.append((key, market))
-    warming = _deferred_factorized_source_request()
+    warming = _deferred_factorized_source_request() or _stale_factorized_projection_request()
     if not candidates and warming is None:
         return finish()
 
@@ -280,12 +325,18 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
         # Headroom is a resource snapshot, not a source generation. Coalesce
         # an unchanged warming request; committed source hints and the full
         # worker retain the publication/resource gates and last-good proof.
-        admission = warming["admission"]
-        hint = {"phase": warming.get("phase"), "admission": {key: admission.get(key) for key in
-                ("contract", "source", "immutable_seed", "required_headroom_bytes", "reason")}}
+        if warming.get("status") == "projection_refresh_required":
+            hint = {key: warming.get(key) for key in
+                    ("status", "contract", "expected_completed_session", "projection_end", "manifest")}
+            prefix = "source_projection_refresh"
+        else:
+            admission = warming["admission"]
+            hint = {"phase": warming.get("phase"), "admission": {key: admission.get(key) for key in
+                    ("contract", "source", "immutable_seed", "required_headroom_bytes", "reason")}}
+            prefix = "source_cache_warming"
         for name, cfg in configs.items():
             if name in enabled and _owns_factorized_source_updater(cfg):
-                due_jobs[f"source_cache_warming:{name}"] = hint
+                due_jobs[f"{prefix}:{name}"] = hint
     result["due_keys"] = sorted(due_jobs)
     result["due"] = bool(result["due_keys"])
     result["reason"] = "retry_due" if result["due"] else "no_due_scheduled_retry"
@@ -379,26 +430,31 @@ def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> b
     expected = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
     if not _owns_factorized_source_updater(cfg):
         return True
-    state = _deferred_factorized_source_request()
+    state = _deferred_factorized_source_request() or _stale_factorized_projection_request()
     if state is None:
         return True
+    projection_refresh = state.get("status") == "projection_refresh_required"
+    action = "factorized_projection_refresh" if projection_refresh else "factorized_cache_warming"
     if not allow_warming:
-        _emit(status="factorized_cache_warming_deferred", market=cfg.market,
+        _emit(status=f"{action}_deferred", market=cfg.market,
               reason="isolated_source_owner_required", owner_unit=ARTIFACT_OWNER_UNIT,
               model_executed=False)
         return False
     bot = _load_discord_bot()
     status = bot._ensure_signal_ready(cfg)
     if status.market_open or not bot._completed_session_publication_ready(status):
-        _emit(status="factorized_cache_warming_deferred", market=cfg.market,
+        _emit(status=f"{action}_deferred", market=cfg.market,
               reason="accepted_official_close_required", model_executed=False)
         return False
-    _emit(status="factorized_cache_warming_started", market=cfg.market,
+    _emit(status=f"{action}_started", market=cfg.market,
           owner=ARTIFACT_OWNER_UNIT, source_owner=str(expected), model_executed=False)
     bot._run_completed_session_command(cfg, bypass_cache=True)
     if _read_retry_json(_factorized_source_updater_receipt()).get("status") not in {"verified", "already_current"}:
         raise RuntimeError("canonical factorized source recovery has no accepted receipt")
-    _emit(status="factorized_cache_warming_verified", market=cfg.market,
+    if projection_refresh and (not (ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/factorized_manifest.json").is_file()
+                               or _stale_factorized_projection_request() is not None):
+        raise RuntimeError("canonical factorized source recovery still lacks the completed calendar")
+    _emit(status=f"{action}_verified", market=cfg.market,
           source_owner=str(expected), model_executed=False)
     return True
 
@@ -599,7 +655,9 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     key=key,
                     market=market,
                 )
-                if not recovered:
+                if recovered:
+                    continue
+                if not discord_bot._artifact_backfill_retry_allowed(key):
                     # Skipping a failed job during backoff does not prove its
                     # artifacts are current. Preserve its per-market receipt
                     # and make the worker's unfinished work visible as well.
@@ -611,7 +669,11 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                         market=market,
                         key=key,
                     )
-                continue
+                    continue
+                # A current readback can CAS an obsolete ready hint to failed
+                # with an immediate retry. Keep this same canonical serial
+                # owner: do not defer repairs behind a later hour-long job or
+                # spawn another inference worker. Recheck priority gates below.
 
             # A multi-market pass can run for hours. Recheck the independent
             # priority gates between expensive inferences, not only once at

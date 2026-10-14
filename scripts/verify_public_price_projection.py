@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -86,12 +87,79 @@ def verify_transaction_report(row: dict, original: dict) -> int:
     return reports
 
 
+def verify_entry_distances(row: dict) -> int:
+    """Independent Decimal price-axis oracle, not the production metric helper."""
+    metrics = row.get("entry_price_distances", {})
+    proofs = row.get("public_price_display", {}).get("visible_fields", {})
+    withheld = row.get("public_price_display", {}).get("withheld_fields", [])
+    if row.get("entry_price") is None or "entry_price" in withheld:
+        assert not metrics, "a derived metric disclosed a withheld entry price"
+        return 0
+    entry = Decimal(str(row["entry_price"]))
+    count = 0
+    for field in ("last_mark_price", "exit_price", "last_exit_price"):
+        if row.get(field) is None or field in withheld or field not in proofs:
+            assert field not in metrics, "a derived metric disclosed a withheld current price"
+            continue
+        metric = metrics[field]
+        assert metric["contract"] == "public_entry_price_distance_v1"
+        price = Decimal(str(row[field]))
+        percent = float((price / entry - 1) * 100)
+        assert math.isclose(metric["change_pct"], percent, rel_tol=1e-10, abs_tol=1e-10)
+        if metric["ticks"] is not None:
+            kind = row.get("security_type") or ("etf" if str(row.get("symbol", "")).startswith("00") else "stock")
+            if kind == "etf":
+                bounds, sizes = ("50",), ("0.01", "0.05")
+            elif metric["tick_session_date"] >= "2005-03-01":
+                bounds, sizes = ("10", "50", "100", "500", "1000"), ("0.01", "0.05", "0.1", "0.5", "1", "5")
+            else:
+                bounds, sizes = ("5", "15", "50", "150", "1000"), ("0.01", "0.05", "0.1", "0.5", "1", "5")
+            def ordinal(value):
+                lower, total = Decimal(0), Decimal(0)
+                for upper, size in zip((*map(Decimal, bounds), Decimal("Infinity")), map(Decimal, sizes)):
+                    total += (min(value, upper) - lower) / size
+                    if value <= upper:
+                        return total
+                    lower = upper
+                raise AssertionError("unreachable price band")
+            ticks = float(ordinal(price) - ordinal(entry))
+            assert math.isclose(metric["ticks"], ticks, rel_tol=1e-10, abs_tol=1e-7), "cross-band tick distance is wrong"
+        count += 1
+    return count
+
+
+def verify_strategy_report(row: dict, original: dict) -> int:
+    """Independent ledger comparison, not a call back into the new classifier."""
+    reports = 0
+    clocks = {"take_profit_price": "entry_at", "stop_trigger_price": "entry_at",
+              "eod_limit_price": "eod_limit_submitted_at",
+              "closing_auction_limit_price": "closing_auction_order_submitted_at",
+              "opening_exit_limit_price": "opening_exit_submitted_at"}
+    proofs = row.get("public_price_display", {}).get("visible_fields", {})
+    for field, clock_key in clocks.items():
+        raw_value = original.get(field)
+        if field in {"take_profit_price", "stop_trigger_price"} and (
+            type(raw_value) in (float, int) and math.isfinite(raw_value) and raw_value > 0
+        ):
+            assert row.get(field) == raw_value, f"owner's valid {field} remains withheld or changed"
+        if row.get(field) is None:
+            continue
+        assert row[field] == raw_value, f"published plan changed {field}"
+        proof = proofs[field]
+        assert proof["publication_basis"] == "owner_paper_strategy_report_v1"
+        assert proof["evidence_kind"] == "strategy_plan" and proof["broker_execution_verified"] is False
+        assert proof["basis_at"] == original[clock_key], "plan invented its clock"
+        assert "license_reference" not in proof and "recorded_at" not in proof
+        reports += 1
+    return reports
+
+
 def main() -> None:
     import pyarrow.parquet as pq
     from playwright.sync_api import expect, sync_playwright
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="https://penguin72487.ddnsgeek.com")
+    parser.add_argument("--url", default="https://penguin72487.dpdns.org")
     parser.add_argument("--session-date", required=True)
     parser.add_argument("--history-date", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -219,6 +287,7 @@ def main() -> None:
                 policy = data["price_display_policy"]
                 assert policy["broker_public_display_permission"] == "unverified"
                 assert policy["paper_transaction_reports"] is True
+                assert policy["paper_strategy_reports"] is True
                 assert "https://www.twse.com.tw/zh/products/information/qa.html" in policy["usage_rules_references"]
                 verified_origins = []
                 for row in data.get("benchmarks", []):
@@ -235,6 +304,9 @@ def main() -> None:
                 receipt["api"][-1]["independent_transaction_report_fields"] = sum(
                     verify_transaction_report(row, originals[day][position_identity(row)]) for row in rows
                 )
+                receipt["api"][-1]["independent_strategy_report_fields"] = sum(
+                    verify_strategy_report(row, originals[day][position_identity(row)]) for row in rows
+                )
 
         # Enumerate the entire selected day's bounded public pages, not merely
         # one screenshot or the first hundred positions.
@@ -247,6 +319,8 @@ def main() -> None:
         assert len(all_rows) == data["total"], "selected-day pagination is incomplete"
         assert {position_identity(row) for row in all_rows} == set(originals[args.session_date]), "public and private ledger scope differs"
         report_fields = sum(verify_transaction_report(row, originals[args.session_date][position_identity(row)]) for row in all_rows)
+        strategy_fields = sum(verify_strategy_report(row, originals[args.session_date][position_identity(row)]) for row in all_rows)
+        distance_fields = sum(verify_entry_distances(row) for row in all_rows)
         assert report_fields > 0, "requested owner transaction reports are missing"
         missing = sorted({row["symbol"] for row in all_rows if not row.get("official_daily_quote")})
         receipt["full_selected_day"] = {
@@ -256,7 +330,12 @@ def main() -> None:
             "visible_exit_prices": sum(row.get("exit_price") is not None for row in all_rows),
             "visible_entry_prices": sum(row.get("entry_price") is not None for row in all_rows),
             "independent_transaction_report_fields": report_fields,
+            "independent_strategy_report_fields": strategy_fields,
+            "visible_take_profit_prices": sum(row.get("take_profit_price") is not None for row in all_rows),
+            "visible_stop_trigger_prices": sum(row.get("stop_trigger_price") is not None for row in all_rows),
             "transaction_accounting_exact": True,
+            "strategy_plan_exact": True,
+            "independent_entry_distance_fields": distance_fields,
         }
 
         with sync_playwright() as pw:
@@ -272,25 +351,41 @@ def main() -> None:
                                 if any(name in response.url for name in ("/app.js?", "/detail-components.js?")) else None)
                         start = time.perf_counter()
                         page.goto(f"{args.url.rstrip('/')}/{product}/", wait_until="domcontentloaded", timeout=20_000)
+                        page.locator('a[href="#price-sources"]').click()
                         page.locator("#quote-display-notice").filter(has_text="0050 開").wait_for(state="visible", timeout=20_000)
                         visible_ms = (time.perf_counter() - start) * 1000
                         notice = page.locator("#quote-display-notice")
+                        # Async tables can change page height after the initial
+                        # anchor jump. content-visibility skips offscreen text;
+                        # inspect a genuinely painted footer, not a DOM shortcut.
+                        notice.scroll_into_view_if_needed()
+                        expect(notice).to_be_in_viewport(timeout=10_000)
+                        expect(notice).to_contain_text(args.session_date, timeout=10_000)
                         assert notice.is_visible()
                         assert args.session_date in notice.inner_text()
-                        reference = fact(args.session_date, "0050", "TWSE")
+                        live_status = fetch_json(f"{args.url.rstrip('/')}/{product}/api/status")
+                        reference_session = live_status["official_price_reference"]["session_date"]
+                        reference = fact(reference_session, "0050", "TWSE")
                         price_text = lambda value: f"{value:,.2f}".rstrip("0").rstrip(".")
                         expect(notice).to_contain_text(
                             f"0050 開 {price_text(reference['open'])}／收 {price_text(reference['close'])}")
                         expect(notice).to_contain_text("公開展示授權待確認")
                         expect(notice).to_contain_text("模擬帳本成交，非券商成交")
-                        for asset, minimum in (("app.js", 101), ("detail-components.js", 16)):
+                        expect(notice).to_contain_text("TP／SL 與委託價是使用者公開的策略設定")
+                        assert page.locator("main > section").last.get_attribute("id") == "price-sources"
+                        assert page.locator("#price-sources #quote-display-notice").count() == 1
+                        expect(page.locator("#price-source-list")).to_contain_text("官方日資料")
+                        for asset, minimum in (("app.js", 103), ("detail-components.js", 19)):
                             versions = [int(parse_qs(urlparse(url).query).get("v", ["0"])[0])
                                         for url in assets if urlparse(url).path.endswith("/" + asset)]
                             assert versions and max(versions) >= minimum, "old immutable frontend asset is still referenced"
                         screenshot = args.output_dir / f"{product}-{width}.png"
                         page.screenshot(path=str(screenshot))
                         if product == "tw-day-trade":
-                            quote = page.locator("#position-body .public-daily-quote").first
+                            reference_toggle = page.locator("#price-reference-details > summary")
+                            reference_toggle.scroll_into_view_if_needed()
+                            reference_toggle.click()
+                            quote = page.locator("#price-reference-list .public-daily-quote").first
                             quote.wait_for(timeout=20_000)
                             # Shared content-visibility:auto intentionally skips
                             # off-screen text layout. Inspect actual visible rows.
@@ -298,9 +393,9 @@ def main() -> None:
                             expect(quote).to_be_in_viewport(timeout=10_000)
                             expect(quote).to_contain_text("官方日行情", timeout=20_000)
                             expect(quote.locator("..")).to_contain_text("（臺北）", timeout=10_000)
-                            expect(quote.locator("..")).to_contain_text("模擬帳本成交", timeout=10_000)
-                            expect(quote.locator("..")).to_contain_text("非券商成交", timeout=10_000)
-                            reference_summary = page.locator("#position-body .daily-reference-details summary").filter(has_text="次日界線").first
+                            expect(page.locator("#price-source-list")).to_contain_text("模擬帳本成交 · 非券商成交")
+                            expect(page.locator("#price-source-list")).to_contain_text("策略設定 · 非行情／非成交")
+                            reference_summary = page.locator("#price-reference-list .daily-reference-details summary").filter(has_text="次日界線").first
                             reference_summary.wait_for(state="visible", timeout=20_000)
                             reference_summary.scroll_into_view_if_needed()
                             reference_summary.click()
@@ -311,16 +406,58 @@ def main() -> None:
                             expect(reference_details).to_contain_text("盤後最後賣")
                             reference_screenshot = args.output_dir / f"{product}-official-details-{width}.png"
                             page.screenshot(path=str(reference_screenshot))
+                            metric = page.locator("#position-body .price-entry-distance").first
+                            metric.wait_for(timeout=20_000)
+                            metric.scroll_into_view_if_needed()
+                            expect(metric).to_contain_text("距進場")
+                            expect(metric).to_contain_text("%")
+                            expect(metric).to_contain_text("tick")
+                            expect(metric.locator("..")).to_contain_text("清算（已平倉）")
+                            assert page.locator("#position-body .public-daily-quote, #position-body .owner-strategy-price").count() == 0
+                            inline_text = page.locator("#position-body").inner_text()
+                            assert "官方日行情" not in inline_text and "來源 臺灣證券交易所" not in inline_text
+                            assert "模擬帳本成交 ·" not in inline_text and "策略設定 · 非行情／非成交" not in inline_text
                         dimensions = page.evaluate("() => ({viewport: innerWidth, document: document.documentElement.scrollWidth})")
                         assert dimensions["document"] <= dimensions["viewport"], "page-level horizontal overflow"
                         if product == "tw-day-trade":
                             detail = args.output_dir / f"{product}-prices-{width}.png"
                             page.screenshot(path=str(detail))
+                        page.locator('a[href="#price-sources"]').click()
+                        notice.scroll_into_view_if_needed()
+                        expect(notice).to_be_in_viewport(timeout=10_000)
+                        footer_screenshot = args.output_dir / f"{product}-footer-{width}.png"
+                        page.screenshot(path=str(footer_screenshot))
+                        if product == "tw-overnight":
+                            assert page.locator(".timeline-panel .source-list").count() == 0
+                            assert page.locator("#price-sources .source-list").count() == 1
+                        refresh_preserved_source_details = False
+                        if width in (1366, 390) and product == "tw-day-trade":
+                            # Repaint through the normal read-only refresh control;
+                            # expanded details and the current document must survive.
+                            reference_key = reference_summary.locator("../..").get_attribute("data-reference-key")
+                            navigations = []
+                            page.on("request", lambda request: navigations.append(request.url)
+                                    if request.is_navigation_request() and request.resource_type == "document" else None)
+                            with page.expect_response(lambda response: "/api/status" in response.url and response.status == 200):
+                                page.locator("#force-refresh").click()
+                            page.locator('a[href="#price-sources"]').click()
+                            expect(page.locator("#price-reference-details")).to_have_attribute("open", "")
+                            # Select by the safe DOM attribute rather than text;
+                            # source titles may be identical on different dates.
+                            reference_item = page.locator(f'#price-reference-list li[data-reference-key="{reference_key}"]')
+                            expect(reference_item.locator(".daily-reference-details")).to_have_attribute("open", "")
+                            assert not navigations, "refresh reloaded the whole document"
+                            refresh_preserved_source_details = True
                         assert not errors, errors
                         receipt["browser"].append({"product": product, "viewport": [width, height],
                             "official_notice_visible_ms": visible_ms, "notice": notice.inner_text(),
                             "page_errors": errors, "dimensions": dimensions, "screenshot": str(screenshot),
                             "frontend_assets": assets,
+                            "strategy_plan_visible": product == "tw-day-trade",
+                            "source_disclosures_at_page_end": True,
+                            "entry_distance_visible": product == "tw-day-trade",
+                            "footer_screenshot": str(footer_screenshot),
+                            "refresh_preserved_source_details": refresh_preserved_source_details,
                             "reference_details_click_verified": product == "tw-day-trade"})
                         page.close()
             finally:

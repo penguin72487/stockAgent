@@ -80,3 +80,64 @@ def test_current_engine_ack_is_readonly_and_not_a_fill_claim(monkeypatch):
 def test_commands_need_success_or_explicit_contractual_defer(monkeypatch, text, accepted):
     monkeypatch.setattr(verifier.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=text))
     assert verifier.command_sync_since_restart()["commands_sync_or_deferred_observed"] is accepted
+
+
+@pytest.fixture
+def runtime(monkeypatch):
+    value = status()
+    value["startup_inference_warmup"] = {"status": "deferred"}
+    owner = {"InvocationID": "before", "MainPID": "12"}
+    admission = {"contract": "live_implementation_process_admission_v1", "code_sha256": "current",
+                 "requires_fresh_process_on_change": True}
+    monkeypatch.setattr(verifier, "owner", lambda: deepcopy(owner))
+    monkeypatch.setattr(verifier, "identity", lambda unit: {"InvocationID": unit})
+    monkeypatch.setattr(verifier, "sha", lambda path: str(path))
+    monkeypatch.setattr(verifier, "status_for_owner", lambda: (deepcopy(value), SimpleNamespace(name="12")))
+    monkeypatch.setattr(verifier, "pending_work", lambda status: None)
+    monkeypatch.setattr(verifier.cache, "verify", lambda: {"markets": [
+        {"market": "cash", "cache_key": "same", "summary_path": "same.json"}]})
+    monkeypatch.setattr(verifier, "engine_acknowledgements", lambda *args: [{"lag": 0}])
+    monkeypatch.setattr(verifier, "gpu_handles", lambda process: [])
+    monkeypatch.setattr(verifier, "gpu_snapshot", lambda: {"gpu": "not probed in unit tests"})
+    monkeypatch.setattr(verifier.BOT, "_scheduled_markets", lambda: [])
+    monkeypatch.setattr(verifier, "current_code_admission", lambda: deepcopy(admission))
+    monkeypatch.setattr(verifier, "command_sync_since_restart", lambda: {
+        "commands_sync_or_deferred_observed": True, "watchdog_or_fatal_observed": False,
+        "new_warm_ready_log_observed": False})
+    return value, owner, admission
+
+
+def test_code_adoption_is_distinct_from_gpu_numerical_acceptance(runtime, monkeypatch):
+    value, owner, admission = runtime
+    monkeypatch.setattr(verifier.cache, "matched_benchmarks", lambda *args: pytest.fail("wrong scope"))
+    baseline = verifier.verify(None, None, code_admission_only=True)
+    assert baseline["contract"] == "discord_native_loaded_code_admission_v1"
+    assert baseline["full_numerical_oracle_proven"] is False
+    owner["InvocationID"] = "after"
+    value["live_implementation_admission"] = admission
+    result = verifier.verify(None, None, baseline, code_admission_only=True)
+    assert result["state"] == "accepted_native_discord_loaded_code_admission"
+    assert result["signals"] == baseline["signals"]
+
+
+@pytest.mark.parametrize("admission", [None, {}, {"code_sha256": "old"}])
+def test_native_changed_owner_needs_its_actual_current_code_admission(runtime, admission):
+    value, owner, _expected = runtime
+    baseline = verifier.verify(None, None, code_admission_only=True)
+    owner["InvocationID"] = "after"
+    value["live_implementation_admission"] = admission
+    with pytest.raises(ValueError, match="implementation_not_current"):
+        verifier.verify(None, None, baseline, code_admission_only=True)
+
+
+def test_original_numerical_acceptance_still_requires_independent_benchmarks(runtime, monkeypatch):
+    calls = []
+    monkeypatch.setattr(verifier.cache, "matched_benchmarks", lambda *args: calls.append(args) or ["proof"])
+    with pytest.raises(ValueError, match="separate modes"):
+        verifier.verify(None, None)
+    with pytest.raises(ValueError, match="separate modes"):
+        verifier.verify("bench", "control", code_admission_only=True)
+    result = verifier.verify("bench", "control")
+    assert result["full_numerical_oracle_proven"] is True and len(calls) == 1
+    with pytest.raises(ValueError, match="control_contract_mismatch"):
+        verifier.verify(None, None, result, code_admission_only=True)

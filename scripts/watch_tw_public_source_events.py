@@ -63,6 +63,14 @@ from scripts.watch_tw_public_publication_group import (  # noqa: E402
     _taiex_calendar_command,
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
+from stockagent.data.tw_public_source_receipts import (  # noqa: E402
+    DERIVED_INPUT_RECEIPTS,
+    iter_input_receipts,
+)
+from stockagent.live.tw_public_source_guard import (  # noqa: E402
+    TWPublicSourceUpdatePending,
+    live_tw_public_source_read_guard,
+)
 from stockagent.live.tw_public_opening_revision import (  # noqa: E402
     active_opening_revision_freeze,
     opening_revision_gate_path,
@@ -129,6 +137,8 @@ MEMORY_HEAVY_REFRESH_DATASETS = frozenset(
 CLOSE_EVENT_PHASE = "close_event"
 CLOSE_PROBE_WINDOW_START = datetime_time(13, 25)
 CLOSE_PROBE_WINDOW_END = datetime_time(14, 10)
+COMPLETED_RECONCILE_COALESCE_SECONDS = 60.0
+DEPENDENCY_SUMMARY_MAX_BYTES = 256 * 1024
 _STOP = threading.Event()
 
 
@@ -1474,20 +1484,9 @@ def _finalize_completed_session_close_event(
         return {"status": "not_ready"}
     expected_date = str(close_event.get("expected_date") or "")[:10]
     completed_receipt_path = state_root.parent / "completed_session" / "latest.json"
-    completed = _read_json(completed_receipt_path)
-    after = completed.get("after")
-    if (
-        close_event.get("reused") is True
-        and completed.get("status") == "ok"
-        and completed.get("expected_date") == expected_date
-        and isinstance(after, Mapping)
-        and after.get("current") is True
-    ):
-        return {
-            "status": "already_current",
-            "expected_date": expected_date,
-            "receipt": str(completed_receipt_path),
-        }
+    # An unchanged close version says nothing about later institutional,
+    # lifecycle or feature inputs. Only the canonical finalizer can validate
+    # the *current* dependency generation under its shared/write lease.
     command = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "finalize_tw_public_completed_session.py"),
@@ -1497,7 +1496,13 @@ def _finalize_completed_session_close_event(
         str(state_root.parent / "publications"),
         "--expected-date",
         expected_date,
+        "--receipt",
+        str(completed_receipt_path),
     ]
+    try:
+        before_receipt = completed_receipt_path.stat()
+    except OSError:
+        before_receipt = None
     started = time.monotonic()
     process = subprocess.Popen(command, cwd=REPO_ROOT)
     while process.poll() is None:
@@ -1514,14 +1519,182 @@ def _finalize_completed_session_close_event(
                 process.kill()
                 process.wait()
             raise RuntimeError("source-event monitor stopped during close finalization")
+    completed = _read_json(completed_receipt_path)
+    after = completed.get("after")
+    try:
+        after_receipt = completed_receipt_path.stat()
+    except OSError:
+        after_receipt = None
+    accepted = (
+        process.returncode == 0
+        and after_receipt is not None
+        and before_receipt != after_receipt
+        and completed.get("status") == "ok"
+        and completed.get("expected_date") == expected_date
+        and isinstance(after, Mapping)
+        and after.get("current") is True
+    )
     return {
-        "status": "ok" if process.returncode == 0 else "failed",
+        "status": "ok" if accepted else "failed",
         "expected_date": expected_date,
         "return_code": int(process.returncode),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "command": command,
         "receipt": str(completed_receipt_path),
     }
+
+
+def _derived_event_dependencies(live_root: Path) -> set[str] | None:
+    """Read only small input manifests; None means route conservatively.
+
+    This is a scheduling hint, never hash/date/coverage acceptance. Real source
+    changes are already captured by the downloader's before/after fingerprints.
+    No parquet scan or full source hashing belongs in the idle poll.
+    """
+
+    root = live_root.resolve(strict=False)
+    names: set[str] = set()
+    try:
+        with live_tw_public_source_read_guard(root / "stocks"):
+            for relative, keys in DERIVED_INPUT_RECEIPTS.values():
+                path = root / relative
+                with path.open("rb") as handle:
+                    payload = handle.read(DEPENDENCY_SUMMARY_MAX_BYTES + 1)
+                if len(payload) > DEPENDENCY_SUMMARY_MAX_BYTES:
+                    return None
+                summary = json.loads(payload)
+                if not isinstance(summary, Mapping):
+                    return None
+                receipts = list(iter_input_receipts(summary, keys))
+                if not receipts:
+                    return None
+                for _key, receipt in receipts:
+                    raw_path = receipt.get("path") or receipt.get("name")
+                    if not raw_path:
+                        return None
+                    source_path = Path(str(raw_path)).expanduser()
+                    if not source_path.is_absolute():
+                        source_path = root / source_path
+                    source_path = source_path.resolve(strict=False)
+                    if source_path.parent == root and source_path.suffix == ".parquet":
+                        names.add(source_path.stem)
+    except (OSError, UnicodeError, ValueError, TWPublicSourceUpdatePending):
+        return None
+    return names
+
+
+def _queue_completed_session_reconcile(
+    state: dict[str, Any],
+    *,
+    datasets: list[str],
+    reason: str,
+    observed: datetime,
+) -> None:
+    pending = state.get("completed_session_pending")
+    pending = dict(pending) if isinstance(pending, Mapping) else {}
+    pending.setdefault("first_pending_at_taipei", observed.isoformat(timespec="seconds"))
+    pending["datasets"] = sorted(set(pending.get("datasets") or ()) | set(datasets))
+    pending["reasons"] = sorted(set(pending.get("reasons") or ()) | {reason})
+    if reason == "official_close_accepted":
+        # Actual newly accepted closing evidence can resolve a publication
+        # wait immediately; it must not inherit a prior not-ready retry delay.
+        pending.pop("next_retry_at_taipei", None)
+    state["completed_session_pending"] = pending
+
+
+def _queue_completed_source_refresh(
+    state: dict[str, Any],
+    refresh: Mapping[str, Any],
+    *,
+    live_root: Path,
+    observed: datetime,
+) -> None:
+    accepted = set(refresh.get("accepted_datasets") or ())
+    changed = {
+        str(row["dataset"])
+        for row in refresh.get("content_changed_datasets") or ()
+        if isinstance(row, Mapping) and row.get("dataset") in accepted
+    }
+    if not changed:
+        return
+    dependencies = _derived_event_dependencies(live_root)
+    relevant = changed if dependencies is None else changed.intersection(dependencies)
+    if relevant:
+        _queue_completed_session_reconcile(
+            state,
+            datasets=sorted(relevant),
+            reason="derived_source_content_changed",
+            observed=observed,
+        )
+
+
+def _drain_completed_session_reconcile(
+    state: dict[str, Any],
+    *,
+    live_root: Path,
+    state_root: Path,
+    heartbeat_seconds: float,
+    observed: datetime,
+) -> dict[str, Any] | None:
+    pending = state.get("completed_session_pending")
+    if not isinstance(pending, Mapping):
+        return None
+    # Preserve the original opening/intraday owner; this lane is postclose only.
+    if observed.astimezone(TAIPEI).timetz().replace(tzinfo=None) < datetime_time(13, 30):
+        return {"status": "waiting_close_window"}
+    retry_at = _parse_timestamp(pending.get("next_retry_at_taipei"))
+    if retry_at is not None and observed < retry_at:
+        return {"status": "retry_deferred", "next_retry_at_taipei": retry_at.isoformat()}
+    # Drain a short known source burst before building, but never let a failed
+    # or permanently pending endpoint postpone known-good feature updates.
+    first = _parse_timestamp(pending.get("first_pending_at_taipei")) or observed
+    if (
+        "official_close_accepted" not in (pending.get("reasons") or ())
+        and (observed - first).total_seconds() < COMPLETED_RECONCILE_COALESCE_SECONDS
+    ):
+        dependencies = _derived_event_dependencies(live_root)
+        remaining = [
+            name
+            for name, row in (state.get("datasets") or {}).items()
+            if row.get("observed_version")
+            and row.get("observed_version") != row.get("applied_version")
+            and (dependencies is None or name in dependencies)
+            and _download_retry_due(row, observed)
+        ]
+        if remaining:
+            return {"status": "coalescing", "pending_source_datasets": sorted(remaining)}
+    try:
+        _atomic_json(state_root / "latest.json", state)
+        expected_date = _latest_completed_taiex_session(live_root, observed=observed)
+        result = _finalize_completed_session_close_event(
+            {"status": "ok", "expected_date": expected_date, "reused": False},
+            live_root=live_root,
+            state_root=state_root,
+            heartbeat_seconds=heartbeat_seconds,
+        )
+    except Exception as exc:
+        if _STOP.is_set():
+            raise
+        result = {"status": "failed", "error": str(exc)}
+    result["triggered_datasets"] = list(pending.get("datasets") or ())
+    result["reasons"] = list(pending.get("reasons") or ())
+    result["completed_at_taipei"] = datetime.now(TAIPEI).isoformat(timespec="seconds")
+    if result["status"] == "ok":
+        state.pop("completed_session_pending", None)
+    else:
+        pending = dict(pending)
+        failures = int(pending.get("failure_count") or 0) + 1
+        delay = min(300.0, 5.0 * 2 ** min(failures - 1, 6))
+        pending.update(
+            failure_count=failures,
+            last_failure=result,
+            next_retry_at_taipei=(datetime.now(TAIPEI) + timedelta(seconds=delay)).isoformat(
+                timespec="seconds"
+            ),
+        )
+        state["completed_session_pending"] = pending
+    state["completed_session_finalize"] = result
+    return result
 
 
 def _summarize_state(
@@ -1611,6 +1784,9 @@ def _summarize_state(
             "opening_apply_deferred_datasets": deferred,
             "last_cycle_changed_count": len(changed),
             "last_cycle_changed_datasets": sorted(changed),
+            "completed_session_reconcile_pending": bool(
+                state.get("completed_session_pending")
+            ),
             "source_counts": dict(
                 sorted(Counter(spec.source for spec in specs).items())
             ),
@@ -1709,6 +1885,14 @@ def main() -> int:
     specs = list(DEFAULT_DATASETS.values())
     specs_by_name = {spec.name: spec for spec in specs}
     state = _load_state(state_path, specs, args)
+    state["runtime_contract"] = "completed_dependency_reconcile_v2"
+    state["runtime_source_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    if not args.probe_only:
+        # Recover already-applied non-close revisions and interrupted finalizers
+        # once per owner, without redownloading or trusting an old current flag.
+        _queue_completed_session_reconcile(
+            state, datasets=[], reason="owner_startup_reconcile", observed=datetime.now(TAIPEI)
+        )
     limiter = SharedRateLimiter(
         resolve_request_interval("tw_public", None), name="tw_public"
     )
@@ -1845,14 +2029,19 @@ def main() -> int:
                         ),
                     )
                     refresh["completed_session_close_event"] = close_event
-                    refresh["completed_session_finalize"] = (
-                        _finalize_completed_session_close_event(
-                            close_event,
-                            live_root=live_root,
-                            state_root=state_root,
-                            heartbeat_seconds=float(args.heartbeat_seconds),
-                        )
+                    _queue_completed_source_refresh(
+                        state, refresh, live_root=live_root, observed=datetime.now(TAIPEI)
                     )
+                    if close_event.get("status") == "ok" and (
+                        close_event.get("reused") is not True
+                        or bool(state.get("completed_session_pending"))
+                    ):
+                        _queue_completed_session_reconcile(
+                            state,
+                            datasets=list(refresh.get("accepted_datasets") or ()),
+                            reason="official_close_accepted",
+                            observed=datetime.now(TAIPEI),
+                        )
                 state["last_refresh"] = refresh
                 if refresh["status"] == "deferred_opening_revision":
                     state["opening_apply_deferred_until_taipei"] = (
@@ -1874,6 +2063,19 @@ def main() -> int:
                 timespec="seconds"
             )
             cycles += 1
+        if not args.probe_only and state.get("completed_session_pending"):
+            # Commit the work before launching the existing serial finalizer.
+            # A crash/stop between apply and build cannot lose its retry lane.
+            finalize = _drain_completed_session_reconcile(
+                state,
+                live_root=live_root,
+                state_root=state_root,
+                heartbeat_seconds=float(args.heartbeat_seconds),
+                observed=datetime.now(TAIPEI),
+            )
+            if finalize is not None and state.get("completed_session_dispatch") != finalize:
+                state["completed_session_dispatch"] = finalize
+                _atomic_json(state_path, state)
         if due:
             _summarize_state(state, specs=specs, changed=changed)
             _atomic_json(state_path, state)

@@ -925,6 +925,7 @@ def _route_ddp_batch_replicated(
     include_volume_notional: bool,
     include_short_capacity_notional: bool,
     global_metadata: Mapping[str, torch.Tensor] | None = None,
+    gather_actions: bool = True,
 ) -> dict[str, torch.Tensor | None]:
     """Gather actions while keeping the full-symbol ledger replicated.
 
@@ -935,12 +936,16 @@ def _route_ddp_batch_replicated(
     ``None`` preserves the historical all-gather oracle.
     """
 
+    if not gather_actions and global_metadata is None:
+        raise ValueError("local account actions require locally owned execution metadata")
+
     routed: dict[str, torch.Tensor | None] = {
-        "weights": _all_gather_autograd(local_weights.contiguous()),
+        "weights": (_all_gather_autograd(local_weights.contiguous())
+                    if gather_actions else local_weights),
     }
     source = batch if global_metadata is None else global_metadata
     if global_metadata is not None:
-        expected_rows = int(local_weights.size(0)) * _distributed_world_size()
+        expected_rows = int(local_weights.size(0)) * (_distributed_world_size() if gather_actions else 1)
         sample_mask = source.get("sample_mask")
         if sample_mask is None or int(sample_mask.size(0)) != expected_rows:
             raise RuntimeError(
@@ -11297,9 +11302,16 @@ def _save_fold_output_artifacts(
     def _copy_plot(name: str, source: Path, target: Path) -> None:
         item_start = time.perf_counter()
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+        # Historical artifact aliases can be hardlinks or symlinks to the
+        # canonical plot. It has just been regenerated; copying onto the same
+        # inode both adds no work and aborts an otherwise complete inference.
+        # Missing or distinct targets still take the ordinary checked copy.
+        same_file = target.exists() and source.samefile(target)
+        if not same_file:
+            shutil.copyfile(source, target)
         plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
         plot_timing[f"{name}_copied_from"] = str(source.name)
+        plot_timing[f"{name}_same_file_reused"] = same_file
 
     if write_plots:
         benchmark_label = _benchmark_plot_label(config)
@@ -22076,7 +22088,7 @@ def _defer_trajectory_ddp_sync(function: Callable[..., Any]) -> Callable[..., An
     return run
 
 
-def _synchronize_trajectory_gradients(model: nn.Module) -> None:
+def _synchronize_trajectory_gradients(model: nn.Module, *, allow_partial_presence: bool = False) -> None:
     """Average accumulated dense gradients with the same scaling as DDP."""
     parameters = [(name, parameter) for name, parameter in model.named_parameters()
         if parameter.requires_grad]
@@ -22087,12 +22099,16 @@ def _synchronize_trajectory_gradients(model: nn.Module) -> None:
     dist.all_reduce(presence, op=dist.ReduceOp.SUM)
     counts = presence.cpu().tolist()
     world_size = _distributed_world_size()
-    if any(count not in (0, world_size) for count in counts):
+    if not allow_partial_presence and any(count not in (0, world_size) for count in counts):
         raise RuntimeError("trajectory gradients are absent on only some DDP ranks")
     groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
     for (name, parameter), count in zip(parameters, counts, strict=True):
         if count == 0:
             continue
+        if parameter.grad is None:
+            # An independent account can legitimately leave a parameter unused
+            # locally. Globally unused parameters retain None (no weight decay).
+            parameter.grad = torch.zeros_like(parameter)
         if parameter.grad.is_sparse:
             raise RuntimeError(f"trajectory synchronization requires a dense gradient: {name}")
         gradient = parameter.grad
@@ -22177,6 +22193,8 @@ def _train_epoch_windowed_tensor_ddp(
     optimizer_step_per_trajectory: bool = False,
     log_return_weights: torch.Tensor | None = None,
     ddp_trajectory_gradient_sync: str = "batch",
+    day_trade_annual_episode_sharding: bool = False,
+    day_trade_annual_episode_world_size: int = 2,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -22190,6 +22208,7 @@ def _train_epoch_windowed_tensor_ddp(
         raise RuntimeError("DDP windowed hotpath requires log_utility, sharpe, sortino, or another return-series objective")
     world_size = _distributed_world_size()
     rank = _distributed_rank()
+    policy_model = model.module if day_trade_annual_episode_sharding else model
     physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
     physical_previous: DayTradeCarryState | None = None
     if physical_source is not None and (
@@ -22200,6 +22219,13 @@ def _train_epoch_windowed_tensor_ddp(
         raise ValueError("physical DDP requires chronological replicated 50%-minute carry accounting")
     if world_size <= 1 or not _distributed_is_initialized():
         raise RuntimeError("DDP windowed hotpath requires an initialized distributed process group")
+    if day_trade_annual_episode_sharding and world_size != day_trade_annual_episode_world_size:
+        raise ValueError("annual ownership world size differs from its checkpoint contract")
+    if day_trade_annual_episode_sharding and (
+            physical_source is None or not execution_runtime.day_trade_training_annual_episodes
+            or not optimizer_step_per_trajectory or ddp_trajectory_gradient_sync != "trajectory"
+            or symbol_sharded_ledger or model.broadcast_buffers or model.static_graph):
+        raise ValueError("whole-account episode sharding requires immutable-buffer trajectory DDP and annual physical accounts")
     if int(batch_size) % world_size != 0:
         raise RuntimeError(
             f"DDP global batch_size must be divisible by world_size; got batch_size={batch_size}, world_size={world_size}"
@@ -22243,6 +22269,23 @@ def _train_epoch_windowed_tensor_ddp(
         )
 
     num_batches = total_rows // int(batch_size)
+    episode_spans = None
+    if day_trade_annual_episode_sharding:
+        from stockagent.training.episode_parallel import plan_annual_episode_ownership
+        cache_key = (id(split), id(physical_source), world_size, int(batch_size),
+                     json.dumps(execution_runtime.day_trade_training_period_contract, sort_keys=True))
+        cached = model.__dict__.get("_annual_episode_plan")
+        if cached is None or cached[0] != cache_key:
+            plan = plan_annual_episode_ownership(
+                split, physical_source, period_contract=execution_runtime.day_trade_training_period_contract,
+                world_size=world_size, global_batch_rows=int(batch_size))
+            model.__dict__["_annual_episode_plan"] = (cache_key, plan)
+            if _distributed_is_rank0():
+                _progress("annual episode ownership: " + json.dumps(plan.receipt(), sort_keys=True))
+        else:
+            plan = cached[1]
+        episode_spans = plan.spans_by_rank[rank]
+        num_batches = len(episode_spans)
     ledger_symbol_count = (
         recurrent_symbol_count // world_size
         if symbol_sharded_ledger
@@ -22329,6 +22372,7 @@ def _train_epoch_windowed_tensor_ddp(
                 split,
                 list(range(num_batches)),
                 int(batch_size),
+                batch_spans=episode_spans,
             )
         )
     )
@@ -22338,8 +22382,12 @@ def _train_epoch_windowed_tensor_ddp(
         # source closure, alive while staging the next chronological batch.
         batch_loss_fn = None
         batch_start = time.perf_counter()
-        global_start = (step_idx - 1) * int(batch_size)
-        local_start = global_start + rank * local_batch_size
+        global_start, global_end = (episode_spans[step_idx - 1] if episode_spans is not None
+                                   else ((step_idx - 1) * int(batch_size), step_idx * int(batch_size)))
+        local_start = (min(global_start, total_rows - local_batch_size)
+                       if episode_spans is not None else global_start + rank * local_batch_size)
+        # NN shape stays fixed. Outputs outside this account span are discarded
+        # before the physical loss; they cannot carry another account's state.
         local_end = local_start + local_batch_size
         prepared_physical_batch = None
         if physical_prefetch is not None:
@@ -22352,7 +22400,7 @@ def _train_epoch_windowed_tensor_ddp(
                 )
         batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
             loss_fn, source=physical_source, split=split, start=global_start,
-            end=global_start + int(batch_size), device=device,
+            end=global_end, device=device,
             previous=physical_previous,
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             reset_period_contract=execution_runtime.day_trade_training_period_contract,
@@ -22424,7 +22472,7 @@ def _train_epoch_windowed_tensor_ddp(
                 enabled=profile_timing,
             ):
                 if use_panel_slab:
-                    model_output = model(
+                    model_output = policy_model(
                         batch["feature_slab"],
                         batch_mask,
                         batch.get("symbol_indices"),
@@ -22435,7 +22483,7 @@ def _train_epoch_windowed_tensor_ddp(
                                 batch,
                                 target_rows=int(batch_mask.size(0)),
                             )
-                            if _model_requires_execution_context(model)
+                            if _model_requires_execution_context(policy_model)
                             else None
                         ),
                     )
@@ -22443,13 +22491,13 @@ def _train_epoch_windowed_tensor_ddp(
                     if batch_x is None:
                         raise RuntimeError("DDP materialized window batch is unavailable")
                     model_output = _call_model(
-                        model,
+                        policy_model,
                         batch_x,
                         batch_mask,
                         return_aux=False,
                         symbol_indices=batch.get("symbol_indices"),
                         portfolio_context=_portfolio_context_for_model(
-                            model,
+                            policy_model,
                             batch,
                             target_rows=int(batch_mask.size(0)),
                         ),
@@ -22460,11 +22508,14 @@ def _train_epoch_windowed_tensor_ddp(
 
             gather_start = time.perf_counter()
             global_metadata: Mapping[str, torch.Tensor] | None = None
-            if replicated_ledger_local_metadata:
+            if replicated_ledger_local_metadata or episode_spans is not None:
+                if episode_spans is not None:
+                    offset = global_start - local_start
+                    local_weights = local_weights[offset:offset + global_end - global_start]
                 metadata_start = time.perf_counter()
                 global_metadata = split.batch_metadata_by_rows(
                     global_start,
-                    global_start + int(batch_size),
+                    global_end,
                     device=prepare_device,
                     non_blocking=False,
                     prepare_timing=timing,
@@ -22503,7 +22554,7 @@ def _train_epoch_windowed_tensor_ddp(
                     and "short_capacity_notional" in batch
                 ),
                 **(
-                    {"global_metadata": global_metadata}
+                    {"global_metadata": global_metadata, "gather_actions": episode_spans is None}
                     if not symbol_sharded_ledger
                     else {}
                 ),
@@ -22706,6 +22757,10 @@ def _train_epoch_windowed_tensor_ddp(
             loss_for_backward = loss * (
                 batch_valid_rows / float(trajectory_valid_rows)
             )
+            if episode_spans is not None:
+                # Dense synchronization averages ranks; compensate once so an
+                # uneven 6/5-account split still has the global date weighting.
+                loss_for_backward = loss_for_backward * world_size
 
         next_prev = (aux_outputs or {}).get("_final_weights")
         portfolio_prev_futures_carry_state = _detach_portfolio_state((aux_outputs or {}).get("_final_futures_carry_state"))
@@ -22953,7 +23008,7 @@ def _train_epoch_windowed_tensor_ddp(
     if optimizer_step_per_trajectory and steps > 0:
         if ddp_trajectory_gradient_sync == "trajectory":
             sync_start = time.perf_counter()
-            _synchronize_trajectory_gradients(model)
+            _synchronize_trajectory_gradients(model, allow_partial_presence=episode_spans is not None)
             _maybe_sync_cuda(device, profile_timing)
             sync_elapsed = time.perf_counter() - sync_start
             timing.grad_s += sync_elapsed
@@ -22981,6 +23036,9 @@ def _train_epoch_windowed_tensor_ddp(
     timing.portfolio_first_default_row = int(gradient_norm_values[6])
     timing.portfolio_first_default_reason = int(gradient_norm_values[7])
     timing.portfolio_final_alive = int(gradient_norm_values[5])
+    if episode_spans is not None:
+        dist.all_reduce(total_loss_t, op=dist.ReduceOp.SUM)
+        total_loss_t.div_(world_size)
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -28153,6 +28211,8 @@ def _run_training_impl(
             # zero-step stateless optimizer. It never updates Adam or its clock.
             active_optimizer = optimizer if log_return_weights is None else torch.optim.SGD(model.parameters(), lr=0.)
             active_scheduler = scheduler if log_return_weights is None else None
+            if config.training.day_trade_annual_episode_sharding and not ddp_enabled:
+                raise RuntimeError("annual episode sharding requires the canonical multi-rank DDP executor")
             if train_windowed is not None:
                 if ddp_enabled:
                     return _train_epoch_windowed_tensor_ddp(
@@ -28162,6 +28222,8 @@ def _run_training_impl(
                         active_optimizer,
                         scaler,
                         ddp_trajectory_gradient_sync=config.training.ddp_trajectory_gradient_sync,
+                        day_trade_annual_episode_sharding=config.training.day_trade_annual_episode_sharding,
+                        day_trade_annual_episode_world_size=config.training.day_trade_annual_episode_world_size,
                         batch_size=train_batch_size,
                         device=device,
                         amp_dtype=amp_dtype,
@@ -28660,6 +28722,13 @@ def _run_training_impl(
             policy_step_prepare_s = time.perf_counter() - policy_step_started
             carry_compile_before = get_day_trade_carry_compile_stats()
             train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
+            if config.training.day_trade_annual_episode_sharding and _distributed_should_write():
+                from downloader.artifact_io import atomic_write_json
+                cached_plan = compiled_train_model.__dict__.get("_annual_episode_plan")
+                if cached_plan is None:
+                    raise RuntimeError("annual training did not produce an ownership plan")
+                atomic_write_json(_group_dir(output_path, train_years) / "annual_episode_ownership.json",
+                                  cached_plan[1].receipt())
             train_bt_runtime_after = get_backtest_runtime_stats()
             train_loss_runtime_after = get_loss_runtime_stats()
             train_carry_compile_delta = {

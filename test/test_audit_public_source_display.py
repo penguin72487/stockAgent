@@ -46,6 +46,21 @@ def test_a_twse_daily_license_cannot_expand_to_unlisted_final_bid_ask(tmp_path):
     assert result["summary"]["grant_errors"][0]["unverified_fields"] == ["last_bid"]
 
 
+def test_owner_strategy_inventory_is_separate_from_verified_raw_quote_grants(tmp_path):
+    policy, metadata = fixtures()
+    result = audit.build_inventory(policy=policy, catalog={"sources": []}, metadata=metadata, root=tmp_path)
+    scopes = {row["source_id"]: row for row in result["owner_report_scopes"]}
+    strategy = scopes["owner_strategy_reports"]
+    assert strategy["enabled"] is True and strategy["raw_quote_grant"] is False
+    assert strategy["broker_execution_verified"] is False
+    assert {"take_profit_price", "stop_trigger_price"} <= set(strategy["fields_by_trusted_record_context"]["paper_position"])
+    assert {row["source_id"] for row in result["official_datasets"] if row["raw_values_exposed_by_this_change"]} == {
+        "twse_daily_ohlcv", "tpex_daily_ohlcv"}
+    policy["owner_strategy_reports"]["record_scope"] = "all_quotes"
+    invalid = audit.build_inventory(policy=policy, catalog={"sources": []}, metadata=metadata, root=tmp_path)
+    assert invalid["owner_report_scopes"][1]["enabled"] is False
+
+
 @pytest.mark.parametrize("change", [
     {"state": "metadata_unavailable"}, {"state": "license_needs_review"},
     {"state": "verified_open_v1", "fields": []},

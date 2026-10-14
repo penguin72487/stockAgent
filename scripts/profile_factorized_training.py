@@ -41,12 +41,16 @@ def main():
         help="Bit-check every actual raw chunk and compare native control/transport gradients, no optimizer.")
     parser.add_argument("--compare-compact-projection", action="store_true",
         help="Compare the opt-in full-affine compact stem to the identical dense stem, no optimizer.")
+    parser.add_argument("--compare-sparse-projection", action="store_true",
+        help="Compare resident CSR/narrow temporal execution to the selected canonical compact baseline, no optimizer.")
+    parser.add_argument("--numeric-experiment", action="store_true",
+        help="Explicitly allow a changed numerical trajectory; retain every strict oracle rejection. Native-repeat, finite-output and nonzero-gradient gates remain mandatory.")
     parser.add_argument("--attention-control-backend", choices=("auto", "manual", "sdpa"), default=None,
         help="Compare the selected attention backend to this canonical backend with identical observations/parameters; no optimizer or relaxed tolerances.")
     parser.add_argument("--compact-stream-control-bytes", type=int, default=None,
         help="Compare the selected stream budget to this control (0 is the original 1 GiB/128-stock policy), same parameters and tolerances.")
     args = parser.parse_args()
-    runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))["admit_output"](
+    runpy.run_path(str(args.code_root.resolve(strict=True) / "stockagent/storage_layout.py"))["admit_output"](
         args.output, "benchmark"
     )
     sys.path.insert(0, str(args.code_root.resolve(strict=True)))
@@ -58,7 +62,7 @@ def main():
         FactorizedPanelFeatures, FactorizedPanelSlab, attach_factorized_features, file_sha256,
     )
     from stockagent.data.panel import build_panel
-    from stockagent.data.walkforward import build_expanding_year_folds
+    from stockagent.data.walkforward import build_expanding_year_folds, year_boundary_offset_sessions
     from stockagent.models.factory import build_model
     from stockagent.models.temporal_basis_fit import temporal_basis_overrides_from_state_dict
     from stockagent.training.dataset import CrossSectionalDataset
@@ -104,6 +108,7 @@ def main():
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
         split_start_year=config.walk_forward.split_start_year,
+        year_boundary_offset_sessions=year_boundary_offset_sessions(config),
     ) if f.fold_id == selected_fold)
     dataset = CrossSectionalDataset(
         panel, fold.train_indices, config.training.lookback, include_volume_notional=True,
@@ -213,7 +218,7 @@ def main():
             "finite_output": bool(torch.isfinite(actual).all()),
             "output_sha256": hashlib.sha256(actual.detach().float().cpu().numpy().tobytes()).hexdigest(),
             "gradient_l1": float(sum(p.grad.detach().abs().sum() for p in model.parameters() if p.grad is not None))}
-        assert record["finite_output"] and np.isfinite(record["gradient_l1"])
+        assert record["finite_output"] and np.isfinite(record["gradient_l1"]) and record["gradient_l1"]>0
         last_output=actual.detach().clone()
         if trace:
             profiler.export_chrome_trace(str(output / "trace.json"))
@@ -237,11 +242,14 @@ def main():
             gradients.update(flat[offset:offset+8*1024**2].cpu().numpy().tobytes())
     comparison=None
     comparison_failures=[]
-    if args.compare_transport or args.compare_compact_projection or args.attention_control_backend or args.compact_stream_control_bytes is not None:
+    if args.compare_transport or args.compare_compact_projection or args.compare_sparse_projection or args.attention_control_backend or args.compact_stream_control_bytes is not None:
         source=panel.features;slab=batch["feature_slab"]
         selected_mode=source.transfer_mode
         selected_checkpoint=model.factorized_encoder_checkpoint
         selected_projection=bool(getattr(model,"factorized_compact_projection",False))
+        selected_sparse=bool(getattr(model,"factorized_sparse_projection",False))
+        if args.compare_sparse_projection and not selected_sparse:
+            raise ValueError("sparse comparison requires the selected resident CSR experiment")
         selected_stream_bytes=int(getattr(model,"factorized_compact_stream_chunk_bytes",0))
         attention_modules = [(m, m.compiled_cross_attention_backend) for m in model.modules()
             if hasattr(m, "compiled_cross_attention_backend")]
@@ -267,6 +275,9 @@ def main():
             del expected,actual
         source.transfer_mode="dense_cpu"
         model.factorized_encoder_checkpoint=True
+        if args.compare_sparse_projection:
+            model.factorized_sparse_projection=False
+            model.__dict__.pop("_factorized_encode_fn",None)
         set_attention_control(True)
         if args.compare_compact_projection:
             model.factorized_compact_projection=False
@@ -307,11 +318,15 @@ def main():
         run_once();control=compare("dense_cpu_repeat_control")
         source.transfer_mode=selected_mode
         model.factorized_encoder_checkpoint=selected_checkpoint
+        if args.compare_sparse_projection:
+            model.factorized_sparse_projection=selected_sparse
+            model.__dict__.pop("_factorized_encode_fn",None)
         set_attention_control(False)
         if args.compare_compact_projection:
             model.factorized_compact_projection=selected_projection
             model.__dict__.pop("_factorized_encode_fn",None)
-        comparison_name = ("selected_stream_budget_vs_control"
+        comparison_name = ("resident_csr_vs_canonical_compact_model" if args.compare_sparse_projection else
+            "selected_stream_budget_vs_control"
             if args.compact_stream_control_bytes is not None else
             ("selected_attention_vs_" + args.attention_control_backend
              if args.attention_control_backend else selected_mode + "_vs_same_dense_model"))
@@ -334,6 +349,9 @@ def main():
         "tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         "features": len(panel.feature_names), "symbols": panel.num_symbols,
         "lookback": config.training.lookback, "global_row": args.global_row,
+        "year_boundary_offset_sessions": year_boundary_offset_sessions(config),
+        "train_start_date": str(panel.dates[fold.train_indices[0]]),
+        "train_end_date": str(panel.dates[fold.train_indices[-1]]),
         "config_sha256": file_sha256(args.config),
         "feature_manifest_sha256": file_sha256(Path(config.data.factorized_feature_manifest)),
         "checkpoint_sha256": file_sha256(args.checkpoint), "cpu_threads": args.cpu_threads,
@@ -341,9 +359,12 @@ def main():
         "transfer_mode": getattr(panel.features,"transfer_mode","dense_cpu"),
         "factorized_encoder_checkpoint": config.training.factorized_encoder_checkpoint,
         "factorized_compact_projection": bool(getattr(model,"factorized_compact_projection",False)),
+        "factorized_sparse_projection": bool(getattr(model,"factorized_sparse_projection",False)),
         "factorized_compact_stream_chunk_bytes": int(getattr(model,"factorized_compact_stream_chunk_bytes",0)),
         "packet_reuse_scope": "new_raw_slab_each_measurement" if args.fresh_packets else "same_raw_slab_repeated",
         "parameter_grad_sha256":gradients.hexdigest(),
+        "numeric_experiment_selected":args.numeric_experiment,
+        "strict_compatibility_passed":not comparison_failures,
         "paired_comparison":comparison,
         "process_affinity": sorted(os.sched_getaffinity(0)), "warmup": warm,
         "measured": measured, "profiled": traced, "optimizer_updates": 0,
@@ -353,9 +374,14 @@ def main():
     # Numerical rejection is a shared phase boundary. Publish both ranks'
     # diagnostics before either destroys NCCL; otherwise a locally failing
     # rank can hang the peer's final barrier for the full process-group TTL.
-    failed=torch.tensor(int(bool(comparison_failures)),device=device)
+    native_failed=(comparison is not None and (
+        not comparison["native_repeat_control"]["output_pass_existing_bf16_oracle"]
+        or not comparison["native_repeat_control"]["all_gradients_pass_existing_bf16_oracle"]))
+    failed=torch.tensor([int(bool(comparison_failures)),int(native_failed)],device=device)
     torch.distributed.all_reduce(failed,op=torch.distributed.ReduceOp.MAX)
-    if int(failed):
+    if int(failed[1]):
+        raise AssertionError("native repeated control rejected; not attributable to the selected experiment")
+    if int(failed[0]) and not args.numeric_experiment:
         raise AssertionError("real-panel paired numerical oracle rejected; both rank diagnostics retained")
     torch.distributed.barrier()
     torch.distributed.destroy_process_group()

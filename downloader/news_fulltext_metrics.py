@@ -21,6 +21,7 @@ GATEWAY_HOST_ISOLATION_CONTRACT_VERSION = 3
 GATEWAY_HOST_CHECKPOINT_CONTRACT_VERSION = 4
 ROBOTS_ORIGIN_POLICY_CONTRACT_VERSION = 1
 ROBOTS_ORIGIN_PRESSURE_CONTRACT_VERSION = 1
+ROBOTS_ORIGIN_TRANSPORT_PRESSURE_CONTRACT_VERSION = 1
 MAX_REQUEST_HOSTS_PER_PROVIDER = 16
 METRICS_SNAPSHOT_CLOCK_CONTRACT_VERSION = 1
 CNYES_NATIVE_BODY_FAILURE_OBSERVATION_CONTRACT_VERSION = 1
@@ -189,6 +190,11 @@ class NewsMetrics:
             if outcome == "transport_error":
                 counts["http_terminal_transport_errors"] += 1
                 counts[prefix + "transport_error_" + error_type] += 1
+                if endpoint == 'robots' and status is None and isolated_robots_origin is True:
+                    # Proven REP certificate failure has NO HTTP response.
+                    # Keep the raw error/request; only its pressure subset is
+                    # isolated. Never subtract a nonexistent response or body.
+                    counts['http_terminal_isolated_robots_origin_transport_errors'] += 1
             elif outcome == 'isolated_gateway_host_error':
                 counts['http_terminal_isolated_gateway_host_errors'] += 1
             elif outcome == 'provisional_gateway_host_error':
@@ -262,6 +268,7 @@ class NewsMetrics:
                 "gateway_host_checkpoint_contract_version": GATEWAY_HOST_CHECKPOINT_CONTRACT_VERSION,
                 "robots_origin_policy_contract_version": ROBOTS_ORIGIN_POLICY_CONTRACT_VERSION,
                 "robots_origin_pressure_contract_version": ROBOTS_ORIGIN_PRESSURE_CONTRACT_VERSION,
+                "robots_origin_transport_pressure_contract_version": ROBOTS_ORIGIN_TRANSPORT_PRESSURE_CONTRACT_VERSION,
                 "transport_failure_diagnostic_contract_version": TRANSPORT_FAILURE_DIAGNOSTIC_CONTRACT_VERSION,
                 "connection_origin_isolation_contract_version": CONNECTION_ORIGIN_ISOLATION_CONTRACT_VERSION,
                 "connection_reuse_observation_contract_version": CONNECTION_REUSE_OBSERVATION_CONTRACT_VERSION,

@@ -43,6 +43,7 @@ _COMPILED_SWEEP_STEPS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]
 _COMPILED_COMMITS: dict[tuple[object, ...], Callable[..., tuple[Tensor, ...]]] = {}
 _COMPILED_CALENDARS: dict[tuple[object, ...], Callable[..., Tensor]] = {}
 _COMPILED_PREPARATIONS: dict[tuple[object, ...], Callable] = {}
+_COMPILED_FINALIZATIONS: dict[tuple[object, ...], Callable] = {}
 _SESSION_DAY_CACHE: OrderedDict[tuple[object, ...], Tensor] = OrderedDict()
 _COMPILED_PATH_LOCK = threading.Lock()
 _CARRY_COMPILE_STATS = {
@@ -51,6 +52,8 @@ _CARRY_COMPILE_STATS = {
     "compiled_calendar_calls": 0,
     "session_prepare_compile_constructors": 0,
     "compiled_session_prepare_calls": 0,
+    "session_finalize_compile_constructors": 0,
+    "compiled_session_finalize_calls": 0,
     "compile_constructors": 0,
     "session_compile_constructors": 0,
     "compiled_path_calls": 0,
@@ -132,6 +135,7 @@ def reset_day_trade_carry_compile_stats(*, clear_cache: bool = False) -> None:
             _COMPILED_COMMITS.clear()
             _COMPILED_CALENDARS.clear()
             _COMPILED_PREPARATIONS.clear()
+            _COMPILED_FINALIZATIONS.clear()
             _SESSION_DAY_CACHE.clear()
 
 
@@ -149,6 +153,7 @@ def invalidate_day_trade_carry_compiled_caches() -> tuple[int, int]:
         _COMPILED_SESSIONS.clear()
         _COMPILED_CALENDARS.clear()
         _COMPILED_PREPARATIONS.clear()
+        _COMPILED_FINALIZATIONS.clear()
         _COMPILED_SWEEP_STEPS.clear()
         _COMPILED_COMMITS.clear()
     return counts
@@ -1442,7 +1447,7 @@ def _commit_carry_inventory(candidate: DayTradeInventoryState,
     inputs = (candidates[cohort_index], working_values[cohort_index],
               originals[cohort_index], trade_alive, accept)
     compiled = None
-    if (_carry_path_compile_enabled(candidate.cohorts)
+    if (not torch.compiler.is_compiling() and _carry_path_compile_enabled(candidate.cohorts)
             and _env_truthy("STOCKAGENT_DAY_TRADE_CARRY_COMMIT_COMPILE", "1")):
         options = _carry_compile_options()
         key = (str(candidate.cohorts.device), torch.is_grad_enabled(),
@@ -1903,6 +1908,83 @@ def _prepare_session_funding(state, session, *, weights, can_enter, initial_capi
     return tuple(output)
 
 
+def _finalize_carry_session_core(previous_alive, session_marks, terminal_price, path_inventory,
+        converted, inventory, working, trade_alive, valid, marks, notional, *,
+        initial_capital, event_compression):
+    """Canonical close/default/atomic commit as one date-independent tensor block."""
+    valid = valid & _require(torch.isfinite(marks), "carry account minute valuation is invalid")
+    intraday_alive = trade_alive & (marks > 0).all()
+    final_inventory = _choose_inventory(intraday_alive, converted, path_inventory)
+    closing_marks = session_marks[:, -1]
+    if terminal_price is not None:
+        terminal_ok = torch.isfinite(terminal_price) & (terminal_price > 0)
+        closing_marks = torch.where(terminal_ok, terminal_price, closing_marks)
+    closing_nav = inventory_nav(final_inventory, initial_capital=initial_capital,
+                                marks=closing_marks)
+    valid = valid & _require(torch.isfinite(closing_nav), "carry account close valuation is invalid")
+    final_alive = intraday_alive & (closing_nav > 0)
+    raw_marks = torch.cat((marks[:-1], closing_nav.reshape(1)))
+    mark_alive = trade_alive & (raw_marks > 0).cumprod(0).bool()
+    committed_marks = torch.where(mark_alive, raw_marks, 0)
+    committed_marks = torch.where(valid, committed_marks, float("nan"))
+    if event_compression:
+        exact_minimum = committed_marks.amin()
+        exact_minimum = torch.where(torch.isfinite(committed_marks).all(), exact_minimum,
+                                    torch.full_like(exact_minimum, float("nan")))
+        committed_marks = torch.stack((exact_minimum, committed_marks[-1]))
+    final_inventory = _commit_carry_inventory(final_inventory, working, inventory,
+        trade_alive=trade_alive, accept=previous_alive & valid)
+    final_inventory = replace(final_inventory,
+        failed=torch.maximum(final_inventory.failed, (~valid).to(torch.float64)))
+    return (final_inventory, committed_marks, torch.where(valid, final_alive, previous_alive),
+            torch.where(trade_alive & valid, notional, 0))
+
+
+def _finalize_carry_session(state, session, path_inventory, converted, inventory,
+        working, trade_alive, valid, marks, notional, *, initial_capital, event_compression):
+    # Calendar ownership stays outside this numerical block. It uses no Python
+    # day value and therefore shares one graph across Gregorian session dates.
+    args = (state.alive, session.marks, session.terminal_liquidation_price, path_inventory,
+            converted, inventory, working, trade_alive, valid, marks, notional)
+    kwargs = dict(initial_capital=initial_capital, event_compression=event_compression)
+    if (marks.device.type != "cuda"
+            or not _env_truthy("STOCKAGENT_DAY_TRADE_FINALIZE_COMPILE", "0")):
+        return _finalize_carry_session_core(*args, **kwargs)
+    tensors = [state.alive, session.marks, trade_alive, valid, marks, notional]
+    for account in (path_inventory, converted, inventory, working):
+        tensors.extend(getattr(account, name) for name in _INVENTORY_FIELDS)
+    if session.terminal_liquidation_price is not None:
+        tensors.append(session.terminal_liquidation_price)
+    options = _carry_compile_options()
+    key = (str(marks.device), torch.is_grad_enabled(), float(initial_capital), bool(event_compression),
+           session.terminal_liquidation_price is not None,
+           tuple((tuple(value.shape), tuple(value.stride()), str(value.dtype), value.requires_grad)
+                 for value in tensors), tuple(sorted(options.items())))
+    with _COMPILED_PATH_LOCK:
+        compiled = _COMPILED_FINALIZATIONS.get(key)
+        if compiled is None:
+            compiled = torch.compile(_compile_isolated_code_object(_finalize_carry_session_core,
+                name=f"day_trade_carry_finalize_{abs(hash(key))}"), fullgraph=True,
+                dynamic=False, options=options)
+            _COMPILED_FINALIZATIONS[key] = compiled
+            _CARRY_COMPILE_STATS["session_finalize_compile_constructors"] += 1
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning,
+                message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*")
+            output = compiled(*args, **kwargs)
+        _CARRY_COMPILE_STATS["compiled_session_finalize_calls"] += 1
+        return output
+    except Exception:
+        with _COMPILED_PATH_LOCK:
+            _COMPILED_FINALIZATIONS.pop(key, None)
+        _CARRY_COMPILE_STATS["compile_failures"] += 1
+        if _strict_no_fallback_enabled():
+            raise
+        _CARRY_COMPILE_STATS["eager_fallback_calls"] += 1
+        return _finalize_carry_session_core(*args, **kwargs)
+
+
 def execute_carry_session(
     state: DayTradeCarryState, session: DayTradeCarrySession, *, weights: Tensor,
     can_enter: Tensor, buy_fee_rate: Tensor, day_sell_fee_rate: Tensor,
@@ -2083,47 +2165,12 @@ def execute_carry_session(
         notional = notional + exit_notional
     if not require_minute_nav_grad:
         marks = marks.detach()
-    valid = valid & _require(torch.isfinite(marks), "carry account minute valuation is invalid")
-    intraday_alive = trade_alive & (marks > 0).all()
-    final_inventory = _choose_inventory(intraday_alive, converted, path_inventory)
-    closing_marks = session.marks[:, -1]
-    if session.terminal_liquidation_price is not None:
-        terminal_ok = (
-            torch.isfinite(session.terminal_liquidation_price)
-            & (session.terminal_liquidation_price > 0)
-        )
-        closing_marks = torch.where(
-            terminal_ok,
-            session.terminal_liquidation_price,
-            closing_marks,
-        )
-    closing_nav = inventory_nav(final_inventory, initial_capital=initial_capital,
-                                marks=closing_marks)
-    valid = valid & _require(torch.isfinite(closing_nav), "carry account close valuation is invalid")
-    final_alive = intraday_alive & (closing_nav > 0)
-    raw_marks = torch.cat((marks[:-1], closing_nav.reshape(1)))
-    mark_alive = trade_alive & (raw_marks > 0).cumprod(0).bool()
-    committed_marks = torch.where(mark_alive, raw_marks, 0)
-    committed_marks = torch.where(valid, committed_marks, float("nan"))
-    if event_compression:
-        exact_minimum = committed_marks.amin()
-        exact_minimum = torch.where(
-            torch.isfinite(committed_marks).all(),
-            exact_minimum,
-            torch.full_like(exact_minimum, float("nan")),
-        )
-        committed_marks = torch.stack(
-            (exact_minimum, committed_marks[-1])
-        )
-    # Source failure is atomic across the account, including malformed action
-    # terms on CUDA. Do not leave successful peers half-advanced on retry.
-    final_inventory = _commit_carry_inventory(final_inventory, working, inventory,
-        trade_alive=trade_alive, accept=state.alive & valid)
-    final_inventory = replace(final_inventory,
-        failed=torch.maximum(final_inventory.failed, (~valid).to(torch.float64)))
-    return (DayTradeCarryState(final_inventory, committed_marks[-1],
-            torch.where(valid, final_alive, state.alive), initial_capital, session.day),
-            committed_marks, torch.where(trade_alive & valid, notional, 0))
+    final_inventory, committed_marks, final_alive, committed_notional = _finalize_carry_session(
+        state, session, path_inventory, converted, inventory, working,
+        trade_alive, valid, marks, notional, initial_capital=initial_capital,
+        event_compression=event_compression)
+    return (DayTradeCarryState(final_inventory, committed_marks[-1], final_alive,
+                              initial_capital, session.day), committed_marks, committed_notional)
 
 
 def _run_day_trade_carry_sessions_core(

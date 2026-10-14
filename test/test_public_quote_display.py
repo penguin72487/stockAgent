@@ -310,3 +310,128 @@ def test_malformed_owner_report_config_cannot_expand_publication_scope(tmp_path,
         assert quotes.public_quote_display_policy().paper_transaction_reports is False
     finally:
         quotes.public_quote_display_policy.cache_clear()
+
+
+@pytest.mark.parametrize("field,clock_field", list(quotes.STRATEGY_POSITION_CLOCKS.items()))
+@pytest.mark.parametrize("filled", [0, 3000])
+def test_owner_strategy_level_does_not_require_a_fill_or_round_original_value(field, clock_field, filled):
+    row = paper_position(**{field: 123.456789, clock_field: "2026-10-13T09:01:00+08:00",
+                            "opening_exit_order_session_date": "2026-10-13", "filled_shares": filled})
+    before = deepcopy(row)
+    policy = quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True)
+    value, proof = policy.strategy_report_price(row, field, row[field], record_kind="paper_position", now=NOW)
+    assert value == 123.456789
+    assert proof["publication_basis"] == quotes.STRATEGY_REPORT_CONTRACT
+    assert proof["evidence_kind"] == "strategy_plan" and proof["broker_execution_verified"] is False
+    assert proof["basis_at"] == row[clock_field]
+    assert "license_reference" not in proof and "recorded_at" not in proof
+    assert row == before
+
+
+@pytest.mark.parametrize("change", [
+    {"take_profit_price": True}, {"take_profit_price": float("nan")}, {"take_profit_price": float("inf")},
+    {"take_profit_price": 0}, {"take_profit_price": -1}, {"market": None}, {"symbol": ""},
+    {"entry_at": None}, {"entry_at": "2026-10-13T09:01:00"},
+    {"entry_at": "2026-10-13T13:00:01+08:00"}, {"session_date": "2026-10-12"},
+])
+def test_owner_strategy_report_rejects_invalid_context_value_or_clock(change):
+    row = paper_position(take_profit_price=125.0, **change) if "take_profit_price" not in change else paper_position(**change)
+    policy = quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True)
+    assert policy.strategy_report_price(row, "take_profit_price", row["take_profit_price"],
+                                        record_kind="paper_position", now=NOW) is None
+
+
+@pytest.mark.parametrize("field", ["entry_price", "execution_price", "sizing_open_price", "last_mark_price",
+    "bid", "ask", "open", "close", "upper_limit", "lower_limit", "next_upper_limit", "price"])
+def test_owner_strategy_report_does_not_authorize_inputs_quotes_exchange_limits_or_fills(field):
+    row = paper_position(**{field: 123.0, "public_display_authorized": True})
+    policy = quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True)
+    assert policy.strategy_report_price(row, field, 123.0, record_kind="paper_position", now=NOW) is None
+    assert policy.observation(row, field, 123.0, now=NOW) is None
+
+
+@pytest.mark.parametrize("sanitizer", [public.sanitize_tw_status, public.sanitize_tw_positions, public.sanitize_tw_signals])
+def test_strategy_reports_share_status_positions_and_signal_lifecycle_without_raw_quote_leak(monkeypatch, sanitizer):
+    monkeypatch.setattr(public, "public_quote_display_policy", lambda: quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True))
+    pos = paper_position(take_profit_price=120.123456789, stop_trigger_price=105.05,
+                         closing_auction_limit_price=103.0, closing_auction_order_submitted_at="2026-10-13T12:00:00+08:00")
+    row = pos if sanitizer is not public.sanitize_tw_signals else {
+        "symbol": pos["symbol"], "market": pos["market"], "session_date": pos["session_date"],
+        "signal_at": "2026-10-13T09:00:00+08:00", "order_limit_price": 125.0, "position": pos,
+        "filled_shares": 0, "execution_price": 123.0, "bid": 111.0, "ask": 112.0,
+    }
+    source = {"simulation_only": True, "production_order_possible": False, "rows": [row], "positions": [row]}
+    before = deepcopy(source)
+    out = sanitizer(source)
+    published = out["positions" if sanitizer is public.sanitize_tw_status else "rows"][0]
+    if sanitizer is public.sanitize_tw_signals:
+        assert published["order_limit_price"] == 125.0  # A planned price, even with no fill.
+        assert published["execution_price"] is None and published["bid"] is None and published["ask"] is None
+        published = published["position"]
+    for field in ("take_profit_price", "stop_trigger_price", "closing_auction_limit_price"):
+        assert published[field] == pos[field]
+        assert published["public_price_display"]["visible_fields"][field]["evidence_kind"] == "strategy_plan"
+    assert published["entry_price"] is None and published["last_mark_price"] is None
+    assert published["reconciled_total_net_pnl_twd"] == pos["reconciled_total_net_pnl_twd"]
+    assert source == before
+    assert public._scrub_public_value({**pos, "record_kind": "paper_position"})["take_profit_price"] is None
+    nested = public._scrub_public_value({**pos, "quotes": [pos]}, record_kind="paper_position")
+    assert nested["take_profit_price"] == pos["take_profit_price"]
+    assert nested["quotes"][0]["take_profit_price"] is None
+
+
+def test_next_open_order_plan_has_its_own_session_not_the_entry_date():
+    row = paper_position(opening_exit_limit_price=120.0, opening_exit_order_session_date="2026-10-14",
+                         opening_exit_submitted_at="2026-10-14T08:30:00+08:00")
+    policy = quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True)
+    now = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    assert policy.strategy_report_price(row, "opening_exit_limit_price", 120.0,
+                                        record_kind="paper_position", now=now)[1]["session_date"] == "2026-10-14"
+    row["opening_exit_order_session_date"] = "2026-10-15"
+    assert policy.strategy_report_price(row, "opening_exit_limit_price", 120.0, record_kind="paper_position", now=now) is None
+
+
+def test_own_order_event_is_plan_not_a_fake_fill(monkeypatch):
+    monkeypatch.setattr(public, "public_quote_display_policy", lambda: quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True))
+    row = {"symbol": "2330", "market": "tw_overnight", "session_date": "2026-10-13", "event_kind": "order",
+           "simulation_only": True, "order_type": "LMT_ROD", "status": "working", "quantity": 1000,
+           "price": 123.456789, "recorded_at": "2026-10-13T12:00:00+08:00"}
+    out = public.sanitize_tw_events({"simulation_only": True, "production_order_possible": False,
+                                   "rows": [row, {**row, "event_kind": "fill"}, {**row, "order_type": "MKT"}]})["rows"]
+    assert out[0]["price"] == row["price"]
+    assert out[0]["public_price_display"]["visible_fields"]["price"]["evidence_kind"] == "strategy_plan"
+    assert out[1]["price"] is None and out[2]["price"] is None
+
+
+@pytest.mark.parametrize("config", [None, {"enabled": True},
+    {"enabled": "true", "contract": quotes.STRATEGY_REPORT_CONTRACT},
+    {"enabled": True, "contract": quotes.STRATEGY_REPORT_CONTRACT, "record_scope": "all_quotes"}])
+def test_malformed_strategy_policy_cannot_expand_the_scope(tmp_path, monkeypatch, config):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps({"schema_version": 1, "contract": quotes.CONTRACT,
+        "default_policy": "withhold_without_verified_public_display_grant", "authorized_sources": [],
+        "owner_strategy_reports": config}))
+    monkeypatch.setattr(quotes, "_POLICY_PATH", policy_path)
+    quotes.public_quote_display_policy.cache_clear()
+    try:
+        assert quotes.public_quote_display_policy().paper_strategy_reports is False
+    finally:
+        quotes.public_quote_display_policy.cache_clear()
+
+
+def test_operator_strategy_request_is_enabled_separately_from_quote_grants():
+    policy = quotes.public_quote_display_policy()
+    assert policy.paper_strategy_reports is True and policy.paper_transaction_reports is True
+    assert {grant["source_id"] for grant in policy.grants} == {"twse_daily_ohlcv", "tpex_daily_ohlcv"}
+
+
+def test_loaded_disclosure_revision_changes_with_scope_or_grant_not_mapping_key_order():
+    policy = quotes.PublicQuoteDisplayPolicy((GRANT,), paper_transaction_reports=True)
+    revision = policy.revision
+    assert "revision" in policy.__dict__  # computed once, not per field/row
+    assert revision == quotes.PublicQuoteDisplayPolicy((dict(reversed(list(GRANT.items()))),),
+                                                      paper_transaction_reports=True).revision
+    assert revision != quotes.PublicQuoteDisplayPolicy((GRANT,), paper_transaction_reports=True,
+                                                       paper_strategy_reports=True).revision
+    assert revision != quotes.PublicQuoteDisplayPolicy(({**GRANT, "public_display": False},),
+                                                       paper_transaction_reports=True).revision

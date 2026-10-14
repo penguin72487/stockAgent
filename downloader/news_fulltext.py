@@ -81,12 +81,20 @@ def load_config(path: Path, *, repo: Path | None = None):
         raise ValueError('cached_cnyes_replay_enabled must be a boolean')
     if type(config.get('cached_cnyes_metadata_replay_enabled', False)) is not bool:
         raise ValueError('cached_cnyes_metadata_replay_enabled must be a boolean')
+    if type(config.get('retained_cnyes_failure_replay_enabled', False)) is not bool:
+        raise ValueError('retained_cnyes_failure_replay_enabled must be a boolean')
     if type(config.get("exclusive_http_owner", False)) is not bool:
         raise ValueError("exclusive_http_owner must be a boolean")
     from downloader.news_fulltext_capacity import capacity_config
     capacity_config(config, registry)
     from downloader.news_fulltext_failure_focus import validate_focus
     config['failure_diagnostic_focus'] = validate_focus(config.get('failure_diagnostic_focus'), registry)
+    config.setdefault('failure_diagnostic_metadata_identity_upgrade', False)
+    if (type(config['failure_diagnostic_metadata_identity_upgrade']) is not bool
+            or config['failure_diagnostic_metadata_identity_upgrade'] and config['failure_diagnostic_focus'] is None):
+        raise ValueError('metadata identity upgrade requires explicit finite diagnostic focus')
+    if config.get('retained_cnyes_failure_replay_enabled', False) and config['failure_diagnostic_focus'] is None:
+        raise ValueError('retained failure replay requires explicit finite diagnostic focus')
     if config.get("require_provider_worker_reservations", False):
         if sum(p.parallelism for p in registry.sources.values() if p.request_enabled) > config["workers"]:
             raise ValueError("worker budget cannot reserve configured publisher parallelism independently")
@@ -166,6 +174,13 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         request_url = tainan_news_request_url(request_url)
         if request_url != row["url"]:
             resolution_basis = "verified_tainan_html_query_separator_v1; original_frontier_url_retained"
+    elif source.embedded_article_layout in {'taiwanhot_visible_article_v1', 'taiwanhot_visible_article_v2', 'taiwanhot_visible_article_v3'}:
+        from downloader.news_fulltext_public_originals import taiwanhot_article_id, taiwanhot_request_ids, taiwanhot_route_matches
+        native_view = source.embedded_article_layout != 'taiwanhot_visible_article_v1'
+        route_views = source.embedded_article_layout == 'taiwanhot_visible_article_v3'
+        if (not taiwanhot_request_ids(request_url) if route_views else
+                taiwanhot_article_id(request_url, requested=True, native_view=native_view) is None):
+            raise NewsError('unsupported_article_path')
     if row.get("body_sha256"):
         if row.get("etag"):
             headers["If-None-Match"] = row["etag"]
@@ -176,6 +191,18 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     if response.status == 304:
         return None
     _require_article_response(response, source)
+    if source.embedded_article_layout in {'taiwanhot_visible_article_v1', 'taiwanhot_visible_article_v2', 'taiwanhot_visible_article_v3'}:
+        mismatch = (not taiwanhot_request_ids(response.url).intersection(taiwanhot_request_ids(request_url))
+                    if route_views else taiwanhot_article_id(response.url, native_view=native_view)
+                    != taiwanhot_article_id(request_url, requested=True, native_view=native_view))
+        if mismatch:
+            from downloader.news_fulltext_diagnostics import FailureResponse
+            error = NewsError('article_identity_not_verified')
+            error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
+            raise error
+        if response.url != request_url:
+            version = 3 if route_views else 2 if native_view else 1
+            resolution_basis = f'verified_taiwanhot_same_id_source_redirect_v{version}; original_frontier_url_retained'
     if source.embedded_article_layout == "macau_visible_news_v1" and response.url != request_url:
         # The reviewed portal has no verified article alias contract. A
         # different current release is not the originally requested ID.
@@ -205,6 +232,11 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     with metrics.measure("article_extraction", source.provider) if metrics else nullcontext():
         try:
             article = extract_article_response(response, source)
+            if (source.embedded_article_layout == 'taiwanhot_visible_article_v3'
+                    and not taiwanhot_route_matches(request_url, article['source_native_article_id'], article['title'])):
+                # A candidate intersection is admission only. The actual OG
+                # ID and visible title must still bind the ORIGINAL route.
+                raise NewsError('article_identity_not_verified')
             if resolution:
                 if (re.sub(r"\s+", "", article["title"]) != re.sub(r"\s+", "", resolution["headline"])
                         or normalize_url(article.get("declared_canonical_url", "")) != normalize_url(resolution["declared_canonical_url"])):
@@ -220,7 +252,7 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
                 if metrics:
                     metrics.count(source.provider, "content_access_refusals")
                 raise NewsError("access_challenge", retry=True, delay=900) from None
-            if error.code == 'body_not_found':
+            if error.code in {'body_not_found', 'article_identity_not_verified'}:
                 from downloader.news_fulltext_diagnostics import FailureResponse
                 # The worker transfers the already-fetched response only.
                 # Bounded storage and SQLite budget belong to the queue owner.
@@ -300,6 +332,8 @@ def seed_discovery(queue: NewsQueue):
     queue.sync_finite_cohorts()
     with queue.db:
         for source in queue.registry.sources.values():
+            if source.known_url_only:
+                continue  # Only locally observed URLs; dormant discovery is not permission.
             if source.metadata_feeds:
                 from downloader.news_fulltext_metadata_feeds import compatible_fingerprints as metadata_fingerprints
                 fingerprints = metadata_fingerprints(source)
@@ -806,6 +840,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
     last_metadata_inventory = started
     last_cached_replay = started - 10
+    last_failure_replay = started - 10
     last_metadata_replay = started
     next_cnyes_work_backfill = started
     next_cnyes_history_backfill = started
@@ -890,6 +925,13 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 recovered = replay_cached_cnyes(queue, stop=http.stop)
                 accepted += recovered.get('accepted_heads', 0)
                 last_cached_replay = time.monotonic()
+            if (continuous_budgets and not draining and not low_disk
+                    and config.get('retained_cnyes_failure_replay_enabled', False)
+                    and 'cnyes' in active and now - last_failure_replay >= 10):
+                from downloader.news_fulltext_replay import replay_retained_cnyes_failures
+                recovered = replay_retained_cnyes_failures(queue, stop=http.stop)
+                accepted += recovered.get('accepted_heads', 0)
+                last_failure_replay = time.monotonic()
             if (continuous_budgets and not draining and not low_disk
                     and config.get('cached_cnyes_metadata_replay_enabled', False)
                     and 'cnyes' in active and now - last_metadata_replay >= 10):

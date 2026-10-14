@@ -68,6 +68,8 @@ def test_idle_live_cuda_cache_release_is_noop_when_no_models(
 ) -> None:
     cleared: list[bool] = []
     monkeypatch.setattr(signal_engine, "_LIVE_MODEL_CACHE", {})
+    monkeypatch.setattr(signal_engine, "_LIVE_CUDA_CACHE_RELEASE_PENDING", False)
+    monkeypatch.setattr(signal_engine, "_live_inference_cpu_cache_retained", lambda: False)
     monkeypatch.setattr(
         signal_engine,
         "clear_live_inference_memory_cache",
@@ -83,6 +85,7 @@ def test_idle_live_cuda_cache_release_returns_allocator_memory(
     models = {"model": object()}
     events: list[str] = []
     monkeypatch.setattr(signal_engine, "_LIVE_MODEL_CACHE", models)
+    monkeypatch.setattr(signal_engine, "_LIVE_CUDA_CACHE_RELEASE_PENDING", False)
 
     def clear() -> None:
         models.clear()
@@ -98,8 +101,10 @@ def test_idle_live_cuda_cache_release_returns_allocator_memory(
         "empty_cache",
         lambda: events.append("empty_cache"),
     )
+    monkeypatch.setattr(signal_engine.torch.accelerator, "empty_host_cache",
+                        lambda: events.append("empty_host_cache"))
     assert signal_engine.release_idle_live_cuda_cache() is True
-    assert events == ["clear", "synchronize", "clear_blas_workspaces", "empty_cache"]
+    assert events == ["clear", "synchronize", "clear_blas_workspaces", "empty_cache", "empty_host_cache"]
 
 
 def test_live_panel_worker_override_is_a_cap(

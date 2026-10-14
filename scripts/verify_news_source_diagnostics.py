@@ -112,7 +112,7 @@ def verify(probes, registry):
                                            if explicit_empty_name else 'source_declared_byline'))
         except (ValueError, KeyError, OSError, NewsError) as error:
             item.update(parser_verified=False, parser_error=error.code if isinstance(error, NewsError) else str(error))
-            if (isinstance(error, NewsError) and error.code in {'source_body_image_only', 'source_body_embedded_only', 'source_body_quote_only', 'source_body_removed', 'source_article_empty_template', 'source_not_found', 'source_document_landing_page', 'paywall_or_login'}
+            if (isinstance(error, NewsError) and error.code in {'source_body_image_only', 'source_body_embedded_only', 'source_body_quote_only', 'source_article_test_only', 'source_body_removed', 'source_article_empty_template', 'source_not_found', 'source_document_landing_page', 'paywall_or_login'}
                     and item.get('diagnostic_integrity_verified')):
                 # A source mask retained by an older misclassifying parser is
                 # evidence of refusal, never accepted article text. New probes

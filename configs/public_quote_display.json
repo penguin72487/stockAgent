@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract": "public_quote_display_v1",
+  "contract": "public_quote_display_v2",
   "default_policy": "withhold_without_verified_public_display_grant",
   "owner_transaction_reports": {
     "enabled": true,
@@ -8,6 +8,13 @@
     "record_scope": "tw_day_trade_and_overnight_paper_ledger",
     "operator_request": "2026-10-13: publish my own transaction prices",
     "notice": "Recorded paper transaction report only. This is not broker execution evidence or a grant to redistribute raw market quotations."
+  },
+  "owner_strategy_reports": {
+    "enabled": true,
+    "contract": "owner_paper_strategy_report_v1",
+    "record_scope": "tw_day_trade_and_overnight_paper_ledger",
+    "operator_request": "2026-10-14: publish my own TP/SL and strategy data",
+    "notice": "Persisted TP/SL and submitted strategy instructions only. Not raw quotes, sizing inputs, exchange limits or execution evidence."
   },
   "authorized_sources": [
     {
@@ -54,6 +61,12 @@
     "reviewed_on": "2026-10-14",
     "scope": "public website price display; API entitlement and noncommercial intent are not a verified redistribution grant",
     "sources": [
+      {
+        "source_id": "owner_paper_strategy_reports",
+        "status": "operator_requested_strategy_plan_not_quote_license",
+        "finding": "The owner explicitly requested publication of their own strategy outputs including TP/SL. Publish original persisted levels and limit/stop instructions in trusted paper endpoints, independently of whether they filled. Do not extend this scope to raw quotes, sizing inputs or broker/exchange redistribution permissions.",
+        "references": []
+      },
       {
         "source_id": "owner_paper_transaction_reports",
         "status": "operator_requested_transaction_report_not_quote_license",

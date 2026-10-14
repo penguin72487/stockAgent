@@ -49,6 +49,11 @@ def amend(cfg, field, value):
         entry['authorization'][field.split('.', 1)[1]] = value
     else:
         entry[field] = value
+    if field == 'private_known_url_scope':
+        # This synthetic open-license publisher is not an approved continuous
+        # personal-reading source. Keep a valid finite annotation to test
+        # scheduling normalization, not an invalid access-scope grant.
+        entry['acquisition_mode'] = 'finite'
     if field == 'official_min_interval_seconds':
         entry['official_rate_limit_evidence_url'] = 'https://publisher.test/rates'
     return changed

@@ -874,12 +874,20 @@ def prefetch_physical_carry_batches(
     batch_size: int,
     *,
     event_compression: bool | None = None,
+    batch_spans: tuple[tuple[int, int], ...] | None = None,
 ):
     """Overlap next-batch NPZ decode/CPU packing with current CUDA training."""
     if batch_size <= 0 or not batch_order:
         raise ValueError("physical prefetch requires a nonempty positive batch plan")
     if batch_order != list(range(len(batch_order))):
         raise ValueError("physical carry prefetch requires chronological batch order")
+    if batch_spans is not None:
+        if len(batch_spans) != len(batch_order) or any(
+                start < 0 or end <= start or end > len(split)
+                for start, end in batch_spans):
+            raise ValueError("physical prefetch spans differ from the bounded batch plan")
+        if any(left[1] > right[0] for left, right in zip(batch_spans[:-1], batch_spans[1:])):
+            raise ValueError("physical prefetch spans must remain chronological and disjoint")
 
     if event_compression is None:
         raw_compression = str(
@@ -888,8 +896,8 @@ def prefetch_physical_carry_batches(
         event_compression = raw_compression not in {"0", "false", "off", "no"}
 
     def prepare(batch_index: int):
-        start = batch_index * batch_size
-        end = min(start + batch_size, len(split))
+        start, end = (batch_spans[batch_index] if batch_spans is not None
+                      else (batch_index * batch_size, min((batch_index + 1) * batch_size, len(split))))
         return source.prepare_batch(
             split, start, end, event_compression=bool(event_compression)
         )

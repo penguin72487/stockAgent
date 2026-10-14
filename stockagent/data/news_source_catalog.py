@@ -14,6 +14,71 @@ SOURCE_REVIEW_DECISIONS = frozenset({
     "review_incomplete", "authorized_api_configuration_required",
 })
 
+# A queue outcome describes an observed URL head, not every possible archive
+# or original publisher. In particular, 404, a denied endpoint and a missing
+# parser are three different things. Keep this contract shared by the planner
+# and the read-only page; it never changes an article state or retries.
+NEWS_OUTCOME_CLASSIFICATION_VERSION = 1
+NEWS_OUTCOME_GROUPS = {
+    "queued_or_retry": frozenset({"pending", "inflight", "retry", "retry_cooldown"}),
+    "waiting_cohort": frozenset({"waiting_cohort"}),
+    "scope_or_access_waiting": frozenset({
+        "awaiting_authorization", "source_not_allowed", "authorization_expired",
+        "article_license_not_verified", "article_rights_not_verified",
+        "article_rights_or_scope_excluded", "robots_disallowed",
+        "paywall", "paywall_or_login", "access_challenge", "robots_access_challenge",
+    }),
+    "repair_required": frozenset({
+        "unsupported_article_path", "body_not_found", "article_attribution_not_verified",
+        "article_title_not_verified", "article_identity_not_verified", "response_too_large",
+        "robots_not_plain_rules", "robots_redirect_refused",
+    }),
+    "nontext_representation": frozenset({
+        "source_body_image_only", "source_body_embedded_only", "pdf_image_only_or_body_not_found",
+    }),
+    "nonarticle_response": frozenset({
+        "source_body_quote_only", "source_article_test_only", "source_document_landing_page",
+    }),
+    "source_currently_empty": frozenset({"source_article_empty_template"}),
+    "origin_absent": frozenset({"not_found", "gone", "source_body_removed", "source_not_found"}),
+}
+_NEWS_OUTCOME_GROUP_BY_STATE = {
+    state: group for group, states in NEWS_OUTCOME_GROUPS.items() for state in states
+}
+
+
+def classify_news_outcomes(states: dict, *, registered: bool, body_enabled: bool) -> dict:
+    """One bounded, mutually exclusive classification of retained queue counts.
+
+    The complete *state* remains distinct from stored-body counters: an old
+    body can still exist during a recheck or after removal. No current queue
+    code certifies exhaustion of all authorized alternatives, so leave final
+    unavailability/closure unknown instead of inventing a completed workload.
+    Unknown outcomes remain visible and actionable, never silently dropped.
+    """
+    if (not isinstance(states, dict) or any(not isinstance(state, str)
+            or type(count) is not int or count < 0 for state, count in states.items())):
+        raise ValueError("invalid news outcome counts")
+    categories = dict.fromkeys(("complete_state", "queued_or_retry", "registration_required",
+        "scope_or_access_waiting", "waiting_cohort", "repair_required",
+        "nontext_representation", "nonarticle_response", "source_currently_empty",
+        "origin_absent", "unknown_outcome"), 0)
+    for state, count in states.items():
+        group = "complete_state" if state == "complete" else _NEWS_OUTCOME_GROUP_BY_STATE.get(state, "unknown_outcome")
+        if group in {"queued_or_retry", "scope_or_access_waiting", "waiting_cohort"}:
+            if not registered:
+                group = "registration_required"
+            elif group == "queued_or_retry" and not body_enabled:
+                group = "scope_or_access_waiting"
+        categories[group] += count
+    return {"contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
+            "grain": "retained queue URL-head states; not unique stories or stored bodies",
+            "categories": categories, "known_urls": sum(categories.values()),
+            "state_counts_preserved": True, "queue_mutation_possible": False,
+            "origin_absence_is_not_all_paths_exhausted": True,
+            "definitively_unavailable_urls": None, "closure_progress_ratio": None,
+            "all_history_complete": False}
+
 
 def planning_review_path(path: Path) -> Path | None:
     """An explicit catalog annotation, never a collector permission source.

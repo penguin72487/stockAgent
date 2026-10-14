@@ -91,6 +91,8 @@ let positionDataRevision = null;
 let positionSelectionKey = null;
 let positionRequestRevisionInFlight = "";
 let positionAbortController = null;
+const EMPTY_SOURCE_ROWS = Object.freeze([]);
+let priceSourceInputs = [];
 let availableDetailDates = [];
 let twPublicMonitorData = null;
 let twPublicMonitorRefreshInFlight = false;
@@ -167,7 +169,8 @@ function installProductCopy() {
     timelineHead.querySelector("p").textContent = "收盤進場、次日開盤沖銷；模擬結果以帳本與實際撮合證據為準。";
   }
   const sourceTemplate = document.querySelector("#overnight-source-contract");
-  if (timeline && sourceTemplate) timeline.after(sourceTemplate.content.cloneNode(true));
+  const sourceFooter = $("execution-source-contract");
+  if (sourceFooter && sourceTemplate) sourceFooter.append(sourceTemplate.content.cloneNode(true));
 
   const sourceTerms = document.querySelectorAll(".source-list dt");
   ["訊號", "試撮界線", "收盤／開盤成交", "一般交易成本", "百分比比較", "隔夜放空資格", "集合競價假設", "跨日退出時程", "延遲邊界"].forEach((label, index) => {
@@ -795,11 +798,7 @@ function renderOverview(data) {
 }
 
 function renderHeader(data) {
-  const quoteNotice = $("quote-display-notice");
-  if (quoteNotice) {
-    quoteNotice.textContent = detailComponents.priceNoticeText(data);
-    quoteNotice.classList.toggle("hidden", !data.price_display_policy);
-  }
+  renderPriceSources(data);
   const health = $("health");
   const presentation = healthPresentation(data.health);
   health.textContent = presentation.label;
@@ -1105,7 +1104,6 @@ function renderBenchmarks(data) {
         <div><span>${esc(priorCloseLabel)}</span><strong>${detailComponents.quoteText(row, ["daily_return_reference_price", "daily_return_previous_close"], sourceNumber)}</strong></div>
         <div><span>Buy & Hold 起點</span><strong>${detailComponents.quoteText(row, "entry_price", sourceNumber)}<small>${shortTime(row.entry_at)}</small></strong></div>
         <div><span>帳本清算估值</span><strong>${detailComponents.quoteText(row, "last_mark_price", sourceNumber)}<small>${shortTime(row.last_quote_at || row.last_mark_at)}</small></strong></div>
-        ${row.official_daily_quote ? `<div class="wide"><span>獨立官方參考（不改帳本估值）</span>${detailComponents.dailyReference(row)}</div>` : ""}
         <div><span>${isTx ? "自動換月" : "持有契約"}</span><strong>${esc(rollText)}</strong></div>
         <div><span>追蹤成本（不扣報酬）</span><strong>${Number.isFinite(totalCosts) ? money(totalCosts) : "—"}</strong></div>
         ${isTx ? `<div><span>1:1 名目資金</span><strong>${collateral}</strong></div><div><span>換月資金流</span><strong>${funding}</strong></div><div class="wide"><span>換月規則</span><strong>同一實體合約以前收計日報酬；換月價差只補入／提回現金，不列報酬，槓桿上限 1×</strong></div>` : ""}
@@ -1754,6 +1752,33 @@ async function loadChartHistory({preferCache = false} = {}) {
   }
 }
 
+function renderPriceSources(data = snapshot) {
+  if (!data || !$("price-source-list")) return;
+  const positions = positionSelectionKey === detailSelectionKey("positions") ? positionRows : EMPTY_SOURCE_ROWS;
+  const signals = signalSelectionKey === detailSelectionKey("signals") ? signalRows : EMPTY_SOURCE_ROWS;
+  const events = eventSelectionKey === detailSelectionKey("events") ? eventRows : EMPTY_SOURCE_ROWS;
+  const inputs = [data, positions, signals, events];
+  if (inputs.every((input, index) => input === priceSourceInputs[index])) return;
+  const view = detailComponents.priceSources({data, positions, signals, events});
+  const quoteNotice = $("quote-display-notice");
+  quoteNotice.textContent = detailComponents.priceNoticeText(data);
+  quoteNotice.classList.toggle("hidden", !data.price_display_policy);
+  setHtml("price-source-list", view.sourcesHtml);
+  const referenceList = $("price-reference-list");
+  const openKeys = new Set([...referenceList.querySelectorAll("li[data-reference-key]")]
+    .filter(node => node.querySelector(".daily-reference-details[open]"))
+    .map(node => node.dataset.referenceKey));
+  setHtml(referenceList, view.referencesHtml);
+  for (const node of referenceList.querySelectorAll("li[data-reference-key]")) {
+    if (openKeys.has(node.dataset.referenceKey)) {
+      const details = node.querySelector(".daily-reference-details");
+      if (details) details.open = true;
+    }
+  }
+  $("price-reference-count").textContent = number(view.referenceCount);
+  priceSourceInputs = inputs;
+}
+
 function renderPositions() {
   const acceptedSelection = positionSelectionKey === detailSelectionKey("positions");
   detailComponents.pagedTable({
@@ -1765,6 +1790,7 @@ function renderPositions() {
     emptyText: acceptedSelection && positionDataRevision === detailDataRevision("positions")
       ? "目前沒有符合篩選的持倉" : "正在讀取符合篩選的持倉…",
   });
+  renderPriceSources();
 }
 
 function renderSignals() {
@@ -1809,6 +1835,7 @@ function renderSignals() {
       selectedKey: featurePanelSignalKey,
     }),
   });
+  renderPriceSources();
 }
 
 function renderSignalFeaturePanel() {
@@ -1881,6 +1908,7 @@ function renderEvents() {
       : acceptedSelection && eventRecordRevision === detailDataRevision("events")
         ? "尚無委託／成交事件" : "正在讀取委託／成交事件…",
   });
+  renderPriceSources();
 }
 
 function renderAudit(data) {

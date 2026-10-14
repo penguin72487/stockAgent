@@ -1,4 +1,4 @@
-"""Visible NOWnews / FTV / reviewed VOA originals in the private collector.
+"""Visible NOWnews / FTV / TaiwanHot / reviewed VOA private source pages.
 
 These are pure identity/metadata adapters, not HTTP clients. Related stories,
 author biographies, AMP recommendations and third-party bylines are not the
@@ -57,6 +57,207 @@ def _visible(node):
         if (parent.has_attr("hidden") or str(parent.get("aria-hidden", "")).lower() == "true"
                 or "display:none" in style or "visibility:hidden" in style):
             raise NewsError("article_identity_not_verified")
+
+
+TAIWANHOT_V1_NATIVE_VIEW_REPAIR_IDENTITY = (
+    '7c462aa61ebff890e661f6486ce904c867d03df8dd10c730e4d2a9a979a3ac0c',
+    'a69d12dd73e9ad3f6270a9e2a1bbc3ff7df632e550cedf946fb98c645f3e4a85',
+)
+TAIWANHOT_V2_ROUTE_REPAIR_IDENTITY = (
+    'ea6f9212563164712548312d0abaaee3e0f7fe020d378927f6edbdcc3293edf9',
+    '8eb0fa981bcf663c65bd839c04110bd074bd8ca3e6ed5b2a192a98bdb6460c83',
+)
+TAIWANHOT_V3_SHORT_PROSE_REPAIR_IDENTITY = (
+    'b03681566468f0a131475f5afd49c5a4f37a9b74d5b67efa882fbf63c4036417',
+    'cc4e4719eb62b183e7d26eea72e72795c47560e94d6c8fd27cf790aa9185d6c7',
+)
+
+
+def taiwanhot_article_id(url, *, requested=False, native_view=False, route_views=False):
+    """Literal legacy requests are not native originals or generated aliases.
+
+    The ordinary transport owns robots checks and each redirect. Only its
+    observed HTTPS native result is a reviewed final representation. v1 stays
+    www/queryless. v2 also admits literal bare-host/query views, but only the
+    complete source page can verify them; no query is removed or host replaced.
+    """
+    try:
+        parts = urlsplit(normalize_url(url))
+    except (NewsError, TypeError, ValueError):
+        return None
+    hosts = ({'www.taiwanhot.net', 'taiwanhot.net', 'web.taiwanhot.net'} if requested else
+             {'www.taiwanhot.net', 'taiwanhot.net'} if native_view else {'www.taiwanhot.net'})
+    if (parts.netloc not in hosts or not requested and parts.scheme != 'https'
+            or re.search(r'%(?:2f|5c)', parts.path, re.I)):
+        return None
+    if requested and parts.path == '/':
+        match = re.fullmatch(r'p=([1-9][0-9]*)', parts.query)
+    elif route_views and (not parts.query or native_view) and re.fullmatch(r'/news/[1-9][0-9]*/?', parts.path):
+        match = re.fullmatch(r'/news/([1-9][0-9]*)/?', parts.path)
+    elif not parts.query or native_view:
+        match = re.fullmatch(r'/news/(?:focus/)?([1-9][0-9]*)/[^/]+(?:/[1-9][0-9]*/[^/]+)?/?', parts.path)
+    else:
+        return None
+    return match[1] if match else None
+
+
+def taiwanhot_request_ids(url):
+    """Admission candidates, never a chosen article or an alternate request.
+
+    Old focus/category/article and current focus/article/category paths share
+    the same shape. Do not guess from ID magnitude or take the last number.
+    Only the observed OG identity + title can bind an alternate legacy slot.
+    """
+    primary = taiwanhot_article_id(url, requested=True, native_view=True, route_views=True)
+    if primary is None:
+        return frozenset()
+    parts = urlsplit(normalize_url(url))
+    legacy = re.fullmatch(r'/news/focus/[1-9][0-9]*/[^/]+/([1-9][0-9]*)/[^/]+/?', parts.path)
+    return frozenset([primary, *([legacy[1]] if legacy else [])])
+
+
+def taiwanhot_route_matches(url, identity, title):
+    """A newly admitted legacy slot needs the literal article-title proof."""
+    primary = taiwanhot_article_id(url, requested=True, native_view=True, route_views=True)
+    if primary == identity:
+        return True
+    if primary is None:
+        return False
+    parts = urlsplit(normalize_url(url))
+    legacy = re.fullmatch(r'/news/focus/[1-9][0-9]*/[^/]+/([1-9][0-9]*)/([^/]+)/?', parts.path)
+    return bool(legacy and legacy[1] == identity and _key(unquote(legacy[2]).replace('+', ' ')) == _key(title))
+
+
+def taiwanhot_visible_article(soup, *, page_url, native_views=False, route_views=False, require_body=True):
+    """One native content wrapper, not sidebar prose or a syndicated-owner claim."""
+    from downloader.news_fulltext_cnews_cmmedia import _declared_access_guard, _publication_clock
+
+    identity = taiwanhot_article_id(page_url, native_view=native_views, route_views=route_views)
+    def declared_id(url):
+        try:
+            if urlsplit(normalize_url(url)).query:
+                return None
+        except (NewsError, TypeError, ValueError):
+            return None
+        return taiwanhot_article_id(url, native_view=native_views, route_views=route_views)
+    og = _one(soup, 'meta[name="og:url"][content],meta[property="og:url"][content]')
+    if route_views:
+        # The source declaration is the anchor, not an ambiguous focus slot.
+        # Matching this anchor to a legacy route is delayed until visible H2.
+        identity = declared_id(og.get('content'))
+    if identity is None or declared_id(og.get('content')) != identity:
+        raise NewsError('article_identity_not_verified')
+    canonical = soup.select('link[rel~="canonical"][href]')
+    if len(canonical) > 1 or any(declared_id(node.get('href')) != identity for node in canonical):
+        raise NewsError('article_identity_not_verified')
+    scope = _one(soup, '.main_content > .content_wrapper')
+    headline = _one(scope, '.top_title > h2.news_title')
+    bodies = scope.select('article > .news_content')
+    if len(bodies) != 1 and (require_body or bodies):
+        raise NewsError('body_not_found')
+    body = bodies[0] if bodies else None
+    _visible(headline)
+    if body is not None:
+        _visible(body)
+    title = headline.get_text(' ', strip=True)
+    titles = soup.select('meta[name="og:title"][content],meta[property="og:title"][content]')
+    if not title or not titles or len(titles) > 2 or any(_key(node.get('content')) != _key(title) for node in titles):
+        raise NewsError('article_identity_not_verified')
+    if route_views and (urlsplit(normalize_url(page_url)).scheme != 'https'
+            or urlsplit(normalize_url(page_url)).netloc not in {'www.taiwanhot.net', 'taiwanhot.net'}
+            or not taiwanhot_route_matches(page_url, identity, title)):
+        raise NewsError('article_identity_not_verified')
+    if native_views:
+        # An actual same-ID bare/query declaration cannot hide a current paid
+        # schema from exact-URL guards. Read declarations, never generate an
+        # alternate request/route or use related-article schemas as this body.
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                for obj in _objects(json.loads(script.get_text())):
+                    types = obj.get('@type', [])
+                    types = [types] if isinstance(types, str) else types
+                    if not isinstance(types, list) or not any(str(t).rsplit('/', 1)[-1] in {'Article', 'NewsArticle', 'BlogPosting'} for t in types):
+                        continue
+                    declared = obj.get('mainEntityOfPage') or obj.get('url') or obj.get('@id')
+                    if isinstance(declared, dict):
+                        declared = declared.get('@id') or declared.get('url')
+                    if isinstance(declared, str):
+                        url = urljoin(page_url, declared)
+                        if ((taiwanhot_route_matches(url, identity, title) if route_views else
+                                taiwanhot_article_id(url, native_view=True) == identity)
+                                and str(obj.get('isAccessibleForFree', 'true')).lower() == 'false'):
+                            raise NewsError('paywall_or_login')
+            except (json.JSONDecodeError, TypeError):
+                continue
+    for url in {page_url, og.get('content')}:
+        _declared_access_guard(soup, url, title)
+    byline = _one(scope, '.top_title > h5.txt_gray2 > span.reporter_name', 'article_attribution_not_verified')
+    clock_node = _one(scope, '.top_title > h5.txt_gray2 > span.post_time', 'invalid_bulk_publication_clock')
+    _visible(byline)
+    _visible(clock_node)
+    author, visible_clock = byline.get_text(' ', strip=True), clock_node.get_text(' ', strip=True)
+    if not author:
+        raise NewsError('article_attribution_not_verified')
+    if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}', visible_clock):
+        raise NewsError('invalid_bulk_publication_clock')
+    clock, clock_basis = _publication_clock(soup, visible_clock, '%Y-%m-%d %H:%M')
+    for node in (body if body is not None else scope).find_all(['p', 'blockquote']):
+        text = node.get_text(' ', strip=True)
+        if re.match(r'^(?:本文(?:禁止|不得)轉載|(?:非經|未經)(?:同意|授權).{0,24}(?:請勿|不得)轉載)', text):
+            raise NewsError('article_rights_or_scope_excluded')
+    # The actual rich-text markup wraps block paragraphs in a <p>. lxml closes
+    # it; html.parser retains one direct wrapping <p>. Verify the same final
+    # heading/link-list suffix in either tree, never delete that prose wrapper.
+    # Unfamiliar tails stay intact. Mutate this request-local DOM once; the
+    # shared plaintext walker still owns body extraction and hashing.
+    markers = [n for n in body.find_all('h3') if n.get_text(' ', strip=True) == '【延伸閱讀】'] if body is not None else []
+    if len(markers) == 1:
+        marker = markers[0]
+        wrapped = marker.parent.name == 'p' and marker.parent.parent is body
+        tail = list(marker.next_siblings)
+        lists = [n for n in tail if getattr(n, 'name', None) == 'ul']
+        suffix_ok = all(getattr(n, 'name', None) in {'ul', 'br'} if getattr(n, 'name', None)
+                        else not str(n).strip() for n in tail)
+        wrapper_ok = not wrapped or all(getattr(n, 'name', None) == 'br' if getattr(n, 'name', None)
+                                       else not str(n).strip() for n in marker.parent.next_siblings)
+        if ((marker.parent is body or wrapped) and suffix_ok and wrapper_ok
+                and len(lists) == 1 and lists[0].select('li > a[href]')):
+            for node in [marker, *[n for n in tail if getattr(n, 'name', None)]]:
+                node.decompose()
+    return {
+        'headline': title, 'author': [{'name': author}], 'datePublished': clock,
+        'published_time_basis': clock_basis,
+        'article_identity_basis': ('same_native_news_id_visible_h2_and_queryless_declared_og_title_url_v2'
+                                   if native_views else 'same_native_news_id_visible_h2_and_declared_og_title_url_v1'),
+        **({'source_native_article_id': identity,
+            'article_identity_basis': 'source_og_id_and_visible_h2_bind_literal_native_or_legacy_focus_route_v3'}
+           if route_views else {}),
+        'author_attribution_detail_json': json.dumps({'byline_raw': author,
+            'byline_relationship': 'source_visible_credit_not_inferred_person_or_owner',
+            'rights_owner_inferred': False}, ensure_ascii=False),
+        'body_completeness': 'verified_current_article_container',
+    }, scope
+
+
+def taiwanhot_verified_short_prose(container, text, source):
+    """Native metadata must already bind the whole container before calling.
+
+    Heading/graphic-caption text is not prose. Leaf paragraph subtrees are
+    disjoint, so malformed nesting cannot create repeated quadratic text walks.
+    A paragraph must contribute to the final configured text, not an excluded
+    photo/caption region. This does not infer a publication clock or rights.
+    """
+    from downloader.news_fulltext_policy import _plain_text_node
+
+    for paragraph in container.find_all('p'):
+        if (paragraph.find('p')
+                or paragraph.find(['h1','h2','h3','h4','figure','figcaption','table'])
+                or paragraph.find_parent(['figure','figcaption'])):
+            continue
+        prose = _plain_text_node(paragraph, source.exclude_selectors, parser=source.html_parser)
+        if prose and prose in text and (re.search(r'[\u3400-\u9fff]', prose) or len(prose.split()) >= 8):
+            return True
+    return False
 
 
 def _identity_and_schemas(soup, page_url, provider, headline, *, amp=False):

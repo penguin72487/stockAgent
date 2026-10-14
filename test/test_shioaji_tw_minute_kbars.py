@@ -74,6 +74,33 @@ def test_research_builder_excludes_non_session_provider_rows() -> None:
     assert rejected == {"2026-09-05": 1}
 
 
+def test_single_day_dry_run_keeps_prior_calendar_context_for_publication_lag(tmp_path, monkeypatch, capsys):
+    from downloader import download_shioaji_tw_minute_kbars as collector
+    from downloader import download_tw_public_data as public
+    prior, current = date(2026, 10, 13), date(2026, 10, 14)
+    reference = tmp_path / "3406.parquet"
+    pl.DataFrame({"date": [prior], "Trading_Volume": [1_000.0]}).write_parquet(reference)
+    args = SimpleNamespace(start_date=str(current), end_date=str(current), stop_at=None,
+        chunk_days=1, workers=1, requests_per_second=5.0, retry_source_gaps=False,
+        request_interval=0.0, traffic_check_interval=5.0, max_traffic_fraction=0.9,
+        base_stock_root=tmp_path / "stocks", calendar_root=tmp_path, symbols="3406",
+        universe_csv=None, all_symbols=False, max_symbols=0, historical_stock_unit=[],
+        output_dir=tmp_path / "output", dry_run=True)
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "_load_universe", lambda _root: [])
+    monkeypatch.setattr(collector, "select_universe", lambda *a, **kw: [SimpleNamespace(symbol="3406", base_path=reference)])
+    monkeypatch.setattr(collector, "historical_stock_units", lambda *a: {})
+    requests = []
+    def calendar(root, start, end):
+        requests.append((start, end))
+        return {prior, current}, "source-calendar-sha"
+    monkeypatch.setattr(public, "_validated_taiex_session_dates", calendar)
+    collector.main()
+    assert requests == [(current-timedelta(days=14), current)]
+    assert "api_query_chunks=1" in capsys.readouterr().out
+    assert not args.output_dir.exists()  # Dry-run did not log in or materialize data.
+
+
 def test_research_builder_quarantines_stale_output_without_deleting(tmp_path: Path) -> None:
     output = tmp_path / "research_dataset"
     kept = output / "trade_date=2026-09-04"

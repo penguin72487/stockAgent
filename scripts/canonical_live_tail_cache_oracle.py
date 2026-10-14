@@ -69,7 +69,12 @@ def verify_unmodified_helpers(identity: dict) -> None:
         SOURCES[0]: {"_load_symbol_arrays_pyarrow_tail", "build_tail_panel"},
         SOURCES[1]: {"_build_panel_from_stable_source", "clear_live_panel_memory_cache",
                      "_live_raw_tail_source_cache", "_LIVE_RAW_TAIL_SOURCE_CACHE",
-                     "_LIVE_RAW_TAIL_SOURCE_CACHE_LOCK", "_LIVE_RAW_TAIL_SOURCE_CACHE_MAX_BYTES"},
+                     "_LIVE_RAW_TAIL_SOURCE_CACHE_LOCK", "_LIVE_RAW_TAIL_SOURCE_CACHE_MAX_BYTES",
+                     # This oracle covers complete BASE construction, not idle
+                     # teardown. Both trials share the current teardown; all
+                     # data/model builders and the saved full output stay fenced.
+                     "clear_live_inference_memory_cache", "release_idle_live_cuda_cache",
+                     "_live_inference_cpu_cache_retained", "_LIVE_CUDA_CACHE_RELEASE_PENDING"},
     }
     def rest(path, ignored):
         nodes = []

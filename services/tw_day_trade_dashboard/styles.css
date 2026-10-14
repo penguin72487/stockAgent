@@ -88,3 +88,14 @@ body{font-variant-numeric:tabular-nums}.public-nav,.jump-nav,main{width:min(1220
 }
 .compact-table td .stock-futures{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-top:5px}
 .stock-futures .badge{white-space:normal;text-align:center}
+.price-entry-distance{font-variant-numeric:tabular-nums;color:var(--text)}
+.price-sources-body{padding:14px 17px;line-height:1.65;overflow-wrap:anywhere;min-width:0}
+.price-sources-body .quote-display-notice{margin:0 0 12px;padding:0;border:0;background:none}
+.price-source-list,.price-reference-list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.price-source-list{grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}
+.price-source-list li,.price-reference-list li{min-width:0;padding:10px;border:1px solid var(--line);border-radius:9px}
+.price-source-list span,.price-source-list small,.price-reference-list small{display:block;color:var(--muted);font-size:12px}
+.price-distance-explanation{color:var(--muted);font-size:12px;margin:14px 0}
+#price-reference-details>summary{cursor:pointer;min-height:44px;padding:10px 0}
+.price-reference-list{grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));max-height:540px;overflow:auto}
+.price-reference-list .daily-reference-details{font-size:12px}

@@ -412,3 +412,26 @@ def test_price_publication_changes_ui_revision_but_not_large_history_revision(tm
             assert all(path in server.update_hub.paths[topic] for topic in ("tw", "overnight"))
     finally:
         server.server_close()
+
+
+def test_owner_disclosure_scope_invalidates_both_detail_revisions_not_financial_history(tmp_path, monkeypatch):
+    from scripts import serve_public_dashboards as gateway
+    from stockagent.live.public_quote_display import PublicQuoteDisplayPolicy
+    server = gateway.PublicDashboardServer(("127.0.0.1", 0), repo_root=tmp_path,
+        public_static_root=tmp_path, taifex_static_root=tmp_path, tw_static_root=tmp_path,
+        shioaji_static_root=tmp_path, openbb_static_root=tmp_path,
+        data_monitor_static_root=tmp_path, traffic_static_root=tmp_path,
+        taifex_upstream="http://127.0.0.1:1", tw_upstream="http://127.0.0.1:1")
+    monkeypatch.setattr(gateway, "build_dashboard_revision", lambda **_: {"revision_token": "unchanged-ledger"})
+    try:
+        monkeypatch.setattr(gateway, "public_quote_display_policy", lambda: PublicQuoteDisplayPolicy())
+        old = [json.loads(method().body) for method in (server.tw_revision, server.overnight_revision)]
+        monkeypatch.setattr(gateway, "public_quote_display_policy",
+                            lambda: PublicQuoteDisplayPolicy(paper_strategy_reports=True))
+        new = [json.loads(method().body) for method in (server.tw_revision, server.overnight_revision)]
+        for before, after in zip(old, new):
+            assert before["revision_token"] != after["revision_token"]
+            assert before["public_quote_revision"] != after["public_quote_revision"]
+            assert before["history_revision"] == after["history_revision"]
+    finally:
+        server.server_close()

@@ -42,6 +42,7 @@
         <article class="completion-estimate completion-estimate-central"><h3>已啟用來源回補</h3><strong id="eligible-eta">未知</strong><p id="eligible-eta-basis">依各來源完整 owner 時間及已落盤版本估算。</p><small>各來源同時進行；不能把獨立來源工時直接相加。</small></article>
         <article class="completion-estimate"><h3>重試／來源問題</h3><strong id="retry-count">—</strong><p id="error-count">阻塞原因待讀取</p><small>403、robots、付費牆、授權、缺正文與署名問題不算完成。</small></article>
       </div>
+      <details class="news-provider-list" id="outcome-panel"><summary>全部已知網址的缺口分類</summary><div class="table-scroll"><table><caption>保留的互斥狀態分類，不是全文完成率</caption><thead><tr><th scope="col">分類</th><th scope="col">網址數</th></tr></thead><tbody id="outcome-rows"><tr><td colspan="2">分類快照讀取中</td></tr></tbody></table></div><p class="data-note">未接線、待核實、解析缺口及非文字資料分開。原站撤下／不存在不代表所有可用途徑都已耗盡，不算下載完成；處置結案尚未通過全量驗收。</p></details>
     </section>
     <section id="traffic" class="section-block" aria-labelledby="traffic-title">
       <header class="section-heading"><span>02</span><div><h2 id="traffic-title">請求、流量與來源限流</h2><p>以下為目前下載器程序啟動後的累計，不是滾動一小時用量，也不是 FinMind API 配額。</p></div></header>
@@ -61,6 +62,6 @@
     <section id="method" class="section-block" aria-labelledby="method-title"><header class="section-heading"><span>05</span><div><h2 id="method-title">統計口徑</h2></div></header><ul class="method-list"><li>已保存正文按唯一網址計數；正文版本、股票關聯列與 metadata 不同，不可混加。網址去重不是跨媒體內容級去重。</li><li>條件估時只外推目前已知可回補網址，使用目前 owner 的完整經過時間與耐久提交版本。新 sitemap、重抓、來源拒絕和未啟用範圍不包含在完成承諾中。</li><li>來源處於冷卻、程序停止或快照過期時不繼續顯示有效 ETA；更新失敗保留最後資料並標示過期。</li><li>正文 UTF-8 大小不是壓縮後容量；完整下載流量與總容量尚未知，不用短期平均冒充精確總量。</li><li>正文與原始 HTML 僅在私人下載工作區；本頁不提供文章、控制下載、觸發來源 API 或自動訓練注入。</li></ul><p class="data-note"><a href="../finmind/">FinMind metadata 管線</a> · <a href="../data-monitor/">全資料總覽</a></p></section>
   </main>
   <footer><span>StockAgent · 新聞爬蟲進度</span><span id="updated-at">尚未取得觀測</span></footer>
-  <script src="../dashboard-core.js?v=15"></script><script src="app.js?v=5"></script><script src="../dashboard-acquisition.js?v=6"></script>
+  <script src="../dashboard-core.js?v=15"></script><script src="app.js?v=7"></script><script src="../dashboard-acquisition.js?v=6"></script>
 </body>
 </html>

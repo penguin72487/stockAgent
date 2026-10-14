@@ -149,7 +149,8 @@ def main(argv=None):
                                   'metadata_inventory_complete': result['complete']}, ensure_ascii=False), flush=True)
     try:
         from downloader.news_fulltext_failure_focus import configure_focus
-        configure_focus(queue, config.get('failure_diagnostic_focus'))
+        configure_focus(queue, config.get('failure_diagnostic_focus'),
+                        metadata_identity_upgrade=config.get('failure_diagnostic_metadata_identity_upgrade', False))
         if args.reviewed_source_outcomes:
             from downloader.news_fulltext_cohorts import record_reviewed_source_outcomes
             result = record_reviewed_source_outcomes(queue, args.url, args.reviewed_source_outcomes)

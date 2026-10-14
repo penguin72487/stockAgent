@@ -888,6 +888,35 @@ def _signal_row_key(row: Mapping[str, Any]) -> str:
     return ""
 
 
+def _committed_scoped_repair_superseded_signals(
+    state: Mapping[str, Any],
+) -> frozenset[tuple[str, str, str]]:
+    """Current read model hides only an explicitly committed failed attempt.
+
+    The original journal remains authoritative audit history. A candidate or
+    unrelated/newer signal cannot suppress another signal's observations.
+    """
+    identities = set()
+    for market, mode in (state.get("modes") or {}).items():
+        if not isinstance(mode, Mapping):
+            continue
+        proof = mode.get("opening_repair")
+        if not isinstance(proof, Mapping):
+            continue
+        original_id = str(proof.get("original_signal_id") or "")
+        committed_id = str(mode.get("signal_id") or "")
+        day = str(mode.get("session_date") or "")[:10]
+        if (proof.get("contract") == "never_filled_original_signal_append_only_minute_repair_v2"
+                and proof.get("simulation_only") is True
+                and proof.get("original_weights_preserved") is True
+                and mode.get("simulation_replay") is True
+                and original_id and day
+                and committed_id.startswith(original_id + ":minute-repair:")
+                and committed_id in (mode.get("processed_signal_ids") or ())):
+            identities.add((day, str(market), original_id))
+    return frozenset(identities)
+
+
 def _signal_feature_roots(
     state: Mapping[str, Any], state_dir: Path
 ) -> tuple[dict[str, list[Path]], list[Path]]:
@@ -8546,6 +8575,7 @@ def build_dashboard_signal_page(
         raise ValueError("limit must be between 1 and 1000")
     root = Path(state_dir)
     state = _object(root / "state.json")
+    superseded_signals = _committed_scoped_repair_superseded_signals(state)
     configured_markets = state.get("enabled_markets")
     enabled_markets = (
         frozenset(str(market) for market in configured_markets)
@@ -8659,6 +8689,7 @@ def build_dashboard_signal_page(
         int(maximum_scan_rows),
         tuple(sorted(enabled_markets)) if enabled_markets is not None else None,
         state_signal_signature,
+        tuple(sorted(superseded_signals)),
         # Quote-only revisions are handled by the exact position overlay below.
         # They must not rebuild the complete immutable signal-history query.
         futures_catalog.revision,
@@ -8922,6 +8953,9 @@ def build_dashboard_signal_page(
     mark_stage("source_projection")
 
     def included(row: Mapping[str, Any]) -> bool:
+        if (str(row.get("session_date") or "")[:10], str(row.get("market") or ""),
+                str(row.get("signal_id") or "")) in superseded_signals:
+            return False
         if (
             enabled_markets is not None
             and str(row.get("market") or "") not in enabled_markets
@@ -8963,6 +8997,12 @@ def build_dashboard_signal_page(
     else:
         pl = polars_module
         predicate = pl.lit(True)
+        for repaired_day, repaired_market, original_id in sorted(superseded_signals):
+            predicate &= ~(
+                (pl.col("session_date").fill_null("") == repaired_day)
+                & (pl.col("market").fill_null("") == repaired_market)
+                & (pl.col("signal_id").fill_null("") == original_id)
+            )
         if enabled_markets is not None:
             predicate &= pl.col("market").fill_null("").is_in(
                 sorted(enabled_markets)

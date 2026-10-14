@@ -28,6 +28,113 @@ from downloader.news_fulltext_queue import source_path, utc_now
 
 
 REPLAY_CHECKPOINT_CONTRACT_VERSION = 2
+RETAINED_FAILURE_REPLAY_VERSION = 1
+
+
+def replay_retained_cnyes_failures(queue, *, maximum_responses=4, maximum_wall_seconds=0.5,
+                                 maximum_raw_bytes=8 << 20, stop=None):
+    """Repair the explicit diagnostic cohort through the existing body writer.
+
+    No discovery, publisher request, deadline reset or new evidence budget.
+    Indexed finite ledger entries are checked once per parser contract. A
+    newer HTTP outcome, active lease, future retry or existing body is never
+    replaced. Storage failures propagate before checkpointing, so the shared
+    durable receipt recovery remains the only acceptance authority.
+    """
+    from downloader.news_fulltext import article_response_record, extract_article_response
+    from downloader.news_fulltext_cohorts import RETAINED_SUPPLEMENT_HEAD_FIELDS
+    focus = getattr(queue, 'failure_diagnostic_focus', None)
+    source = queue.registry.sources.get('cnyes')
+    if (focus is None or not source or not source.allowed or source.acquisition_mode == 'finite'):
+        return {'responses_checked': 0, 'accepted_heads': 0, 'http_requests': 0}
+    if (type(maximum_responses) is not int or not 1 <= maximum_responses <= 16
+            or type(maximum_wall_seconds) not in (int, float) or not math.isfinite(maximum_wall_seconds)
+            or not 0 < maximum_wall_seconds <= 2 or type(maximum_raw_bytes) is not int
+            or not 1 <= maximum_raw_bytes <= 16 << 20):
+        raise ValueError('unbounded retained failure replay')
+    with queue.db:
+        queue.db.execute('''CREATE TABLE IF NOT EXISTS retained_failure_replays(
+            receipt_path TEXT NOT NULL,parser_fingerprint TEXT NOT NULL,state TEXT NOT NULL,
+            error_code TEXT,checked_at_utc TEXT NOT NULL,
+            PRIMARY KEY(receipt_path,parser_fingerprint)) WITHOUT ROWID''')
+    jobs = queue.db.execute('''SELECT f.url_sha256,f.attempt_number,f.reserved_bytes,
+            f.response_sha256,f.receipt_path FROM failure_evidence_focus_attempts f
+        JOIN articles a ON a.id=f.url_sha256 AND a.provider=f.provider
+        WHERE f.cohort_id=? AND f.outcome='raw_saved' AND NOT EXISTS(
+            SELECT 1 FROM retained_failure_replays r WHERE r.receipt_path=f.receipt_path
+                AND r.parser_fingerprint=?)
+            AND a.body_sha256 IS NULL AND a.state IN ('pending','retry','retry_cooldown','body_not_found')
+            AND a.lease_owner IS NULL AND a.lease_until IS NULL AND a.due<=?
+        ORDER BY f.attempt_number DESC LIMIT 128''',
+        (focus.id, source.parser_repair_fingerprint, time.time())).fetchall()
+    started = time.monotonic()
+    totals = Counter(responses_checked=0, accepted_heads=0, raw_bytes_checked=0)
+    for job in jobs:
+        if (totals['responses_checked'] >= maximum_responses or time.monotonic() - started >= maximum_wall_seconds
+                or stop and stop.is_set()):
+            break
+        head = queue.db.execute('SELECT * FROM articles WHERE id=? AND provider=?', (job[0], 'cnyes')).fetchone()
+        if (head is None or head['body_sha256'] is not None or head['state'] not in {'pending', 'retry', 'retry_cooldown', 'body_not_found'}
+                or head['lease_owner'] is not None or head['lease_until'] is not None):
+            continue
+        if head['due'] > time.time():
+            continue  # The same persisted retry deadline, not another HTTP lane.
+        if job[2] > maximum_raw_bytes - totals['raw_bytes_checked']:
+            continue
+        state, code, record = 'parse_unresolved', None, None
+        try:
+            receipt, raw, outcome, receipt_sha = focus.read_retained_response(job)
+            totals['raw_bytes_checked'] += job[2]
+            observed = datetime.fromisoformat(raw['captured_at_utc'])
+            checked = datetime.fromisoformat(head['last_checked_at_utc'])
+            if (outcome != 'raw_saved' or raw['request_url'] != head['url']
+                    or raw['final_url'] != head['url'] or head['url'] not in focus.targets
+                    or json.loads(raw['authorization_json']) != source.authorization
+                    or observed.utcoffset() is None or checked.utcoffset() is None
+                    or observed > datetime.now(timezone.utc) or not 0 <= (checked - observed).total_seconds() <= 60):
+                raise ValueError('retained_failure_superseded_or_scope_changed')
+            headers = json.loads(raw['headers_json'])
+            if not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()):
+                raise ValueError('retained_failure_headers_invalid')
+            response = Response(raw['final_url'], raw['status'], headers, raw['raw_response_body'])
+            with queue.metrics.measure('retained_failure_extraction', 'cnyes'):
+                article = extract_article_response(response, source)
+            record = article_response_record(source, dict(head), response, article,
+                captured_at_utc=raw['captured_at_utc'], http_duration_seconds=None,
+                parse_duration_seconds=None, duration_seconds=None,
+                resolution_basis='verified_finite_diagnostic_original; not a new HTTP response')
+            record.update(acquisition_transport='retained_raw_reparse',
+                source_observed_at_utc=raw['captured_at_utc'], reparsed_at_utc=utc_now(),
+                replay_source_parquet=receipt['path'], replay_source_receipt=job[4],
+                replay_source_receipt_sha256=receipt_sha,
+                retained_failure_replay_contract_version=RETAINED_FAILURE_REPLAY_VERSION,
+                retained_failure_scope_id=focus.id, retained_failure_attempt_number=job[1],
+                historical_point_in_time=False)
+            state = 'validated'
+        except (OSError, ValueError, TypeError, KeyError, NewsError, pa.ArrowException) as error:
+            code = error.code if isinstance(error, NewsError) else 'retained_failure_evidence_invalid'
+            state = 'parse_unresolved' if isinstance(error, NewsError) else 'failed_validation'
+            queue.metrics.count('cnyes', 'retained_failure_' + state)
+        totals['responses_checked'] += 1
+        if record is not None and state == 'validated':
+            # Claim only AFTER validation. No failed local parse consumes an
+            # HTTP attempt or changes the original source failure/deadline.
+            row = queue.claim_url(head['url'], 600)
+            if row is None:
+                continue
+            witness = queue.db.execute('SELECT * FROM articles WHERE id=?', (job[0],)).fetchone()
+            record['retained_failure_head_json'] = json.dumps(
+                {key: witness[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS}, sort_keys=True)
+            queue.accept([record])  # Disk/receipt/commit errors intentionally propagate.
+            totals['accepted_heads'] += 1
+            state = 'accepted'
+        with queue.db:
+            queue.db.execute('INSERT OR IGNORE INTO retained_failure_replays VALUES (?,?,?,?,?)',
+                (job[4], source.parser_repair_fingerprint, state, code, utc_now()))
+    for key in ('responses_checked', 'accepted_heads'):
+        queue.metrics.count('cnyes', 'retained_failure_' + key, totals[key])
+    return {**totals, 'contract_version': RETAINED_FAILURE_REPLAY_VERSION, 'http_requests': 0,
+            'all_history_complete': False, 'original_observation_clocks_preserved': True}
 
 
 def ensure_replay_schema(queue):

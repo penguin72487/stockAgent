@@ -80,12 +80,17 @@ test("price withholding does not turn a closed day-trade or overnight position i
   }
 });
 
-test("public market source clocks are visible and escaped, while withheld raw values never render", () => {
+test("public source clocks are escaped in the footer, not repeated beside event prices", () => {
   const {view} = components({formatOverrides: {sourceNumber: (value) => String(value ?? "—")}});
-  const visible = view.eventRow({price: 112.5, public_price_display: {visible_fields: {
-    price: {source: '<img onerror="x">', observed_at: "2026-10-13T09:00:01+08:00"}}}});
+  const row = {price: 112.5, public_price_display: {visible_fields: {
+    price: {source: '<img onerror="x">', observed_at: "2026-10-13T09:00:01+08:00"}}}};
+  const visible = view.eventRow(row);
   assert.match(visible, /112.5/);
-  assert.match(visible, /公開行情 &lt;img/);
+  assert.doesNotMatch(visible, /公開行情|onerror/);
+  const footer = view.priceSources({events: [row]}).sourcesHtml;
+  assert.match(footer, /&lt;img/);
+  assert.match(footer, /10-13 09:00:01/);
+  assert.doesNotMatch(footer, /<img/);
   assert.doesNotMatch(visible, /<img/);
   const hidden = view.eventRow({price: 12345.67, public_price_display: {withheld_fields: ["price"]}});
   assert.match(hidden, /等待可公開來源/);

@@ -149,6 +149,7 @@ class SourcePolicy:
     http_capacity_source_fingerprint: str = ''
     parser_repair_fingerprint: str = ''
     parser_repair_capture_fingerprint: str = ''
+    known_url_only: bool = False
 
     @property
     def request_enabled(self) -> bool:
@@ -164,6 +165,9 @@ def parser_repair_fingerprint(payload: dict[str, Any]) -> str:
     Copy the nested mappings so the original capture payload stays identical.
     """
     normalized = dict(payload)
+    # URL admission/discovery scheduling is not a body-parser repair. Old
+    # refusals and immutable bodies must not be replayed after a scope-only edit.
+    normalized.pop('known_url_only_schedule_contract_version', None)
     entry = dict(payload['entry'])
     for field in ('acquisition_mode', 'private_known_url_scope', 'note',
                   'interval_seconds', 'parallelism', 'discovery_interval_seconds',
@@ -179,6 +183,36 @@ def parser_repair_fingerprint(payload: dict[str, Any]) -> str:
             normalized['authorization'] = authorization
     normalized['entry'] = entry
     return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+
+
+def _known_url_only_scope(entry, auth):
+    """Local metadata growth only, not an authorization to discover a site.
+
+    This explicit scope reuses the existing personal-reading or article-level
+    license checks. Reject endpoint configuration, including dormant discovery
+    jobs, rather than silently expanding the scope on a later edit.
+    """
+    scope = entry.get('private_known_url_scope', '')
+    if scope == '':
+        return False
+    if not isinstance(scope, str) or scope not in {'personal_noncommercial_originals_v1', 'per_article_licensed_text_v1'}:
+        raise ValueError('unreviewed known-URL-only scope')
+    if entry.get('acquisition_mode') == 'finite':
+        return False  # A retained annotation never extends an immutable cohort.
+    personal = scope == 'personal_noncommercial_originals_v1' and auth.get('kind') == 'personal_research'
+    licensed = (scope == 'per_article_licensed_text_v1' and auth.get('kind') == 'open_license'
+                and bool(entry.get('required_license_url_prefix')) and bool(entry.get('license_selectors'))
+                and entry.get('require_configured_container') is True)
+    if entry.get('require_author_attribution') is not True:
+        raise ValueError('known-URL-only scope or reviewed author scope requires exact current-article attribution')
+    if (not (personal or licensed) or entry.get('acquisition_mode') != 'continuous'
+            or not entry.get('article_selectors') or not entry.get('article_path_pattern')):
+        raise ValueError('unreviewed known-URL-only scope')
+    if any(entry.get(field) for field in (
+            'feeds', 'sitemaps', 'wordpress_apis', 'cnyes_apis', 'fulltext_feeds',
+            'index_pages', 'incremental_index_pages', 'metadata_feeds', 'cnyes_public_index')):
+        raise ValueError('known-URL-only scope cannot configure discovery endpoints')
+    return True
 
 
 def cnyes_bulk_fingerprint(source: SourcePolicy) -> str:
@@ -264,6 +298,7 @@ class PolicyRegistry:
             legacy = str(entry.get("legacy_release_layout", ""))
             if legacy and (legacy not in _FED_RELEASE_LAYOUT_VERSIONS or provider != "fed_board" or auth.get("kind") != "public_domain"):
                 raise ValueError("unreviewed legacy release parser")
+            known_url_only = _known_url_only_scope(entry, auth)
             embedded = str(entry.get("embedded_article_layout", ""))
             einfo_layout = (embedded == "einfo_next_post_v1" and provider == "einfo" and auth.get("kind") == "open_license"
                             and auth.get("license") == "CC-BY-NC-ND-4.0" and auth.get("evidence_url") == "https://e-info.org.tw/copyright")
@@ -298,7 +333,9 @@ class PolicyRegistry:
             cmmedia_layout = (embedded == "cmmedia_visible_article_v1" and provider == "cmmedia"
                               and domains == ("www.cmmedia.com.tw",) and auth.get("kind") == "personal_research"
                               and auth.get("evidence_url") == "https://www.cmmedia.com.tw/home/copyright"
-                              and entry.get("acquisition_mode") == "finite"
+                              and (entry.get("acquisition_mode") == "finite"
+                                   or known_url_only and entry.get('private_known_url_scope')
+                                   == 'personal_noncommercial_originals_v1')
                               and entry.get("require_configured_container") is True
                               and entry.get("require_author_attribution") is True)
             nownews_layout = (embedded == "nownews_visible_article_v1" and provider == "nownews"
@@ -320,6 +357,21 @@ class PolicyRegistry:
                                and entry.get("private_known_url_scope") == "personal_noncommercial_originals_v1")
                           and entry.get("require_configured_container") is True
                           and entry.get("require_author_attribution") is True)
+            taiwanhot_layout = (embedded in {'taiwanhot_visible_article_v1', 'taiwanhot_visible_article_v2', 'taiwanhot_visible_article_v3'} and provider == 'taiwanhot'
+                                and domains == ('taiwanhot.net',) and auth.get('kind') == 'personal_research'
+                                and auth.get('evidence_url') == 'https://www.taiwanhot.net/'
+                                and known_url_only and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
+                                and entry.get('require_configured_container') is True
+                                and entry.get('require_author_attribution') is True
+                                and entry.get('article_path_pattern') == (
+                                    '^(?:/news/(?:focus/)?[1-9][0-9]*(?:/|$)|/$)'
+                                    if embedded == 'taiwanhot_visible_article_v3' else
+                                    '^(?:/news/(?:focus/)?[1-9][0-9]*/|/$)')
+                                and entry.get('article_selectors') == ['article > .news_content']
+                                and entry.get('title_selector') == '.top_title > h2.news_title'
+                                and entry.get('author_selectors') == ['.top_title > h5.txt_gray2 > span.reporter_name']
+                                and entry.get('publication_selectors') == ['.top_title > h5.txt_gray2 > span.post_time']
+                                and entry.get('exclude_selectors') == ['.photo_wrap'])
             voa_layout = (embedded in {"voa_original_article_v1", "voa_reviewed_private_article_v2"}
                           and (provider, domains, auth.get("evidence_url")) in {
                               ("voa_chinese", ("www.voachinese.com",), "https://www.voachinese.com/p/3874.html"),
@@ -373,7 +425,7 @@ class PolicyRegistry:
                                and entry.get('require_configured_container') is True
                                and entry.get('require_author_attribution') is True
                                and entry.get('article_selectors') == [':scope > article.content'])
-            if embedded and not (einfo_layout or cmnews_layout or tainan_layout or macau_layout or kmdn_layout or cnews_layout or cmmedia_layout or nownews_layout or ftv_layout or voa_layout or tfc_layout or nccu_layout or taichung_layout or changhua_layout):
+            if embedded and not (einfo_layout or cmnews_layout or tainan_layout or macau_layout or kmdn_layout or cnews_layout or cmmedia_layout or nownews_layout or ftv_layout or taiwanhot_layout or voa_layout or tfc_layout or nccu_layout or taichung_layout or changhua_layout):
                 raise ValueError("unreviewed embedded article parser")
             acquisition_mode = entry.get("acquisition_mode", "continuous")
             if not isinstance(acquisition_mode, str) or acquisition_mode not in {"continuous", "finite"}:
@@ -497,16 +549,20 @@ class PolicyRegistry:
                                                         "collection_purpose": config.get("collection_purpose", "personal_research"),
                                                         "html_parser": html_parser,
                                                         "entry": capture_entry, "authorization": auth}
+            if known_url_only:
+                fingerprint_payload['known_url_only_schedule_contract_version'] = 1
             if cnyes_apis:
                 fingerprint_payload["cnyes_adapter_contract_version"] = 8
                 fingerprint_payload["reviewed_cnyes_endpoint_inventory"] = cnyes_inventory
             if provider == 'cnyes':
+                fingerprint_payload['visible_headline_body_ownership_contract_version'] = 1
                 fingerprint_payload['verified_short_html_body_contract_version'] = 5
                 fingerprint_payload['verified_native_prose_spacing_contract_version'] = 1
                 fingerprint_payload['mobile_canonical_html_contract_version'] = 43
                 fingerprint_payload['verified_empty_html_outcome_contract_version'] = 8
                 fingerprint_payload['verified_native_quote_only_outcome_contract_version'] = 7
                 fingerprint_payload['verified_native_image_only_outcome_contract_version'] = 4
+                fingerprint_payload['verified_source_test_article_outcome_contract_version'] = 1
             if fulltext_feeds:
                 fingerprint_payload['fulltext_feed_rights_contract_version'] = 2
             if pdf_pattern:
@@ -539,12 +595,15 @@ class PolicyRegistry:
             data_fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True).encode()).hexdigest()
             capacity_fingerprint = ''
             if provider == 'cnyes':
-                # Only the new word-spacing parser ABI is not HTTP policy.
+                # Word spacing and verified source-test outcomes are parser
+                # ABIs, not HTTP policy.
                 # Keep the exact previous pacing/refusal identity, including
                 # every original scope, authorization, endpoint and config
                 # field. Other HTML ABI/policy changes still invalidate it.
                 capacity_payload = dict(fingerprint_payload)
                 capacity_payload.pop('verified_native_prose_spacing_contract_version')
+                capacity_payload.pop('verified_source_test_article_outcome_contract_version')
+                capacity_payload.pop('visible_headline_body_ownership_contract_version')
                 capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
             bulk_fingerprint = ""
             if cnyes_apis:
@@ -555,6 +614,8 @@ class PolicyRegistry:
                 bulk_payload.pop('verified_empty_html_outcome_contract_version', None)
                 bulk_payload.pop('verified_native_quote_only_outcome_contract_version', None)
                 bulk_payload.pop('verified_native_image_only_outcome_contract_version', None)
+                bulk_payload.pop('verified_source_test_article_outcome_contract_version', None)
+                bulk_payload.pop('visible_headline_body_ownership_contract_version', None)
                 bulk_fingerprint = hashlib.sha256(json.dumps(bulk_payload, sort_keys=True).encode()).hexdigest()
             feed_fingerprint = ''
             if fulltext_feeds:
@@ -609,6 +670,7 @@ class PolicyRegistry:
                 http_capacity_source_fingerprint=capacity_fingerprint,
                 parser_repair_fingerprint=parser_repair_fingerprint(fingerprint_payload),
                 parser_repair_capture_fingerprint=data_fingerprint,
+                known_url_only=known_url_only,
             )
 
     def match(self, url: str) -> SourcePolicy | None:
@@ -970,6 +1032,11 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
     elif source.embedded_article_layout == "ftv_visible_article_v1":
         from downloader.news_fulltext_public_originals import ftv_visible_article
         article, article_scope = ftv_visible_article(soup, page_url=page_url)
+    elif source.embedded_article_layout in {'taiwanhot_visible_article_v1', 'taiwanhot_visible_article_v2', 'taiwanhot_visible_article_v3'}:
+        from downloader.news_fulltext_public_originals import taiwanhot_visible_article
+        article, article_scope = taiwanhot_visible_article(soup, page_url=page_url,
+            native_views=source.embedded_article_layout != 'taiwanhot_visible_article_v1',
+            route_views=source.embedded_article_layout == 'taiwanhot_visible_article_v3')
     elif source.embedded_article_layout in {"voa_original_article_v1", "voa_reviewed_private_article_v2"}:
         from downloader.news_fulltext_public_originals import voa_original_article
         article, article_scope = voa_original_article(soup, source, page_url=page_url)
@@ -1085,6 +1152,11 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
                     body, method, short_configured_body = text, 'css:' + selector, True
                     break
             if len(text) >= 100 or (source.allow_short_configured_body and len(nodes) == 1 and text):
+                if (source.provider == 'taiwanhot' and source.embedded_article_layout == 'taiwanhot_visible_article_v3'
+                        and len(text) < 100):
+                    from downloader.news_fulltext_public_originals import taiwanhot_verified_short_prose
+                    if not taiwanhot_verified_short_prose(nodes[0], text, source):
+                        continue
                 body, method = text, "css:" + selector
                 short_configured_body = len(text) < 100
                 break
@@ -1194,6 +1266,10 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
     # the existing guard; navigation, credit and media-only posts never qualify.
     nontrivial_text_missing = (len(body.split()) < 8 and not re.search(r"[\u3400-\u9fff]", body)
                               and not verified_globalvoices_micro_post)
+    if source.provider == 'cnyes' and method == 'jsonld_article_body' and 0 < len(body) < 100:
+        from downloader.news_fulltext_publishers import cnyes_verified_test_article
+        if cnyes_verified_test_article(soup, source, article, body, page_url=expected_url):
+            raise NewsError('source_article_test_only')
     if (source.provider == 'cnyes' and method == 'jsonld_article_body'
             and 0 < len(body) < 100 and nontrivial_text_missing):
         from downloader.news_fulltext_publishers import cnyes_verified_quote_only_body, cnyes_verified_short_prose_spacing
@@ -1298,6 +1374,8 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         "published_time_basis": article.get("published_time_basis") or (
             "publisher_declared_date_only; no_intraday_time_inferred" if legacy_publication else "publisher_declared_clock_or_unknown"),
         "article_identity_basis": article.get("article_identity_basis"),
+        **({"source_native_article_id": article["source_native_article_id"]}
+           if source.embedded_article_layout == 'taiwanhot_visible_article_v3' else {}),
         "modified_at_raw": str(article["dateModified"]) if article.get("dateModified") else None,
         "declared_canonical_url": canonical.get("href") if canonical else None,
         "declared_license_urls_json": json.dumps(licenses, ensure_ascii=False),

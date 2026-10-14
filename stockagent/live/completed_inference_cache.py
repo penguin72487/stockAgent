@@ -58,6 +58,37 @@ def implementation_identity() -> list[dict[str, Any]]:
     return [file_identity(path) for path in sorted(paths)]
 
 
+class LoadedImplementationChanged(RuntimeError):
+    """Disk code no longer describes this process's admitted live implementation."""
+
+    def __init__(self) -> None:
+        self.details = {"reason": "live_implementation_changed", "retryable": False,
+                        "requires_fresh_process": True, "model_not_admitted": True}
+        super().__init__("Live inference code changed after process admission; "
+                         "use the canonical owner reload, not a relabelled cache.")
+
+
+@lru_cache(maxsize=1)
+def _admitted_implementation_json() -> str:
+    # A string cannot be mutated by an identity consumer. The role entrypoint
+    # binds this BEFORE importing its model/config/data dependencies.
+    return json.dumps(implementation_identity(), sort_keys=True, allow_nan=False)
+
+
+def loaded_implementation_identity() -> list[dict[str, Any]]:
+    """Require a stable admitted code generation, including added/deleted files.
+
+    Reading disk on each request is not proof of a resident Python module's
+    version. Never bless a changed tree as the code behind an old model/config.
+    This performs CPU file identities only; it neither reloads modules nor
+    initializes CUDA. A fresh role is required after a code change.
+    """
+    admitted = json.loads(_admitted_implementation_json())
+    if implementation_identity() != admitted:
+        raise LoadedImplementationChanged()
+    return admitted
+
+
 def array_identity(value: np.ndarray) -> dict[str, Any]:
     array = np.ascontiguousarray(value)
     if array.dtype.hasobject:

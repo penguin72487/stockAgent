@@ -2,9 +2,10 @@
 
 An API entitlement is not a redistribution grant. Unknown quotes are withheld.
 Raw quotations need a server-owned grant and a role-specific observation.
-Separately, the owner may publish recorded paper transactions as a transaction
-report, not as a licensed feed or a broker fill. Payload flags cannot authorize
-either publication path.
+Separately, the owner may publish recorded paper transactions and strategy
+plans, not as a licensed feed or a broker fill. Payload flags cannot authorize
+any publication path. A strategy level is not a raw quotation, even when an
+order intentionally uses a market's legal price boundary.
 Policy changes require a public-reader restart, which also discards old encoded
 responses; they never require a broker login or a trading-engine restart.
 """
@@ -14,7 +15,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
+from functools import cached_property, lru_cache
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -22,8 +24,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
-CONTRACT = "public_quote_display_v1"
+CONTRACT = "public_quote_display_v2"
 PAPER_REPORT_CONTRACT = "owner_paper_transaction_report_v1"
+STRATEGY_REPORT_CONTRACT = "owner_paper_strategy_report_v1"
 PROTECTED_OBSERVATIONS_KEY = "public_price_observations"
 TAIPEI = ZoneInfo("Asia/Taipei")
 _POLICY_PATH = Path(__file__).resolve().parents[2] / "configs/public_quote_display.json"
@@ -40,6 +43,14 @@ _ACCOUNTING_FIELDS = frozenset({
     "closing_auction_limit_price", "opening_exit_limit_price", "take_profit_price",
     "stop_trigger_price",
 })
+# Narrow, producer-owned plan fields. Never include sizing inputs, marks,
+# OHLC, Bid/Ask or exchange limits: the owner-report scope is not a feed grant.
+STRATEGY_POSITION_CLOCKS = {
+    "take_profit_price": "entry_at", "stop_trigger_price": "entry_at",
+    "eod_limit_price": "eod_limit_submitted_at",
+    "closing_auction_limit_price": "closing_auction_order_submitted_at",
+    "opening_exit_limit_price": "opening_exit_submitted_at",
+}
 
 
 def _is_quote_price_field(key: str) -> bool:
@@ -117,6 +128,72 @@ def _expected_session(record: Mapping[str, Any], field: str) -> str | None:
 class PublicQuoteDisplayPolicy:
     grants: tuple[Mapping[str, Any], ...] = ()
     paper_transaction_reports: bool = False
+    paper_strategy_reports: bool = False
+
+    @cached_property
+    def revision(self) -> str:
+        """Loaded disclosure rules are part of the public read-model identity.
+
+        Compute once per policy, never hash the configuration file per row.
+        A reader restart loads a new generation; changing disclosure alone must
+        invalidate status/detail responses, not the financial minute curves.
+        """
+        return hashlib.sha256(json.dumps({
+            "contract": CONTRACT, "grants": self.grants,
+            "owner_transaction_reports": self.paper_transaction_reports,
+            "transaction_contract": PAPER_REPORT_CONTRACT,
+            "owner_strategy_reports": self.paper_strategy_reports,
+            "strategy_contract": STRATEGY_REPORT_CONTRACT,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+    def strategy_report_price(
+        self, record: Mapping[str, Any], field: str, private_value: Any,
+        *, record_kind: str | None, now: datetime | None = None,
+    ) -> tuple[float, dict[str, Any]] | None:
+        """Disclose the owner's persisted plan without requiring a fill.
+
+        TP/SL and submitted limit/stop instructions are outputs of the strategy,
+        not prices at which a market necessarily traded. The trusted endpoint
+        supplies the record context; arbitrary nested mappings cannot opt in.
+        Preserve original precision and replay flags. A basis/submission clock
+        is not the generation/acquisition time of a replayed strategy plan.
+        """
+        if (not self.paper_strategy_reports
+                or type(private_value) not in (int, float)
+                or not math.isfinite(private_value) or private_value <= 0
+                or not isinstance(record.get("symbol"), str) or not record["symbol"]
+                or not isinstance(record.get("market"), str) or not record["market"]):
+            return None
+        current_clock = now or datetime.now(TAIPEI)
+        if current_clock.tzinfo is None:
+            return None
+        clock_kind = "submission"
+        if record_kind == "paper_position" and field in STRATEGY_POSITION_CLOCKS:
+            clock_value = record.get(STRATEGY_POSITION_CLOCKS[field])
+            if field in {"take_profit_price", "stop_trigger_price"}:
+                clock_kind = "entry_basis"
+        elif record_kind == "paper_signal" and field == "order_limit_price":
+            clock_value = record.get("signal_at")
+            clock_kind = "signal_basis"
+        elif (record_kind == "paper_event" and field == "price"
+              and record.get("event_kind") == "order"
+              and record.get("simulation_only") is True
+              and record.get("order_type") in {"LMT", "LMT_ROD", "LOCAL_STOP_MKT"}
+              and _positive_quantity(record.get("quantity"))):
+            clock_value = record.get("submitted_at") or record.get("recorded_at")
+        else:
+            return None
+        clock = _record_clock(clock_value, current_clock)
+        expected_session = (record.get("opening_exit_order_session_date")
+                            if field == "opening_exit_limit_price" else record.get("session_date"))
+        if clock is None or clock.astimezone(TAIPEI).date().isoformat() != expected_session:
+            return None
+        return float(private_value), {
+            "source": "使用者公開的策略設定", "price_role": field,
+            "publication_basis": STRATEGY_REPORT_CONTRACT, "evidence_kind": "strategy_plan",
+            "basis_at": str(clock_value), "clock_kind": clock_kind,
+            "session_date": str(expected_session), "broker_execution_verified": False,
+        }
 
     def transaction_report_price(
         self, record: Mapping[str, Any], field: str, private_value: Any,
@@ -314,10 +391,14 @@ def public_quote_display_policy() -> PublicQuoteDisplayPolicy:
         enabled = (isinstance(report, Mapping) and report.get("enabled") is True
                    and report.get("contract") == PAPER_REPORT_CONTRACT
                    and report.get("record_scope") == "tw_day_trade_and_overnight_paper_ledger")
+        strategy = payload.get("owner_strategy_reports")
+        strategy_enabled = (isinstance(strategy, Mapping) and strategy.get("enabled") is True
+                            and strategy.get("contract") == STRATEGY_REPORT_CONTRACT
+                            and strategy.get("record_scope") == "tw_day_trade_and_overnight_paper_ledger")
         return PublicQuoteDisplayPolicy(tuple(
             dict(grant) for grant in payload["authorized_sources"]
             if isinstance(grant, Mapping)
-        ), paper_transaction_reports=enabled)
+        ), paper_transaction_reports=enabled, paper_strategy_reports=strategy_enabled)
     except (OSError, ValueError, TypeError):
         return PublicQuoteDisplayPolicy()
 
@@ -325,6 +406,7 @@ def public_quote_display_policy() -> PublicQuoteDisplayPolicy:
 def public_quote_display_notice(*, include_paper_reports: bool = False) -> dict[str, Any]:
     notice = {
         "contract": CONTRACT,
+        "policy_revision": public_quote_display_policy().revision,
         "policy": "verified_public_source_only",
         "pending_label": "等待可公開來源",
         "message": "官方日行情及櫃買盤後最後買賣價、次日參考／申報價格界限依來源接通；次日欄位不當作當日漲跌停或即時價格。永豐分鐘／即時行情展示授權尚待確認，不代表沒有取得價格；模型、帳本與損益原值不變。",
@@ -338,12 +420,21 @@ def public_quote_display_notice(*, include_paper_reports: bool = False) -> dict[
             "https://data.gov.tw/dataset/11370",
         ],
     }
-    if include_paper_reports and public_quote_display_policy().paper_transaction_reports:
+    policy = public_quote_display_policy()
+    if include_paper_reports and policy.paper_transaction_reports:
         notice["policy"] = "verified_public_quotes_and_owner_paper_transaction_reports"
         notice["paper_transaction_reports"] = True
         notice["message"] = (
             "已記錄的進出場價按使用者意願公開，標示為模擬帳本成交，不是券商成交。"
             "官方日行情、盤後買賣價與次日申報界限另列日期與來源，不冒充即時行情；永豐原始分鐘／即時行情公開展示授權尚未確認。"
             "交易紀錄公開不等於行情轉載授權；模型、帳本與損益原值不變。"
+        )
+    if include_paper_reports and policy.paper_strategy_reports:
+        notice["policy"] = "verified_public_quotes_and_owner_paper_reports"
+        notice["paper_strategy_reports"] = True
+        notice["strategy_report_contract"] = STRATEGY_REPORT_CONTRACT
+        notice["message"] = (
+            "TP／SL 及已記錄策略委託價由使用者選擇公開，是策略計畫，不是行情或成交價。"
+            + notice["message"]
         )
     return notice

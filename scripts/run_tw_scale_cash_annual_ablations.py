@@ -38,6 +38,77 @@ OPTIMIZED_SOURCE = ROOT / ('artifacts/operations/training_launches/'
 FRONTIER_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_frontier_20261014_v8.yaml'
 FRONTIER_SOURCE = ROOT / ('artifacts/operations/training_launches/'
                          'tw_scale_cash_annual_last_fold_frontier_20261014_v8/frontier-source-v1.json')
+STRUCTURAL_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_structural_20261014_v9.yaml'
+STRUCTURAL_SOURCE = ROOT / ('artifacts/operations/training_launches/'
+                           'tw_scale_cash_annual_last_fold_structural_20261014_v9/structural-source-v1.json')
+RESIDENT_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_resident_20261014_v10.yaml'
+RESIDENT_SOURCE = ROOT / ('artifacts/operations/training_launches/'
+                         'tw_scale_cash_annual_last_fold_resident_20261014_v10/resident-source-v1.json')
+
+
+def _structural_source(parent: dict, binding_path: Path, *,
+                       binding_contract: str = 'tw_ablation_structural_source_v1',
+                       parent_key: str = 'parent_frontier_source_sha256') -> tuple[dict, Path]:
+    """Bind a measured extension to its exact parent and full-fold evidence."""
+    from stockagent.runtime_identity import verify_release_bundles, verify_source_release
+    binding = json.loads(binding_path.read_text())
+    if (binding.get('contract') != binding_contract
+            or binding.get(parent_key) != parent['source_sha256']):
+        raise ValueError('structural ablations require their validated frontier parent')
+    receipt = Path(binding['source_receipt'])
+    code = receipt.parent / 'build-source'
+    if verify_source_release(receipt, code)['source_sha256'] != binding['source_sha256']:
+        raise ValueError('structural source identity differs from its binding')
+    verify_release_bundles(receipt)
+    old = json.loads(Path(parent['source_receipt']).read_text())['code']['files']
+    new = json.loads(receipt.read_text())['code']['files']
+    changed = sorted(name for name in set(old) | set(new) if old.get(name) != new.get(name))
+    if changed != binding['amendment_files']:
+        raise ValueError('structural source amendment inventory differs from review')
+    acceptance = Path(binding['performance_acceptance_receipt'])
+    if hashlib.sha256(acceptance.read_bytes()).hexdigest() != binding['performance_acceptance_sha256']:
+        raise ValueError('structural performance evidence changed')
+    proof = json.loads(acceptance.read_text())
+    if (proof.get('contract') != 'frontier_full_fold_abba_acceptance_v1'
+            or proof.get('order') != ['A', 'B', 'B', 'A']
+            or proof.get('selected_fold') != 11 or proof.get('world_size') != 2
+            or len(proof.get('trials', [])) != 4
+            or {r['source_sha256'] for r in proof['trials']} != {binding['performance_source_sha256']}):
+        raise ValueError('structural recipe lacks balanced maximum-rank complete-fold evidence')
+    for item in proof['trials']:
+        result_path = Path(item['result'])
+        if hashlib.sha256(result_path.read_bytes()).hexdigest() != item['result_sha256']:
+            raise ValueError('structural complete-fold result changed')
+        result = json.loads(result_path.read_text())
+        if (not result.get('ok') or not result.get('lifecycle_ok')
+                or result.get('timing_scope') != 'maximum_rank'
+                or (item['arm'] == 'B' and not result.get('annual_ownership_validation', {}).get('ok'))):
+            raise ValueError('structural performance trial failed lifecycle or ownership acceptance')
+    tested = json.loads(Path(binding['performance_source_receipt']).read_text())['code']['files']
+    for name in set(new) | set(tested):
+        if name.startswith(('stockagent/', 'backtest/')) and new.get(name) != tested.get(name):
+            raise ValueError(f'structural runtime differs from measured source: {name}')
+    return {**parent, **binding}, code
+
+
+def _resident_source(parent: dict, binding_path: Path) -> tuple[dict, Path]:
+    """The resident representation also needs its all-parameter adjoint proof."""
+    source, code = _structural_source(parent, binding_path,
+        binding_contract='tw_ablation_resident_source_v1',
+        parent_key='parent_structural_source_sha256')
+    path = Path(source['mechanism_validation_receipt'])
+    if hashlib.sha256(path.read_bytes()).hexdigest() != source['mechanism_validation_sha256']:
+        raise ValueError('resident projection mechanism validation changed')
+    proof = json.loads(path.read_text())
+    if (proof.get('source_sha256') != source['source_sha256']
+            or proof.get('strict_cuda_returncode') != 0
+            or proof.get('mechanism_tests_returncode') != 0
+            or proof.get('mechanism_tests', 0) < 32
+            or proof.get('projection_contract') != 'full_schema_csr_affine_stable_full_rows_gpu_resident_v2'
+            or proof.get('all_parameter_adjoint_pass') is not True
+            or proof.get('financial_owner_files_unchanged') is not True):
+        raise ValueError('resident full-schema mechanism/adjoint validation is incomplete')
+    return source, code
 
 
 def _frontier_source(parent: dict, binding_path: Path) -> tuple[dict, Path]:
@@ -315,12 +386,18 @@ def main(argv: list[str] | None = None) -> int:
                         help='Baseline then 27 variants; shared measured recipe, OOM capacity retries, continue after failures.')
     parser.add_argument('--frontier', action='store_true',
                         help='Baseline, seven optimizer recipes, then the original 27 variants in a fresh v8 root.')
+    parser.add_argument('--structural', action='store_true',
+                        help='Same 35 cases with measured whole-account DDP in a fresh v9 root.')
+    parser.add_argument('--resident-sparse', action='store_true',
+                        help='Same 35 cases with a verified resident full-schema CSR stem in a fresh v10 root.')
     args = parser.parse_args(argv)
     if args.plots_only and args.dry_run:
         parser.error('--plots-only and --dry-run are mutually exclusive')
     selected = _selection(args.only)
-    optimized = args.optimized or args.frontier
-    spec_path = (FRONTIER_SPEC if args.frontier else OPTIMIZED_SPEC if args.optimized
+    structural = args.structural or args.resident_sparse
+    frontier = args.frontier or structural
+    optimized = args.optimized or frontier
+    spec_path = (RESIDENT_SPEC if args.resident_sparse else STRUCTURAL_SPEC if args.structural else FRONTIER_SPEC if args.frontier else OPTIMIZED_SPEC if args.optimized
                  else REPAIR_SPEC if args.numerical_repair else SPEC)
     if selected is None:
         _, all_rows = _experiment_rows(spec_path)
@@ -354,8 +431,14 @@ def main(argv: list[str] | None = None) -> int:
     if optimized:
         source, code = _optimized_source(source, OPTIMIZED_SOURCE)
         report_source, report_code = source, code
-    if args.frontier:
+    if frontier:
         source, code = _frontier_source(source, FRONTIER_SOURCE)
+        report_source, report_code = source, code
+    if structural:
+        source, code = _structural_source(source, STRUCTURAL_SOURCE)
+        report_source, report_code = source, code
+    if args.resident_sparse:
+        source, code = _resident_source(source, RESIDENT_SOURCE)
         report_source, report_code = source, code
     for required in ('scripts/run_ablation_experiments.py', 'scripts/check_environment.py', 'coda_runner.sh'):
         if not (code / required).is_file():
@@ -385,11 +468,21 @@ def main(argv: list[str] | None = None) -> int:
                         baseline_included=True, failure_policy='record_and_continue',
                         capacity_policy=spec['runtime']['capacity_retry'],
                         optimization_recipe_sha256=source['optimization_recipe_sha256'])
-    if args.frontier:
+    if frontier:
         contract.update(contract='annual_scale_cash_frontier_optimizer_last_fold_v5',
                         optimizer_recipes_after_baseline=True,
                         optimizer_dependency_files=source['dependency_files'],
                         optimizer_validation_sha256=source['optimizer_validation_sha256'])
+    if structural:
+        contract.update(contract='annual_scale_cash_structural_last_fold_ofat_v6',
+                        episode_parallel_abi='annual_whole_account_local_actions_weighted_gradient_mean_v2',
+                        ownership_exceptions=spec['matrix'].get('experiment_overrides', {}),
+                        performance_acceptance_sha256=source['performance_acceptance_sha256'])
+    if args.resident_sparse:
+        contract.update(contract='annual_scale_cash_resident_last_fold_ofat_v7',
+                        projection_contract='full_schema_csr_affine_stable_full_rows_gpu_resident_v2',
+                        numerical_trajectory='full_schema_affine_reordered_fp32_with_bf16_partitions_v2',
+                        mechanism_validation_sha256=source['mechanism_validation_sha256'])
     _bind_contract(output / 'ablation-contract.json', contract)
     runtime_root = ROOT / 'artifacts/operations/training_launches' / output.name
     _bind_contract(runtime_root / 'input-contract.json', contract)
@@ -421,7 +514,12 @@ def main(argv: list[str] | None = None) -> int:
         expected = recipe['overrides']['training']['financial_transformer']
         if spec['matrix']['fixed_overrides']['training']['financial_transformer'] != expected:
             raise ValueError('every ablation must use the exact shared baseline optimization recipe')
-    if args.frontier:
+        if structural:
+            actual = {**spec['matrix'].get('base_overrides', {}).get('training', {}),
+                      **spec['matrix']['fixed_overrides']['training']}
+            if any(actual.get(key) != value for key, value in recipe['overrides']['training'].items()):
+                raise ValueError('every structural ablation must use the measured account and gradient recipe')
+    if frontier:
         env['PYTHONPATH'] = os.pathsep.join([source['dependency_root'], str(code), env.get('PYTHONPATH', '')])
     command = _command(report_code, effective_spec, selected, dry_run=args.dry_run,
                        python=python, continue_on_failure=optimized)

@@ -24,12 +24,16 @@ const daily = {session_date: "2026-09-21", open: 2445, close: 2480,
   }}};
 
 for (const product of ["tw_day_trade", "tw_overnight"]) {
-  test(`${product} shows daily references separately without inventing the private fill`, () => {
-    const html = view(product).positionRow({symbol: "2330", status: "closed",
+  test(`${product} moves daily references to the footer without inventing the private fill`, () => {
+    const row = {symbol: "2330", status: "closed",
       entry_price: null, exit_price: null, official_daily_quote: daily,
-      public_price_display: {withheld_fields: ["entry_price", "exit_price"]}});
-    assert.match(html, /官方日行情 2026-09-21 · 開 2445／收 2480/);
-    assert.match(html, /取得 09-22 17:13:47（臺北） · 非分鐘成交/);
+      public_price_display: {withheld_fields: ["entry_price", "exit_price"]}};
+    const render = view(product);
+    const html = render.positionRow(row);
+    const footer = render.priceSources({positions: [row]});
+    assert.doesNotMatch(html, /官方日行情|取得|來源 臺灣證券交易所/);
+    assert.match(footer.referencesHtml, /官方日行情 2026-09-21 · 開 2445／收 2480/);
+    assert.match(footer.referencesHtml, /取得 09-22 17:13:47（臺北） · 非分鐘成交/);
     assert.match(html, /等待可公開來源/);
     assert.match(html, /已平倉/);
   });
@@ -86,12 +90,13 @@ test("prior official references cannot be mistaken for today's prices", () => {
   assert.match(notice, /官方日行情 2026-09-21：2330 開 2445／收 2480/);
 });
 
-test("daily proof shows market day instead of pretending the acquisition clock is a tick", () => {
-  const html = view().quoteText({sizing_open_price: 2445, public_price_display: {visible_fields: {
+test("daily provenance shows only in the footer, with the actual market day", () => {
+  const row = {sizing_open_price: 2445, public_price_display: {visible_fields: {
     sizing_open_price: {source: "證交所", grain: "daily", session_date: "2026-09-21", observed_at: "2026-09-22T09:13:47Z"},
-  }}}, "sizing_open_price");
-  assert.match(html, /官方日價核對 2026-09-21/);
-  assert.ok(!html.includes("2026-09-22T09:13:47Z"));
+  }}};
+  const render = view();
+  assert.equal(render.quoteText(row, "sizing_open_price"), "2445");
+  assert.match(render.priceSources({signals: [row]}).sourcesHtml, /資料日 2026-09-21/);
 });
 
 test("an empty strategy can show independent official quotes without a readiness claim", () => {
@@ -120,7 +125,7 @@ for (const product of ["tw_day_trade", "tw_overnight"]) {
     assert.match(render.quoteText(row, "entry_price"), /公開展示授權待確認/);
     assert.match(render.positionRow(row), /已平倉・公開展示授權待確認/);
     assert.ok(!render.positionRow(row).includes("等待可公開來源"));
-    assert.match(render.positionRow(row), /官方日行情 2026-09-21/);
+    assert.match(render.priceSources({positions: [row]}).referencesHtml, /官方日行情 2026-09-21/);
     const invalid = {entry_price: null, public_price_display: {withheld_fields: ["entry_price"],
       withheld_reasons: {entry_price: "public_observation_not_verified"}}};
     assert.match(render.quoteText(invalid, "entry_price"), /公開價格核對未通過/);
@@ -132,7 +137,8 @@ test("an independently verified exit remains visible if another exit field is wi
     last_exit_price: null, public_price_display: {visible_fields: {
       exit_price: {source: "證交所", grain: "daily", session_date: "2026-09-21"},
     }, withheld_fields: ["last_exit_price"]}});
-  assert.match(html, /2480<small>官方日價核對/);
+  assert.match(html, /2480/);
+  assert.doesNotMatch(html, /官方日價核對/);
   assert.ok(!html.includes("已平倉・等待可公開來源"));
 });
 
@@ -150,9 +156,12 @@ for (const product of ["tw_day_trade", "tw_overnight"]) {
     const row = {symbol: "2330", status: "closed", entry_price: 112.12345, exit_price: 115.5,
       public_price_display: {visible_fields: {entry_price: proof, exit_price: proof}}};
     const render = view(product);
-    assert.match(render.positionRow(row), /112\.12345<small>模擬帳本成交/);
-    assert.match(render.positionRow(row), /115\.5<small>模擬帳本成交/);
-    assert.match(render.quoteText(row, "entry_price"), /10-13 09:01:00（臺北） · 非券商成交/);
+    assert.match(render.positionRow(row), /112\.12345/);
+    assert.match(render.positionRow(row), /115\.5/);
+    assert.doesNotMatch(render.positionRow(row), /模擬帳本成交|非券商成交/);
+    const footer = render.priceSources({positions: [row]});
+    assert.match(footer.sourcesHtml, /模擬帳本成交 · 非券商成交/);
+    assert.match(footer.sourcesHtml, /10-13 09:01:00（臺北）/);
     assert.ok(!render.quoteText(row, "entry_price").includes("公開行情"));
     assert.ok(!render.quoteText(row, "entry_price").includes("授權"));
   });
@@ -170,4 +179,71 @@ test("a closed position with only a last fill price is not described as partly c
   const html = view().positionRow({symbol: "2330", status: "closed", last_exit_price: 115.5});
   assert.match(html, /115\.5/);
   assert.ok(!html.includes("部分 115.5"));
+});
+
+for (const product of ["tw_day_trade", "tw_overnight"]) {
+  test(`${product} renders owner strategy levels as plans without a public-quote or fill claim`, () => {
+    const proof = {source: "使用者公開的策略設定", publication_basis: "owner_paper_strategy_report_v1",
+      evidence_kind: "strategy_plan", broker_execution_verified: false};
+    const row = {symbol: "2330", take_profit_price: 125.05, stop_trigger_price: 100.1,
+      opening_exit_limit_price: 99.9, public_price_display: {visible_fields: {
+        take_profit_price: proof, stop_trigger_price: proof, opening_exit_limit_price: proof}}};
+    const render = view(product);
+    assert.equal(render.quoteText(row, "take_profit_price"), "125.05");
+    assert.ok(!render.quoteText(row, "take_profit_price").includes("公開行情"));
+    assert.ok(!render.quoteText(row, "take_profit_price").includes("模擬帳本成交"));
+    const html = render.positionRow(row);
+    assert.doesNotMatch(html, /策略設定 · 非行情／非成交/);
+    assert.match(render.priceSources({positions: [row]}).sourcesHtml, /策略設定 · 非行情／非成交/);
+    if (product === "tw_day_trade") assert.match(html, /SL 100\.1/);
+  });
+}
+
+test("header separates own TP/SL from raw broker quotes", () => {
+  const text = view().priceNoticeText({price_display_policy: {paper_strategy_reports: true,
+    paper_transaction_reports: true, broker_public_display_permission: "unverified"},
+    official_price_reference: {session_date: "2026-09-21", quotes: [{symbol: "2330", official_daily_quote: daily}]}});
+  assert.match(text, /TP／SL 與委託價是使用者公開的策略設定，非行情／非成交/);
+  assert.match(text, /模擬帳本成交，非券商成交/);
+  assert.match(text, /永豐分鐘／即時價格公開展示授權待確認/);
+});
+
+for (const product of ["tw_day_trade", "tw_overnight"]) {
+  test(`${product} shows closed liquidation movement at the exit price, not an old private mark`, () => {
+    const row = {symbol: "2330", status: "closed", filled_shares: 1000, entry_price: 999,
+      exit_price: 1005, last_mark_price: 888, exit_at: "2026-10-14T13:24:00+08:00",
+      entry_price_distances: {exit_price: {contract: "public_entry_price_distance_v1",
+        change_pct: 0.6006006, ticks: 2, approximate_ticks: false}}};
+    const html = view(product).positionRow(row);
+    assert.match(html, /清算（已平倉） 1005/);
+    assert.match(html, /距進場 \+0\.6% · \+2 tick/);
+    assert.doesNotMatch(html, /888/);
+    for (const side of ["long", "short"]) {
+      assert.match(view(product).positionRow({...row, side}), /距進場 \+0\.6% · \+2 tick/);
+    }
+  });
+
+  test(`${product} marks fractional VWAP tick distance approximate and does not leak withheld prices`, () => {
+    const render = view(product);
+    const row = {entry_price: 42.554581872809216, exit_price: 42.65,
+      entry_price_distances: {exit_price: {contract: "public_entry_price_distance_v1",
+        change_pct: 0.22410779, ticks: 1.90836254, approximate_ticks: true}}};
+    assert.match(render.priceDistanceText(row, "exit_price"), /距進場 \+0\.22% · 約 \+1\.91 tick/);
+    row.public_price_display = {withheld_fields: ["exit_price"]};
+    assert.equal(render.priceDistanceText(row, "exit_price"), "");
+    row.public_price_display = {withheld_fields: ["entry_price"]};
+    assert.equal(render.priceDistanceText(row, "exit_price"), "");
+    assert.equal(render.priceDistanceText({}, "exit_price"), "");
+  });
+}
+
+test("footer deduplicates official references without losing acquired time or hidden-field boundaries", () => {
+  const row = {symbol: "2330", official_daily_quote: daily};
+  const render = view();
+  const footer = render.priceSources({data: {official_price_reference: {quotes: [row]}},
+    positions: [row, {...row}], signals: [{...row, position: row}], events: [row]});
+  assert.equal(footer.referenceCount, 1);
+  assert.equal((footer.referencesHtml.match(/data-reference-key=/g) || []).length, 1);
+  assert.match(footer.sourcesHtml, /臺灣證券交易所/);
+  assert.match(footer.referencesHtml, /09-22 17:13:47（臺北）/);
 });

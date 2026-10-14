@@ -6,8 +6,9 @@ import argparse
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 import sys
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,6 +20,18 @@ def _signal_url(base_url, *, market, day):
     # urljoin discards an empty query suffix; add '?' after resolving the path.
     return urljoin(base_url, "api/signals") + "?" + urlencode(
         {"mode": market, "date": day, "offset": 0, "limit": 1})
+
+
+def _is_cloudflare_beacon(url):
+    parsed = urlsplit(url)
+    return (parsed.scheme == "https" and parsed.netloc == "static.cloudflareinsights.com"
+            and (parsed.path == "/beacon.min.js" or parsed.path.startswith("/beacon.min.js/")))
+
+
+def _expected_beacon_csp_denial(message):
+    match = re.match(r"Loading the script '([^']+)' violates the following Content Security Policy directive:", message)
+    return bool(match and _is_cloudflare_beacon(match[1])
+                and "script-src 'self'" in message and "The action has been blocked." in message)
 
 
 def _verify_signal_boundary(payload, *, market, day, private_features=False):
@@ -81,11 +94,15 @@ def main():
                                                   device_scale_factor=ratio)
                     try:
                         page = context.new_page()
-                        errors, aborted = [], []
+                        errors, aborted, blocked_beacons = [], [], []
                         page.on("pageerror", lambda exc: errors.append(str(exc)))
-                        page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
-                        page.on("requestfailed", lambda req: (aborted if "ERR_ABORTED" in str(req.failure)
-                                                             else errors).append(f"{req.url}: {req.failure}"))
+                        page.on("console", lambda msg: (
+                            blocked_beacons if _expected_beacon_csp_denial(msg.text) else errors
+                        ).append(msg.text) if msg.type == "error" else None)
+                        page.on("requestfailed", lambda req: (
+                            blocked_beacons if req.failure == "csp" and _is_cloudflare_beacon(req.url)
+                            else aborted if "ERR_ABORTED" in str(req.failure) else errors
+                        ).append(f"{req.url}: {req.failure}"))
                         page.on("response", lambda response: errors.append(f"HTTP {response.status}: {response.url}")
                                 if response.status >= 400 else None)
                         status_response = context.request.get(urljoin(args.url, "api/status"), timeout=60_000)
@@ -176,6 +193,7 @@ def main():
                             "public_checkpoint_disclosed": disclosed is not None,
                             "public_first_last_signal_boundaries": boundaries,
                             "signal_count": page.locator("#signal-count").inner_text(),
+                            "blocked_optional_third_party_beacons": blocked_beacons,
                             "intentional_request_aborts": aborted, "screenshots": [str(chart_image), str(cards_image)]})
                         _atomic_json(output, receipt)
                     finally:

@@ -248,6 +248,38 @@ def _fresh_regular_execution_quote(
     return False
 
 
+def _completed_minute_replay_quote(
+    mode: Mapping[str, Any], quote: Mapping[str, Any], observed_at: datetime,
+) -> bool:
+    """Admit source-backed paper bars without fabricating live L1 metadata."""
+    now = _now_taipei(observed_at)
+    stamp = _parse_timestamp(quote.get("quote_at"))
+    low, high = _finite(quote.get("historical_bar_low")), _finite(quote.get("historical_bar_high"))
+    opening, close = _finite(quote.get("historical_bar_open")), _finite(quote.get("valuation_price_0901"))
+    return bool(
+        mode.get("simulation_replay") is True
+        and mode.get("counterfactual_open_replay") is True
+        and mode.get("historical_minute_valuation") is True
+        and mode.get("entry_fill_contract") in {
+            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+        }
+        and mode.get("session_date") == now.date().isoformat()
+        and quote.get("historical_minute_valuation") is True
+        and quote.get("source") == "retained_right_labelled_1m_ohlcv_counterfactual"
+        and quote.get("fill_contract") == (
+            "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
+            if mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+            else "historical_1m_ohlcv_counterfactual_not_executable_bid_ask"
+        )
+        and stamp == now and now.second == 0 and now.microsecond == 0
+        and ENTRY_GATE <= now.time() <= SESSION_CLOSE
+        and (_finite(quote.get("observed_minute_volume_lots")) or 0) > 0
+        and low is not None and high is not None and 0 < low <= high
+        and opening is not None and low <= opening <= high
+        and close is not None and low <= close <= high
+    )
+
+
 def _quote_after_signal(
     quote: Mapping[str, Any], signal_at: datetime, *, allow_equal: bool = False
 ) -> bool:
@@ -585,6 +617,11 @@ def _prepare_entry_plan(
     minute_price_at_0901 = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
     )
+    # register_signal admits this exception only for an explicitly labelled
+    # 09:01 counterfactual replay. Historical ticks/KBars have a completed
+    # minute clock, not a live L1 exchange clock. Preserve live quote freshness
+    # checks even when their provider prefix happens to be the same.
+    completed_minute_replay = minute_price_at_0901 and allow_quote_at_signal
     prior_fill = (
         quote_values.get("historical_prior_paper_fill")
         if spec.historical_full_fill_at_0901
@@ -678,7 +715,8 @@ def _prepare_entry_plan(
                 _quote_after_signal(
                     quote_values, signal_at, allow_equal=allow_quote_at_signal
                 )
-                if causal_market_full_target or spec.strict_intraday
+                if (causal_market_full_target or spec.strict_intraday)
+                and not completed_minute_replay
                 else (quote_at >= signal_at if allow_quote_at_signal else quote_at > signal_at)
             )
             and quote_at <= observation_at
@@ -3414,6 +3452,7 @@ class TwDayTradeSimulationEngine:
         *,
         now: datetime | None = None,
         reason: str,
+        completed_session_replay: bool = False,
     ) -> str:
         """Allow one replacement signal only when the session never filled.
 
@@ -3426,7 +3465,11 @@ class TwDayTradeSimulationEngine:
 
         observed = _now_taipei(now)
         wall_time = observed.timetz().replace(tzinfo=None)
-        if wall_time < LIVE_ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
+        # A source-pinned, never-filled completed-session replay is separate
+        # from reopening live entry. Its audit event retains the real operation
+        # clock; callers must not backdate `now` to bypass the live window.
+        postclose_replay = completed_session_replay and wall_time >= SESSION_CLOSE
+        if not postclose_replay and (wall_time < LIVE_ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME):
             raise RuntimeError("flat-session rearm is outside the entry window")
         normalized_reason = str(reason or "").strip()
         if not normalized_reason:
@@ -3478,6 +3521,7 @@ class TwDayTradeSimulationEngine:
             previous_signal_id=previous_signal_id,
             previous_entry_completed_at=previous_entry_completed_at,
             previous_signal_counts=previous_signal_counts,
+            completed_session_replay=postclose_replay,
         )
         self._persist(observed)
         return "rearmed"
@@ -4160,6 +4204,8 @@ class TwDayTradeSimulationEngine:
             self._archive_mode_positions(mode, archived_at=observed)
 
         mode["session_date"] = observed.date().isoformat()
+        mode.pop("entry_sweep_completed_at", None)
+        mode["entry_post_0901_minute_price_fill_count"] = 0
         mode["session_valid"] = True
         mode.pop("non_session_invalidated_at", None)
         mode.pop("non_session_invalidation_reason", None)
@@ -4841,6 +4887,9 @@ class TwDayTradeSimulationEngine:
             if order.get("status") == "working"
         )
         mode["entry_fill_outcome"] = entry_fill_outcome
+        if (deterministic_0901_minute_price_fill and entry_requested_shares > 0
+                and entry_filled_shares == entry_requested_shares):
+            mode["entry_sweep_completed_at"] = observed.isoformat(timespec="seconds")
         mode["entry_best_quote_fill_count"] = entry_best_quote_fill_count
         mode["entry_synthetic_fallback_fill_count"] = (
             entry_synthetic_fallback_fill_count
@@ -6021,7 +6070,7 @@ class TwDayTradeSimulationEngine:
         if signed == 0:
             return
         strict = mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT
-        if strict and not self._fresh_regular_quote(quote, now):
+        if strict and not (self._fresh_regular_quote(quote, now) or _completed_minute_replay_quote(mode, quote, now)):
             position["exit_quote_status"] = "waiting_fresh_non_trial_quote"
             return
         bid = _finite(quote.get("bid"))
@@ -7198,12 +7247,16 @@ class TwDayTradeSimulationEngine:
         if signed == 0:
             return
         if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
-            if not self._fresh_regular_quote(quote, now):
+            replay_quote = _completed_minute_replay_quote(mode, quote, now)
+            if not (self._fresh_regular_quote(quote, now) or replay_quote):
                 position["exit_quote_status"] = "waiting_fresh_non_trial_quote"
                 return
             lower, upper = _finite(position.get("lower_limit")), _finite(position.get("upper_limit"))
             if lower is None or upper is None or not lower <= price <= upper:
                 position["exit_quote_status"] = "invalid_execution_price_limits"
+                return
+            if replay_quote and not float(quote["historical_bar_low"]) <= price <= float(quote["historical_bar_high"]):
+                position["exit_quote_status"] = "execution_price_outside_historical_range"
                 return
         if str(position.get("share_replacement_halted_until") or "") > now.date().isoformat():
             return

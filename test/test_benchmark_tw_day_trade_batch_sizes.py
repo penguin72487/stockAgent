@@ -326,6 +326,25 @@ def test_score_uses_slowest_rank_and_rejects_incomplete_rank_timing() -> None:
     assert not benchmark._score_curve(rows, **kwargs)["ok"]
 
 
+def test_annual_score_requires_verified_account_coverage_instead_of_legacy_batch_count():
+    from stockagent.training.episode_parallel import AnnualEpisodePlan
+    plan = AnnualEpisodePlan((((0, 3),), ((3, 5),)), ((2024,), (2025,)),
+                             (3, 2), 5, 3, (((2024, 0, 3),), ((2025, 3, 5),)))
+    rows = [_epoch(i, wall=4., train=3.) for i in (3, 4, 5)]
+    for row in rows:
+        row.update(train_batches=1, epoch_wall_s_max_rank=4., train_total_s_max_rank=3.,
+                   dynamo_unique_graphs_epoch_delta=0)
+    kwargs = dict(skip_epochs=2, minimum_steady_epochs=3, train_rows=5,
+                  global_batch_size=6, world_size=2, memory=_memory(),
+                  max_peak_fraction=.9, min_headroom_gib=3.)
+    score = benchmark._score_curve(rows, annual_ownership=plan.receipt(), **kwargs)
+    assert score["ok"] and score["annual_ownership_validation"]["ok"]
+    assert score["padded_slots"] == 6
+    bad = plan.receipt()
+    bad["rows_by_rank"] = (2, 3)
+    assert not benchmark._score_curve(rows, annual_ownership=bad, **kwargs)["ok"]
+
+
 def test_score_curve_rejects_unsafe_vram_and_winner_uses_complete_epoch_rate() -> None:
     rows = [_epoch(3, wall=4.0, train=3.0), _epoch(4, wall=4.0, train=3.0), _epoch(5, wall=4.0, train=3.0)]
     score = benchmark._score_curve(

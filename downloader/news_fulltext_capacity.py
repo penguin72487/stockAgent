@@ -68,7 +68,8 @@ def _completed_resume_pressure(sample):
     """
     keys = {'pressure_transport_or_server_errors', 'pressure_request_results', 'pressure_response_results'}
     present = keys & sample.keys()
-    isolated_keys = ('isolated_gateway_host_errors', 'isolated_robots_origin_errors', 'provisional_gateway_host_errors')
+    isolated_keys = ('isolated_gateway_host_errors', 'isolated_robots_origin_errors',
+                     'isolated_robots_origin_transport_errors', 'provisional_gateway_host_errors')
     isolated = {key: sample.get(key, 0) for key in isolated_keys}
     if any(type(value) is not int or value < 0 for value in isolated.values()):
         return None
@@ -78,9 +79,11 @@ def _completed_resume_pressure(sample):
     if present != keys or any(type(sample[key]) is not int or sample[key] < 0 for key in keys):
         return None
     removed = isolated['isolated_gateway_host_errors'] + isolated['isolated_robots_origin_errors']
-    if isolated['provisional_gateway_host_errors'] or removed > min(raw) or raw[1] > raw[0] or raw[2] > raw[0]:
+    transport = isolated['isolated_robots_origin_transport_errors']
+    if (isolated['provisional_gateway_host_errors'] or removed > min(raw) or raw[1] > raw[0] or raw[2] > raw[0]
+            or transport > raw[0] - raw[1] or removed + transport > raw[2]):
         return None
-    expected = tuple(value - removed for value in raw)
+    expected = (raw[0] - removed - transport, raw[1] - removed, raw[2] - removed - transport)
     actual = (sample['pressure_request_results'], sample['pressure_response_results'], sample['pressure_transport_or_server_errors'])
     return actual if actual == expected else None
 
@@ -371,7 +374,10 @@ class PublisherCapacity:
             isolated_errors = min(errors, delta.get('http_terminal_isolated_gateway_host_errors', 0)) if terminal_results else 0
             isolated_robots_errors = min(errors - isolated_errors,
                 delta.get('http_terminal_isolated_robots_origin_errors', 0)) if terminal_results else 0
-            all_isolated_errors = isolated_errors + isolated_robots_errors
+            isolated_response_errors = isolated_errors + isolated_robots_errors
+            isolated_robots_transport = min(errors - isolated_response_errors,
+                delta.get('http_terminal_isolated_robots_origin_transport_errors', 0)) if terminal_results else 0
+            all_isolated_errors = isolated_response_errors + isolated_robots_transport
             provisional_errors = min(errors - all_isolated_errors,
                 delta.get('http_terminal_provisional_gateway_host_errors', 0)) if terminal_results else 0
             pressure_errors = errors - all_isolated_errors
@@ -417,7 +423,7 @@ class PublisherCapacity:
             started_requests = delta.get("http_requests_started", 0)
             requests = delta.get("http_terminal_requests", 0) if terminal_results else started_requests
             responses = delta.get("http_terminal_responses", 0) if terminal_results else delta.get("http_responses_received", 0)
-            pressure_requests, pressure_responses = requests - all_isolated_errors, responses - all_isolated_errors
+            pressure_requests, pressure_responses = requests - all_isolated_errors, responses - isolated_response_errors
             if min(pressure_requests, pressure_responses) < self.policy["minimum_requests"] and wall < self.policy["maximum_window_seconds"]:
                 continue
             heads = max(0, delta.get('durably_accepted_new_url_heads', 0) - delta.get('durably_accepted_cached_new_url_heads', 0))
@@ -471,11 +477,12 @@ class PublisherCapacity:
                       "validated_bulk_ids": delta.get("bulk_article_ids_validated", 0), "transport_or_server_errors": errors,
                       "isolated_gateway_host_errors": isolated_errors,
                       "isolated_robots_origin_errors": isolated_robots_errors,
+                      "isolated_robots_origin_transport_errors": isolated_robots_transport,
                       "provisional_gateway_host_errors": provisional_errors,
                       "pressure_transport_or_server_errors": pressure_errors,
                       "pressure_request_results": pressure_requests, "pressure_response_results": pressure_responses,
                       "all_observed_hosts_healthy": not errors and not unusable_responses,
-                      "health_scope": "non-isolated completed results; only fresh completed other-host proof isolates REP502/504 pressure; provisional gateway errors retain pressure; all isolated failures remain raw errors, not bodies or permission",
+                      "health_scope": "non-isolated completed results; only fresh completed other-host proof isolates REP502/504 or certificate-failure pressure; certificate failures remove no HTTP response; provisional gateway errors retain pressure; all isolated failures remain raw errors, not bodies or permission",
                       "opening_http_inflight": previous.get("http_inflight", 0),
                       "closing_http_inflight": counts.get("http_inflight", 0),
                       "http_status_counts": {k.removeprefix(status_prefix): v for k, v in delta.items() if k.startswith(status_prefix)},

@@ -59,6 +59,19 @@ if (discord.version_info.major, discord.version_info.minor) < (2, 4):
         f"discord.py>=2.4 is required for User Install commands; found {discord.__version__}"
     )
 
+from stockagent.live.completed_inference_cache import (
+    identity_digest as _completed_identity_digest, loaded_implementation_identity,
+)
+
+# Admit one stable tree before config/data/model modules enter sys.modules.
+# Later edits require the existing qualified owner reload, not hot-importing
+# only some modules or labelling resident old outputs with new disk hashes.
+_LIVE_IMPLEMENTATION_ADMISSION = {
+    "contract": "live_implementation_process_admission_v1",
+    "code_sha256": _completed_identity_digest({"code": loaded_implementation_identity()}),
+    "requires_fresh_process_on_change": True,
+}
+
 from downloader.status import command_asset, command_option, first_download_failure
 from stockagent.live.market_config import (
     LiveMarketConfig,
@@ -1413,11 +1426,17 @@ def _preopen_market_final_armed_for_session(
     )
 
 
-def _preopen_market_symbol_count(cfg: LiveMarketConfig) -> int:
+def _preopen_readiness_payload() -> dict[str, Any]:
     try:
-        payload = json.loads(_preopen_readiness_path().read_text(encoding="utf-8"))
+        return json.loads(_preopen_readiness_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return 0
+        return {}
+
+
+def _preopen_market_symbol_count(
+    cfg: LiveMarketConfig, *, readiness: dict[str, Any] | None = None,
+) -> int:
+    payload = _preopen_readiness_payload() if readiness is None else readiness
     row = (payload.get("markets") or {}).get(str(cfg.market))
     return int(row.get("symbol_count") or 0) if isinstance(row, dict) else 0
 
@@ -1842,6 +1861,12 @@ def _begin_artifact_backfill(key: str, market: str) -> dict[str, Any]:
             "error_type": None,
             "error_message": None,
         }
+        if isinstance(previous, dict) and isinstance(previous.get("prior_ready_receipt"), dict):
+            # Keep the disproven ready hint across begin/finish, not just for
+            # the short interval between CAS invalidation and serial repair.
+            for name in ("prior_ready_receipt", "ready_invalidated_at", "ready_invalidated_by_run_id"):
+                if name in previous:
+                    job[name] = copy.deepcopy(previous[name])
         jobs[str(key)] = job
         if len(jobs) > 64:
             for stale_key in list(jobs)[:-64]:
@@ -6061,6 +6086,9 @@ def _write_discord_service_status() -> dict[str, Any]:
         "updated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "discord_connected": bool(bot.is_ready()),
         "core_health": "ready" if bot.is_ready() else "waiting",
+        # This is the immutable startup admission, not a disk scan on every
+        # heartbeat. A read-only observer compares it to its current code.
+        "live_implementation_admission": dict(_LIVE_IMPLEMENTATION_ADMISSION),
         "opening_input_dispatch": {
             "policy": "session_fenced_single_flight_bounded_poll_v1",
             "scheduler_interval_seconds": 0.1,
@@ -6932,6 +6960,70 @@ def _formal_history_latest_date(cfg: LiveMarketConfig) -> str | None:
     return parsed.date().isoformat() if parsed is not None else None
 
 
+def _formal_history_completed_date(cfg: LiveMarketConfig) -> str | None:
+    """A returns table is not a completion receipt for the full fold workflow.
+
+    Reports can fail after new returns have already been written, leaving an
+    older ``fold_complete.json`` behind. Use the canonical, model-free path
+    contract and matching receipt coverage before skipping expensive inference.
+    This cheap scheduling gate does not replace full artifact conformance or
+    checkpoint/source-semantic validation.
+    """
+
+    latest = _formal_history_latest_date(cfg)
+    if latest is None:
+        return None
+    try:
+        from stockagent.training.lifecycle import TrainingArtifactLayout
+
+        fold_dir = _market_fold_dir(cfg)
+        marker_path = fold_dir / "fold_complete.json"
+        marker_stat = marker_path.stat()
+        with marker_path.open("r", encoding="utf-8") as handle:
+            marker = json.loads(handle.read(64 * 1024))
+        if not isinstance(marker, dict):
+            return None
+        fold_id = int(marker["fold_id"])
+        layout = TrainingArtifactLayout(fold_dir.parent)
+        if (
+            marker.get("status") != "complete"
+            or int(marker.get("artifact_scope_version", 0)) < 2
+            or marker.get("test_scope") != "full_horizon"
+            or marker.get("deployment_scope") != "stitched_deployment"
+            or marker.get("test_date_end") != latest
+            or layout.fold_dir(fold_id) != fold_dir
+            or (
+                getattr(cfg, "fold_id", None) is not None
+                and int(cfg.fold_id) != fold_id
+            )
+        ):
+            return None
+        for path in layout.required_fold_paths(fold_id):
+            if not path.is_file() or path.stat().st_size <= 0:
+                return None
+        returns_path = _formal_returns_artifact_path(cfg)
+        current_marker_stat = marker_path.stat()
+        if (
+            returns_path is None
+            or returns_path.stat().st_mtime_ns > marker_stat.st_mtime_ns
+            or (
+                current_marker_stat.st_dev,
+                current_marker_stat.st_ino,
+                current_marker_stat.st_mtime_ns,
+                current_marker_stat.st_size,
+            ) != (
+                marker_stat.st_dev,
+                marker_stat.st_ino,
+                marker_stat.st_mtime_ns,
+                marker_stat.st_size,
+            )
+        ):
+            return None
+    except (OSError, ValueError, TypeError, OverflowError, KeyError, MarketUnsupportedError):
+        return None
+    return latest
+
+
 def _previous_source_session_date(
     cfg: LiveMarketConfig,
     target_date: str | None,
@@ -6984,7 +7076,7 @@ def _artifact_backfill_is_current(
         required_formal = _previous_source_session_date(cfg, target_key)
         if not required_formal:
             return False
-        formal_latest = _formal_history_latest_date(cfg)
+        formal_latest = _formal_history_completed_date(cfg)
         formal_ready = bool(
             required_formal
             and formal_latest
@@ -6995,7 +7087,7 @@ def _artifact_backfill_is_current(
             target_key,
         )
     if execution_mode == "tw_day_trade":
-        formal_latest = _formal_history_latest_date(cfg)
+        formal_latest = _formal_history_completed_date(cfg)
         return bool(
             formal_latest
             and formal_latest >= target_key
@@ -7014,6 +7106,71 @@ def _formal_history_timeout_seconds(cfg: LiveMarketConfig) -> int:
             int(getattr(cfg, "pre_signal_timeout_seconds", 900) or 900),
         )
     return max(60, int(configured))
+
+
+def _preflight_formal_history_calendar(cfg: LiveMarketConfig) -> None:
+    """Reject a proven partial factorized calendar before starting train.py.
+
+    A live-tail projection is valid for its own consumer, not full-history
+    inference. The configured benchmark supplies the canonical BASE calendar
+    (panel.py may add official sessions). This is only an early rejection gate:
+    member hashes, complete axes and source semantics remain with the trainer.
+    Unknown/non-benchmark calendars still use that canonical validation.
+    """
+
+    config_path = _resolve_repo_path(cfg.config_path) or Path(cfg.config_path)
+    if not config_path.is_file():
+        return  # Let the canonical command diagnose absent/non-file configs.
+    train_config = load_config(config_path)
+    raw_manifest = getattr(train_config.data, "factorized_feature_manifest", "")
+    if not raw_manifest:
+        return
+    manifest_path = _resolve_repo_path(raw_manifest) or Path(raw_manifest)
+    try:
+        with manifest_path.open("rb") as handle:
+            payload = handle.read(16 * 1024 * 1024 + 1)
+        if len(payload) > 16 * 1024 * 1024:
+            raise ValueError("factorized manifest exceeds the bounded preflight reader")
+        manifest = json.loads(payload)
+        dates = manifest["dates"]
+        if (
+            not isinstance(dates, list) or not dates
+            or not all(isinstance(day, str) and date.fromisoformat(day).isoformat() == day for day in dates)
+            or dates != sorted(set(dates))
+        ):
+            raise ValueError("factorized dates must be nonempty unique ordered ISO dates")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise BotUserError(f"`{cfg.market}` formal history input calendar is invalid: {exc}") from exc
+
+    benchmark = str(getattr(train_config.data, "benchmark_name", "") or "")
+    if not benchmark or Path(benchmark).name != benchmark:
+        return
+    parquet_root = _resolve_repo_path(train_config.data.parquet_root)
+    if parquet_root is None:
+        return
+    benchmark_path = parquet_root / f"{benchmark}_features.parquet"
+    if not benchmark_path.is_file():
+        return
+
+    import polars as pl
+
+    calendar = pl.scan_parquet(benchmark_path).select(
+        pl.col("date").cast(pl.Date, strict=False).alias("date")
+    ).drop_nulls()
+    start = getattr(train_config.data, "panel_start_date", None)
+    if start:
+        calendar = calendar.filter(pl.col("date") >= pl.lit(date.fromisoformat(start)))
+    required = calendar.unique().sort("date").collect()["date"].to_list()
+    available = set(dates)
+    missing = [day.isoformat() for day in required if day.isoformat() not in available]
+    if missing:
+        raise BotUserError(
+            f"`{cfg.market}` full formal history requires its complete factorized "
+            f"calendar; configured projection covers {len(dates)} dates "
+            f"({dates[0]}..{dates[-1]}) but omits {len(missing)} benchmark sessions "
+            f"({missing[0]}..{missing[-1]}). Prepare the full source scope; "
+            "refusing a shortened history or repeated model startup."
+        )
 
 
 def _formal_history_compile_cache_namespace() -> str:
@@ -7041,9 +7198,10 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
         or status.data.panel_date
     )
     target_key = str(target_date or "").replace("T", " ")[:10]
-    latest_key = _formal_history_latest_date(cfg)
+    latest_key = _formal_history_completed_date(cfg)
     if target_key and latest_key and latest_key >= target_key:
         return False
+    _preflight_formal_history_calendar(cfg)
     fold_id = cfg.fold_id
     if fold_id is None:
         checkpoint = _market_model_checkpoint(cfg)
@@ -7108,7 +7266,7 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
         raise BotUserError(
             f"`{cfg.market}` formal history inference failed rc={completed.returncode}"
         )
-    refreshed = _formal_history_latest_date(cfg)
+    refreshed = _formal_history_completed_date(cfg)
     execution_mode = _market_execution_mode(cfg)
     # Naive row t is evaluated with close[t] -> close[t+1], so a source panel
     # ending on target day normally yields canonical tables through the prior
@@ -7351,6 +7509,8 @@ def _reconcile_artifact_backfill_if_current(
         status = _ensure_signal_ready(effective)
         execution_mode = _market_execution_mode(effective)
         if not _artifact_backfill_is_current(effective, status, execution_mode):
+            if bool(getattr(status.data, "fresh", False)):
+                _invalidate_ready_artifact_backfill(key, market)
             return False
         _sync_latest_live_weights_to_market_artifact(effective)
     except Exception:
@@ -7361,6 +7521,36 @@ def _reconcile_artifact_backfill_if_current(
         f"[artifact-backfill] market={market} status=reconciled_current_artifact",
         flush=True,
     )
+    return True
+
+
+def _invalidate_ready_artifact_backfill(key: str, market: str) -> bool:
+    """CAS an obsolete ready hint back to retryable, preserving its receipt.
+
+    The small controller treats durable ready keys as terminal. A failed
+    current-proof readback must therefore invalidate that hint, not leave a
+    repaired job permanently deferred. Never overwrite a concurrent running
+    job or existing failure/backoff.
+    """
+
+    observed = datetime.now().astimezone().isoformat(timespec="seconds")
+    with _artifact_backfill_status_guard():
+        payload = _load_artifact_backfill_status()
+        job = (payload.get("jobs") or {}).get(str(key))
+        if not isinstance(job, dict) or job.get("status") != "ready" or job.get("market") != market:
+            return False
+        job["prior_ready_receipt"] = {
+            name: job.get(name) for name in ("status", "attempt", "run_id", "completed_at")
+        }
+        job.update(
+            status="failed", next_retry_at=observed, retry_delay_seconds=0,
+            error_type="ArtifactCompletionProofError",
+            error_message="Current canonical artifact completion proof is missing or stale",
+            ready_invalidated_at=observed, ready_invalidated_by_run_id=_BOT_RUN_ID,
+        )
+        payload["updated_at"] = observed
+        _write_artifact_backfill_status(payload)
+    bot._last_artifact_backfill_keys.discard(key)
     return True
 
 
@@ -11131,11 +11321,70 @@ async def postclose_fast_arm() -> None:
             )
 
 
+def _set_scheduler_poll_seconds(loop: Any, seconds: float) -> None:
+    """Change only the existing task's wake cadence, not its eligibility gates."""
+
+    if loop.seconds != seconds:
+        loop.change_interval(seconds=seconds)
+
+
+def _postclose_scheduler_poll_seconds(markets: list[str]) -> float:
+    for market in markets:
+        cfg = _resolve_market(market)
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        key = _postclose_fast_clock_key(cfg, now, phase="cache")
+        if key is not None and key not in bot._postclose_fast_completed_keys:
+            return 0.1
+        close_minutes = _hhmm_minutes(cfg.close_time)
+        if close_minutes is not None and 0 <= close_minutes < 1440:
+            seconds_until_close = (
+                close_minutes * 60 - now.hour * 3600 - now.minute * 60
+                - now.second - now.microsecond / 1_000_000
+            )
+            if 0 <= seconds_until_close <= 30:
+                return 0.1
+    return 5.0
+
+
+def _scheduler_poll_seconds(
+    configs: list[LiveMarketConfig], *, pending: bool = False,
+) -> float:
+    """Idle polls are bounded to 5 s; enter 10 Hz before every known deadline.
+
+    A 30 s guard is longer than the idle period. Unfinished keys/input jobs
+    retain the original cadence, including broker-confirmation and retry waits.
+    Calendar/price/source gates remain in the callback, not in this planner.
+    """
+
+    if pending:
+        return 0.1
+    for cfg in configs:
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        interval = _market_schedule_interval_minutes(cfg)
+        if interval is not None:
+            ready = now - timedelta(seconds=_market_schedule_delay_seconds(cfg))
+            seconds = ready.hour * 3600 + ready.minute * 60 + ready.second + ready.microsecond / 1_000_000
+            # The canonical interval key contains the ready-date. Its midnight
+            # rollover is a deadline even if the interval does not divide a day.
+            remaining = min(interval * 60 - (seconds % (interval * 60)), 86400 - seconds)
+        else:
+            minutes = _hhmm_minutes(_market_schedule_time(cfg))
+            if minutes is None or not 0 <= minutes < 1440:
+                continue
+            seconds = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1_000_000
+            remaining = (minutes * 60 - seconds) % 86400
+        if remaining <= 30:
+            return 0.1
+    return 5.0
+
+
 @tasks.loop(seconds=0.1)
 async def postclose_fast_cache() -> None:
     """At 13:30, build memory-only provisional caches ahead of Discord demand."""
 
-    for market in _postclose_fast_markets():
+    markets = _postclose_fast_markets()
+    _set_scheduler_poll_seconds(postclose_fast_cache, _postclose_scheduler_poll_seconds(markets))
+    for market in markets:
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
         schedule_key = _postclose_fast_clock_key(cfg, now, phase="cache")
@@ -11836,6 +12085,9 @@ async def scheduled_signal() -> None:
     error_messages: list[str] = []
     due: list[tuple[LiveMarketConfig, datetime, str, bool]] = []
     scheduled_markets = list(_scheduled_markets())
+    readiness = _preopen_readiness_payload() if scheduled_markets else {}
+    scheduled_configs: list[LiveMarketConfig] = []
+    pending = False
     scheduled_markets.sort(
         key=lambda market: (
             0
@@ -11844,12 +12096,13 @@ async def scheduled_signal() -> None:
                 or getattr(_resolve_market(market), "overnight_simulation_enabled", False)
             )
             else 1,
-            -_preopen_market_symbol_count(_resolve_market(market)),
+            -_preopen_market_symbol_count(_resolve_market(market), readiness=readiness),
             market,
         )
     )
     for market in scheduled_markets:
         cfg = _resolve_market(market)
+        scheduled_configs.append(cfg)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
         session_open, _session_reason = _scheduled_market_session_day(cfg, now)
         if not session_open:
@@ -11862,6 +12115,7 @@ async def scheduled_signal() -> None:
             continue
         if key in bot._last_scheduled_keys:
             continue
+        pending = True
         day_trade_simulation = bool(
             getattr(cfg, "day_trade_simulation_enabled", False)
         )
@@ -11903,6 +12157,10 @@ async def scheduled_signal() -> None:
             continue
         due.append((cfg, now, key, _scheduled_signal_requires_preopen_catch_up(cfg, now)))
 
+    _set_scheduler_poll_seconds(
+        scheduled_signal,
+        _scheduler_poll_seconds(scheduled_configs, pending=pending or bool(bot._scheduled_input_jobs)),
+    )
     poll_due, preparations = _scheduled_input_poll_jobs(due)
     async for (cfg, now, key, catch_up), prepared_inputs in _scheduled_inputs_ready_order(
             poll_due, preparations, poll_timeout=0.05, cancel_pending=False):

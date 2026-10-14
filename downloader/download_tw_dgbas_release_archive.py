@@ -97,10 +97,12 @@ PDF_PUBLISHED_RE = re.compile(
 ATTACHMENT_EXTENSIONS = frozenset({".pdf", ".xls", ".xlsx", ".ods", ".odt", ".doc", ".docx", ".zip"})
 _THREAD_LOCAL = threading.local()
 _CA_LOCK = threading.Lock()
-_CA_TEMP: tempfile.TemporaryDirectory[str] | None = None
-_CA_BUNDLE: str | None = None
+_CA_TEMPS: dict[tuple[str, str], tempfile.TemporaryDirectory[str]] = {}
+_CA_BUNDLES: dict[tuple[str, str], str] = {}
 TWCA_INTERMEDIATE_URL = "https://sslserver.twca.com.tw/cacert/secure_sha2_2023G3.crt"
 TWCA_INTERMEDIATE_SHA256 = "1a2c75fd096e0499e9ff6ac74e526f61eaae3edfc8c2ea4436fee0c24d8b7d0e"
+TWCA_CYBER_INTERMEDIATE_URL = "https://sslserver.twca.com.tw/cacert/Cyber_SSL_2023.crt"
+TWCA_CYBER_INTERMEDIATE_SHA256 = "01af2324d098098f5e0cdf6faabada430b21cce777f47eacb26248b2fda3e531"
 
 
 def _roc_date(value: str) -> date:
@@ -303,28 +305,45 @@ def _session() -> requests.Session:
     return session
 
 
-def _ws_dgbas_ca_bundle() -> str:
-    """Repair the server's missing TWCA intermediate without disabling TLS."""
+def _pinned_intermediate_bundle(url: str, fingerprint: str) -> str:
+    """Add an HTTPS-fetched pinned intermediate, retaining system trust/hostname checks.
 
-    global _CA_TEMP, _CA_BUNDLE
-    if _CA_BUNDLE is not None:
-        return _CA_BUNDLE
+    stat.gov.tw and ws.dgbas.gov.tw use different TWCA chains. Never substitute
+    a leaf certificate, disable verification, or change the system trust store.
+    See TWCA's SSL CA certificate information (2024-03-27), CYBER Root section.
+    """
+    key = (url, fingerprint)
+    if key in _CA_BUNDLES:
+        return _CA_BUNDLES[key]
     with _CA_LOCK:
-        if _CA_BUNDLE is not None:
-            return _CA_BUNDLE
-        response = requests.get(TWCA_INTERMEDIATE_URL, timeout=15)
+        if key in _CA_BUNDLES:
+            return _CA_BUNDLES[key]
+        response = requests.get(url, timeout=15, verify=True, allow_redirects=False)
         response.raise_for_status()
         der = response.content
-        if hashlib.sha256(der).hexdigest() != TWCA_INTERMEDIATE_SHA256:
+        if response.status_code != 200 or len(der) > 64_000:
+            raise RuntimeError("unexpected TWCA intermediate certificate response")
+        if hashlib.sha256(der).hexdigest() != fingerprint:
             raise RuntimeError("TWCA intermediate certificate fingerprint changed")
         bundle = Path(requests.certs.where()).read_bytes()
         bundle += b"\n" + ssl.DER_cert_to_PEM_cert(der).encode("ascii")
-        _CA_TEMP = tempfile.TemporaryDirectory(prefix="stockagent-dgbas-ca-")
-        atexit.register(_CA_TEMP.cleanup)
-        path = Path(_CA_TEMP.name) / "ca-bundle.pem"
+        temporary = tempfile.TemporaryDirectory(prefix="stockagent-dgbas-ca-")
+        atexit.register(temporary.cleanup)
+        path = Path(temporary.name) / "ca-bundle.pem"
         path.write_bytes(bundle)
-        _CA_BUNDLE = str(path)
-        return _CA_BUNDLE
+        _CA_TEMPS[key] = temporary
+        _CA_BUNDLES[key] = str(path)
+        return str(path)
+
+
+def _ws_dgbas_ca_bundle() -> str:
+    return _pinned_intermediate_bundle(TWCA_INTERMEDIATE_URL, TWCA_INTERMEDIATE_SHA256)
+
+
+def _stat_ca_bundle() -> str:
+    return _pinned_intermediate_bundle(
+        TWCA_CYBER_INTERMEDIATE_URL, TWCA_CYBER_INTERMEDIATE_SHA256,
+    )
 
 
 def _fetch(url: str, limiter: SharedRateLimiter, *, max_bytes: int) -> bytes:
@@ -336,9 +355,14 @@ def _fetch(url: str, limiter: SharedRateLimiter, *, max_bytes: int) -> bytes:
             raise ValueError(f"out-of-scope release URL: {current}")
         limiter.wait()
         try:
-            verify = _ws_dgbas_ca_bundle() if parsed.hostname == "ws.dgbas.gov.tw" else True
+            verify = (_ws_dgbas_ca_bundle() if parsed.hostname == "ws.dgbas.gov.tw"
+                      else _stat_ca_bundle())
             with _session().get(current, timeout=(10, 35), stream=True,
                                 allow_redirects=False, verify=verify) as response:
+                if response.status_code in {401, 403}:
+                    raise SourceAccessBlocked(
+                        f"official host refused access with HTTP {response.status_code}: {current}"
+                    )
                 if response.status_code in {301, 302, 303, 307, 308}:
                     last_response = f"HTTP {response.status_code} redirect from {current}"
                     current = urljoin(current, response.headers.get("Location", ""))

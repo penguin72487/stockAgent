@@ -258,16 +258,21 @@ def _cnyes_visible_article_scope(soup):
 
     Native React streamed pages put the article in S:0 after a sidebar loading
     h1. Only the article ancestor of the public body is an identity witness.
-    Reject ambiguous/nested article headers and unrelated page-wide matches.
+    Body headings belong to the body, even when the publisher uses H1 for
+    them. Retain all body text; exclude only those nodes from headline
+    ownership. Two linear walks avoid repeated ancestor scans for every body
+    heading. Ambiguous/nested article ownership still fails closed.
     """
     containers = _select_nodes(soup, '#article-container')
     if len(containers) != 1:
         return None
     scope = containers[0].find_parent('article')
-    if scope is None:
+    if scope is None or scope.find_parent('article') is not None or containers[0].find('article') is not None:
         return None
-    headers = scope.find_all('h1')
-    if len(headers) != 1:
+    body_headers = {id(header) for header in containers[0].find_all('h1')}
+    headers = [header for header in scope.find_all('h1') if id(header) not in body_headers]
+    if (len(headers) != 1 or headers[0].find_parent('article') is not scope
+            or headers[0].find_parent('h1') is not None):
         return None
     return headers[0], containers[0]
 
@@ -3307,6 +3312,105 @@ def cnyes_verified_short_body(soup, source, article, body, *, page_url, restore_
         return None
     return _cnyes_verified_visible_current_body(soup, source, article, body, page_url=page_url,
                                                restore_source_spacing=restore_source_spacing)
+
+
+def cnyes_verified_test_article(soup, source, article, body, *, page_url):
+    """Observed test-account signatures are nonbody outcomes, not news success.
+
+    A short text or a headline mentioning tests is insufficient. Require one
+    exact observed title/body pair and the existing whole free visible/current/
+    schema clock proof. Do not infer that other placeholders, short reports or
+    publisher test accounts have no obtainable text.
+    """
+    signatures = {
+        '測試帳號：XX': 'XXXX',
+        '測試帳號：123': '1234',
+        '測試帳號：1655566': '165655+55',
+    }
+    if (source.provider != 'cnyes' or not isinstance(body, str)
+            or not 0 < len(body) < 100 or article.get('headline') not in signatures
+            or re.sub(r'\s+', '', body) != signatures[article['headline']]):
+        return False
+    parts = urlsplit(page_url or '')
+    if (parts.scheme != 'https' or parts.netloc != 'news.cnyes.com' or parts.query or parts.fragment
+            or re.fullmatch(r'/news/id/([1-9][0-9]*)', parts.path) is None):
+        return False
+    if _cnyes_verified_visible_current_body(soup, source, article, body, page_url=page_url) is None:
+        return False
+    from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+    from downloader.news_fulltext_policy import _objects
+    from downloader.news_fulltext_cnyes_images import _native_ad_placeholder
+
+    declarations = []
+    scripts = soup.find_all('script', type='application/ld+json', limit=17)
+    if len(scripts) > 16:
+        return False
+    try:
+        for script in scripts:
+            text = script.get_text()
+            if len(text) > 1 << 20:
+                return False
+            for node in _objects(json.loads(text)):
+                if node.get('@type') == 'NewsArticle' and node.get('url') == page_url:
+                    declarations.append(node)
+                    if len(declarations) > 1:
+                        return False
+    except (ValueError, TypeError, RecursionError):
+        return False
+    if declarations != [article]:
+        return False
+
+    scope = _cnyes_visible_article_scope(soup)
+    data = _cnyes_current_article_data(soup, int(parts.path.rsplit('/', 1)[1]),
+                                      verify_video=True, verify_author=True)
+    if scope is None or data is None or data.get('video', '') != '':
+        return False
+    current = BeautifulSoup(html.unescape(data['content']), source.html_parser)
+    if current.head is not None:
+        return False
+
+    def paragraphs(root, native):
+        result = []
+        nodes = list(root.contents)
+        if len(nodes) > 16:
+            return None
+        offset = 0
+        while offset < len(nodes):
+            node = nodes[offset]
+            offset += 1
+            if isinstance(node, Comment):
+                return None
+            if isinstance(node, NavigableString):
+                if str(node).strip():
+                    return None
+                continue
+            if not isinstance(node, Tag):
+                return None
+            if native and _native_ad_placeholder(node):
+                continue
+            if native and node.name == 'section' and node.attrs == {'style': 'margin-top:30px'}:
+                nested = paragraphs(node, False)
+                if nested is None:
+                    return None
+                result.extend(nested)
+                # Each source renderer SECTION, not just the final one, has
+                # one immediate empty P delimiter. No other blank is erased.
+                if (offset < len(nodes) and isinstance(nodes[offset], Tag)
+                        and nodes[offset].name == 'p' and not nodes[offset].attrs
+                        and not nodes[offset].contents):
+                    offset += 1
+                continue
+            if (node.name != 'p' or node.attrs or any(type(child) is not NavigableString
+                                                    for child in node.contents)):
+                return None
+            result.append(node.get_text().strip())
+        return result
+
+    declared = paragraphs(current.body or current, False)
+    visible = paragraphs(scope[1], True)
+    if declared is None or visible is None or not declared or any(not text for text in declared):
+        return False
+    return declared == visible
 
 
 def _cnyes_verified_visible_current_body(soup, source, article, body, *, page_url, restore_source_spacing=False):

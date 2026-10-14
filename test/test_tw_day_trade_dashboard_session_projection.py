@@ -87,6 +87,88 @@ def test_latest_signal_page_reads_all_imported_accounts(fragmented_accounts):
     assert {row["market"] for row in page["rows"]} == set(active)
 
 
+@pytest.mark.parametrize("latest,private_features", [(True, True), (False, True), (True, False)])
+def test_committed_scoped_repair_view_keeps_complete_new_signal_and_original_audit(
+    fragmented_accounts, latest, private_features, monkeypatch,
+):
+    root, _, active = fragmented_accounts
+    market = active[0]
+    original_id = market
+    repaired_id = original_id + ":minute-repair:approved"
+    state = json.loads((root / "state.json").read_text())
+    mode = state["modes"][market]
+    mode.update(signal_id=repaired_id, processed_signal_ids=[original_id, repaired_id], simulation_replay=True,
+                opening_repair={"contract": "never_filled_original_signal_append_only_minute_repair_v2",
+                                "original_signal_id": original_id, "simulation_only": True,
+                                "original_weights_preserved": True})
+    (root / "state.json").write_text(json.dumps(state))
+    summary = root / "summary.json"
+    summary.write_text(json.dumps({"source_publication_contract": {
+        "feature_proxy_publication_allowed": not private_features, "research_only": True,
+        "historical_point_in_time_proven": False}, "model_explanation": {"top_feature_drivers": []}}))
+    rows = [json.loads(line) for line in (root / "signals.jsonl").read_text().splitlines()]
+    old = next(row for row in rows if row.get("signal_id") == original_id)
+    old.update(ask=10, bid=9, execution_price=10, filled_shares=0, filled_weight=0,
+               requested_shares=1000, reason="quote_not_after_signal", status="blocked", sizing_open_price=10)
+    rows.append({**old, "signal_id": repaired_id, "status": "ready", "filled_shares": 1000,
+                 "reason": "counterfactual_observed_09_01_minute_price_fill", "signal_source_path": str(summary)})
+    _write_rows(root / "signals.jsonl", rows)
+    original_bytes = (root / "signals.jsonl").read_bytes()
+    monkeypatch.setattr(dashboard, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+    page = dashboard.build_dashboard_signal_page(state_dir=root, start_date=DAY if latest else "2026-09-23",
+                                                 end_date=DAY, mode=market, limit=100)
+    current = [row for row in page["rows"] if row["session_date"] == DAY]
+    assert [row["signal_id"] for row in current] == [repaired_id]
+    assert current[0]["filled_shares"] == 1000
+    if private_features:
+        assert page["feature_drivers_by_signal"][repaired_id]["feature_proxy_publication_allowed"] is False
+    assert (root / "signals.jsonl").read_bytes() == original_bytes
+    other = dashboard.build_dashboard_signal_page(state_dir=root, session_date=DAY, mode=active[1], limit=100)
+    assert other["total"] == 1 and other["rows"][0]["signal_id"] == active[1]
+
+
+@pytest.mark.parametrize("invalid", ["not_processed", "unrelated_id", "unpreserved", "nonpaper", "wrong_contract"])
+def test_uncommitted_or_unrelated_repair_cannot_hide_original_signal(invalid):
+    mode = {"session_date": DAY, "signal_id": "original:minute-repair:accepted",
+            "processed_signal_ids": ["original:minute-repair:accepted"], "simulation_replay": True,
+            "opening_repair": {"contract": "never_filled_original_signal_append_only_minute_repair_v2",
+                               "original_signal_id": "original", "simulation_only": True,
+                               "original_weights_preserved": True}}
+    if invalid == "not_processed":
+        mode["processed_signal_ids"] = []
+    elif invalid == "unrelated_id":
+        mode["signal_id"] = "unrelated"
+    elif invalid == "unpreserved":
+        mode["opening_repair"]["original_weights_preserved"] = False
+    elif invalid == "nonpaper":
+        mode["opening_repair"]["simulation_only"] = False
+    else:
+        mode["opening_repair"]["contract"] = "candidate_not_applied"
+    assert not dashboard._committed_scoped_repair_superseded_signals({"modes": {"m": mode}})
+
+
+def test_signal_page_cache_invalidates_committed_repair_view(fragmented_accounts):
+    root, _, active = fragmented_accounts
+    market = active[0]
+    state = json.loads((root / "state.json").read_text())
+    mode = state["modes"][market]
+    repaired_id = market + ":minute-repair:accepted"
+    mode.update(signal_id=repaired_id, simulation_replay=True, processed_signal_ids=[market, repaired_id])
+    rows = [json.loads(line) for line in (root / "signals.jsonl").read_text().splitlines()]
+    old = next(row for row in rows if row.get("signal_id") == market)
+    rows.append({**old, "signal_id": repaired_id})
+    _write_rows(root / "signals.jsonl", rows)
+    (root / "state.json").write_text(json.dumps(state))
+    args = dict(state_dir=root, session_date=DAY, mode=market)
+    assert dashboard.build_dashboard_signal_page(**args)["total"] == 2
+    mode["opening_repair"] = {"contract": "never_filled_original_signal_append_only_minute_repair_v2",
+                              "original_signal_id": market, "simulation_only": True,
+                              "original_weights_preserved": True}
+    (root / "state.json").write_text(json.dumps(state))
+    accepted = dashboard.build_dashboard_signal_page(**args)
+    assert accepted["total"] == 1 and accepted["rows"][0]["signal_id"] == repaired_id
+
+
 @pytest.mark.parametrize("compact", [True, False])
 def test_status_aggregates_complete_session_before_limiting_response(
     fragmented_accounts, compact,

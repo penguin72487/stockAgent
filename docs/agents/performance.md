@@ -22,6 +22,59 @@ for a scoped example.
 Neither a finite scalar nor a small speed difference proves acceptance or a global
 optimum; repeat measurements only enough to resolve a material uncertainty.
 
+### Configured annual account ownership: 2026-10-14 observation
+
+For the measured Vastai1T dual-RTX-5090 annual-reset FinancialTransformer
+baseline (d32, lookback32, global256/local128, fold11), whole configured accounts
+can be owned independently by each rank. Within-account financial recurrence,
+FP64 closing, fees, FIFO, masks and absorbing default still follow the canonical
+bridge. Local actions remove per-batch action gathering and replicated accounting;
+date-weighted gradients are reduced once before the epoch update. Unequal NN
+call counts require avoiding DDP forward collectives and handling globally used,
+locally absent gradients without changing globally unused parameters.
+
+The accepted BPTT experiment truncates at local128 and configured account
+boundaries; bind `annual_whole_account_local_actions_weighted_gradient_mean_v2`
+and actual configured world size to the checkpoint contract. Reject incompatible
+optimizer resume. A single continuous account, including `annual_reset__off`,
+does not supply this independent axis. Validate all date coverage, unique account
+ownership, padding, gradient weights and update cadence using the canonical
+ownership receipt; do not waive an old batch-count failure without new evidence.
+
+Four complete A/B/B/A trials measured steady maximum-rank epoch means
+74.414 -> 51.610 seconds (30.6% less time, 1.4418x throughput) for annual ownership
+plus compiled closing. Complete four-epoch fold means were 490.318 -> 480.891
+seconds (1.9% less time); startup remains material. NVML average utilization did
+not increase, and is not the effective-work denominator. Standalone closing
+fusion failed host headroom admission; annual-only versus combined fusion has
+only single-screen evidence. Do not extrapolate these results to other hardware,
+shapes, strategy quality or a completed 1000-epoch run. Source, tests, exceptions
+and raw results are in [the measured structural report](../gpu_structural_optimization_2026-10-14.md).
+
+### Full-schema resident projection: 2026-10-14 observation
+
+On the same dual-RTX-5090 d32/lookback32 fold11 workload, a repeated CPU compact
+packet and wide H2D/checkpoint path dominated before Tensor Core math. Cache
+immutable physical date blocks as full-schema CSR, retain zero-column effects
+in stable LayerNorm/RMSNorm affine projection, and checkpoint narrow learned
+embeddings. Store the CSR dense operand contiguously as `[F, projected_width]`;
+the transposed view was a measured bottleneck. Fixed source statistics may be
+cached; learned weights and embeddings must be recomputed each update.
+
+Common-source A/B/B/A measured complete steady MAX-rank epochs
+53.372 -> 17.351 seconds (3.076x throughput), while cold four-epoch folds only
+improved 482.979 -> 456.163 seconds (5.55% less time). New cold CSR construction
+remains expensive. Original global256/local128 failed the 1.5GiB headroom gate;
+the admitted capacity exception is global128/local64, with every date, feature,
+dimension and one epoch update retained. This changes BPTT truncation and numeric
+trajectory: use the resident ABI/new root and reject v9 optimizer resume.
+Do not project baseline acceptance onto unmeasured d128/lookback256 variants.
+After staging is removed, financial recurrence/adjoint dominates; low NVML busy
+alone is not evidence that replacing attention kernels will multiply throughput.
+Mechanism/adjoint tests, retained numeric rejections, full artifact/financial-owner
+checks and CPU-readable off-node results are in
+[the resident rewrite report](../gpu_architecture_rewrite_2026-10-14.md).
+
 ## Remote node selection
 
 The user's 2026-10-03 instruction requires every remote build to use that node's

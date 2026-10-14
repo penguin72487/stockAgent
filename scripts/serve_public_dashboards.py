@@ -47,6 +47,7 @@ from stockagent.live.dashboard_updates import (
     metadata_signature,
 )  # noqa: E402
 from stockagent.live.public_daily_quotes import OfficialDailyQuoteSource  # noqa: E402
+from stockagent.live.public_quote_display import public_quote_display_policy  # noqa: E402
 from stockagent.live.benchmark_history_projection import (  # noqa: E402
     projection_head_path as benchmark_projection_head_path,
 )
@@ -2206,7 +2207,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             self.update_hub.signature(path) for path in self.update_hub.paths["tw"]
             if path not in self.public_quote_source.paths
         )
-        quote_revision = self.public_quote_source.revision()
+        quote_revision = f"{self.public_quote_source.revision()}:{public_quote_display_policy().revision}"
         session_date = dashboard_session_clock(datetime.now(UTC)).get(
             "display_session_date"
         )
@@ -2288,7 +2289,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             for path in self.update_hub.paths["overnight"]
             if path not in self.public_quote_source.paths
         )
-        quote_revision = self.public_quote_source.revision()
+        quote_revision = f"{self.public_quote_source.revision()}:{public_quote_display_policy().revision}"
 
         def build() -> Mapping[str, Any]:
             payload = build_dashboard_revision(

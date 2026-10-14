@@ -21,6 +21,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import torch
 
+# Bind before importing the live model/config/data closure. The Discord role
+# binds even earlier because it imports some of those modules before this one.
+from stockagent.live.completed_inference_cache import loaded_implementation_identity
+
+loaded_implementation_identity()
+
 if TYPE_CHECKING:
     from stockagent.data.factorized_panel import FactorizedLiveWindow
 
@@ -88,6 +94,9 @@ from stockagent.training.runtime import (
     resolve_device,
 )
 
+# Reject a source edit racing role imports, not only a later model request.
+loaded_implementation_identity()
+
 
 @dataclass(slots=True)
 class LiveSignalResult:
@@ -154,6 +163,9 @@ _LIVE_CHECKPOINT_CACHE_LOCK = threading.Lock()
 _LIVE_MODEL_CACHE_MAX_ENTRIES = 8
 _LIVE_MODEL_CACHE: OrderedDict[str, torch.nn.Module] = OrderedDict()
 _LIVE_MODEL_CACHE_LOCK = threading.Lock()
+# Invalidation drops Tensor references, not necessarily allocator reservations.
+# Keep the obligation until the serialized idle owner has flushed them once.
+_LIVE_CUDA_CACHE_RELEASE_PENDING = False
 _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES = 8
 _LIVE_MODEL_INPUT_CACHE_MAX_BYTES = 6 * 1024**3
 _LIVE_MODEL_INPUT_CACHE: OrderedDict[
@@ -182,10 +194,10 @@ def completed_panel_source_fingerprint(
 
 def _completed_panel_identity(config: ExperimentConfig, *, rule_data_dir=None) -> str:
     from stockagent.live.completed_inference_cache import (
-        configuration_identity, identity_digest, implementation_identity, source_fingerprint,
+        configuration_identity, identity_digest, source_fingerprint,
     )
     return identity_digest({"source": source_fingerprint(config, rule_data_dir=rule_data_dir),
-        "configuration": configuration_identity(config), "code": implementation_identity(),
+        "configuration": configuration_identity(config), "code": loaded_implementation_identity(),
         "torch": str(torch.__version__), "numpy": np.__version__})
 
 
@@ -264,11 +276,33 @@ def clear_live_panel_memory_cache() -> None:
 def clear_live_inference_memory_cache() -> None:
     """Clear panel, checkpoint, and GPU-model caches after a deployment change."""
 
+    global _LIVE_CUDA_CACHE_RELEASE_PENDING
+
     clear_live_panel_memory_cache()
     with _LIVE_CHECKPOINT_CACHE_LOCK:
         _LIVE_CHECKPOINT_CACHE.clear()
     with _LIVE_MODEL_CACHE_LOCK:
+        _LIVE_CUDA_CACHE_RELEASE_PENDING |= bool(_LIVE_MODEL_CACHE)
         _LIVE_MODEL_CACHE.clear()
+
+
+def _live_inference_cpu_cache_retained() -> bool:
+    """Inspect existing references only; never allocate a cache or probe CUDA."""
+    with _LIVE_PANEL_CACHE_LOCK:
+        if _LIVE_PANEL_CACHE or _LIVE_PANEL_SOURCE_KEY_CACHE or _LIVE_FACTORIZED_PANEL_CACHE:
+            return True
+    with _LIVE_CHECKPOINT_CACHE_LOCK:
+        if _LIVE_CHECKPOINT_CACHE:
+            return True
+    with _LIVE_MODEL_INPUT_CACHE_LOCK:
+        if _LIVE_MODEL_INPUT_CACHE:
+            return True
+    with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
+        if _LIVE_ALIGNED_PANEL_CACHE:
+            return True
+    with _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK:
+        return (_LIVE_RAW_TAIL_SOURCE_CACHE is not None
+                and bool(_LIVE_RAW_TAIL_SOURCE_CACHE.stats()["entries"]))
 
 
 def release_idle_live_cuda_cache() -> bool:
@@ -279,15 +313,18 @@ def release_idle_live_cuda_cache() -> bool:
     caller must gate it to off-hours and serialize against model inference.
     """
 
+    global _LIVE_CUDA_CACHE_RELEASE_PENDING
+
     with _LIVE_MODEL_CACHE_LOCK:
         has_models = bool(_LIVE_MODEL_CACHE)
-    if not has_models:
+        cuda_release_pending = has_models or _LIVE_CUDA_CACHE_RELEASE_PENDING
+    if not cuda_release_pending and not _live_inference_cpu_cache_retained():
         return False
     clear_live_inference_memory_cache()
     import gc
 
     gc.collect()
-    if torch.cuda.is_initialized():
+    if cuda_release_pending and torch.cuda.is_initialized():
         # cuBLAS owns allocations outside Python Tensor references. The
         # documented clear hook releases them without changing GEMM workspace
         # size, precision or kernel policy. Only the serialized idle owner may
@@ -297,6 +334,16 @@ def release_idle_live_cuda_cache() -> bool:
         if clear_workspaces is not None:
             clear_workspaces()
         torch.cuda.empty_cache()
+        # The device allocator above does not return page-locked host buffers.
+        # The public API exists in our verified runtime; older runtimes retain
+        # their existing behavior rather than invoking an unguarded private API.
+        empty_host_cache = getattr(getattr(torch, "accelerator", None), "empty_host_cache", None)
+        if empty_host_cache is not None:
+            empty_host_cache()
+    with _LIVE_MODEL_CACHE_LOCK:
+        # Do not erase this obligation if a release step raised. A later idle
+        # attempt may retry even when invalidation already emptied the models.
+        _LIVE_CUDA_CACHE_RELEASE_PENDING = False
     return True
 
 
@@ -386,6 +433,7 @@ def _cached_live_model(
     panel: PanelData,
     runtime_device: torch.device,
 ) -> tuple[torch.nn.Module, bool]:
+    loaded_implementation_identity()
     key = _model_cache_key(
         checkpoint_key=checkpoint_key,
         runtime_device=runtime_device,
@@ -3403,14 +3451,14 @@ def _live_forward_outputs(
 
     from stockagent.live.completed_inference_cache import (
         CONTRACT, array_identity, cached_forward, configuration_identity, file_identity,
-        implementation_identity, window_identity,
+        window_identity,
     )
 
     repo = Path(__file__).resolve().parents[2]
     identity = {
         "contract": CONTRACT, "config": loaded_config_identity or file_identity(config_path),
         "checkpoint": loaded_checkpoint_identity or file_identity(checkpoint),
-        "resolved_config": configuration_identity(config), "code": implementation_identity(),
+        "resolved_config": configuration_identity(config), "code": loaded_implementation_identity(),
         "symbols": panel.symbols, "features": panel.feature_names,
         "window_dates": [str(day) for day in panel.dates[
             panel_idx - int(config.training.lookback) + 1:panel_idx + 1]],
@@ -3505,6 +3553,7 @@ def generate_live_signal(
     partial_summary = telemetry["signal_summary"]
     partial_latency = partial_summary["live_latency"]
     telemetry["signal_stage"] = "prepare"
+    loaded_implementation_identity()
     quote_latency_ms = 0.0
     inference_latency_ms = 0.0
     progress_total = 17

@@ -17,6 +17,7 @@ if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text, sha256_file
+from stockagent.data.news_source_catalog import classify_news_outcomes, NEWS_OUTCOME_CLASSIFICATION_VERSION
 
 
 FINANCIAL_PROVIDERS = frozenset({
@@ -95,6 +96,9 @@ def implementation_plan(item, provider, entry, review):
     repairs = [ERROR_REPAIRS.get(error, "preserve source outcome; classify representation, schema and per-item failures")
                for error in errors]
     return {
+        "outcome_progress_json": json.dumps(classify_news_outcomes(item['states'],
+            registered=item.get('configured') is True, body_enabled=item.get('enabled') is True)
+            if isinstance(item.get('states'), dict) else None, ensure_ascii=False, sort_keys=True),
         "research_topic": SOURCE_TOPICS.get(provider, "financial_markets" if provider in FINANCIAL_PROVIDERS
                                              else "public_sector_unclassified" if role == "government_origin" else "general_events"),
         "value_basis": "topic relevance heuristic; not measured predictive alpha; no source excluded by ranking",
@@ -296,6 +300,7 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
     return {
         "contract_version": (7 if work_order is not None and work_order['contract_version'] == 2
                              else 6 if work_order is not None else 5),
+        "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         **ordering, "input_observed_at_utc": inventory["observed_at_utc"],
         "queue_owner_id": inventory.get("queue_owner_id"),
         "small_threshold_urls": small_threshold,

@@ -318,6 +318,72 @@ def test_save_fold_output_artifacts_survives_broken_report_pipe(
     assert (tmp_path / "fold_complete.json").is_file()
 
 
+@pytest.mark.parametrize("alias", ("absent", "distinct", "hardlink", "symlink"))
+def test_fold_plot_aliases_preserve_complete_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str,
+) -> None:
+    names = ("equity_curve", "equity_curve_log", "annual_performance")
+    for name in names:
+        source, target = tmp_path / f"{name}.png", tmp_path / f"leverage_{name}.png"
+        source.write_bytes(b"previous generation")
+        if alias == "hardlink":
+            target.hardlink_to(source)
+        elif alias == "symlink":
+            target.symlink_to(source.name)
+        elif alias == "distinct":
+            target.write_bytes(b"outdated separate plot")
+
+    copied = []
+    original_copy = trainer_module.shutil.copyfile
+
+    def tracked_copy(source, target, *args, **kwargs):
+        copied.append((Path(source), Path(target)))
+        return original_copy(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_module.shutil, "copyfile", tracked_copy)
+    returns = np.array([0.01, -0.02, 0.03], dtype=np.float32)
+    backtest = BacktestResult(
+        strategy_returns=returns.copy(),
+        benchmark_returns=np.zeros(3, dtype=np.float32),
+        turnovers=np.ones(3, dtype=np.float32),
+        weights_history=np.ones((3, 1), dtype=np.float32),
+    )
+    fold_result = FoldResult(
+        fold_id=1, train_years=[2023], val_years=[2024], test_years=[2025],
+        best_val_loss=0.0, val_ic={}, val_metrics={}, test_ic={}, test_metrics={},
+    )
+    config = SimpleNamespace(
+        trading=TradingConfig(
+            frequency="daily", buy_fee_rate=0.0, sell_fee_rate=0.0,
+            long_only=False, reporting_leverage=1.0,
+        ),
+        training=TrainingConfig(
+            non_blocking_transfer=False, table_output_format="parquet",
+            save_daily_weights_table=True,
+        ),
+    )
+    _save_fold_output_artifacts(
+        fold_dir=tmp_path, fold_result=fold_result, model=nn.Linear(1, 1),
+        test_backtest=backtest,
+        test_dates=np.array(["2025-01-02", "2025-01-03", "2025-01-06"], dtype="datetime64[D]"),
+        symbols=["A"], config=config, print_report=False, write_plots=True, mark_complete=True,
+    )
+
+    assert len(copied) == (0 if alias in {"hardlink", "symlink"} else 3)
+    for name in names:
+        source, target = tmp_path / f"{name}.png", tmp_path / f"leverage_{name}.png"
+        assert source.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert target.read_bytes() == source.read_bytes()
+        assert source.samefile(target) is (alias in {"hardlink", "symlink"})
+    assert (tmp_path / "fold_complete.json").is_file()
+    assert (tmp_path / "mode_artifact_contract.json").is_file()
+    timing = json.loads((tmp_path / "plot_timing.json").read_bytes())
+    for name in names:
+        assert timing[f"leverage_{name}_same_file_reused"] is (alias in {"hardlink", "symlink"})
+    with np.load(tmp_path / "test_backtest.npz") as stored:
+        np.testing.assert_array_equal(stored["strategy_returns"], returns)
+
+
 def test_walkforward_refresh_separates_reset_test_and_stitched_deployment(
     tmp_path: Path,
     monkeypatch,
@@ -589,7 +655,13 @@ def test_reporting_leverage_artifacts_use_replayed_leverage_not_canonical(
     monkeypatch.setattr(trainer_module, "plot_equity_curve", capture)
     monkeypatch.setattr(trainer_module, "plot_equity_curve_log", capture)
     monkeypatch.setattr(trainer_module, "plot_annual_performance", capture)
-    monkeypatch.setattr(trainer_module, "generate_annual_report", lambda *_args: "leveraged report")
+    def capture_report(result, report_dates, *, period_contract):
+        assert result is plotted[-1]
+        np.testing.assert_array_equal(report_dates, dates)
+        assert period_contract is None
+        return "leveraged report"
+
+    monkeypatch.setattr(trainer_module, "generate_annual_report", capture_report)
 
     leveraged = _write_reporting_leverage_artifacts(
         base,

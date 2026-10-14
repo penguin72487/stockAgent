@@ -41,6 +41,7 @@ from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     _fresh_regular_execution_quote,
+    _completed_minute_replay_quote,
     _quote_after_signal,
     LiveEligibility,
     ModeSpec,
@@ -2033,14 +2034,17 @@ def test_official_open_policy_does_not_execute_before_0901(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("weight", (0.1, -0.1))
+@pytest.mark.parametrize("strict_intraday", (False, True))
 def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     tmp_path: Path,
     weight: float,
+    strict_intraday: bool,
 ) -> None:
     spec = replace(
         _spec(tmp_path),
         entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
         entry_price_offset_ticks=0,
+        strict_intraday=strict_intraday,
     )
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     summary = {
@@ -2051,6 +2055,7 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     quote = _quote(open_price=1_000.0, bid=900.0, ask=1_100.0)
     quote.update(
         {
+            "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
             "execution_price_0901": 1_007.5,
             "quote_at": _now(9, 1).isoformat(),
             "historical_source_quote_at": _now(9, 0, 59).isoformat(),
@@ -2392,6 +2397,31 @@ def test_paper_market_order_fills_full_request_at_best_quote_without_depth_cap(
     assert signal["top_book_capacity_shares"] == 1_000
     assert signal["filled_shares"] == 10_000
     assert signal["synthetic_fill"] is False
+
+
+@pytest.mark.parametrize("damage", [None, "live_mode", "wrong_contract", "stale", "future", "wrong_source", "zero_volume", "invalid_range"])
+def test_completed_minute_exit_evidence_never_becomes_live_non_trial_quote(damage):
+    from scripts.rebuild_tw_day_trade_open_price_replay import _bar_quote
+    now = _now(9, 2)
+    mode = {"simulation_replay": True, "counterfactual_open_replay": True,
+            "historical_minute_valuation": True, "session_date": str(now.date()),
+            "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
+    quote = _bar_quote({"symbol": "2330"}, {"open": 101, "low": 100, "high": 103,
+                       "close": 102, "volume_shares": 10_000}, observed=now, bid=102, ask=None)
+    if damage == "live_mode":
+        mode["simulation_replay"] = False
+    elif damage == "wrong_contract":
+        mode["entry_fill_contract"] = "live"
+    elif damage in {"stale", "future"}:
+        quote["quote_at"] = _now(9, 1 if damage == "stale" else 3).isoformat()
+    elif damage == "wrong_source":
+        quote["source"] = "shioaji:stock_snapshot"
+    elif damage == "zero_volume":
+        quote["observed_minute_volume_lots"] = 0
+    elif damage == "invalid_range":
+        quote["historical_bar_low"] = 104
+    assert _completed_minute_replay_quote(mode, quote, now) is (damage is None)
+    assert not _fresh_regular_execution_quote(quote, now)  # No simtrade/exchange time fabricated.
 
 
 def test_causal_paper_market_fills_full_target_from_shioaji_stream_without_depth_claim(
@@ -3508,6 +3538,31 @@ def test_rearm_flat_session_refuses_any_position_history(tmp_path: Path) -> None
             now=_now(9, 30),
             reason="must not double enter",
         )
+
+
+@pytest.mark.parametrize("replay, hour, minute, accepted", [
+    (False, 14, 0, False), (True, 14, 0, True), (True, 13, 29, False),
+])
+def test_postclose_never_filled_rearm_needs_explicit_completed_replay(
+    tmp_path: Path, replay: bool, hour: int, minute: int, accepted: bool,
+) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = _spec(tmp_path)
+    engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[_row()],
+        quotes={}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7),
+    )
+    kwargs = dict(now=_now(hour, minute), reason="source-pinned completed paper replay",
+                  completed_session_replay=replay)
+    if not accepted:
+        with pytest.raises(RuntimeError, match="outside the entry window"):
+            engine.rearm_flat_session(spec.market, **kwargs)
+        return
+    assert engine.rearm_flat_session(spec.market, **kwargs) == "rearmed"
+    event = json.loads(engine.events_path.read_text().splitlines()[-1])
+    assert event["recorded_at"] == _now(hour, minute).isoformat()
+    assert event["completed_session_replay"] is True
+    assert engine.state["modes"][spec.market]["processed_signal_ids"] == ["signal-1"]
 
 
 def test_non_session_invalidation_voids_only_zero_fill_signal(tmp_path: Path) -> None:

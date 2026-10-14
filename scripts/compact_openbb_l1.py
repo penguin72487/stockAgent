@@ -52,6 +52,7 @@ from scripts.openbb_l1_source_journal import (
     prepare_source_audit,
 )
 from scripts.openbb_l1_view_schema import (
+    PhysicalSchemaIdentityCache,
     SCHEMA_IDENTITY_REVISION,
     schema_identities,
 )
@@ -67,6 +68,7 @@ STALE_SOURCE_SCAN_ORDER = "member_first"
 SOURCE_AUDIT_CONTRACT_REVISION = 1
 SCHEMA_GROUPED_ENDPOINT = "regulators.sec.filing_headers"
 SCHEMA_GROUPED_POLICY_REVISION = 1
+DERIVATIVE_METADATA_AUDIT_POLICY = "openbb_l1_physical_reflection_cache_v1"
 
 
 class _CompactorLockBusy(RuntimeError):
@@ -211,8 +213,10 @@ def _view_source_proof(
     path: Path, segment_id: str, parquet_file: pq.ParquetFile,
     before: tuple[int, int, int, int, int], *, output_rows: int,
     output_bytes: int, arrow_fingerprint: str,
+    physical_cache: PhysicalSchemaIdentityCache | None = None,
 ) -> ViewSourceProof:
-    observed_arrow, identity = schema_identities(parquet_file)
+    observed_arrow, identity = (schema_identities(parquet_file) if physical_cache is None
+                               else schema_identities(parquet_file, physical_cache=physical_cache))
     if (
         parquet_file.metadata.num_rows != output_rows
         or before[2] != output_bytes
@@ -732,6 +736,7 @@ def _mark_stale_segments(
     changed_task_ids: Sequence[str] | None = None,
     timing: dict[str, float] | None = None,
     view_proofs: dict[str, ViewSourceProof] | None = None,
+    metadata_audit: dict[str, object] | None = None,
 ) -> tuple[set[str], int]:
     stage_started = time.monotonic()
     # Source members store absolute paths while the archive normally records
@@ -791,6 +796,11 @@ def _mark_stale_segments(
     # change. Checking one path per segment is bounded by the segment count.
     stage_started = time.monotonic()
     known = {str(row["segment_id"]): row for row in rows}
+    # Only repeated physical reflection is memoized, within this one attempt.
+    # Each file still opens its own footer and validates rows/bytes/current
+    # Arrow schema and both signatures. No file validity crosses invocations.
+    physical_cache = PhysicalSchemaIdentityCache() if view_proofs is not None else None
+    footer_open_attempts = 0
     for row in connection.execute(
         f"""
         SELECT segment_id, endpoint, output_path, output_rows, output_bytes,
@@ -812,6 +822,7 @@ def _mark_stale_segments(
                 view_proofs is not None and row["endpoint"] == SCHEMA_GROUPED_ENDPOINT
             )
             before = _view_file_signature(path) if collect_proof else None
+            footer_open_attempts += 1
             parquet_file = pq.ParquetFile(str(path))
             if before is not None:
                 # The proof validates rows, bytes and the manifest Arrow hash
@@ -822,6 +833,7 @@ def _mark_stale_segments(
                     output_rows=int(row["output_rows"]),
                     output_bytes=int(row["output_bytes"]),
                     arrow_fingerprint=str(row["schema_fingerprint"]),
+                    physical_cache=physical_cache,
                 )
                 view_proofs[proof.path] = proof
             elif int(parquet_file.metadata.num_rows) != int(row["output_rows"]):
@@ -853,6 +865,12 @@ def _mark_stale_segments(
                 "stale_reason": derivative_error,
             }
 
+    if metadata_audit is not None:
+        metadata_audit.update(
+            policy=DERIVATIVE_METADATA_AUDIT_POLICY,
+            footer_open_attempts=footer_open_attempts,
+            physical_cache=None if physical_cache is None else physical_cache.snapshot(),
+        )
     if timing is not None:
         timing["stale_derivative_metadata_scan"] = round(
             time.monotonic() - stage_started, 3
@@ -953,12 +971,14 @@ def _load_unassigned_shards(
     if (
         plan_token is not None
         and not filters
-        and 0 < limit <= 8192
+        and 0 < limit <= 32_768
         and TASK_COMPACTION_INDEX in task_indexes
     ):
         # The partial covering index preserves the original global
         # endpoint/task-id order without sorting millions of unassigned
-        # successes. Only the selected batch needs table-row lookups.
+        # successes. Only the selected batch needs table-row lookups. The
+        # measured bound covers the installed service's 32,768-source batch;
+        # keep the independent, endpoint-sort fallback's smaller bound below.
         rows = connection.execute(
             f"""
             SELECT t.task_id, t.endpoint, t.output_path, t.rows, t.updated_at
@@ -1801,6 +1821,7 @@ def _write_status(
     view_endpoint_actions: Mapping[str, str] | None = None,
     stage_resources: Mapping[str, Mapping[str, int | None]] | None = None,
     source_audit: Mapping[str, object] | None = None,
+    derivative_metadata_audit: Mapping[str, object] | None = None,
     schema_grouped_sec_views: bool = False,
     started_at_utc: str | None = None,
     failed_segments: int = 0,
@@ -2004,6 +2025,7 @@ def _write_status(
             else STALE_SOURCE_SCAN_ORDER
         ),
         "source_audit": dict(source_audit or {"mode": "full_legacy"}),
+        "derivative_metadata_audit": dict(derivative_metadata_audit or {}),
         "deferred_query_views": dict(sorted(deferred_query_views.items())),
         "stage_seconds": timings,
         "view_endpoint_seconds": dict(sorted((view_endpoint_seconds or {}).items())),
@@ -2346,6 +2368,8 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
             stage_resources["before_stale_contract_audit"] = _stage_resources()
             attempt.phase("stale_contract_audit")
             stage_started = time.monotonic()
+            derivative_metadata_audit: dict[str, object] = {}
+            attempt.payload["derivative_metadata_audit"] = derivative_metadata_audit
             stale_endpoints, stale_segments = _mark_stale_segments(
                 manifest,
                 args.endpoint,
@@ -2356,6 +2380,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 ),
                 timing=stage_seconds,
                 view_proofs=view_proofs,
+                metadata_audit=derivative_metadata_audit,
             )
             stage_seconds["stale_contract_audit"] = round(time.monotonic() - stage_started, 3)
             attempt.payload["stale_segments"] = stale_segments
@@ -2569,6 +2594,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                     if key not in {"before_attempt", "after_attempt"}
                 },
                 schema_grouped_sec_views=args.schema_grouped_sec_views,
+                derivative_metadata_audit=derivative_metadata_audit,
                 source_audit=(
                     {
                         "mode": journal_plan.mode,

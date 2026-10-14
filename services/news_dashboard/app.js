@@ -26,6 +26,8 @@ const stateLabels = Object.freeze({
   paywall_or_login: "付費／登入內容", access_challenge: "來源存取驗證", robots_access_challenge: "robots 存取驗證挑戰", robots_not_plain_rules: "robots 回應身分／規則待驗證", robots_redirect_refused: "robots 轉址待修",
   source_body_removed: "來源已主動撤下正文", source_not_found: "來源網址已不存在", source_body_image_only: "來源正文僅圖片，未做 OCR", source_body_embedded_only: "來源正文僅外部嵌入，未取得文字", source_article_empty_template: "來源目前回空白文章模板，未取得正文", pdf_image_only_or_body_not_found: "影像 PDF 待文字辨識",
   source_body_quote_only: "原站只提供行情片段，未取得新聞正文",
+  source_article_test_only: "來源測試帳號內容，非新聞正文",
+  source_document_landing_page: "文件索引頁，非新聞正文",
   source_not_allowed: "來源未允許", authorization_expired: "授權到期", paywall: "付費牆", not_found: "來源不存在",
   gone: "來源已移除", response_too_large: "回應過大", other: "其他待查原因",
 });
@@ -44,6 +46,11 @@ const reviewLabels = Object.freeze({permission_required: "需取得來源同意"
   not_reviewed: "尚未審閱", private_public_candidate: "私人研究候選範圍，未自動啟用",
   reviewed_existing_scope: "已核對現有範圍", active_existing_policy: "依現有抓取規則",
   authorized_api_configuration_required: "授權 API 待設定", review_unverified: "審閱時間待驗證"});
+const outcomeLabels = Object.freeze({complete_state: "正文完成狀態", queued_or_retry: "可排程／重試",
+  registration_required: "尚未接線", scope_or_access_waiting: "範圍／存取待核實", waiting_cohort: "新增待納入批次",
+  repair_required: "解析／端點待修", nontext_representation: "圖片／嵌入／PDF 待文字驗證",
+  nonarticle_response: "行情／測試／文件索引", source_currently_empty: "目前空模板",
+  origin_absent: "原站撤下／不存在", unknown_outcome: "其他待查"});
 const state = {latest: null, filter: "all", query: "", sort: "state", page: 0, inFlight: false, retry: null, retryDelay: 3000, cnyesListOpen: false};
 const PAGE_SIZE = 24;
 const fetchJson = Dashboard.createJsonFetcher({expectedRoot: "object", cache: "no-store", timeoutMs: 15000});
@@ -128,7 +135,7 @@ function cnyesListProgress(source) {
     : '<p class="news-provider-note">舊快照、未啟用或數量無法核對時，清單進度顯示未知；不補零、不算完成。</p>';
   const scopes = history?.current_source_contract_scope_states;
   const historyFacts = history
-    ? `<dl class="news-provider-facts"><div><dt>已驗證分類清單查詢範圍</dt><dd data-news-history-count="verified">${count(history.verified_list_scopes)}</dd></div><div><dt>分類範圍等待頁面證據</dt><dd data-news-history-count="waiting">${count(scopes.waiting_page_evidence)}</dd></div><div><dt>未解分類查詢範圍</dt><dd data-news-history-count="gaps">${count(history.unresolved_category_scopes)}</dd></div><div><dt>已核對退場的缺口收據</dt><dd data-news-history-count="retired">${count(history.retired_gap_receipts)}</dd></div></dl><p class="news-provider-note">分類查詢範圍可能包含父子窗口與重疊分類，不是唯一日期或缺失篇數。公開清單補漏不會自動刪掉分類缺口，也不代表該日全文已齊。</p>`
+    ? `<dl class="news-provider-facts"><div><dt>已驗證分類清單查詢範圍</dt><dd data-news-history-count="verified">${count(history.verified_list_scopes)}</dd></div><div><dt>分類範圍等待清單證據</dt><dd data-news-history-count="waiting">${count(history.waiting_list_scopes ?? scopes.waiting_page_evidence)}</dd></div><div><dt>來源清單矛盾，非完成</dt><dd data-news-history-count="inconsistent">${count(history.inconsistent_source_scopes)}</dd></div><div><dt>頁面上限需分區</dt><dd data-news-history-count="page_cap">${count(history.page_cap_exceeded_scopes)}</dd></div><div><dt>未解分類查詢範圍</dt><dd data-news-history-count="gaps">${count(history.unresolved_category_scopes)}</dd></div><div><dt>已核對退場的缺口收據</dt><dd data-news-history-count="retired">${count(history.retired_gap_receipts)}</dd></div></dl><p class="news-provider-note">分類查詢範圍可能包含父子窗口與重疊分類，不是唯一日期或缺失篇數。來源矛盾、原頁重查及子窗口待證分開保留，不算清單完成。公開清單補漏不會自動刪掉分類缺口，也不代表該日全文已齊。</p>`
     : '<p class="news-provider-note">分類歷史驗證尚無有效快照；缺口數未知，不視為已補齊。</p>';
   return `<details class="news-provider-list" data-news-list-provider="cnyes" data-news-index-state="${indexState}"${state.cnyesListOpen ? " open" : ""}><summary>${summary}</summary>${cnyesManifestPhase(source.manifest_phase_progress)}${indexFacts}${historyFacts}<p class="news-provider-note" data-news-list-eta>全鉅亨歷史完成時間未知；清單階段估時不含全文，下方條件估時只涵蓋當前可回補正文網址，不包含尚未探索的清單或歷史缺口。</p></details>`;
 }
@@ -155,7 +162,9 @@ function renderSources(data) {
   $("source-next").disabled = state.page + 1 >= pages;
   $("pipeline-empty").hidden = rows.length !== 0;
   html("pipeline-grid", rows.slice(start, start + PAGE_SIZE).map(source => {
-    const ratio = source.progress_ratio == null ? "未知" : `${decimal(source.progress_ratio * 100)}%`;
+    const hasStoredCounters = source.stored_body_counter_available === true;
+    const bodyRatio = hasStoredCounters ? source.stored_body_progress_ratio : source.progress_ratio;
+    const ratio = bodyRatio == null ? "未知" : `${decimal(bodyRatio * 100)}%`;
     const statesText = Object.entries(source.states || {}).filter(([, value]) => value > 0)
       .map(([key, value]) => `${key === "awaiting_authorization" && source.authorized_api_setup ? "舊網頁管線未啟用" : stateLabels[key] || "其他"} ${count(value)}`).join(" · ");
     const finish = live(data) && source.conditional_finish_at_utc ? `條件完成 ${stamp(source.conditional_finish_at_utc)}` : "完成時點尚未知";
@@ -163,8 +172,8 @@ function renderSources(data) {
     const cohort = source.finite_cohort;
     const metadata = source.original_metadata;
     const metadataOnly = metadata && source.known_urls === 0;
-    const progressLabel = metadataOnly ? "正文工作尚未建立" : cohort ? "固定批次已存正文／網址" : "已完成狀態／已知網址";
-    const progressCount = metadataOnly ? "未入佇列" : cohort ? `${count(cohort.stored_bodies)} / ${count(cohort.urls)}` : `${count(source.complete_urls)} / ${count(source.known_urls)}`;
+    const progressLabel = metadataOnly ? "正文工作尚未建立" : hasStoredCounters ? "已存正文／全部已知網址" : cohort ? "固定批次已存正文／網址" : "已完成狀態／已知網址";
+    const progressCount = metadataOnly ? "未入佇列" : hasStoredCounters ? `${count(source.stored_body_urls)} / ${count(source.known_urls)}` : cohort ? `${count(cohort.stored_bodies)} / ${count(cohort.urls)}` : `${count(source.complete_urls)} / ${count(source.known_urls)}`;
     const metadataNote = metadata ? `<p class="news-provider-note news-provider-original-metadata">已解析原始媒體線索 <span data-news-original-links>${count(metadata.literal_metadata_links)}</span> 條 · ${count(metadata.original_hosts)} 個主機；可能多條指向同篇，不是正文筆數、不授予抓取或使用權限。</p>` : '';
     const feed = source.metadata_feed_progress;
     const feedNext = feed?.next_check_ready ? '已到期，等待排程' : stamp(feed?.next_check_at_utc);
@@ -172,7 +181,9 @@ function renderSources(data) {
     const supplement = source.finite_supplements;
     const outcomes = cohort && cohort.reviewed_nonbody_outside_cohort;
     const outcomeNote = outcomes && outcomes.urls ? `；已核對非正文 ${count(outcomes.urls)} 個網址（來源不存在 ${count(outcomes.states.source_not_found || 0)}，非文章路徑 ${count(outcomes.states.unsupported_article_path || 0)}），不計入已存正文` : "";
-    const cohortNote = cohort ? `固定批次不重抓${supplement ? `；已核對追加 ${count(supplement.stored_bodies)} / ${count(supplement.urls)} 正文` : ""}${outcomeNote}；未核對新增 ${count(cohort.unreviewed_new_urls ?? cohort.new_urls_outside_cohort)} 個網址（待排 ${count(source.growth_waiting_urls)}）` : "";
+    const cohortNote = cohort ? `原固定批次 ${count(cohort.stored_bodies)} / ${count(cohort.urls)}，不重抓${supplement ? `；已核對追加 ${count(supplement.stored_bodies)} / ${count(supplement.urls)} 正文` : ""}${outcomeNote}；未核對新增 ${count(cohort.unreviewed_new_urls ?? cohort.new_urls_outside_cohort)} 個網址（待排 ${count(source.growth_waiting_urls)}）` : "";
+    const disposition = source.outcome_progress;
+    const dispositionNote = !disposition ? "" : `<details class="news-provider-list" data-news-outcome-provider="${escape(source.id)}"><summary>缺口分類與下一步</summary><dl class="news-provider-facts">${Object.entries(disposition.categories || {}).filter(([, value]) => value > 0).map(([key, value]) => `<div><dt>${escape(outcomeLabels[key] || "其他待查")}</dt><dd data-news-outcome="${escape(key)}">${count(value)}</dd></div>`).join("")}</dl><p class="news-provider-note">分類依已保留的網址狀態；不覆寫正文、收據或重試期限。原站不存在不代表所有可用替代都已找過；尚無全途徑不可取得／結案比例的驗收。舊正文可能在重查或原站撤下後仍保留，不與狀態數相加。</p></details>`;
     const apiNote = source.authorized_api_setup ? '<p class="news-provider-eta">已確認 API 授權；先設定 CNA_API_KEY 並核對實際工具、全文範圍與配額。目前未開始 API 全文下載，完成時間未知；舊網頁佇列保留，不算完成。</p>' : '';
     const work = source.body_work_progress;
     const forecast = source.completion_forecast;
@@ -185,7 +196,7 @@ function renderSources(data) {
     return `<article class="pipeline-card"><header class="pipeline-card-header"><div class="news-provider-identity"><strong>${escape(source.name)}</strong><small>${escape(source.id)}</small></div><span class="pipeline-status ${badge}">${escape(labels[source.state] || "待觀測")}</span></header>${apiNote}
       <dl class="news-provider-facts"><div><dt>${progressLabel}</dt><dd>${progressCount}</dd></div><div><dt>待回補</dt><dd>${count(source.remaining_urls)}</dd></div><div><dt>正文 UTF-8</dt><dd>${bytes(source.text_bytes)}</dd></div><div><dt>${metadataOnly ? "新增正文速率尚未量測" : source.authorized_api_setup ? "API 新增正文／分鐘，未量測" : forecast ? "近期新增正文／分鐘" : source.forecast_rate_basis === "new_stored_url_heads" ? "本程序新增正文／分鐘" : "舊快照版本速率／分鐘"}</dt><dd data-news-rate="completion">${decimal(displayedRate == null ? null : displayedRate * 60)}</dd></div></dl>
       ${feedNote}${metadataNote}${workNote}${cnyesListProgress(source)}
-      <progress class="news-provider-progress mini-progress-track" max="1"${source.progress_ratio == null ? "" : ` value="${source.progress_ratio}"`} aria-label="${escape(source.name)} ${cohort ? '固定批次正文比例' : '已完成狀態占已知網址的比例'}"></progress><div class="news-provider-states">${cohort ? '固定批次' : '已知範圍'} ${ratio} · ${escape(statesText || (metadataOnly ? "已有原始網址線索，尚未建立正文工作" : "尚無已發現網址"))}${cohortNote ? `<p>${escape(cohortNote)}</p>` : ''}</div>
+      <progress class="news-provider-progress mini-progress-track" max="1"${bodyRatio == null ? "" : ` value="${bodyRatio}"`} aria-label="${escape(source.name)} ${hasStoredCounters ? '已存正文占全部已知網址的比例' : cohort ? '固定批次正文比例' : '已完成狀態占已知網址的比例'}"></progress><div class="news-provider-states">${hasStoredCounters ? '全部已知網址' : cohort ? '固定批次' : '已知範圍'} ${ratio} · ${escape(statesText || (metadataOnly ? "已有原始網址線索，尚未建立正文工作" : "尚無已發現網址"))}${cohortNote ? `<p>${escape(cohortNote)}</p>` : ''}</div>${dispositionNote}
       <p class="news-provider-note">剩餘 ${escape(eta(source, data))} · ${escape(finish)}</p>${forecastNote}<p class="news-provider-note">${escape(reviewLabels[source.source_policy_review] || "來源審閱紀錄不可用")}${source.source_reviewed_at_utc ? ` · 核對 ${escape(stamp(source.source_reviewed_at_utc))}` : ""}</p><p class="news-provider-note">${source.authorized_api_setup ? "官方 API 能力檢查已實作，全文管線未啟用" : source.adapter_registered ? "共用下載器已接線" : "來源尚未註冊"} · ${source.adapter_acceptance === "committed_body_heads_observed" ? "已觀測正文入庫" : "尚無正文入庫證據"}${source.source_role === "redirector" ? " · 轉址來源，須找到原始媒體 URL" : ""}</p><p class="news-provider-note">${escape(errorLabel(source))}</p></article>`;
   }).join(""));
   if (restoreListFocus) $("pipeline-grid").querySelector('[data-news-list-provider="cnyes"] > summary')?.focus({preventScroll: true});
@@ -237,7 +248,9 @@ function render(data) {
   text("metadata-count", `${count(acquisition.metadata_partitions)} 個來源分區`);
   text("discovery-count", `到期清點 ${count(acquisition.discovery_due)} 個 · 清點錯誤 ${count(acquisition.discovery_errors)} 個 · 端點暫停 ${count(acquisition.temporarily_blocked_bulk_pages)} 頁`);
   text("retry-count", `${count(acquisition.retry_urls)} 個待重試`);
-  text("error-count", `未啟用／其他不可執行 ${count(acquisition.blocked_urls)} · metadata 失敗 ${count(acquisition.metadata_errors)}`);
+  const outcomes = data.outcome_progress?.categories;
+  text("error-count", outcomes ? `待修 ${count(outcomes.repair_required)} · 原站不存在 ${count(outcomes.origin_absent)} · 非文字／非文章 ${count(outcomes.nontext_representation + outcomes.nonarticle_response)} · metadata 失敗 ${count(acquisition.metadata_errors)}` : `未啟用／其他不可執行 ${count(acquisition.blocked_urls)} · metadata 失敗 ${count(acquisition.metadata_errors)}`);
+  html("outcome-rows", outcomes ? Object.entries(outcomes).filter(([, value]) => value > 0).map(([key, value]) => `<tr><td>${escape(outcomeLabels[key] || "其他待查")}</td><td data-news-outcome-total="${escape(key)}">${count(value)}</td></tr>`).join("") : '<tr><td colspan="2">尚無有效分類快照</td></tr>');
   text("request-count", count(data.worker.requests));
   text("response-bytes", bytes(data.worker.response_bytes));
   const measured = data.providers.filter(source => source.enabled && source.owner_articles_per_second != null);

@@ -52,7 +52,8 @@ def test_explicit_personal_known_url_policy_keeps_original_content_boundaries(pr
 @pytest.mark.parametrize('provider', ['ftvnews', 'genetinfo', 'inside', 'pansci', 'cmmedia', 'cnews'])
 def test_each_private_source_retains_its_explicit_admission_mode(provider):
     _, registry, _ = load_config(Path(os.environ.get('STOCKAGENT_NEWS_SCOPE_CONFIG', 'configs/news_fulltext.json')))
-    expected = 'continuous' if provider in {'ftvnews', 'genetinfo'} else 'finite'
+    expected = 'continuous' if provider in {'ftvnews', 'genetinfo'} or (
+        provider == 'cmmedia' and registry.sources[provider].known_url_only) else 'finite'
     assert registry.sources[provider].acquisition_mode == expected
     if provider == 'inside':
         assert not registry.sources[provider].allowed

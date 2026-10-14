@@ -1553,7 +1553,7 @@ def test_day_trade_settlement_backfill_skips_current_history(monkeypatch) -> Non
         )
     )
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: "2026-07-21",
     )
 
@@ -1585,7 +1585,7 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(
     )
     dates = iter(["2026-07-17", "2026-07-22"])
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: next(dates),
     )
     calls = []
@@ -1631,7 +1631,7 @@ def test_formal_history_backfill_discovers_fold_from_checkpoint(
     dates = iter(["2026-07-24", "2026-07-27"])
     calls = []
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: next(dates),
     )
     monkeypatch.setattr(
@@ -1735,14 +1735,14 @@ def test_naive_artifact_current_requires_contiguous_formal_history_and_close_sig
         lambda cfg, target: True,
     )
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: "2026-07-23",
     )
 
     assert not _artifact_backfill_is_current(cfg, status, "naive")
 
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: "2026-07-24",
     )
     assert _artifact_backfill_is_current(cfg, status, "naive")
@@ -1759,7 +1759,7 @@ def test_day_trade_artifact_current_requires_latest_close_signal(monkeypatch) ->
         )
     )
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda _cfg: "2026-09-07",
     )
     monkeypatch.setattr(

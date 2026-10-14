@@ -1,0 +1,26 @@
+# Admission is enforced by the immutable v9 source binding and full-fold ABBA.
+# This host-specific recipe keeps the model, input data and financial semantics.
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: vastai1t_annual_whole_account_finalize_v2
+    kernel_environment: true
+    batch_size: 256
+    fold: 11
+    cpu_threads: 8
+    compile_threads: 16
+    epochs: 4
+    overrides:
+      training:
+        financial_transformer:
+          compiled_cross_attention_backend: manual
+          temporal_blocks_fp32: false
+          kernel_softmax_backend: quack
+        day_trade_annual_episode_sharding: true
+        day_trade_annual_episode_world_size: 2
+        ddp_broadcast_buffers: false
+        ddp_trajectory_gradient_sync: trajectory
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+      STOCKAGENT_DAY_TRADE_FINALIZE_COMPILE: 1

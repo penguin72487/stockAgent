@@ -119,19 +119,35 @@ def command_sync_since_restart():
     )), "new_warm_ready_log_observed": "[startup-warm] status=ready" in text}
 
 
-def verify(benchmarks: Path, controls: Path, control=None):
+def current_code_admission() -> dict:
+    return {"contract": "live_implementation_process_admission_v1",
+            "code_sha256": cache.forward_cache.identity_digest(
+                {"code": cache.forward_cache.loaded_implementation_identity()}),
+            "requires_fresh_process_on_change": True}
+
+
+def verify(benchmarks: Path | None, controls: Path | None, control=None, *,
+           code_admission_only: bool = False):
+    contract = ("discord_native_loaded_code_admission_v1" if code_admission_only else
+                "discord_preparation_gpu_idle_runtime_v1")
+    if (code_admission_only and (benchmarks is not None or controls is not None)
+            or not code_admission_only and (benchmarks is None or controls is None)):
+        raise ValueError("code admission and independent numerical acceptance are separate modes")
+    if control is not None and control.get("contract") != contract:
+        raise ValueError("discord_idle_control_contract_mismatch")
     current = owner()
     protected = {unit: identity(unit) for unit in PROTECTED}
     proofs = {str(path): sha(path) for path in CODE}
     status, process = status_for_owner()
     pending_work(status)
     full = cache.verify()
-    full["benchmarks"] = cache.matched_benchmarks(full, benchmarks, controls)
+    if not code_admission_only:
+        full["benchmarks"] = cache.matched_benchmarks(full, benchmarks, controls)
     acknowledgements = engine_acknowledgements(status, [row["market"] for row in full["markets"]])
     signals = [{"market": row["market"], "cache_key": row["cache_key"], "summary_path": row["summary_path"],
                 "summary_sha256": sha(row["summary_path"])} for row in full["markets"]]
     result = {
-        "contract": "discord_preparation_gpu_idle_runtime_v1",
+        "contract": contract,
         "observed_at_utc": datetime.now(timezone.utc).isoformat(), "state": "ready_for_discord_idle_reload",
         "owner": current, "protected": protected, "code_sha256": proofs, "status": status,
         "python_pid": int(process.name), "gpu_device_handles": gpu_handles(process),
@@ -144,6 +160,8 @@ def verify(benchmarks: Path, controls: Path, control=None):
         "services_started_or_restarted_by_verifier": False, "provider_requests": 0, "gpu_calls": 0,
         "trading_writes": False, "source_files_written": 0,
         "next_prewarm_and_opening_verified": False, "all_board_memory_attributed": False,
+        "full_numerical_oracle_proven": not code_admission_only,
+        "runtime_code_admission": status.get("live_implementation_admission"),
     }
     if owner() != current or protected != {unit: identity(unit) for unit in PROTECTED}:
         raise ValueError("native_owner_generation_changed_during_readback")
@@ -155,12 +173,15 @@ def verify(benchmarks: Path, controls: Path, control=None):
             raise ValueError("discord_owner_not_reloaded")
         if (result["gpu_device_handles"] or status["startup_inference_warmup"].get("status") == "ready"):
             raise ValueError("discord_native_owner_not_gpu_cold")
+        if code_admission_only and result["runtime_code_admission"] != current_code_admission():
+            raise ValueError("discord_loaded_implementation_not_current")
         result["journal"] = command_sync_since_restart()
         if (not result["journal"]["commands_sync_or_deferred_observed"]
                 or result["journal"]["watchdog_or_fatal_observed"]
                 or result["journal"]["new_warm_ready_log_observed"]):
             raise ValueError("unexpected_native_owner_warmup_or_fatal")
-        result["state"] = "accepted_native_discord_gpu_idle_adoption"
+        result["state"] = ("accepted_native_discord_loaded_code_admission" if code_admission_only else
+                           "accepted_native_discord_gpu_idle_adoption")
     return result
 
 
@@ -168,12 +189,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--control", type=Path)
-    parser.add_argument("--benchmarks", type=Path, required=True)
-    parser.add_argument("--controls", type=Path, required=True)
+    parser.add_argument("--benchmarks", type=Path)
+    parser.add_argument("--controls", type=Path)
+    parser.add_argument("--code-admission-only", action="store_true",
+                        help="Verify stable current artifacts and native loaded-code ownership; "
+                             "not an independent GPU numerical benchmark")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.baseline == (args.control is not None):
         parser.error("choose baseline or control")
+    if args.code_admission_only == (args.benchmarks is not None or args.controls is not None):
+        parser.error("code admission takes no benchmarks; numerical acceptance requires both paths")
+    if not args.code_admission_only and (args.benchmarks is None or args.controls is None):
+        parser.error("numerical acceptance requires both --benchmarks and --controls")
     if args.output.exists() or args.output.is_symlink():
         raise FileExistsError("preserve idle-adoption evidence")
     if not args.output.resolve().is_relative_to((ROOT / "artifacts/operations").resolve()):
@@ -181,7 +209,8 @@ def main():
     result = {"state": "failed"}
     try:
         result = verify(args.benchmarks, args.controls,
-                        None if args.baseline else json.loads(args.control.read_bytes()))
+                        None if args.baseline else json.loads(args.control.read_bytes()),
+                        code_admission_only=args.code_admission_only)
     except Exception as exc:
         result["error_type"] = type(exc).__name__
         raise

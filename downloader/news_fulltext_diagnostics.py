@@ -4,7 +4,7 @@ No extra HTTP, worker SQLite writes, accepted bodies, browser text or exports.
 General evidence retains its original two attempts per provider/UTC day.
 Five static Cnyes parser stages each have two separately persisted attempts;
 legacy stage witnesses are charged first. After a daily bucket is spent, the
-two independently scoped raw-capable providers may reserve one supplemental
+three independently scoped raw-capable providers may reserve one supplemental
 sample per fixed bucket/UTC hour, never per URL or parser fingerprint. Storage
 errors consume reservations, and restarts/upgrades cannot reset them. Independently
 identified free Cnyes HTML or article-licensed Global Voices HTML may retain
@@ -30,11 +30,14 @@ from downloader.news_fulltext_metrics import (
 )
 from downloader.news_fulltext_policy import NewsError, normalize_url
 from downloader.news_fulltext_failure_focus import RECEIPT_CONTRACT_VERSION as FOCUS_RECEIPT_CONTRACT_VERSION
+from downloader.news_fulltext_failure_focus import METADATA_UPGRADE_RECEIPT_CONTRACT_VERSION
 
 
 FAILURE_DIAGNOSTIC_CONTRACT_VERSION = 6
 FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION = 3
 RAW_SCOPE_OBSERVATION_CONTRACT_VERSION = 1
+LAYOUT_INDEPENDENT_RAW_SCOPE_CONTRACT_VERSION = 2
+PUBLIC_METADATA_RAW_SCOPE_CONTRACT_VERSION = 3
 CNYES_RAW_SCOPE_REASONS = frozenset({
     'not_cnyes_or_not_success', 'request_identity_not_verified',
     'response_identity_or_mime_not_verified', 'native_identity_not_verified',
@@ -46,10 +49,122 @@ CNYES_RAW_SCOPE_REASONS = frozenset({
     'matching_schema_not_found', 'schema_clock_or_title_or_access_not_verified',
     'scope_check_exception', 'native_current_public_scope_proved',
     'canonical_current_public_scope_proved',
+    'diagnostic_heading_identity_not_verified',
+    'canonical_current_public_identity_without_body_layout_proved',
+    'canonical_current_public_metadata_scope_proved',
 })
 DAILY_PROVIDER_ATTEMPTS = 2
 HOURLY_BUCKET_ATTEMPTS = 1
-HOURLY_EVIDENCE_PROVIDERS = frozenset({'cnyes', 'globalvoices'})
+HOURLY_EVIDENCE_PROVIDERS = frozenset({'cnyes', 'globalvoices', 'taiwanhot'})
+IDENTITY_METADATA_CONTRACT_VERSION = 1
+
+
+def _public_taiwanhot_scope(context, source):
+    """Independent native metadata for private layout diagnosis, not a body.
+
+    A broken/missing body selector cannot be a prerequisite for diagnosing it.
+    Still require the typed known-URL scope, actual OG/title, current byline and
+    real minute clock, no paid/rights override, and ORIGINAL route binding.
+    """
+    if (source.provider != 'taiwanhot' or source.embedded_article_layout != 'taiwanhot_visible_article_v3'
+            or source.authorization.get('kind') != 'personal_research'
+            or not source.known_url_only
+            or context.response.status != 200
+            or not re.search(r'(?:text/html|application/xhtml[+]xml)', context.response.headers.get('content-type', ''), re.I)):
+        return False
+    from downloader.news_fulltext_policy import public_article_document
+    from downloader.news_fulltext_public_originals import taiwanhot_visible_article, taiwanhot_route_matches
+    try:
+        soup = public_article_document(context.response.body, source, page_url=context.response.url)
+        metadata, _ = taiwanhot_visible_article(soup, page_url=context.response.url,
+            native_views=True, route_views=True, require_body=False)
+        return taiwanhot_route_matches(context.requested_url, metadata['source_native_article_id'], metadata['headline'])
+    except (NewsError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+        return False
+
+
+def retain_identity_metadata(queue, row, error, context):
+    """At most two metadata-only identity witnesses/provider/UTC day.
+
+    This separate static error bucket never refills old body/raw budgets.
+    Reserve before DOM/I/O; no worker write, request, raw body, body permission,
+    retry change, acceptance or per-URL/parser reset. Failed writes stay charged.
+    """
+    provider = row['provider']
+    try:
+        source = queue.registry.require(row['url'])
+        if (not source.allowed or not re.fullmatch(r'[a-z0-9_]+', provider)
+                or context.provider != provider or source.provider != provider
+                or context.source_fingerprint != source.data_fingerprint or context.requested_url != row['url']
+                or queue.registry.require(context.response.url).provider != provider
+                or context.response.status != 200 or len(context.response.body) > 8 << 20
+                or not re.search(r'(?:text/html|application/xhtml[+]xml)', context.response.headers.get('content-type', ''), re.I)):
+            return
+        clock = datetime.fromisoformat(context.received_at_utc)
+        if clock.tzinfo is None:
+            return
+        day = clock.astimezone(timezone.utc).strftime('%Y%m%d')
+        key = f'failure_identity_metadata_attempts:v1:{provider}:{day}'
+        with queue.db:
+            previous = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (key,)).fetchone()
+            attempts = int(previous[0]) if previous else 0
+            if not 0 <= attempts <= DAILY_PROVIDER_ATTEMPTS:
+                raise ValueError('invalid_identity_metadata_budget')
+            if attempts == DAILY_PROVIDER_ATTEMPTS:
+                queue.metrics.count(provider, 'failure_identity_metadata_budget_exhausted')
+                return
+            queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (key, str(attempts + 1)))
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(context.response.body, source.html_parser)
+        def declarations(selector, attribute):
+            nodes = soup.select(selector)
+            values = []
+            for node in nodes[:16]:
+                value = str(node.get(attribute, ''))
+                try:
+                    parts = urlsplit(value)
+                    display = (_display_url(value)[:512] if parts.scheme in {'http', 'https'}
+                               and parts.netloc and not parts.username and not parts.password else None)
+                except ValueError:
+                    display = None
+                values.append({'display_url': display,
+                               'original_value_sha256': hashlib.sha256(value.encode()).hexdigest()})
+            return {'node_count': len(nodes), 'values': values, 'truncated': len(nodes) > 16}
+        titles = soup.select('h1,h2.news_title')
+        facts = {'canonical': declarations('link[rel~="canonical"][href]', 'href'),
+                 'og_url': declarations('meta[name="og:url"][content],meta[property="og:url"][content]', 'content'),
+                 'title_nodes': len(titles),
+                 'title_sha256': [hashlib.sha256(n.get_text(' ', strip=True).encode()).hexdigest() for n in titles[:16]],
+                 'configured_containers': [{'selector': selector, 'nodes': len(soup.select(selector))}
+                                           for selector in source.selectors[:16]]}
+        if provider == 'taiwanhot':
+            from downloader.news_fulltext_public_originals import taiwanhot_request_ids
+            facts['requested_admission_candidates'] = sorted(taiwanhot_request_ids(row['url']))
+            facts['response_admission_candidates'] = sorted(taiwanhot_request_ids(context.response.url))
+            facts['candidates_are_not_verified_article_ids'] = True
+        stamp = clock.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + uuid.uuid4().hex[:8]
+        target = queue.root / 'identity_metadata' / day / provider / (stamp + '.json')
+        value = {'contract_version': IDENTITY_METADATA_CONTRACT_VERSION, 'provider': provider,
+            'owner_id': queue.owner, 'request_url': _display_url(row['url']),
+            'final_url': _display_url(context.response.url),
+            'request_url_sha256': hashlib.sha256(row['url'].encode()).hexdigest(),
+            'final_url_sha256': hashlib.sha256(context.response.url.encode()).hexdigest(),
+            'response_sha256': hashlib.sha256(context.response.body).hexdigest(),
+            'response_bytes': len(context.response.body), 'http_status': 200,
+            'error_code': error.code, 'observed_at_utc': context.received_at_utc,
+            'data_fingerprint': source.data_fingerprint, 'authorization_fingerprint': source.authorization_fingerprint,
+            'budget_key': key, 'budget_attempt': attempts + 1, 'budget_limit': DAILY_PROVIDER_ATTEMPTS,
+            'diagnostic_only': True, 'raw_response_retained': False, 'accepted_as_article': False,
+            'publish': False, 'remote_training_export': False,
+            'query_and_fragments_redacted': True, 'facts': facts}
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        assert not target.exists(), 'preserve_original_identity_metadata'
+        assert len(json.dumps(value, ensure_ascii=False).encode()) <= 65536, 'bounded_identity_metadata_required'
+        atomic_write_json(target, value, durable=True)
+        target.chmod(0o600)
+        queue.metrics.count(provider, 'failure_identity_metadata_saved')
+    except Exception:
+        queue.metrics.count(provider, 'failure_identity_metadata_write_errors')
 
 
 @dataclass(frozen=True)
@@ -194,18 +309,37 @@ def _observe_raw_scope(observation, allowed, reason):
     return allowed
 
 
-def _public_cnyes_scope(context, source, observation=None):
+def _public_cnyes_scope(context, source, observation=None, *, require_body_layout=True,
+                        require_heading_identity=True):
     """Public identity only, never treat the diagnostic as article acceptance."""
+    if require_body_layout and not require_heading_identity:
+        raise ValueError('metadata_identity_is_private_diagnostics_only')
+    def observe(allowed, reason):
+        result = _observe_raw_scope(observation, allowed, reason)
+        if observation is not None and not require_body_layout:
+            observation.update(contract_version=LAYOUT_INDEPENDENT_RAW_SCOPE_CONTRACT_VERSION,
+                original_layout_check='visible_article_layout_not_verified',
+                independent_identity_only=True)
+            if not require_heading_identity:
+                observation.update(contract_version=PUBLIC_METADATA_RAW_SCOPE_CONTRACT_VERSION,
+                    original_heading_check='diagnostic_heading_identity_not_verified',
+                    body_visibility_verified=False)
+        return result
+
     if source.provider != 'cnyes' or context.response.status != 200:
-        return _observe_raw_scope(observation, False, 'not_cnyes_or_not_success')
+        return observe(False, 'not_cnyes_or_not_success')
     parts = urlsplit(context.requested_url)
     match = re.fullmatch(r'/news/id/([0-9]+)', parts.path)
     if parts.fragment or parts.hostname not in {'news.cnyes.com', 'm.cnyes.com'} or not match:
-        return _observe_raw_scope(observation, False, 'request_identity_not_verified')
+        return observe(False, 'request_identity_not_verified')
+    if not require_body_layout and (parts.scheme != 'https' or parts.netloc != 'news.cnyes.com' or parts.query):
+        # This separate proof covers primary HTTPS documents only. It never
+        # changes the stricter reviewed mobile/exp canonical identity contract.
+        return observe(False, 'request_identity_not_verified')
     if (normalize_url(context.response.url) != normalize_url(context.requested_url)
             or context.response.headers.get('content-type', '').split(';')[0].strip().lower()
             not in {'text/html', 'application/xhtml+xml'}):
-        return _observe_raw_scope(observation, False, 'response_identity_or_mime_not_verified')
+        return observe(False, 'response_identity_or_mime_not_verified')
     from bs4 import BeautifulSoup
     from downloader.news_fulltext_policy import _objects, public_article_document
     from downloader.news_fulltext_publishers import (
@@ -231,47 +365,100 @@ def _public_cnyes_scope(context, source, observation=None):
         # Unknown/secret query parameters retain metadata only.
         return _observe_raw_scope(observation, False, 'unreviewed_query')
 
-    soup = BeautifulSoup(context.response.body, source.html_parser)
+    soup = (BeautifulSoup(context.response.body, source.html_parser) if require_body_layout else
+            public_article_document(context.response.body, source, page_url=context.requested_url))
     canonical = soup.select('link[rel="canonical"]')
     scope = _cnyes_visible_article_scope(soup)
     if len(canonical) != 1 or normalize_url(canonical[0].get('href', '')) != normalize_url(context.requested_url):
-        return _observe_raw_scope(observation, False, 'canonical_identity_not_verified')
-    if scope is None:
+        return observe(False, 'canonical_identity_not_verified')
+    if scope is None and require_body_layout:
         return _observe_raw_scope(observation, False, 'visible_article_layout_not_verified')
+    if require_body_layout:
+        heading = scope[0]
+    elif require_heading_identity:
+        # Identity evidence does not need to extract, recognize or accept the
+        # failed body. Use only a unique DOM heading outside non-visible and
+        # navigation containers, with no hidden text in its descendants.
+        headings = soup.body.find_all('h1') if soup.body is not None else []
+        if len(headings) != 1 or not _diagnostic_heading_identity(headings[0]):
+            return observe(False, 'diagnostic_heading_identity_not_verified')
+        heading = headings[0]
+    else:
+        # A received, already-allowed public response can be diagnosed from
+        # its exact canonical/current/free/schema identity without accepting
+        # any rendered/hidden body. No body or heading text supplies this proof.
+        heading = None
     data = _cnyes_current_article_data(soup, int(match[1]))
     if not data:
-        return _observe_raw_scope(observation, False, 'current_article_data_not_verified')
+        return observe(False, 'current_article_data_not_verified')
     if type(data.get('payment')) is not int or data['payment'] != 0:
-        return _observe_raw_scope(observation, False, 'current_free_payment_not_verified')
+        return observe(False, 'current_free_payment_not_verified')
     if type(data.get('publishAt')) is not int:
-        return _observe_raw_scope(observation, False, 'current_publication_epoch_type_not_verified')
+        return observe(False, 'current_publication_epoch_type_not_verified')
     if not isinstance(data.get('title'), str):
-        return _observe_raw_scope(observation, False, 'current_title_type_not_verified')
+        return observe(False, 'current_title_type_not_verified')
     if normalize_url(data.get('url', '')) != normalize_url(context.requested_url):
-        return _observe_raw_scope(observation, False, 'current_url_identity_not_verified')
-    if re.sub(r'\s+', '', scope[0].get_text(' ', strip=True)) != re.sub(r'\s+', '', data['title']):
-        return _observe_raw_scope(observation, False, 'visible_current_title_not_verified')
+        return observe(False, 'current_url_identity_not_verified')
+    if (not require_body_layout and not data['title'].strip()
+            or heading is not None and re.sub(r'\s+', '', heading.get_text(' ', strip=True))
+            != re.sub(r'\s+', '', data['title'])):
+        return observe(False, 'visible_current_title_not_verified')
     if source.excluded_article_title_pattern and re.search(source.excluded_article_title_pattern, data['title']):
-        return _observe_raw_scope(observation, False, 'excluded_article_title')
+        return observe(False, 'excluded_article_title')
     declarations = []
     for script in soup.select('script[type="application/ld+json"]'):
         try:
-            declarations.extend(node for node in _objects(json.loads(script.get_text()))
+            options = {} if require_body_layout else {'object_pairs_hook': _diagnostic_unique_object}
+            declarations.extend(node for node in _objects(json.loads(script.get_text(), **options))
                                 if node.get('@type') == 'NewsArticle'
                                 and normalize_url(node.get('url', '')) == normalize_url(context.requested_url))
         except (NewsError, ValueError, TypeError, RecursionError):
-            return _observe_raw_scope(observation, False, 'schema_json_not_verified')
+            return observe(False, 'schema_json_not_verified')
     if not declarations:
-        return _observe_raw_scope(observation, False, 'matching_schema_not_found')
+        return observe(False, 'matching_schema_not_found')
+    if not require_body_layout and len(declarations) != 1:
+        return observe(False, 'matching_schema_not_found')
     for node in declarations:
         try:
             clock = datetime.fromisoformat(node.get('datePublished', '').replace('Z', '+00:00'))
             if (clock.tzinfo is None or clock.timestamp() != data['publishAt'] or node.get('headline') != data['title']
-                    or str(node.get('isAccessibleForFree', 'true')).lower() == 'false'):
-                return _observe_raw_scope(observation, False, 'schema_clock_or_title_or_access_not_verified')
+                    or str(node.get('isAccessibleForFree', 'true')).lower() == 'false'
+                    or not require_body_layout and not (node.get('isAccessibleForFree', True) is True
+                        or type(node.get('isAccessibleForFree')) is str and node['isAccessibleForFree'] == 'true')):
+                return observe(False, 'schema_clock_or_title_or_access_not_verified')
         except (ValueError, TypeError, AttributeError, OverflowError):
-            return _observe_raw_scope(observation, False, 'schema_clock_or_title_or_access_not_verified')
-    return _observe_raw_scope(observation, True, 'canonical_current_public_scope_proved')
+            return observe(False, 'schema_clock_or_title_or_access_not_verified')
+    return observe(True, 'canonical_current_public_scope_proved' if require_body_layout else
+                   'canonical_current_public_identity_without_body_layout_proved' if require_heading_identity else
+                   'canonical_current_public_metadata_scope_proved')
+
+
+def _diagnostic_heading_identity(heading):
+    """Private metadata witness, not body visibility or permission inference."""
+    nodes = [heading, *heading.parents, *heading.find_all(True)]
+    for node in nodes:
+        if node.name in {'script', 'style', 'template', 'noscript', 'nav', 'footer', 'aside', 'dialog'}:
+            return False
+        if ('hidden' in node.attrs or 'inert' in node.attrs
+                or str(node.get('aria-hidden', '')).lower() == 'true'):
+            return False
+        styles = re.sub(r'\s+|/\*.*?\*/', '', str(node.get('style', '')).lower())
+        if re.search(r'(?:^|;)(?:display:none|visibility:(?:hidden|collapse)|content-visibility:hidden|opacity:0(?:[.]0+)?)(?:!important)?(?:;|$)', styles):
+            return False
+        classes = node.get('class', [])
+        classes = classes.split() if isinstance(classes, str) else classes
+        if {'hidden', 'd-none', 'invisible', 'sr-only', 'visually-hidden', 'screen-reader-only'}.intersection(classes):
+            return False
+    return True
+
+
+def _diagnostic_unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('ambiguous_diagnostic_schema_key')
+        value[key] = item
+    return value
 
 
 def _licensed_globalvoices_scope(context, source):
@@ -432,10 +619,14 @@ def retain_index_failure_response(queue, task, error):
 def retain_failure_response(queue, row, error):
     """Best-effort diagnostics; the original failure is persisted first."""
     context = getattr(error, 'failure_response', None)
+    if error.code == 'article_identity_not_verified' and isinstance(context, FailureResponse):
+        retain_identity_metadata(queue, row, error, context)
+        return
     if error.code != 'body_not_found' or not isinstance(context, FailureResponse):
         return
     provider = row['provider']
     focus, reservation = None, None
+    preproved_scope = None
     try:
         source = queue.registry.require(row['url'])
         if (not source.allowed or not re.fullmatch(r'[a-z0-9_]+', provider) or context.requested_url != row['url']
@@ -456,11 +647,29 @@ def retain_failure_response(queue, row, error):
             # expensive scope parsing and do not spend the general budget.
             if not focus.needs_response(row['url']):
                 return
+            if focus.metadata_upgrade_pending(row['url']):
+                # A prior metadata-only pair cannot be reset or overwritten.
+                # Only a new, already-received NORMAL response with positive
+                # free/current/unique-schema identity may spend attempt two.
+                # No reservation is spent on another inconclusive proof.
+                preproved_scope = {}
+                try:
+                    proved = _public_cnyes_scope(context, source, preproved_scope,
+                        require_body_layout=False, require_heading_identity=False)
+                except (NewsError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+                    proved = False
+                if not proved:
+                    queue.metrics.count(provider, 'failure_metadata_identity_upgrade_scope_unproved')
+                    reason = preproved_scope.get('first_failed_check')
+                    if reason in CNYES_RAW_SCOPE_REASONS:
+                        queue.metrics.count(provider, 'failure_metadata_identity_upgrade_unproved_' + reason)
+                    return
             stamp = clock.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + uuid.uuid4().hex[:8]
             response_sha = hashlib.sha256(context.response.body).hexdigest()
             target = queue.root / 'diagnostics' / day / provider / 'focus' / focus.id / (stamp + '.parquet')
             reservation = focus.reserve(row['url'], len(context.response.body), response_sha,
-                str(target.with_suffix('.receipt.json').relative_to(queue.root)))
+                str(target.with_suffix('.receipt.json').relative_to(queue.root)),
+                metadata_identity_proved=preproved_scope is not None)
             budget = {key: value for key, value in reservation.items() if not key.startswith('_')} if reservation else None
         else:
             focus = None
@@ -471,13 +680,32 @@ def retain_failure_response(queue, row, error):
             target = queue.root / 'diagnostics' / day / provider / (stamp + '.parquet')
         if budget is None:
             return
-        scope_observation = {}
+        scope_observation = preproved_scope if preproved_scope is not None else {}
         try:
+            public_scope = preproved_scope is not None or _public_cnyes_scope(context, source, scope_observation)
+            if not public_scope and scope_observation.get('first_failed_check') == 'visible_article_layout_not_verified':
+                # A failed body selector cannot be a prerequisite for diagnosing
+                # that selector. This independently proves free public metadata
+                # identity, retaining received bytes privately, never accepting
+                # a body, requesting again or changing source authorization.
+                public_scope = _public_cnyes_scope(context, source, scope_observation, require_body_layout=False)
+            if not public_scope and scope_observation.get('first_failed_check') == 'diagnostic_heading_identity_not_verified':
+                # Rendering failure is not a prerequisite for PRIVATE source
+                # diagnosis. Require independent positive canonical, current
+                # ID/payment0/title/URL and unique schema/aware-clock proof.
+                public_scope = _public_cnyes_scope(context, source, scope_observation,
+                    require_body_layout=False, require_heading_identity=False)
             retention_basis = ('matching_current_public_payment0_identity_and_aware_clock'
-                               if _public_cnyes_scope(context, source, scope_observation) else
+                               if public_scope else
                                'matching_current_native_article_CC_license_authors_and_aware_clock'
                                if _licensed_globalvoices_scope(context, source) else
+                               'matching_native_taiwanhot_identity_author_and_minute_clock_private_diagnostic_only'
+                               if _public_taiwanhot_scope(context, source) else
                                'metadata_only_no_body_scope_inferred')
+            if public_scope and scope_observation.get('independent_identity_only'):
+                retention_basis = 'layout_independent_current_public_payment0_identity_and_aware_clock_diagnostic_only'
+            if public_scope and scope_observation.get('contract_version') == PUBLIC_METADATA_RAW_SCOPE_CONTRACT_VERSION:
+                retention_basis = 'canonical_current_public_metadata_identity_for_private_diagnostic_only'
             raw_allowed = retention_basis != 'metadata_only_no_body_scope_inferred'
         except (NewsError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
             raw_allowed = False  # Broken evidence permits metadata only.
@@ -495,7 +723,9 @@ def retain_failure_response(queue, row, error):
                 requested_display = normalize_url(row['url'])
                 final_display = normalize_url(context.response.url)
         identity = {
-            'contract_version': FOCUS_RECEIPT_CONTRACT_VERSION if focus is not None else FAILURE_DIAGNOSTIC_CONTRACT_VERSION,
+            'contract_version': (METADATA_UPGRADE_RECEIPT_CONTRACT_VERSION
+                if budget.get('failure_diagnostic_metadata_identity_upgrade_contract_version') else
+                FOCUS_RECEIPT_CONTRACT_VERSION if focus is not None else FAILURE_DIAGNOSTIC_CONTRACT_VERSION),
             'provider': provider,
             'budget_contract_version': FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION,
             **budget,

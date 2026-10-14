@@ -16,7 +16,8 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 from stockagent.data.news_source_catalog import (
     configuration_paths, load_news_configuration, load_source_review_ledger,
-    planning_review_path, source_role,
+    planning_review_path, source_role, classify_news_outcomes,
+    NEWS_OUTCOME_CLASSIFICATION_VERSION,
 )
 
 
@@ -32,7 +33,8 @@ _STATES = frozenset({
     "paywall", "not_found", "gone", "response_too_large",
     "paywall_or_login", "access_challenge", "robots_access_challenge", "robots_not_plain_rules", "robots_redirect_refused",
     "source_body_removed", "source_not_found", "source_body_image_only", "source_body_embedded_only", "source_article_empty_template",
-    "source_body_quote_only",
+    "source_body_quote_only", "source_article_test_only",
+    "source_document_landing_page",
     "pdf_image_only_or_body_not_found",
 })
 _READY_STATES = {"pending", "inflight", "retry", "retry_cooldown"}
@@ -274,8 +276,14 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
     """Only current-contract scope counts; scopes can overlap across dates."""
     raw = _object(value)
     states = raw.get('current_source_contract_scope_states')
-    allowed = ('list_complete', 'list_complete_by_page_ID_equivalence',
-               'partition_list_complete', 'waiting_page_evidence')
+    complete = ('list_complete', 'list_complete_by_page_ID_equivalence', 'partition_list_complete')
+    waiting = ('waiting_page_evidence', 'waiting_original_page_recheck', 'waiting_child_evidence')
+    inconsistent = ('inconsistent_source_snapshot', 'inconsistent_original_page_ID_reference',
+                    'inconsistent_source_identity_or_date', 'inconsistent_partition_evidence')
+    # These are actual canonical producer outcomes, not unknown states that
+    # may be silently coerced into complete. A source conflict must remain
+    # visible without hiding all otherwise verified historical scopes.
+    allowed = complete + waiting + inconsistent + ('source_page_cap_exceeded',)
     retired = _count(raw.get('retired_gap_receipts'))
     if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
             or not isinstance(states, Mapping) or set(states) - set(allowed)
@@ -286,7 +294,11 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
     if any(value is None for value in counts.values()) or sum(counts.values()) > 2**53 - 1:
         return None
     return {'contract_version': 1, 'current_source_contract_scope_states': counts,
-            'verified_list_scopes': sum(counts[key] for key in allowed[:3]),
+            'scope_outcome_projection_contract_version': 1,
+            'verified_list_scopes': sum(counts[key] for key in complete),
+            'waiting_list_scopes': sum(counts[key] for key in waiting),
+            'inconsistent_source_scopes': sum(counts[key] for key in inconsistent),
+            'page_cap_exceeded_scopes': counts['source_page_cap_exceeded'],
             'retired_gap_receipts': retired, 'unresolved_category_scopes': _cnyes_category_gap_count(gaps),
             'list_coverage_is_not_body_coverage': True, 'all_history_complete': False,
             'finish_eta_utc': None, 'progress_ratio': None}
@@ -584,6 +596,9 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         if isinstance(identifier, str) and identifier in configured and deadline is not None and deadline > now.timestamp():
             endpoint_circuits[identifier] = endpoint_circuits.get(identifier, 0) + 1
     providers = []
+    stored_counter_declared = 'provider_stored_body_counter_contract_version' in status
+    stored_counter_version = status.get('provider_stored_body_counter_contract_version')
+    stored_counter_supported = type(stored_counter_version) is int and stored_counter_version == 1
     for identifier in sorted(set(configured) | set(raw_providers)):
         if not isinstance(identifier, str) or not _ID.fullmatch(identifier):
             continue
@@ -592,6 +607,10 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         known = sum(counts.values()) if valid else None
         ready = sum(counts.get(key, 0) for key in _READY_STATES) if valid else None
         complete = counts.get("complete", 0) if valid else None
+        stored_urls = (_count(raw.get('stored_body_urls')) if raw else 0) if valid and stored_counter_supported else None
+        if stored_urls is not None and (known is None or stored_urls > known):
+            stored_urls = None
+        stored_ratio = stored_urls / known if known and stored_urls is not None else None
         growth_waiting = counts.get('waiting_cohort', 0) if valid else None
         blocked = known - (ready or 0) - (complete or 0) - (growth_waiting or 0) if known is not None else None
         raw_mode = raw.get('acquisition_mode')
@@ -642,6 +661,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         enabled = raw.get("automatic_collection_enabled") is True
         metadata_feed = _metadata_feed_progress(raw.get('metadata_feed_progress'), now=now) if valid else None
         body_enabled = enabled and raw.get('automatic_fulltext_allowed', True) is True
+        outcome_progress = classify_news_outcomes(dict(counts), registered=identifier in configured,
+                                                  body_enabled=body_enabled) if valid else None
         detail = _object(metric_providers.get(identifier))
         http_counts = _object(detail.get("counts"))
         accepted = _count(http_counts.get("durably_accepted_versions"))
@@ -664,6 +685,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                 or supplement and not supplement['all_supplement_bodies_stored']
                 or supplement_raw and supplement is None):
             eta = None  # No pending request is not proof all cohort bodies exist.
+        if ready == 0 and (blocked or growth_waiting):
+            eta = None  # A completed old batch is not a finished known frontier.
         # A finite conditional projection is not a guaranteed completion clock.
         finish = None
         if eta is not None and observed and eta <= 3650 * 86400:
@@ -677,8 +700,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                      if metadata_feed and not body_enabled else
                  "running" if counts.get("inflight", 0) else
                  "backfilling" if ready else "attention" if blocked else
-                 "finite_complete" if cohort and cohort['all_cohort_bodies_stored'] else
-                 "waiting_cohort" if growth_waiting else "known_queue_clear")
+                 "waiting_cohort" if growth_waiting else
+                 "finite_complete" if cohort and cohort['all_cohort_bodies_stored'] else "known_queue_clear")
         api_setup = None
         if identifier == 'cna' and authorized_cna_setup and not enabled:
             api_setup = {'phase': 'capability_discovery_only', 'user_authorization_declared': True,
@@ -716,10 +739,13 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "source_policy_review": review_decision,
             "source_reviewed_at_utc": review_at.isoformat() if review_valid else None,
             "adapter_registered": identifier in configured,
-            "adapter_acceptance": "committed_body_heads_observed" if complete else "no_body_acceptance_observed",
+            "adapter_acceptance": "committed_body_heads_observed" if stored_urls or complete else "no_body_acceptance_observed",
             "source_role": source_role(identifier.removeprefix("unregistered:")) if identifier.startswith("unregistered:") else
                 source_role(settings.get("domains", [""])[0]) if isinstance(settings.get("domains"), list) and settings["domains"] else "publisher_or_other_unverified",
             "known_urls": known, "complete_urls": complete, "remaining_urls": ready,
+            "stored_body_urls": stored_urls, "stored_body_progress_ratio": stored_ratio,
+            "stored_body_counter_available": stored_counter_supported,
+            "outcome_progress": outcome_progress,
             "original_metadata": original_sources.get(identifier),
             "body_work_progress": _body_work_progress(raw.get('body_work_progress'), ready) if identifier == 'cnyes' else None,
             "public_index_progress": _cnyes_public_index_progress(raw.get('public_index_progress')) if identifier == 'cnyes' else None,
@@ -772,14 +798,29 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     consistency = (known is not None and known == sum(counts.values())
                    and known == sum(source["known_urls"] or 0 for source in providers)
                    and stored is not None and stored <= known)
+    if stored_counter_declared:
+        consistency = consistency and stored_counter_supported and all(
+            source['stored_body_urls'] is not None for source in providers) and stored == sum(
+                source['stored_body_urls'] or 0 for source in providers)
     if valid and not consistency:
         health = "degraded"
         ratio = None
         for source in providers:
             source["conditional_eta_seconds"] = source["conditional_finish_at_utc"] = None
+            source['stored_body_progress_ratio'] = None
     eligible = [source for source in providers if source["enabled"] and source["remaining_urls"]]
     etas = [source["conditional_eta_seconds"] for source in eligible]
     eligible_eta = max(etas) if consistency and live and etas and all(eta is not None for eta in etas) else None
+    outcome_totals = Counter()
+    if valid:
+        for source in providers:
+            outcome_totals.update(source['outcome_progress']['categories'])
+    outcome_progress = ({'contract_version': NEWS_OUTCOME_CLASSIFICATION_VERSION,
+        'categories': dict(outcome_totals), 'known_urls': known,
+        'snapshot_consistent': consistency, 'grain': 'retained queue URL-head states',
+        'origin_absence_is_not_all_paths_exhausted': True,
+        'definitively_unavailable_urls': None, 'closure_progress_ratio': None,
+        'all_history_complete': False} if valid else None)
     owner_requests = _object(status.get("http_requests_this_run"))
     requests = [_count(number) for number in owner_requests.values()]
     stages = []
@@ -824,6 +865,9 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                       'publisher_requests': 0}
     return {
         "schema_version": 1, "nonbody_source_outcome_progress_contract_version": 1,
+        "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
+        "outcome_progress": outcome_progress,
+        "provider_stored_body_counter_contract_version": 1 if stored_counter_supported else None,
         "cnyes_list_progress_projection_contract_version": 1,
         "cnyes_manifest_phase_projection_contract_version": 1,
         "original_source_inventory_contract_version": 1,

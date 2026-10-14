@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import re
+import ssl
 import threading
 import time
 from typing import Callable
@@ -448,7 +449,7 @@ class NewsHTTP:
             self.metrics.count(provider, kind + '_diagnostic_write_errors')
 
     def _record_transport_problem(self, source, url, endpoint, phase, status, wall, headers_wall, size, error_types,
-                                  *, robots_origin=None, connection_observation=None):
+                                  *, robots_origin=None, connection_observation=None, robots_pressure=None):
         now = datetime.now(timezone.utc)
         observation = {
             'contract_version': TRANSPORT_FAILURE_DIAGNOSTIC_CONTRACT_VERSION,
@@ -471,6 +472,8 @@ class NewsHTTP:
                 'initial_origin': robots_origin, 'scope': 'initial_origin_policy', 'permission_granted': False,
                 'source_data_fingerprint': source.data_fingerprint,
                 'authorization_fingerprint': source.authorization_fingerprint}
+            if robots_pressure is not None:
+                observation['robots_origin_policy']['capacity_pressure'] = robots_pressure
         self._persist_problem('transport', source.provider, observation, day=now.strftime('%Y%m%d'))
 
     def _raw(self, url: str, headers: dict | None = None, *, robots_origin=None, metadata_feed=None) -> Response:
@@ -571,30 +574,56 @@ class NewsHTTP:
             if isinstance(session, OriginConnectionSession):
                 # Observe before recovery discards this failed origin's pool.
                 connection_observation = session.finish_connection_observation(url)
-            # One dead keep-alive/read timeout is not proof the whole publisher
-            # is down. Keep healthy, evenly paced requests working; trip the
-            # publisher circuit for a confirmed route/TLS failure or repeated
-            # transport failures without an intervening HTTP response.
+            # One origin's bad certificate denies its REP, not permission to
+            # disable TLS, reuse old Allow, replace its host or request a body.
+            # Only fresh completed OTHER-host proof isolates provider pressure.
+            # Unknown TLS/routes and all ordinary article failures retain the
+            # conservative publisher breaker.
             chain, seen, route_failure, error_types = exc, set(), isinstance(exc, requests.exceptions.SSLError), []
+            certificate_failure, network_route_failure = False, False
             while chain is not None and id(chain) not in seen:
                 seen.add(id(chain))
                 if len(error_types) < 8:
                     error_types.append(type(chain).__name__[:64])
-                route_failure |= getattr(chain, "errno", None) in {errno.ENETUNREACH, errno.EHOSTUNREACH}
+                certificate_failure |= isinstance(chain, ssl.SSLCertVerificationError)
+                network_route_failure |= getattr(chain, "errno", None) in {errno.ENETUNREACH, errno.EHOSTUNREACH}
+                route_failure |= network_route_failure
                 chain = chain.__cause__ or chain.__context__
-            self._record_transport_problem(source, url, endpoint, phase, status, failure_wall, headers_wall, size, error_types,
-                                           robots_origin=robots_origin, connection_observation=connection_observation)
+            rep_certificate = (robots_origin is not None and certificate_failure and not network_route_failure
+                               and status is None and phase == 'awaiting_headers')
+            robots_pressure = None
             with self.lock:
                 self.host_circuits.failure(source.provider, host)
-                failures = self.transport_failures.get(source.provider, 0) + 1
-                self.transport_failures[source.provider] = failures
-            if route_failure or failures >= self.config.get("transport_breaker_failures", 3):
+                if rep_certificate:
+                    proof = self.host_circuits.corroboration(source.provider, host,
+                        excluded_hosts=(urlsplit(robots_origin).hostname,))
+                    healthy = proof['corroborating_hosts']
+                    isolated_robots_origin = bool(healthy)
+                    robots_pressure = {
+                        'contract_version': ROBOTS_ORIGIN_PRESSURE_CONTRACT_VERSION, 'isolated': bool(healthy),
+                        'basis': 'recent_completed_other_registered_host; not_permission_or_body_acceptance',
+                        'corroborating_hosts': healthy,
+                        'success_ages_seconds': {h: proof['other_success_ages_seconds'][h] for h in healthy}}
+                failures = self.transport_failures.get(source.provider, 0)
+                if not isolated_robots_origin:
+                    failures += 1
+                    self.transport_failures[source.provider] = failures
+            self._record_transport_problem(source, url, endpoint, phase, status, failure_wall, headers_wall, size, error_types,
+                robots_origin=robots_origin, connection_observation=connection_observation, robots_pressure=robots_pressure)
+            if not isolated_robots_origin and (route_failure or failures >= self.config.get("transport_breaker_failures", 3)):
                 self.defer(source.provider, 30)
                 self.metrics.count(source.provider, "transport_circuit_opened")
             self._reset_failed_connection(source.provider, url)
             self.metrics.count(source.provider, "transport_errors")
             self.metrics.count(source.provider, "transport_error_" + type(exc).__name__)
-            raise NewsError("transport_error", retry=True, delay=30) from exc
+            error = NewsError("transport_error", retry=True, delay=30)
+            if rep_certificate:
+                # Persist the actual initial authority's negative policy and
+                # bounded retry generation, even if pressure scope is unknown.
+                # _robots owns that checkpoint; expiry is a probe, not recovery.
+                error.robots_origin_isolation = True
+                error.robots_pressure_corroboration = robots_pressure
+            raise error from exc
         finally:
             if connection_observation is None and isinstance(session, OriginConnectionSession):
                 connection_observation = session.finish_connection_observation(url)

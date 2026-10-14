@@ -343,11 +343,16 @@ def test_close_event_finalizer_uses_newest_accepted_phase(
         def poll(self):
             return self.returncode
 
-    monkeypatch.setattr(
-        source_events.subprocess,
-        "Popen",
-        lambda command, cwd: (captured.append(command) or Process()),
-    )
+    def launch(command, cwd):
+        captured.append(command)
+        receipt_path = Path(command[command.index("--receipt") + 1])
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({
+            "status": "ok", "expected_date": "2026-09-07", "after": {"current": True},
+        }), encoding="utf-8")
+        return Process()
+
+    monkeypatch.setattr(source_events.subprocess, "Popen", launch)
     result = source_events._finalize_completed_session_close_event(
         {
             "status": "ok",

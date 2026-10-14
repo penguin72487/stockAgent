@@ -2308,6 +2308,10 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     # Lossless zero-column LayerNorm/Linear contraction. No input/parameter is
     # discarded; reordered FP32 sums opt into a fresh optimizer trajectory.
     factorized_compact_projection: bool = False
+    # Versioned full-schema CSR projection; fixed input normalization and
+    # source bytes may persist on GPU across updates, learned tensors may not.
+    factorized_sparse_projection: bool = False
+    factorized_sparse_cache_bytes: int = 8 * 1024**3
     # Zero preserves the existing 1 GiB / 128-stock compact stream limit.
     # Positive values opt into a bounded larger stream, never feature pruning.
     factorized_compact_stream_chunk_bytes: int = 0
@@ -2477,6 +2481,10 @@ class TrainingConfig:
     ddp_bucket_cap_mb: int = 4
     ddp_broadcast_buffers: bool = True
     ddp_trajectory_gradient_sync: str = "batch"
+    # Independent configured annual physical accounts are owned by one rank.
+    # Local actions never leave that rank; date-weighted gradients reduce once.
+    day_trade_annual_episode_sharding: bool = False
+    day_trade_annual_episode_world_size: int = 2
     # Keep the policy model time-sharded under DDP, then transpose the action
     # and execution tensors to contiguous symbol shards for the recurrent
     # carrying ledger. PyTorch functional collectives own autograd; there is no
@@ -3061,6 +3069,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )):
         raise ValueError("trajectory DDP synchronization requires a full-trajectory optimizer update")
     training["ddp_trajectory_gradient_sync"] = trajectory_sync
+    training["day_trade_annual_episode_sharding"] = bool(training["day_trade_annual_episode_sharding"])
+    training["day_trade_annual_episode_world_size"] = int(training["day_trade_annual_episode_world_size"])
+    if training["day_trade_annual_episode_world_size"] < 2:
+        raise ValueError("annual episode ownership requires at least two configured ranks")
+    if training["day_trade_annual_episode_sharding"] and (
+            not training["day_trade_training_annual_episodes"]
+            or not training["day_trade_optimizer_step_per_trajectory"]
+            or trajectory_sync != "trajectory" or training["ddp_broadcast_buffers"]
+            or training["distributed_symbol_sharded_ledger"]
+            or multi_gpu_strategy not in {"auto", "distributed_data_parallel"}):
+        raise ValueError("annual episode sharding requires annual physical accounts, trajectory synchronization, immutable buffers and DDP")
     training["temporal_basis_covariance_lag_batch_size"] = int(
         training["temporal_basis_covariance_lag_batch_size"]
     )
@@ -3544,6 +3563,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["factorized_compact_projection"] = bool(
         financial_transformer["factorized_compact_projection"]
     )
+    financial_transformer["factorized_sparse_projection"] = bool(
+        financial_transformer["factorized_sparse_projection"]
+    )
+    financial_transformer["factorized_sparse_cache_bytes"] = int(
+        financial_transformer["factorized_sparse_cache_bytes"]
+    )
+    if financial_transformer["factorized_sparse_cache_bytes"] < 1:
+        raise ValueError("factorized_sparse_cache_bytes must be positive")
     financial_transformer["factorized_compact_stream_chunk_bytes"] = int(
         financial_transformer["factorized_compact_stream_chunk_bytes"]
     )
@@ -5581,6 +5608,8 @@ def load_config(
             ddp_bucket_cap_mb=training_raw["ddp_bucket_cap_mb"],
             ddp_broadcast_buffers=training_raw["ddp_broadcast_buffers"],
             ddp_trajectory_gradient_sync=training_raw["ddp_trajectory_gradient_sync"],
+            day_trade_annual_episode_sharding=training_raw["day_trade_annual_episode_sharding"],
+            day_trade_annual_episode_world_size=training_raw["day_trade_annual_episode_world_size"],
             distributed_symbol_sharded_ledger=training_raw[
                 "distributed_symbol_sharded_ledger"
             ],

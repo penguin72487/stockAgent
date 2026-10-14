@@ -483,7 +483,10 @@ def _load_retained_historical_entry_books(
             )
             current_minute_receipt = (
                 isinstance(payload, dict)
-                and payload.get("schema_version") == 2
+                and (payload.get("schema_version") == 2 or (
+                    payload.get("schema_version") == 3
+                    and payload.get("query_contract") == "bounded_incremental_per_mode_source_queries_v3"
+                ))
                 and payload.get("execution_price_contract")
                 == "source_backed_right_labelled_09_01_minute_price_vwap_else_kbar_close"
             )

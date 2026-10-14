@@ -116,6 +116,10 @@ def test_only_html_abi_changes_not_bulk_index_or_authorization(cnyes_config, tmp
             return original_sha(value)
         if isinstance(payload, dict) and 'verified_native_prose_spacing_contract_version' in payload:
             assert payload.pop('verified_native_prose_spacing_contract_version') == 1
+            # Reconstruct the actual pre-spacing HTTP identity, not a newer
+            # capture with the independently versioned source-test outcome.
+            assert payload.pop('verified_source_test_article_outcome_contract_version') == 1
+            assert payload.pop('visible_headline_body_ownership_contract_version') == 1
             return original_sha(json.dumps(payload, sort_keys=True).encode())
         return original_sha(value)
 

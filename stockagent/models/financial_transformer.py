@@ -372,6 +372,10 @@ class CandleEncoder(nn.Module):
         owned_normalization = bool(
             not input_is_normalized and self.causal_feature_rms_normalization
             and self.causal_feature_compression == "none"
+            # Host-only workspace ownership checks are not traceable by
+            # Dynamo. Compiled eval keeps the original out-of-place FP32
+            # normalization; eager inference retains its owned clone fast path.
+            and not torch.compiler.is_compiling()
             and not self.training and torch.is_inference_mode_enabled()
         )
         if owned_inference and (not owned_normalization or clean_fp32 is not x):
@@ -1107,6 +1111,8 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         portfolio_blocks_fp32: bool = False,
         candle_projection_fp32: bool = False,
         factorized_compact_projection: bool = False,
+        factorized_sparse_projection: bool = False,
+        factorized_sparse_cache_bytes: int = 8 * 1024**3,
         factorized_compact_stream_chunk_bytes: int = 0,
         factorized_input_compile: bool = True,
         daily_context_num_features: int = 0,
@@ -1119,6 +1125,12 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         super().__init__(*args, **kwargs)
         self.factorized_input_compile=bool(factorized_input_compile)
         self.factorized_compact_projection=bool(factorized_compact_projection)
+        self.factorized_sparse_projection=bool(factorized_sparse_projection)
+        self.factorized_sparse_cache_bytes=int(factorized_sparse_cache_bytes)
+        if self.factorized_sparse_cache_bytes < 1:
+            raise ValueError("sparse source cache requires a positive byte budget")
+        if self.factorized_sparse_projection and not self.factorized_compact_projection:
+            raise ValueError("sparse projection requires the admitted compact FP32 stem")
         self.factorized_compact_stream_chunk_bytes=int(factorized_compact_stream_chunk_bytes)
         if self.factorized_compact_stream_chunk_bytes < 0 or (
             self.factorized_compact_stream_chunk_bytes and not self.factorized_compact_projection

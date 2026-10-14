@@ -403,7 +403,7 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                 "sizing_open_price": None,
                 "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
                 "public_price_display": {
-                    "contract": "public_quote_display_v1",
+                    "contract": "public_quote_display_v2",
                     "withheld_fields": ["sizing_open_price"],
                     "withheld_reasons": {"sizing_open_price": "public_source_not_connected"},
                     "visible_fields": {},
@@ -438,7 +438,7 @@ def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
                         "last_mark_quote_source": "shioaji:stock_snapshot",
                         "reconciled_total_net_pnl_twd": 2520.0,
                         "public_price_display": {
-                            "contract": "public_quote_display_v1",
+                            "contract": "public_quote_display_v2",
                             "withheld_fields": ["last_mark_price"],
                             "withheld_reasons": {"last_mark_price": "public_display_permission_unverified"},
                             "visible_fields": {},
@@ -983,8 +983,27 @@ def test_day_trade_clock_ends_at_auction_without_overnight_contract_details() ->
     ):
         assert requirement in closing_step.group(0)
     assert '<template id="overnight-source-contract"><dl class="source-list">' in panel
-    assert 'timeline.after(sourceTemplate.content.cloneNode(true))' in javascript
+    assert 'sourceFooter.append(sourceTemplate.content.cloneNode(true))' in javascript
+    assert 'id="execution-source-contract"' in html.split('<section id="price-sources"')[1]
     assert "if (!IS_OVERNIGHT) return;" in javascript
+
+
+def test_tw_price_source_disclosures_are_the_last_page_section_and_shared() -> None:
+    root = Path(__file__).resolve().parents[1] / "services" / "tw_day_trade_dashboard"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    detail = (root / "detail-components.js").read_text(encoding="utf-8")
+    main = html.split('<main id="main-content">')[1].split("</main>")[0]
+    footer = main.split('<section id="price-sources"')[1]
+    assert 'id="quote-display-notice"' in footer
+    assert 'id="quote-display-notice"' not in main.split('<section id="price-sources"')[0]
+    assert footer.rstrip().endswith("</section>")
+    assert 'id="price-source-list"' in footer and 'id="price-reference-list"' in footer
+    assert 'data-reference-key' in javascript and 'details.open = true' in javascript
+    renderers = detail.split('function positionRow(row)')[1]
+    assert 'dailyReference(row)' not in renderers
+    assert 'entry_price_source' not in renderers
+    assert 'priceDistanceText' in renderers and 'renderPriceSources' in javascript
 
 
 def test_public_pages_share_visual_tokens() -> None:
@@ -1781,6 +1800,7 @@ def test_data_monitor_provider_page_and_filtered_api(tmp_path: Path) -> None:
 def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) -> None:
     playwright = pytest.importorskip("playwright.sync_api")
     from playwright.sync_api import Error as PlaywrightError
+    from scripts.probe_browser_runtime import browser_profile_launch_options
 
     rows = [
         {"id": "finlab:price:收盤價", "endpoint_id": "finlab:price:收盤價", "title": "收盤價",
@@ -1820,7 +1840,10 @@ def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) ->
 
     try:
         with playwright.sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # This checks HTML/2D disclosure/search behavior, not GPU/WebGL.
+            # Keep the default compositor control probe as a separate failure;
+            # an explicit software profile still requires native actionable clicks.
+            browser = p.chromium.launch(**browser_profile_launch_options("cpu-2d"))
             try:
                 for width in (1280, 390):
                     page = browser.new_page(viewport={"width": width, "height": 800})
@@ -1834,7 +1857,8 @@ def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) ->
                     page.locator("#provider-name").get_by_text("FinLab").wait_for(timeout=8000)
                     assert page.locator("#provider-ratio").text_content() == "不適用"
                     assert page.locator("#provider-source-rows tr").count() == 0
-                    page.evaluate("() => {StockAgentAcquisition.reveal('provider-sources');document.getElementById('provider-sources').scrollIntoView({block:'start',behavior:'instant'});}")
+                    page.locator("#acq-catalog > summary").click()
+                    page.locator("#provider-sources").scroll_into_view_if_needed()
                     page.wait_for_function("() => document.querySelectorAll('#provider-source-rows tr').length === 2")
                     page.locator("#provider-source-search").fill("收盤")
                     page.get_by_text("1/1 項符合結果").wait_for(timeout=8000)

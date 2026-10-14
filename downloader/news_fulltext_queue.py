@@ -42,7 +42,7 @@ from downloader.news_fulltext_status import (
 from downloader.news_fulltext_metadata_ingest import METADATA_INGEST_CONTRACT_VERSION
 
 
-ARTICLE_DISPATCH_CONTRACT_VERSION = 5
+ARTICLE_DISPATCH_CONTRACT_VERSION = 6
 ARTICLE_READY_PROBE_SQL = (
     "SELECT 1 FROM articles INDEXED BY dispatch WHERE provider=? "
     "AND state IN ('pending','retry','retry_cooldown') AND due<=? LIMIT 1"
@@ -931,6 +931,10 @@ class NewsQueue:
         self.recheck_changed_cnyes_parser(prior_sources.get('source_capture_fingerprint:cnyes'),
                                          prior_parsers.get('source_parser_repair_fingerprint:cnyes'))
         self.recheck_changed_feed_parser(prior_sources, prior_parsers)
+        self.recheck_taiwanhot_native_views(prior_sources.get('source_capture_fingerprint:taiwanhot'),
+                                          prior_parsers.get('source_parser_repair_fingerprint:taiwanhot'))
+        self.recheck_taiwanhot_route_metadata(prior_sources.get('source_capture_fingerprint:taiwanhot'),
+                                            prior_parsers.get('source_parser_repair_fingerprint:taiwanhot'))
         self.recheck_restricted_bulk_pages(skip_providers=scheduling_only_changes)
         if previous and previous[0] == fingerprint:
             if parser_settings:
@@ -968,10 +972,15 @@ class NewsQueue:
                                     "AND metadata_order_day IS NULL AND metadata_date_raw LIKE '____-__-__%'", (host,))
                     self.db.execute("UPDATE articles SET state='pending',due=0,error_code=NULL "
                                     "WHERE host=? AND state='awaiting_authorization'", (host,))
-                    if parser_changed and source.provider != 'cnyes':
+                    if (parser_changed and source.provider != 'cnyes'
+                            and not (source.provider == 'taiwanhot'
+                                     and source.embedded_article_layout == 'taiwanhot_visible_article_v3')):
                         # Retry parser failures only after a parser repair,
                         # not changed scheduling/review prose. Access and the
                         # complete capture contract are evaluated separately.
+                        # TWH v3's pinned migration above owns its observation
+                        # cohort; the generic reset would erase leased/head
+                        # failures and their attempts/deadlines afterwards.
                         self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 "
                                         "WHERE host=? AND state IN ('body_not_found','article_attribution_not_verified',"
                                         "'article_title_not_verified')", (host,))
@@ -1053,7 +1062,9 @@ class NewsQueue:
                         for key, url in failures:
                             if re.fullmatch(source.pdf_path_pattern, urlsplit(url).path):
                                 self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 WHERE id=?", (key,))
-                    if parser_changed and (source.provider == 'inside' or source.source_not_found_paths or source.allow_short_configured_body):
+                    if (parser_changed and (source.provider == 'inside' or source.source_not_found_paths or source.allow_short_configured_body)
+                            and not (source.provider == 'taiwanhot'
+                                     and source.embedded_article_layout == 'taiwanhot_visible_article_v3')):
                         # Reviewed namespace/soft-404 and exact short-body
                         # parser repairs only, not a source-error reset.
                         # Preserve all source refusals, paywalls, missing URLs
@@ -1097,6 +1108,110 @@ class NewsQueue:
         self.migrate_parser_repair_lanes()
         self.migrate_unknown_cnyes_body_rechecks()
         self.migrate_unknown_cnyes_identity_rechecks()
+
+    def recheck_taiwanhot_native_views(self, previous_capture, previous_identity):
+        """Pinned v1 URI admission defects, not body failures/source refusals.
+
+        Keep attempts, due, error/observation clocks and raw/head evidence.
+        Move only newly admitted missing/unleased literal views to the bounded
+        retry lane. Unknown old parsers and unchanged owner starts do no scan.
+        """
+        from downloader.news_fulltext_public_originals import (
+            TAIWANHOT_V1_NATIVE_VIEW_REPAIR_IDENTITY, taiwanhot_article_id)
+        source = self.registry.sources.get('taiwanhot')
+        old_capture, old_parser = TAIWANHOT_V1_NATIVE_VIEW_REPAIR_IDENTITY
+        if (source is None or not source.allowed or source.embedded_article_layout != 'taiwanhot_visible_article_v2'
+                or previous_capture != old_capture or not isinstance(previous_identity, str)):
+            return
+        try:
+            old_identity = json.loads(previous_identity)
+        except (ValueError, TypeError):
+            return
+        if old_identity != {'contract_version': 1, 'data_fingerprint': old_capture, 'parser_fingerprint': old_parser}:
+            return
+        marker = 'taiwanhot_native_view_identity_repair_v2:' + old_capture + ':' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        with self.metrics.measure('native_view_identity_repair', source.provider), self.db:
+            candidates = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                'FROM articles INDEXED BY dispatch WHERE provider=? AND state IN '
+                "('article_identity_not_verified','unsupported_article_path') AND body_sha256 IS NULL "
+                'AND lease_owner IS NULL AND lease_until IS NULL', (source.provider,)).fetchall()
+            repaired = []
+            for row in candidates:
+                if row['error_code'] != row['state'] or taiwanhot_article_id(row['url'], requested=True, native_view=True) is None:
+                    continue
+                bare_identity = (row['state'] == 'article_identity_not_verified'
+                    and urlsplit(row['url']).netloc == 'taiwanhot.net'
+                    and taiwanhot_article_id(row['url'], requested=True) is not None)
+                new_query_view = (row['state'] == 'unsupported_article_path'
+                                  and taiwanhot_article_id(row['url'], requested=True) is None)
+                if not (bare_identity or new_query_view):
+                    continue
+                self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],))
+                repaired.append({k: row[k] for k in ('url', 'state', 'error_code', 'attempts', 'due', 'last_checked_at_utc')})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 2, 'old_capture': old_capture, 'old_parser': old_parser,
+                'new_capture': source.data_fingerprint, 'new_parser': source.parser_repair_fingerprint,
+                'observed_at_utc': utc_now(), 'rows_moved': len(repaired), 'rows': repaired,
+                'target_state': 'retry', 'attempts_due_errors_clocks_and_bodies_preserved': True,
+                'source_refusals_leases_and_stored_heads_reset': False, 'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_view_identity_failures_scheduled_for_recheck', len(repaired))
+
+    def recheck_taiwanhot_route_metadata(self, previous_capture, previous_identity):
+        """Pinned route observation or verified whole-short-prose repair.
+
+        A short/old focus path can now be validated. Other still-unidentified
+        public responses need the newly bounded failure metadata once, not an
+        unproven body-complete verdict. Preserve leases/heads/source refusals
+        and original attempts, due and clocks; normal retry fairness applies.
+        A separate pinned v3 short-prose opt-in moves only missing bodies;
+        other identity errors and diagnostic budgets are never reset.
+        """
+        from downloader.news_fulltext_public_originals import (
+            TAIWANHOT_V2_ROUTE_REPAIR_IDENTITY, TAIWANHOT_V3_SHORT_PROSE_REPAIR_IDENTITY,
+            taiwanhot_request_ids)
+        source = self.registry.sources.get('taiwanhot')
+        if (source is None or not source.allowed or source.embedded_article_layout != 'taiwanhot_visible_article_v3'
+                or not isinstance(previous_identity, str)):
+            return
+        short_prose = (source.allow_short_configured_body
+                       and previous_capture == TAIWANHOT_V3_SHORT_PROSE_REPAIR_IDENTITY[0])
+        old_capture, old_parser = (TAIWANHOT_V3_SHORT_PROSE_REPAIR_IDENTITY if short_prose else
+                                   TAIWANHOT_V2_ROUTE_REPAIR_IDENTITY)
+        if previous_capture != old_capture:
+            return
+        try:
+            old = json.loads(previous_identity)
+        except (ValueError, TypeError):
+            return
+        if old != {'contract_version': 1, 'data_fingerprint': old_capture, 'parser_fingerprint': old_parser}:
+            return
+        marker = ('taiwanhot_complete_short_prose_repair_v3:' if short_prose else
+                  'taiwanhot_route_metadata_observation_v3:') + old_capture + ':' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        with self.metrics.measure('route_metadata_recheck', source.provider), self.db:
+            candidates = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                'FROM articles INDEXED BY dispatch WHERE provider=? AND state IN '
+                + ("('body_not_found')" if short_prose else
+                   "('unsupported_article_path','article_identity_not_verified','body_not_found')")
+                + ' AND body_sha256 IS NULL AND lease_owner IS NULL AND lease_until IS NULL', (source.provider,)).fetchall()
+            rows = []
+            for row in candidates:
+                if row['error_code'] != row['state'] or not taiwanhot_request_ids(row['url']):
+                    continue
+                self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],))
+                rows.append({k: row[k] for k in ('url','state','error_code','attempts','due','last_checked_at_utc')})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 3, 'old_capture': old_capture, 'old_parser': old_parser,
+                'new_capture': source.data_fingerprint, 'new_parser': source.parser_repair_fingerprint,
+                'observed_at_utc': utc_now(), 'rows_moved': len(rows), 'rows': rows,
+                'target_state': 'retry', 'attempts_due_errors_clocks_and_bodies_preserved': True,
+                'source_refusals_leases_and_stored_heads_reset': False,
+                'accepted_as_bodies': False, 'metadata_observation_is_not_a_body_repair': not short_prose,
+                'whole_configured_short_prose_with_native_metadata_optin': short_prose}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_route_or_unknown_metadata_rechecks_scheduled', len(rows))
 
     @staticmethod
     def unknown_cnyes_body_recheck_allowed(source, row):
@@ -1639,7 +1754,10 @@ class NewsQueue:
         regular work prefers first downloads over newer known parser repairs;
         those repairs receive their bounded independent turn. Due network
         retries retain latest-first service instead of being demoted with
-        parser failures. A regular-lane retry must not reset the oldest-due
+        parser failures. A due access refusal yields to ready first downloads
+        in the regular lane, but keeps the oldest-due retry lane's bounded turn.
+        This changes no source cooldown, per-row deadline or access policy.
+        A regular-lane retry must not reset the oldest-due
         lane's independent service credit; only selecting that lane does.
         Within an already awarded stored-body slot, a separate burst serves
         the oldest due failed recheck. This does not borrow missing-body work
@@ -1721,6 +1839,18 @@ class NewsQueue:
                                 fresh_missing_ready = True
                 if candidates:
                     break  # A lane without due work never consumes an idle slot.
+            # The newer refused URL otherwise wins after every source cooldown
+            # and starves older first downloads. Use the already-found, bounded
+            # candidates: no new query/index, due reset or publisher request.
+            # An awarded retry/stored/undated turn retains its original share.
+            if lane == 'regular' and any(r['state'] == 'pending' and r['body_sha256'] is None
+                                         and r['error_code'] is None for r in candidates):
+                ready = [r for r in candidates if not (r['body_sha256'] is None
+                         and r['state'] in {'retry', 'retry_cooldown'}
+                         and r['error_code'] == 'source_access_denied')]
+                if len(ready) < len(candidates):
+                    self.metrics.count(provider, 'frontier_access_refusal_fairness_deferrals')
+                    candidates = ready
             row = max(candidates, key=lambda r: (r['body_sha256'] is None,
                 (r['cnyes_known_body_candidate'] == candidate_turn) if provider == 'cnyes' and lane == 'regular' else True,
                 r["metadata_order_day"] or "")) if candidates else None
@@ -1781,7 +1911,7 @@ class NewsQueue:
         if not source.allowed:
             feeds = source.metadata_feeds
             return ("kind='metadata_feed' AND url IN (" + ','.join('?' for _ in feeds) + ")", list(feeds)) if feeds else ("0", [])
-        if source.acquisition_mode == "finite":
+        if source.acquisition_mode == "finite" or source.known_url_only:
             return "0", []  # Retain old discovery receipts, never poll them.
         clauses = ["kind NOT IN ('wordpress_posts','cnyes_news','rss_fulltext','metadata_feed')"]
         parameters = []
@@ -1829,7 +1959,8 @@ class NewsQueue:
         # SQLite cannot prove a partial-index predicate once the finite-scope
         # WHERE 0 is constant-folded. Keep that explicit no-discovery query
         # free of an index hint; it must remain a no-work result, not a crash.
-        index_hint = '' if source.acquisition_mode == 'finite' or not source.request_enabled else ' INDEXED BY discovery_ready_order'
+        index_hint = '' if (source.acquisition_mode == 'finite' or source.known_url_only
+                            or not source.request_enabled) else ' INDEXED BY discovery_ready_order'
         statement, binds = host_filtered_query(
             'SELECT * FROM discovery' + index_hint +
             ' WHERE provider=? AND due<=? AND superseded_by_windows_json IS NULL',
@@ -2003,6 +2134,8 @@ class NewsQueue:
                 raise ValueError('retained_metadata_head_changed_before_acceptance')
             if record.get('retained_supplement_head_json') is not None and not self._supplement_head_matches(record):
                 raise ValueError('retained_supplement_head_changed_before_acceptance')
+            if record.get('retained_failure_head_json') is not None and not self._failure_replay_head_matches(record):
+                raise ValueError('retained_failure_head_changed_before_acceptance')
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
         relative = f"bodies/{stamp[:8]}/{stamp}.parquet"
         target = self.root / relative
@@ -2095,10 +2228,46 @@ class NewsQueue:
                 and head['lease_owner'] is None and head['lease_until'] is None
                 and all(head[key] == expected[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS if key not in restart_fields))
 
+    def _failure_replay_head_matches(self, record):
+        """A retained normal response cannot restore a superseded URL head."""
+        from downloader.news_fulltext_cohorts import RETAINED_SUPPLEMENT_HEAD_FIELDS
+        from downloader.news_fulltext_replay import RETAINED_FAILURE_REPLAY_VERSION
+        if (record.get('retained_failure_replay_contract_version') != RETAINED_FAILURE_REPLAY_VERSION
+                or record.get('acquisition_transport') != 'retained_raw_reparse'):
+            raise ValueError('invalid retained failure acceptance contract')
+        expected = json.loads(record['retained_failure_head_json'])
+        if (set(expected) != set(RETAINED_SUPPLEMENT_HEAD_FIELDS) or expected['state'] != 'inflight'
+                or expected['body_sha256'] is not None or not expected['lease_owner']
+                or expected['url'] != record['requested_url'] or expected['provider'] != 'cnyes'):
+            raise ValueError('invalid retained failure missing-head witness')
+        source = self.registry.require(record['requested_url'])
+        if (not source.allowed or source.provider != 'cnyes' or source.acquisition_mode == 'finite'
+                or source.data_fingerprint != record['data_fingerprint']
+                or source.authorization_fingerprint != record['authorization_fingerprint']):
+            return False
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='failure_evidence_focus_attempts'").fetchone():
+            return False
+        head = self.db.execute('SELECT * FROM articles WHERE id=?', (bytes.fromhex(record['article_id']),)).fetchone()
+        ledger = self.db.execute('''SELECT 1 FROM failure_evidence_focus_attempts WHERE provider='cnyes'
+            AND url_sha256=? AND attempt_number=? AND cohort_id=? AND receipt_path=? AND response_sha256=? AND outcome='raw_saved' ''',
+            (bytes.fromhex(record['article_id']), record['retained_failure_attempt_number'],
+             record['retained_failure_scope_id'], record['replay_source_receipt'], record['response_sha256'])).fetchone()
+        if head is None or ledger is None:
+            return False
+        if all(head[key] == expected[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS):
+            return True
+        restart_fields = {'state', 'due', 'error_code', 'lease_owner', 'lease_until'}
+        return (head['state'] == 'retry' and head['due'] == 0 and head['error_code'] == 'owner_restart'
+                and head['lease_owner'] is None and head['lease_until'] is None
+                and all(head[key] == expected[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS if key not in restart_fields))
+
     def _accept_records(self, records: list[dict], relative: str, receipt_relative: str):
         metadata_heads, http_attempts = 0, 0
         with self.db:
             for record in records:
+                if record.get('retained_failure_head_json') is not None and not self._failure_replay_head_matches(record):
+                    self.counter('retained_failure_superseded_at_commit', 1)
+                    continue
                 if record.get('retained_supplement_head_json') is not None and not self._supplement_head_matches(record):
                     self.counter('retained_supplement_superseded_at_commit', 1)
                     continue
@@ -2118,7 +2287,8 @@ class NewsQueue:
                     body_sha256=?,parquet_path=?,etag=?,last_modified=?,authorization_fingerprint=?,
                     metadata_order_day=CASE WHEN coalesce(metadata_order_day,'')='' THEN ? ELSE metadata_order_day END,
                     lease_owner=NULL,lease_until=NULL WHERE id=?""",
-                    (record["captured_at_utc"], record["captured_at_utc"], record["body_bytes"], record["body_sha256"], relative,
+                    (record["captured_at_utc"], (json.loads(record['retained_failure_head_json'])['last_checked_at_utc']
+                        if record.get('retained_failure_head_json') is not None else record["captured_at_utc"]), record["body_bytes"], record["body_sha256"], relative,
                      record.get("etag"), record.get("last_modified"), record["authorization_fingerprint"],
                      accepted_publication_sort_day(record.get('published_at_raw')),
                      bytes.fromhex(record["article_id"])))
@@ -2189,6 +2359,10 @@ class NewsQueue:
             item = providers.setdefault(provider, {"states": {}, "text_bytes": 0})
             item["states"][state] = count
             item["text_bytes"] += body_bytes or 0
+        # Transactional head counters are O(providers), not an articles-table
+        # scan per heartbeat. Rechecks/failures retain old bodies and must not
+        # make their stored-body progress vanish with the complete state.
+        stored_heads = dict(self.db.execute("SELECT provider,heads FROM stored_body_metrics"))
         with self.metrics.measure('status_original_source_inventory'):
             original_sources = original_source_inventory(self.db, self.registry)
         for provider, evidence in original_sources['sources'].items():
@@ -2200,6 +2374,7 @@ class NewsQueue:
             }
         for provider, item in providers.items():
             source = self.registry.sources.get(provider)
+            item["stored_body_urls"] = stored_heads.get(provider, 0)
             item["configured"] = source is not None
             item["acquisition_mode"] = source.acquisition_mode if source else "unreviewed"
             if source and source.acquisition_mode == "finite":
@@ -2290,6 +2465,7 @@ class NewsQueue:
             "status_query_timing_contract_version": STATUS_QUERY_TIMING_CONTRACT_VERSION,
             "bulk_item_error_count_contract_version": BULK_ERROR_COUNT_CONTRACT_VERSION,
             "status_json_encoding": "compact_utf8",
+            "provider_stored_body_counter_contract_version": 1,
             "original_source_inventory": {key: value for key, value in original_sources.items() if key != 'sources'},
             "article_failure_observation_contract_version": FAILURE_OBSERVATION_CONTRACT_VERSION,
             "failure_diagnostic_budget_contract_version": FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION,
@@ -2319,7 +2495,7 @@ class NewsQueue:
             "owner_id": self.owner,
             "unique_articles": sum(totals.values()), "states": dict(totals), "providers": providers,
             "accepted_text_bytes": sum(p["text_bytes"] for p in providers.values()),
-            "articles_with_stored_body": self.db.execute("SELECT coalesce(sum(heads),0) FROM stored_body_metrics").fetchone()[0],
+            "articles_with_stored_body": sum(stored_heads.values()),
             "metadata_partitions": origins[0], "metadata_association_rows": origins[1], "invalid_metadata_urls": origins[2],
             "metadata_inventory": {"contract_version": METADATA_INGEST_CONTRACT_VERSION, "partial_partitions": metadata_pending[0],
                                    "partial_rows_imported": metadata_pending[1], "partial_rows_expected": metadata_pending[2],

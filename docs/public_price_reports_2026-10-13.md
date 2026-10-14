@@ -33,7 +33,9 @@
 - 進出場保留全精度；顯示用既有格式化，不改 VWAP 為整數或硬湊合法 tick。
 - 完整訊號有非零紙上成交且可對應同標的／模式／日期／成本的持倉，才顯示執行價。
   零成交訊號的計價來源不假冒自己的買賣。
-- 原始市價、bid／ask、分鐘 OHLC、未成交委託與其他市場價格維持獨立來源授權判斷。
+- 原始市價、bid／ask、分鐘 OHLC 與其他市場價格維持獨立來源授權判斷。
+  10 月 14 日使用者另明確授權公開策略 TP／SL 與已記錄委託，依下方獨立
+  owner-strategy contract 發布；未成交委託不是成交報告，也不是原始行情授權。
   nested raw quote 不能繼承 owner-report context。
 - 公開原因顯示「公開展示授權待確認」或「公開價格核對未通過」，不把權限不明
   說成沒有取得行情，也不暗示已確認禁止。
@@ -99,6 +101,7 @@ source hash 與金融快照 semantic hash。只有持倉封存 envelope 的 `arc
 | TWSE 官方日資料 | 開高低收、成交股數、成交金額、成交筆數 | [開放資料 11549](https://data.gov.tw/dataset/11549)；此資料集沒有列全市場最後買賣價，不把 MI_INDEX 的其他欄位自動放行。 |
 | TPEx 官方日資料 | 上述日資料、均價、盤後最後買賣價、次日參考價、次日申報上下界 | [開放資料 11370](https://data.gov.tw/dataset/11370) 明列這些欄位；標示原始來源日，不冒充當日市價或 tick。 |
 | 使用者模擬交易報告 | 已記錄的進場、退出成交價與交易損益 | 使用者要求公開；保留模擬及回放標籤，不描述為券商成交。 |
+| 使用者策略設定 | TP／SL、13:20 與尾盤限價、次日開盤沖銷委託價 | 10 月 14 日使用者明確要求公開；沿用原帳本策略值，標示非行情／非成交，不要求先成交才展示計畫。 |
 | 永豐證券與期貨 | 原有模型、資料取得及模擬帳本內部使用 | 證券公網報價轉載許可仍未確認；[期貨 API 同意書](https://www.sinotrade.com.tw/newweb/signCenter/F_openApi/) 另有書面授權條款，不混用兩種商品的約定。 |
 | MIS 即時市況 | 原有內部取價不變 | 免費瀏覽不等於上述日資料的開放授權；依 [TWSE FAQ](https://www.twse.com.tw/zh/products/information/qa.html) 與 [使用條款](https://www.twse.com.tw/zh/terms/use.html) 保留公網展示待確認狀態。 |
 | FinMind | 原有取得統計及內部取得不變；本次官行情由官來源接出 | [資料授權聲明](https://finmind.github.io/Disclaimer/) 區分原始開放來源與服務權限；歷史或非即時本身不是全面轉載許可。 |
@@ -167,3 +170,96 @@ run_fintech_python scripts/verify_public_price_projection.py \
 
 `cpu-2d` 驗證 HTML、SVG、Canvas 2D 及原生互動，不等同 GPU／WebGL 驗收。
 網站接線、資料健康、完整分鐘行情、行情轉載授權與真正券商成交仍分別驗收。
+
+## 2026 年 10 月 14 日策略 TP／SL 分類修正
+
+根因是原共用 `*_price` 遮蔽器只對「已成交的使用者交易報告」開例外，沒有
+區分策略輸出；TP／SL 因而被錯誤當作未核對的原始行情。改用
+`public_quote_display_v2` 與獨立 `owner_paper_strategy_report_v1`，兩頁重用
+同一發布層和 `detail-components.js?v=17`，不改模型、訊號、交易帳本或費用。
+
+### 欄位契約
+
+- TP／SL 是帳本中已存在的策略設定，不從官方日價猜算或覆蓋，保留原精度。
+- `eod_limit_price`、`closing_auction_limit_price`、`opening_exit_limit_price`
+  及訊號 `order_limit_price`、已記錄 LMT／LOCAL_STOP 指令可按策略報告顯示。
+  數值與對應交易日／原始 basis 或提交時鐘須有效；開盤沖銷委託使用其自己的
+  次日日期，不能拿建倉日配對。策略報告沒有成交量門檻，不能把「未成交」
+  等同「沒有策略價格」。
+- basis／提交時鐘不冒充回放的實際生成時間。前端明示「策略設定 · 非行情／非成交」，
+  成交欄則維持「模擬帳本成交 · 非券商成交」，原回放旗標仍保留。
+- 例外只在可信的持倉、訊號及指令集合生效；巢狀行情、原始 OHLC／bid／ask、
+  sizing 輸入價與交易所價格界線不會繼承使用者策略設定權限。
+- 官方價格仍依命名的資料集、欄位、角色與日期核對。櫃買 11370 明列次日
+  申報上下界；不能換標籤當今天漲跌停。上市價格界線的公開規則與直接轉載
+  來源產品也不能混為一談：[交易制度](https://www.twse.com.tw/zh/products/system/trading.html)
+  與 [漲跌幅資料表的使用範圍](https://eshop.twse.com.tw/zh/product/detail/d701c003b95c4a7497b9ea6447f0fcdd)
+  分別說明計算原則與來源產品條件，不據此聲稱所有漲跌停數字都禁止展示。
+
+### 刷新與範圍
+
+公開策略政策 fingerprint 納入當沖、隔日沖 status／detail 的 revision；只有
+政策改變時也會更新價格投影。fingerprint 每個載入政策只計算一次，不逐列讀檔
+或重新 hash，且不改 `history_revision`、不重算金融分鐘曲線。政策設定仍由
+唯讀 reader 重啟載入；不重新登入永豐、不啟動 provider 下載、不重啟交易引擎。
+
+本輪完整來源清冊為 39 群組、48 個登記／查證項目及 161 個官方 collector 項目。
+15 個命名資料集的政府授權 metadata 已核對，146 個仍待逐項核對。公開價格
+grant 仍只有 TWSE／TPEx 的兩個日資料集；使用者策略／模擬成交是另兩種報告
+用途，不因來源可匿名下載、價格為歷史資料或使用者非商用，就擴張成其他原始
+行情的公開授權。進度、配額、效能、儲存及已登記欄位清冊沿用既有公網投影。
+
+完整 [本輪來源清冊](../artifacts/operations/public-owner-strategy-prices-20261014/source_inventory.json)
+包含 owner-report 可發布欄位、所有來源分類及待核對項目。
+
+### 驗收
+
+361 個相關 Python 測試、38 個 Node 測試通過；不是全庫測試宣告。今日 681 筆
+持倉逐頁直接對比未遮蔽的本機帳本，681 個 TP、681 個 SL 及共 1,755 個可見
+策略價格欄位與原值完全相等，另驗證進場、退出、股數、費用與損益不變。
+9 月 21 日只抽查首 100 筆持倉，不代表全歷史都逐頁查驗。
+
+公網兩頁各五種 viewport（筆電、1080p、2K、平板、手機）的原生互動與價格標籤
+通過，共 10 組；實際查看筆電、手機截圖，沒有整頁橫向溢位或 page error。
+`cpu-2d` 不代表 GPU／WebGL 驗證；IPv4 的這次價格驗收不重複宣稱雙棧網路已
+全面驗收。僅更新公開 reader，當沖、隔日沖、Discord、TAIFEX capture 與
+Cloudflare connector 的 PID／InvocationID 在最終部署前後不變。
+
+重測沿用本頁的 `verify_public_price_projection.py`，改用 2026-10-14 的
+`--session-date`。它以獨立 raw-file／private-ledger 比對，不反過來呼叫新分類器
+作為「證明」；原始失敗與替代驗收仍保留於 agent 工作流程收據。
+
+本次 [公網驗收](../artifacts/dashboard_acceptance/owner_strategy_prices_20261014_final/receipt.json)
+及 [部署讀回](../artifacts/operations/public-owner-strategy-prices-20261014/deployment_final.json)
+是價格接線證據，不替代策略健康、開盤延遲、行情完整性或券商成交驗收。
+
+## 2026-10-14：價格來源集中頁尾與距進場指標
+
+當沖、隔日沖共用 `detail-components.js` 的價格格式化，不再在進場、出場、TP／SL
+或事件價格旁重複來源。整頁最後的「資料來源與計算說明」保留來源角色、行情日期、
+實際取得／帳本紀錄時間及去重後完整官方日資料；隔日沖的來源契約也移入頁尾。
+公開權限、缺價理由、原始交易／重建時間和反事實標示仍保留，不增加行情公開授權。
+重新取資料不重載整份文件，且保留已展開的官方資料明細。
+
+新增唯讀 `public_entry_price_distance_v1`：只有進場與比較價格各自通過公開檢查後，
+才產生 `(比較價 - 進場價) / 進場價 × 100`；這是價格變化，不反轉空方符號，
+也不是扣費後損益。Tick 距離使用 canonical `tw_price_rules.py` 的商品／交易日級距
+跨區間累計，例如股票 999 → 1,005 是 2 tick，不能以末端的 5 元直接相除。
+VWAP／均價不改原值、不量化到報價格點，距離標為「約」；未知商品／日期沒有
+猜測 tick，未公開的價格也不能透過百分比或 tick 洩漏。
+
+已平倉的清算優先顯示帳本出場均價與出場時間；缺少均價時只顯示末次出場價，
+不補造完整出場均價。未平倉仍使用帳本當時清算估值；
+這是 renderer 的取欄位規則，沒有改成交、股數、費用、PnL、分鐘曲線或模型。
+475 個相關 Python 測試及 43 個 Node 測試通過，包含歷史級距、跨區間、ETF、
+正負方向、VWAP、缺價與發布權限；不是全庫測試宣告。
+
+今日 681 筆持倉的 1,456 個距進場欄位通過獨立 Decimal 驗算，原始財務欄位及
+兩份官方日資料來源 SHA 不變。公網兩頁各五種 viewport 共 10 組通過，無
+page error 或整頁橫向溢位；筆電與手機另以原生更新按鈕驗證展開狀態與不重載。
+隔日沖今日沒有持倉，實盤頁面的距離顯示不宣稱已驗證有成交的隔日沖紀錄；
+共用 renderer 的隔日沖案例由 Node 測試驗證。僅重啟公開 reader，交易引擎不動。
+
+本輪 [公網驗收與截圖](../artifacts/dashboard_acceptance/tw_price_footer_distance_20261014_release/receipt.json)
+及 [部署讀回](../artifacts/operations/tw-price-footer-distance-20261014/deployment.json)
+保留實際查驗範圍，沿用 `verify_public_price_projection.py` 可重新測試。

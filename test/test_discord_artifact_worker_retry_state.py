@@ -130,6 +130,29 @@ def test_proven_recovery_can_complete_without_retry(isolated_worker, monkeypatch
     assert emissions[-1]["retry_deferred"] == 0
 
 
+def test_obsolete_ready_hint_is_repaired_by_the_same_serial_owner(isolated_worker, monkeypatch):
+    status_path, emissions = isolated_worker
+    status_path.write_text(json.dumps({"jobs": {"market": _pending_job("ready")}}))
+    calls = []
+
+    def invalidate(_cfg, *, key, market):
+        assert runner.discord_bot._invalidate_ready_artifact_backfill(key, market)
+        return False
+
+    monkeypatch.setattr(runner.discord_bot, "_reconcile_artifact_backfill_if_current", invalidate)
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", lambda cfg: calls.append(cfg.market))
+    assert runner.run_once() == 0
+    assert calls == ["market"]
+    status = json.loads(status_path.read_text())
+    assert status["jobs"]["market"]["status"] == "ready"
+    assert status["jobs"]["market"]["attempt"] == 5
+    assert status["jobs"]["market"]["prior_ready_receipt"]["status"] == "ready"
+    assert status["jobs"]["market"]["prior_ready_receipt"]["attempt"] == 4
+    assert status["jobs"]["market"]["ready_invalidated_by_run_id"] == runner.discord_bot._BOT_RUN_ID
+    assert status["maintenance_run"]["attempted"] == 1
+    assert emissions[-1]["retry_deferred"] == 0
+
+
 def test_other_markets_continue_without_hiding_deferred_work(
     isolated_worker, monkeypatch, tmp_path
 ) -> None:
