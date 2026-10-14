@@ -34,6 +34,33 @@ def test_source_no_close_is_not_zero_or_previous_close(tmp_path):
         official_closes(root,_now(13,30).date())
 
 
+def test_source_pin_retains_exact_wire_after_latest_report_refresh(tmp_path):
+    root = reports(tmp_path)
+    latest = root / "twse_daily_ohlcv/2026-08-13.json"
+    prior = latest.read_bytes()
+    prices, pinned = official_closes(root, _now(13, 30).date(), exchanges=("twse",), pin_sources=True)
+    fixed = Path(pinned[0]["path"])
+    assert fixed != latest and fixed.read_bytes() == prior
+    assert fixed.name == latest.name and fixed.parent.name == latest.parent.name
+    changed = json.loads(prior)
+    changed["tables"][0]["data"][0][1] = "1000"
+    latest.write_text(json.dumps(changed))
+    retained, sources = official_closes(fixed.parent.parent, _now(13, 30).date(), exchanges=("twse",))
+    assert retained["2330"]["price"] == prices["2330"]["price"] == 999.
+    assert sources == pinned
+    refreshed, next_pin = official_closes(root, _now(13, 30).date(), exchanges=("twse",), pin_sources=True)
+    assert refreshed["2330"]["price"] == 1000. and next_pin[0]["path"] != str(fixed)
+    assert fixed.read_bytes() == prior
+
+
+def test_source_pin_rejects_modified_content_addressed_file(tmp_path):
+    root = reports(tmp_path)
+    _, pinned = official_closes(root, _now(13, 30).date(), exchanges=("twse",), pin_sources=True)
+    Path(pinned[0]["path"]).write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="immutable raw receipt changed"):
+        official_closes(root, _now(13, 30).date(), exchanges=("twse",), pin_sources=True)
+
+
 def test_official_close_parser_accepts_twse_notes_but_rejects_truncated_price_rows(tmp_path):
     root = reports(tmp_path)
     path = root / 'twse_daily_ohlcv/2026-08-13.json'

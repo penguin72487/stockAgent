@@ -32,6 +32,101 @@ REPORT_SOURCE = SOURCE.parent / 'reporting-source-v1.json'
 REPAIR_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_selected_20261008_v6.yaml'
 NUMERICAL_SOURCE = ROOT / ('artifacts/operations/training_launches/'
                          'tw_scale_cash_annual_last_fold_selected_20261008_v6/numerical-source-v2.json')
+OPTIMIZED_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_optimized_20261013_v7.yaml'
+OPTIMIZED_SOURCE = ROOT / ('artifacts/operations/training_launches/'
+                          'tw_scale_cash_annual_last_fold_optimized_20261013_v7/optimized-source-v1.json')
+FRONTIER_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_frontier_20261014_v8.yaml'
+FRONTIER_SOURCE = ROOT / ('artifacts/operations/training_launches/'
+                         'tw_scale_cash_annual_last_fold_frontier_20261014_v8/frontier-source-v1.json')
+
+
+def _frontier_source(parent: dict, binding_path: Path) -> tuple[dict, Path]:
+    """Extend the accepted optimized source with reviewed optimizer experiments."""
+    from stockagent.runtime_identity import verify_release_bundles, verify_source_release
+    binding = json.loads(binding_path.read_text())
+    if (binding.get('contract') != 'tw_ablation_frontier_source_v1'
+            or binding.get('parent_optimized_source_sha256') != parent['source_sha256']):
+        raise ValueError('frontier ablations require their accepted optimized parent')
+    receipt = Path(binding['source_receipt'])
+    code = receipt.parent / 'build-source'
+    observed = verify_source_release(receipt, code)
+    verify_release_bundles(receipt)
+    if observed['source_sha256'] != binding['source_sha256']:
+        raise ValueError('frontier source identity differs from its binding')
+    old = json.loads(Path(parent['source_receipt']).read_text())['code']['files']
+    new = json.loads(receipt.read_text())['code']['files']
+    changed = sorted(name for name in set(old) | set(new) if old.get(name) != new.get(name))
+    if changed != binding['amendment_files']:
+        raise ValueError('frontier source amendment inventory differs from review')
+    validation = Path(binding['optimizer_validation_receipt'])
+    if hashlib.sha256(validation.read_bytes()).hexdigest() != binding['optimizer_validation_sha256']:
+        raise ValueError('frontier optimizer validation receipt changed')
+    validation_proof = json.loads(validation.read_text())
+    if (validation_proof.get('source_sha256') != binding['validated_optimizer_source_sha256']
+            or validation_proof.get('torch_version') != parent['kernel_versions']['torch']
+            or validation_proof.get('optimizer_tests', 0) < 20
+            or validation_proof.get('optimizer_tests_returncode') != 0
+            or validation_proof.get('strict_cuda_returncode') != 0):
+        raise ValueError('frontier optimizer validation is incomplete')
+    # Queue/entrypoint changes can follow the tested optimizer release, but the
+    # actual optimizer, model and financial owners must be identical to it.
+    validated = json.loads(Path(binding['validated_optimizer_source_receipt']).read_text())['code']['files']
+    for name in set(new) | set(validated):
+        if name.startswith(('stockagent/', 'backtest/')) and new.get(name) != validated.get(name):
+            raise ValueError(f'frontier runtime differs from validated optimizer source: {name}')
+    dependency_root = Path(binding['dependency_root']).resolve()
+    dependency_files = binding['dependency_files']
+    if not dependency_files or not any(name.endswith('direct_url.json') for name in dependency_files):
+        raise ValueError('frontier dependencies lack pinned provenance')
+    for name, expected in dependency_files.items():
+        path = (dependency_root / name).resolve()
+        if (not path.is_relative_to(dependency_root)
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected):
+            raise ValueError(f'frontier optimizer dependency changed: {name}')
+    return {**parent, **binding}, code
+
+
+def _optimized_source(parent: dict, binding_path: Path) -> tuple[dict, Path]:
+    """Pin the reviewed merged release and the previously measured recipe."""
+    from stockagent.runtime_identity import verify_release_bundles, verify_source_release
+    binding = json.loads(binding_path.read_text())
+    if (binding.get('contract') != 'tw_ablation_optimized_source_v1'
+            or binding.get('parent_numerical_source_sha256') != parent['source_sha256']):
+        raise ValueError('optimized ablations require their accepted numerical parent')
+    receipt = Path(binding['source_receipt'])
+    code = receipt.parent / 'build-source'
+    observed = verify_source_release(receipt, code)
+    verify_release_bundles(receipt)
+    if observed['source_sha256'] != binding['source_sha256']:
+        raise ValueError('optimized source identity differs from its binding')
+    old = json.loads(Path(parent['source_receipt']).read_text())['code']['files']
+    new = json.loads(receipt.read_text())['code']['files']
+    changed = sorted(name for name in set(old) | set(new) if old.get(name) != new.get(name))
+    if changed != binding['amendment_files']:
+        raise ValueError('optimized source amendment inventory differs from review')
+    acceptance = Path(binding['performance_acceptance_receipt'])
+    if hashlib.sha256(acceptance.read_bytes()).hexdigest() != binding['performance_acceptance_sha256']:
+        raise ValueError('prior performance evidence changed')
+    performance = json.loads(acceptance.read_text())
+    if (performance.get('contract') != 'frontier_full_fold_abba_acceptance_v1'
+            or performance.get('order') != ['A', 'B', 'B', 'A']
+            or {r['source_sha256'] for r in performance['trials'] if 'candidate' in r['name']}
+               != {binding['performance_source_sha256']}):
+        raise ValueError('optimized recipe lacks its balanced complete-fold evidence')
+    for item in performance['trials']:
+        result = Path(item['result'])
+        if hashlib.sha256(result.read_bytes()).hexdigest() != item['result_sha256']:
+            raise ValueError('prior complete-fold result changed')
+    python = Path(binding['kernel_python']).absolute()
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise ValueError('optimized ablations require the validated private kernel environment')
+    versions = subprocess.run([str(python), '-c',
+        'import importlib.metadata as m,json; '
+        'print(json.dumps({k:m.version(k) for k in ("torch","quack-kernels","nvidia-cutlass-dsl")}))'],
+        check=True, capture_output=True, text=True)
+    if json.loads(versions.stdout) != binding['kernel_versions']:
+        raise ValueError('private kernel packages differ from the measured recipe')
+    return binding, code
 
 
 def _shifted_source(launch: dict, binding_path: Path) -> tuple[dict, Path]:
@@ -135,13 +230,16 @@ def _numerical_source(training: dict, reporting: dict, binding_path: Path) -> tu
     return binding, code
 
 
-def _command(code: Path, spec: Path, selected: set[str], *, dry_run: bool) -> list[str]:
-    command = [sys.executable, str(code / 'scripts/run_ablation_experiments.py'),
+def _command(code: Path, spec: Path, selected: set[str], *, dry_run: bool,
+             python: str | None = None, continue_on_failure: bool = False) -> list[str]:
+    command = [python or sys.executable, str(code / 'scripts/run_ablation_experiments.py'),
                '--spec', str(spec), '--runner', str(RUNNER),
                '--only', ','.join(sorted(selected)), '--max-folds', '1',
                '--multi-gpu-strategy', 'distributed_data_parallel', '--parallel-jobs', '1',
                '--cpu-threads', '8', '--torch-compile-threads', '16',
-               '--no-auto-resume', '--stop-on-fail']
+               '--no-auto-resume']
+    if not continue_on_failure:
+        command.append('--stop-on-fail')
     if dry_run:
         command.append('--dry-run')
     return command
@@ -188,9 +286,9 @@ def _training_preflight(code: Path, env: dict[str, str]) -> int:
     # failures without an NVML false positive or an uncaught properties query.
     # Then retain the exact frozen release's strict package/environment gate.
     commands = [
-        [sys.executable, str(ROOT / 'scripts/check_environment.py'),
+        [env.get('PYTHON_BIN', sys.executable), str(ROOT / 'scripts/check_environment.py'),
          '--require-cuda', '--minimum-cuda-devices', '2', '--strict'],
-        [sys.executable, str(code / 'scripts/check_environment.py'),
+        [env.get('PYTHON_BIN', sys.executable), str(code / 'scripts/check_environment.py'),
          '--require-cuda', '--strict'],
     ]
     for command in commands:
@@ -213,11 +311,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--plots-only', action='store_true', help='Refresh completed charts; no training or optimizer writes.')
     parser.add_argument('--numerical-repair', action='store_true',
                         help='Use the versioned fully Inductor small-head repair in a fresh v6 root; same experiments.')
+    parser.add_argument('--optimized', action='store_true',
+                        help='Baseline then 27 variants; shared measured recipe, OOM capacity retries, continue after failures.')
+    parser.add_argument('--frontier', action='store_true',
+                        help='Baseline, seven optimizer recipes, then the original 27 variants in a fresh v8 root.')
     args = parser.parse_args(argv)
     if args.plots_only and args.dry_run:
         parser.error('--plots-only and --dry-run are mutually exclusive')
     selected = _selection(args.only)
-    spec_path = REPAIR_SPEC if args.numerical_repair else SPEC
+    optimized = args.optimized or args.frontier
+    spec_path = (FRONTIER_SPEC if args.frontier else OPTIMIZED_SPEC if args.optimized
+                 else REPAIR_SPEC if args.numerical_repair else SPEC)
     if selected is None:
         _, all_rows = _experiment_rows(spec_path)
         selected = {row['name'] for row in all_rows}
@@ -242,10 +346,16 @@ def main(argv: list[str] | None = None) -> int:
     proof = json.loads(Path(launch['acceptance_receipt']).read_text())
     source, code = _shifted_source(launch, SOURCE)
     report_source, report_code = _reporting_source(source, REPORT_SOURCE)
-    if args.numerical_repair:
+    if args.numerical_repair or optimized:
         source, code = _numerical_source(source, report_source, NUMERICAL_SOURCE)
         # The numerical child contains the exact already-accepted reporting
         # scripts; pin both roles to the real child, not a misleading old SHA.
+        report_source, report_code = source, code
+    if optimized:
+        source, code = _optimized_source(source, OPTIMIZED_SOURCE)
+        report_source, report_code = source, code
+    if args.frontier:
+        source, code = _frontier_source(source, FRONTIER_SOURCE)
         report_source, report_code = source, code
     for required in ('scripts/run_ablation_experiments.py', 'scripts/check_environment.py', 'coda_runner.sh'):
         if not (code / required).is_file():
@@ -270,6 +380,16 @@ def main(argv: list[str] | None = None) -> int:
         'old_calendar_baseline_comparable': False,
         'variant_gpu_training_verified': False,
     }
+    if optimized:
+        contract.update(contract='annual_scale_cash_optimized_last_fold_ofat_v4',
+                        baseline_included=True, failure_policy='record_and_continue',
+                        capacity_policy=spec['runtime']['capacity_retry'],
+                        optimization_recipe_sha256=source['optimization_recipe_sha256'])
+    if args.frontier:
+        contract.update(contract='annual_scale_cash_frontier_optimizer_last_fold_v5',
+                        optimizer_recipes_after_baseline=True,
+                        optimizer_dependency_files=source['dependency_files'],
+                        optimizer_validation_sha256=source['optimizer_validation_sha256'])
     _bind_contract(output / 'ablation-contract.json', contract)
     runtime_root = ROOT / 'artifacts/operations/training_launches' / output.name
     _bind_contract(runtime_root / 'input-contract.json', contract)
@@ -289,7 +409,22 @@ def main(argv: list[str] | None = None) -> int:
     effective_spec.write_text(yaml.safe_dump(generated_spec, allow_unicode=True, sort_keys=False))
     env = _environment({**launch, 'source_receipt': source['source_receipt']}, proof, code)
     env['STOCKAGENT_ABLATION_REPORT_SOURCE_RECEIPT'] = report_source['source_receipt']
-    command = _command(report_code, effective_spec, selected, dry_run=args.dry_run)
+    python = sys.executable
+    if optimized:
+        recipe_path = ROOT / spec['optimization_recipe']
+        if hashlib.sha256(recipe_path.read_bytes()).hexdigest() != source['optimization_recipe_sha256']:
+            raise ValueError('optimized recipe changed; use a new versioned binding')
+        recipe = yaml.safe_load(recipe_path.read_text())['full_fold_candidates'][0]
+        python = str(Path(source['kernel_python']).absolute())
+        env.update(PYTHON_BIN=python, FINTECH_ENV_PATH=str(Path(python).parent.parent))
+        env.update({key: str(value) for key, value in recipe['runtime_overrides'].items()})
+        expected = recipe['overrides']['training']['financial_transformer']
+        if spec['matrix']['fixed_overrides']['training']['financial_transformer'] != expected:
+            raise ValueError('every ablation must use the exact shared baseline optimization recipe')
+    if args.frontier:
+        env['PYTHONPATH'] = os.pathsep.join([source['dependency_root'], str(code), env.get('PYTHONPATH', '')])
+    command = _command(report_code, effective_spec, selected, dry_run=args.dry_run,
+                       python=python, continue_on_failure=optimized)
     if args.plots_only:
         command.append('--plots-only')
     ordered = [row['name'] for row in rows]
@@ -310,7 +445,8 @@ def main(argv: list[str] | None = None) -> int:
         return subprocess.run(command, cwd=report_code, env=env).returncode
     # Cheap generation and canonical calendar checks precede any GPU lease/job.
     # Dry-run/config construction alone cannot prove annual lookback coverage.
-    prepared = subprocess.run(_command(report_code, effective_spec, selected, dry_run=True), cwd=report_code, env=env)
+    prepared = subprocess.run(_command(report_code, effective_spec, selected, dry_run=True,
+        python=python, continue_on_failure=optimized), cwd=report_code, env=env)
     if prepared.returncode:
         return prepared.returncode
     _, full_queue = _experiment_rows(spec_path)
@@ -318,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     context_name = ('calendar-context.json' if len(rows) == len(full_queue)
                     else f'calendar-context-{selection_id}.json')
     context_receipt = runtime_root / context_name
-    context = subprocess.run([sys.executable, str(ROOT / 'scripts/check_tw_scale_cash_ablation_context.py'),
+    context = subprocess.run([python, str(ROOT / 'scripts/check_tw_scale_cash_ablation_context.py'),
         '--code-root', str(code), '--config-root', str(output / 'generated_configs'),
         '--baseline-config', launch['config'], '--only', ','.join(ordered),
         '--report', str(context_receipt)], cwd=code, env=env)
@@ -333,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
                       'formal_training_started': False}, ensure_ascii=False), flush=True)
     # Old calendar-period results are not a control for shifted periods.
     # Preserve per-case reporting; paired plots wait for a matching control.
-    if (output / 'baseline/summary.json').exists():
+    if not optimized and (output / 'baseline/summary.json').exists():
         raise ValueError('shifted queue must not inherit an unverified baseline reference')
     if context.returncode:
         print('所選實驗缺少年初因果上下文；尚未啟動訓練。詳見 ' + str(context_receipt), flush=True)

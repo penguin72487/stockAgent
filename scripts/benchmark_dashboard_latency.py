@@ -64,7 +64,7 @@ def summarize(values):
             "max_ms": round(max(values), 3)}
 
 
-def service_snapshot():
+def service_snapshot(*, include_host_services=False):
     """Allowlisted local runtime and last-attempt evidence for every installed service.
 
     Last-attempt duration is distinct from the age of a daemon and from an
@@ -76,7 +76,7 @@ def service_snapshot():
                           "ExecMainStatus", "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic")
     properties = (*text_properties, "ControlGroup", *counter_properties)
     result = subprocess.run(
-        ["systemctl", "show", "stockagent-*.service", "--all", "--no-pager",
+        ["systemctl", "show", "*.service" if include_host_services else "stockagent-*.service", "--all", "--no-pager",
          "--property=" + ",".join(properties)],
         check=True, capture_output=True, text=True, timeout=10,
     )
@@ -84,7 +84,7 @@ def service_snapshot():
     for block in result.stdout.split("\n\n"):
         values = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
         unit = values.get("Id", "")
-        if not unit.startswith("stockagent-") or not unit.endswith(".service"):
+        if not unit.endswith(".service") or (not include_host_services and not unit.startswith("stockagent-")):
             continue
         units[unit] = {key: values.get(key) for key in text_properties}
         for key in counter_properties:

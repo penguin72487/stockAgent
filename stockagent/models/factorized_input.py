@@ -134,6 +134,41 @@ def _factorized_stock_chunk_size(model, slab, mask, *, raw_basis=False):
     return max(1, min(cap, budget // max(1, rows * slab.size(2) * 4)))
 
 
+def forward_factorized_live_window(model, window, mask, *, return_aux=None,
+                                   symbol_indices=None, portfolio_context=None):
+    """Lossless bounded transport, full-shape original math, private workspace."""
+    if model.training or not torch.is_inference_mode_enabled():
+        raise RuntimeError("factorized live windows require eval and inference mode")
+    if (model._input_basis_enabled() or model._raw_temporal_basis_enabled()
+            or model.temporal_basis_feature_encoder is not None
+            or getattr(model, "daily_context_encoder", None) is not None
+            or model.candle_encoder.causal_feature_window_rms_normalization
+            or not model.candle_encoder.causal_feature_rms_normalization
+            or model.candle_encoder.causal_feature_compression != "none"
+            or model.candle_encoder.feature_svd_components
+            or model.candle_encoder.feature_bottleneck_dim):
+        raise ValueError("factorized live windows require the admitted no-basis model")
+    if any(isinstance(m, nn.Dropout) and m.p != 0 for m in model.modules()):
+        raise ValueError("factorized live encoding requires zero dropout")
+    if tuple(window.shape) != (model.lookback, mask.size(1), model.num_features):
+        raise ValueError("factorized live window does not match the model input schema")
+    if not model.allow_dynamic_symbols and symbol_indices is None and mask.size(1) != model.num_symbols:
+        raise ValueError("factorized live window does not match the checkpoint symbol axis")
+    model._check_symbol_indices(symbol_indices, mask.size(1))
+    collect = return_aux is True or (return_aux is None and model.return_aux and model.return_aux_details)
+    # Preserve the ORIGINAL full shape/GEMM/reduction schedule. Chunking the
+    # Candle projection itself is not bit-equivalent on all CUDA kernels.
+    # Only storage transport is chunked. This freshly reconstructed allocation
+    # is owned by this call, so RMS can normalize in place without a 5 GiB clone.
+    raw = window.materialize(model.candle_encoder.candle_query.device)
+    h, token_aux = model.candle_encoder(raw, return_aux=collect, owned_inference=True)
+    del raw
+    h = model._add_window_positions(h, int(mask.size(1)), symbol_indices)
+    output = model._forward_embedded(h, mask, return_aux=return_aux,
+                                    portfolio_context=portfolio_context)
+    return model._attach_candle_aux(output, token_aux, return_aux)
+
+
 @torch.compiler.disable
 def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
                             symbol_indices=None,portfolio_context=None):

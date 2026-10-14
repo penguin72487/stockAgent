@@ -98,6 +98,61 @@ def _resolution_snapshot():
             'original_url': 'https://private.test/?api_key=PRIVATE_TOKEN', 'body': 'PRIVATE_BODY'}
 
 
+def _metadata_feed_snapshot(tmp_path):
+    status = _seed(tmp_path)
+    progress = {'contract_version': 1, 'enabled': True, 'registered_feeds': 14, 'verified_feeds': 2,
+        'latest_feed_item_observations': 80, 'latest_feed_response_bytes': 40000,
+        'feeds_with_errors': 0, 'poll_interval_seconds': 300,
+        'next_check_at_utc': (NOW + timedelta(minutes=5)).isoformat(), 'last_check_at_utc': NOW.isoformat(),
+        'article_bodies_accepted': 0, 'overlapping_feed_items_not_unique_articles': True,
+        'all_history_complete': False, 'finish_eta_utc': None, 'raw_xml': 'PRIVATE_XML', 'items': ['PRIVATE_SUMMARY']}
+    status['providers']['ltn'] = {'states': {'awaiting_authorization': 5}, 'text_bytes': 0,
+        'automatic_collection_enabled': True, 'automatic_fulltext_allowed': False, 'metadata_feed_progress': progress}
+    status['unique_articles'] += 5
+    status['states']['awaiting_authorization'] += 5
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    return status
+
+
+def test_metadata_feed_counts_never_become_fulltext_eta_or_exported_rows(tmp_path):
+    _metadata_feed_snapshot(tmp_path)
+    data = build_news_public_status(tmp_path, now=NOW)
+    row = next(item for item in data['providers'] if item['id'] == 'ltn')
+    assert row['enabled'] and row['state'] == 'metadata_polling' and not row['automatic_fulltext_allowed']
+    assert row['complete_urls'] == 0 and row['conditional_eta_seconds'] is None
+    assert row['conditional_finish_at_utc'] is None and row['completion_forecast'] is None
+    assert row['metadata_feed_progress']['latest_feed_item_observations'] == 80
+    assert row['metadata_feed_progress']['verified_feeds'] == 2
+    assert 'PRIVATE_XML' not in json.dumps(data) and 'PRIVATE_SUMMARY' not in json.dumps(data)
+    assert build_news_public_status(tmp_path, now=NOW + timedelta(seconds=181))['worker']['fresh'] is False
+
+
+@pytest.mark.parametrize('cooling,errors,expected', [(False, 0, 'metadata_polling'),
+    (False, 1, 'attention'), (True, 0, 'cooldown'), (True, 1, 'cooldown')])
+def test_metadata_polling_cannot_hide_source_cooldowns_or_feed_errors(tmp_path, cooling, errors, expected):
+    status = _metadata_feed_snapshot(tmp_path)
+    status['providers']['ltn']['metadata_feed_progress']['feeds_with_errors'] = errors
+    if cooling:
+        status['provider_next_attempt_utc']['ltn'] = (NOW + timedelta(minutes=5)).isoformat()
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    row = next(item for item in build_news_public_status(tmp_path, now=NOW)['providers'] if item['id'] == 'ltn')
+    assert row['state'] == expected
+    assert row['conditional_eta_seconds'] is None and row['completion_forecast'] is None
+
+
+@pytest.mark.parametrize('next_at,ready', [('1970-01-01T00:00:00+00:00', True),
+    ((NOW - timedelta(seconds=1)).isoformat(), True),
+    ((NOW + timedelta(minutes=5)).isoformat(), False), (None, False)])
+def test_metadata_zero_due_is_ready_not_a_1970_calendar_date(tmp_path, next_at, ready):
+    status = _metadata_feed_snapshot(tmp_path)
+    status['providers']['ltn']['metadata_feed_progress']['next_check_at_utc'] = next_at
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    row = next(item for item in build_news_public_status(tmp_path, now=NOW)['providers'] if item['id'] == 'ltn')
+    progress = row['metadata_feed_progress']
+    assert progress['next_check_ready'] is ready
+    assert progress['next_check_at_utc'] == (None if next_at == '1970-01-01T00:00:00+00:00' else next_at)
+
+
 def _original_source_snapshot(status):
     status['providers']['unregistered:only-original.test'] = {
         'states': {}, 'text_bytes': 0, 'automatic_collection_enabled': False,
@@ -349,6 +404,20 @@ def test_failed_supplement_has_no_false_finished_countdown(tmp_path):
     assert source['state'] == 'attention'
     assert source['finite_supplements']['progress_ratio'] == 0
     assert source['conditional_eta_seconds'] is source['conditional_finish_at_utc'] is None
+
+
+def test_missing_title_is_visible_as_its_own_blocker_not_an_author_error(tmp_path):
+    status = _seed(tmp_path)
+    status['providers']['cnyes']['states'] = {'complete': 2, 'pending': 3, 'article_title_not_verified': 1}
+    status['states'] = {**status['providers']['cnyes']['states'], 'awaiting_authorization': 4}
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['states']['article_title_not_verified'] == 1
+    assert 'article_attribution_not_verified' not in source['states']
+    assert source['known_urls'] == 6 and source['complete_urls'] == 2
+    assert source['remaining_urls'] == 3 and source['blocked_urls'] == 1
+    assert result['states']['article_title_not_verified'] == 1
 
 
 def test_recorded_nonbody_outcomes_leave_body_denominators_and_private_proofs_separate(tmp_path):

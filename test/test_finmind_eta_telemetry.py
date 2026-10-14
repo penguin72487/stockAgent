@@ -207,6 +207,48 @@ def test_read_connection_cannot_mutate_queue(tmp_path):
             conn.execute("DELETE FROM requests")
 
 
+def test_shared_queue_aggregates_preserve_forecast_and_avoid_regrouping(tmp_path, monkeypatch):
+    from scripts import audit_finmind_query_ranges
+    from downloader import finmind_eta_work as work
+    from test_finmind_eta_work import _database, _spec
+    dataset = 'TaiwanFuturesKBar'
+    monkeypatch.setattr(audit_finmind_query_ranges, 'registry', lambda: {dataset: {
+        **_spec(dataset, 'complement'), 'query_shape': 'per_id_day'}})
+    _database(tmp_path, 'sponsor', [])
+    path = _database(tmp_path, 'complement', [
+        (dataset, 'TX', 'a', 'id_day', 8, 'complete', NOW.isoformat()),
+        (dataset, 'TX', 'b', 'id_day', 8, 'complete', (NOW + timedelta(days=1)).isoformat()),
+        (dataset, 'TX', 'c', 'id_day', 8, 'complete', None),
+        (dataset, 'TX', 'd', 'id_day', 10, 'observed_empty', NOW.isoformat()),
+    ])
+    with sqlite3.connect(path) as conn:
+        conn.execute('ALTER TABLE tasks ADD COLUMN rows INTEGER DEFAULT 0')
+        conn.execute('ALTER TABLE tasks ADD COLUMN bytes INTEGER DEFAULT 0')
+        conn.execute('ALTER TABLE tasks ADD COLUMN last_attempt_at_utc TEXT')
+    snapshots = {}
+    work.build_finmind_workload(tmp_path, NOW, queue_snapshots=snapshots)
+    baseline_forecast = telemetry.recurring_forecast(tmp_path, NOW)
+    baseline_worker = telemetry._queue_worker(tmp_path / 'complement', 'complement', NOW)
+    statements = []
+    original_connect = telemetry._connect
+    @contextmanager
+    def traced(database):
+        with original_connect(database) as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+    monkeypatch.setattr(telemetry, '_connect', traced)
+    assert telemetry.recurring_forecast(tmp_path, NOW, queue_snapshots=snapshots) == baseline_forecast
+    assert telemetry._queue_worker(tmp_path / 'complement', 'complement', NOW,
+                                   snapshot=snapshots['complement']) == baseline_worker
+    assert not any('SELECT state,count(*) FROM tasks' in query for query in statements)
+    assert not any('SELECT dataset,kind,priority,state,count(*)' in query for query in statements)
+    # Another time or another root must take a fresh ordinary inventory.
+    statements.clear()
+    assert telemetry.recurring_forecast(tmp_path, NOW + timedelta(seconds=1), queue_snapshots=snapshots) == \
+        telemetry.recurring_forecast(tmp_path, NOW + timedelta(seconds=1))
+    assert any('SELECT dataset,kind,priority,state,count(*)' in query for query in statements)
+
+
 def test_traffic_extrema_use_two_covering_index_seeks(tmp_path, monkeypatch):
     first, last = NOW - timedelta(days=300), NOW - timedelta(seconds=1)
     _traffic(tmp_path, [last, NOW + timedelta(days=1), first])

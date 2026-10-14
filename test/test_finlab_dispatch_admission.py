@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import os
+import shutil
 import subprocess
 
 from scripts.check_finlab_refresh_due import refresh_due
@@ -139,7 +141,54 @@ def test_deployed_timer_contract_has_real_runtime_entrypoint():
     timer = (root / "deploy/systemd/stockagent-finlab-local-refresh.timer.in").read_text()
     assert 'ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_due.sh"' in service
     assert "OnUnitInactiveSec=1min" in timer
+    assert "OnActiveSec=1min" in timer  # A previous boot's deactivation cannot seed retries.
     subprocess.run(["bash", "-n", str(root / "scripts/run_finlab_refresh_due.sh")], check=True)
+
+
+def test_timer_only_installer_does_not_replace_or_restart_workers(tmp_path):
+    """Exercise the real installer with privileged mutations replaced by logs."""
+    root = Path(__file__).resolve().parents[1]
+    isolated = tmp_path / "repo"
+    scripts = isolated / "scripts"
+    templates = isolated / "deploy/systemd"
+    scripts.mkdir(parents=True)
+    templates.mkdir(parents=True)
+    for name in ("install_registered_data_refresh_services.sh", "run_finlab_refresh.sh",
+                 "run_finlab_refresh_frozen.sh"):
+        shutil.copyfile(root / "scripts" / name, scripts / name)
+    timer = "stockagent-finlab-local-refresh.timer"
+    shutil.copyfile(root / "deploy/systemd" / f"{timer}.in", templates / f"{timer}.in")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    for command in ("systemctl", "systemd-analyze", "install"):
+        fake = bin_dir / command
+        fake.write_text(
+            '#!/bin/bash\n'
+            'printf "%s %s\\n" "${0##*/}" "$*" >> "$FINLAB_TEST_COMMAND_LOG"\n'
+            'if [[ "${0##*/}" == "systemctl" && "${1:-}" == "show" ]]; then echo waiting; fi\n'
+        )
+        fake.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(scripts / "install_registered_data_refresh_services.sh"), "finlab-timer-only"],
+        env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+             "FINLAB_TEST_COMMAND_LOG": str(command_log)},
+        text=True, capture_output=True,
+    )
+    # The installer intentionally retains its existing root requirement.
+    if os.geteuid() != 0:
+        assert result.returncode == 2 and not command_log.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    commands = command_log.read_text().splitlines()
+    assert [row for row in commands if row.startswith("systemctl ")] == [
+        "systemctl daemon-reload", f"systemctl enable {timer}",
+        f"systemctl restart {timer}", f"systemctl show {timer} -p SubState --value",
+    ]
+    installed = [row for row in commands if row.startswith("install ")]
+    assert len(installed) == 1 and timer in installed[0]
+    assert ".service" not in installed[0] and "quota-snapshot" not in "\n".join(commands)
+    assert "worker and other units left untouched" in result.stdout
 
 
 def test_dead_owner_and_overrun_are_not_fake_running_or_eta(tmp_path):

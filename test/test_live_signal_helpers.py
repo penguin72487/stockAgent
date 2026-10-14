@@ -90,13 +90,16 @@ def test_idle_live_cuda_cache_release_returns_allocator_memory(
 
     monkeypatch.setattr(signal_engine, "clear_live_inference_memory_cache", clear)
     monkeypatch.setattr(signal_engine.torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(signal_engine.torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(signal_engine.torch._C, "_cuda_clearCublasWorkspaces",
+                        lambda: events.append("clear_blas_workspaces"))
     monkeypatch.setattr(
         signal_engine.torch.cuda,
         "empty_cache",
         lambda: events.append("empty_cache"),
     )
     assert signal_engine.release_idle_live_cuda_cache() is True
-    assert events == ["clear", "empty_cache"]
+    assert events == ["clear", "synchronize", "clear_blas_workspaces", "empty_cache"]
 
 
 def test_live_panel_worker_override_is_a_cap(
@@ -284,6 +287,38 @@ def test_factorized_rolling_window_preserves_bits_and_bounds_cache(monkeypatch):
         np.testing.assert_array_equal(before.view(np.uint32), preserved.view(np.uint32))
         assert features.reads == [slice(0, 3), 3]
         assert sum(v[1].nbytes for v in signal_engine._LIVE_MODEL_INPUT_CACHE.values()) <= 64
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
+
+
+@pytest.mark.parametrize("source_view", [False, True])
+def test_factorized_cold_window_sanitizes_bounded_private_chunks(monkeypatch, source_view):
+    class Features:
+        _stockagent_factorized_features = True
+        def __init__(self):
+            self.values = np.arange(2 * 1024 * 1024 + 10, dtype=np.float32).reshape(2, 1, -1)
+            self.values.reshape(-1)[:4] = [np.nan, np.inf, -np.inf, -0.0]
+        def __getitem__(self, key):
+            return self.values[key] if source_view else self.values[key].copy()
+    features = Features()
+    original = features.values.copy()
+    expected = np.nan_to_num(original, nan=0.0, posinf=0.0, neginf=0.0)
+    panel = SimpleNamespace(features=features, num_symbols=1,
+                            feature_names=["feature"] * features.values.shape[-1])
+    sanitize = np.nan_to_num
+    calls = []
+    def bounded(value, **kwargs):
+        calls.append((value.size, kwargs.get("copy")))
+        return sanitize(value, **kwargs)
+    monkeypatch.setattr(signal_engine.np, "nan_to_num", bounded)
+    signal_engine.clear_live_panel_memory_cache()
+    try:
+        actual = signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2)
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_array_equal(features.values.view(np.uint32), original.view(np.uint32))
+        assert not np.shares_memory(actual, features.values)
+        assert calls and all(size <= 1024 * 1024 and copy is False for size, copy in calls)
+        assert signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2) is actual
     finally:
         signal_engine.clear_live_panel_memory_cache()
 

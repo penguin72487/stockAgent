@@ -43,6 +43,29 @@ def _native_ad_placeholder(node):
         and newline.name == 'br' and not newline.attrs and not newline.contents)
 
 
+def _measured_image_dimensions(attributes):
+    """Validate source dimensions without erasing their original attributes.
+
+    Native 2026844 declares 600x358, whereas the earlier measured chart was
+    600x546. Dimensions are presentation metadata, not a fixed article type.
+    Require bounded canonical positive integers and the source's exact
+    width/height ratio string; forest equality still compares every raw field.
+    Never infer dimensions from image bytes, request media or accept NaN/inf.
+    """
+    if set(attributes) != {'src', 'data-height', 'data-width', 'data-ratio'}:
+        return False
+    dimensions = []
+    for key in ('data-width', 'data-height'):
+        value = attributes[key]
+        if not isinstance(value, str) or re.fullmatch(r'[1-9][0-9]{0,4}', value) is None:
+            return False
+        dimension = int(value)
+        if dimension > 32768:
+            return False
+        dimensions.append(dimension)
+    return attributes['data-ratio'] == str(dimensions[0] / dimensions[1])
+
+
 def same_image_only_view(container, full_content, source, article_id, visible):
     """Match a bounded whole forest, never turn image alt into narrative."""
     if not isinstance(full_content, str) or len(full_content) > 65536:
@@ -60,7 +83,7 @@ def same_image_only_view(container, full_content, source, article_id, visible):
         src = urlsplit(attributes['src'])
         if (src.scheme not in {'http', 'https'} or src.netloc != 'cimg.cnyes.cool'
                 or src.query or src.fragment or re.fullmatch(
-                    '/prod/news/' + str(article_id) + '/o/[0-9a-f]{32}[.]jpg', src.path) is None):
+                    '/prod/news/' + str(article_id) + '/[ol]/[0-9a-f]{32}[.]jpg', src.path) is None):
             return None
         keys = set(attributes)
         ordinary = keys == {'src', 'alt'} and isinstance(attributes['alt'], str)
@@ -71,9 +94,7 @@ def same_image_only_view(container, full_content, source, article_id, visible):
             and attributes['style'] == 'height: 1420px; width: 300px; filter: none; border: #aaaaaa 1px solid;'
             and attributes['border'] == attributes['hspace'] == '0'
             and attributes['width'] == '300' and attributes['height'] == '1420')
-        measured_chart = (keys == {'src', 'data-height', 'data-width', 'data-ratio'}
-            and attributes['data-height'] == '546' and attributes['data-width'] == '600'
-            and attributes['data-ratio'] == '1.098901098901099')
+        measured_chart = _measured_image_dimensions(attributes)
         plain_border = keys == {'src', 'border'} and attributes['border'] == '0'
         measured_border = (keys == {'src', 'border', 'alt', 'width', 'height'}
             and attributes['border'] == '0' and isinstance(attributes['alt'], str)

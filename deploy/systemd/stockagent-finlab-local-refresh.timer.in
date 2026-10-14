@@ -2,6 +2,10 @@
 Description=Refresh licensed FinLab research cache after quota reset and TW opening
 
 [Timer]
+# Seed the relative retry after boot or timer activation. A last deactivation
+# from a previous boot cannot schedule OnUnitInactiveSec in this boot.
+# Existing ExecCondition gates still decide whether any source work is due.
+OnActiveSec=1min
 OnCalendar=*-*-* 07:00:05 Asia/Taipei
 OnCalendar=*-*-* 08:00:05 Asia/Taipei
 OnCalendar=*-*-* 08:03:00 Asia/Taipei

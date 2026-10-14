@@ -15,6 +15,12 @@ from scripts.probe_browser_runtime import browser_profile_launch_options
 from scripts.promote_tw_day_trade_replay import _atomic_json
 
 
+def _signal_url(base_url, *, market, day):
+    # urljoin discards an empty query suffix; add '?' after resolving the path.
+    return urljoin(base_url, "api/signals") + "?" + urlencode(
+        {"mode": market, "date": day, "offset": 0, "limit": 1})
+
+
 def _verify_signal_boundary(payload, *, market, day, private_features=False):
     rows = payload.get("rows") or []
     if (payload.get("simulation_only") is not True
@@ -105,8 +111,8 @@ def main():
                             raise ValueError("not an exclusively paper dashboard")
                         boundaries = []
                         for day in dict.fromkeys((args.start_date, args.end_date)):
-                            response = context.request.get(urljoin(args.url, "api/signals?") + urlencode(
-                                {"mode": args.market, "date": day, "offset": 0, "limit": 1}), timeout=60_000)
+                            response = context.request.get(
+                                _signal_url(args.url, market=args.market, day=day), timeout=60_000)
                             if not response.ok:
                                 raise ValueError(f"public signal boundary HTTP {response.status}")
                             boundaries.append(_verify_signal_boundary(response.json(), market=args.market,

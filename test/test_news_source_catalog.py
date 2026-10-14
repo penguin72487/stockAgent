@@ -242,10 +242,13 @@ def gv_access_denied_article():
     title = 'Access denied: the social and economic costs of Nigeria’s Twitter blackout'
     raw = ('<html><head><title>' + title + ' · Global Voices</title><link rel="canonical" href="' + url + '"></head>'
            '<body><div class="post-container"><div class="post-header"><h1 class="post-title">' + title + '</h1>'
-           '<div id="post-header-credit"><a class="user-link">Olusegun Akinfenwa</a></div></div>'
+           '<div id="post-header-credit"><a class="user-link" href="/author/synthetic-writer/">Olusegun Akinfenwa</a></div></div>'
            '<div class="entry"><p>' + 'Original public news body. ' * 20 + '</p></div>'
-           '<div class="post-credit-container"><a rel="license" href="https://creativecommons.org/licenses/by/3.0/">CC</a></div>'
-           '</div></body></html>').encode()
+           '<div class="postfooter-credits post-credit-container"><span class="contributor-name">'
+           '<a class="user-link" href="/author/synthetic-writer/">Olusegun Akinfenwa</a></span>'
+           '<a rel="license" href="https://creativecommons.org/licenses/by/3.0/">CC</a></div>'
+           '</div></body></html>').replace('</head>', '<meta property="article:published_time" '
+               'content="2021-07-01T12:00:00+00:00"></head>').encode()
     return url, raw
 
 

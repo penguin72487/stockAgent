@@ -43,6 +43,7 @@ from stockagent.backtest.tw_futures_portfolio import (
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
 )
 from stockagent.config import ExperimentConfig
+from stockagent.training.optimizer_config import optimizer_checkpoint_fields
 from stockagent.data.panel import PanelData, _TIFRS_MAX_CARRY_DAYS
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
@@ -881,7 +882,7 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         "seed": int(training.seed),
         "objective": objective,
         "optimizer": {
-            "name": "AdamW",
+            **optimizer_checkpoint_fields(training),
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),
@@ -1084,7 +1085,7 @@ def _training_checkpoint_contract_schema_2(
         "loss_type": str(training.loss_type),
         "loss_portfolio_activation": str(training.loss_portfolio_activation),
         "optimizer": {
-            "name": "AdamW",
+            **optimizer_checkpoint_fields(training),
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),

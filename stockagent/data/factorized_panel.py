@@ -848,7 +848,98 @@ class FactorizedDateView:
         return FactorizedDateView(self.source.subset_symbols(indices), self.rows)
 
 
-def attach_factorized_live_features(panel, manifest_path: str | Path):
+class FactorizedLiveWindow:
+    """Immutable bounded live input with an independent last-row quote overlay.
+
+    Reuses the exact training transport codec; omitted positive-zero storage
+    columns are reconstructed before the ordinary dense Candle Encoder. This
+    is neither feature selection nor the opt-in compact affine model path.
+    """
+    _stockagent_factorized_live_window = True
+
+    def __init__(self, features, start, stop, *, overlay=None):
+        self.features = features
+        self.start, self.stop = int(start), int(stop)
+        if not 0 <= self.start < self.stop <= features.shape[0]:
+            raise ValueError("factorized live window is outside the source calendar")
+        self.shape = (self.stop-self.start, *features.shape[1:])
+        self.overlay = overlay
+        self.nbytes = 0 if overlay is None else overlay[1].nbytes
+        self.transport_stats = {}
+
+    def with_last_feature(self, index, values):
+        if not 0 <= int(index) < self.shape[-1]:
+            raise ValueError("opening feature index is outside the model schema")
+        values = np.asarray(values, dtype=np.float32)
+        if values.shape != (self.shape[1],) or not np.isfinite(values).all():
+            raise ValueError("opening feature overlay must be finite and symbol-aligned")
+        values = values.copy()
+        values.setflags(write=False)
+        return type(self)(self.features, self.start, self.stop,
+                          overlay=(int(index), values))
+
+    def __getitem__(self, key):
+        # Only the final row is needed by existing feature diagnostics. Never
+        # materialize the full window through an accidental NumPy conversion.
+        if key != -1:
+            raise IndexError("bounded live feature diagnostics require the final row")
+        value = np.nan_to_num(self.features[self.stop-1], nan=0., posinf=0., neginf=0.)
+        if self.overlay is not None:
+            value[:, self.overlay[0]] = self.overlay[1]
+        return value
+
+    def stock_chunks(self, device, *, chunk_stocks=128):
+        if isinstance(self.features, FactorizedDateView):
+            source = self.features.source
+            rows = self.features.rows[self.start:self.stop]
+        else:
+            source = self.features
+            rows = np.arange(self.start, self.stop)
+        # Share the immutable verified block cache without modifying its
+        # transport policy for other callers. No transformed GPU cache lives
+        # across requests, devices, folds, or model-state changes.
+        from copy import copy
+        source = copy(source)
+        source.transfer_stats = dict(source.transfer_stats)
+        source.transfer_stats.update(logical_dense_bytes=0, host_payload_bytes=0)
+        source.transfer_mode = "compact_cuda_packed" if device.type == "cuda" else "dense_cpu"
+        slab = FactorizedPanelSlab(source, rows, pin_slabs=device.type == "cuda", device=device)
+        for begin in range(0, self.shape[1], chunk_stocks):
+            end = min(self.shape[1], begin+chunk_stocks)
+            raw = slab.stock_chunk(begin, end)
+            # Same nan/inf sentinel and FP32 storage as the canonical host
+            # normalizer. The freshly reconstructed tensor is privately owned.
+            raw.nan_to_num_(nan=0., posinf=0., neginf=0.)
+            if self.overlay is not None:
+                column, values = self.overlay
+                raw[-1, :, column].copy_(torch.from_numpy(values[begin:end].copy()).to(device))
+            yield raw.unsqueeze(0)
+        self.transport_stats.update({"logical_dense_bytes": source.transfer_stats["logical_dense_bytes"],
+                                     "host_payload_bytes": source.transfer_stats["host_payload_bytes"]})
+
+    def materialize(self, device):
+        """Reconstruct the full original tensor shape, not chunked model math."""
+        import time
+        started = time.perf_counter()
+        cache = (self.features.source if isinstance(self.features, FactorizedDateView)
+                 else self.features)._cache
+        self.transport_stats = {"layout": "lossless_packed_full_shape_owned_fp32_v1",
+            "source_cache_misses_before": cache.misses,
+            "source_cache_hits_before": cache.hits,
+            "source_cache_budget_bytes": cache.budget_bytes}
+        result = torch.empty((1, *self.shape), dtype=torch.float32, device=device)
+        begin = 0
+        for raw in self.stock_chunks(device):
+            end = begin+raw.size(2)
+            result[:, :, begin:end].copy_(raw)
+            begin = end
+        self.transport_stats.update(source_cache_misses_after=cache.misses,
+            source_cache_hits_after=cache.hits, source_cache_resident_bytes=cache.bytes)
+        self.transport_stats["input_reconstruct_enqueue_ms"] = round((time.perf_counter()-started)*1000, 3)
+        return result
+
+
+def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_cache_bytes=None):
     """Attach a receipt-bound research-paper projection to a live base panel."""
     from copy import copy
     from stockagent.training.checkpoint_contract import subset_panel_symbols
@@ -884,7 +975,7 @@ def attach_factorized_live_features(panel, manifest_path: str | Path):
     rows = np.asarray([source_rows[day] for day in panel_days], dtype=np.int64)
     base[rows] = panel.features
     source_panel.features = base
-    source_panel = attach_factorized_features(source_panel, path)
+    source_panel = attach_factorized_features(source_panel, path, host_cache_bytes=host_cache_bytes)
     result = copy(panel)
     result.features = FactorizedDateView(source_panel.features, rows)
     result.feature_names = source_panel.feature_names

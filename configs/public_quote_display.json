@@ -2,5 +2,79 @@
   "schema_version": 1,
   "contract": "public_quote_display_v1",
   "default_policy": "withhold_without_verified_public_display_grant",
-  "authorized_sources": []
+  "owner_transaction_reports": {
+    "enabled": true,
+    "contract": "owner_paper_transaction_report_v1",
+    "record_scope": "tw_day_trade_and_overnight_paper_ledger",
+    "operator_request": "2026-10-13: publish my own transaction prices",
+    "notice": "Recorded paper transaction report only. This is not broker execution evidence or a grant to redistribute raw market quotations."
+  },
+  "authorized_sources": [
+    {
+      "source_id": "twse_daily_ohlcv",
+      "dataset_id": "twse_daily_ohlcv",
+      "grant_id": "government-open-data-v1",
+      "public_label": "臺灣證券交易所",
+      "public_display": true,
+      "license_reference": "https://data.gov.tw/dataset/11549",
+      "valid_from": "2026-10-13",
+      "perpetual": true,
+      "venues": ["TWSE"],
+      "grain": "daily",
+      "daily_price_roles": {
+        "open": ["open"], "high": ["high"], "low": ["low"], "close": ["close"],
+        "sizing_open_price": ["open"], "entry_price": ["open", "close"],
+        "exit_price": ["open", "close"], "last_exit_price": ["open", "close"], "last_mark_price": ["close"],
+        "daily_return_previous_close": ["close"], "daily_return_reference_price": ["close"]
+      }
+    },
+    {
+      "source_id": "tpex_daily_ohlcv",
+      "dataset_id": "tpex_daily_ohlcv",
+      "grant_id": "government-open-data-v1",
+      "public_label": "證券櫃檯買賣中心",
+      "public_display": true,
+      "license_reference": "https://data.gov.tw/dataset/11370",
+      "valid_from": "2026-10-13",
+      "perpetual": true,
+      "venues": ["TPEX"],
+      "grain": "daily",
+      "daily_price_roles": {
+        "open": ["open"], "high": ["high"], "low": ["low"], "close": ["close"],
+        "sizing_open_price": ["open"], "entry_price": ["open", "close"],
+        "exit_price": ["open", "close"], "last_exit_price": ["open", "close"], "last_mark_price": ["close"],
+        "daily_return_previous_close": ["close"], "daily_return_reference_price": ["close"]
+      }
+    }
+  ],
+  "usage_rules_review": {
+    "reviewed_on": "2026-10-13",
+    "scope": "public website price display; API entitlement and noncommercial intent are not a verified redistribution grant",
+    "sources": [
+      {
+        "source_id": "owner_paper_transaction_reports",
+        "status": "operator_requested_transaction_report_not_quote_license",
+        "finding": "The owner requested disclosure of their own transaction prices. Publish recorded paper fills separately from raw quote fields, with simulation labels. A simple number and a copyrightable work are distinct; this distinction does not establish a broker/exchange contractual exemption or blanket quote redistribution permission.",
+        "references": ["https://www.tipo.gov.tw/tw/copyright/692-11576.html", "https://www.twse.com.tw/zh/products/information/qa.html"]
+      },
+      {
+        "source_id": "shioaji_stocks",
+        "status": "public_display_permission_unverified",
+        "finding": "The public securities API consent describes trading and data risks, but does not establish a blanket external-display permission. TWSE FAQ item 2 requires consent and a written contract for value-added market information supplied to others; no general noncommercial exemption was found.",
+        "references": ["https://www.sinotrade.com.tw/newweb/signCenter/S_openAPI/", "https://www.twse.com.tw/zh/products/information/qa.html"]
+      },
+      {
+        "source_id": "shioaji_futures",
+        "status": "written_permission_required_by_api_terms",
+        "finding": "The futures API consent describes non-display use of TAIFEX real-time ticks and clause 10 requires prior written consent or authorization for the specified redistribution and other uses.",
+        "references": ["https://www.sinotrade.com.tw/newweb/signCenter/F_openApi/"]
+      },
+      {
+        "source_id": "tw_official_open_daily",
+        "status": "verified_open_dataset",
+        "finding": "The registered TWSE and TPEx daily OHLC datasets carry Government Open Data License v1. This applies to the identified daily datasets, not all broker minute/tick quotations. Keep attribution, market date and acquisition time distinct.",
+        "references": ["https://data.gov.tw/dataset/11549", "https://data.gov.tw/dataset/11370", "https://data.gov.tw/license", "https://www.twse.com.tw/zh/terms/use.html"]
+      }
+    ]
+  }
 }

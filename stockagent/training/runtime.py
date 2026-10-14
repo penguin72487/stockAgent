@@ -166,6 +166,9 @@ def call_model(
                 "model does not accept required derivative portfolio_context"
             )
         kwargs["portfolio_context"] = portfolio_context
+    if getattr(x, "_stockagent_factorized_live_window", False):
+        target = unwrap_model(model)
+        return target.forward_from_factorized_live_window(x, model_mask, **kwargs)
     return model(x, model_mask, **kwargs)
 
 

@@ -20,6 +20,7 @@ from typing import Any, Iterator
 from downloader.finmind_account import backfill_budget
 from downloader.finmind_scheduling import incremental_reservation
 from downloader.finmind_history_order import BY_DATASET, STAGES
+from downloader.finmind_eta_work import QueueAggregateSnapshot
 
 
 WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "7d": 604800}
@@ -233,7 +234,8 @@ def _traffic(root: Path, now: datetime) -> dict[str, Any]:
         return {**base, "state": "unavailable", "error_code": "traffic_read_failed"}
 
 
-def _queue_worker(root: Path, owner: str, now: datetime) -> dict[str, Any]:
+def _queue_worker(root: Path, owner: str, now: datetime, *,
+                  snapshot: QueueAggregateSnapshot | None = None) -> dict[str, Any]:
     status = _read_json(root / "status.json")
     age = _age(status.get("observed_at_utc"), now)
     result: dict[str, Any] = {
@@ -247,8 +249,8 @@ def _queue_worker(root: Path, owner: str, now: datetime) -> dict[str, Any]:
         return result
     try:
         with _connect(path) as connection:
-            result["queue_states"] = dict(connection.execute(
-                "SELECT state,count(*) FROM tasks GROUP BY state"))
+            result["queue_states"] = (dict(snapshot.states) if snapshot and snapshot.matches(path, now)
+                                      else dict(connection.execute("SELECT state,count(*) FROM tasks GROUP BY state")))
             # Four windows in one bounded scan. Queues can have hundreds of
             # thousands of rows and are not indexed by last_attempt_at_utc.
             measures = ",".join(
@@ -400,7 +402,8 @@ def timed_incremental_forecast(root: Path, now: datetime) -> dict[str, Any]:
                        for (stamp, period, session_only, weekdays), count in sorted(events.items())]}
 
 
-def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any]:
+def recurring_forecast(root: Path, now: datetime | None = None, *,
+                       queue_snapshots: dict[str, QueueAggregateSnapshot] | None = None) -> dict[str, Any]:
     """Estimate future refresh load, never reuse the current overdue backlog.
 
     Worker renewal cadence plus one new calendar partition per frontier ID
@@ -441,10 +444,12 @@ def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any
             with _connect(path) as conn:
                 SUPPLEMENTAL = effective_sources(conn, SUPPLEMENTAL_BASE) if owner == 'complement' else SUPPLEMENTAL_BASE
                 if owner == 'complement':
-                    for dataset, kind, priority, state, count in conn.execute("""
+                    snapshot = (queue_snapshots or {}).get(owner)
+                    renewals = snapshot.renewals if snapshot and snapshot.matches(path, now) else conn.execute("""
                         SELECT dataset,kind,priority,state,count(*) FROM tasks
                         WHERE state IN ('complete','observed_empty') AND kind!='derived'
-                        AND next_attempt_at_utc IS NOT NULL GROUP BY 1,2,3,4"""):
+                        AND next_attempt_at_utc IS NOT NULL GROUP BY 1,2,3,4""")
+                    for dataset, kind, priority, state, count in renewals:
                         if dataset == 'TaiwanStockNews' or catalog.get(dataset, {}).get('primary_owner') != 'complement':
                             continue
                         empty = state == 'observed_empty'
@@ -501,7 +506,8 @@ def recurring_forecast(root: Path, now: datetime | None = None) -> dict[str, Any
             'limitations': 'current_known_universe_only_not_future_listings_or_future_retries'}
 
 
-def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
+def build_finmind_eta_telemetry(root: Path, now: datetime, *,
+                               queue_snapshots: dict[str, QueueAggregateSnapshot] | None = None) -> dict[str, Any]:
     """Inspect ``data_finmind`` without invoking provider APIs or mutating state."""
     if now.tzinfo is None:
         raise ValueError("now must be timezone aware")
@@ -533,13 +539,14 @@ def build_finmind_eta_telemetry(root: Path, now: datetime) -> dict[str, Any]:
         "reservation_plan": plan,
         "reserve_is_consumption_measurement": False,
     }
-    forecast = recurring_forecast(root, now)
+    forecast = recurring_forecast(root, now, queue_snapshots=queue_snapshots)
     forecast['timed_incremental'] = timed_incremental_forecast(root, now)
     if forecast['requests_per_hour'] is not None:
         quota['forecast_recurring_requests_per_hour'] = forecast['requests_per_hour']
     quota['recurring_forecast'] = forecast
     traffic = _traffic(root, now)
-    workers = {owner: _queue_worker(root / owner, owner, now) for owner in ("sponsor", "complement")}
+    workers = {owner: _queue_worker(root / owner, owner, now, snapshot=(queue_snapshots or {}).get(owner))
+               for owner in ("sponsor", "complement")}
     from downloader.finmind_storage_objects import transfer_statistics
     from downloader.finmind_json_pipeline import measured_rates as json_pipeline_rates
     json_pipelines = {}

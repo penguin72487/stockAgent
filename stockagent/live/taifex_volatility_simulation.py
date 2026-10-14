@@ -95,7 +95,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 12
+EXECUTION_CONTRACT_VERSION: Final[int] = 13
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -525,6 +525,7 @@ class TaifexVolatilitySimulation:
         ),
         catalog_expansion_entry_policy: str = CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
         settlement_bootstrap_only: bool = False,
+        recover_expired_cycle_futures: bool = False,
         startup_now: datetime | None = None,
         active_strategy_ids: Iterable[str] | None = None,
     ) -> None:
@@ -612,6 +613,7 @@ class TaifexVolatilitySimulation:
         self.strategy_capital_buffer_multiple = capital_buffer_multiple
         self.catalog_expansion_entry_policy = expansion_policy
         self.settlement_bootstrap_only = bool(settlement_bootstrap_only)
+        self.recover_expired_cycle_futures = bool(recover_expired_cycle_futures)
         self.strategy_ids = requested_strategy_ids
         self.underlying = underlying
         self.hedge = hedge
@@ -867,6 +869,9 @@ class TaifexVolatilitySimulation:
             elif execution_version == 11:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("gamma_scalping_trigger_state_migration")
+            elif execution_version == 12:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("explicit_expired_cycle_reduce_only_recovery")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -1939,6 +1944,10 @@ class TaifexVolatilitySimulation:
             "transaction_tax_twd": float(tax_twd),
             "net_cash_flow_twd": gross_cash - float(fee_twd) - float(tax_twd),
             "reason": reason,
+            "paper_repair": reason.startswith("paper_repair_expired_cycle_") or bool(
+                (self.state.get("active_cycle") or {}).get("futures_recovery")
+                and reason == "official_taifex_final_cash_settlement"
+            ),
         }
         _append_jsonl(self.ledger_path, row)
 
@@ -3933,8 +3942,11 @@ class TaifexVolatilitySimulation:
         if frame.height != 1:
             return None
         row = frame.row(0, named=True)
+        price = float(row["final_settlement_price"])
+        if not math.isfinite(price) or price <= 0.0:
+            return None
         return (
-            float(row["final_settlement_price"]),
+            price,
             str(row.get("source_file", "")),
             str(row.get("source_sha256", "")),
         )
@@ -3966,7 +3978,7 @@ class TaifexVolatilitySimulation:
         cycle = self.state.get("active_cycle")
         if isinstance(cycle, Mapping):
             expiry = date.fromisoformat(str(cycle["expiry_date"]))
-            if expiry < trading_date:
+            if expiry < trading_date and cycle.get("status") != "settled_options_reducing_futures":
                 pending_expiries.append(f"weekly_cycle:{expiry.isoformat()}")
         parity_state = self.state.get("put_call_parity_tx") or {}
         parity_position = parity_state.get("open_position")
@@ -4005,10 +4017,13 @@ class TaifexVolatilitySimulation:
         expiry = date.fromisoformat(str(cycle["expiry_date"]))
         if expiry >= taifex_trading_date(now):
             return
-        if any(
-            int(self.state["strategies"][strategy_id]["futures_position"]) != 0
+        has_futures = any(
+            int(self.state["strategies"][strategy_id].get(field) or 0) != 0
             for strategy_id in self.strategy_ids
-        ):
+            if strategy_id != PUT_CALL_PARITY_TX_STRATEGY_ID
+            for field in ("futures_position", "underlying_futures_position")
+        )
+        if has_futures and not self.recover_expired_cycle_futures:
             raise RuntimeError(
                 "cannot cash-settle cycle while a shadow futures hedge remains open"
             )
@@ -4018,6 +4033,47 @@ class TaifexVolatilitySimulation:
             self.state["blocked_reason"] = f"missing_official_final_settlement:{expiry}"
             return
         settlement_price, source_file, source_sha = settlement
+        if has_futures:
+            recovery = cycle.get("futures_recovery")
+            if not isinstance(recovery, dict):
+                # A different front-month quote cannot close old inventory.
+                # Freeze the pre-bootstrap identities before status is rewritten.
+                previous_status = json.loads(self.status_path.read_text(encoding="utf-8"))
+                if (previous_status.get("active_cycle") or {}).get("cycle_id") != cycle["cycle_id"]:
+                    raise RuntimeError("expired-cycle recovery has no matching original status")
+                recovery = {
+                    "hedge_contract": previous_status.get("hedge_contract"),
+                    "underlying_contract": previous_status.get("underlying_contract"),
+                    "started_at_utc": _now_iso(),
+                    "official_settlement_price": settlement_price,
+                    "source_sha256": source_sha,
+                }
+            for field, key, instrument in (
+                ("futures_position", "hedge_contract", self.hedge),
+                ("underlying_futures_position", "underlying_contract", self.underlying),
+            ):
+                if any(
+                    int(self.state["strategies"][sid].get(field) or 0)
+                    for sid in self.strategy_ids
+                    if sid != PUT_CALL_PARITY_TX_STRATEGY_ID
+                ) and recovery.get(key) != instrument.code:
+                    raise RuntimeError(f"expired-cycle recovery contract mismatch: {key}")
+            # No broker orders are part of this explicitly authorized paper repair.
+            self.broker_orders_enabled = False
+            self.state["broker_orders_enabled"] = False
+            cycle["futures_recovery"] = recovery
+        # Validate all metadata before appending the first settlement leg.
+        for strategy_id in self.strategy_ids:
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                continue
+            ledger = self.state["strategies"][strategy_id]
+            for code, position in (ledger.get("option_positions") or {}).items():
+                if not int(position):
+                    continue
+                leg = (ledger.get("option_position_metadata") or {}).get(code) or {}
+                strike = float(leg.get("strike") or 0.0)
+                if leg.get("option_right") not in {"C", "P"} or not math.isfinite(strike) or strike <= 0:
+                    raise RuntimeError(f"invalid held option settlement metadata: {code}")
         for strategy_id in self.strategy_ids:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
@@ -4066,6 +4122,42 @@ class TaifexVolatilitySimulation:
                     tax_twd=tax,
                     price_source="official_taifex_final_settlement_intrinsic_value",
                 )
+                # Persist between settlement legs instead of waiting for the
+                # whole catalogue; the original backup/journal remains evidence.
+                self._persist_state()
+        if has_futures:
+            first_recovery = cycle.get("status") != "settled_options_reducing_futures"
+            cycle["status"] = "settled_options_reducing_futures"
+            self.state["pending_targets"] = {}
+            self.state["blocked_reason"] = None
+            self.state["last_engine_step_error"] = None
+            self.state["engine_status"] = "waiting_expired_cycle_futures_reduction"
+            self._persist_state()
+            if first_recovery:
+                _append_jsonl(self.events_path, {
+                    "event": "expired_cycle_options_settled_futures_reduction_pending",
+                    "at_utc": _now_iso(), "cycle_id": cycle["cycle_id"],
+                    "expiry_date": expiry.isoformat(), "source_sha256": source_sha,
+                    "official_final_settlement": settlement_price,
+                    "paper_repair": True, "broker_submission": False,
+                })
+            if self.settlement_bootstrap_only or taifex_market_phase(now) not in {"day_continuous", "night_continuous"}:
+                return
+            all_flat = True
+            for strategy_id in self.strategy_ids:
+                if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                    continue
+                hedge_flat = self._execute_future_target(
+                    strategy_id=strategy_id, target=0, decision_ns=decision_ns,
+                    reason="paper_repair_expired_cycle_reduce_only_at_fresh_same_contract_book",
+                )
+                underlying_flat = self._execute_underlying_future_target(
+                    strategy_id=strategy_id, target=0, decision_ns=decision_ns,
+                    reason="paper_repair_expired_cycle_reduce_only_at_fresh_same_contract_book",
+                )
+                all_flat = hedge_flat and underlying_flat and all_flat
+            if not all_flat:
+                return
         _append_jsonl(
             self.events_path,
             {
@@ -4076,6 +4168,7 @@ class TaifexVolatilitySimulation:
                 "official_final_settlement": settlement_price,
                 "source_file": source_file,
                 "source_sha256": source_sha,
+                "paper_repair": bool(cycle.get("futures_recovery")),
             },
         )
         self.state["active_cycle"] = None
@@ -4702,6 +4795,11 @@ class TaifexVolatilitySimulation:
         try:
             self._maybe_settle_expired_put_call_parity(observed_now, decision_ns)
             self._maybe_settle_expired_cycle(observed_now, decision_ns)
+            if (self.state.get("active_cycle") or {}).get("status") == "settled_options_reducing_futures":
+                # Never allow entries, calibration, parity or margin expansion
+                # to overwrite a reduction-only target while its quote is missing.
+                self._write_status(decision_ns=decision_ns)
+                return
             self._maybe_open_cycle(observed_now, decision_ns)
             session_state = self._intraday_session_state(observed_now)
             if (

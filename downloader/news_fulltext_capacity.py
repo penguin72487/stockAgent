@@ -187,7 +187,7 @@ def capacity_config(config, registry):
                 or not source.interval_seconds <= recovery_ceiling <= 3600):
             raise ValueError("invalid bounded transient capacity backoff")
     if result["enabled"] and config.get("require_provider_worker_reservations", False) and sum(providers[p].get("capacity_max_parallelism", s.parallelism)
-                                 for p, s in registry.sources.items() if s.allowed) > config["workers"]:
+                                 for p, s in registry.sources.items() if s.request_enabled) > config["workers"]:
         raise ValueError("worker budget cannot reserve maximum adaptive publisher concurrency")
     return result
 
@@ -198,7 +198,7 @@ class PublisherCapacity:
         self.policy = capacity_config(config, http.registry)
         entries = {entry["id"]: entry for entry in config["providers"]}
         self.transient_backoff_limits = {p: entries[p].get("capacity_transient_backoff_max_seconds", max(2.0, s.interval_seconds))
-                                        for p, s in http.registry.sources.items() if s.allowed}
+                                        for p, s in http.registry.sources.items() if s.request_enabled}
         self.path = Path(http.root) / "rate_calibration.json"
         focus_identity = {}
         if config.get('failure_diagnostic_focus') is not None:
@@ -220,7 +220,7 @@ class PublisherCapacity:
             "cnyes_unknown_body_recheck_contract_version": CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION,
             "providers": {p: {"source": s.data_fingerprint, "authorization": s.authorization_fingerprint,
                                "maximum_parallelism": http.maximum_parallelism[p]}
-                          for p, s in http.registry.sources.items() if s.allowed},
+                          for p, s in http.registry.sources.items() if s.request_enabled},
         }, sort_keys=True).encode()).hexdigest()
         self.provider_fingerprints = {p: hashlib.sha256(json.dumps({"measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
             "policy": self.policy, "source": s.data_fingerprint, "authorization": s.authorization_fingerprint,
@@ -229,6 +229,7 @@ class PublisherCapacity:
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "stored_body_retry_burst": config.get('stored_body_retry_burst', 8),
             "maximum_parallelism": http.maximum_parallelism[p],
+            **({'metadata_feed_fingerprint': s.metadata_feed_fingerprint} if not s.allowed and s.metadata_feeds else {}),
             **({'cnyes_body_value_dispatch_contract': CNYES_WORK_DISPATCH_VERSION,
                 'cnyes_unknown_body_recheck_contract_version': CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION,
                 'cnyes_scope_seed_maintenance_contract': CNYES_SCOPE_SEED_VERSION,
@@ -236,7 +237,7 @@ class PublisherCapacity:
                 'cnyes_primary_body_burst': config.get('cnyes_primary_body_burst', 8)} if p == 'cnyes' else {}),
             **({'private_failure_evidence_budget_contract': FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION}
                if p in HOURLY_EVIDENCE_PROVIDERS else {})}, sort_keys=True).encode()).hexdigest()
-            for p, s in http.registry.sources.items() if s.allowed}
+            for p, s in http.registry.sources.items() if s.request_enabled}
         try:
             saved = json.loads(self.path.read_text())
             if isinstance(saved, dict) and saved.get("version") == 1 and isinstance(saved.get("providers"), dict):
@@ -342,6 +343,15 @@ class PublisherCapacity:
         changed = False
         for provider, item in self.states.items():
             observed = observations.get(provider, {})
+            source = self.http.registry.sources[provider]
+            if not source.allowed and source.metadata_feeds:
+                # A rolling information feed has no body-throughput target.
+                # Poll its declared jobs; never manufacture extra requests to
+                # populate a rate ladder or claim an article capacity ceiling.
+                item['state'] = 'metadata_polling'
+                item['reason'] = 'registered RSS information cadence, not body capacity calibration'
+                self._reset(provider, observed, now)
+                continue
             if provider not in self.baselines:
                 self._reset(provider, observed, now)
                 continue

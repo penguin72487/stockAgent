@@ -48,6 +48,20 @@ def test_cgroup_memory_breakdown_separates_file_cache_from_anon(tmp_path):
     ) == {"MemoryAnon": None, "MemoryFile": None}
 
 
+def test_optional_host_service_sample_stays_allowlisted(monkeypatch):
+    import subprocess
+    from scripts import benchmark_dashboard_latency as benchmark
+    def run(args, **kwargs):
+        assert args[2] == '*.service'
+        return subprocess.CompletedProcess([], 0, stdout=(
+            'Id=postgresql.service\nActiveState=active\nCPUUsageNSec=10\nEnvironment=secret\n\n'
+            'Id=stockagent-test.service\nActiveState=active\nCPUUsageNSec=20\n'))
+    monkeypatch.setattr(benchmark.subprocess, 'run', run)
+    units = benchmark.service_snapshot(include_host_services=True)['units']
+    assert set(units) == {'postgresql.service', 'stockagent-test.service'}
+    assert all('Environment' not in row for row in units.values())
+
+
 def test_cgroup_memory_events_are_cumulative_and_missing_is_unknown(tmp_path):
     from scripts.benchmark_dashboard_latency import _cgroup_memory_events
 

@@ -46,6 +46,7 @@ from stockagent.live.dashboard_updates import (
     DashboardUpdateHub,
     metadata_signature,
 )  # noqa: E402
+from stockagent.live.public_daily_quotes import OfficialDailyQuoteSource  # noqa: E402
 from stockagent.live.benchmark_history_projection import (  # noqa: E402
     projection_head_path as benchmark_projection_head_path,
 )
@@ -1652,6 +1653,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.data_monitor_static_root = Path(data_monitor_static_root)
         self.traffic_static_root = Path(traffic_static_root)
         self.repo_root = Path(repo_root)
+        self.public_quote_source = OfficialDailyQuoteSource(self.repo_root / "data_tw_public")
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
         self.traffic_observer = PublicTrafficObserver(
@@ -1703,7 +1705,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "benchmark_marks.jsonl",
                     "benchmark_history.json",
                 )
-            },
+            } | set(self.public_quote_source.paths),
         )
         for topic, directory in (
             ("tw", "tw_day_trade_simulation"),
@@ -1724,6 +1726,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
             overnight_root / "overnight_signal_history.parquet",
             overnight_root / "overnight_event_history.parquet",
         )
+        for topic in ("tw", "overnight"):
+            self.update_hub.paths[topic] += self.public_quote_source.paths
 
     def server_close(self) -> None:
         self.update_hub.close()
@@ -2158,7 +2162,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     # Completed-session position snapshots and immutable
                     # benchmark history already enumerate the public selector.
                     include_ledger_session_dates=False,
-                )
+                ), quote_source=self.public_quote_source,
             )
             service_sync = dict(payload.get("service_sync") or {})
             service_sync["revision_token"] = revision_token
@@ -2199,7 +2203,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
     def tw_revision(self) -> PreparedResponse:
         signature = tuple(
             self.update_hub.signature(path) for path in self.update_hub.paths["tw"]
+            if path not in self.public_quote_source.paths
         )
+        quote_revision = self.public_quote_source.revision()
         session_date = dashboard_session_clock(datetime.now(UTC)).get(
             "display_session_date"
         )
@@ -2215,12 +2221,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
             payload["revision_token"] = (
-                f"{payload.get('revision_token') or 'missing'}:{history_revision}"
+                f"{payload.get('revision_token') or 'missing'}:{history_revision}:{quote_revision}"
             )
+            payload["public_quote_revision"] = quote_revision
             return payload
 
         return self.cached_local_json(
-            cache_key=f"tw-revision:{signature}:{session_date}",
+            cache_key=f"tw-revision:{signature}:{session_date}:{quote_revision}",
             ttl_seconds=0.05,
             cache_control="no-store",
             stale_grace_seconds=0.0,
@@ -2278,7 +2285,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         signature = tuple(
             self.update_hub.signature(path)
             for path in self.update_hub.paths["overnight"]
+            if path not in self.public_quote_source.paths
         )
+        quote_revision = self.public_quote_source.revision()
 
         def build() -> Mapping[str, Any]:
             payload = build_dashboard_revision(
@@ -2293,12 +2302,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
             payload["revision_token"] = (
-                f"{payload.get('revision_token') or 'missing'}:{history_revision}"
+                f"{payload.get('revision_token') or 'missing'}:{history_revision}:{quote_revision}"
             )
+            payload["public_quote_revision"] = quote_revision
             return payload
 
         return self.cached_local_json(
-            cache_key=f"overnight-revision:{signature}",
+            cache_key=f"overnight-revision:{signature}:{quote_revision}",
             ttl_seconds=0.05,
             cache_control="no-store",
             stale_grace_seconds=0.0,
@@ -2327,7 +2337,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     include_ledger_session_dates=False,
                     discord_markets_field="overnight_markets",
                     discord_engine_revision_field="overnight_engine_state_revision",
-                )
+                ), quote_source=self.public_quote_source,
             )
             payload["product"] = "tw_overnight"
             payload["model_adapter_notice"] = (
@@ -2693,13 +2703,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ):
                 raise ValueError("data-monitor feature snapshot changed during read")
 
-            def reject_nonfinite(value: str) -> None:
-                raise ValueError(f"data-monitor feature snapshot has non-finite JSON: {value}")
-
             # Paging must inspect the DTO even if a producer sidecar exists;
             # the sidecar is only an accelerator for the legacy full-byte route.
-            payload = json.loads(body, parse_constant=reject_nonfinite)
-            index = FeaturePageIndex.from_payload(payload, source_signature=signature)
+            index = FeaturePageIndex.from_json(body, source_signature=signature)
             if signature != metadata_signature(snapshot.stat()):
                 raise ValueError("data-monitor feature snapshot changed during validation")
             self._feature_page_index = (snapshot, signature, index)
@@ -2926,7 +2932,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 upstream_url=f"{self.taifex_upstream}/api/history?range=1d",
                 ttl_seconds=55.0,
                 cache_control="no-cache",
-                stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
+                stale_grace_seconds=0.0,
                 sanitizer=sanitize_taifex_history,
             )
 
@@ -3691,7 +3697,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 ),
                 ttl_seconds=55.0,
                 cache_control="no-cache",
-                stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
+                # The upstream already coalesces/rebuilds its history. A second
+                # SWR layer would hold the previous minute for another refresh.
+                stale_grace_seconds=0.0,
                 sanitizer=sanitize_taifex_history,
             )
         if path == "/tw-day-trade/api/status":
@@ -3746,7 +3754,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    )
+                    ), quote_source=self.server.public_quote_source,
                 ),
             )
         if path == "/tw-day-trade/api/positions":
@@ -3769,7 +3777,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    )
+                    ), quote_source=self.server.public_quote_source,
                 ),
             )
         if path == "/tw-day-trade/api/events":
@@ -3798,7 +3806,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=symbol,
                         offset=offset,
                         limit=limit,
-                    )
+                    ), quote_source=self.server.public_quote_source,
                 ),
             )
         if path == "/tw-overnight/api/status":
@@ -3853,7 +3861,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    )
+                    ), quote_source=self.server.public_quote_source,
                 ),
             )
         if path == "/tw-overnight/api/positions":
@@ -3876,7 +3884,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    )
+                    ), quote_source=self.server.public_quote_source,
                 ),
             )
         if path == "/tw-overnight/api/events":
@@ -3898,7 +3906,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0]),
-                    )
+                    ), quote_source=self.server.public_quote_source,
                 ),
             )
         if path == "/shioaji/api/status":

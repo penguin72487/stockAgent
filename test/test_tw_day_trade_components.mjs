@@ -3,6 +3,27 @@ import {readFileSync} from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+test("minute chart axis labels scale to phone width without removing source points", () => {
+  const renderer = readFileSync(new URL("../services/tw_day_trade_dashboard/chart-renderer.js", import.meta.url), "utf8");
+  const context = vm.createContext({});
+  vm.runInContext(renderer.slice(renderer.indexOf("  function taipeiDayNumber("),
+    renderer.indexOf("  function formatMinute(")), context);
+  const first = Date.UTC(2026, 1, 25, 1, 1) / 60000;
+  const minutes = Array.from({length: 156 * 270}, (_, index) => (
+    first + Math.floor(index / 270) * 1440 + index % 270
+  ));
+  const phone = context.tickPlan(minutes, 3);
+  const desktop = context.tickPlan(minutes, 10);
+  assert.equal(phone.positions.length, 3);
+  assert.equal(desktop.positions.length, 10);
+  assert.equal(phone.positions[0], 0);
+  assert.equal(phone.positions.at(-1), 155 * 270);
+  assert.equal(minutes.length, 42120);
+  const oneSession = context.tickPlan(minutes.slice(0, 270), 3);
+  assert.equal(oneSession.positions.length, 3);
+  assert.equal(oneSession.positions.at(-1), 269);
+});
+
 function components(options = {}) {
   const context = vm.createContext({});
   for (const file of ["presentation.js", "detail-components.js"]) {

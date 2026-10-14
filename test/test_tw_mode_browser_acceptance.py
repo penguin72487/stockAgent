@@ -1,6 +1,16 @@
 import pytest
 
-from scripts.verify_tw_day_trade_mode_browser import _verify_signal_boundary
+from urllib.parse import parse_qs, urlsplit
+
+from scripts.verify_tw_day_trade_mode_browser import _signal_url, _verify_signal_boundary
+
+
+def test_native_public_signal_request_keeps_the_query_separator():
+    url = _signal_url("https://example.test/tw-day-trade/", market="new", day="2026-02-25")
+    parsed = urlsplit(url)
+    assert parsed.path == "/tw-day-trade/api/signals"
+    assert parse_qs(parsed.query) == {"mode": ["new"], "date": ["2026-02-25"],
+                                     "offset": ["0"], "limit": ["1"]}
 
 
 def _payload():

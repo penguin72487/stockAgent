@@ -13,6 +13,7 @@ const labels = Object.freeze({
   cooldown: "來源冷卻", known_queue_clear: "已知待辦已清", attention: "需注意", not_enabled: "未啟用／待確認",
   finite_complete: "固定批次正文已存", waiting_cohort: "新文章等待納入批次",
   authorized_api_pending: "授權 API 待接線",
+  metadata_polling: "RSS 資訊追新，非全文",
   stopped: "下載器已停止", stale: "觀測已過期", unavailable: "尚無有效快照", invalid: "快照版本不相容", degraded: "快照數量不一致",
   draining: "正在排空保存", waiting_disk: "等待磁碟空間", waiting_restart: "設定交接，等待續跑",
 });
@@ -20,7 +21,7 @@ const stateLabels = Object.freeze({
   complete: "已完成狀態", pending: "待回補", inflight: "處理中", retry: "待重試", retry_cooldown: "重試冷卻",
   awaiting_authorization: "未啟用／待確認", unsupported_article_path: "網址格式未支援", body_not_found: "缺正文",
   waiting_cohort: "新文章待納入，非抓取失敗",
-  article_attribution_not_verified: "作者未驗證", article_license_not_verified: "授權標記未驗證", robots_disallowed: "robots 限制",
+  article_attribution_not_verified: "作者未驗證", article_title_not_verified: "標題未驗證", article_license_not_verified: "授權標記未驗證", robots_disallowed: "robots 限制",
   article_identity_not_verified: "文章身分待驗證", article_rights_not_verified: "原創／來源署名待驗證", article_rights_or_scope_excluded: "原創／作者權利未確認或超出範圍",
   paywall_or_login: "付費／登入內容", access_challenge: "來源存取驗證", robots_access_challenge: "robots 存取驗證挑戰", robots_not_plain_rules: "robots 回應身分／規則待驗證", robots_redirect_refused: "robots 轉址待修",
   source_body_removed: "來源已主動撤下正文", source_not_found: "來源網址已不存在", source_body_image_only: "來源正文僅圖片，未做 OCR", source_body_embedded_only: "來源正文僅外部嵌入，未取得文字", source_article_empty_template: "來源目前回空白文章模板，未取得正文", pdf_image_only_or_body_not_found: "影像 PDF 待文字辨識",
@@ -34,6 +35,7 @@ const stages = Object.freeze({owner_initialization: "Owner 初始化", policy_re
   receipt_hash_fsync: "收據雜湊／fsync", acceptance_sqlite_commit: "耐久佇列提交", status_write: "快照寫入", idle_wait: "無工作等待",
   address_validation: "公開位址檢查", request_slot_wait: "限流等待", transport: "網路回應", article_extraction: "正文解析", discovery_extraction: "Feed／sitemap 解析"});
 const capacityLabels = Object.freeze({warming: "累積樣本", ramping: "階梯升速", verifying: "退回後穩定驗證",
+  metadata_polling: "RSS 更新排程，不進行額外測速請求",
   recovering_transport: "暫時故障恢復驗證，非限速", endpoint_validation_failed: "端點／回應結構待修，非限速",
   waiting_source: "遵守來源暫停", insufficient_samples: "請求樣本不足", insufficient_useful_data: "無新增正文，不升速",
   official_or_learned_floor: "遵守來源／robots 間隔", stable_source_backoff: "限速後穩定設定",
@@ -164,6 +166,9 @@ function renderSources(data) {
     const progressLabel = metadataOnly ? "正文工作尚未建立" : cohort ? "固定批次已存正文／網址" : "已完成狀態／已知網址";
     const progressCount = metadataOnly ? "未入佇列" : cohort ? `${count(cohort.stored_bodies)} / ${count(cohort.urls)}` : `${count(source.complete_urls)} / ${count(source.known_urls)}`;
     const metadataNote = metadata ? `<p class="news-provider-note news-provider-original-metadata">已解析原始媒體線索 <span data-news-original-links>${count(metadata.literal_metadata_links)}</span> 條 · ${count(metadata.original_hosts)} 個主機；可能多條指向同篇，不是正文筆數、不授予抓取或使用權限。</p>` : '';
+    const feed = source.metadata_feed_progress;
+    const feedNext = feed?.next_check_ready ? '已到期，等待排程' : stamp(feed?.next_check_at_utc);
+    const feedNote = !feed ? '' : `<div class="news-provider-work" data-news-metadata-feed><dl class="news-provider-facts"><div><dt>已驗 RSS／已註冊</dt><dd>${count(feed.verified_feeds)} / ${count(feed.registered_feeds)}</dd></div><div><dt>最新 feed 資訊筆數</dt><dd>${count(feed.latest_feed_item_observations)}</dd></div><div><dt>最新 XML 流量</dt><dd>${bytes(feed.latest_feed_response_bytes)}</dd></div><div><dt>RSS 錯誤端點</dt><dd>${count(feed.feeds_with_errors)}</dd></div></dl><p class="news-provider-note">標題、摘要、連結與發布時間；不同 feed 可能包含同篇，不是去重文章或全文。每 ${decimal(feed.poll_interval_seconds / 60)} 分鐘追新；最近核對 ${escape(stamp(feed.last_check_at_utc))}，下一次 ${escape(feedNext)}。持續追新沒有全歷史完成時間；全文尚未啟用。</p></div>`;
     const supplement = source.finite_supplements;
     const outcomes = cohort && cohort.reviewed_nonbody_outside_cohort;
     const outcomeNote = outcomes && outcomes.urls ? `；已核對非正文 ${count(outcomes.urls)} 個網址（來源不存在 ${count(outcomes.states.source_not_found || 0)}，非文章路徑 ${count(outcomes.states.unsupported_article_path || 0)}），不計入已存正文` : "";
@@ -179,7 +184,7 @@ function renderSources(data) {
       : '<p class="news-provider-note news-provider-work">正文工作分類尚未就緒；不以未知數當成零或完成。</p>';
     return `<article class="pipeline-card"><header class="pipeline-card-header"><div class="news-provider-identity"><strong>${escape(source.name)}</strong><small>${escape(source.id)}</small></div><span class="pipeline-status ${badge}">${escape(labels[source.state] || "待觀測")}</span></header>${apiNote}
       <dl class="news-provider-facts"><div><dt>${progressLabel}</dt><dd>${progressCount}</dd></div><div><dt>待回補</dt><dd>${count(source.remaining_urls)}</dd></div><div><dt>正文 UTF-8</dt><dd>${bytes(source.text_bytes)}</dd></div><div><dt>${metadataOnly ? "新增正文速率尚未量測" : source.authorized_api_setup ? "API 新增正文／分鐘，未量測" : forecast ? "近期新增正文／分鐘" : source.forecast_rate_basis === "new_stored_url_heads" ? "本程序新增正文／分鐘" : "舊快照版本速率／分鐘"}</dt><dd data-news-rate="completion">${decimal(displayedRate == null ? null : displayedRate * 60)}</dd></div></dl>
-      ${metadataNote}${workNote}${cnyesListProgress(source)}
+      ${feedNote}${metadataNote}${workNote}${cnyesListProgress(source)}
       <progress class="news-provider-progress mini-progress-track" max="1"${source.progress_ratio == null ? "" : ` value="${source.progress_ratio}"`} aria-label="${escape(source.name)} ${cohort ? '固定批次正文比例' : '已完成狀態占已知網址的比例'}"></progress><div class="news-provider-states">${cohort ? '固定批次' : '已知範圍'} ${ratio} · ${escape(statesText || (metadataOnly ? "已有原始網址線索，尚未建立正文工作" : "尚無已發現網址"))}${cohortNote ? `<p>${escape(cohortNote)}</p>` : ''}</div>
       <p class="news-provider-note">剩餘 ${escape(eta(source, data))} · ${escape(finish)}</p>${forecastNote}<p class="news-provider-note">${escape(reviewLabels[source.source_policy_review] || "來源審閱紀錄不可用")}${source.source_reviewed_at_utc ? ` · 核對 ${escape(stamp(source.source_reviewed_at_utc))}` : ""}</p><p class="news-provider-note">${source.authorized_api_setup ? "官方 API 能力檢查已實作，全文管線未啟用" : source.adapter_registered ? "共用下載器已接線" : "來源尚未註冊"} · ${source.adapter_acceptance === "committed_body_heads_observed" ? "已觀測正文入庫" : "尚無正文入庫證據"}${source.source_role === "redirector" ? " · 轉址來源，須找到原始媒體 URL" : ""}</p><p class="news-provider-note">${escape(errorLabel(source))}</p></article>`;
   }).join(""));

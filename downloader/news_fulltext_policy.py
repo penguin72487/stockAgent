@@ -25,6 +25,7 @@ import soupsieve
 
 
 CONTRACT_VERSION = 1
+_GLOBALVOICES_HTML_BODY_CONTRACT_VERSION = 10
 CAPTURE_POLICY_VERSION = 2
 TRACKING_KEYS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
 # Reviewed source revisions, not an unbounded parser or automatic upgrade.
@@ -139,6 +140,16 @@ class SourcePolicy:
     fulltext_feed_data_fingerprint: str = ""
     cnyes_index_api: str = ""
     cnyes_index_data_fingerprint: str = ""
+    incremental_index_pages: tuple[str, ...] = ()
+    metadata_feeds: tuple[str, ...] = ()
+    metadata_feed_authorization: dict[str, Any] | None = None
+    metadata_feed_fingerprint: str = ''
+    metadata_feed_interval_seconds: int = 0
+    cnyes_index_compatibility: tuple[str, str] = ()
+
+    @property
+    def request_enabled(self) -> bool:
+        return self.allowed or bool(self.metadata_feeds)
 
 
 def cnyes_bulk_fingerprint(source: SourcePolicy) -> str:
@@ -334,6 +345,26 @@ class PolicyRegistry:
             acquisition_mode = entry.get("acquisition_mode", "continuous")
             if not isinstance(acquisition_mode, str) or acquisition_mode not in {"continuous", "finite"}:
                 raise ValueError("invalid news acquisition mode")
+            incremental_indexes = entry.get('incremental_index_pages', [])
+            if (not isinstance(incremental_indexes, list) or len(incremental_indexes) > 32
+                    or any(not isinstance(url, str) or not url or len(url) > 2048 for url in incremental_indexes)
+                    or len(set(incremental_indexes)) != len(incremental_indexes)):
+                raise ValueError('invalid incremental index scope')
+            if incremental_indexes:
+                declared_interval = entry.get('discovery_interval_seconds', 3600)
+                if (acquisition_mode != 'continuous' or type(declared_interval) is not int
+                        or not 60 <= declared_interval <= 365*86400):
+                    raise ValueError('incremental index requires continuous mode and a valid interval')
+                for url in incremental_indexes:
+                    try:
+                        parts = urlsplit(url)
+                        valid = (url in entry.get('index_pages', []) and normalize_url(url) == url
+                            and not parts.query and not parts.fragment
+                            and any(parts.hostname == d or (parts.hostname or '').endswith('.'+d) for d in domains))
+                    except NewsError:
+                        valid = False
+                    if not valid:
+                        raise ValueError('incremental index must be an exact registered public index URL')
             publication_selectors = entry.get('publication_selectors', [])
             if (not isinstance(publication_selectors, list) or len(publication_selectors) > 8
                     or any(not isinstance(s, str) or not s or len(s) > 512 for s in publication_selectors)):
@@ -418,9 +449,17 @@ class PolicyRegistry:
                     raise ValueError("invalid Cnyes history start")
             from downloader.news_fulltext_cnyes_index import reviewed_index
             cnyes_index_api, index_fingerprint = reviewed_index(entry, provider, auth)
+            index_compatibility = ((index_fingerprint, reviewed_index(entry, provider, auth, data_version=1)[1])
+                                   if cnyes_index_api else ())
+            from downloader.news_fulltext_metadata_feeds import reviewed_policy
+            metadata_urls, metadata_auth, metadata_fingerprint, metadata_interval = reviewed_policy(entry, config)
             # Public list metadata has its own ABI. Enabling that list must
             # not invalidate millions of verified bodies/category pages.
-            capture_entry = {key:value for key,value in entry.items() if key != 'cnyes_public_index'}
+            # Live-index cadence has its own scheduling ABI. It grants no new
+            # body/endpoint scope and must not invalidate historical captures
+            # or cause otherwise unchanged indexes/feeds to be reparsed.
+            capture_entry = {key:value for key,value in entry.items()
+                             if key not in {'cnyes_public_index', 'incremental_index_pages', 'metadata_feed_policy'}}
             fingerprint_payload = {"version": CONTRACT_VERSION, "capture_policy_version": CAPTURE_POLICY_VERSION,
                                                         "collection_purpose": config.get("collection_purpose", "personal_research"),
                                                         "html_parser": html_parser,
@@ -430,10 +469,10 @@ class PolicyRegistry:
                 fingerprint_payload["reviewed_cnyes_endpoint_inventory"] = cnyes_inventory
             if provider == 'cnyes':
                 fingerprint_payload['verified_short_html_body_contract_version'] = 5
-                fingerprint_payload['mobile_canonical_html_contract_version'] = 41
+                fingerprint_payload['mobile_canonical_html_contract_version'] = 43
                 fingerprint_payload['verified_empty_html_outcome_contract_version'] = 8
                 fingerprint_payload['verified_native_quote_only_outcome_contract_version'] = 7
-                fingerprint_payload['verified_native_image_only_outcome_contract_version'] = 3
+                fingerprint_payload['verified_native_image_only_outcome_contract_version'] = 4
             if fulltext_feeds:
                 fingerprint_payload['fulltext_feed_rights_contract_version'] = 2
             if pdf_pattern:
@@ -443,7 +482,7 @@ class PolicyRegistry:
             if embedded:
                 fingerprint_payload["embedded_article_adapter_contract_version"] = (
                     {"cmnews_visible_article_v1": 6, "einfo_next_post_v1": 2, "cnews_visible_article_v1": 4,
-                     "ftv_visible_article_v1": 4, "nownews_visible_article_v1": 2,
+                     "ftv_visible_article_v1": 5, "nownews_visible_article_v1": 2,
                      "tainan_visible_news_v1": 2, "voa_reviewed_private_article_v2": 3,
                      "taichung_visible_news_v1": 2}.get(embedded, 1))
             if tainan_layout:
@@ -451,7 +490,7 @@ class PolicyRegistry:
             if provider == "globalvoices":
                 fingerprint_payload["publisher_removed_body_notice_contract_version"] = 2
                 fingerprint_payload["publisher_challenge_headline_identity_contract_version"] = 1
-                fingerprint_payload['verified_small_html_body_contract_version'] = 6
+                fingerprint_payload['verified_small_html_body_contract_version'] = _GLOBALVOICES_HTML_BODY_CONTRACT_VERSION
                 fingerprint_payload['mixed_nontext_native_embed_classification_version'] = 1
             if provider == 'genetinfo':
                 fingerprint_payload['image_only_body_classification_version'] = 1
@@ -507,6 +546,9 @@ class PolicyRegistry:
                 feed_fingerprint,
                 cnyes_index_api,
                 index_fingerprint,
+                tuple(incremental_indexes),
+                metadata_urls, metadata_auth, metadata_fingerprint, metadata_interval,
+                cnyes_index_compatibility=index_compatibility,
             )
 
     def match(self, url: str) -> SourcePolicy | None:
@@ -754,36 +796,46 @@ def _has_paywall(root: Tag) -> bool:
 def _globalvoices_declared_news_headline(soup: BeautifulSoup, source: SourcePolicy, page_url: str | None) -> bool:
     """A verified news title is not an access-denial response.
 
-    The original July 1, 2021 article is titled 'Access denied: ...'. Exempt
-    only that reviewed publisher/template from the title substring heuristic,
-    with its requested canonical, actual body, byline and article license.
-    Explicit challenge elements and every HTTP/robots refusal remain binding.
+    Native news uses this phrase in both prefix and suffix headlines. Its word
+    position is not access evidence. Require the same current canonical/body,
+    visible header/footer author profiles, aware clock and per-article license
+    used by the publisher's exceptional-body identity contract. Other title
+    markers, explicit challenges and HTTP/robots refusals remain binding.
     """
     if source.provider != "globalvoices" or not page_url or not source.title_selector:
         return False
     if soup.select_one('#challenge-form, #cf-challenge-running, .cf-challenge') is not None:
         return False
     headlines = _select_nodes(soup, source.title_selector)
-    canonical = _select_nodes(soup, 'link[rel="canonical"]')
-    if len(headlines) != 1 or len(canonical) != 1:
+    if len(headlines) != 1:
         return False
     headline = re.sub(r'\s+', ' ', headlines[0].get_text(' ', strip=True)).casefold()
     title = re.sub(r'\s+', ' ', soup.title.get_text(' ', strip=True)).casefold() if soup.title else ''
-    if not re.fullmatch(r'access denied: .+', headline) or title != headline + ' · global voices':
-        return False
-    try:
-        if normalize_url(canonical[0].get('href')) != normalize_url(page_url):
-            return False
-    except NewsError:
+    if not re.search(r'\baccess denied\b', headline) or title != headline + ' · global voices':
         return False
     bodies = [node for selector in source.selectors for node in _select_nodes(soup, selector)]
     if len(bodies) != 1 or len(_plain_text_node(bodies[0], source.exclude_selectors, parser=source.html_parser)) < 100:
         return False
-    if not any(node.get_text(' ', strip=True) for selector in source.author_selectors for node in _select_nodes(soup, selector)):
+    from downloader.news_fulltext_publishers import _globalvoices_visible_article_identity
+
+    identity = _globalvoices_visible_article_identity(soup, source, page_url=page_url)
+    if identity is None or identity[0] is not bodies[0]:
         return False
-    return bool(source.required_license_url_prefix and any(
-        str(node.get('href', '')).startswith(source.required_license_url_prefix)
-        for selector in source.license_selectors for node in _select_nodes(soup, selector)))
+    sitekeys = soup.select('[data-sitekey]')
+    if sitekeys:
+        # Seven retained native public templates have this exact comment-only
+        # widget, outside the declared article. It verifies posting a comment,
+        # not reading the already-visible licensed body. Never solve/submit it
+        # or exempt an article gate, an unknown widget or ambiguous ownership.
+        widgets = soup.select('#respond > .respond-content > form#commentform > h-captcha.h-captcha[data-sitekey]')
+        scopes, responds, forms = soup.select('#page-content'), soup.select('#respond'), soup.select('form#commentform')
+        if (len(sitekeys) != 1 or len(widgets) != 1 or sitekeys[0] is not widgets[0]
+                or len(scopes) != 1 or len(responds) != 1 or len(forms) != 1
+                or bodies[0].find_parent(id='page-content') is not scopes[0]
+                or responds[0].find_parent(id='page-content') is not scopes[0]
+                or responds[0].find_parent(class_='post-container') is not None):
+            return False
+    return True
 
 
 def public_article_document(payload: bytes, source: SourcePolicy, *, page_url: str | None = None) -> BeautifulSoup:
@@ -942,6 +994,7 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
             raise NewsError('source_body_image_only')
     image_only_container = False
     short_configured_body = False
+    verified_untitled_html_body = False
     if native_canonical_article is not None:
         method = 'cnyes_visible_canonical_alias_v1'
         short_configured_body = 0 < len(body) < 100
@@ -960,8 +1013,13 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
                 # CTA a complete article or repeatedly retry a valid image page.
                 image_only_container = True
             if source.provider == 'globalvoices' and 0 < len(text) < 100:
-                from downloader.news_fulltext_publishers import globalvoices_verified_small_body
+                from downloader.news_fulltext_publishers import (
+                    globalvoices_verified_small_body, globalvoices_verified_untitled_body,
+                )
                 verified = globalvoices_verified_small_body(soup, source, text, page_url=page_url)
+                if not verified:
+                    verified = globalvoices_verified_untitled_body(soup, source, text, page_url=page_url)
+                    verified_untitled_html_body = bool(verified)
                 if verified:
                     article = verified
                     body, method, short_configured_body = text, 'css:' + selector, True
@@ -1110,6 +1168,12 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         title = str(title_meta.get("content", "")) if title_meta else ""
     if not title and method in _FED_RELEASE_LAYOUT_VERSIONS and soup.title:
         title = soup.title.get_text(" ", strip=True)
+    if source.provider == 'globalvoices' and not title and not verified_untitled_html_body:
+        from downloader.news_fulltext_publishers import globalvoices_verified_untitled_body
+        verified = globalvoices_verified_untitled_body(soup, source, body, page_url=page_url)
+        if verified:
+            article.update(verified)
+            verified_untitled_html_body = True
     if source.excluded_article_title_pattern and re.search(source.excluded_article_title_pattern, title):
         raise NewsError("article_rights_or_scope_excluded")
     authors = article.get("author") or []
@@ -1133,7 +1197,9 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         if not author_names or any(name not in source.permitted_author_names for name in author_names):
             raise NewsError('article_rights_or_scope_excluded')
     if (source.require_configured_container and not title and _FED_RELEASE_LAYOUT_VERSIONS.get(method, 0) < 3
-            or source.require_author_attribution and not any(author_names) and not source_visible_name_empty):
+            and not verified_untitled_html_body):
+        raise NewsError('article_title_not_verified')
+    if source.require_author_attribution and not any(author_names) and not source_visible_name_empty:
         raise NewsError("article_attribution_not_verified")
     published = article.get("datePublished") or legacy_publication
     if not published and source.provider != 'pansci':
@@ -1145,7 +1211,9 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         if len(clocks) == 1:
             published = clocks.pop()  # Exact declared text; never URL, scrape or related-story date.
     return {
-        "title": title, "title_basis": "publisher_declared_title" if title else "unknown_source_title_not_found",
+        "title": title, "title_basis": ('source_visible_title_empty_verified_numeric_article'
+                                        if verified_untitled_html_body else
+                                        "publisher_declared_title" if title else "unknown_source_title_not_found"),
         "author_attribution_detail_json": article.get("author_attribution_detail_json"),
         "verified_image_captions_json": article.get("verified_image_captions_json"),
         "verified_article_notices_json": article.get("verified_article_notices_json"),

@@ -108,6 +108,10 @@ current inode 的外部 FD／mmap、quarantine 後 metadata 與每次 nlink 減�
   從本機繼續；分開記錄請求 accepted、API actual stopped、SSH 關閉，不從
   連不上推論完整停止或不再計費。不要將 Stop 當成 Destroy 授權。實際例子及
   有界 producer／原生 D 讀取見 `docs/vast_pre_stop_backup_2026-10-10.md`。
+- **故障後轉移訓練：** 使用者指定並確認新的 SSH 目的機後，沿既有 rescue
+  owner 發臨時 key、固定 runtime／source、驗舊 worker 停止與 generation fence，
+  strict CUDA 及實際新 epoch 各自驗收。不自行租機或選 target，不把權重還原
+  當完整續訓；保全可先完成。入口及接手見 `docs/vast_training_rescue_2026-10-13.md`。
 
 成功更新本次任務證據，保留 failed／deferred 原結果。回報最新時間與分母／scope；
 每批 verified 不代表全歷史已驗收，現有 filesystem 沿用也不表示已格式遷移。

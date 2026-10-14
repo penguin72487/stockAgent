@@ -63,6 +63,48 @@ def test_primary_owner_excludes_aliases_derived_and_retired_tasks(tmp_path, monk
     assert result['summary']['unbatched_requests'] == 3
 
 
+def test_ephemeral_aggregates_share_clock_and_preserve_null_renewals(tmp_path, monkeypatch):
+    dataset = 'TaiwanStockPrice'
+    path = _database(tmp_path, 'complement', [
+        (dataset, '', 'a', 'day', 0, 'complete', NOW.isoformat()),
+        (dataset, '', 'b', 'day', 0, 'complete', (NOW + timedelta(days=1)).isoformat()),
+        (dataset, '', 'c', 'day', 0, 'complete', None),
+        (dataset, '', 'd', 'derived', 0, 'complete', NOW.isoformat()),
+        (dataset, '', 'e', 'day', 8, 'observed_empty', NOW.isoformat()),
+        (dataset, '', 'f', 'day', 8, 'pending', NOW.isoformat()),
+        (dataset, '', 'g', None, 8, 'complete', NOW.isoformat()),
+    ])
+    monkeypatch.setattr(work, '_registry', lambda: {dataset: _spec(dataset, 'complement')})
+    snapshots = {'old_owner': None}
+    before = path.read_bytes()
+    ordinary = work.build_finmind_workload(tmp_path, NOW)
+    reused = work.build_finmind_workload(tmp_path, NOW, queue_snapshots=snapshots)
+    assert ordinary == reused
+    assert set(snapshots) == {'complement'}
+    snapshot = snapshots['complement']
+    assert snapshot.matches(path, NOW)
+    assert not snapshot.matches(path, NOW + timedelta(seconds=1))
+    assert not snapshot.matches(tmp_path / 'sponsor/queue.sqlite3', NOW)
+    assert snapshot.states == {'complete': 5, 'observed_empty': 1, 'pending': 1}
+    assert snapshot.renewals == ((dataset, 'day', 0, 'complete', 2),
+                                 (dataset, 'day', 8, 'observed_empty', 1))
+    assert path.read_bytes() == before
+
+
+def test_priority_seek_preserves_exists_semantics_with_duplicate_legacy_keys(tmp_path, monkeypatch):
+    dataset = 'TaiwanFuturesKBar'
+    path = _database(tmp_path, 'complement', [
+        (dataset, 'TX', '2020-01-02', 'id_day', 8, 'pending', None),
+        (dataset, 'MTX', '2020-01-02', 'id_day', 8, 'pending', None),
+    ])
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE finmind_priority_tasks(dataset TEXT,data_id TEXT,partition TEXT)')
+        conn.executemany('INSERT INTO finmind_priority_tasks VALUES (?,?,?)',
+                         [(dataset, 'TX', '2020-01-02')] * 3)
+    _, rows = _result(tmp_path, monkeypatch, [_spec(dataset, 'complement')])
+    assert rows[dataset]['priority_override']['requests'] == 1
+
+
 def test_done_refresh_only_due_priority_zero_is_incremental(tmp_path, monkeypatch):
     dataset = 'TaiwanStockPrice'
     _database(tmp_path, 'sponsor', [

@@ -285,8 +285,9 @@ def snapshot_finmind_estimate(root: Path, *, now: datetime | None = None) -> dic
     from downloader.acquisition_policy import evaluate_finmind_secondary_admission
 
     now = now or datetime.now(UTC)
-    workload = build_finmind_workload(root, now)
-    telemetry = build_finmind_eta_telemetry(root, now)
+    queue_snapshots = {}
+    workload = build_finmind_workload(root, now, queue_snapshots=queue_snapshots)
+    telemetry = build_finmind_eta_telemetry(root, now, queue_snapshots=queue_snapshots)
     public_root = Path(__file__).resolve().parents[1] / 'data_tw_public'
     calendar: dict[str, str] = {}
     def protected(day: date) -> bool:
@@ -300,7 +301,7 @@ def snapshot_finmind_estimate(root: Path, *, now: datetime | None = None) -> dic
             calendar[day.isoformat()] = decision.status
         state = calendar[day.isoformat()]
         return state != 'closed' and (state in {'actual_open', 'scheduled_open'} or day.weekday() < 5)
-    admission = evaluate_finmind_secondary_admission(root=root, now=now)
+    admission = evaluate_finmind_secondary_admission(root=root, now=now, _workload_snapshot=(root, workload))
     estimate = ordered_estimate(workload, telemetry, now, day_is_protected=protected,
                                 secondary_admission=admission)
     estimate['scenario_projection_contract'] = 1

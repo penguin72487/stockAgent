@@ -275,13 +275,17 @@ def test_ltn_official_rss_permission_does_not_enable_html_or_mislabel_abstract_a
     assert not any(source.get(key) for key in ('fulltext_feeds', 'wordpress_apis', 'cnyes_apis'))
 
 
-def test_money_link_member_contract_review_keeps_anonymous_public_scope_separate():
+def test_money_link_public_footer_review_keeps_news_and_financial_products_separate():
     reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
     review = reviews['money_link']
-    assert review['capture_decision'] == 'review_incomplete'
+    assert review['capture_decision'] == 'permission_required'
+    assert 'https://tweb.money-link.com.tw/policy/declaration.aspx' in review['evidence_urls']
     assert 'https://ww2.money-link.com.tw/MemberCenter/MemberTerms.aspx?term=4' in review['evidence_urls']
-    assert 'actual member/product contracts' in review['observation']
-    assert 'Anonymous public-news capture scope remains unresolved' in review['observation']
+    assert 'outside any login' in review['observation']
+    assert 'editorial-content rights' in review['observation']
+    assert 'not automatically treat that financial-data product paragraph as the entire news contract' in review['observation']
+    assert 'does not prove that no licensed feed exists' in review['observation']
+    assert 'planning review grants no source permission' in review['observation']
     config = load_news_configuration(Path('configs/news_fulltext.json'))
     source = next(row for row in config['providers'] if row['id'] == 'money_link')
     assert source['enabled'] is False and source['authorization']['kind'] == 'awaiting_authorization'

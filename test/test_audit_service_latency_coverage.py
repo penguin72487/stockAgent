@@ -11,6 +11,23 @@ import pytest
 from scripts import audit_service_latency_coverage as audit
 
 
+def test_gpu_telemetry_does_not_treat_unknown_values_as_zero(monkeypatch):
+    monkeypatch.setattr(audit.shutil, 'which', lambda name: '/usr/bin/nvidia-smi')
+    def run(args, **kwargs):
+        assert '--format=csv,noheader,nounits' in args
+        return subprocess.CompletedProcess(args, 0, stdout='0, Test GPU, 4, 1024, 8192, [N/A]\n')
+    monkeypatch.setattr(audit.subprocess, 'run', run)
+    result = audit.gpu_snapshot()
+    assert result['state'] == 'observed'
+    assert result['devices'][0]['power_watts'] is None
+    assert result['devices'][0]['utilization_percent'] == 4
+
+
+def test_gpu_telemetry_unavailable_is_not_cuda_failure(monkeypatch):
+    monkeypatch.setattr(audit.shutil, 'which', lambda _: None)
+    assert audit.gpu_snapshot() == {'state': 'unavailable', 'devices': []}
+
+
 def test_public_ipv6_external_evidence_never_promotes_stale_or_reused_probe(
     tmp_path: Path,
 ) -> None:

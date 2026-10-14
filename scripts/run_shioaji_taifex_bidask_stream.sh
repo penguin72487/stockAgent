@@ -61,6 +61,10 @@ STRATEGY_OPTION_RISK_MARGIN_B_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_
 STRATEGY_OPTION_RISK_MARGIN_C_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_C_TWD:-18800}"
 STRATEGY_CAPITAL_BUFFER_MULTIPLE="${SHIOAJI_TAIFEX_STRATEGY_CAPITAL_BUFFER_MULTIPLE:-2.0}"
 STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY="${SHIOAJI_TAIFEX_STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY:-immediate_live}"
+recovery_args=()
+if [[ "${SHIOAJI_TAIFEX_RECOVER_EXPIRED_CYCLE_FUTURES:-false}" == true ]]; then
+  recovery_args+=(--recover-expired-cycle-futures)
+fi
 LOG_FILE="$RUN_ROOT/run.log"
 LOCK_FILE="$RUN_ROOT/runner.lock"
 mkdir -p "$RUN_ROOT"
@@ -130,6 +134,7 @@ while true; do
     if ! run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
       --simulation \
       --settle-expired-strategy-state-only \
+      "${recovery_args[@]}" \
       --capture-session "$capture_session" \
       --trade-date "$trade_date" \
       --stop-at "$stop_at" \
@@ -167,6 +172,7 @@ while true; do
     strategy_args=()
     if [[ "$strategy_bootstrap_ready" == true && "$worker_index" -eq 0 ]]; then
       strategy_args+=(
+        "${recovery_args[@]}"
         --execute-strategies
         --final-settlement-path "$FINAL_SETTLEMENT_PATH"
         --strategy-mode "$STRATEGY_MODE"

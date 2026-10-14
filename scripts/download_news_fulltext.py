@@ -129,13 +129,24 @@ def main(argv=None):
                             return
         previous = queue.db.execute("SELECT value FROM counters WHERE key='last_metadata_ingest_epoch'").fetchone()
         due = not previous or time.time() - previous[0] >= config["metadata_refresh_seconds"]
-        if not args.skip_local_ingest and (args.command == "inventory" or due):
-            queue.status(activity="inventorying")
+        pending = getattr(queue, 'metadata_inventory_pending', False)
+        if not args.skip_local_ingest and (args.command == "inventory" or due or pending):
+            if not pending:
+                queue.status(activity="inventorying")
             with metrics.measure("metadata_inventory"):
-                imported = queue.ingest_local(repo / config["finlab_root"], repo / config["finmind_root"])
-            with queue.db:
-                queue.gauge("last_metadata_ingest_epoch", int(time.time()))
-            print(json.dumps({"changed_metadata_partitions_imported": imported}, ensure_ascii=False), flush=True)
+                if args.continuous:
+                    from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_SECONDS
+                    result = queue.ingest_local_slice(repo / config['finlab_root'], repo / config['finmind_root'],
+                        maximum_wall_seconds=METADATA_SLICE_SECONDS, stop=http.stop if http else None)
+                else:
+                    result = {'imported': queue.ingest_local(repo / config['finlab_root'], repo / config['finmind_root']),
+                              'complete': True}
+            if result['complete']:
+                with queue.db:
+                    queue.gauge("last_metadata_ingest_epoch", int(time.time()))
+            if result['imported'] or result['complete']:
+                print(json.dumps({'changed_metadata_partitions_imported': result['imported'],
+                                  'metadata_inventory_complete': result['complete']}, ensure_ascii=False), flush=True)
     try:
         from downloader.news_fulltext_failure_focus import configure_focus
         configure_focus(queue, config.get('failure_diagnostic_focus'))

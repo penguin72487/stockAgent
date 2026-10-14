@@ -71,7 +71,7 @@ class NewsHTTP:
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.limiters = {p.provider: limiter_factory(p.interval_seconds, name="news-fulltext:" + p.provider)
-                         for p in registry.sources.values() if p.allowed}
+                         for p in registry.sources.values() if p.request_enabled}
         self.send_locks = {provider: threading.Lock() for provider in self.limiters}
         self.robots_locks: dict[str, threading.Lock] = {}
         self.robots_parsers: dict[str, tuple[float, Protego]] = {}
@@ -127,6 +127,8 @@ class NewsHTTP:
         base = parts.scheme + "://" + parts.netloc + parts.path
         if parts.path == "/robots.txt":
             return "robots"
+        if url in source.metadata_feeds:
+            return 'metadata_feed'
         if base in source.cnyes_apis:
             return "cnyes_" + parts.path.rsplit("/", 1)[-1]
         if base in source.wordpress_apis:
@@ -257,7 +259,13 @@ class NewsHTTP:
                 error.robots_origin_isolation = True
                 raise error
 
-    def _reserve_request(self, source, url, *, endpoint=None):
+    def _require(self, url, metadata_feed=None):
+        if metadata_feed is None:
+            return self.registry.require(url)
+        from downloader.news_fulltext_metadata_feeds import require_request
+        return require_request(self.registry, url, metadata_feed)
+
+    def _reserve_request(self, source, url, *, endpoint=None, metadata_feed=None):
         # Lock only the send reservation, never the network response. Concurrent
         # responses may overlap, but dispatch commitments remain evenly paced.
         with self.metrics.measure("request_slot_wait", source.provider), self.send_locks[source.provider]:
@@ -278,8 +286,8 @@ class NewsHTTP:
                     if remaining <= 0:
                         if self.stop.is_set():
                             raise NewsError("stopping", retry=True, delay=1, request_deferred=True)
-                        if source.authorization.get("valid_until"):
-                            self.registry.require(url)  # Permission may expire during the pacing wait.
+                        if metadata_feed is not None or source.authorization.get("valid_until"):
+                            self._require(url, metadata_feed)  # Permission may expire during the pacing wait.
                         # One clock event, after telemetry-lock waiting, owns
                         # both the next deadline and measured dispatch gap.
                         # Refusal/floor checks and this commitment share the
@@ -387,14 +395,14 @@ class NewsHTTP:
             raise error
 
     def _record_access_problem(self, response: Response, code: str, *, body_read: bool,
-                               recovery_observation=None, robots_origin=None, robots_pressure=None):
+                               recovery_observation=None, robots_origin=None, robots_pressure=None, metadata_feed=None):
         """Preserve the refusal layer, not just a retry timestamp.
 
         Only failed access/policy requests take this path. Ordinary successful
         articles incur no new hash, parse or file write. These are private
         diagnostic events, not accepted-body receipts or public status fields.
         """
-        provider = self.registry.require(response.url).provider
+        provider = self._require(response.url, metadata_feed).provider
         observation = {
             "contract_version": 2, "owner_id": self.metrics.owner_id,
             "provider": provider, "requested_url": response.url,
@@ -465,10 +473,10 @@ class NewsHTTP:
                 'authorization_fingerprint': source.authorization_fingerprint}
         self._persist_problem('transport', source.provider, observation, day=now.strftime('%Y%m%d'))
 
-    def _raw(self, url: str, headers: dict | None = None, *, robots_origin=None) -> Response:
-        source = self.registry.require(url)
+    def _raw(self, url: str, headers: dict | None = None, *, robots_origin=None, metadata_feed=None) -> Response:
+        source = self._require(url, metadata_feed)
         if robots_origin is not None and (policy_origin(robots_origin + '/') != robots_origin
-                or self.registry.require(robots_origin + '/').provider != source.provider):
+                or self._require(robots_origin + ('/robots.txt' if metadata_feed is not None else '/'), metadata_feed).provider != source.provider):
             raise NewsError('robots_origin_context_invalid')
         if self.stop.is_set():
             raise NewsError("stopping", retry=True, delay=1, request_deferred=True)
@@ -482,7 +490,7 @@ class NewsHTTP:
             if error.code == "dns_error":
                 self.defer(source.provider, max(30, error.delay))
             raise
-        self._reserve_request(source, url, endpoint='robots' if robots_origin is not None else None)
+        self._reserve_request(source, url, endpoint='robots' if robots_origin is not None else None, metadata_feed=metadata_feed)
         started = time.monotonic()
         started_cpu = time.thread_time()
         endpoint = 'robots' if robots_origin is not None else self.endpoint_kind(source, url)
@@ -517,7 +525,7 @@ class NewsHTTP:
                     self._record_access_problem(Response(url, response.status_code, response_headers, b""), error.code,
                         body_read=False, recovery_observation=getattr(error, 'gateway_recovery_observation', None),
                         robots_origin=robots_origin if getattr(error, 'robots_origin_isolation', False) else None,
-                        robots_pressure=getattr(error, 'robots_pressure_corroboration', None))
+                        robots_pressure=getattr(error, 'robots_pressure_corroboration', None), metadata_feed=metadata_feed)
                     raise
                 maximum = max(self.config["max_response_bytes"], source.pdf_max_response_bytes) if registered_pdf else self.config["max_response_bytes"]
                 try:
@@ -631,8 +639,8 @@ class NewsHTTP:
         error.delay = state['delay_seconds']
         error.robots_origin_isolation = True
 
-    def _robots(self, url: str) -> Protego:
-        source = self.registry.require(url)
+    def _robots(self, url: str, *, metadata_feed=None) -> Protego:
+        source = self._require(url, metadata_feed)
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
         cache_path = self.root / "robots" / (hashlib.sha256(origin.encode()).hexdigest() + ".json")
@@ -674,7 +682,7 @@ class NewsHTTP:
                 previous_policy_cache = cache
                 try:
                     for _ in range(6):
-                        result = self._raw(target, headers, robots_origin=origin)
+                        result = self._raw(target, headers, robots_origin=origin, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
                         if result.status not in {301, 302, 303, 307, 308}:
                             break
                         location = result.headers.get('location')
@@ -682,7 +690,7 @@ class NewsHTTP:
                             raise NewsError('robots_redirect_missing_location', retry=True, delay=300)
                         target = normalize_url(urljoin(target, location))
                         # Redirect rules still belong to the initial authority.
-                        if self.registry.require(target).provider != source.provider:
+                        if self._require(target, metadata_feed).provider != source.provider:
                             raise NewsError("robots_redirect_refused")
                         headers = {}
                     else:
@@ -697,7 +705,7 @@ class NewsHTTP:
                             try:
                                 cache.update(robots_representation(result, source, origin))
                             except NewsError as error:
-                                self._record_access_problem(result, error.code, body_read=True)
+                                self._record_access_problem(result, error.code, body_read=True, metadata_feed=metadata_feed)
                                 raise
                             if cache["representation_kind"] != "plain_utf8":
                                 self.metrics.count(source.provider, "robots_" + cache["representation_kind"])
@@ -726,7 +734,7 @@ class NewsHTTP:
             self.robots_parsers[origin] = (cache["checked_at"], parser)
             return parser
 
-    def get(self, url: str, *, headers: dict | None = None, follow_redirects: bool = True) -> Response:
+    def get(self, url: str, *, headers: dict | None = None, follow_redirects: bool = True, metadata_feed=None) -> Response:
         """Check every requested origin; optionally inspect a redirect only.
 
         Link diagnosis may read a public redirect's location without following
@@ -736,13 +744,13 @@ class NewsHTTP:
         if type(follow_redirects) is not bool:
             raise ValueError("follow_redirects must be a boolean")
         url = normalize_url(url)
-        provider = self.registry.require(url).provider
+        provider = self._require(url, metadata_feed).provider
         for _ in range(6):
             # Check source rights and robots at every hop, not after auto-follow.
-            if self.registry.require(url).provider != provider:
+            if self._require(url, metadata_feed).provider != provider:
                 raise NewsError("redirect_outside_authorized_provider")
             try:
-                parser = self._robots(url)
+                parser = self._robots(url, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
             except NewsError as error:
                 if getattr(error, 'robots_origin_isolation', False):
                     raise  # No extension of an intact origin deadline, no publisher-wide pause.
@@ -757,7 +765,7 @@ class NewsHTTP:
                 raise
             if not parser.can_fetch(url, self.config["user_agent"].split("/", 1)[0]):
                 raise NewsError("robots_disallowed")
-            response = self._raw(url, headers)
+            response = self._raw(url, headers, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
             if response.status not in {301, 302, 303, 307, 308} or not follow_redirects:
                 return response
             location = response.headers.get("location")

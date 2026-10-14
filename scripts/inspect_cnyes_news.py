@@ -11,6 +11,7 @@ from datetime import datetime
 import hashlib
 import html
 import json
+from itertools import islice
 from pathlib import Path
 import re
 import sqlite3
@@ -52,6 +53,89 @@ def headline_comparison_metadata(visible, current):
                 for key, value in (('visible', visible), ('current', current))}}
 
 
+def cnyes_document_representation_shape(soup, source, *, article_id):
+    """Explain missing native containers without exporting source prose.
+
+    This is a bounded diagnostic, not an identity, visibility or permission
+    witness. Field types/lengths are useful even when no body can be retained;
+    never include values, bylines, URLs, scripts or schema excerpts here.
+    """
+    from downloader.news_fulltext_publishers import _cnyes_current_article_data
+
+    def shape(value):
+        result = {'type': type(value).__name__}
+        if isinstance(value, str):
+            result['characters'] = len(value)
+        return result
+
+    data_error = False
+    try:
+        data = _cnyes_current_article_data(soup, article_id)
+    except (NewsError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+        data, data_error = None, True
+    result = {'contract_version': 2, 'current_data_present': data is not None,
+              'current_shape_malformed': data_error,
+              'current_field_shapes': {key: shape(data.get(key)) for key in
+                  ('title', 'content', 'payment', 'publishAt', 'url', 'author')} if data is not None else {},
+              'current_payment_zero': bool(data is not None and type(data.get('payment')) is int
+                                           and data['payment'] == 0),
+              'matching_schema_shapes': [], 'schema_documents_examined': 0,
+              'schema_objects_examined': 0, 'schema_invalid_documents': 0,
+              'bounded_schema_scan': True, 'source_text_exported': False,
+              'raw_scope_or_article_acceptance_granted': False}
+    containers = soup.find_all(id='article-container', limit=5)
+    result['native_container_limit_reached'] = len(containers) > 4
+    result['native_container_shapes'] = []
+    for container in containers[:4]:
+        parent = container.find_parent('article')
+        headers = parent.find_all('h1', limit=5) if parent is not None else []
+        result['native_container_shapes'].append({
+            'tag': container.name, 'has_article_parent': parent is not None,
+            'article_header_count_capped_at_five': len(headers),
+            'article_header_limit_reached': len(headers) > 4,
+            'article_header_shapes': [{'tag': header.name, 'characters': len(header.get_text(' ', strip=True)),
+                'matches_current_headline': bool(data is not None and isinstance(data.get('title'), str)
+                    and headline_comparison_metadata(header.get_text(' ', strip=True), data['title'])['whitespace_equivalent'])}
+                for header in headers[:4]],
+            'ancestor_tags': [node.name for node in islice(container.parents, 8) if node.name],
+        })
+    scripts = soup.find_all('script', type='application/ld+json', limit=17)
+    result['schema_document_limit_reached'] = len(scripts) > 16
+    for script in scripts[:16]:
+        result['schema_documents_examined'] += 1
+        raw = script.get_text()
+        if len(raw) > 1 << 20:
+            result['schema_invalid_documents'] += 1
+            continue
+        try:
+            nodes = list(islice(_objects(json.loads(raw)), 65))
+        except (ValueError, TypeError, RecursionError):
+            result['schema_invalid_documents'] += 1
+            continue
+        result['schema_objects_examined'] += min(len(nodes), 64)
+        if len(nodes) > 64:
+            result['schema_object_limit_reached'] = True
+        for node in nodes[:64]:
+            if node.get('@type') != 'NewsArticle':
+                continue
+            # A declared same-ID URL is diagnostic association only. The
+            # canonical/native/current/free/author/clock proof below remains
+            # wholly separate and still controls raw retention.
+            try:
+                parts = urlsplit(node.get('url', '')) if isinstance(node.get('url'), str) else None
+            except ValueError:
+                continue
+            if (parts is None or parts.scheme != 'https' or parts.netloc not in
+                    {'news.cnyes.com', 'm.cnyes.com'} or parts.path != f'/news/id/{article_id}'):
+                continue
+            if len(result['matching_schema_shapes']) == 4:
+                result['schema_shape_limit_reached'] = True
+                continue
+            result['matching_schema_shapes'].append({key: shape(node.get(key)) for key in
+                ('headline', 'articleBody', 'author', 'datePublished', 'isAccessibleForFree')})
+    return result
+
+
 def cnyes_html_structure(soup, source, *, page_url):
     """Bounded identity/clock/body comparison metadata, never body acceptance.
 
@@ -66,13 +150,15 @@ def cnyes_html_structure(soup, source, *, page_url):
         cnyes_visible_headline_matches,
     )
 
-    result = {"contract_version": 2, "raw_public_scope": False,
+    result = {"contract_version": 5, "raw_public_scope": False,
               "article_containers": len(soup.select('#article-container'))}
     parts = urlsplit(page_url)
     match = re.fullmatch(r'/news/id/([0-9]+)', parts.path)
     if (source.provider != 'cnyes' or not match or parts.scheme != 'https'
             or parts.netloc not in {'news.cnyes.com', 'm.cnyes.com'}):
         return result
+    result['document_representation_shape'] = cnyes_document_representation_shape(
+        soup, source, article_id=int(match[1]))
     canonical = soup.select('link[rel="canonical"][href]')
     result['canonical_count'] = len(canonical)
     scope = _cnyes_visible_article_scope(soup)
@@ -82,6 +168,14 @@ def cnyes_html_structure(soup, source, *, page_url):
     try:
         declared_url = normalize_url(canonical[0]['href'])
         declared_parts = urlsplit(declared_url)
+        result['canonical_path_matches_request'] = declared_parts.path == parts.path
+        result['canonical_public_origin'] = declared_parts.scheme == 'https' and declared_parts.netloc in {
+            'news.cnyes.com', 'm.cnyes.com'}
+        result['canonical_origin_kind'] = ({'news.cnyes.com': 'desktop_news', 'm.cnyes.com': 'mobile_news'}
+                                           .get(declared_parts.netloc, 'other'))
+        og = soup.select('meta[property="og:url"][content]')
+        result['og_url_count'] = len(og)
+        result['og_url_matches_canonical'] = len(og) == 1 and normalize_url(og[0]['content']) == declared_url
         if (declared_parts.scheme != 'https' or declared_parts.netloc not in {'news.cnyes.com', 'm.cnyes.com'}
                 or declared_parts.path != parts.path or declared_parts.query or declared_parts.fragment):
             return result
@@ -94,6 +188,19 @@ def cnyes_html_structure(soup, source, *, page_url):
             result['native_scope_visible'] = True
         except NewsError:
             result['native_scope_visible'] = False
+        declarations = []
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                declarations.extend(node for node in _objects(json.loads(script.get_text()))
+                                    if node.get('@type') == 'NewsArticle' and node.get('url') == declared_url)
+            except (ValueError, TypeError, RecursionError):
+                result['invalid_schema_declaration'] = True
+                return result
+        result['current_schema_count'] = len(declarations)
+        if len(declarations) == 1:
+            entity = declarations[0].get('mainEntityOfPage')
+            entity = entity.get('@id') if isinstance(entity, dict) else entity
+            result['schema_main_entity_matches_canonical'] = entity == declared_url
         data = _cnyes_current_article_data(soup, int(match[1]))
         result['current_data_present'] = data is not None
         result['current_author_unambiguous'] = _cnyes_current_article_data(
@@ -107,15 +214,6 @@ def cnyes_html_structure(soup, source, *, page_url):
         visible_title = header.get_text(' ', strip=True)
         result['visible_headline_matches_current'] = cnyes_visible_headline_matches(visible_title, data.get('title'))
         result['headline_comparison'] = headline_comparison_metadata(visible_title, data.get('title'))
-        declarations = []
-        for script in soup.select('script[type="application/ld+json"]'):
-            try:
-                declarations.extend(node for node in _objects(json.loads(script.get_text()))
-                                    if node.get('@type') == 'NewsArticle' and node.get('url') == declared_url)
-            except (ValueError, TypeError, RecursionError):
-                result['invalid_schema_declaration'] = True
-                return result
-        result['current_schema_count'] = len(declarations)
         if len(declarations) != 1:
             return result
         declared = declarations[0]

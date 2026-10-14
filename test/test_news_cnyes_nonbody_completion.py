@@ -194,7 +194,7 @@ def test_blank_chunks_do_not_hide_changed_forest_or_unsupported_renderer(cnyes_c
 @pytest.mark.parametrize('field,now,before', [
     ('verified_empty_html_outcome_contract_version', 8, 7),
     ('verified_native_quote_only_outcome_contract_version', 7, 6),
-    ('verified_native_image_only_outcome_contract_version', 3, 2),
+    ('verified_native_image_only_outcome_contract_version', 4, 3),
 ])
 def test_failed_outcome_versions_do_not_rewrite_bulk_or_permissions(cnyes_config, tmp_path, monkeypatch, field, now, before):
     current = source(cnyes_config, tmp_path)

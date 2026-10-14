@@ -8,6 +8,9 @@ data:
   panel_cache_root: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/base
   day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/physical-source
   live_tail_panel_rows: 48
+  # Preserve the verified 32-session lossless working set across live calls.
+  # Runtime cache capacity only; no feature/model/checkpoint ABI change.
+  factorized_host_cache_bytes: 2147483648
 training:
   financial_transformer:
     # Exact scalar spelling stored in the checkpoint's model contract.

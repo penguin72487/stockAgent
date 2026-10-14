@@ -797,7 +797,7 @@ function renderOverview(data) {
 function renderHeader(data) {
   const quoteNotice = $("quote-display-notice");
   if (quoteNotice) {
-    quoteNotice.textContent = data.price_display_policy?.message || "";
+    quoteNotice.textContent = detailComponents.priceNoticeText(data);
     quoteNotice.classList.toggle("hidden", !data.price_display_policy);
   }
   const health = $("health");
@@ -1102,9 +1102,10 @@ function renderBenchmarks(data) {
       <div class="delta ${pnlClass(returnPct)}">${returnPct == null ? "所選日期等待完整來源" : `${dailyReturnText} · 所選期間 ${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)} · 累積損益 ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
       <div class="benchmark-facts">
         <div><span>持有標的</span><strong class="benchmark-contract">${esc(holding)}</strong></div>
-        <div><span>${esc(priorCloseLabel)}</span><strong>${sourceNumber(row.daily_return_reference_price ?? row.daily_return_previous_close)}</strong></div>
-        <div><span>Buy & Hold 起點</span><strong>${sourceNumber(row.entry_price)}<small>${shortTime(row.entry_at)}</small></strong></div>
-        <div><span>目前可清算價</span><strong>${sourceNumber(row.last_mark_price)}<small>${shortTime(row.last_quote_at || row.last_mark_at)}</small></strong></div>
+        <div><span>${esc(priorCloseLabel)}</span><strong>${detailComponents.quoteText(row, ["daily_return_reference_price", "daily_return_previous_close"], sourceNumber)}</strong></div>
+        <div><span>Buy & Hold 起點</span><strong>${detailComponents.quoteText(row, "entry_price", sourceNumber)}<small>${shortTime(row.entry_at)}</small></strong></div>
+        <div><span>帳本清算估值</span><strong>${detailComponents.quoteText(row, "last_mark_price", sourceNumber)}<small>${shortTime(row.last_quote_at || row.last_mark_at)}</small></strong></div>
+        ${row.official_daily_quote ? `<div class="wide"><span>獨立官方參考（不改帳本估值）</span>${detailComponents.dailyReference(row)}</div>` : ""}
         <div><span>${isTx ? "自動換月" : "持有契約"}</span><strong>${esc(rollText)}</strong></div>
         <div><span>追蹤成本（不扣報酬）</span><strong>${Number.isFinite(totalCosts) ? money(totalCosts) : "—"}</strong></div>
         ${isTx ? `<div><span>1:1 名目資金</span><strong>${collateral}</strong></div><div><span>換月資金流</span><strong>${funding}</strong></div><div class="wide"><span>換月規則</span><strong>同一實體合約以前收計日報酬；換月價差只補入／提回現金，不列報酬，槓桿上限 1×</strong></div>` : ""}

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -21,7 +22,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from downloader.artifact_io import atomic_write_bytes  # noqa: E402
 from stockagent.live.taifex_volatility_dashboard import (  # noqa: E402
+    DASHBOARD_SCHEMA_VERSION,
     DEFAULT_MARK_LIMIT_PER_STRATEGY,
+    HISTORY_RANGE_SECONDS,
+    _history_strategy_inputs,
     build_dashboard_history_snapshot,
     build_dashboard_snapshot,
 )
@@ -35,8 +39,8 @@ DEFAULT_STATIC_ROOT: Final[Path] = Path("services/taifex_dashboard")
 DEFAULT_HISTORY_CACHE_DIR: Final[Path] = Path(
     "artifacts/cache/shioaji_taifex_volatility_dashboard"
 )
-HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 1
-HISTORY_MEMORY_CACHE_ENTRIES: Final[int] = 3
+HISTORY_CACHE_SCHEMA_VERSION: Final[int] = 2
+HISTORY_MEMORY_CACHE_ENTRIES: Final[int] = 4
 HISTORY_RANGE_KEYS: Final[frozenset[str]] = frozenset(
     {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}
 )
@@ -139,6 +143,11 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._history_state_lock = threading.Lock()
         self._history_build_lock = threading.Lock()
         self._history_refreshing: set[str] = set()
+        self._prewarm_stop = threading.Event()
+
+    def server_close(self) -> None:
+        self._prewarm_stop.set()
+        super().server_close()
 
     def _history_cache_path(self, range_key: str) -> Path | None:
         if self.history_cache_dir is None or range_key not in HISTORY_RANGE_KEYS:
@@ -147,9 +156,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def _history_source_signature(self) -> tuple[object, ...]:
         """Cheap invalidation for the multi-GB ledger; never hash it per poll."""
-        paths = [
-            self.state_dir / name for name in ("state.json", "status.json", "marks.jsonl")
-        ]
+        paths = [self.state_dir / "marks.jsonl"]
         for receipt in sorted((self.state_dir / "backfills").glob("*/receipt.json")):
             paths.extend((receipt, receipt.parent / "marks.jsonl"))
         signature: list[object] = []
@@ -160,6 +167,18 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             except FileNotFoundError:
                 observation = None
             signature.append((str(path), observation))
+        # Status is refreshed much more frequently than minute marks. A mere
+        # clock/position rewrite must not trigger another multi-GB history scan.
+        # Preserve the exact legacy capital fallback and strategy-set inputs.
+        objects = []
+        for name in ("state.json", "status.json"):
+            try:
+                payload = json.loads((self.state_dir / name).read_text(encoding="utf-8"))
+                objects.append(payload if isinstance(payload, dict) else {})
+            except FileNotFoundError:
+                objects.append({})
+        ids, capitals = _history_strategy_inputs(*objects)
+        signature.append(("projection_inputs", ids, tuple(capitals.items())))
         return tuple(signature)
 
     def _read_persisted_history(
@@ -184,6 +203,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             return None
         snapshot = envelope.get("snapshot")
         if not isinstance(snapshot, dict) or snapshot.get("range") != range_key:
+            return None
+        if snapshot.get("dashboard_schema_version") != DASHBOARD_SCHEMA_VERSION:
             return None
         history = snapshot.get("history")
         if not isinstance(history, list) or any(
@@ -242,6 +263,16 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             evicted, _ = self._history_cache.popitem(last=False)
             self._history_source_signatures.pop(evicted, None)
 
+    def _history_far_behind_source(self, snapshot: dict[str, object]) -> bool:
+        """Do not amplify a days-old startup cache through two layers of SWR."""
+        try:
+            status = json.loads((self.state_dir / "status.json").read_text(encoding="utf-8"))
+            source = datetime.fromisoformat(status["updated_at_utc"])
+            end = datetime.fromisoformat(str(snapshot["coverage_end_utc"]))
+            return (source - end).total_seconds() > 120.0
+        except (OSError, ValueError, KeyError, TypeError):
+            return False  # The normal source/status builder reports unavailable data.
+
     def snapshot(self) -> dict[str, object]:
         now_monotonic = time.monotonic()
         cached = self._snapshot_cache
@@ -281,13 +312,14 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                     )
             cached = self._history_cache.get(range_key)
             recorded_signature = self._history_source_signatures.get(range_key)
+            far_behind = cached is not None and self._history_far_behind_source(cached[1])
             if cached is not None and (
                 recorded_signature == source_signature
-                or (recorded_signature is None and now_monotonic - cached[0] < 55.0)
+                or (recorded_signature is None and now_monotonic - cached[0] < 55.0 and not far_behind)
             ):
                 self._history_cache.move_to_end(range_key)
                 return cached[1]
-            if cached is not None:
+            if cached is not None and not far_behind:
                 self._history_cache.move_to_end(range_key)
                 if range_key not in self._history_refreshing:
                     self._history_refreshing.add(range_key)
@@ -301,9 +333,9 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 # curve immediately while the append-only ledger is rebuilt.
                 return cached[1]
 
-        # Only the first request for a never-built range may wait.  The service
-        # prewarms the default 1d view at startup, so normal page loads do not
-        # pay the multi-hundred-megabyte ledger scan.
+        # Never-built ranges and an old generation trailing a changed source by
+        # >2 minutes wait for the real projection. Fast stale bytes are not proof
+        # of cold recovery. Normal minute deltas retain single-flight/SWR.
         return self._build_history_snapshot(range_key=range_key)
 
     def _build_history_snapshot(self, *, range_key: str) -> dict[str, object]:
@@ -315,7 +347,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 recorded_signature = self._history_source_signatures.get(range_key)
                 if cached is not None and (
                     recorded_signature == source_signature
-                    or (recorded_signature is None and now_monotonic - cached[0] < 55.0)
+                    or (recorded_signature is None and now_monotonic - cached[0] < 55.0
+                        and not self._history_far_behind_source(cached[1]))
                 ):
                     self._history_refreshing.discard(range_key)
                     return cached[1]
@@ -343,7 +376,26 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 if source_signature == self._history_source_signature()
                 else ()  # Force the next reader to refresh after a racing write.
             )
+            aliases: dict[str, dict[str, object]] = {}
+            start_ns, end_ns = full.get("source_window_start_ns"), full.get("source_window_end_ns")
+            if (
+                start_ns is not None and end_ns is not None
+                and full.get("range_window_start_ns") == start_ns
+            ):
+                span_ns = max(0, int(end_ns) - int(start_ns))
+                aliases = {
+                    key: {**snapshot, "range": key, "range_seconds": duration}
+                    for key, duration in HISTORY_RANGE_SECONDS.items()
+                    if key != range_key
+                    and (duration is None or duration * 1_000_000_000 >= span_ns)
+                }
             with self._history_state_lock:
+                for key, alias in aliases.items():
+                    self._history_disk_checked.add(key)
+                    self._remember_history(
+                        range_key=key, snapshot=alias,
+                        observed_at=time.monotonic(), source_signature=stable_signature,
+                    )
                 self._remember_history(
                     range_key=range_key,
                     snapshot=snapshot,
@@ -351,6 +403,8 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                     source_signature=stable_signature,
                 )
                 self._history_refreshing.discard(range_key)
+            for key, alias in aliases.items():
+                self._persist_history(range_key=key, snapshot=alias)
             self._persist_history(range_key=range_key, snapshot=snapshot)
             return snapshot
 
@@ -401,6 +455,13 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         # until that first response has left the process.
         time.sleep(1.0)
         self.prewarm_status()
+        self.maintain_default_history()
+
+    def maintain_default_history(self, *, poll_seconds: float = 5.0) -> None:
+        # Observe source changes before a viewer's minute boundary. Unchanged
+        # projection inputs are cache hits, not repeated full-ledger scans.
+        while not self._prewarm_stop.wait(poll_seconds):
+            self.prewarm_default_history()
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):

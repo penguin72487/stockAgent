@@ -30,17 +30,29 @@ from downloader.artifact_io import atomic_write_json  # noqa: E402
 from scripts.benchmark_data_monitor_projection_pipeline import capture  # noqa: E402
 from stockagent import private_json  # noqa: E402
 from stockagent.live import data_monitor_inventory as inventory  # noqa: E402
+from stockagent.live.data_monitor_record_codec import encode_record_cache  # noqa: E402
 from stockagent.runtime_identity import identity_sha256  # noqa: E402
 
 
-def benchmark(root: Path, *, repeats: int = 2) -> dict:
+def benchmark(root: Path, *, repeats: int = 2, mode: str = "decode") -> dict:
+    if mode not in {"decode", "encode"}:
+        raise ValueError("unknown record codec benchmark mode")
+    code_paths = (Path(__file__).resolve(), Path(inventory.__file__),
+                  REPO_ROOT / "stockagent/live/data_monitor_record_codec.py",
+                  REPO_ROOT / "stockagent/private_json.py",
+                  REPO_ROOT / "scripts/benchmark_data_monitor_projection_pipeline.py")
+    def code_identity():
+        return {str(path.relative_to(REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in code_paths}
+    code_before = code_identity()
     generation = capture(root)
     original_stat = Path.stat
     body = json.dumps(generation["payload"], separators=(",", ":")).encode()
-    native_loads, native_dumps = private_json.loads, private_json.dumps
+    native_loads = private_json.loads
     trials = []
     outputs = []
     output_bytes_hashes = []
+    all_sources_checked = []
     with tempfile.TemporaryDirectory(prefix="stockagent-record-codec-") as directory:
         for repeat in range(repeats):
             for index, variant in enumerate(("stdlib", "native", "native", "stdlib")):
@@ -49,27 +61,50 @@ def benchmark(root: Path, *, repeats: int = 2) -> dict:
                 cache.parent.mkdir(parents=True)
                 cache.write_bytes(body)
                 stat_calls = 0
+                checked_paths = set()
 
                 def frozen_stat(path, *args, **kwargs):
                     nonlocal stat_calls
                     key = str(path)
                     if key in generation["source_stats"]:
                         stat_calls += 1
+                        checked_paths.add(key)
                         value = generation["source_stats"][key]
                         if value is None:
                             raise FileNotFoundError(key)
                         return value
                     return original_stat(path, *args, **kwargs)
 
-                loads = json.loads if variant == "stdlib" else native_loads
-                dumps = (lambda value: json.dumps(value, separators=(",", ":")).encode()) if variant == "stdlib" else native_dumps
+                encoder_observation = {}
+                def legacy_dumps(value, *, observation=None):
+                    if observation is not None:
+                        observation.update(backend="stdlib", fallback_reason="comparison_baseline")
+                    return json.dumps(value, separators=(",", ":")).encode()
+
+                def candidate_dumps(value, *, observation=None):
+                    encoded = encode_record_cache(value, observation=encoder_observation)
+                    if observation is not None:
+                        observation.update(encoder_observation)
+                    return encoded
+
+                if mode == "decode":
+                    loads = json.loads if variant == "stdlib" else native_loads
+                    dumps = legacy_dumps
+                else:
+                    loads = native_loads
+                    dumps = legacy_dumps if variant == "stdlib" else candidate_dumps
+                # New production versions own only this private cache writer;
+                # older versions still route through private_json.dumps. The
+                # fixture comparison freezes exactly the selected boundary.
+                encoder_owner = inventory if hasattr(inventory, "encode_record_cache") else private_json
+                encoder_name = "encode_record_cache" if encoder_owner is inventory else "dumps"
                 gc.collect()
                 frame = inventory.InventorySnapshot(trial_root)
                 with patch.object(Path, "stat", frozen_stat), \
                      patch.object(inventory, "_selected_files", return_value=generation["selected"]), \
                      patch.object(inventory, "uuid4", return_value=UUID(int=1)), \
                      patch.object(private_json, "loads", loads), \
-                     patch.object(private_json, "dumps", dumps):
+                     patch.object(encoder_owner, encoder_name, dumps):
                     started = time.perf_counter()
                     cpu_started = time.process_time()
                     result = inventory.build_record_inventory(
@@ -81,26 +116,44 @@ def benchmark(root: Path, *, repeats: int = 2) -> dict:
                 output = json.loads(persisted)
                 output_bytes_hashes.append(hashlib.sha256(persisted).hexdigest())
                 outputs.append(identity_sha256(output))
+                all_sources_checked.append(checked_paths == generation["source_stats"].keys())
                 trials.append({"variant": variant, "wall_ms": round(wall_ms, 3),
                                "cpu_ms": round(cpu_ms, 3),
                                "source_stat_calls": stat_calls, "cached_files": result["cached_files"],
                                "source_observation_root": result["source_observation_root"],
                                "source_observation_matches_cache": result["source_observation_matches_cache"],
                                "output_bytes": cache.stat().st_size, "output_semantic_sha256": outputs[-1],
+                               "encoder_observation": encoder_observation,
                                "timing_ms": result["timing_ms"]})
                 del frame, output, result
     parity = len(set(outputs)) == 1
     bytes_parity = len(set(output_bytes_hashes)) == 1
     medians = {name: statistics.median(t["wall_ms"] for t in trials if t["variant"] == name)
                for name in ("stdlib", "native")}
-    return {"schema_version": 1, "state": "verified" if parity and bytes_parity else "mismatch",
+    native_encoder_used = mode == "decode" or all(
+        row["encoder_observation"].get("backend") == "msgspec_validated_metadata"
+        for row in trials if row["variant"] == "native"
+    )
+    code_after = code_identity()
+    code_stable = code_before == code_after
+    accepted = parity and (mode == "encode" or bytes_parity) and native_encoder_used and all(all_sources_checked) and code_stable
+    return {"schema_version": 2, "state": "verified" if accepted else "mismatch",
             "scope": "full record cache decode, frozen-source identity checks, aggregation and atomic cache/index writes",
             "excludes": ["imports", "directory_discovery", "live_or_cold_source_io", "Parquet_footer_refresh",
                          "feature_publisher", "provider_calls", "network", "browser"],
-            "input_sha256": generation["sha256"], "input_bytes": len(body),
+            "input_sha256": hashlib.sha256(body).hexdigest(), "input_bytes": len(body),
+            "captured_source_sha256": generation["sha256"],
+            "input_representation": "ASCII-escaped canonical trial seed; captured source may be UTF-8 JSON",
             "native_available": private_json.native_available(),
-            "native_backend": "msgspec-decode_stdlib-encode", "native_version": private_json._native.__version__,
+            "mode": mode,
+            "native_backend": "msgspec-decode_stdlib-encode" if mode == "decode" else "msgspec-validated-metadata-encode",
+            "native_encoder_used": native_encoder_used,
+            "native_version": private_json._native.__version__,
             "production_source_writes": 0,
+            "code_before": code_before, "code_after": code_after, "code_stable": code_stable,
+            "source_signature": generation["signature"],
+            "selected_source_paths": len(generation["source_stats"]),
+            "all_source_identities_checked": all(all_sources_checked),
             "parity": parity, "cache_bytes_parity": bytes_parity, "median_ms": medians,
             "speedup": round(medians["stdlib"] / medians["native"], 4),
             "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -113,16 +166,21 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--native-package-path", type=Path)
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--mode", choices=("decode", "encode"), default="decode")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("repeats must be positive")
     if args.native_package_path:
+        if args.mode == "encode":
+            parser.error("encoding comparison must use the installed canonical runtime")
         sys.path.insert(0, str(args.native_package_path.resolve()))
         import msgspec
         private_json._native = msgspec
     if not private_json.native_available():
         parser.error("native candidate must be available; install or pass --native-package-path")
-    result = benchmark(REPO_ROOT, repeats=args.repeats)
+    if args.output.exists():
+        parser.error("output must be a new evidence file")
+    result = benchmark(REPO_ROOT, repeats=args.repeats, mode=args.mode)
     atomic_write_json(args.output, result)
     print(json.dumps({key: result[key] for key in ("state", "parity", "input_bytes", "median_ms", "speedup")}))
     return 0 if result["state"] == "verified" else 1

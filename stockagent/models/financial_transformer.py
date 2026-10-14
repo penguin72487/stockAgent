@@ -364,6 +364,7 @@ class CandleEncoder(nn.Module):
         x: torch.Tensor,
         *,
         input_is_normalized: bool = False,
+        owned_inference: bool = False,
     ) -> torch.Tensor:
         model_dtype = self.joint_projection.proj.weight.dtype
         model_device = self.joint_projection.proj.weight.device
@@ -373,7 +374,9 @@ class CandleEncoder(nn.Module):
             and self.causal_feature_compression == "none"
             and not self.training and torch.is_inference_mode_enabled()
         )
-        if owned_normalization:
+        if owned_inference and (not owned_normalization or clean_fp32 is not x):
+            raise RuntimeError("owned candle input requires plain FP32 inference normalization")
+        if owned_normalization and not owned_inference:
             clean_fp32 = clean_fp32.clone()
         if self.sanitize_inputs:
             clean_fp32 = (torch.nan_to_num_(clean_fp32, nan=0.0, posinf=0.0, neginf=0.0)
@@ -496,8 +499,9 @@ class CandleEncoder(nn.Module):
         x: torch.Tensor,
         *,
         return_aux: bool = False,
+        owned_inference: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        joint_features = self._base_joint_features(x)
+        joint_features = self._base_joint_features(x, owned_inference=owned_inference)
         embedding = self._forward_base_with_zero_extra(joint_features)
         if not return_aux:
             return embedding, {}
@@ -1543,6 +1547,10 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
                 return_aux=return_aux,symbol_indices=symbol_indices,portfolio_context=portfolio_context)
         return super().forward_from_panel_slab(feature_slab,mask,temperature=temperature,
             return_aux=return_aux,symbol_indices=symbol_indices,portfolio_context=portfolio_context)
+
+    def forward_from_factorized_live_window(self, window, mask, **kwargs):
+        from stockagent.models.factorized_input import forward_factorized_live_window
+        return forward_factorized_live_window(self, window, mask, **kwargs)
 
     def _prepare_raw_temporal_basis_source(
         self,

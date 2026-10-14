@@ -48,7 +48,7 @@ def book_fingerprint(state):
     return hashlib.sha256(json.dumps(book, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def official_closes(raw_root: Path, day: date, *, exchanges=("twse", "tpex")):
+def official_closes(raw_root: Path, day: date, *, exchanges=("twse", "tpex"), pin_sources=False):
     prices, sources = {}, []
     for exchange in exchanges:
         path = raw_root / f"{exchange}_daily_ohlcv" / f"{day}.json"
@@ -58,7 +58,20 @@ def official_closes(raw_root: Path, day: date, *, exchanges=("twse", "tpex")):
                 or str(payload.get("date")) != day.strftime("%Y%m%d")
                 or str(payload.get("stat")).lower() != "ok"):
             raise ValueError(f"invalid official report date/status: {path}")
-        source = {"path": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+        digest = hashlib.sha256(raw).hexdigest()
+        if pin_sources:
+            # The collector's date-named file is a mutable latest pointer.
+            # A fill must retain the exact wire bytes it actually consumed.
+            # Reuse the canonical immutable writer; never overwrite a version.
+            from downloader.download_tw_public_data import _write_immutable_raw, HistoricalResponseError
+            try:
+                path = _write_immutable_raw(raw, raw_root / ".close_evidence" / digest / f"{exchange}_daily_ohlcv",
+                                            f"{exchange}_daily_ohlcv", ".json", stem=str(day))
+            except HistoricalResponseError as exc:
+                # Preserve the strict parser error boundary used by runtime
+                # per-exchange isolation; corrupted evidence never becomes a fill.
+                raise ValueError(str(exc)) from exc
+        source = {"path": str(path.resolve()), "sha256": digest, "bytes": len(raw)}
         sources.append(source)
         tables = payload.get("tables")
         if not isinstance(tables, list) or not all(isinstance(t, dict) for t in tables):
@@ -115,7 +128,7 @@ def last_traded_price(raw_root: Path, day: date, symbol: str, current):
             continue
         if not path.exists():
             raise ValueError(f"cannot prove last trade across missing report: {path}")
-        prices, proof = official_closes(raw_root, observed_day, exchanges=(exchange,))
+        prices, proof = official_closes(raw_root, observed_day, exchanges=(exchange,), pin_sources=True)
         sources.extend(proof)
         row = prices.get(symbol)
         if row is None:
@@ -137,7 +150,7 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
     state = json.loads((root / "state.json").read_text())
     if state.get("simulation_only") is not True or state.get("production_order_possible") is not False:
         raise ValueError("not an exclusively paper ledger")
-    prices, sources = official_closes(raw_root, day)
+    prices, sources = official_closes(raw_root, day, pin_sources=True)
     allowed = set(last_traded_price_for)
     selected = set(markets) if markets else set(state["modes"])
     if not selected <= state["modes"].keys():

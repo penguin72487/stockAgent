@@ -679,6 +679,7 @@ def main() -> int:
             "service_trend": round(trend_elapsed * 1_000, 3),
         },
         "inventory_stages_ms": record_inventory.get("timing_ms", {}),
+        "inventory_cache_encoding": record_inventory.get("cache_encoding_observation"),
         "inventory_fast_index_hit": bool(record_inventory.get("fast_index_hit")),
         "inventory_preflight": record_inventory.get("preflight_observation"),
         "public_projection_stages_ms": public_status_timing_ms,

@@ -67,7 +67,7 @@ def request_text(text: str) -> tuple[str | None, str | None]:
     if (text.startswith(("# AGENTS.md instructions", "<environment_context>",
                          "<INSTRUCTIONS>", "<skills_instructions>", "<recommended_plugins>",
                          "<external_codex_apps_", "<permissions instructions>", "<collaboration_mode>"))
-            or "<codex_internal_context>" in text):
+            or re.match(r"^<(?:codex_internal_context|skill)(?:\s|>)", text)):
         return None, "injected_context"
     if not text:
         return None, "empty_or_nontext"

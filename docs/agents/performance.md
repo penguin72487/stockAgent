@@ -2,6 +2,26 @@
 
 Use for compile, cache, batch, throughput or hardware investigations. Measure the complete requested workflow. Timings and tuning values below are observations of the named shape, hardware and experiment; they are starting points, not requirements for unrelated configurations. For vastai1T TW day-trade acceptance use two-GPU DDP, the formal global batch, the complete fold lifecycle and steady epoch 3+ maximum-rank wall time as specified in runtime.md. Epoch 2 observations below are historical or diagnostic. No benchmark result authorizes changing accounting or silently skipping work.
 
+## Numerical and optimizer experiments
+
+For semantic-preserving work, use the selected account's equality/gradient oracle.
+An explicitly selected precision, batch, kernel or gradient experiment may instead
+change continuous outputs and optimizer trajectory. Declare its numerical tolerance,
+changed axes and reference; compare nonempty trades, finite gradients and the full
+requested workflow. Preserve source values/units/clocks, fee and settlement formulas,
+whole-lot legality, masks and absorbing ruin. At fixed source/actions, test the
+account's discrete fields and financial recurrence; a changed model trajectory is
+not expected to produce an identical historical trade list or checkpoint.
+
+Record matching version/fingerprints and a new artifact root for incompatible
+training changes; retain the old comparator/results and reject old optimizer resume.
+The user's 2026-10-06 and 2026-10-12 numerical permissions apply to their named
+performance experiments, not every historical replay. See
+[batch/precision evidence](../tw_daytrade_no_basis_batch_powers_2026-10-06.md)
+for a scoped example.
+Neither a finite scalar nor a small speed difference proves acceptance or a global
+optimum; repeat measurements only enough to resolve a material uncertainty.
+
 ## Remote node selection
 
 The user's 2026-10-03 instruction requires every remote build to use that node's

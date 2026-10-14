@@ -140,7 +140,11 @@ def test_completion_relative_timers_have_independent_restart_anchor() -> None:
         }
         if not directives.intersection({"OnUnitInactiveSec", "OnUnitActiveSec"}):
             continue
-        assert directives.intersection({"OnActiveSec", "OnCalendar"}), timer_path.name
+        # OnBootSec/OnStartupSec are also independent anchors: systemd fires
+        # them immediately when their deadline predates timer activation.
+        assert directives.intersection(
+            {"OnActiveSec", "OnCalendar", "OnBootSec", "OnStartupSec"}
+        ), timer_path.name
 
 
 def test_intraday_timer_has_isolated_rearm_install_mode() -> None:

@@ -10059,7 +10059,21 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
     """Persist compact byte indexes for reboot-fast historical date reads."""
 
     root = Path(state_dir)
-    benchmark_history = _benchmark_history_index(root)
+    # The accepted head already is the session/date catalog. Warming dates
+    # must not eagerly retain every historical benchmark row when chart reads
+    # already use verified per-session projections. Do not publish this empty
+    # selection into the full-row cache: real reads still verify selected
+    # shards, or use the unchanged canonical fallback when the head is stale.
+    benchmark_catalog = load_benchmark_projection(
+        state_dir=root,
+        source_path=root / BENCHMARK_HISTORY_FILENAME,
+        selected_sessions=(),
+    )
+    benchmark_session_count = (
+        len(benchmark_catalog.session_entries)
+        if benchmark_catalog is not None
+        else len(_benchmark_history_index(root).marks_by_session)
+    )
     sources = (
         ("signals.jsonl", False),
         ("orders.jsonl", False),
@@ -10072,7 +10086,7 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
         ("latency.jsonl", True),
     )
     indexed: dict[str, int] = {}
-    indexed[BENCHMARK_HISTORY_FILENAME] = len(benchmark_history.marks_by_session)
+    indexed[BENCHMARK_HISTORY_FILENAME] = benchmark_session_count
     indexed["position_history"] = len(_position_history_index(root).entries)
     for filename, recorded_at_fallback in sources:
         index = _ledger_session_index(

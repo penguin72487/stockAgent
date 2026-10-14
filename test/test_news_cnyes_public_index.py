@@ -121,7 +121,7 @@ def test_reject_bad_source_request_before_network(queue,mutation):
 @pytest.mark.parametrize('field,value', [
     ('payment',False),('payment',0.0),('payment',2),('publishAt',1410278400.0),
     ('publishAt',1410278399),('publishAt',1410364800),('categoryId',False),
-    ('categoryId',0),('title',''),('title',None),
+    ('categoryId',0),('title',[]),('title',None),
 ])
 def test_metadata_clock_permission_and_field_types_not_guessed(queue,field,value):
     data = index_payload()

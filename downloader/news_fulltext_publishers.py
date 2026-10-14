@@ -124,6 +124,23 @@ def _cnyes_visible_after_completed_stream(node, revealed_wrapper):
             raise NewsError('article_identity_not_verified')
 
 
+def _cnyes_empty_anchor_has_no_body(node):
+    """A pure empty link contributes no words, numbers, media or metadata.
+
+    The native 2015 article templates have invisible zero-text anchors. Do
+    not require an empty navigation marker to be visible, but never treat a
+    hidden image, script, comment or accessibility label as an empty link.
+    This does not remove/normalize content or relax the three-body proof.
+    """
+    from bs4 import NavigableString
+
+    return (node.name == 'a'
+            and not any(node.has_attr(key) for key in (
+                'aria-label', 'aria-labelledby', 'aria-describedby', 'title',
+                'itemprop', 'content', 'data-content', 'data-body'))
+            and all(type(child) is NavigableString and not str(child).strip() for child in node.contents))
+
+
 def _cnyes_flight_frames(fragments):
     """Read bounded framing, not JavaScript or a general Flight interpreter.
 
@@ -2136,13 +2153,18 @@ def _cnyes_caption_schema_view(container, full_content, source, excluded, reveal
 def cnyes_supported_mobile_view(parts):
     """Only the observed URI shape; never infer arbitrary query semantics.
 
-    Preserve exp=a/exp=b in the requested/final URL and raw response. Acceptance
-    still requires the actual page's canonical/current/schema/body proof;
+    Preserve every observed query in the requested/final URL and raw response.
+    The two legacy RSS/auth-labelled shapes were fetched anonymously, unchanged
+    on 2026-10-13: both declared a free visible same-ID article. In particular
+    defer_action=auth is NOT removed, followed as an action, or an auth grant.
+    Acceptance still requires the actual page's canonical/current/schema/body proof;
     this predicate alone declares neither equivalence nor a public body.
     """
     return (parts.scheme == 'https' and parts.netloc == 'm.cnyes.com'
             and re.fullmatch(r'/news/id/[0-9]+', parts.path) is not None
-            and parts.query in {'', 'exp=a', 'exp=b'} and not parts.fragment)
+            and parts.query in {'', 'exp=a', 'exp=b',
+                                'amp;utm_medium=RSS&amp;utm_campaign=relate', 'defer_action=auth'}
+            and not parts.fragment)
 
 
 def cnyes_supported_native_alias_view(parts):
@@ -2608,6 +2630,8 @@ def cnyes_native_canonical_article(soup, source, *, page_url):
         elif not grids or grids != _cnyes_table_grids(declared_content, source):
             raise _cnyes_native_body_failure('table_grid_mismatch')
     for node in container.find_all(['p', 'td', 'th', 'li', 'a']):
+        if _cnyes_empty_anchor_has_no_body(node):
+            continue
         if not node.find_parent(['figure', 'figcaption', 'nav', 'aside']):
             _cnyes_visible_after_completed_stream(node, reveal)
     return {**article, 'articleBody': html.escape(visible),
@@ -2945,7 +2969,7 @@ def cnyes_verified_empty_body(soup, source, article, *, page_url):
         return False
 
 
-def _globalvoices_visible_article_identity(soup, source, *, page_url):
+def _globalvoices_visible_article_identity(soup, source, *, page_url, allow_empty_title=False):
     """Bind exceptional short/nontext outcomes to one declared article."""
     from downloader.news_fulltext_policy import normalize_url
     from downloader.news_fulltext_public_originals import _visible
@@ -2974,8 +2998,46 @@ def _globalvoices_visible_article_identity(soup, source, *, page_url):
         headline = heads[0].get_text(' ', strip=True)
         published = clocks[0].get('content', '')
         clock = datetime.fromisoformat(published.replace('Z', '+00:00'))
-        if not headline or clock.tzinfo is None:
+        if clock.tzinfo is None or not headline and not allow_empty_title:
             return None
+        untitled_binding = ''
+        if not headline:
+            # Native historical numeric-ID micro-posts can have an explicitly
+            # empty visible title element. Bind that absence to exactly this
+            # source post, never a slug, related story, hidden heading or URL-
+            # derived headline. This does not infer why the source left it empty.
+            match = re.fullmatch(r'/[0-9]{4}/[0-9]{2}/[0-9]{2}/([1-9][0-9]{0,15})/?', parts.path)
+            if match is None or parts.query:
+                return None
+            posts = containers[0].select('.post-' + match[1])
+            def inside(node, parent):
+                return any(ancestor is parent for ancestor in node.parents)
+
+            if len(posts) != 1 or not inside(entries[0], posts[0]):
+                return None
+            untitled_binding = 'matching_numeric_post_id_and_visible_empty_title'
+            head_inside, credit_inside = inside(heads[0], posts[0]), inside(credits[0], posts[0])
+            if not head_inside or not credit_inside:
+                # Observed native layout: header is in a sibling wrapper above
+                # the main/article wrappers, NOT in .post-container. Bind both
+                # to the one page-content and source body postid; never borrow
+                # a related story's heading or byline from arbitrary page text.
+                scopes = soup.select('#page-content')
+                headers = soup.select('#page-content > .post-header-container > .post-header')
+                body_ids = [value for value in soup.body.get('class', [])
+                            if re.fullmatch(r'postid-[0-9]+', value)] if soup.body else []
+                if (head_inside or credit_inside or len(scopes) != 1 or len(headers) != 1
+                        or soup.body is None or 'single-post' not in soup.body.get('class', [])
+                        or body_ids != ['postid-' + match[1]]
+                        or not inside(containers[0], scopes[0])
+                        or heads[0].find_parent(class_='post-header') is not headers[0]
+                        or credits[0].find_parent(class_='post-header') is not headers[0]):
+                    return None
+                untitled_binding += '; same_single_page_content_external_header_and_body_post_id'
+            footer_nodes = containers[0].select('.postfooter-credits .contributor-name a.user-link')
+            license_nodes = containers[0].select('.post-credit-container [rel="license"]')
+            if any(not inside(node, posts[0]) for node in (*footer_nodes, *license_nodes)):
+                return None
 
         def named_profiles(nodes):
             result = []
@@ -3002,7 +3064,7 @@ def _globalvoices_visible_article_identity(soup, source, *, page_url):
                 or not any(str(n.get('href', '')).startswith(source.required_license_url_prefix) for n in licenses)):
             return None
         return entries[0], {'headline': headline, 'author': [{'name': name} for name, _ in writers],
-                            'datePublished': published}
+                            'datePublished': published, 'article_identity_basis': untitled_binding}
     except NewsError:
         return None
     except (ValueError, TypeError, AttributeError, OverflowError):
@@ -3011,12 +3073,27 @@ def _globalvoices_visible_article_identity(soup, source, *, page_url):
 
 def globalvoices_verified_small_body(soup, source, body, *, page_url):
     """Verify complete micro-posts; never accept media/summary as their text."""
+    if not 0 < len(body) < 100:
+        return None
+    return _globalvoices_verified_prose(soup, source, body, page_url=page_url)
+
+
+def globalvoices_verified_untitled_body(soup, source, body, *, page_url):
+    """Preserve one verified source-empty title, not an invented replacement."""
+    if not body or not source.title_selector:
+        return None
+    heads = soup.select(source.title_selector)
+    if len(heads) != 1 or heads[0].get_text(' ', strip=True):
+        return None
+    return _globalvoices_verified_prose(soup, source, body, page_url=page_url, allow_empty_title=True)
+
+
+def _globalvoices_verified_prose(soup, source, body, *, page_url, allow_empty_title=False):
     from downloader.news_fulltext_policy import _plain_text_node
     from downloader.news_fulltext_public_originals import _visible
 
-    if not 0 < len(body) < 100:
-        return None
-    identity = _globalvoices_visible_article_identity(soup, source, page_url=page_url)
+    identity = _globalvoices_visible_article_identity(soup, source, page_url=page_url,
+                                                     allow_empty_title=allow_empty_title)
     if identity is None:
         return None
     entry, article = identity
@@ -3054,12 +3131,18 @@ def globalvoices_verified_small_body(soup, source, body, *, page_url):
         return None
     if body == '[Pictochart.com embed removed because it no longer worked]':
         raise NewsError('source_body_removed')
-    return {**article,
+    result = {**article,
             'article_identity_basis': 'canonical_visible_micro_post; matching_header_footer_authors_clock_and_article_license',
-            'body_completeness': ('verified_publisher_short_body; one_visible_article_container_not_summary'
+            'body_completeness': (('verified_publisher_short_body; ' if len(body) < 100 else 'verified_publisher_body; ')
+                                  + 'one_visible_article_container_not_summary'
                                   + ('; excluded_source_caption_containers; embedded_images_not_downloaded_or_OCRed'
                                      if images else '')
                                   + ('; external_static_video_not_requested_or_transcribed' if static_video else ''))}
+    if allow_empty_title:
+        result['title_basis'] = 'source_visible_title_empty_verified_numeric_article'
+        result['article_identity_basis'] += '; ' + article['article_identity_basis']
+        result['body_completeness'] += '; source_visible_title_empty'
+    return result
 
 
 _GLOBALVOICES_PREVIOUS_REPORT_TEXT = "More information see GV's previous report."

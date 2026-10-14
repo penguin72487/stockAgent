@@ -24,6 +24,28 @@ PENGUIN_DAY_TRADE_MARKETS = (
 )
 
 
+@pytest.mark.parametrize("at,deadline,active,expected", [
+    ("18:00", "2026-10-13T18:10:00+08:00", None, True),
+    ("09:00", "2026-10-13T09:10:00+08:00", None, False),
+    ("13:30", "2026-10-13T13:40:00+08:00", None, False),
+    ("18:00", "2026-10-13T17:59:00+08:00", None, False),
+    ("18:00", "2026-10-13T19:00:00+08:00", None, False),
+    ("18:00", "2026-10-13T18:10:00", None, False),
+    ("18:00", "invalid", None, False),
+    ("18:00", None, None, False),
+    ("18:00", "2026-10-13T18:10:00+08:00", 1., False),
+])
+def test_deployment_warmup_deadline_is_bounded_and_not_an_opening_bypass(monkeypatch, at, deadline, active, expected):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(f"2026-10-13T{at}:00+08:00")
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_env", lambda key, *args: deadline if key == "STOCKAGENT_DEPLOYMENT_WARMUP_UNTIL" else None)
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", active)
+    assert discord_bot._deployment_warmup_window_open() is expected
+
+
 def test_gpu_warmup_only_precedes_verified_open_and_offhours_releases_cache(
     monkeypatch,
 ) -> None:
@@ -46,7 +68,7 @@ def test_gpu_warmup_only_precedes_verified_open_and_offhours_releases_cache(
     class PreopenClock(datetime):
         @classmethod
         def now(cls, tz=None):
-            return datetime(2026, 9, 21, 7, 30, tzinfo=tz)
+            return datetime(2026, 9, 21, 8, 10, tzinfo=tz)
 
     class ClosedClock(datetime):
         @classmethod
@@ -103,6 +125,9 @@ def test_offhours_session_gate_reuses_one_second_proof_but_opening_is_live(
 
 def test_offhours_gpu_cache_release_never_interrupts_inference(monkeypatch) -> None:
     calls: list[str] = []
+    monkeypatch.setattr(discord_bot.bot, "_startup_inference_warmup_complete", True)
+    monkeypatch.setattr(discord_bot.bot, "_startup_inference_warmup_failure_count", 0)
+    monkeypatch.setattr(discord_bot.bot, "_startup_inference_warmup_retry_after", 0.0)
     monkeypatch.setattr(
         discord_bot, "_offhours_gpu_cache_release_allowed", lambda: True
     )
@@ -119,6 +144,77 @@ def test_offhours_gpu_cache_release_never_interrupts_inference(monkeypatch) -> N
         discord_bot._MODEL_INFERENCE_LOCK.release()
     assert discord_bot._release_offhours_gpu_cache_sync() is True
     assert calls == ["release"]
+    assert discord_bot.bot._startup_inference_warmup_complete is False
+
+
+@pytest.mark.parametrize("at,allowed", [("13:29", False), ("13:31", True), ("14:05", True)])
+def test_verified_close_releases_without_waiting_until_1700(monkeypatch, at, allowed):
+    cfg = SimpleNamespace(market="cash", timezone="Asia/Taipei",
+        day_trade_simulation_enabled=True, close_time="13:30")
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(f"2026-10-13T{at}:00+08:00")
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_deployment_warmup_window_open", lambda: False)
+    monkeypatch.setattr(discord_bot, "_opening_critical_work_pending", lambda: False)
+    monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: ["cash"])
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda _: cfg)
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *_: (True, "verified"))
+    assert discord_bot._offhours_gpu_cache_release_allowed() is allowed
+
+
+def test_live_other_market_prevents_shared_model_eviction(monkeypatch):
+    cfg = SimpleNamespace(market="crypto", day_trade_simulation_enabled=False)
+    monkeypatch.setattr(discord_bot, "_deployment_warmup_window_open", lambda: False)
+    monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: [cfg.market])
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda _: cfg)
+    monkeypatch.setattr(discord_bot, "_runtime_status_for_display", lambda _: SimpleNamespace(market_open=True))
+    assert discord_bot._offhours_gpu_cache_release_allowed() is False
+
+
+def test_release_error_cannot_replace_successful_inference(monkeypatch):
+    observed = []
+    monkeypatch.setattr(discord_bot, "_offhours_gpu_cache_release_allowed", lambda: True)
+    monkeypatch.setattr(discord_bot, "_log_exception", lambda *args: observed.append(args))
+    def fail():
+        raise RuntimeError("device no longer present")
+    monkeypatch.setattr(discord_bot, "release_idle_live_cuda_cache", fail)
+    with discord_bot._MODEL_INFERENCE_LOCK:
+        assert discord_bot._release_completed_inference_cache_owned() is False
+    assert observed[0][0] == "completed_inference_cache_release"
+
+
+@pytest.mark.parametrize("case,enabled", [("closed", True), ("open", False),
+    ("unaccepted", False), ("warm", False), ("postclose-arm", False), ("scheduled", False)])
+def test_completed_cache_only_uses_accepted_offhours_panel(monkeypatch, case, enabled):
+    from stockagent.live.market_config import LiveMarketConfig
+    cfg = LiveMarketConfig(market="cash", label="cash", config_path="fake.yaml",
+        day_trade_simulation_enabled=True, price_source="panel")
+    status = SimpleNamespace(market_open=case == "open", data=SimpleNamespace(fresh=True))
+    monkeypatch.setattr(discord_bot, "_resolve_market", lambda _: cfg)
+    monkeypatch.setattr(discord_bot, "_effective_market_config", lambda value: value)
+    monkeypatch.setattr(discord_bot, "_market_notice", lambda _: None)
+    monkeypatch.setattr(discord_bot, "_completed_session_receipt_ready", lambda _: case != "unaccepted")
+    kwargs = discord_bot._signal_kwargs(market="cash", price_source="panel",
+        prepared_status=status, scheduled=case == "scheduled", progress_label=case)
+    assert kwargs["use_completed_session_cache"] is enabled
+
+
+def test_closed_artifact_cache_requires_current_source_identity(monkeypatch):
+    cfg = SimpleNamespace(market="cash", day_trade_simulation_enabled=True, config_path="fake.yaml")
+    status = SimpleNamespace(market_open=False,
+        data=SimpleNamespace(fresh=True, last_data_date="2026-10-13"))
+    summary = {"panel_date": "2026-10-13", "price_source": "panel_close"}
+    monkeypatch.setattr(discord_bot, "_summary_matches_market_deployment", lambda *_: (True, None))
+    monkeypatch.setattr(discord_bot, "completed_panel_source_fingerprint", lambda *_, **__: "v2")
+    reuse = lambda: discord_bot._can_reuse_latest_signal_now(cfg, status, summary,
+        requested_price_source="panel")
+    assert reuse() == (False, "completed_source_identity_missing")
+    summary["completed_panel_source_fingerprint"] = "v1"
+    assert reuse() == (False, "completed_source_generation_changed")
+    summary["completed_panel_source_fingerprint"] = "v2"
+    assert reuse() == (True, "cached_latest_official_close")
 
 
 def test_guide_lists_all_tw_execution_modes() -> None:
@@ -261,7 +357,9 @@ def test_all_four_overnight_adapters_use_1320_latest_quote_schedule(
 def test_penguin_discord_deployment_only_enables_tw_day_trade_modes() -> None:
     configs = discord_bot._market_configs()
     enabled = {key for key, cfg in configs.items() if cfg.enabled}
-    assert enabled == set(PENGUIN_DAY_TRADE_MARKETS)
+    # Original four remain, but an accepted independent addition is allowed.
+    assert set(PENGUIN_DAY_TRADE_MARKETS).issubset(enabled)
+    assert all(configs[key].day_trade_simulation_enabled for key in enabled)
 
 
 def test_overnight_scheduler_catches_up_only_before_close(monkeypatch) -> None:
@@ -982,7 +1080,7 @@ def test_postclose_artifact_maintenance_isolated_from_discord_cgroup() -> None:
     assert "Nice=-5" in gateway
     assert "CPUWeight=200" in gateway
     assert "IOWeight=200" in gateway
-    assert "MemoryHigh=12G" in gateway
+    assert "MemoryHigh=16G" in gateway
     assert "MemoryMax=24G" in gateway
     assert "MemorySwapMax=4G" in gateway
     assert "TasksMax=2048" in gateway

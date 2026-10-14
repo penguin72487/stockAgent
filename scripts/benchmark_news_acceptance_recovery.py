@@ -13,6 +13,7 @@ from contextlib import nullcontext
 import hashlib
 from importlib import metadata
 import json
+import locale
 import os
 from pathlib import Path
 import resource
@@ -25,10 +26,35 @@ from urllib.parse import quote
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext_queue import NewsQueue, source_path, utc_now
 from downloader import news_fulltext_queue as queue_module
+from downloader.news_fulltext_queue import read_acceptance_receipt_input as _binary_receipt_input
 from stockagent import private_json
 
 
 _RECEIPT_PREFETCH_CHARACTERS = 1 << 20
+
+
+def _binary_recovery(queue, paths):
+    """Benchmark only: canonical SQL/orphan replay, alternate input I/O."""
+    original_recover = queue._recover_acceptance_receipt
+    def recover(path, relative, committed):
+        original_recover(path, relative, committed, receipt_text=_binary_receipt_input(path))
+    queue._recover_acceptance_receipt = recover
+    try:
+        queue.recover_acceptance(receipt_paths=paths)
+    finally:
+        queue._recover_acceptance_receipt = original_recover
+
+
+def _text_recovery(queue, paths):
+    """Original synchronous text reference, still canonical SQL/orphan replay."""
+    original_recover = queue._recover_acceptance_receipt
+    def recover(path, relative, committed):
+        original_recover(path, relative, committed, receipt_text=path.read_text())
+    queue._recover_acceptance_receipt = recover
+    try:
+        queue.recover_acceptance(receipt_paths=paths)
+    finally:
+        queue._recover_acceptance_receipt = original_recover
 
 
 def _bounded_receipt_text(path):
@@ -72,7 +98,7 @@ def _prefetch_recovery(queue, paths, workers):
 
 
 def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
-              read_ahead_workers=0, evict_receipt_pages=False):
+              read_ahead_workers=0, evict_receipt_pages=False, binary_read_only=False):
     if type(maximum_receipts) is not int or not 1 <= maximum_receipts <= 8192:
         raise ValueError('bounded_receipt_cohort_required')
     if type(cycles) is not int or not 1 <= cycles <= 3:
@@ -81,7 +107,8 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
         raise ValueError('explicit_json_decode_comparison_required')
     if type(read_ahead_workers) is not int or not 0 <= read_ahead_workers <= 8:
         raise ValueError('bounded_receipt_read_ahead_workers_required')
-    if type(evict_receipt_pages) is not bool or json_decode_only and read_ahead_workers:
+    if (type(evict_receipt_pages) is not bool or type(binary_read_only) is not bool
+            or sum((json_decode_only, bool(read_ahead_workers), binary_read_only)) > 1):
         raise ValueError('separate_receipt_io_and_decode_comparisons_required')
     if evict_receipt_pages and not (hasattr(os, 'posix_fadvise') and hasattr(os, 'POSIX_FADV_DONTNEED')):
         raise ValueError('receipt_only_page_advice_unavailable')
@@ -103,21 +130,24 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
     cohort_json_bytes = sum(path.stat().st_size for path in paths)
     before = [sha256_file(path) for path in paths]
     decode_parity = None
-    if json_decode_only:
+    if json_decode_only or binary_read_only:
         # Outside timed recovery: compare all fields, not only parquet_path,
         # and bind the equality proof to the unchanged full receipt bytes.
         semantic_hashes, mismatches = [], []
         for path in paths:
             text = path.read_text()
-            reference = json.dumps(json.loads(text), sort_keys=True, ensure_ascii=True)
-            candidate = json.dumps(private_json.loads(text), sort_keys=True, ensure_ascii=True)
+            reference = json.dumps(private_json.loads(text) if binary_read_only else json.loads(text),
+                                   sort_keys=True, ensure_ascii=True)
+            candidate = json.dumps(private_json.loads(_binary_receipt_input(path) if binary_read_only else text),
+                                   sort_keys=True, ensure_ascii=True)
             semantic_hashes.append(hashlib.sha256(reference.encode()).hexdigest())
             if reference != candidate:
                 mismatches.append(str(path.relative_to(root)))
         decode_parity = {'all_fields_equal': not mismatches, 'mismatches': mismatches,
             'full_json_sha256': hashlib.sha256(json.dumps(semantic_hashes).encode()).hexdigest(),
             'native_available': private_json.native_available(),
-            'text_read_and_stdlib_fallback_preserved': True}
+            'text_read_and_stdlib_fallback_preserved': True,
+            'binary_input_only_comparison': binary_read_only}
         if mismatches:
             raise ValueError('full_receipt_decode_parity_required')
     queue = NewsQueue.__new__(NewsQueue)
@@ -145,7 +175,8 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
 
     results = []
     original_decode = queue_module.decode_private_json
-    reference_mode, candidate_mode = (('serial_read', 'prefetch_read') if read_ahead_workers else
+    reference_mode, candidate_mode = (('text_read', 'binary_read') if binary_read_only else
+                                      ('serial_read', 'prefetch_read') if read_ahead_workers else
                                       ('stdlib_json', 'shared_private_json') if json_decode_only
                                       else ('legacy', 'bounded'))
     try:
@@ -164,14 +195,19 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
                         calls['committed_lookup_statements'] += 1
                 queue.db.set_trace_callback(trace)
                 cpu, wall = time.process_time(), time.perf_counter()
-                if read_ahead_workers:
+                if binary_read_only:
                     if mode == reference_mode:
-                        queue.recover_acceptance(receipt_paths=paths)
+                        _text_recovery(queue, paths)
+                    else:
+                        _binary_recovery(queue, paths)
+                elif read_ahead_workers:
+                    if mode == reference_mode:
+                        _text_recovery(queue, paths)
                     else:
                         _prefetch_recovery(queue, paths, read_ahead_workers)
                 elif json_decode_only:
                     queue_module.decode_private_json = json.loads if mode == reference_mode else original_decode
-                    queue.recover_acceptance(receipt_paths=paths)
+                    _text_recovery(queue, paths)
                 elif mode == 'legacy':
                     legacy()
                 else:
@@ -196,7 +232,7 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
         len(paths) if r['mode'] == 'legacy' else (len(paths) + 127) // 128) for r in results)
     implementation_after = {str(path): sha256_file(path) for path in implementation_paths}
     accepted = accepted and implementation_before == implementation_after
-    return {'contract_version': 3 if read_ahead_workers else 2 if json_decode_only else 1,
+    return {'contract_version': 4 if binary_read_only else 3 if read_ahead_workers else 2 if json_decode_only else 1,
         'accepted': accepted, 'observed_at_utc': utc_now(),
         'scope': 'AB/BA instrumented fixed committed-receipt stage in isolated SQLite; not live boot or publisher maximum',
         'cohort_receipts': len(paths), 'cohort_sha256': hashlib.sha256(json.dumps(
@@ -208,6 +244,8 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
                         if evict_receipt_pages else 'same receipt cohort reread after input hashing/full-value parity; not a cold boot or page-cache eviction test'),
         'receipt_only_page_advice_requested': evict_receipt_pages,
         'candidate_read_ahead_workers': read_ahead_workers,
+        'candidate_binary_read_only': binary_read_only,
+        'default_receipt_encoding': locale.getpreferredencoding(False),
         'source_receipts_unchanged': unchanged, 'production_database_written': False, 'publisher_requests': 0,
         'results': results, 'medians': medians, 'decode_parity': decode_parity,
         'wall_speedup': medians[reference_mode]['wall_seconds'] / medians[candidate_mode]['wall_seconds'],
@@ -227,13 +265,15 @@ def main(argv=None):
                         help='Compare stdlib and existing private-cache full JSON decoding; identical bounded SQL and read order')
     parser.add_argument('--read-ahead-workers', type=int, default=0,
                         help='Compare serial receipt I/O against a bounded I/O-only pool (1..8)')
+    parser.add_argument('--binary-read-only', action='store_true',
+                        help='Compare original text reads with exact ASCII-byte input; same complete receipt decoder and SQL')
     parser.add_argument('--evict-receipt-pages', action='store_true',
                         help='Request per-file Linux DONTNEED advice before trials; no global cache eviction or source mutation')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     result = benchmark(args.root, maximum_receipts=args.maximum_receipts, cycles=args.cycles,
                        json_decode_only=args.json_decode_only, read_ahead_workers=args.read_ahead_workers,
-                       evict_receipt_pages=args.evict_receipt_pages)
+                       evict_receipt_pages=args.evict_receipt_pages, binary_read_only=args.binary_read_only)
     atomic_write_json(args.output, result)
     print(json.dumps({k: result[k] for k in ('accepted', 'cohort_receipts', 'medians', 'wall_speedup', 'publisher_requests')}))
     return 0 if result['accepted'] else 1

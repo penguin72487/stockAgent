@@ -22,6 +22,30 @@ from scripts.benchmark_cnyes_acquisition import verify_batches
 from stockagent.data.news_source_catalog import configuration_paths
 
 
+CONTRACT_VERSION = 8
+
+
+def _replay_feed_envelope(payload, request_url, registry, source):
+    """Use the registered feed parser, with no transport or relaxed rights.
+
+    A mixed restricted envelope is never a valid historical body source. A
+    non-body neighbour need not invalidate an independently usable item, but
+    an error for that selected identity must not be silently ignored.
+    """
+    from downloader.news_fulltext_bulk import BULK_RESTRICTED_ITEM_ERRORS
+    from downloader.news_fulltext_feed import feed_records
+
+    response = SimpleNamespace(url=request_url, body=payload,
+                               headers={'content-type': 'application/rss+xml'})
+    rows, errors = feed_records(response, SimpleNamespace(registry=registry), source)
+    if any(error['error'] in BULK_RESTRICTED_ITEM_ERRORS for error in errors):
+        raise ValueError('selected_feed_contains_restricted_text')
+    indexed = {row['article_id']: row for row in rows}
+    if len(indexed) != len(rows):
+        raise ValueError('selected_feed_item_not_replayable')
+    return indexed, {error.get('url') for error in errors}
+
+
 def audit(root: Path, urls: list[str], *, registry=None) -> dict:
     if not 1 <= len(urls) <= 16:
         raise ValueError("one to sixteen explicitly selected URLs required")
@@ -30,7 +54,7 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
     db.row_factory = sqlite3.Row
     try:
         db.execute("BEGIN")
-        result = {"contract_version": 7, "database_snapshot_at_utc": utc_now(), "articles": [], "errors": [],
+        result = {"contract_version": CONTRACT_VERSION, "database_snapshot_at_utc": utc_now(), "articles": [], "errors": [],
                   "publish": False, "remote_training_export": False,
                   "all_history_complete": False, "scope": "explicit selected durable heads, not source history",
                   "current_source_replay_requested": registry is not None}
@@ -50,6 +74,7 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                 records = pq.read_table(source_path(root, path)).to_pylist()
                 indexed = {r["article_id"]: r for r in records}
                 envelopes = {r["article_id"]: r["raw_response_body"] for r in records if r["raw_response_body"] is not None}
+                feed_replays = {}  # At most the selected batch's shared envelopes; no global raw cache.
                 for url, row in selected:
                     record = indexed.get(row["id"].hex())
                     if record is None or record["body_sha256"] != row["body_sha256"]:
@@ -82,6 +107,21 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                                 if len(replay_matches) != 1:
                                     raise ValueError('selected_api_item_not_replayable')
                                 replay = replay_matches[0]
+                            elif record.get('extraction_method') == 'rss_content_encoded_v1':
+                                key = (record['source_response_article_id'], record['source_request_url'], source.provider)
+                                if key not in feed_replays:
+                                    feed_replays[key] = _replay_feed_envelope(
+                                        payload, record['source_request_url'], registry, source)
+                                feed_rows, failed_urls = feed_replays[key]
+                                replay = feed_rows.get(record['article_id'])
+                                if replay is None or record['requested_url'] in failed_urls:
+                                    raise ValueError('selected_feed_item_not_replayable')
+                                if (any(replay.get(k) != record.get(k) for k in (
+                                        'requested_url', 'final_url', 'published_time_basis', 'body_completeness',
+                                        'license_verification_basis', 'per_article_license_verified'))
+                                        or json.loads(replay['declared_license_urls_json'])
+                                        != json.loads(record['declared_license_urls_json'])):
+                                    raise ValueError('current_source_replay_changed_rss_license_or_scope')
                             elif record.get('extraction_method') == 'fed_pdf_original_text_v1':
                                 from downloader.news_fulltext_pdf import extract_board_pdf
                                 replay = extract_board_pdf(payload, source, page_url=record['final_url'])
@@ -139,7 +179,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/news_fulltext.json"))
     parser.add_argument("--url", action="append", required=True)
-    parser.add_argument("--reparse-current-source", action="store_true", help="Replay selected HTML/PDF source envelopes with current parser; no HTTP or rewrite of historical capture fingerprints")
+    parser.add_argument("--reparse-current-source", action="store_true", help="Replay selected HTML/JSON/RSS/PDF source envelopes with their registered current parser; no HTTP or rewrite of historical capture fingerprints")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     config, registry, repo = load_config(args.config)

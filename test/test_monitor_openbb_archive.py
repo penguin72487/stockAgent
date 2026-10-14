@@ -20,6 +20,48 @@ from scripts.monitor_openbb_archive import (
 )
 
 
+def test_archive_metadata_batches_preserve_first_row_and_decode_tail(tmp_path: Path) -> None:
+    path = tmp_path / 'provenance.parquet'
+    table = pa.table({'_provider': ['official'] * 200001,
+                      '_query_json': ['{"period": "all"}'] * 200001})
+    pq.write_table(table, path, row_group_size=200001)
+    with pq.ParquetFile(path) as source:
+        expected = source.read_row_group(0, columns=table.column_names).slice(0, 1).to_pylist()[0]
+        assert monitor._archive_first_row(source, table.column_names) == expected
+
+
+def test_archive_metadata_does_not_hide_corruption_after_first_batch() -> None:
+    class CorruptAfterHead:
+        def iter_batches(self, **kwargs):
+            assert kwargs['row_groups'] == [0]
+            assert kwargs['batch_size'] == 65536
+            yield pa.record_batch([pa.array(['official'])], names=['_provider'])
+            raise pa.ArrowInvalid('damaged later metadata page')
+    with pytest.raises(pa.ArrowInvalid, match='later metadata page'):
+        monitor._archive_first_row(CorruptAfterHead(), ['_provider'])
+
+
+def test_empty_metadata_file_retains_zero_rows_classification(tmp_path: Path) -> None:
+    manifest = Manifest(tmp_path / '_state/openbb_archive.sqlite3')
+    task = _task(tmp_path, 'empty-provenance')
+    try:
+        manifest.upsert_tasks([task])
+        path = Path(task.output_path)
+        path.parent.mkdir(parents=True)
+        pq.write_table(pa.table({name: pa.array([], type=pa.string())
+                                 for name in monitor.REQUIRED_ARCHIVE_COLUMNS}), path)
+        manifest.connection.execute("UPDATE tasks SET status='success',rows=0,selected_provider='yfinance'")
+        manifest.connection.commit()
+        result = monitor._audit_success_files(manifest.connection, output_dir=tmp_path,
+                                             plan_token=None, show_progress=False)
+        assert result['success_zero_row_tasks'] == 1
+        assert result['unreadable_files'] == 0
+        assert result['checked_rows'] == 0
+        assert not result['passed']
+    finally:
+        manifest.close()
+
+
 def test_daily_quota_projection_exposes_optimistic_lower_bound() -> None:
     projection = _daily_quota_projection(
         "fmp", "basic", 2_133_079, 250, evidence_tasks=38

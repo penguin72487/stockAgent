@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from concurrent.futures import Future
 import hashlib
 import json
@@ -14,11 +15,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from stockagent.data.factorized_panel import FactorizedLiveWindow
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.backtest.tw_execution import normalize_execution_mode
@@ -161,6 +165,25 @@ _LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
 ] = OrderedDict()
 _LIVE_ALIGNED_PANEL_CACHE_LOCK = threading.Lock()
 _LIVE_FACTORIZED_PANEL_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
+_LIVE_COMPLETED_SOURCE_IDENTITIES: dict[str, str] = {}
+
+
+def completed_panel_source_fingerprint(
+    config_path: str | Path, *, rule_data_dir: str | Path | None = None,
+) -> str:
+    """Fence persisted close signals to the current canonical source generation."""
+    config = load_config(config_path)
+    with live_tw_public_source_read_guard(config.data.parquet_root):
+        return _completed_panel_identity(config, rule_data_dir=rule_data_dir)
+
+
+def _completed_panel_identity(config: ExperimentConfig, *, rule_data_dir=None) -> str:
+    from stockagent.live.completed_inference_cache import (
+        configuration_identity, identity_digest, implementation_identity, source_fingerprint,
+    )
+    return identity_digest({"source": source_fingerprint(config, rule_data_dir=rule_data_dir),
+        "configuration": configuration_identity(config), "code": implementation_identity(),
+        "torch": str(torch.__version__), "numpy": np.__version__})
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -233,6 +256,14 @@ def release_idle_live_cuda_cache() -> bool:
 
     gc.collect()
     if torch.cuda.is_initialized():
+        # cuBLAS owns allocations outside Python Tensor references. The
+        # documented clear hook releases them without changing GEMM workspace
+        # size, precision or kernel policy. Only the serialized idle owner may
+        # call this; ordinary live invalidation keeps its warm workspaces.
+        torch.cuda.synchronize()
+        clear_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+        if clear_workspaces is not None:
+            clear_workspaces()
         torch.cuda.empty_cache()
     return True
 
@@ -301,6 +332,7 @@ def _model_cache_key(
     runtime_device: torch.device,
     panel: PanelData,
     lookback: int,
+    config: ExperimentConfig | None = None,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(checkpoint_key.encode("utf-8"))
@@ -308,6 +340,9 @@ def _model_cache_key(
     digest.update(str(int(lookback)).encode("ascii"))
     digest.update("\0".join(panel.feature_names).encode("utf-8"))
     digest.update("\0".join(panel.symbols).encode("utf-8"))
+    if config is not None:
+        from stockagent.live.completed_inference_cache import configuration_identity
+        digest.update(configuration_identity(config).encode())
     return digest.hexdigest()
 
 
@@ -324,6 +359,7 @@ def _cached_live_model(
         runtime_device=runtime_device,
         panel=panel,
         lookback=config.training.lookback,
+        config=config,
     )
     with _LIVE_MODEL_CACHE_LOCK:
         cached = _LIVE_MODEL_CACHE.get(key)
@@ -481,7 +517,8 @@ def _cached_normalized_model_window(
     *,
     panel_idx: int,
     lookback: int,
-) -> np.ndarray:
+    factorized_stream: bool = False,
+) -> np.ndarray | FactorizedLiveWindow:
     """Reuse the pre-open normalized base window; only the open-gap row changes."""
 
     # ``id(panel)`` alone is not a durable cache identity: an aligned panel is
@@ -495,6 +532,11 @@ def _cached_normalized_model_window(
         int(panel.num_symbols),
         len(panel.feature_names),
     )
+    if (factorized_stream and getattr(panel.features, "_stockagent_factorized_features", False)
+            and os.environ.get("STOCKAGENT_LIVE_FACTORIZED_STREAM", "1") != "0"):
+        from stockagent.data.factorized_panel import FactorizedLiveWindow
+        return FactorizedLiveWindow(panel.features, int(panel_idx)-int(lookback)+1,
+                                    int(panel_idx)+1)
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         entry = _LIVE_MODEL_INPUT_CACHE.get(key)
         if entry is not None:
@@ -525,6 +567,22 @@ def _cached_normalized_model_window(
         value[:-1] = previous[1:]
         value[-1] = np.nan_to_num(panel.features[int(panel_idx)], nan=0.0,
                                   posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    elif getattr(panel.features, "_stockagent_factorized_features", False):
+        # The factorized reader decodes a private dense slab. A 32-session
+        # window can exceed 5 GiB: copying it and creating three full-size
+        # nan_to_num masks crosses the service's memory.high and stalls the
+        # owner. Sanitize bounded chunks of that owned allocation instead.
+        # Never mutate a view into source/cache storage or change FP32 values.
+        decoded = panel.features[start : int(panel_idx) + 1]
+        value = np.asarray(decoded)
+        if (value.dtype != np.float32 or not value.flags.owndata
+                or not value.flags.writeable or not value.flags.c_contiguous):
+            value = np.array(decoded, dtype=np.float32, order="C", copy=True)
+        flat = value.reshape(-1)
+        chunk_values = 1024 * 1024
+        for offset in range(0, flat.size, chunk_values):
+            np.nan_to_num(flat[offset : offset + chunk_values], copy=False,
+                          nan=0.0, posinf=0.0, neginf=0.0)
     else:
         value = np.nan_to_num(
             panel.features[start : int(panel_idx) + 1],
@@ -538,6 +596,21 @@ def _cached_normalized_model_window(
                > _LIVE_MODEL_INPUT_CACHE_MAX_BYTES):
             _LIVE_MODEL_INPUT_CACHE.popitem(last=False)
     return value
+
+
+def _factorized_live_stream_admitted(config: ExperimentConfig) -> bool:
+    """Use owned transport only for the tested plain, full-width input ABI."""
+    candle = config.training.financial_transformer
+    return bool(config.data.factorized_feature_manifest
+        and config.training.model_name == "financial_transformer"
+        and candle.causal_feature_rms_normalization
+        and candle.causal_feature_compression == "none"
+        and not candle.causal_feature_window_rms_normalization
+        and not candle.temporal_basis_families
+        and not candle.feature_svd_components
+        and not candle.feature_bottleneck_dim
+        and not candle.daily_context_layers
+        and not (candle.dropout or candle.input_dropout or candle.candle_dropout))
 
 
 def _require_supported_live_execution(execution_mode: object) -> str:
@@ -649,14 +722,16 @@ def _build_panel(
             from stockagent.data.factorized_panel import attach_factorized_live_features
             manifest_path = Path(config.data.factorized_feature_manifest).resolve(strict=True)
             stat = manifest_path.stat()
-            key = (id(panel), str(manifest_path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            key = (id(panel), str(manifest_path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                   config.data.factorized_host_cache_bytes)
             with _LIVE_PANEL_CACHE_LOCK:
                 entry = _LIVE_FACTORIZED_PANEL_CACHE.get(key)
             if entry is not None and entry[0] is panel and entry[2] == _factorized_member_signatures(manifest_path):
                 panel = entry[1]
             else:
                 base = panel
-                panel = attach_factorized_live_features(base, manifest_path)
+                panel = attach_factorized_live_features(base, manifest_path,
+                    host_cache_bytes=config.data.factorized_host_cache_bytes)
                 signatures = _factorized_member_signatures(manifest_path)
                 with _LIVE_PANEL_CACHE_LOCK:
                     _LIVE_FACTORIZED_PANEL_CACHE[key] = (base, panel, signatures)
@@ -2182,9 +2257,9 @@ def _day_trade_live_model_window(
     price_snapshot: PriceSnapshot,
     resolved_asof: str,
     source_timezone: str | None,
-    base_model_window: np.ndarray | None = None,
+    base_model_window: np.ndarray | FactorizedLiveWindow | None = None,
     model_observation: str = "session_open",
-) -> tuple[np.ndarray, str, str, bool, np.ndarray]:
+) -> tuple[np.ndarray | FactorizedLiveWindow, str, str, bool, np.ndarray]:
     """Build a same-session observation without inventing a completed daily bar.
 
     ``session_open`` is the executable 09:00 day-trade contract.  The explicit
@@ -2203,7 +2278,8 @@ def _day_trade_live_model_window(
 
     start = int(panel_idx) - int(lookback) + 1
     base = (
-        np.asarray(base_model_window, dtype=np.float32)
+        (base_model_window if getattr(base_model_window, "_stockagent_factorized_live_window", False)
+         else np.asarray(base_model_window, dtype=np.float32))
         if base_model_window is not None
         else np.nan_to_num(
             panel.features[start : panel_idx + 1],
@@ -2303,7 +2379,6 @@ def _day_trade_live_model_window(
         gap_idx = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
     except ValueError:
         return base, feature_cutoff, decision_time, True, observed_open
-    window = base.copy()
     gap = np.zeros((panel.num_symbols,), dtype=np.float32)
     gap[observed_open] = np.log(
         observed_prices_np[observed_open] / closes_np[observed_open]
@@ -2314,7 +2389,11 @@ def _day_trade_live_model_window(
     # Taiwan's ordinary daily limit is far below this bound. Extreme values
     # indicate a stale quote, corporate action, or mismatched symbol mapping.
     gap[~np.isfinite(gap) | (np.abs(gap) > 0.5)] = 0.0
-    window[-1, :, gap_idx] = gap
+    if getattr(base, "_stockagent_factorized_live_window", False):
+        window = base.with_last_feature(gap_idx, gap)
+    else:
+        window = base.copy()
+        window[-1, :, gap_idx] = gap
     return window, feature_cutoff, decision_time, True, observed_open
 
 
@@ -2324,7 +2403,7 @@ def _cached_session_day_trade_rules(
     parquet_root: str,
     symbols: tuple[str, ...],
     session_date: str,
-    source_identity: tuple[tuple[int, int, int], ...],
+    source_identity: tuple[tuple[int, int, int, int], ...],
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     # File identity is part of the key: source acceptance/replacement must
     # invalidate the hot cache. Failures are never cached by lru_cache.
@@ -2370,7 +2449,8 @@ def _day_trade_model_eligibility(
     )
     paths = [root / f"{v}_day_trade_eligibility.parquet" for v in ("twse", "tpex")]
     paths.append(Path(parquet_root) / "symbols.csv")
-    identity = tuple((s.st_ino, s.st_size, s.st_mtime_ns) for p in paths for s in [p.stat()])
+    identity = tuple((s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                     for p in paths for s in [p.stat()])
     eligible, short, proof = _cached_session_day_trade_rules(
         str(root.resolve()), str(Path(parquet_root).resolve()), tuple(panel.symbols),
         str(session_date)[:10], identity,
@@ -3216,6 +3296,100 @@ def _reject_unready_opening_prefetch(
         raise
 
 
+def _live_forward_outputs(
+    *, config: ExperimentConfig, config_path: str | Path, checkpoint: Path,
+    checkpoint_key: str, state_dict: dict[str, Any], panel: PanelData,
+    x_np: Any, mask_np: np.ndarray, runtime_device: torch.device,
+    amp_dtype: torch.dtype | None, non_blocking: bool,
+    include_unconstrained: bool, completed_cache: bool, panel_idx: int,
+    source_fingerprint: str | None,
+    loaded_config_identity: dict[str, Any] | None = None,
+    loaded_checkpoint_identity: dict[str, Any] | None = None,
+) -> tuple[Any, Any, bool, dict[str, Any] | None]:
+    """One canonical forward; completed sessions may reuse lossless CPU outputs."""
+    model_cache_hit = False
+    model = None
+    x = None
+
+    def forward(mask_values: np.ndarray) -> Any:
+        nonlocal model_cache_hit, model, x
+        # Only a real cache miss needs CUDA readiness or a resident GPU model.
+        if model is None:
+            device = resolve_device(config)
+            model, model_cache_hit = _cached_live_model(
+                config=config, checkpoint_key=checkpoint_key, state_dict=state_dict,
+                panel=panel, runtime_device=device,
+            )
+        with torch.inference_mode():
+            if x is None:
+                x = (x_np if getattr(x_np, "_stockagent_factorized_live_window", False) else
+                     torch.from_numpy(x_np).unsqueeze(0).to(
+                         device=runtime_device, non_blocking=non_blocking))
+            mask = torch.from_numpy(mask_values).unsqueeze(0).to(
+                device=runtime_device, non_blocking=non_blocking)
+            with autocast_context(runtime_device, amp_dtype):
+                output = call_model(model, x, mask, return_aux=True)
+                weights, _aux = extract_weights_and_aux(output)
+                _require_single_target_live_weights(weights,
+                    execution_mode=config.trading.execution_mode,
+                    expected_symbols=panel.num_symbols)
+            return output
+
+    if not completed_cache:
+        output = forward(mask_np)
+        raw = forward(np.ones_like(mask_np, dtype=bool)) if include_unconstrained else None
+        return output, raw, model_cache_hit, None
+
+    from stockagent.live.completed_inference_cache import (
+        CONTRACT, array_identity, cached_forward, configuration_identity, file_identity,
+        implementation_identity, window_identity,
+    )
+
+    repo = Path(__file__).resolve().parents[2]
+    identity = {
+        "contract": CONTRACT, "config": loaded_config_identity or file_identity(config_path),
+        "checkpoint": loaded_checkpoint_identity or file_identity(checkpoint),
+        "resolved_config": configuration_identity(config), "code": implementation_identity(),
+        "symbols": panel.symbols, "features": panel.feature_names,
+        "window_dates": [str(day) for day in panel.dates[
+            panel_idx - int(config.training.lookback) + 1:panel_idx + 1]],
+        "input": window_identity(x_np), "device": str(runtime_device),
+        "torch": str(torch.__version__), "cuda": torch.version.cuda,
+        "cpu_threads": torch.get_num_threads(),
+        "amp_dtype": str(amp_dtype),
+        "tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "factorized_transport": os.environ.get("STOCKAGENT_LIVE_FACTORIZED_STREAM", "1"),
+    }
+
+    def validate_identity() -> None:
+        # Config/checkpoint identities precede their reads. Reject a deployment
+        # racing the calculation, rather than label old tensors as a new model.
+        for proof in [identity["config"], identity["checkpoint"], *identity["code"]]:
+            if file_identity(proof["path"]) != proof:
+                raise RuntimeError("completed inference identity changed; retry")
+        if _checkpoint_cache_key(checkpoint) != checkpoint_key:
+            raise RuntimeError("completed checkpoint changed after loading; retry")
+
+    validate_identity()
+    cache_root = Path(os.environ.get("STOCKAGENT_COMPLETED_INFERENCE_CACHE_ROOT") or
+                      str(repo / "artifacts/cache/completed_live_inference"))
+    output, receipt = cached_forward(cache_root,
+        {**identity, "mask": array_identity(mask_np)}, lambda: forward(mask_np),
+        validate_before_commit=validate_identity)
+    # A source revision must rebuild prices/eligibility/display rows, but it
+    # need not repeat GPU math when the complete input and mask are unchanged.
+    # The generation fences the published summary, not this pure forward key.
+    receipt = {**receipt, "accepted_source_generation": source_fingerprint}
+    raw = None
+    if include_unconstrained:
+        all_symbols = np.ones_like(mask_np, dtype=bool)
+        raw, raw_receipt = cached_forward(cache_root,
+            {**identity, "mask": array_identity(all_symbols)}, lambda: forward(all_symbols),
+            validate_before_commit=validate_identity)
+        receipt = {**receipt, "unconstrained": raw_receipt}
+    return output, raw, model_cache_hit, receipt
+
+
 def generate_live_signal(
     *,
     market: str | None = None,
@@ -3255,6 +3429,7 @@ def generate_live_signal(
     day_trade_rule_data_dir: str | Path | None = None,
     tw_latest_quote_cache_seconds: float = 0.0,
     tw_latest_quote_force_refresh: bool = False,
+    use_completed_session_cache: bool = False,
     _panel_override: PanelData | None = None,
     _prefetched_quote: PrefetchedLiveQuote | None = None,
     _timing_sink: dict[str, Any] | None = None,
@@ -3274,12 +3449,23 @@ def generate_live_signal(
     progress_total = 17
     progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
     _emit_progress(progress_callback, label=progress_name, step=1, total=progress_total, message="load config")
+    completed_config_identity = None
+    if use_completed_session_cache:
+        from stockagent.live.completed_inference_cache import file_identity
+
+        completed_config_identity = file_identity(config_path)
     config = load_config(config_path)
     require_live_feature_source(config.data)
     execution_mode = _require_supported_live_execution(config.trading.execution_mode)
     normalized_day_trade_observation = str(
         day_trade_model_observation or "session_open"
     ).strip().lower()
+    if execution_mode == "tw_day_trade":
+        # This model starts an independent daily cohort; the paper executor
+        # owns FIFO inventory. Reporting may read existing prior rows, but
+        # generating older signals cannot improve today's target or holdings.
+        ensure_previous_signal = False
+        previous_signal_backfill_limit = 0
     if normalized_day_trade_observation not in {"session_open", "latest_quote"}:
         raise ValueError(
             "day_trade_model_observation must be session_open or latest_quote, "
@@ -3314,10 +3500,13 @@ def generate_live_signal(
     trading_frequency = str(getattr(config.trading, "frequency", "") or "")
     intraday_frequency = _is_intraday_frequency(trading_frequency)
 
-    runtime_device = resolve_device(config)
+    runtime_device = (torch.device(config.environment.device)
+                      if use_completed_session_cache else resolve_device(config))
     amp_dtype = resolve_amp_dtype(config.environment.amp_dtype)
     non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
 
+    completed_checkpoint_identity = (
+        file_identity(checkpoint) if use_completed_session_cache else None)
     checkpoint_payload, checkpoint_cache_key, checkpoint_cache_hit = _cached_checkpoint(checkpoint)
     _emit_progress(
         progress_callback,
@@ -3329,6 +3518,20 @@ def generate_live_signal(
     state_dict = checkpoint_payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
+
+    completed_source_fingerprint = None
+    if use_completed_session_cache:
+        if execution_mode != "tw_day_trade" or str(price_source).lower() != "panel":
+            raise ValueError("completed inference cache requires TW day-trade panel close")
+        with live_tw_public_source_read_guard(config.data.parquet_root):
+            completed_source_fingerprint = _completed_panel_identity(
+                config, rule_data_dir=day_trade_rule_data_dir)
+        source_key = str(Path(config_path).resolve())
+        with _LIVE_PANEL_CACHE_LOCK:
+            previous_source = _LIVE_COMPLETED_SOURCE_IDENTITIES.get(source_key)
+            _LIVE_COMPLETED_SOURCE_IDENTITIES[source_key] = completed_source_fingerprint
+        if previous_source != completed_source_fingerprint:
+            clear_live_panel_memory_cache()
 
     if _panel_override is not None:
         panel = _panel_override
@@ -3489,7 +3692,7 @@ def generate_live_signal(
             else quote_notice
         )
     current_prices = price_snapshot.prices
-    day_trade_model_window: np.ndarray | None = None
+    day_trade_model_window: np.ndarray | FactorizedLiveWindow | None = None
     day_trade_feature_cutoff: str | None = None
     day_trade_live_session = False
     day_trade_observed_model_price = np.zeros((panel.num_symbols,), dtype=bool)
@@ -3506,6 +3709,7 @@ def generate_live_signal(
             panel,
             panel_idx=panel_idx,
             lookback=config.training.lookback,
+            factorized_stream=_factorized_live_stream_admitted(config),
         )
         (
             day_trade_model_window,
@@ -3720,21 +3924,6 @@ def generate_live_signal(
     drift = estimate_drifted_weights(previous_weights, drift_base_prices, current_prices)
     _emit_progress(progress_callback, label=progress_name, step=10, total=progress_total, message="mark previous holdings")
 
-    model, model_cache_hit = _cached_live_model(
-        config=config,
-        checkpoint_key=checkpoint_cache_key,
-        state_dict=state_dict,
-        panel=panel,
-        runtime_device=runtime_device,
-    )
-    _emit_progress(
-        progress_callback,
-        label=progress_name,
-        step=11,
-        total=progress_total,
-        message=f"model ready cache_hit={model_cache_hit}",
-    )
-
     start = panel_idx - int(config.training.lookback) + 1
     x_np = (
         day_trade_model_window
@@ -3743,6 +3932,7 @@ def generate_live_signal(
             panel,
             panel_idx=panel_idx,
             lookback=config.training.lookback,
+            factorized_stream=_factorized_live_stream_admitted(config),
         )
     )
     mask_np = np.asarray(panel.tradable_mask[panel_idx], dtype=bool)
@@ -3829,35 +4019,36 @@ def generate_live_signal(
     inference_started = time.perf_counter()
     telemetry["signal_stage"] = "model_inference"
     partial_latency["pre_inference_prepare_ms"] = round((inference_started - quote_finished) * 1000.0, 3)
+    guard = (live_tw_public_source_read_guard(config.data.parquet_root)
+             if use_completed_session_cache else nullcontext())
+    with guard:
+        if use_completed_session_cache:
+            if day_trade_live_session or not str(price_snapshot.source).startswith("panel"):
+                raise ValueError("completed inference cache refuses live observations")
+            if _completed_panel_identity(config, rule_data_dir=day_trade_rule_data_dir) != completed_source_fingerprint:
+                raise RuntimeError("completed source generation changed before inference; retry")
+        model_output, unconstrained_output, model_cache_hit, completed_forward_cache = _live_forward_outputs(
+            config=config, config_path=config_path, checkpoint=checkpoint,
+            checkpoint_key=checkpoint_cache_key, state_dict=state_dict, panel=panel,
+            x_np=x_np, mask_np=mask_np, runtime_device=runtime_device,
+            amp_dtype=amp_dtype, non_blocking=non_blocking,
+            include_unconstrained=include_unconstrained_raw_scores,
+            completed_cache=use_completed_session_cache, panel_idx=panel_idx,
+            source_fingerprint=completed_source_fingerprint,
+            loaded_config_identity=completed_config_identity,
+            loaded_checkpoint_identity=completed_checkpoint_identity,
+        )
+    _emit_progress(progress_callback, label=progress_name, step=11, total=progress_total,
+                   message=f"model result ready cache_hit={model_cache_hit}")
     with torch.inference_mode():
-        x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
-        mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
-        with autocast_context(runtime_device, amp_dtype):
-            model_output = call_model(model, x, mask, return_aux=True)
-            model_weights_t, aux = extract_weights_and_aux(model_output)
-            model_weights_t = _require_single_target_live_weights(
-                model_weights_t,
-                execution_mode=execution_mode,
-                expected_symbols=panel.num_symbols,
-            )
-            if include_unconstrained_raw_scores:
-                # This second pass deliberately exposes every checkpoint symbol to
-                # the model.  Its score logits are for inspection only and never
-                # feed the executable target/backtest path below.
-                unconstrained_output = call_model(
-                    model,
-                    x,
-                    torch.ones_like(mask, dtype=torch.bool),
-                    return_aux=True,
-                )
-                _, unconstrained_aux = extract_weights_and_aux(unconstrained_output)
-                (
-                    unconstrained_raw_score_tensor,
-                    unconstrained_raw_score_source,
-                ) = _raw_score_tensor_from_model_output(
-                    unconstrained_output,
-                    unconstrained_aux,
-                )
+        model_weights_t, aux = extract_weights_and_aux(model_output)
+        model_weights_t = _require_single_target_live_weights(
+            model_weights_t, execution_mode=execution_mode, expected_symbols=panel.num_symbols)
+        if include_unconstrained_raw_scores:
+            # Inspection-only all-symbol mask retains its own exact cache key.
+            _, unconstrained_aux = extract_weights_and_aux(unconstrained_output)
+            unconstrained_raw_score_tensor, unconstrained_raw_score_source = _raw_score_tensor_from_model_output(
+                unconstrained_output, unconstrained_aux)
         _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
         model_weights = model_weights_t[0].detach().float().cpu().numpy().astype(np.float64)
         # Quote gaps are independent execution constraints, not an all-model
@@ -3918,6 +4109,7 @@ def generate_live_signal(
             turnover = float(np.abs(target_weights - current_weights).sum())
             estimated_trade_cost = None
         else:
+            mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
             zero_returns = torch.zeros_like(model_weights_t, dtype=torch.float32)
             initial = torch.from_numpy(current_weights.astype(np.float32)).to(
                 device=runtime_device,
@@ -3955,11 +4147,13 @@ def generate_live_signal(
             target_weights = backtest.final_weights.detach().float().cpu().numpy().astype(np.float64)
             turnover = float(backtest.turnovers[0].detach().float().cpu().item())
             estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
-    if runtime_device.type == "cuda":
+    if runtime_device.type == "cuda" and not use_completed_session_cache:
         torch.cuda.synchronize(runtime_device)
     inference_finished = time.perf_counter()
     inference_latency_ms = (inference_finished - inference_started) * 1000.0
     partial_latency["model_inference_ms"] = round(inference_latency_ms, 3)
+    if getattr(x_np, "_stockagent_factorized_live_window", False):
+        partial_latency["factorized_input_transport"] = dict(x_np.transport_stats)
     telemetry["signal_stage"] = "format_and_publish"
     _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
 
@@ -4294,6 +4488,7 @@ def generate_live_signal(
         "checkpoint_fingerprint": short_file_fingerprint(checkpoint),
         "config_path": str(config_path),
         "config_fingerprint": short_file_fingerprint(Path(config_path)),
+        "completed_panel_source_fingerprint": completed_source_fingerprint,
         "previous_weights_date": previous_weights_display_date,
         "previous_weights_data_date": previous_weights_data_date,
         "previous_weights_path": previous_weights_path,
@@ -4342,6 +4537,7 @@ def generate_live_signal(
             "panel_cache_tier": str(panel_cache_tier),
             "checkpoint_cache_hit": bool(checkpoint_cache_hit),
             "model_cache_hit": bool(model_cache_hit),
+            "completed_forward_cache": completed_forward_cache,
             "alignment_cache_hit": bool(alignment_cache_hit),
             "quote_prefetched_outside_model_lock": quote_prefetched,
             "pre_quote_prepare_ms": round(
@@ -4352,6 +4548,7 @@ def generate_live_signal(
                 float((inference_started - quote_finished) * 1000.0), 3
             ),
             "model_inference_ms": round(float(inference_latency_ms), 3),
+            "factorized_input_transport": partial_latency.get("factorized_input_transport"),
             "post_inference_format_ms": round(
                 float((signal_ready - inference_finished) * 1000.0), 3
             ),

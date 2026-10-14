@@ -81,11 +81,21 @@ def _ensure_cohort(queue, source):
                                               'http_requests': 0, 'all_history_complete': False}, sort_keys=True)))
 
 
-def _checkpoint(queue, fingerprint, key, state, error=None):
+def _checkpoint_batch(queue, fingerprint, checkpoints):
+    """Commit bounded local outcomes together, never body acceptance.
+
+    The caller has at most 64 heads. A crash before this commit repeats their
+    guards; a crash after immutable acceptance is still recovered by the
+    changed head. SQLite failure rolls back this whole local checkpoint group.
+    """
+    if not checkpoints:
+        return
     with queue.db:
-        queue.db.execute('UPDATE retained_metadata_replays SET state=?,error_code=?,checked_at_utc=? '
-                         'WHERE source_fingerprint=? AND article_id=?',
-                         (state, error, utc_now(), fingerprint, key))
+        queue.db.executemany('UPDATE retained_metadata_replays SET state=?,error_code=?,checked_at_utc=? '
+                            'WHERE source_fingerprint=? AND article_id=?',
+                            ((state, error, utc_now(), fingerprint, key) for key, state, error in checkpoints))
+    queue.metrics.count('cnyes', 'retained_metadata_checkpoint_rows', len(checkpoints))
+    queue.metrics.count('cnyes', 'retained_metadata_checkpoint_transactions')
 
 
 def _needs_repair(record):
@@ -210,20 +220,21 @@ def replay_retained_cnyes_metadata(queue, *, maximum_heads=32, maximum_wall_seco
                                     + target_clause.replace('article_id', 'r.article_id')
                                     + ' ORDER BY r.original_path,r.article_id LIMIT ?',
                                     (fp, *targets, maximum_heads - len(pending))).fetchall()
-        groups = defaultdict(list)
+        groups, eligibility_checkpoints = defaultdict(list), []
         for job in [*pending, *deferred]:
             head = queue.db.execute('SELECT * FROM articles WHERE id=?', (job['article_id'],)).fetchone()
             if not head or (head['parquet_path'], head['body_sha256']) != (job['original_path'], job['original_body_sha256']):
-                _checkpoint(queue, fp, job['article_id'], 'superseded')
+                eligibility_checkpoints.append((job['article_id'], 'superseded', None))
             elif head['state'] != 'complete' or head['lease_owner'] is not None or head['lease_until'] is not None:
-                _checkpoint(queue, fp, job['article_id'], 'deferred')
+                eligibility_checkpoints.append((job['article_id'], 'deferred', None))
             else:
                 groups[job['original_path']].append(dict(head))
+        _checkpoint_batch(queue, fp, eligibility_checkpoints)
         for relative, heads in groups.items():
             if (time.monotonic() - started >= maximum_wall_seconds or totals['raw_bytes_checked'] >= maximum_bytes
                     or stop and stop.is_set()):
                 break
-            eligible = []
+            eligible, checkpoints = [], []
             try:
                 path = source_path(queue.root, relative)
                 if path.stat().st_size > maximum_bytes:
@@ -250,10 +261,10 @@ def replay_retained_cnyes_metadata(queue, *, maximum_heads=32, maximum_wall_seco
                     if counts[key] != 1 or old['body_sha256'] != head['body_sha256']:
                         raise ValueError('retained_metadata_batch_head_not_unique')
                     if urlsplit(old['final_url']).hostname != 'm.cnyes.com':
-                        _checkpoint(queue, fp, head['id'], 'not_mobile_html_candidate')
+                        checkpoints.append((head['id'], 'not_mobile_html_candidate', None))
                         totals['heads_checked'] += 1
                     elif not _needs_repair(old):
-                        _checkpoint(queue, fp, head['id'], 'current_metadata_complete')
+                        checkpoints.append((head['id'], 'current_metadata_complete', None))
                         totals['heads_checked'] += 1
                     else:
                         selected.append(head)
@@ -282,23 +293,28 @@ def replay_retained_cnyes_metadata(queue, *, maximum_heads=32, maximum_wall_seco
                         totals['raw_bytes_checked'] += len(payload)
                         eligible.append(_repair_record(old, payload, head, source, receipt_row[0], receipt_digest))
                     except (ValueError, KeyError, TypeError, NewsError) as error:
-                        _checkpoint(queue, fp, head['id'], 'failed_validation',
-                                    error.code if isinstance(error, NewsError) else str(error)[:160])
+                        checkpoints.append((head['id'], 'failed_validation',
+                                            error.code if isinstance(error, NewsError) else str(error)[:160]))
                         queue.metrics.count('cnyes', 'retained_metadata_validation_errors')
                     totals['heads_checked'] += 1
             except (ValueError, KeyError, TypeError, OSError, pa.ArrowException) as error:
                 # This is a local/source-proof gap, never a verdict that a
                 # publisher has corrupt data. Leave original heads untouched.
                 for head in heads:
-                    _checkpoint(queue, fp, head['id'], 'failed_validation', str(error)[:160])
+                    checkpoints.append((head['id'], 'failed_validation', str(error)[:160]))
                 queue.metrics.count('cnyes', 'retained_metadata_validation_errors', len(heads))
                 continue
+            finally:
+                # Keep unrelated complete/deferred/failure outcomes durable
+                # even when a later body acceptance fails. No verified repair
+                # is checkpointed before the independent immutable commit.
+                _checkpoint_batch(queue, fp, checkpoints)
             if eligible:
                 # Storage/commit failures propagate, leaving the cohort pending.
                 # The canonical owner restart recovers durable receipts first.
                 repaired = queue.accept(eligible)
-                for record in eligible:
-                    _checkpoint(queue, fp, bytes.fromhex(record['article_id']), 'verified_repair')
+                _checkpoint_batch(queue, fp, [(bytes.fromhex(record['article_id']), 'verified_repair', None)
+                                              for record in eligible])
                 totals['repaired_versions'] += repaired
         queue.metrics.count('cnyes', 'retained_metadata_heads_checked', totals['heads_checked'])
         queue.metrics.count('cnyes', 'retained_metadata_repaired_versions', totals['repaired_versions'])

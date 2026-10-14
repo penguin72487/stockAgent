@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import time
 from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retryable_queue_error, optimize_queue
+from downloader.finmind_queue_indexes import dispatch_indexes, ensure_status_index
 from typing import Any
 
 import pyarrow as pa
@@ -165,6 +166,10 @@ def _db(path: Path) -> sqlite3.Connection:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_finmind_due_refresh "
                            "ON tasks(next_attempt_at_utc,priority,dataset) "
                            "WHERE state IN ('complete','observed_empty') AND next_attempt_at_utc IS NOT NULL")
+        # Heartbeats retain exact aggregates, not a TTL or completion counter.
+        # Bounded planner maintenance below is essential: an unanalyzed wide
+        # index can otherwise hurt the independent frontier/dispatch joins.
+        ensure_status_index(connection)
         retry_cohorts.ensure_schema(connection)
         retry_policy.migrate(connection, path.parent, _now())
         retry_cohorts.reconcile(connection, _now())
@@ -679,11 +684,12 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
     has_cursor = connection.execute("SELECT 1 FROM sqlite_master WHERE name='dispatch_cursor'").fetchone()
     cursor = ("SELECT priority,last_dataset FROM dispatch_cursor" if has_cursor else
               "SELECT -1 AS priority,'' AS last_dataset WHERE 0")
+    pending_index, zero_due_index, due_index = dispatch_indexes(connection)
     query = (
         "WITH eligible AS ("
-        "SELECT * FROM tasks WHERE state IN ('pending','failed') AND "
+        "SELECT * FROM tasks{pending_index} WHERE state IN ('pending','failed') AND "
         "((state='pending' AND next_attempt_at_utc IS NULL) OR next_attempt_at_utc<=?) " + early_scope + ' ' +
-        "UNION ALL SELECT * FROM tasks WHERE state IN ('complete','observed_empty') "
+        "UNION ALL SELECT * FROM tasks{accepted_index} WHERE state IN ('complete','observed_empty') "
         "AND next_attempt_at_utc IS NOT NULL AND next_attempt_at_utc<=? {accepted_scope}), "
         "cursors AS (" + cursor + ") "
         "SELECT tasks.dataset,data_id,partition,kind,tasks.priority,state FROM eligible tasks "
@@ -716,11 +722,13 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
     # Required/repair work and priority-zero renewals strictly precede old
     # maintenance in the existing CASE order. Seek that dominant set first;
     # do not sort thousands of accepted histories on every minute-bar call.
-    row = connection.execute(query.format(accepted_scope='AND priority=0'), args).fetchone()
+    row = connection.execute(query.format(accepted_scope='AND priority=0', pending_index=pending_index,
+                                         accepted_index=zero_due_index), args).fetchone()
     if row is None:
         if first_history and has_unseeded_frontier(connection, first_history, now):
             return None  # The owner refills; a preview never mutates the cursor.
-        row = connection.execute(query.format(accepted_scope=''), args).fetchone()
+        row = connection.execute(query.format(accepted_scope='', pending_index=pending_index,
+                                             accepted_index=due_index), args).fetchone()
     if row and advance_cursor:
         connection.execute('INSERT OR REPLACE INTO dispatch_cursor VALUES (?,?)', (row[4], row[0]))
         connection.commit()

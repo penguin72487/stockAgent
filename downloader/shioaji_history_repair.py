@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
+import errno
+import hashlib
 import json
+import os
 from pathlib import Path
 from functools import lru_cache
+import stat as stat_mode
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -43,15 +47,54 @@ def latest_completed_futures_session(calendar: Path, now: datetime | None = None
     return result
 
 
-@lru_cache(maxsize=16384)
+@lru_cache(maxsize=131_072)
 def _signature_sha(path: str, signature: tuple[int, ...]) -> str:
-    return sha256_file(Path(path))
+    """Hash the opened file identity, not a second resolution of its name.
+
+    A symlink or atomic publication may change between stat and open. Bind the
+    digest to fstat before/after reading; never memoize B's digest under A's
+    identity. Nonblocking open also prevents a replaced FIFO from hanging an
+    audit before it can reject the non-regular descriptor.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat_mode.S_ISREG(opened.st_mode) or _stat_identity(opened) != signature:
+            raise OSError(errno.EAGAIN, "source changed during SHA-256 verification", path)
+        if flags & getattr(os, "O_NONBLOCK", 0):
+            os.set_blocking(descriptor, True)
+        # file_digest owns no descriptor. Close its stream and our descriptor
+        # on every success/failure without a second path-based open.
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            result = hashlib.file_digest(stream, "sha256").hexdigest()
+        if _stat_identity(os.fstat(descriptor)) != signature:
+            raise OSError(errno.EAGAIN, "source changed during SHA-256 verification", path)
+        return result
+    finally:
+        os.close(descriptor)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
 
 
 def verified_sha(path: Path) -> str:
-    stat = path.stat()
-    return _signature_sha(str(path.resolve()), (stat.st_dev, stat.st_ino, stat.st_size,
-                                                stat.st_mtime_ns, stat.st_ctime_ns))
+    """Reuse only an unchanged regular file's exact five-field identity.
+
+    absolute() preserves filesystem semantics of symlinks and '..' without
+    resolving every path component on each cache hit. The owned descriptor on
+    misses and the final path stat on hits/misses close the identity races.
+    """
+    path = path.absolute()
+    observed = path.stat()
+    if not stat_mode.S_ISREG(observed.st_mode):
+        raise OSError(errno.EINVAL, "SHA-256 verification requires a regular file", str(path))
+    signature = _stat_identity(observed)
+    result = _signature_sha(str(path), signature)
+    if _stat_identity(path.stat()) != signature:
+        raise OSError(errno.EAGAIN, "source changed during SHA-256 verification", str(path))
+    return result
 
 
 def utc_stamp(now: datetime | None = None) -> str:

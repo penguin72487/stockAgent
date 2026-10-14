@@ -13,6 +13,7 @@ isolated union before the same promotion. It never submits a production order.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 import fcntl
@@ -20,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -636,7 +638,17 @@ def _build_addition_plan(args, config, config_path, experiment_path, experiment,
         expected_minute_rows=len(sessions)*len(expected)*270)
     if config.market in active and not current["matches"]:
         raise ValueError("addition cannot replace an already active market")
-    flat = _flat_live_state(live, set(active))
+    resumed = getattr(args, "resume_addition_candidate", None)
+    if resumed and config.market in (_object(live / "state.json").get("modes") or {}) and config.market not in active:
+        from stockagent.live.day_trade_addition import inspect_aborted_activation
+        abort = inspect_aborted_activation(live, _resolved(resumed))
+        if abort["added_market"] != config.market or set(abort["retained_markets"]) != set(active):
+            raise ValueError("resumed additive candidate has a different market scope")
+        flat = {"path": str(live / "state.json"), "flat_markets": sorted(active),
+                "aborted_unfunded_activation": config.market,
+                "recovery_requires_preserved_activation_evidence": True}
+    else:
+        flat = _flat_live_state(live, set(active))
     return {"schema_version": 1, "operation": "add_independent_mode", "plan_complete": True,
             "status": "already_current" if current["matches"] else "ready_to_apply",
             "simulation_only": True, "production_order_possible": False,
@@ -859,9 +871,71 @@ def _verify_dashboard(
     return results
 
 
+def _promote_with_cutover(command, *, before_exchange, stage, run_dir):
+    """Use the canonical promoter's late-drain hook, retaining ordinary logs."""
+    from scripts import promote_tw_day_trade_replay as promoter
+    stdout_path, stderr_path = run_dir / f"{stage}.stdout.log", run_dir / f"{stage}.stderr.log"
+    started = datetime.now(TAIPEI)
+    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            try:
+                promoter.main(argv=list(command[2:]), before_exchange=before_exchange)
+            except Exception as exc:
+                print(f"{type(exc).__name__}: {exc}", file=stderr)
+                raise
+    return {"stage": stage, "command": list(command), "returncode": 0,
+            "started_at": started.isoformat(), "completed_at": datetime.now(TAIPEI).isoformat(),
+            "stdout_path": str(stdout_path), "stderr_path": str(stderr_path),
+            "writer_drain": "canonical_after_full_source_validation"}
+
+
+def _ensure_discord_deployment_schedule(market: str, *, run_dir: Path, env_path: Path | None = None):
+    """Extend only the selected allow-list; keep other schedules and secrets exact."""
+    path = env_path or _resolved(Path(os.environ.get("STOCKAGENT_DISCORD_ENV_FILE") or "services/discord_bot/.env"))
+    before = path.read_bytes()
+    lines = before.decode().splitlines(keepends=True)
+    key = "STOCKAGENT_SCHEDULED_MARKETS"
+    indices = [i for i, line in enumerate(lines) if line.strip().removeprefix("export ").startswith(key+"=")]
+    if len(indices) > 1:
+        raise ValueError("ambiguous duplicate Discord schedule key")
+    previous = None
+    if indices:
+        i = indices[0]
+        previous = lines[i]
+        value = shlex.split(lines[i].strip().removeprefix("export ").split("=", 1)[1], comments=True)
+        if len(value) != 1:
+            raise ValueError("Discord schedule is not a literal market allow-list")
+        markets = [item.strip() for item in value[0].split(",") if item.strip()]
+        if not any(item.casefold() in {"all", "*"} for item in markets) and market not in markets:
+            markets.append(market)
+            lines[i] = key+"="+",".join(markets)+"\n"
+    deadline_key = "STOCKAGENT_DEPLOYMENT_WARMUP_UNTIL"
+    deadline = (datetime.now(TAIPEI)+timedelta(minutes=10)).isoformat(timespec="seconds")
+    deadline_indices = [i for i, line in enumerate(lines) if line.strip().removeprefix("export ").startswith(deadline_key+"=")]
+    if len(deadline_indices) > 1:
+        raise ValueError("ambiguous duplicate deployment warmup deadline")
+    deadline_line = deadline_key+"="+deadline+"\n"
+    if deadline_indices:
+        lines[deadline_indices[0]] = deadline_line
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(deadline_line)
+    if path.read_bytes() != before:
+        raise RuntimeError("Discord environment changed while planning the scoped update")
+    atomic_write_text(path, "".join(lines), durable=True, mode=0o600)
+    receipt = {"contract": "additive_schedule_and_bounded_no_publication_warmup_v1",
+               "market": market, "env_path": str(path), "previous_schedule_line": previous,
+               "warmup_deadline": deadline, "other_environment_values_unchanged": True,
+               "simulation_only": True, "production_order_possible": False}
+    _atomic_json(run_dir / "discord_schedule_update.json", receipt)
+    return receipt
+
+
 def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     """Accept an independent replay, retain old accounts, then use the promoter."""
-    from stockagent.live.day_trade_addition import merge_addition
+    from stockagent.live.day_trade_addition import merge_addition, preserve_aborted_activation, validate_aborted_activation
+    from stockagent.live.day_trade_maintenance import control_lease
     target, history = plan["replacement"], plan["history"]
     market = target["stable_market_id"]
     live, expected = _resolved(args.live_dir), set(plan["active_markets"])
@@ -869,10 +943,20 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
     root = _resolved(args.operations_root) / market
     run = root / "runs" / datetime.now(TAIPEI).strftime("%Y%m%dT%H%M%S%z")
     run.mkdir(parents=True, exist_ok=False)
-    candidate = Path(tempfile.mkdtemp(prefix=f"{market}.addition.", dir=live.parent))
+    resumed = getattr(args, "resume_addition_candidate", None)
+    reuse = bool(resumed) and not getattr(args, "rebuild_resumed_addition", False)
+    candidate = (_resolved(resumed) if reuse else Path(tempfile.mkdtemp(prefix=f"{market}.addition.", dir=live.parent)))
     component = run / "new_mode_replay"
     stages = []
     status_path = root / "status.json"
+    if resumed:
+        previous_operation = _object(status_path)
+        if (previous_operation.get("status") != "failed_retryable"
+                or previous_operation.get("promotion_completed") is not False
+                or Path(previous_operation.get("candidate_dir", "")).resolve() != _resolved(resumed).resolve()
+                or previous_operation.get("plan", {}).get("replacement") != target
+                or previous_operation.get("plan", {}).get("history") != history):
+            raise ValueError("resume requires this exact failed, unpromoted additive operation and scope")
     status = {"schema_version": 1, "status": "running", "plan": plan,
               "run_dir": str(run), "candidate_dir": str(candidate), "stages": stages}
     _atomic_json(status_path, status)
@@ -883,13 +967,15 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
         raise ValueError("independent addition requires a genuinely disabled configuration")
     config = load_market_config(config_path)
     accepted_signals = _resolved(resolved_live_output_dir(config))
-    signal_root = _resolved(args.staged_signal_root) if args.staged_signal_root else run / "signal_root"
+    signal_root = (_resolved(args.staged_signal_root) if args.staged_signal_root
+                   else accepted_signals if resumed else run / "signal_root")
     # backfill --live-output-dir is an exact output directory, not a base
     # which receives another implicit model suffix.
     scoped = signal_root
     promoted = enabled = stopped = False
+    maintenance = ExitStack()
     try:
-        if not args.staged_signal_root:
+        if not args.staged_signal_root and not resumed:
             stages.append(_run("signal_backfill", [sys.executable,
                 str(REPO_ROOT / "scripts/backfill_tw_day_trade_open_signals.py"),
                 "--market-config", str(config_path), "--start-date", history["start_date"],
@@ -927,14 +1013,15 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             pending = Path(tempfile.mkdtemp(prefix=".signals-addition.", dir=accepted_signals.parent))
             shutil.copytree(scoped, pending, dirs_exist_ok=True)
             os.replace(pending, accepted_signals)
-        stages.append(_run("new_mode_replay", [sys.executable,
+        if not reuse:
+            stages.append(_run("new_mode_replay", [sys.executable,
             str(REPO_ROOT / "scripts/rebuild_tw_day_trade_open_price_replay.py"),
             "--markets-dir", str(isolated_configs), "--only-market", market,
             "--single-market-signal-dir", str(accepted_signals), "--state-dir", str(component),
             "--start-date", history["start_date"], "--end-date", history["end_date"],
             "--benchmark-state-source", str(live / "state.json"),
             "--benchmark-history-source", str(live / "benchmark_history.json"),
-            "--replay-intraday-kbars"], run_dir=run))
+                "--replay-intraday-kbars"], run_dir=run))
         def curves(state_dir, stage):
             state = _object(state_dir / "state.json")
             carried = any(mode.get("margin_carry_contract") for mode in state["modes"].values())
@@ -950,11 +1037,29 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             for item in state["modes"]:
                 command.extend(("--expected-market", item))
             return _run(stage, command, run_dir=run)
-        stages.append(curves(component, "new_mode_minute_curves"))
-        _flat_live_state(live, retained)
-        addition = merge_addition(live, component, candidate, added_market=market)
-        stages.append({"stage": "retain_old_accounts_and_execution_bytes", "receipt": addition})
-        stages.append(curves(candidate, "combined_minute_curves"))
+        if not reuse:
+            stages.append(curves(component, "new_mode_minute_curves"))
+            aborted_candidate = None
+            if resumed and market in (_object(live / "state.json").get("modes") or {}):
+                aborted_candidate = _resolved(resumed)
+            else:
+                _flat_live_state(live, retained)
+            addition = merge_addition(live, component, candidate, added_market=market,
+                                      aborted_activation_candidate=aborted_candidate)
+            stages.append({"stage": "retain_old_accounts_and_execution_bytes", "receipt": addition})
+            stages.append(curves(candidate, "combined_minute_curves"))
+        else:
+            candidate_state = _object(candidate / "state.json")
+            added_mode = candidate_state["modes"][market]
+            if (set(candidate_state["modes"]) != expected
+                    or added_mode.get("checkpoint_fingerprint") != target["checkpoint_fingerprint"]
+                    or added_mode.get("initial_capital_twd") != target["initial_capital_twd"]):
+                raise ValueError("resumed candidate model/capital/mode set differs")
+            if market in (_object(live / "state.json").get("modes") or {}):
+                stages.append({"stage": "preserve_aborted_unfunded_activation",
+                               "receipt": preserve_aborted_activation(live, candidate)})
+            stages.append({"stage": "reuse_candidate_not_acceptance", "candidate": str(candidate),
+                           "previous_run_dir": previous_operation["run_dir"]})
         promote = [sys.executable, str(REPO_ROOT / "scripts/promote_tw_day_trade_replay.py"),
                    "--live-dir", str(live), "--candidate-dir", str(candidate), "--added-market", market]
         for item in sorted(expected):
@@ -962,22 +1067,31 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
         stages.append(_run("validate_addition", [*promote, "--validate-only"], run_dir=run))
         # Slow source verification occurs while the existing engine stays up.
         # Flatness and configuration identity are fenced again at cutover.
-        _flat_live_state(live, retained)
-        subprocess.run(["systemctl", "stop", SIMULATION_SERVICE], check=True)
-        stopped = True
-        _flat_live_state(live, retained)
-        if config_path.read_bytes() != config_bytes:
-            raise RuntimeError("candidate configuration changed while staging; refusing to overwrite")
-        _atomic_json(run / "configuration_rollback.json", {"path": str(config_path), "content": config_bytes.decode()})
         enabled_text = yaml.safe_dump(dict(raw, enabled=True), allow_unicode=True, sort_keys=False)
-        atomic_write_text(config_path, enabled_text)
-        enabled = True
-        stages.append(_run("promote_addition", promote, run_dir=run))
+        def cutover():
+            nonlocal stopped, enabled
+            maintenance.enter_context(control_lease(owner=f"add-mode:{market}:{run.name}", timeout_seconds=90))
+            if _object(candidate / "rebuild_receipt.json").get("aborted_activation"):
+                validate_aborted_activation(candidate, live=live)
+            else:
+                _flat_live_state(live, retained)
+            subprocess.run(["systemctl", "stop", SIMULATION_SERVICE], check=True)
+            stopped = True
+            if config_path.read_bytes() != config_bytes:
+                raise RuntimeError("candidate configuration changed while staging; refusing to overwrite")
+            _atomic_json(run / "configuration_rollback.json", {"path": str(config_path), "content": config_bytes.decode()})
+            atomic_write_text(config_path, enabled_text)
+            enabled = True
+        _atomic_json(status_path, status)
+        stages.append(_promote_with_cutover(promote, before_exchange=cutover,
+                                            stage="promote_addition", run_dir=run))
         promoted = True
         subprocess.run(["systemctl", "start", SIMULATION_SERVICE], check=True)
         stopped = False
         _wait_active(SIMULATION_SERVICE)
         sync = _wait_engine_sync(live, expected)
+        stages.append({"stage": "include_added_mode_in_discord_schedule",
+                       "receipt": _ensure_discord_deployment_schedule(market, run_dir=run)})
         previous = _object(_resolved(DISCORD_STATUS_PATH)).get("run_id", "")
         discord_restart = _restart_and_wait_active(DISCORD_SERVICE)
         discord = _wait_discord_ready(expected_engine_run_id=str(sync.get("engine_run_id") or ""),
@@ -992,6 +1106,7 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             raise RuntimeError("combined minute count does not meet the planned all-mode scope")
         result = {**status, "status": "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] else "complete",
                   "completed_at": datetime.now(TAIPEI).isoformat(), "signal_acceptance": signals,
+                  "promotion_completed": True,
                   "promotion_receipt": str(live / "promotion_receipt.json"),
                   "rollback_directory": promotion["rollback_directory"], "engine_sync": sync,
                   "discord": {"run_id": discord.get("run_id"), "restart": discord_restart,
@@ -1006,8 +1121,11 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
                                  "error": str(exc), "promotion_completed": promoted})
         raise
     finally:
-        if stopped:
-            subprocess.run(["systemctl", "start", SIMULATION_SERVICE], check=True)
+        try:
+            if stopped:
+                subprocess.run(["systemctl", "start", SIMULATION_SERVICE], check=True)
+        finally:
+            maintenance.close()
 
 
 def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
@@ -1164,26 +1282,35 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
         )
 
         stopped = False
+        maintenance = ExitStack()
         try:
-            # Recheck after the long isolated build and again while quiesced.
-            _flat_live_state(live_dir, expected_markets)
-            subprocess.run(["systemctl", "stop", SIMULATION_SERVICE], check=True)
-            stopped = True
-            _flat_live_state(live_dir, expected_markets)
-            stages.append(_run("promote", promote_command, run_dir=run_dir))
+            from stockagent.live.day_trade_maintenance import control_lease
+            def cutover():
+                nonlocal stopped
+                maintenance.enter_context(control_lease(owner=f"replace-mode:{market}:{run_dir.name}", timeout_seconds=90))
+                _flat_live_state(live_dir, expected_markets)
+                subprocess.run(["systemctl", "stop", SIMULATION_SERVICE], check=True)
+                stopped = True
+                _flat_live_state(live_dir, expected_markets)
+            stages.append(_promote_with_cutover(promote_command, before_exchange=cutover,
+                                                stage="promote", run_dir=run_dir))
         finally:
-            if (
-                stopped
-                or subprocess.run(
-                    ["systemctl", "is-active", "--quiet", SIMULATION_SERVICE],
-                    check=False,
-                ).returncode
-                != 0
-            ):
-                subprocess.run(["systemctl", "start", SIMULATION_SERVICE], check=True)
+            try:
+                if (
+                    stopped
+                    or subprocess.run(
+                        ["systemctl", "is-active", "--quiet", SIMULATION_SERVICE],
+                        check=False,
+                    ).returncode != 0
+                ):
+                    subprocess.run(["systemctl", "start", SIMULATION_SERVICE], check=True)
+            finally:
+                maintenance.close()
 
         _wait_active(SIMULATION_SERVICE)
         sync = _wait_engine_sync(live_dir, expected_markets)
+        stages.append({"stage": "confirm_discord_deployment_schedule",
+                       "receipt": _ensure_discord_deployment_schedule(market, run_dir=run_dir)})
         try:
             previous_discord_run_id = str(
                 _object(_resolved(DISCORD_STATUS_PATH)).get("run_id") or ""
@@ -1325,6 +1452,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", default="latest")
     parser.add_argument("--add-mode", action="store_true", help="Add an independent paper mode; retain all current accounts and execution bytes.")
     parser.add_argument("--staged-signal-root", type=Path, help="Reuse an isolated signal root only after full checkpoint/session validation; addition only.")
+    parser.add_argument("--resume-addition-candidate", type=Path,
+                        help="Revalidate an exact failed, unpromoted additive candidate; preserve any provably unfunded aborted activation.")
+    parser.add_argument("--rebuild-resumed-addition", action="store_true",
+                        help="Preserve the failed candidate and rebuild its independent replay/curves from fresh pinned source bytes.")
     parser.add_argument("--expected-initial-capital", type=float, default=10_000_000.0)
     parser.add_argument(
         "--candidate-preflight", action="store_true",
@@ -1343,10 +1474,58 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _recover_promoted_addition(args, plan, previous_operation):
+    """Finish consumers after an accepted exchange; never replay/promote twice."""
+    from stockagent.live.day_trade_maintenance import control_lease
+    target, history = plan["replacement"], plan["history"]
+    market, expected = target["stable_market_id"], set(plan["active_markets"])
+    if (plan.get("operation") != "add_independent_mode"
+            or previous_operation.get("status") != "failed_retryable"
+            or previous_operation.get("promotion_completed") is not True
+            or not plan["current_deployment"]["matches"]
+            or previous_operation.get("plan", {}).get("replacement") != target
+            or previous_operation.get("plan", {}).get("history") != history):
+        raise ValueError("consumer recovery requires the exact already-promoted failed addition")
+    live = _resolved(args.live_dir)
+    run = Path(previous_operation["run_dir"])
+    with control_lease(owner=f"deployed-consumer-recovery:{market}", timeout_seconds=90):
+        _flat_live_state(live, expected)
+        sync = _wait_engine_sync(live, expected)
+        schedule = _ensure_discord_deployment_schedule(market, run_dir=run)
+        previous_run = _object(_resolved(DISCORD_STATUS_PATH)).get("run_id", "")
+        restart = _restart_and_wait_active(DISCORD_SERVICE)
+        discord = _wait_discord_ready(expected_engine_run_id=sync["engine_run_id"],
+            expected_markets=expected, target_market=market,
+            checkpoint_fingerprint=target["checkpoint_fingerprint"], previous_run_id=str(previous_run))
+        public = _restart_and_wait_active(PUBLIC_SERVICE)
+        dashboard = _verify_dashboard(market=market, start_date=history["start_date"],
+                                     end_date=history["end_date"], expected_markets=expected)
+        promotion = _object(live / "promotion_receipt.json")
+        if promotion["acceptance"]["minute_curve_validation"]["validated_rows"] != history["expected_strategy_minute_rows"]:
+            raise RuntimeError("consumer recovery minute scope differs")
+        result = {**previous_operation,
+            "status": "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] else "complete",
+            "previous_consumer_failure": previous_operation.get("error"), "error": None,
+            "consumer_recovered_at": datetime.now(TAIPEI).isoformat(), "promotion_completed": True,
+            "completed_at": datetime.now(TAIPEI).isoformat(), "schedule_update": schedule,
+            "promotion_receipt": str(live / "promotion_receipt.json"),
+            "rollback_directory": promotion["rollback_directory"], "engine_sync": sync,
+            "discord": {"run_id": discord.get("run_id"), "restart": restart,
+                        "warmup": discord.get("startup_inference_warmup")},
+            "public_restart": public, "dashboard_acceptance": dashboard,
+            "second_ledger_promotion_performed": False}
+        _atomic_json(_resolved(args.operations_root) / market / "status.json", result)
+        return result
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.staged_signal_root and not args.add_mode:
         raise ValueError("--staged-signal-root requires --add-mode")
+    if args.resume_addition_candidate and (not args.add_mode or args.action not in {"plan", "apply"}):
+        raise ValueError("--resume-addition-candidate requires additive plan/apply")
+    if args.rebuild_resumed_addition and not args.resume_addition_candidate:
+        raise ValueError("--rebuild-resumed-addition requires --resume-addition-candidate")
     if args.candidate_preflight and args.action != "plan":
         raise ValueError("--candidate-preflight is read-only and supports plan only")
     if args.action == "status":
@@ -1373,6 +1552,11 @@ def main() -> None:
         )
         return
     if plan["status"] == "already_current":
+        status_path = _resolved(args.operations_root) / plan["replacement"]["stable_market_id"] / "status.json"
+        prior = _object(status_path) if status_path.is_file() else {}
+        if args.add_mode and prior.get("status") == "failed_retryable" and prior.get("promotion_completed") is True:
+            print(json.dumps(_recover_promoted_addition(args, plan, prior), ensure_ascii=False, indent=2, sort_keys=True))
+            return
         print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
         return
     operations_root = _resolved(args.operations_root) / str(

@@ -67,7 +67,7 @@ def test_html36_and_quote6_change_only_html_not_permission_or_bulk(cnyes_config,
         except (ValueError, TypeError, UnicodeDecodeError):
             return real(value)
         if isinstance(payload, dict) and 'mobile_canonical_html_contract_version' in payload:
-            assert payload['mobile_canonical_html_contract_version'] == 41
+            assert payload['mobile_canonical_html_contract_version'] == 43
             assert payload['verified_native_quote_only_outcome_contract_version'] == 7
             payload['mobile_canonical_html_contract_version'] = 31
             payload['verified_native_quote_only_outcome_contract_version'] = 4

@@ -1349,6 +1349,23 @@ def _audit_parquet_ownership(
     }
 
 
+def _archive_first_row(parquet_file: pq.ParquetFile, columns: Sequence[str], *,
+                       batch_size: int = 65536, use_threads: bool = True) -> dict[str, Any]:
+    """Validate the existing row group in bounded batches and return its head.
+
+    Keep the original decoding boundary, including corruption after the first
+    row. Do not materialize a whole group just to select one provenance row, or
+    silently turn complete metadata decoding into a prefix-only integrity test.
+    This is still not an audit of every payload column or every row group.
+    """
+    batches = parquet_file.iter_batches(batch_size=batch_size, row_groups=[0],
+                                        columns=list(columns), use_threads=use_threads)
+    first = next(batches).slice(0, 1).to_pylist()[0]
+    for _ in batches:
+        pass  # Preserve errors in all requested pages, without retaining them.
+    return first
+
+
 def _audit_success_files(
     connection: sqlite3.Connection,
     *,
@@ -1452,6 +1469,15 @@ def _audit_success_files(
                     if issue is None and missing_columns:
                         metadata_mismatch += 1
                         issue = f"missing_archive_columns={missing_columns}"
+                    if issue is None and parquet_rows > 0 and parquet_file.metadata.row_group(0).num_rows > 8192:
+                        # Validate schema first: some Arrow versions reject an
+                        # unknown dictionary column before we can classify it
+                        # as missing provenance. Tiny files need no second
+                        # reader. Reuse the footer for larger metadata groups.
+                        footer = parquet_file.metadata
+                        parquet_file.close()
+                        parquet_file = pq.ParquetFile(
+                            path, metadata=footer, read_dictionary=list(REQUIRED_ARCHIVE_COLUMNS))
                     if (
                         issue is None
                         and parquet_rows == 1
@@ -1459,13 +1485,7 @@ def _audit_success_files(
                             parquet_file.schema_arrow.names
                         )
                     ):
-                        wrapper = (
-                            parquet_file.read_row_group(
-                                0, columns=["result", "metadata"]
-                            )
-                            .slice(0, 1)
-                            .to_pylist()[0]
-                        )
+                        wrapper = _archive_first_row(parquet_file, ("result", "metadata"))
                         raw_result = wrapper.get("result")
                         raw_metadata = wrapper.get("metadata")
                         if (
@@ -1477,13 +1497,7 @@ def _audit_success_files(
                             encoded_wrapper += 1
                             issue = "encoded_result_wrapper_not_row_normalized"
                     if issue is None and parquet_rows > 0:
-                        metadata = (
-                            parquet_file.read_row_group(
-                                0, columns=list(REQUIRED_ARCHIVE_COLUMNS)
-                            )
-                            .slice(0, 1)
-                            .to_pylist()[0]
-                        )
+                        metadata = _archive_first_row(parquet_file, REQUIRED_ARCHIVE_COLUMNS)
                         expected = {
                             "_openbb_endpoint": str(row["endpoint"]),
                             "_provider": str(row["selected_provider"]),

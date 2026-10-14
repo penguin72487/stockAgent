@@ -107,6 +107,7 @@ from stockagent.live.signal_engine import (
     LiveSignalResult,
     TWOpeningInputCoveragePending,
     clear_live_panel_memory_cache,
+    completed_panel_source_fingerprint,
     generate_live_signal,
     finalize_live_signal_artifacts,
     prefetch_live_signal_prices,
@@ -1608,9 +1609,7 @@ def _opening_critical_work_pending(observed: datetime | None = None) -> bool:
         session_open, _session_reason = _scheduled_market_session_day(cfg, now)
         if not session_open:
             continue
-        prepare_minutes = _hhmm_minutes(
-            getattr(cfg, "preopen_prepare_time", None) or "08:15"
-        )
+        prepare_minutes = _startup_gpu_prepare_minutes(cfg)
         open_minutes = _hhmm_minutes(getattr(cfg, "open_time", None) or "09:00")
         now_minutes = now.hour * 60 + now.minute
         if prepare_minutes is None or open_minutes is None:
@@ -3099,7 +3098,18 @@ def _signal_kwargs(
         "write": write,
         "publish_latest": publish_latest,
     }
-    return cfg.signal_kwargs(**overrides)
+    kwargs = cfg.signal_kwargs(**overrides)
+    kwargs["use_completed_session_cache"] = bool(
+        not scheduled
+        and is_day_trade
+        and not bool(getattr(status, "market_open", False))
+        and str(kwargs.get("price_source") or "").lower() == "panel"
+        and bool(getattr(getattr(status, "data", None), "fresh", False))
+        and _completed_session_receipt_ready(status)
+        and "warm" not in str(progress_label or "")
+        and "postclose-arm" not in str(progress_label or "")
+    )
+    return kwargs
 
 
 async def _deliver_deferred_response(
@@ -3463,6 +3473,8 @@ def _run_market_signal_sync(**kwargs):
         try:
             return generate_live_signal(**resolved_kwargs)
         finally:
+            if resolved_kwargs.get("use_completed_session_cache"):
+                _release_completed_inference_cache_owned()
             if isinstance(timing_sink, dict):
                 timing_sink["signal_worker_ms"] = round(
                     (time.perf_counter() - worker_started) * 1000.0,
@@ -3704,7 +3716,7 @@ def _load_startup_inference_warmup_status() -> dict[str, Any]:
         return {"status": "pending", "run_id": _BOT_RUN_ID, "markets": []}
     if not isinstance(payload, dict) or payload.get("run_id") != _BOT_RUN_ID:
         return {"status": "pending", "run_id": _BOT_RUN_ID, "markets": []}
-    return payload
+    return {**payload, "model_cache_resident_ready": bool(bot._startup_inference_warmup_complete)}
 
 
 def _postclose_fast_cache_status_path() -> Path:
@@ -3856,11 +3868,28 @@ def _write_postclose_fast_cache_status_best_effort(
         _log_exception(f"postclose_fast_status:{cfg.market}", exc)
 
 
+def _deployment_warmup_window_open() -> bool:
+    """A bounded deployment check, never an opening-path or publication bypass."""
+    raw = _env("STOCKAGENT_DEPLOYMENT_WARMUP_UNTIL")
+    if not raw:
+        return False
+    try:
+        deadline = datetime.fromisoformat(raw)
+        if deadline.tzinfo is None:
+            return False
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        remaining = (deadline-now).total_seconds()
+        return (0 < remaining <= 15*60 and now.hour*60+now.minute >= 13*60+40
+                and bot._opening_attempt_started_monotonic is None)
+    except (TypeError, ValueError):
+        return False
+
+
 def _startup_inference_warmup_must_defer() -> bool:
-    """Prewarm before 08:15, or recover a cold owner waiting on opening inputs.
+    """Warm just before preparation, or recover a cold owner after opening.
 
     Keep the protected opening window and active signal attempt first. After
-    that window, a restart must not stay model-cold until tomorrow's 07:00.
+    that window, a restart must not stay model-cold until tomorrow's preparation.
     Recovery uses the existing no-quote/no-publication warmup under its mutex.
     """
 
@@ -3882,7 +3911,9 @@ def _startup_inference_warmup_must_defer() -> bool:
         if prepare_minutes is None or open_minutes is None:
             continue
         now_minutes = now.hour * 60 + now.minute
-        if prepare_minutes - 75 <= now_minutes < prepare_minutes:
+        warm_start = _startup_gpu_protection_start_minutes(cfg)
+        exact_minutes = now_minutes + now.second / 60 + now.microsecond / 60_000_000
+        if warm_start <= exact_minutes < prepare_minutes:
             warm_window_open = True
         if (
             prepare_minutes <= now_minutes <= open_minutes + 5
@@ -3894,27 +3925,90 @@ def _startup_inference_warmup_must_defer() -> bool:
             if bot._opening_attempt_started_monotonic is not None:
                 return True
             warm_window_open = True
-    return not warm_window_open
+    return not (warm_window_open or _deployment_warmup_window_open())
+
+
+def _startup_gpu_prepare_minutes(cfg: LiveMarketConfig) -> int | None:
+    raw = str(getattr(cfg, "preopen_prepare_time", None) or "08:15")
+    if re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", raw) is None:
+        return None
+    return _hhmm_minutes(raw)
+
+
+def _startup_gpu_protection_start_minutes(cfg: LiveMarketConfig) -> float:
+    """Use the same bounded lead for warmup and resident-model protection.
+
+    The five-mode cold startup measured 15.338 s on penguin. Ten minutes before
+    preparation retains the 60/120/240 s retry allowance without reserving GPU
+    memory from 07:00. Other hosts can use the explicit, bounded override.
+    An unknown preparation clock retains the earlier fail-closed protection.
+    """
+    prepare = _startup_gpu_prepare_minutes(cfg)
+    if prepare is None:
+        return 7 * 60
+    try:
+        lead_seconds = _env_float("STOCKAGENT_STARTUP_WARM_LEAD_SECONDS", 600.0)
+    except (TypeError, ValueError):
+        lead_seconds = 600.0
+    if not math.isfinite(lead_seconds):
+        lead_seconds = 600.0
+    return prepare - min(75 * 60, max(60.0, lead_seconds)) / 60
 
 
 def _offhours_gpu_cache_release_allowed() -> bool:
-    """Protect 07:00–17:00 on actual trading sessions, including prewarm."""
+    """Protect prewarm/live work, not an arbitrary 17:00 wall-clock cutoff."""
 
+    if _deployment_warmup_window_open():
+        return False
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
         if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            # This is a shared model cache, not a TW-only cache. A cash close
+            # cannot evict models needed by crypto or another active session.
+            if _runtime_status_for_display(cfg).market_open:
+                return False
             continue
         now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
         session_open, reason = _scheduled_market_session_day(cfg, now)
         calendar_uncertain = any(
             marker in reason for marker in ("missing", "unverified", "conflicting")
         )
+        close_minutes = _hhmm_minutes(getattr(cfg, "close_time", None))
+        # Unknown schedules retain the former fail-closed boundary. Verified
+        # TW cash sessions can release immediately after their close work.
+        protected_until = close_minutes if close_minutes is not None else 17 * 60
         if (
             (session_open or calendar_uncertain)
-            and 7 * 60 <= now.hour * 60 + now.minute < 17 * 60
+            and _startup_gpu_protection_start_minutes(cfg)
+            <= now.hour * 60 + now.minute + now.second / 60 + now.microsecond / 60_000_000
+            < protected_until
         ):
             return False
+    if _opening_critical_work_pending():
+        return False
     return True
+
+
+def _release_live_cuda_cache_owned() -> bool:
+    """Reset the process-hot flag only after the serialized cache was cleared."""
+    released = release_idle_live_cuda_cache()
+    if released:
+        # A completed warmup is historical evidence, not proof that evicted
+        # models remain process-hot tomorrow. Permanent failure stays terminal.
+        bot._startup_inference_warmup_complete = False
+        bot._startup_inference_warmup_failure_count = 0
+        bot._startup_inference_warmup_retry_after = 0.0
+    return released
+
+
+def _release_completed_inference_cache_owned() -> bool:
+    """Caller holds the model mutex; release failures never hide its result."""
+    try:
+        if _offhours_gpu_cache_release_allowed():
+            return _release_live_cuda_cache_owned()
+    except Exception as exc:
+        _log_exception("completed_inference_cache_release", exc)
+    return False
 
 
 def _release_offhours_gpu_cache_sync() -> bool:
@@ -3923,7 +4017,7 @@ def _release_offhours_gpu_cache_sync() -> bool:
     if not _MODEL_INFERENCE_LOCK.acquire(blocking=False):
         return False
     try:
-        return release_idle_live_cuda_cache()
+        return _release_live_cuda_cache_owned()
     finally:
         _MODEL_INFERENCE_LOCK.release()
 
@@ -6103,6 +6197,13 @@ def _can_reuse_latest_signal_now(
             not in {"", "completed_panel", "official_close"}
         ):
             return False, "closed_day_trade_contract_mismatch"
+        source_identity = summary.get("completed_panel_source_fingerprint")
+        if not source_identity:
+            return False, "completed_source_identity_missing"
+        config_path = _resolve_repo_path(cfg.config_path) or Path(cfg.config_path)
+        if source_identity != completed_panel_source_fingerprint(
+                config_path, rule_data_dir=getattr(cfg, "day_trade_rule_data_dir", None)):
+            return False, "completed_source_generation_changed"
         return True, "cached_latest_official_close"
 
     realtime_source = _realtime_price_source_for_market(cfg)
@@ -7007,25 +7108,20 @@ def _run_completed_session_signal_cache_sync(
     )
     if not target_date:
         return None
-    if _market_has_panel_close_signal_for_date(cfg, target_date):
-        latest = _latest_market_signal(cfg)
-        if latest is not None:
-            summary_path, summary = latest
-            weights_path = _summary_artifact_path(summary, "weights_path", summary_path)
-            deployment_ok, _reason = _summary_matches_market_deployment(cfg, status, summary)
-            if (
-                deployment_ok
-                and _summary_data_date_key(summary) == target_date
-                and str(summary.get("price_source") or "").lower() in {"panel", "panel_close"}
-                # Official postclose signals deliberately prohibit execution.
-                # That flag is not a provisional source or an invalid cache.
+    # Inspect the canonical pointer once, not 128 historical summaries every
+    # minute. A date match alone cannot prove same-day source revision reuse.
+    latest = _latest_market_signal(cfg)
+    if latest is not None:
+        summary_path, summary = latest
+        weights_path = _summary_artifact_path(summary, "weights_path", summary_path)
+        reusable, _reason = _can_reuse_latest_signal_now(
+            cfg, status, summary, requested_price_source="panel")
+        if (reusable and _summary_data_date_key(summary) == target_date
                 and not summary.get("postclose_fast_preview")
-                and weights_path is not None
-                and weights_path.is_file()
-            ):
-                if reconcile_gateway_cache_status:
-                    _record_official_postclose_cache_ready(cfg, summary, reused=True)
-                return None
+                and weights_path is not None and weights_path.is_file()):
+            if reconcile_gateway_cache_status:
+                _record_official_postclose_cache_ready(cfg, summary, reused=True)
+            return None
     progress_label = f"postclose-cache:{cfg.market}"
     progress_callback = (
         _ConsoleProgress(prefix=progress_label)
@@ -7033,14 +7129,21 @@ def _run_completed_session_signal_cache_sync(
         else None
     )
     with _MODEL_INFERENCE_LOCK:
-        result = generate_live_signal(
-            **cfg.signal_kwargs(
-                price_source="panel",
-                market_notice=_market_notice(status),
-                progress_callback=progress_callback,
-                progress_label=progress_label,
+        try:
+            result = generate_live_signal(
+                **cfg.signal_kwargs(
+                    price_source="panel",
+                    market_notice=_market_notice(status),
+                    progress_callback=progress_callback,
+                    progress_label=progress_label,
+                    ensure_previous_signal=False if getattr(cfg, "day_trade_simulation_enabled", False) else None,
+                    previous_signal_backfill_limit=0 if getattr(cfg, "day_trade_simulation_enabled", False) else None,
+                    use_completed_session_cache=bool(
+                        getattr(cfg, "day_trade_simulation_enabled", False)),
+                )
             )
-        )
+        finally:
+            _release_completed_inference_cache_owned()
     result = _enrich_signal_performance_for_discord(
         cfg,
         result,
@@ -7121,13 +7224,9 @@ def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | Non
                 if _env_bool("STOCKAGENT_BOT_PROGRESS", True)
                 else None
             )
-            result = generate_live_signal(
-                **cfg.signal_kwargs(
-                    price_source="panel",
-                    market_notice=_market_notice(status),
-                    progress_callback=progress_callback,
-                    progress_label=progress_label,
-                )
+            result = _run_market_signal_sync(
+                market=cfg.market, price_source="panel", prepared_status=status,
+                progress_callback=progress_callback, progress_label=progress_label,
             )
             _sync_latest_live_weights_to_market_artifact(cfg)
             return result
@@ -7162,13 +7261,9 @@ def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | Non
         return None
     progress_label = f"backfill:{cfg.market}"
     progress_callback = _ConsoleProgress(prefix=progress_label) if _env_bool("STOCKAGENT_BOT_PROGRESS", True) else None
-    result = generate_live_signal(
-        **cfg.signal_kwargs(
-            price_source="panel",
-            market_notice=_market_notice(status),
-            progress_callback=progress_callback,
-            progress_label=progress_label,
-        )
+    result = _run_market_signal_sync(
+        market=cfg.market, price_source="panel", prepared_status=status,
+        progress_callback=progress_callback, progress_label=progress_label,
     )
     _sync_latest_live_weights_to_market_artifact(cfg)
     return result
@@ -11278,7 +11373,7 @@ async def startup_inference_warmup() -> None:
             )
 
 
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=30)
 async def offhours_gpu_cache_release() -> None:
     """Return model VRAM to the shared Windows GPU when markets are closed."""
 

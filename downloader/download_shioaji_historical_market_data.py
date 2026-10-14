@@ -609,7 +609,7 @@ def _file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
-@lru_cache(maxsize=131_072)
+@lru_cache(maxsize=4_096)
 def _valid_receipt_at_signature(
     path: Path, data_path: Path, method: str, code: str,
     receipt_signature: tuple[int, int, int, int, int] | None,
@@ -644,9 +644,14 @@ def _valid_receipt(path: Path, data_path: Path, *, method: str, code: str) -> di
     if receipt_signature is None:
         return None
     data_signature = _file_signature(data_path)
-    payload = _valid_receipt_at_signature(
-        path, data_path, method, code, receipt_signature, data_signature
-    )
+    try:
+        payload = _valid_receipt_at_signature(
+            path, data_path, method, code, receipt_signature, data_signature
+        )
+    except OSError:
+        # Concurrent publication is not a valid receipt, nor a reason to abort
+        # the entire archive audit. Do not memoize a transient hash failure.
+        return None
     return dict(payload) if payload is not None else None
 
 
@@ -718,6 +723,29 @@ def missing_kbar_activity(receipt: dict[str, Any], start: date, end: date,
     return {day for day in official_dates if start <= day <= end and day not in observed}
 
 
+def _receipt_needs_query(
+    receipt: dict[str, Any] | None, *, refresh_empty: bool,
+    positive_activity: bool, missing_activity: bool = False,
+) -> bool:
+    """One retry predicate for both dispatch and coverage summaries."""
+
+    if receipt is None:
+        return True
+    if not refresh_empty:
+        return False
+    if receipt['status'] == 'source_empty':
+        return retry_due(receipt, positive_activity=positive_activity)
+    return bool(missing_activity and retry_due(
+        receipt.get('coverage_retry'), positive_activity=True,
+    ))
+
+
+def _contract_queries_deferred(availability: dict[str, Any] | None, *, refresh_empty: bool) -> bool:
+    return bool(refresh_empty and availability
+                and availability.get('status') in {'contract_unavailable', 'query_failed'}
+                and not retry_due(availability))
+
+
 def build_tasks(
     root: Path,
     rows: Sequence[HistoryContract],
@@ -730,7 +758,7 @@ def build_tasks(
     tasks: list[HistoryTask] = []
     for row in rows:
         unavailable = _read_receipt(root / 'availability' / f'{row.code}.json')
-        if refresh_empty and unavailable and unavailable.get('status') in {'contract_unavailable', 'query_failed'} and not retry_due(unavailable):
+        if _contract_queries_deferred(unavailable, refresh_empty=refresh_empty):
             continue
         official_dates = (activity or FuturesActivity()).exact_dates(row)
         observed_dates: set[date] = set()
@@ -743,11 +771,10 @@ def build_tasks(
                     if parsed is not None:
                         observed_dates.add(parsed)
             positive = any(start <= day <= end for day in official_dates)
-            repair_partial = bool(receipt and receipt['status'] == 'complete'
-                                  and missing_kbar_activity(receipt, start, end, official_dates)
-                                  and retry_due(receipt.get('coverage_retry'), positive_activity=True))
-            if receipt and not (refresh_empty and (repair_partial or (receipt['status'] == 'source_empty'
-                                and retry_due(receipt, positive_activity=positive)))):
+            gaps = bool(receipt and receipt['status'] == 'complete'
+                        and missing_kbar_activity(receipt, start, end, official_dates))
+            if not _receipt_needs_query(receipt, refresh_empty=refresh_empty,
+                                        positive_activity=positive, missing_activity=gaps):
                 continue
             tasks.append(
                 HistoryTask(
@@ -767,8 +794,7 @@ def build_tasks(
         for trading_date in sorted(dates):
             data_path, receipt_path = _tick_paths(root, row, trading_date)
             receipt = _valid_receipt(receipt_path, data_path, method='ticks', code=row.code)
-            if receipt and not (refresh_empty and receipt['status'] == 'source_empty'
-                                and retry_due(receipt, positive_activity=True)):
+            if not _receipt_needs_query(receipt, refresh_empty=refresh_empty, positive_activity=True):
                 continue
             tasks.append(
                 HistoryTask(
@@ -821,9 +847,11 @@ def _write_summary(
     completed_contracts = 0
     source_empty_queries = positive_empty_queries = unavailable_contracts = failed_contracts = 0
     partial_kbar_chunks = missing_kbar_dates = 0
+    pending_queries = 0
     for row in rows:
         official_dates = (activity or FuturesActivity()).exact_dates(row)
         availability = _read_receipt(root / 'availability' / f'{row.code}.json') or {}
+        queries_deferred = _contract_queries_deferred(availability, refresh_empty=refresh_empty)
         unavailable_contracts += availability.get('status') == 'contract_unavailable'
         failed_contracts += availability.get('status') == 'query_failed'
         bucket = collection_rows.setdefault(
@@ -843,29 +871,47 @@ def _write_summary(
         bucket["contracts"] += 1
         contract_kbar_total = 0
         contract_kbar_resolved = 0
+        observed_dates: set[date] = set()
         for start, end in iter_date_chunks(row.begin_date, row.end_date, chunk_days):
             contract_kbar_total += 1
             data_path, receipt_path = _kbar_paths(root, row, start, end)
             receipt = _valid_receipt(
                 receipt_path, data_path, method="kbars", code=row.code
             )
+            positive = any(start <= day <= end for day in official_dates)
+            gaps = missing_kbar_activity(receipt, start, end, official_dates) if receipt else set()
+            if not queries_deferred and _receipt_needs_query(
+                receipt, refresh_empty=refresh_empty, positive_activity=positive,
+                missing_activity=bool(gaps and receipt['status'] == 'complete'),
+            ):
+                pending_queries += 1
             if receipt is not None:
                 contract_kbar_resolved += 1
                 bucket["kbar_rows"] += int(receipt.get("rows") or 0)
                 bucket["stored_bytes"] += int(receipt.get("size") or 0)
-                gaps = missing_kbar_activity(receipt, start, end, official_dates)
                 missing_kbar_dates += len(gaps)
                 partial_kbar_chunks += bool(gaps and receipt['status'] == 'complete')
                 if receipt['status'] == 'source_empty':
                     source_empty_queries += 1
-                    positive_empty_queries += any(start <= day <= end for day in official_dates)
-        dates = [] if kbars_only else sorted(set(observed_tick_dates(root, row, chunk_days=chunk_days)) | official_dates)
+                    positive_empty_queries += positive
+                if not kbars_only:
+                    for value in receipt.get('observed_trading_dates') or ():
+                        parsed = _date_value(value)
+                        if parsed is not None:
+                            observed_dates.add(parsed)
+        # These dates have already passed the receipt, SHA and file-signature
+        # gates above. Do not revisit the entire KBar tree to rediscover them.
+        dates = [] if kbars_only else sorted(observed_dates | official_dates)
         resolved_ticks = 0
         for trading_date in dates:
             data_path, receipt_path = _tick_paths(root, row, trading_date)
             receipt = _valid_receipt(
                 receipt_path, data_path, method="ticks", code=row.code
             )
+            if not queries_deferred and _receipt_needs_query(
+                receipt, refresh_empty=refresh_empty, positive_activity=True,
+            ):
+                pending_queries += 1
             if receipt is not None:
                 resolved_ticks += 1
                 bucket["tick_rows"] += int(receipt.get("rows") or 0)
@@ -884,10 +930,8 @@ def _write_summary(
         for key in totals:
             if key in bucket:
                 totals[key] += int(bucket[key])
-    pending = build_tasks(root, rows, chunk_days=chunk_days, kbars_only=kbars_only,
-                          refresh_empty=refresh_empty, activity=activity)
     unresolved = totals['kbar_chunks'] - totals['resolved_kbar_chunks'] + totals['tick_dates'] - totals['resolved_tick_dates']
-    final_state = state if pending else ('waiting_source' if unresolved or positive_empty_queries or missing_kbar_dates or failed_contracts else 'complete')
+    final_state = state if pending_queries else ('waiting_source' if unresolved or positive_empty_queries or missing_kbar_dates or failed_contracts else 'complete')
     payload = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "source": SOURCE,
@@ -906,7 +950,7 @@ def _write_summary(
         'official_activity': (activity or FuturesActivity()).provenance,
         **totals,
         "complete_contracts": completed_contracts,
-        "pending_queries": len(pending),
+        "pending_queries": pending_queries,
         "tick_target_universe_finalized": bool(
             not kbars_only and totals["resolved_kbar_chunks"] == totals["kbar_chunks"]
         ),
@@ -1307,7 +1351,8 @@ def main() -> int:
         print(
             "[shioaji-history] "
             f"{describe_rate_limit('shioaji_quote_query', request_interval)} "
-            f"pending={len(tasks)} contracts={len(rows)}",
+            f"pending={len(tasks)} contracts={len(rows)} "
+            "summary_strategy=single_pass_receipt_v1",
             flush=True,
         )
         completed_queries = 0
@@ -1419,7 +1464,7 @@ def main() -> int:
                 )
                 print(
                     f"[shioaji-history] summary_audit query={completed_queries} "
-                    f"kind=intermediate elapsed_seconds={time.perf_counter() - summary_started:.3f}",
+                    f"kind=intermediate coverage_passes=1 elapsed_seconds={time.perf_counter() - summary_started:.3f}",
                     flush=True,
                 )
             print(
@@ -1443,7 +1488,7 @@ def main() -> int:
         )
         print(
             f"[shioaji-history] summary_audit query={completed_queries} "
-            f"kind=final elapsed_seconds={time.perf_counter() - summary_started:.3f}",
+            f"kind=final coverage_passes=1 elapsed_seconds={time.perf_counter() - summary_started:.3f}",
             flush=True,
         )
         final_state = str(summary["state"])

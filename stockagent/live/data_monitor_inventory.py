@@ -24,6 +24,7 @@ from typing import Any
 from uuid import uuid4
 
 from stockagent import private_json
+from stockagent.live.data_monitor_record_codec import encode_record_cache
 
 
 # Footer/cache row semantics remain v10 for already-running read-only readers.
@@ -1107,12 +1108,21 @@ def _build_record_inventory_unlocked(
         # cache contract. Do not advertise an empty safe delta in that case.
         changed_dataset_ids = None
     current_payload["feature_revision"] = feature_revision
+    cache_encoding_observation = None
+    cache_encode_ms = cache_write_ms = 0.0
     if refresh:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache_path.with_name(f"{cache_path.name}.tmp.{uuid4().hex}")
         try:
-            temporary.write_bytes(private_json.dumps(current_payload))
+            cache_encoding_observation = {}
+            encode_started = time.perf_counter()
+            encoded = encode_record_cache(current_payload, observation=cache_encoding_observation)
+            cache_encode_ms = round((time.perf_counter() - encode_started) * 1_000, 3)
+            write_started = time.perf_counter()
+            temporary.write_bytes(encoded)
+            del encoded
             os.replace(temporary, cache_path)
+            cache_write_ms = round((time.perf_counter() - write_started) * 1_000, 3)
         finally:
             temporary.unlink(missing_ok=True)
         _write_quick_index(
@@ -1137,12 +1147,15 @@ def _build_record_inventory_unlocked(
         "source_observation_matches_cache": observation.matches_cache,
         "fast_index_hit": False,
         "changed_dataset_ids": changed_dataset_ids,
+        "cache_encoding_observation": cache_encoding_observation,
         "timing_ms": {
             "quick_index_probe": quick_index_probe_ms,
             "cache_decode": cache_decode_ms,
             "discover": discover_ms,
             "signature_scan": signature_scan_ms,
             "aggregate_and_persist": round((time.perf_counter() - stage_start) * 1_000, 3),
+            "cache_encode": cache_encode_ms,
+            "cache_write": cache_write_ms,
         },
     }
 

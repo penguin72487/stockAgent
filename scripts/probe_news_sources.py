@@ -18,7 +18,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 from lxml import etree
@@ -51,13 +51,60 @@ def require_diagnostic_owner_scope(config, registry, canonical_config, canonical
         raise ValueError('isolated_diagnostic_overlaps_enabled_production_host; use canonical collector config/root')
 
 
-def require_current_missing_body_failures(root, urls, registry, *, now=None):
+FAILURE_PROBE_CODES = (
+    'body_not_found', 'article_attribution_not_verified',
+    'article_title_not_verified', 'article_identity_not_verified',
+)
+
+
+def extraction_failure_location(error):
+    """Code-generation-local parser sites, never traceback text or locals.
+
+    The error code alone cannot distinguish a conflicting canonical from a
+    schema/title mismatch. Keep only trusted downloader filenames, function
+    names and line numbers; no response text, source URLs or absolute paths.
+    """
+    parser_root = Path(__file__).resolve().parent.parent / 'downloader'
+    sites, visibility, frame, examined = [], None, error.__traceback__, 0
+    while frame is not None and examined < 32:
+        code = frame.tb_frame.f_code
+        path = Path(code.co_filename)
+        if (path.parent == parser_root
+                and re.fullmatch(r'news_fulltext(?:_[a-z_]+)?[.]py', path.name)
+                and re.fullmatch(r'[_a-zA-Z][_a-zA-Z0-9]{0,120}', code.co_name)):
+            sites.append({'module': path.name, 'function': code.co_name, 'line': frame.tb_lineno})
+            if path.name == 'news_fulltext_public_originals.py' and code.co_name == '_visible':
+                from bs4 import Tag
+                candidate = frame.tb_frame.f_locals.get('node')
+                refusing = frame.tb_frame.f_locals.get('parent')
+                if isinstance(candidate, Tag) and isinstance(refusing, Tag):
+                    # Only structural flags from this trusted visibility guard.
+                    # Never serialize locals, IDs, classes, CSS, links or text.
+                    ancestors = [candidate, *candidate.parents]
+                    style = re.sub(r'\s+', '', str(refusing.get('style', ''))).lower()
+                    visibility = {'candidate_tag': candidate.name, 'refusing_tag': refusing.name,
+                        'candidate_text_characters': len(candidate.get_text(' ', strip=True)),
+                        'refusing_hidden': refusing.has_attr('hidden'),
+                        'refusing_aria_hidden': str(refusing.get('aria-hidden', '')).lower() == 'true',
+                        'refusing_display_none': 'display:none' in style,
+                        'refusing_visibility_hidden': 'visibility:hidden' in style,
+                        'within_registered_cnyes_ad_slot': any(str(n.get('id', '')).startswith(
+                            'div-gpt-ad-cnyes_news_article_') for n in ancestors if getattr(n, 'attrs', None))}
+        frame = frame.tb_next
+        examined += 1
+    return {'contract_version': 2, 'sites': sites[-8:], 'visibility': visibility,
+            'line_numbers_are_code_generation_local': True, 'source_text_or_locals_exported': False}
+
+
+def require_current_missing_body_failures(root, urls, registry, *, now=None, failure_code='body_not_found'):
     """Grant only due, genuinely missing failed heads, never stale diagnostics.
 
     Read before obtaining the sole HTTP lock. A live repair completed while
     draining the owner cancels this probe instead of downloading it again.
     The grant is evidence, not a queue mutation or deadline override.
     """
+    if failure_code not in FAILURE_PROBE_CODES:
+        raise ValueError('unsupported_missing_article_failure_probe')
     if not 1 <= len(urls) <= 16 or len(set(urls)) != len(urls):
         raise ValueError('bounded_failure_probe_selection_required')
     now = time.time() if now is None else now
@@ -71,15 +118,15 @@ def require_current_missing_body_failures(root, urls, registry, *, now=None):
             row = db.execute('SELECT provider,url,state,error_code,body_sha256,due,last_checked_at_utc,lease_owner,lease_until '
                              'FROM articles WHERE url=?', (url,)).fetchone()
             if (not source.allowed or row is None or row['provider'] != source.provider
-                    or row['state'] not in {'body_not_found', 'retry', 'retry_cooldown'}
-                    or row['error_code'] != 'body_not_found' or row['body_sha256'] is not None
+                    or row['state'] not in {failure_code, 'retry', 'retry_cooldown'}
+                    or row['error_code'] != failure_code or row['body_sha256'] is not None
                     or row['due'] > now or not row['last_checked_at_utc']
                     or row['lease_owner'] is not None or row['lease_until'] is not None):
                 raise ValueError('probe_no_longer_a_due_failed_missing_body')
             try:
                 clock = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
-                if clock.tzinfo is None:
-                    raise ValueError('unaware failure clock')
+                if clock.tzinfo is None or clock.timestamp() > now + 2:
+                    raise ValueError('unaware or future failure clock')
             except (ValueError, TypeError):
                 raise ValueError('probe_failure_observation_clock_not_verified') from None
             proof.append(dict(row))
@@ -88,13 +135,15 @@ def require_current_missing_body_failures(root, urls, registry, *, now=None):
         db.close()
 
 
-def select_current_failure_urls(root, provider, registry, *, maximum=4, now=None):
+def select_current_failure_urls(root, provider, registry, *, maximum=4, now=None, failure_code='body_not_found'):
     """Select bounded due failures after the producer has drained, not before.
 
     Two per retry/terminal lane lets diagnosis inspect different failure
     representations instead of repeatedly reading only the oldest head.
     Explicit finite cohorts still require direct reviewed URL selection.
     """
+    if failure_code not in FAILURE_PROBE_CODES:
+        raise ValueError('unsupported_missing_article_failure_probe')
     source = registry.sources.get(provider)
     if (type(maximum) is not int or not 1 <= maximum <= 16 or source is None
             or not source.allowed or source.acquisition_mode == 'finite'):
@@ -104,14 +153,14 @@ def select_current_failure_urls(root, provider, registry, *, maximum=4, now=None
     try:
         db.execute('BEGIN')
         urls = []
-        for state in ('retry', 'retry_cooldown', 'body_not_found'):
+        for state in ('retry', 'retry_cooldown', failure_code):
             if len(urls) >= maximum:
                 break
             urls.extend(row[0] for row in db.execute(
-                "SELECT url FROM articles INDEXED BY dispatch WHERE provider=? AND state=? AND error_code='body_not_found' "
+                "SELECT url FROM articles INDEXED BY dispatch WHERE provider=? AND state=? AND error_code=? "
                 "AND body_sha256 IS NULL AND due<=? AND last_checked_at_utc IS NOT NULL "
                 "AND lease_owner IS NULL AND lease_until IS NULL ORDER BY due LIMIT ?",
-                (provider, state, now, min(2, maximum - len(urls)))))
+                (provider, state, failure_code, now, min(2, maximum - len(urls)))))
         if not urls:
             raise ValueError('no_due_failed_missing_body_to_probe')
         return urls
@@ -193,6 +242,104 @@ def wordpress_public_metadata_shape(data, headers):
         'raw_response_retained': False, 'article_body_accepted': False}
 
 
+def globalvoices_public_identity_shape(soup, source, *, page_url):
+    """Bounded native binding metadata, never prose or a guessed source clock.
+
+    Exceptional empty-title acceptance depends on actual DOM ownership as well
+    as authors/canonical/time. Counts stay exact; at most eight nodes per role
+    and eight ancestors are described. Only declared header clocks and public
+    bylines leave the response. Query values, credentials and entry text do not.
+    This observes the current parser; it cannot grant acceptance or a retry.
+    """
+    from downloader.news_fulltext_policy import normalize_url
+    from downloader.news_fulltext_public_originals import _visible
+    from downloader.news_fulltext_publishers import _globalvoices_visible_article_identity
+
+    if source.provider != 'globalvoices':
+        raise ValueError('globalvoices_native_identity_metadata_scope_required')
+    expected = normalize_url(page_url)
+    numeric = re.fullmatch(r'/[0-9]{4}/[0-9]{2}/[0-9]{2}/([1-9][0-9]{0,15})/?', urlsplit(expected).path)
+    roles = {
+        'canonical': soup.select('link[rel="canonical"]'),
+        'container': soup.select('.post-container'),
+        'title': soup.select(source.title_selector) if source.title_selector else [],
+        'header_credit': soup.select('#post-header-credit'),
+        'published_meta': soup.select('meta[property="article:published_time"]'),
+        'entry': soup.select('.post-container .entry'),
+        'numeric_post': soup.select('.post-container .post-' + numeric[1]) if numeric else [],
+        'footer_writer': soup.select('.post-container .postfooter-credits .contributor-name a.user-link'),
+        'article_license': soup.select('.post-container .post-credit-container [rel="license"]'),
+    }
+    container = roles['container'][0] if len(roles['container']) == 1 else None
+    post = roles['numeric_post'][0] if len(roles['numeric_post']) == 1 else None
+
+    def shape(node):
+        return {'tag': node.name, 'id': str(node.get('id', ''))[:100],
+                'classes': [str(value)[:80] for value in node.get('class', [])[:8]]}
+
+    def public_url(value):
+        try:
+            resolved = urljoin(expected, value)
+            parts = urlsplit(resolved)
+            # Preserve the binding result, not secret-bearing URL components.
+            origin = parts.hostname or ''
+            if parts.port is not None:
+                origin += ':' + str(parts.port)
+            try:
+                matches = normalize_url(resolved) == expected
+            except NewsError:
+                matches = False
+            return {'url_without_query_or_credentials': urlunsplit((parts.scheme, origin, parts.path, '', ''))[:512],
+                    'query_present': bool(parts.query), 'fragment_present': bool(parts.fragment),
+                    'credentials_present': parts.username is not None or parts.password is not None,
+                    'matches_requested_url': matches}
+        except (NewsError, TypeError, ValueError):
+            return {'invalid_url': True}
+
+    def describe(node, role):
+        row = {**shape(node), 'ancestors': [shape(parent) for parent in islice(node.parents, 8) if parent.name],
+               'inside_single_container': container is not None and any(parent is container for parent in node.parents),
+               'inside_single_numeric_post': post is not None and any(parent is post for parent in node.parents)}
+        try:
+            _visible(node)
+            row['visible'] = True
+        except NewsError:
+            row['visible'] = False
+        if role in {'canonical', 'footer_writer', 'article_license'}:
+            row.update(public_url(node.get('href', '')))
+        if role == 'title':
+            row['visible_text_characters'] = len(node.get_text(' ', strip=True))
+        elif role == 'footer_writer':
+            row['public_byline'] = node.get_text(' ', strip=True)[:200]
+        elif role == 'header_credit':
+            profiles = node.select('a.user-link')
+            row['profile_count'] = len(profiles)
+            row['public_profiles'] = [{**public_url(profile.get('href', '')),
+                'public_byline': profile.get_text(' ', strip=True)[:200]} for profile in profiles[:8]]
+            row['direct_children'] = [shape(child) for child in islice(node.children, 24) if child.name]
+            row['declared_header_clocks'] = [
+                {**shape(clock), 'datetime': str(clock.get('datetime', ''))[:160],
+                 'content': str(clock.get('content', ''))[:160],
+                 'public_clock_text': clock.get_text(' ', strip=True)[:100]}
+                for clock in node.select('time, .date, .post-date, [itemprop="datePublished"]')[:8]]
+        elif role == 'published_meta':
+            value = str(node.get('content', ''))
+            row['source_clock_raw'] = value[:160]
+            try:
+                row['aware_clock'] = datetime.fromisoformat(value.replace('Z', '+00:00')).tzinfo is not None
+            except (TypeError, ValueError, OverflowError):
+                row['aware_clock'] = False
+        return row
+
+    return {'contract_version': 1, 'numeric_requested_post_id': numeric[1] if numeric else None,
+        'counts': {role: len(nodes) for role, nodes in roles.items()},
+        'nodes': {role: [describe(node, role) for node in nodes[:8]] for role, nodes in roles.items()},
+        'current_exception_identity_verified': _globalvoices_visible_article_identity(
+            soup, source, page_url=page_url, allow_empty_title=True) is not None,
+        'body_text_exported': False, 'raw_response_retained': False,
+        'article_durably_accepted': False, 'automatic_profile_requests': 0}
+
+
 def probe_provider(http, urls, *, retain=False, output_root=None):
     results = []
     for url in urls:
@@ -208,6 +355,9 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                         response_sha256=hashlib.sha256(response.body).hexdigest())
             if response.status == 200 and "html" in response.headers.get("content-type", ""):
                 soup = BeautifulSoup(response.body, "lxml")
+                if source.provider == 'globalvoices':
+                    item['globalvoices_public_identity'] = globalvoices_public_identity_shape(
+                        soup, source, page_url=response.url)
                 if source.provider == 'cnyes':
                     from scripts.inspect_cnyes_news import cnyes_html_structure
                     item['cnyes_structure'] = cnyes_html_structure(soup, source, page_url=response.url)
@@ -362,7 +512,7 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                         item["publisher_article_credit_candidates"] = [n.get_text(" ", strip=True)
                             for n in body.find_all("p") if not n.find("p")
                             and len(n.get_text(" ", strip=True)) <= 200
-                            and re.match(r"^[（(]?(?:民視|即時|財經|政治|社會|生活|娛樂|體育|國際|論壇|CNEWS|匯流|圖[、,，]?文[／/]|圖[／/]|文[／/]|CTWANT|周刊王)", n.get_text(" ", strip=True))][:12] if body else []
+                            and re.match(r"^[（(]?(?:民視|即時|財經|政治|社會|生活|娛樂|體育|國際|論壇|中央社|CNEWS|匯流|圖[、,，]?文[／/]|圖[／/]|文[／/]|CTWANT|周刊王)", n.get_text(" ", strip=True))][:12] if body else []
                 item["top_level_body_elements"] = [{"tag": n.name, "id": n.get("id"), "classes": n.get("class"),
                     "width": n.get("width"), "align": n.get("align"),
                     "characters": len(n.get_text(" ", strip=True))} for n in soup.body.find_all(recursive=False) if n.name][:30] if soup.body else []
@@ -418,6 +568,7 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                     item["body_characters"] = len(article["body"])
                 except NewsError as error:
                     item["extraction_error"] = error.code
+                    item['extraction_failure_location'] = extraction_failure_location(error)
                 if retain and item.get("extraction_error") not in {"paywall_or_login", "access_challenge", "article_rights_or_scope_excluded",
                                                                 "article_license_not_verified", "article_rights_not_verified"} and (
                         source.provider != 'cnyes' or item.get('cnyes_structure', {}).get('raw_public_scope', False)) and (
@@ -576,12 +727,18 @@ def main(argv=None):
     selection.add_argument("--probe", action="append", default=[])
     selection.add_argument('--current-failure-provider', help='Select current due missing-body failures after draining the canonical producer')
     parser.add_argument('--maximum-failure-probes', type=int, default=4)
+    parser.add_argument('--failure-code', choices=FAILURE_PROBE_CODES, default='body_not_found',
+                        help='Explicit observed missing-article failure; title/attribution/identity diagnosis is metadata-only')
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--retain-reviewed-response", action="store_true", help="Retain private public diagnostics, not accepted bodies or denied/member responses")
     parser.add_argument("--trace-access", action="store_true", help="Record private bounded redirect/header/robots structure through the same HTTP path")
     parser.add_argument('--require-current-missing-body-failure', action='store_true',
                         help='Read-only exact-head preflight; reject saved, leased, denied, undated or not-yet-due selections')
     args = parser.parse_args(argv)
+    if args.failure_code != 'body_not_found' and (
+            not (args.current_failure_provider or args.require_current_missing_body_failure)
+            or args.retain_reviewed_response):
+        parser.error('title/attribution/identity failure diagnosis requires current failed-head preflight and metadata-only output')
     if len(args.probe) > 16:
         parser.error("at most sixteen explicitly selected probes")
     config, registry, repo = load_config(args.config)
@@ -590,7 +747,7 @@ def main(argv=None):
     if args.current_failure_provider:
         try:
             args.probe = select_current_failure_urls(repo / config['root'], args.current_failure_provider, registry,
-                                                    maximum=args.maximum_failure_probes)
+                                                    maximum=args.maximum_failure_probes, failure_code=args.failure_code)
         except ValueError as error:
             if str(error) != 'no_due_failed_missing_body_to_probe':
                 raise  # Invalid scope/bounds/storage still fail explicitly.
@@ -613,7 +770,8 @@ def main(argv=None):
     failure_grant = None
     if args.require_current_missing_body_failure:
         try:
-            failure_grant = require_current_missing_body_failures(repo / config['root'], args.probe, registry)
+            failure_grant = require_current_missing_body_failures(repo / config['root'], args.probe, registry,
+                                                                 failure_code=args.failure_code)
         except ValueError as error:
             if str(error) != 'probe_no_longer_a_due_failed_missing_body':
                 raise  # Bad bounds, source clocks and storage still fail.
@@ -646,6 +804,7 @@ def main(argv=None):
                   "performance": http.metrics.snapshot(), "official_rate_limit": None}
         if failure_grant is not None:
             result['current_failed_missing_body_preflight'] = failure_grant
+            result['failure_probe_code'] = args.failure_code
         if trace:
             result["http_path_by_provider"] = {provider: trace.snapshot(provider) for provider in groups}
         atomic_write_json(args.output, result)

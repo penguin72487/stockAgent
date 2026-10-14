@@ -2,6 +2,30 @@
 
 Use the section for the service being changed. Operational acceptance requires fresh runtime evidence; historical service observations do not establish current readiness.
 
+## Shioaji SDK maintenance
+
+- `scripts/maintain_shioaji_sdk.py` queries official PyPI stable releases,
+  rejects yanked/pre-release/incompatible wheels, verifies SHA256 and validates
+  the native Python API plus focused quote, volume, scheduling and execution
+  tests in an isolated target. It never logs in or submits an order and never
+  upgrades unrelated CUDA/data packages to make a candidate pass.
+- Install with `source scripts/runtime_env.sh` followed by
+  `run_fintech_python scripts/install_shioaji_sdk_maintenance.py`. The canonical
+  timer checks hourly at `:40` and runs daily at 05:30 Asia/Taipei. Promotion is
+  allowed only 05:15–06:30, after the night session and before preopen; a late
+  boot catch-up checks versions without restarting trading owners.
+- Native SDKs are process-local. Stop reviewed existing SDK owners before
+  replacing the package, then restore only previously active services/timers.
+  Coordinate with the existing paper-service control lease; an unmanaged SDK
+  process defers promotion rather than being killed. Installation failures use
+  the preserved exact previous wheel; a durable journal and `ExecStopPost`
+  recover interrupted replacement. Preserve the original failure receipts.
+- Inspect `artifacts/operations/shioaji_sdk/status.json`, candidate acceptance,
+  transaction and private logs. Installed version, mapped native inode,
+  successful owner restart, real login/quotes and market readiness are distinct
+  proofs. Use existing source/owner receipts and preopen gates for the latter;
+  offline compatibility tests never imply a broker fill or complete live data.
+
 ## Discord Service Reliability Contract
 
 - Treat Discord/Gateway liveness and private artifact maintenance as separate
@@ -43,6 +67,13 @@ Use the section for the service being changed. Operational acceptance requires f
   be connected, command sync to succeed or be explicitly deferred, all enabled
   TW modes to acknowledge the engine revision with zero lag, and logs
   since the current restart to contain no watchdog or fatal error.
+- GPU residency follows the same verified session/preparation window as model
+  warmup, not a separate hard-coded 07:00 retention rule. Successful serialized
+  idle eviction invalidates the process-hot flag; it does not change signals,
+  inputs, precision or permanent-failure classification. A completed warmup
+  receipt is historical evidence, not current residency. The measured penguin
+  ten-minute lead and actual cold-owner readback are scoped in
+  [preparation and release evidence](../completed_session_inference_cache_2026-10-13.md#盤前暖機與釋放窗口).
 
 ## TW Day-Trade Engine Responsiveness
 
@@ -111,9 +142,54 @@ Use the section for the service being changed. Operational acceptance requires f
   engine lock.  Cash-settle an expired weekly cycle and any expired
   `put_call_parity_tx` package only from the official TAIFEX final-settlement
   parquet, then snapshot the remaining current contracts.  Missing official
-  settlement, a residual futures hedge, or malformed leg metadata must fail
-  closed.  Do not require an expired contract to remain in the next trading
+  settlement or malformed leg metadata must fail closed. A residual futures
+  hedge fails closed unless the explicit paper-recovery policy below is enabled.
+  Do not require an expired contract to remain in the next trading
   date's Shioaji catalogue; that ordering deadlocks settlement before startup.
+- Contract v13 adds user-authorized `--recover-expired-cycle-futures` (runner
+  `SHIOAJI_TAIFEX_RECOVER_EXPIRED_CYCLE_FUTURES=true`, default false). Preserve a
+  verified backup before enabling it. Settle expired options from the official
+  receipt, freeze futures identities from the matching original-cycle status,
+  and preserve nonzero futures until fresh non-trial same-contract five-level
+  depth can completely reduce that strategy to zero. Missing/mismatched contract
+  evidence remains blocked; insufficient depth retries without inventing a fill.
+  No new cycle, calibration, parity entry or risk expansion runs while reduction
+  is pending. Paper repair disables broker orders persistently, records its
+  actual receipt/execution times and explicit repair reason, and resumes through
+  the existing worker 0 after reduction. It is not a backdated 9/18 or broker fill.
+- Dashboard v9 ages valuation evidence against the observer clock. Preserve the
+  original source trading date; `observed_trading_date` describes today's session,
+  not a backdated mark. Historical cache invalidation uses marks/backfill versions
+  plus the shared strategy/capital projection inputs, not every status heartbeat.
+  Reject persisted caches from an old dashboard schema. If a changed source is
+  more than two minutes ahead of a cached curve, rebuild the actual projection
+  instead of amplifying days-old data through stacked stale-while-refresh caches.
+  The UI distinguishes current strategy health from a curve still catching up.
+  The native prewarmer keeps the default 1d generation current on mark changes
+  and stops with the server. TAIFEX public history does not add a second SWR
+  layer; the native projection is its single refresh owner.
+  History cache v2 freezes one source timestamp upper bound across native and
+  canonical readers; marks appended during a rebuild belong to the next query.
+  The anchor includes verified replay generations as well as the live ledger.
+  Ranges share a projection only when their effective source window and bucket
+  geometry are identical; on a short history, quarter/year/all need one full
+  scan, not three. Warmup 503/timeout observations remain visible and are retried
+  without a page reload. They are not accepted as data completion or zero latency.
+- Verify paper repair with `scripts/verify_taifex_web_recovery.py`: supply the
+  verified `--backup-dir`, original `--capture-id`, output directory and local /
+  public `--url` values. It checks preserved ledger prefixes, official source
+  hashes/intrinsic values, raw captured five-level fills, every strategy's current
+  curve endpoint, read-only HTTP behavior and native responsive interactions.
+  With `--observe-minute-refresh`, the browser must observe the actual scheduler
+  advancing its endpoint without reloads. The public warmup probe injects one
+  browser-only 503 and verifies waiting/retry/real-API recovery without changing
+  production sources or caches; real HTTP failures remain separate in receipts.
+  Browser `cpu-2d` verification is explicit and does not prove GPU/WebGL readiness.
+  The [2026-10-13 recovery acceptance](../../artifacts/operations/taifex_web_repair_20261013/accepted-release/acceptance.json)
+  verified 28 original futures reductions and 108 option settlements against
+  preserved ledger prefixes and original price evidence, plus all seven ranges
+  on local/public APIs and laptop/tablet/phone browser widths. It did not replay
+  the historical interruption or establish actual broker fills.
 - Successful expiry settlement is a continuous-roll boundary, not a terminal
   strategy state.  On the first complete fresh Bid/Ask set, alive weekly
   strategies select the nearest listed weekly expiry strictly after the current

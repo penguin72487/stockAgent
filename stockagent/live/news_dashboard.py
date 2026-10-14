@@ -26,7 +26,7 @@ _ID = re.compile(r"^(?:[a-z][a-z0-9_]{0,63}|unregistered:[a-z0-9.-]{1,253})$")
 _STATES = frozenset({
     "pending", "inflight", "complete", "retry", "retry_cooldown",
     "awaiting_authorization", "waiting_cohort", "unsupported_article_path", "body_not_found",
-    "article_attribution_not_verified", "article_license_not_verified",
+    "article_attribution_not_verified", "article_title_not_verified", "article_license_not_verified",
     "article_identity_not_verified", "article_rights_not_verified", "article_rights_or_scope_excluded",
     "robots_disallowed", "source_not_allowed", "authorization_expired",
     "paywall", "not_found", "gone", "response_too_large",
@@ -52,7 +52,34 @@ _AUTHORIZATION = {"personal_research", "open_license", "public_domain", "unrevie
 _CAPACITY_STATES = {"warming", "ramping", "verifying", "waiting_source", "insufficient_samples",
                     "recovering_transport", "endpoint_validation_failed",
                     "insufficient_useful_data", "official_or_learned_floor", "stable_source_backoff",
-                    "stable_pipeline_capacity", "engineering_ceiling_unverified"}
+                    "stable_pipeline_capacity", "engineering_ceiling_unverified", "metadata_polling"}
+
+
+def _metadata_feed_progress(value, *, now):
+    raw = _object(value)
+    fields = ('registered_feeds', 'verified_feeds', 'latest_feed_item_observations',
+              'latest_feed_response_bytes', 'feeds_with_errors', 'poll_interval_seconds')
+    numbers = {key: _count(raw.get(key)) for key in fields}
+    if (type(raw.get('contract_version')) is not int or raw.get('contract_version') != 1
+            or raw.get('enabled') is not True
+            or any(item is None for item in numbers.values())
+            or not 1 <= numbers['registered_feeds'] <= 14
+            or numbers['verified_feeds'] > numbers['registered_feeds']
+            or numbers['feeds_with_errors'] > numbers['registered_feeds']
+            or not 60 <= numbers['poll_interval_seconds'] <= 86400
+            or type(raw.get('article_bodies_accepted')) is not int or raw.get('article_bodies_accepted') != 0
+            or raw.get('overlapping_feed_items_not_unique_articles') is not True
+            or raw.get('all_history_complete') is not False or raw.get('finish_eta_utc') is not None):
+        return None
+    next_check = _stamp(raw.get('next_check_at_utc'))
+    last_check = _stamp(raw.get('last_check_at_utc'))
+    # The canonical queue's due=0 means ready, not a January 1970 appointment.
+    return {'contract_version': 1, 'enabled': True, **numbers,
+        'next_check_ready': bool(next_check and next_check <= now),
+        'next_check_at_utc': next_check.isoformat() if next_check and next_check.timestamp() > 0 else None,
+        'last_check_at_utc': last_check.isoformat() if last_check else None,
+        'article_bodies_accepted': 0, 'overlapping_feed_items_not_unique_articles': True,
+        'all_history_complete': False, 'finish_eta_utc': None}
 
 
 def _object(value: Any) -> Mapping[str, Any]:
@@ -613,6 +640,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             cohort['reviewed_nonbody_outside_cohort'] = verified_outcomes
             cohort['unreviewed_new_urls'] = outside - (outcome_count if verified_outcomes else 0)
         enabled = raw.get("automatic_collection_enabled") is True
+        metadata_feed = _metadata_feed_progress(raw.get('metadata_feed_progress'), now=now) if valid else None
+        body_enabled = enabled and raw.get('automatic_fulltext_allowed', True) is True
         detail = _object(metric_providers.get(identifier))
         http_counts = _object(detail.get("counts"))
         accepted = _count(http_counts.get("durably_accepted_versions"))
@@ -624,12 +653,12 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         measured_capacity = _object(calibration.get(identifier))
         forecast = (_completion_forecast(metrics, {**measured_capacity, 'measurement_contract_version': calibration_version,
                                          'completion_window_owner_contract_version': completion_owner_version},
-                                         heads, observed, now, live, current_owner=status.get('owner_id')) if enabled else None)
+                                         heads, observed, now, live, current_owner=status.get('owner_id')) if body_enabled else None)
         eta_rate = forecast['new_url_heads_per_second'] if forecast is not None else rate
         cooldown = _stamp(cooldowns.get(identifier))
         cooling = bool(cooldown and cooldown > now)
-        eta = (ready / eta_rate if enabled and ready and eta_rate and not cooling else
-               0.0 if enabled and ready == 0 and live else None)
+        eta = (ready / eta_rate if body_enabled and ready and eta_rate and not cooling else
+               0.0 if body_enabled and ready == 0 and live else None)
         if mode == 'finite' and ready == 0 and (
                 not cohort or not cohort['all_cohort_bodies_stored']
                 or supplement and not supplement['all_supplement_bodies_stored']
@@ -643,7 +672,10 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                 eta = finish = None  # Old projection elapsed without proof of completion.
         state = ("unavailable" if not valid else "not_enabled" if not enabled else
                  "stale" if not fresh else activity if not live else
-                 "cooldown" if cooling else "running" if counts.get("inflight", 0) else
+                 "cooldown" if cooling else
+                 ("attention" if metadata_feed['feeds_with_errors'] else "metadata_polling")
+                     if metadata_feed and not body_enabled else
+                 "running" if counts.get("inflight", 0) else
                  "backfilling" if ready else "attention" if blocked else
                  "finite_complete" if cohort and cohort['all_cohort_bodies_stored'] else
                  "waiting_cohort" if growth_waiting else "known_queue_clear")
@@ -679,6 +711,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         providers.append({
             "id": identifier, "name": name, "configured": identifier in configured,
             "enabled": enabled, "state": state, "authorization_kind": auth,
+            "automatic_fulltext_allowed": body_enabled, "metadata_feed_progress": metadata_feed,
             "authorized_api_setup": api_setup,
             "source_policy_review": review_decision,
             "source_reviewed_at_utc": review_at.isoformat() if review_valid else None,

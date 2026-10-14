@@ -1,0 +1,31 @@
+# Baseline, seven optimizer recipes, then the unchanged 27 original OFAT cases.
+# Formal 1000-epoch ceiling and baseline architecture are inherited, not the
+# 12-epoch diagnostic screen. Each optimizer receives its own checkpoint ABI.
+base_spec: tw_scale_cash_annual_last_fold_optimized_20261013_v7.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_last_fold_frontier_20261014_v8
+matrix:
+  prepend_dimensions:
+    - name: optimizer
+      enabled: true
+      variants:
+        - name: muon
+          description: Hidden Linear Muon + auxiliary AdamW; baseline model/LR/schedule.
+          overrides: {training: {optimizer_name: muon}}
+        - name: normuon
+          description: Hidden Linear NorMuon + auxiliary AdamW; neuron normalization.
+          overrides: {training: {optimizer_name: normuon}}
+        - name: dion3
+          description: Hidden Linear Dion3 + auxiliary AdamW; fraction0.25/error feedback.
+          overrides: {training: {optimizer_name: dion3}}
+        - name: soap
+          description: Hidden Linear SOAP + auxiliary AdamW; precondition frequency4.
+          overrides: {training: {optimizer_name: soap, optimizer_options: {precondition_frequency: 4}}}
+        - name: ademamix
+          description: All-parameter AdEMAMix; beta3=0.99/alpha2/12-update ramp.
+          overrides: {training: {optimizer_name: ademamix, optimizer_options: {betas: [0.9, 0.999, 0.99], alpha: 2.0, beta3_warmup: 12, alpha_warmup: 12}}}
+        - name: muon_ademamix
+          description: Hidden Linear Muon + auxiliary AdEMAMix; explicit interaction recipe.
+          overrides: {training: {optimizer_name: muon, optimizer_options: {aux_optimizer: ademamix, aux_betas: [0.9, 0.999, 0.99], aux_alpha: 2.0, aux_beta3_warmup: 12, aux_alpha_warmup: 12}}}
+        - name: muon_lr2
+          description: Muon matrix LR x2; auxiliary LR and baseline model unchanged.
+          overrides: {training: {optimizer_name: muon, optimizer_options: {matrix_lr_scale: 2.0}}}

@@ -56,7 +56,7 @@ def test_gap_sample_is_bounded_exact_summary_and_no_mutation(config, tmp_path, c
         assert changes == queue.db.total_changes
         assert before == [dict(row) for row in queue.db.execute('SELECT * FROM bulk_window_gaps ORDER BY scope_url')]
         status = queue.status()
-        assert status['status_projection_contract_version'] == 2
+        assert status['status_projection_contract_version'] == 3
         assert status['bulk_gap_projection'] == summary and status['bulk_historical_window_gaps'] == projected
         assert json.loads((tmp_path / 'status.json').read_bytes()) == status
         assert (tmp_path / 'status.json').stat().st_size < len(json.dumps(status, ensure_ascii=False, indent=2).encode())

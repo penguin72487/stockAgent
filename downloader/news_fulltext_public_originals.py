@@ -384,6 +384,24 @@ def _ftv_newsroom_credit(body):
         text = ''.join(parts).strip()
         if len(text) > 200:
             continue
+        # Actual older finance articles end with a standalone （中央社）.
+        # This is explicit syndicated provenance, not a missing newsroom
+        # reporter. Do not infer it from a mention, a first line followed by
+        # prose, a photo, a quotation or a page/related-story footer. Inspect
+        # the full paragraph only for this rare, exact marker; the common
+        # credit path and original text are unchanged.
+        if (text in {'（中央社）', '(中央社)'}
+                and node.get_text(' ', strip=True) == text
+                and not node.find(['img', 'iframe', 'video', 'audio'])
+                and not node.find_parent(['blockquote', 'footer', 'header', 'template', 'noscript'])):
+            _visible(node)
+            for inline in inline_nodes:
+                _visible(inline)
+            error = NewsError('article_rights_or_scope_excluded')
+            # Static, non-prose witness for the normal owner's telemetry.
+            # No retained third-party response or extra source request.
+            error.ftv_native_scope_witness = 'standalone_visible_CNA_credit_v1'
+            raise error
         # Explicit third-party provenance stays binding even if another
         # paragraph mentions this publisher's newsroom.
         if re.match(r"^(?:圖[、,，]?文|文|圖)[／/]\s*(?!民視)(\S+)|^(?:CNEWS|匯流新聞網|CTWANT|周刊王)", text):

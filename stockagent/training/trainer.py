@@ -9234,8 +9234,16 @@ def _create_adamw_optimizer(
     device: torch.device,
     *,
     label: str,
-) -> torch.optim.AdamW:
+) -> torch.optim.Optimizer:
     """Create the canonical neural-training optimizer for every executor."""
+    if config.training.optimizer_name != "adamw":
+        from stockagent.training.optimizers import create_frontier_optimizer
+        optimizer = create_frontier_optimizer(model, config.training, device)
+        partition = getattr(optimizer, "parameter_partition_manifest", {})
+        print(f"[{label}] optimizer={config.training.optimizer_name}; "
+              f"matrix_tensors={len(partition.get('matrix', []))}; "
+              f"auxiliary_tensors={len(partition.get('auxiliary', []))}")
+        return optimizer
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]

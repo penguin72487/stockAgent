@@ -1465,7 +1465,16 @@ def _cutover_blockers(
                and isinstance(live_state.get("enabled_markets"), list)
                and m not in live_state["enabled_markets"]}
     added = added_markets or set()
-    if not added.issubset(expected_markets) or added & set(live_modes):
+    aborted = None
+    if added:
+        from stockagent.live.day_trade_addition import validate_aborted_activation
+        receipt = _load_object(candidate / "rebuild_receipt.json")
+        if receipt.get("aborted_activation"):
+            try:
+                aborted = validate_aborted_activation(candidate, live=live)
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                blockers.append(f"aborted activation recovery is not valid: {exc}")
+    if not added.issubset(expected_markets) or (added & set(live_modes) and aborted is None):
         blockers.append("added modes must be new members of the exact candidate mode set")
     if set(live_modes) - retired != expected_markets - added:
         blockers.append(
@@ -1496,10 +1505,30 @@ def _cutover_blockers(
         if receipt.get("contract") != ADDITION_CONTRACT or added != {receipt.get("added_market")}:
             blockers.append("added-mode cutover requires the matching independently validated additive receipt")
         else:
-            from stockagent.live.day_trade_addition import evidence_path
+            from stockagent.live.day_trade_addition import (
+                LEDGERS, evidence_path, retained_accounts_match, sha,
+            )
             prior = _load_object(evidence_path(candidate, receipt["prior_state"]))
-            if prior.get("modes") != live_modes:
+            retained_live = {m: row for m, row in live_modes.items() if aborted is None or m not in added}
+            if not retained_accounts_match(prior.get("modes"), retained_live):
                 blockers.append("retained live accounts changed after the additive snapshot")
+            # A flat heartbeat is harmless; losing an intervening decision,
+            # order, fill, event or latency receipt is not. Recheck the complete
+            # original byte streams again under the ordinary cutover locks.
+            proofs = receipt.get("retained_execution_prefixes") or {}
+            if aborted is not None:
+                proofs = aborted["streams"]
+            for name in LEDGERS:
+                source = live / name
+                proof = proofs.get(name)
+                if proof is None:
+                    changed = source.is_file() and source.stat().st_size > 0
+                else:
+                    changed = (not source.is_file()
+                               or source.stat().st_size != proof["bytes"]
+                               or sha(source) != proof["sha256"])
+                if changed:
+                    blockers.append(f"retained live execution bytes changed after the additive snapshot: {name}")
     return blockers
 
 
@@ -1608,8 +1637,8 @@ def _require_added_runtime_policy(candidate: Path, added_markets: set[str]) -> N
             raise RuntimeError(f"independent runtime checkpoint differs from accepted replay: {market}")
 
 
-def main(*, before_exchange: Callable[[], None] | None = None) -> None:
-    args = build_parser().parse_args()
+def main(*, before_exchange: Callable[[], None] | None = None, argv=None) -> None:
+    args = build_parser().parse_args(argv)
     if args.validation_receipt is not None and not args.validate_only:
         raise ValueError("--validation-receipt requires --validate-only")
     live = args.live_dir.resolve(strict=True)

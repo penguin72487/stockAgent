@@ -1801,6 +1801,8 @@ def test_completed_session_cache_runs_before_formal_history(monkeypatch) -> None
     monkeypatch.setattr(discord_bot, "_effective_market_config", lambda value: value)
     monkeypatch.setattr(discord_bot, "_ensure_signal_ready", lambda _cfg: status)
     monkeypatch.setattr(discord_bot, "_completed_session_receipt_ready", lambda _status: True)
+    monkeypatch.setattr(discord_bot, "_latest_market_signal", lambda _: None)
+    monkeypatch.setattr(discord_bot, "_offhours_gpu_cache_release_allowed", lambda: False)
     monkeypatch.setattr(
         discord_bot,
         "_market_has_panel_close_signal_for_date",
@@ -1811,7 +1813,8 @@ def test_completed_session_cache_runs_before_formal_history(monkeypatch) -> None
     monkeypatch.setattr(
         discord_bot,
         "generate_live_signal",
-        lambda **kwargs: calls.append(("signal", kwargs["price_source"])) or result,
+        lambda **kwargs: calls.append(("signal", kwargs["price_source"],
+            kwargs["ensure_previous_signal"], kwargs["previous_signal_backfill_limit"])) or result,
     )
     monkeypatch.setattr(
         discord_bot,
@@ -1825,7 +1828,7 @@ def test_completed_session_cache_runs_before_formal_history(monkeypatch) -> None
     )
 
     assert discord_bot._run_completed_session_signal_cache_sync(cfg) is result
-    assert calls == [("signal", "panel"), "presentation", "sync"]
+    assert calls == [("signal", "panel", False, 0), "presentation", "sync"]
 
 
 def test_latest_signal_artifact_result_prepares_summary_only_once(

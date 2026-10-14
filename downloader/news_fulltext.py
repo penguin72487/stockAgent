@@ -88,7 +88,7 @@ def load_config(path: Path, *, repo: Path | None = None):
     from downloader.news_fulltext_failure_focus import validate_focus
     config['failure_diagnostic_focus'] = validate_focus(config.get('failure_diagnostic_focus'), registry)
     if config.get("require_provider_worker_reservations", False):
-        if sum(p.parallelism for p in registry.sources.values() if p.allowed) > config["workers"]:
+        if sum(p.parallelism for p in registry.sources.values() if p.request_enabled) > config["workers"]:
             raise ValueError("worker budget cannot reserve configured publisher parallelism independently")
     return config, registry, repo
 
@@ -300,6 +300,12 @@ def seed_discovery(queue: NewsQueue):
     queue.sync_finite_cohorts()
     with queue.db:
         for source in queue.registry.sources.values():
+            if source.metadata_feeds:
+                queue.db.executemany("INSERT INTO discovery(url,kind,provider,priority) VALUES (?,'metadata_feed',?,0) "
+                    "ON CONFLICT(url) DO UPDATE SET kind='metadata_feed',priority=0,"
+                    "due=CASE WHEN error_code IS NULL THEN 0 ELSE due END "
+                    "WHERE kind!='metadata_feed' OR (parser_fingerprint IS NOT NULL AND parser_fingerprint!=?)",
+                    ((url, source.provider, source.metadata_feed_fingerprint) for url in source.metadata_feeds))
             if source.allowed and source.acquisition_mode != "finite":
                 queue.db.executemany("INSERT OR IGNORE INTO discovery(url,kind,provider) VALUES (?,?,?)",
                                      ((url, kind, source.provider) for kind, urls in (("feed", source.feeds), ("sitemap", source.sitemaps))
@@ -328,11 +334,16 @@ def seed_discovery(queue: NewsQueue):
                     generic_index_filter = " AND substr(url,1,instr(url||'?','?')-1)!=?"
                     index_parameters += (ENDPOINT,)
                     if getattr(source, 'cnyes_index_api', ''):
+                        from downloader.news_fulltext_cnyes_index import compatible_fingerprints
+                        versions = compatible_fingerprints(source)
                         queue.db.execute('UPDATE discovery SET due=0 WHERE ' + index_where
-                                         + " AND parser_fingerprint!=? AND substr(url,1,instr(url||'?','?')-1)=?",
-                                         (source.provider, source.cnyes_index_data_fingerprint, ENDPOINT))
+                                         + " AND parser_fingerprint NOT IN (" + ','.join('?' for _ in versions)
+                                         + ") AND substr(url,1,instr(url||'?','?')-1)=?",
+                                         (source.provider, *versions, ENDPOINT))
                 queue.db.execute('UPDATE discovery SET due=0 WHERE ' + index_where
                                  + ' AND parser_fingerprint!=?' + generic_index_filter, index_parameters)
+                from downloader.news_fulltext_schedule import reconcile_incremental_indexes
+                reconcile_incremental_indexes(queue, source, discovery_fingerprint(source))
                 queue.db.executemany("INSERT OR IGNORE INTO discovery(url,kind,provider,priority) VALUES (?,'wordpress_posts',?,1)",
                                      ((wordpress_url(base), source.provider) for base in source.wordpress_apis))
                 if source.cnyes_apis:
@@ -418,7 +429,14 @@ def discovery_fingerprint(source):
 
 
 def fetch_discovery(http: NewsHTTP, task: dict):
-    source = http.registry.require(task["url"])
+    metadata = task['kind'] == 'metadata_feed'
+    if metadata:
+        from downloader.news_fulltext_metadata_feeds import require_request
+        source = require_request(http.registry, task['url'], task['url'])
+        if task['provider'] != source.provider:
+            raise NewsError('metadata_feed_provider_mismatch')
+    else:
+        source = http.registry.require(task["url"])
     from downloader.news_fulltext_cnyes_index import is_index_task, parse_index, validate_request
     index_task = is_index_task(task)
     if index_task:
@@ -428,17 +446,23 @@ def fetch_discovery(http: NewsHTTP, task: dict):
     if task["kind"] in registered and wordpress_base(task["url"]) not in registered[task["kind"]]:
         raise NewsError("unregistered_bulk_api")  # reject before a network request
     headers = {}
-    fingerprint = source.cnyes_index_data_fingerprint if index_task else discovery_fingerprint(source)
+    fingerprint = (source.metadata_feed_fingerprint if metadata else
+                   source.cnyes_index_data_fingerprint if index_task else discovery_fingerprint(source))
     compatible = task.get("parser_fingerprint") == fingerprint
+    if index_task:
+        from downloader.news_fulltext_cnyes_index import compatible_fingerprints
+        compatible = task.get('parser_fingerprint') in compatible_fingerprints(source)
     if task["etag"] and compatible:
         headers["If-None-Match"] = task["etag"]
     if task["last_modified"] and compatible:
         headers["If-Modified-Since"] = task["last_modified"]
-    response = http.get(task["url"], headers=headers)
+    response = http.get(task["url"], headers=headers, **({'metadata_feed': task['url']} if metadata else {}))
     if response.status not in {200, 304}:
         raise NewsError("discovery_http_" + str(response.status))
     if response.status == 304 and (not compatible or not headers):
         raise NewsError("unverifiable_discovery_not_modified", retry=True, delay=60)
+    if metadata:
+        return response, [], [], []  # Parse once at scoped durable acceptance; never HTML fallback.
     if index_task:
         with http.metrics.measure('public_index_metadata_extraction',source.provider):
             links = parse_index(response,source)[2] if response.status == 200 else []
@@ -474,6 +498,9 @@ def fetch_discovery(http: NewsHTTP, task: dict):
 
 
 def accept_discovery(queue: NewsQueue, task: dict, response, links, records, errors):
+    if task['kind'] == 'metadata_feed':
+        from downloader.news_fulltext_metadata_feeds import accept
+        return accept(queue, task, response, links, records, errors)
     source = queue.registry.sources[task["provider"]]
     from downloader.news_fulltext_cnyes_index import accept_index, is_index_task
     if is_index_task(task):
@@ -669,7 +696,8 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
                                  ((task["url"], e["item_number"], source.provider, e["url"], e["error"], utc_now()) for e in errors))
             queue.counter("bulk_item_errors_observed", len(errors))
         page = feed_page(task["url"]) if task["kind"] == "rss_fulltext" else wordpress_page(task["url"])
-        delay = source.discovery_interval_seconds if task["kind"] == "feed" or bulk and page == 1 else 86400
+        live_index = task['kind'] == 'index' and task['url'] in source.incremental_index_pages
+        delay = source.discovery_interval_seconds if task["kind"] == "feed" or bulk and page == 1 or live_index else 86400
         if task["kind"] == "rss_fulltext" and page > 1:
             delay = 365 * 86400
         if bulk and (wordpress_page(task["url"]) > 1 or task["kind"] == "cnyes_news" and "startAt=" in task["url"]):
@@ -704,15 +732,36 @@ def fail_discovery(queue: NewsQueue, task: dict, error: NewsError):
     with queue.db:
         queue.db.execute("UPDATE discovery SET due=?,attempts=?,error_code=?,last_checked_at_utc=? WHERE url=?",
                          (time.time() + delay, attempts, error.code, utc_now(), task["url"]))
+        if task['kind'] == 'metadata_feed':
+            from downloader.news_fulltext_metadata_feeds import record_failure_observation
+            record_failure_observation(queue, task, error)
         from downloader.news_fulltext_cnyes_index import ENDPOINT, is_index_task
         if is_index_task(task):
             source = queue.registry.sources[task['provider']]
             fingerprint = getattr(source,'cnyes_index_data_fingerprint','')
             if fingerprint:
-                queue.db.execute('INSERT INTO bulk_endpoint_cooldowns VALUES (?,?,?,?,?,?) '
+                from downloader.news_fulltext_cnyes_index import (
+                    record_request_failure_scope, reconcile_inherited_metadata_deadline,
+                )
+                existing = (queue.db.execute('SELECT * FROM bulk_endpoint_cooldowns WHERE provider=? AND endpoint=?',
+                    (source.provider, ENDPOINT)).fetchone() if error.code == 'cnyes_index_unverified_metadata' else None)
+                deadline = time.time() + delay
+                keep_global = (error.code == 'cnyes_index_unverified_metadata' and existing
+                    and existing['error_code'] != 'cnyes_index_unverified_metadata'
+                    and existing['not_before'] > time.time())
+                if not keep_global:
+                    queue.db.execute('INSERT INTO bulk_endpoint_cooldowns VALUES (?,?,?,?,?,?) '
                     'ON CONFLICT(provider,endpoint) DO UPDATE SET data_fingerprint=excluded.data_fingerprint,'
                     'not_before=max(not_before,excluded.not_before),error_code=excluded.error_code,request_url=excluded.request_url',
-                    (source.provider,ENDPOINT,fingerprint,time.time()+delay,error.code,task['url']))
+                    (source.provider,ENDPOINT,fingerprint,deadline,error.code,task['url']))
+                if error.code == 'cnyes_index_unverified_metadata':
+                    from downloader.news_fulltext_diagnostics import index_failure_metadata
+                    record_request_failure_scope(queue, source, {'provider':source.provider, 'endpoint':ENDPOINT,
+                        'data_fingerprint':fingerprint, 'not_before':deadline,
+                        'error_code':error.code, 'request_url':task['url']},
+                        metadata_diagnostic=index_failure_metadata(queue, task, error))
+                else:
+                    reconcile_inherited_metadata_deadline(queue, source)
         elif error.code in {"bulk_all_items_unusable", "bulk_pagination_no_progress", "bulk_pagination_totals_invalid"}:
             source = queue.registry.sources[task["provider"]]
             if task["kind"] == "cnyes_news" and source.cnyes_apis:
@@ -724,13 +773,16 @@ def fail_discovery(queue: NewsQueue, task: dict, error: NewsError):
             else:
                 queue.db.execute("INSERT OR REPLACE INTO bulk_adapter_cooldowns VALUES (?,?,?,?)",
                                  (source.provider, source.data_fingerprint, time.time() + delay, error.code))
+    if getattr(error, 'failure_response', None) is not None:
+        from downloader.news_fulltext_diagnostics import retain_index_failure_response
+        retain_index_failure_response(queue, task, error)
 
 
 def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: int, max_discovery_requests: int = 64,
               executor=None, max_run_seconds: float | None = None, provider_ids: set[str] | None = None,
               continuous_budgets: bool = False, refresh_metadata=None):
     if provider_ids is not None and (not provider_ids or any(
-            p not in queue.registry.sources or not queue.registry.sources[p].allowed for p in provider_ids)):
+            p not in queue.registry.sources or not queue.registry.sources[p].request_enabled for p in provider_ids)):
         raise ValueError("cycle provider selection must contain authorized, configured providers")
     started, accepted, claimed = time.monotonic(), 0, 0
     http.metrics = queue.metrics
@@ -745,6 +797,8 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     discovery_claimed, discovery_inflight = 0, set()
     article_budget_used, discovery_budget_used, budget_rollovers = 0, 0, 0
     last_maintenance = started
+    from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
+    last_metadata_inventory = started
     last_cached_replay = started - 10
     last_metadata_replay = started
     next_cnyes_work_backfill = started
@@ -753,7 +807,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     pending_records, futures = [], {}
     pending_bytes, pending_raw_bytes, last_flush, last_status = 0, 0, time.monotonic(), 0
     active = {provider: 0 for provider, source in queue.registry.sources.items()
-              if source.allowed and (provider_ids is None or provider in provider_ids)}
+              if source.request_enabled and (provider_ids is None or provider in provider_ids)}
     provider_order = deque(active)
     low_disk, last_disk_check = False, 0
     pool = ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="news-fulltext") if executor is None else nullcontext(executor)
@@ -770,9 +824,17 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                                        or max_discovery_requests > 0 and discovery_budget_used >= max_discovery_requests):
                 article_budget_used = discovery_budget_used = 0
                 budget_rollovers += 1
-            if continuous_budgets and now - last_maintenance >= config.get("service_cycle_seconds", 180):
-                if refresh_metadata:
-                    refresh_metadata()
+            maintenance_due = now - last_maintenance >= config.get('service_cycle_seconds', 180)
+            if (continuous_budgets and refresh_metadata and not http.stop.is_set()
+                    and (max_run_seconds is None or now - started < max_run_seconds) and (
+                    maintenance_due or getattr(queue, 'metadata_inventory_pending', False)
+                    and now - last_metadata_inventory >= METADATA_SLICE_INTERVAL_SECONDS)):
+                # One original 4k-row commit can overrun the soft local budget,
+                # but never ingest the whole large file before HTTP dispatch.
+                refresh_metadata()
+                last_metadata_inventory = time.monotonic()
+                now = last_metadata_inventory
+            if continuous_budgets and maintenance_due and not http.stop.is_set():
                 queue.schedule_recent_rechecks(config["recent_article_recheck_seconds"], config["recent_article_window_days"])
                 seed_discovery(queue)
                 last_maintenance = time.monotonic()
@@ -893,7 +955,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                     if historical_bulk:
                         http.bulk_since_article[provider] = min(config.get("bulk_article_burst", 16),
                                                               http.bulk_since_article.get(provider, 0) + 1)
-                elif max_articles > 0 and (continuous_budgets or article_budget_used < max_articles):
+                elif source.allowed and max_articles > 0 and (continuous_budgets or article_budget_used < max_articles):
                     row = row or queue.claim(provider, config["lease_seconds"],
                                              excluded_hosts=excluded_hosts, excluded_origins=excluded_origins,
                                              missing_body_burst=config.get("missing_body_recheck_burst", 8),
@@ -1023,6 +1085,9 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
             # Even diagnostic work limits of zero must not spin continuously.
             if max_articles == 0 and max_discovery_requests == 0:
                 delay = max(1, delay)
+            if getattr(queue, 'metadata_inventory_pending', False):
+                from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
+                delay = min(delay, METADATA_SLICE_INTERVAL_SECONDS)
             if remaining is not None:
                 delay = min(delay, max(0, duration_seconds - (time.monotonic() - started)))
             if delay:

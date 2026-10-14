@@ -51,6 +51,17 @@ def _keys(value: object) -> set[str]:
     return found
 
 
+def test_taifex_history_has_one_refresh_owner_not_stacked_stale_cache() -> None:
+    calls = []
+    server = SimpleNamespace(taifex_upstream="http://127.0.0.1:8765",
+                             cached_json=lambda **kwargs: calls.append(kwargs))
+    handler = PublicDashboardHandler.__new__(PublicDashboardHandler)
+    handler.server = server
+    handler._api_response("/taifex/api/history", "range=1d")
+    assert calls[0]["cache_key"] == "taifex-history:1d"
+    assert calls[0]["stale_grace_seconds"] == 0.0
+
+
 def test_public_projections_fail_closed_on_non_simulation_payload() -> None:
     with pytest.raises(UnsafePublicDashboardPayload):
         sanitize_taifex_status(
@@ -372,6 +383,7 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                 "public_price_display": {
                     "contract": "public_quote_display_v1",
                     "withheld_fields": ["sizing_open_price"],
+                    "withheld_reasons": {"sizing_open_price": "public_source_not_connected"},
                     "visible_fields": {},
                 },
             }
@@ -406,6 +418,7 @@ def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
                         "public_price_display": {
                             "contract": "public_quote_display_v1",
                             "withheld_fields": ["last_mark_price"],
+                            "withheld_reasons": {"last_mark_price": "public_display_permission_unverified"},
                             "visible_fields": {},
                         }}
 
@@ -998,7 +1011,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f'src="../time-axis.js?v={version}"' in html
     tw_html = (root / "tw_day_trade_dashboard/index.html").read_text(encoding="utf-8")
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in tw_html
-    assert 'src="chart-renderer.js?v=4"' in tw_html
+    assert 'src="chart-renderer.js?v=6"' in tw_html
     assert "https://" not in tw_html and "http://" not in tw_html
 
     shared_javascript = (root / "public_dashboards" / "dashboard-core.js").read_text(
@@ -1080,7 +1093,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "function renderBenchmarks" in tw_javascript
     assert "timeAxis.buildTimeAxis" not in tw_javascript
     assert "new global.uPlot(options, plotData, host)" in tw_chart_javascript
-    assert "function tickPlan(minutes)" in tw_chart_javascript
+    assert "function tickPlan(minutes, maximumTicks = 10)" in tw_chart_javascript
     assert "selectedMinuteMask" in tw_chart_javascript
     assert 'id="detail-start-date" type="date"' in tw_html
     assert 'id="detail-end-date" type="date"' in tw_html
@@ -2368,11 +2381,16 @@ def test_tw_status_registry_generation_invalidates_cache_without_engine_commit(t
         receipt_path(datetime.now(TAIPEI).date().isoformat()).write_text('{"new_source_generation": true}')
         server.tw_status()
         deadline = time.monotonic() + 1.0
-        while len(calls) < 2:
+        # Entering the asynchronous builder is not a cache-commit receipt.
+        # Observe the publication itself before asserting generation change.
+        while True:
+            with server._cache_lock:
+                after = {key for key in server._cache if key.startswith("tw-status:")}
+            if any(key not in before for key in after):
+                break
             assert time.monotonic() < deadline
             time.sleep(0.01)
-        after = {key for key in server._cache if key.startswith("tw-status:")}
-        assert any(key not in before for key in after)
+        assert len(calls) == 2
     finally:
         server.server_close()
 

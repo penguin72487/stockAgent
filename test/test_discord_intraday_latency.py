@@ -42,7 +42,8 @@ def test_restart_recovers_original_observed_clock_not_new_process_wake(monkeypat
 
 
 @pytest.mark.parametrize("at,active,session_open,state,defer", [
-    ("07:30", None, True, "retry", False),
+    ("07:30", None, True, "retry", True),
+    ("08:10", None, True, "retry", False),
     ("09:02", None, True, "retry", True),
     ("09:20", None, True, "retry", False),
     ("09:20", 1., True, "retry", True),

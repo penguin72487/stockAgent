@@ -258,6 +258,139 @@ def _licensed_globalvoices_scope(context, source):
     return True
 
 
+def _index_failure_context(queue, task, error):
+    """Same source, request and strict failure; no I/O, grant or quota change."""
+    context = getattr(error, 'failure_response', None)
+    if error.code != 'cnyes_index_unverified_metadata' or not isinstance(context, FailureResponse):
+        return None
+    from downloader.news_fulltext_cnyes_index import is_index_task, parse_index, validate_request
+    source = queue.registry.require(task['url'])
+    if (not is_index_task(task) or not source.allowed or context.provider != source.provider
+            or context.requested_url != task['url'] or context.response.url != task['url']
+            or context.source_fingerprint != source.cnyes_index_data_fingerprint
+            or context.response.status != 200 or len(context.response.body) > 8 << 20):
+        return None
+    validate_request(task['url'], source)
+    observed = datetime.fromisoformat(context.received_at_utc)
+    if observed.utcoffset() is None:
+        return None
+    try:
+        parse_index(context.response, source)
+    except NewsError as proved:
+        if (proved.code == error.code and getattr(proved, 'cnyes_index_failure_details', None)
+                == getattr(error, 'cnyes_index_failure_details', None)):
+            return source, context, observed, proved.cnyes_index_failure_details, proved.cnyes_index_metadata_raw_allowed is True
+    return None
+
+
+def index_failure_metadata(queue, task, error):
+    """Bounded typed facts in the EXISTING failed-request witness, not raw.
+
+    Raw reservations may legitimately be spent. Error-field reasons must not
+    disappear with them: this small metadata leaf accompanies the canonical
+    source failure update without adding an archive, URL key or raw allowance.
+    """
+    try:
+        proved = _index_failure_context(queue, task, error)
+        if proved is None:
+            return None
+        source, context, observed, detail, raw_allowed = proved
+        from downloader.news_fulltext_cnyes_index import FAILURE_DIAGNOSTIC_CONTRACT_VERSION
+        metadata = {
+            'contract_version': FAILURE_DIAGNOSTIC_CONTRACT_VERSION,
+            'response_sha256': hashlib.sha256(context.response.body).hexdigest(),
+            'response_bytes': len(context.response.body),
+            'validation_observed_at_utc': context.received_at_utc,
+            'authorization_fingerprint': source.authorization_fingerprint,
+            'failure_details': detail, 'failure_details_complete': True,
+            'raw_response_retained': False, 'accepted_body_count': 0,
+            'permission_granted': False, 'publish': False, 'remote_training_export': False,
+            'clock_basis': 'local validator-failure observation; not HTTP-arrival or publication time',
+        }
+        if len(json.dumps(metadata, separators=(',', ':'), allow_nan=False).encode()) > 4096:
+            # The JSON decoder already bounds integer parsing, but malformed
+            # source scalars may still be large. Keep types/reasons and exact
+            # value hashes instead of unbounded numbers or invented values.
+            detail = json.loads(json.dumps(detail))
+            for fields in detail['checked_fields'].values():
+                if 'value' in fields:
+                    fields['value_sha256'] = hashlib.sha256(json.dumps(fields.pop('value')).encode()).hexdigest()
+                    fields['value_omitted_for_bound'] = True
+            detail['news_id_sha256'] = hashlib.sha256(str(detail.pop('news_id')).encode()).hexdigest()
+            metadata['failure_details'] = detail
+            metadata['failure_details_complete'] = False
+        if len(json.dumps(metadata, separators=(',', ':'), allow_nan=False).encode()) > 4096:
+            queue.metrics.count(task['provider'], 'public_index_field_metadata_oversize')
+            return None
+        queue.metrics.count(source.provider, 'public_index_field_metadata_observations')
+        return metadata
+    except Exception:
+        queue.metrics.count(task['provider'], 'public_index_field_metadata_errors')
+        return None  # An invalid diagnostic cannot undo the original source failure.
+
+
+def retain_index_failure_response(queue, task, error):
+    """A rejected public index is metadata, not a body or permission grant.
+
+    Reuse the original provider-general daily/hourly reservations unchanged.
+    This failure-only queue-owner sink receives normal source bytes, validates
+    the exact scoped cause again and preserves it privately. Unknown fields
+    permit only bounded field diagnostics, never their values or raw bodies.
+    """
+    context = getattr(error, 'failure_response', None)
+    if error.code != 'cnyes_index_unverified_metadata' or not isinstance(context, FailureResponse):
+        return
+    try:
+        from downloader.news_fulltext_cnyes_index import FAILURE_DIAGNOSTIC_CONTRACT_VERSION as INDEX_DIAGNOSTIC_VERSION
+        proved = _index_failure_context(queue, task, error)
+        if proved is None:
+            return
+        source, context, observed, detail, raw_allowed = proved
+        budget = _reserve_evidence(queue, source.provider, observed, None)
+        if budget is None:
+            return
+        utc = observed.astimezone(timezone.utc)
+        stamp = utc.strftime('%Y%m%dT%H%M%S%fZ') + '-' + uuid.uuid4().hex[:8]
+        target = queue.root / 'diagnostics' / utc.strftime('%Y%m%d') / source.provider / 'index' / (stamp + '.parquet')
+        identity = {
+            'contract_version': INDEX_DIAGNOSTIC_VERSION, 'provider': source.provider,
+            'budget_contract_version': FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION, **budget,
+            'request_url': task['url'], 'final_url': context.response.url,
+            'request_url_sha256': hashlib.sha256(task['url'].encode()).hexdigest(),
+            'response_sha256': hashlib.sha256(context.response.body).hexdigest(),
+            'response_bytes': len(context.response.body), 'status': 200, 'error_code': error.code,
+            'captured_at_utc': context.received_at_utc,
+            'clock_basis': 'local validator-failure observation; not HTTP-arrival or publication time',
+            'index_fingerprint': source.cnyes_index_data_fingerprint,
+            'authorization_fingerprint': source.authorization_fingerprint,
+            'failure_details_json': json.dumps(detail, sort_keys=True, allow_nan=False),
+            'headers_json': json.dumps({k:v[:2048] for k,v in context.response.headers.items()
+                                       if k in {'content-type','content-length','content-encoding','server'}}),
+            'diagnostic_only': True, 'metadata_only': True, 'accepted_as_article': False,
+            'accepted_body_count': 0, 'publish': False, 'remote_training_export': False,
+            'raw_response_retained': raw_allowed,
+            'retention_basis': ('registered_metadata_endpoint_and_all_reviewed_row_fields'
+                                if raw_allowed else 'metadata_field_diagnostics_only_unreviewed_fields_present'),
+        }
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_write_parquet(target, table_from_records([{**identity,
+            'raw_response_body': context.response.body if raw_allowed else None}]),
+            compression='zstd', compression_level=9, durable=True)
+        target.chmod(0o600)
+        receipt = target.with_suffix('.receipt.json')
+        atomic_write_json(receipt, {**identity, 'path': str(target.relative_to(queue.root)),
+                                   'sha256': sha256_file(target)}, durable=True)
+        receipt.chmod(0o600)
+        queue.metrics.count(source.provider, 'public_index_failure_diagnostics_saved')
+        queue.metrics.count(source.provider, 'public_index_failure_raw_diagnostics_saved' if raw_allowed
+                            else 'public_index_failure_metadata_diagnostics_saved')
+    except Exception:
+        # The authoritative error and source due time were committed first.
+        # Storage failures consume their original reservation, not new requests
+        # or refilled budgets; other providers keep working normally.
+        queue.metrics.count(task['provider'], 'public_index_failure_diagnostic_write_errors')
+
+
 def retain_failure_response(queue, row, error):
     """Best-effort diagnostics; the original failure is persisted first."""
     context = getattr(error, 'failure_response', None)

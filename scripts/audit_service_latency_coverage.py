@@ -2469,7 +2469,38 @@ def _matched_step_timing_summary(
     }
 
 
-def build_report(*, sample_seconds: float) -> dict[str, object]:
+def gpu_snapshot() -> dict[str, object]:
+    """NVML telemetry only; does not initialize CUDA or execute model work."""
+    if shutil.which('nvidia-smi') is None:
+        return {'state': 'unavailable', 'devices': []}
+    fields = ('index', 'name', 'utilization.gpu', 'memory.used', 'memory.total', 'power.draw')
+    try:
+        completed = subprocess.run(['nvidia-smi', '--query-gpu=' + ','.join(fields),
+                                    '--format=csv,noheader,nounits'], check=True, capture_output=True,
+                                   text=True, timeout=5)
+        devices = []
+        for row in csv.reader(completed.stdout.splitlines()):
+            if len(row) != len(fields):
+                raise ValueError('invalid_gpu_telemetry')
+            values = [value.strip() for value in row]
+            def number(value):
+                try:
+                    result = float(value)
+                    return result if math.isfinite(result) and result >= 0 else None
+                except ValueError:
+                    return None
+            devices.append({'index': values[0], 'name': values[1],
+                            'utilization_percent': number(values[2]),
+                            'memory_used_mib': number(values[3]), 'memory_total_mib': number(values[4]),
+                            'power_watts': number(values[5])})
+        return {'state': 'observed', 'devices': devices,
+                'observed_at_utc': datetime.now(UTC).isoformat(),
+                'boundary': 'instantaneous_gpu_telemetry_not_inference_latency_or_cuda_readiness'}
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return {'state': 'unavailable', 'devices': [], 'error_type': type(error).__name__}
+
+
+def build_report(*, sample_seconds: float, include_host_services: bool = False) -> dict[str, object]:
     if not 1 <= sample_seconds <= 60:
         raise ValueError("sample_seconds must be between 1 and 60")
     # Windows/WMI startup checks can take seconds. Keep them outside the
@@ -2479,16 +2510,20 @@ def build_report(*, sample_seconds: float) -> dict[str, object]:
     auxiliary_schedules = auxiliary_schedule_snapshot()
     startup = startup_snapshot()
     product_probes = product_probe_snapshot()
-    before = service_snapshot()
+    before = service_snapshot(include_host_services=True) if include_host_services else service_snapshot()
     process_before = repository_process_snapshot()
+    gpu_before = gpu_snapshot() if include_host_services else None
     time.sleep(sample_seconds)
     repository_processes = repository_process_snapshot()
-    after = service_snapshot()
+    after = service_snapshot(include_host_services=True) if include_host_services else service_snapshot()
+    gpu_after = gpu_snapshot() if include_host_services else None
     host_pressure = pressure_snapshot()
     resources = service_deltas(before, after)
     service_rows = []
     for row in sorted(resources["rows"], key=lambda item: item["unit"]):
         unit = row["unit"]
+        if not unit.startswith('stockagent-'):
+            continue  # Host services get resources only, never project receipts.
         timer = unit.removesuffix(".service") + ".timer"
         path = unit.removesuffix(".service") + ".path"
         completed_attempt = bool(
@@ -2615,6 +2650,18 @@ def build_report(*, sample_seconds: float) -> dict[str, object]:
             process_before, repository_processes, same_host_epoch=True,
         ),
         "host_pressure": host_pressure,
+        "host_running_services": {
+            "state": 'observed' if include_host_services else 'not_requested',
+            "boundary": 'local_system_manager_active_or_activating_units_only_not_remote_or_windows_processes',
+            "sample_seconds": resources['sample_seconds'],
+            "rows": [{key: row.get(key) for key in (
+                'unit', 'ActiveState', 'SubState', 'MainPID', 'InvocationID',
+                'cpu_cores_average', 'MemoryCurrent', 'MemoryAnon', 'MemoryFile',
+                'CgroupIOReadBytesDelta', 'CgroupIOWriteBytesDelta', 'same_process')}
+                for row in resources['rows'] if include_host_services
+                and row.get('ActiveState') in {'active', 'activating'}],
+            "gpu_before": gpu_before, "gpu_after": gpu_after,
+        },
     }
 
 
@@ -2622,8 +2669,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-seconds", type=float, default=10.0)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--include-host-services", action="store_true",
+                        help="Also sample local system-manager service resources and GPU telemetry")
     args = parser.parse_args()
-    report = build_report(sample_seconds=args.sample_seconds)
+    report = build_report(sample_seconds=args.sample_seconds, include_host_services=args.include_host_services)
     output = args.output or REPO_ROOT / "artifacts/benchmarks" / (
         f"service-coverage-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.json"
     )

@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly Shioaji version check and daily 05:30 Taipei SDK maintenance
+
+[Timer]
+OnCalendar=*-*-* *:40:00 Asia/Taipei
+OnCalendar=*-*-* 05:30:00 Asia/Taipei
+Persistent=true
+AccuracySec=30s
+Unit=stockagent-shioaji-sdk-maintenance.service
+
+[Install]
+WantedBy=timers.target

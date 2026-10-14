@@ -78,6 +78,10 @@ elif [[ "${1:-}" == "intraday-timer-only" ]]; then
   # Repair the recurring trigger without replacing a running downloader or
   # reinstalling unrelated, possibly dirty service templates.
   units=(stockagent-registered-data-intraday.timer)
+elif [[ "${1:-}" == "finlab-timer-only" ]]; then
+  # Rearm the FinLab dispatch clock without replacing an existing worker,
+  # quota observer, resource slice, or any other dirty service template.
+  units=(stockagent-finlab-local-refresh.timer)
 elif [[ "${1:-}" == "finlab-only" ]]; then
   # The quota observer is independent of the slow account download worker.
   units=(
@@ -101,7 +105,7 @@ elif [[ "${1:-}" == "public-economic-only" ]]; then
   units=(stockagent-public-economic-history.service stockagent-public-economic-history.timer
          stockagent-openbb-public-priority.service stockagent-openbb-public-priority.timer)
 elif [[ $# -gt 0 ]]; then
-  echo "usage: $0 [resource-slices-only|features-only|crypto-training-only|intraday-timer-only|finlab-only|finmind-only|finmind-announcements-only|taifex-rules-only|keyed-public-catalogs-only|public-economic-only]" >&2
+  echo "usage: $0 [resource-slices-only|features-only|crypto-training-only|intraday-timer-only|finlab-timer-only|finlab-only|finmind-only|finmind-announcements-only|taifex-rules-only|keyed-public-catalogs-only|public-economic-only]" >&2
   exit 2
 fi
 temporary_dir="$(mktemp -d)"
@@ -118,7 +122,7 @@ for unit in "${units[@]}"; do
 done
 
 verify_units=("$temporary_dir"/*)
-if [[ "${1:-}" == "finlab-only" || $# -eq 0 ]]; then
+if [[ "${1:-}" == "finlab-only" || "${1:-}" == "finlab-timer-only" || $# -eq 0 ]]; then
   # Bash parses loops incrementally during execution. Catch a syntax error
   # before installing the timer or starting a multi-hour account download.
   bash -n "$repo_root/scripts/run_finlab_refresh.sh"
@@ -131,7 +135,7 @@ if [[ "${1:-}" == "finmind-only" || $# -eq 0 ]]; then
 fi
 systemd-analyze verify "${verify_units[@]}"
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
-if [[ "${1:-}" != "resource-slices-only" && "${1:-}" != "intraday-timer-only" && "${1:-}" != "finmind-announcements-only" && "${1:-}" != "taifex-rules-only" && "${1:-}" != "keyed-public-catalogs-only" && "${1:-}" != "public-economic-only" ]]; then
+if [[ "${1:-}" != "resource-slices-only" && "${1:-}" != "intraday-timer-only" && "${1:-}" != "finlab-timer-only" && "${1:-}" != "finmind-announcements-only" && "${1:-}" != "taifex-rules-only" && "${1:-}" != "keyed-public-catalogs-only" && "${1:-}" != "public-economic-only" ]]; then
   chmod 0755 \
     "$repo_root/scripts/check_outside_tw_opening_resource_window.py" \
     "$repo_root/scripts/run_outside_tw_opening_resource_window.sh" \
@@ -188,6 +192,17 @@ if [[ "${1:-}" == "intraday-timer-only" ]]; then
     exit 1
   fi
   echo "[registered-data] intraday timer rearmed; other units and running jobs left untouched"
+  exit 0
+fi
+if [[ "${1:-}" == "finlab-timer-only" ]]; then
+  systemctl enable stockagent-finlab-local-refresh.timer
+  systemctl restart stockagent-finlab-local-refresh.timer
+  timer_substate="$(systemctl show stockagent-finlab-local-refresh.timer -p SubState --value)"
+  if [[ "$timer_substate" == "elapsed" ]]; then
+    echo "[registered-data] FinLab timer remains elapsed after restart" >&2
+    exit 1
+  fi
+  echo "[registered-data] FinLab timer rearmed; worker and other units left untouched"
   exit 0
 fi
 if [[ "${1:-}" == "finlab-only" ]]; then

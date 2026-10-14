@@ -162,6 +162,7 @@ def test_official_cache_after_fast_window_reconciles_status_without_redundant_in
     from services.discord_bot import bot as module
     cfg = SimpleNamespace(
         market="test", timezone="Asia/Taipei", day_trade_simulation_enabled=True,
+        config_path="configs/test.yaml",
         signal_kwargs=lambda **kwargs: kwargs,
     )
     status = SimpleNamespace(market_open=False, data=SimpleNamespace(
@@ -177,6 +178,7 @@ def test_official_cache_after_fast_window_reconciles_status_without_redundant_in
     summary = {
         "panel_date": "2026-10-08", "signal_id": "official-close",
         "price_source": price_source, "execution_preview_only": True,
+        "completed_panel_source_fingerprint": "generation-v1" if cached else None,
     }
     result = SimpleNamespace(summary=summary)
     observed, inference = [], []
@@ -188,6 +190,8 @@ def test_official_cache_after_fast_window_reconciles_status_without_redundant_in
     monkeypatch.setattr(module, "_latest_market_signal", lambda _: (tmp_path / "summary.json", summary))
     monkeypatch.setattr(module, "_summary_artifact_path", lambda *_: weights)
     monkeypatch.setattr(module, "_summary_matches_market_deployment", lambda *_: (True, None))
+    monkeypatch.setattr(module, "completed_panel_source_fingerprint", lambda *_, **__: "generation-v1")
+    monkeypatch.setattr(module, "_offhours_gpu_cache_release_allowed", lambda: False)
     monkeypatch.setattr(module, "_market_notice", lambda _: None)
     monkeypatch.setattr(module, "_env_bool", lambda *_: False)
     monkeypatch.setattr(module, "generate_live_signal", lambda **_: inference.append(True) or result)

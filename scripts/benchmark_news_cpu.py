@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import cProfile
 from datetime import datetime
 import hashlib
@@ -413,7 +413,8 @@ def status_projection_replay(root, registry, output_parent, repetitions=7):
         owner = dict(db.execute('SELECT key,value FROM queue_settings'))['current_owner_id']
         q = NewsQueue.__new__(NewsQueue)  # No constructor, migration, owner or lock.
         q.db, q.owner, q.registry = db, owner, registry
-        q.metrics = SimpleNamespace(snapshot=lambda: snapshot['performance'])
+        q.metrics = SimpleNamespace(snapshot=lambda: snapshot['performance'],
+                                    measure=lambda *args, **kwargs: nullcontext())
         q.http_capacity_snapshot = lambda: snapshot.get('http_capacity')
         source_progress = snapshot['original_url_resolution']
         q._original_url_started = monotonic_clock - source_progress['owner_elapsed_seconds']

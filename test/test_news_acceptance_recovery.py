@@ -68,11 +68,11 @@ def test_committed_receipts_are_still_parsed_but_use_one_covering_lookup(config,
     queue, http = accepted_queue(config, tmp_path)
     try:
         reads, statements = [], []
-        original_read = type(tmp_path).read_text
+        original_read = type(tmp_path).read_bytes
         def read(path, *args, **kwargs):
             reads.append(path)
             return original_read(path, *args, **kwargs)
-        monkeypatch.setattr(type(tmp_path), 'read_text', read)
+        monkeypatch.setattr(type(tmp_path), 'read_bytes', read)
         before = queue.db.total_changes
         queue.db.set_trace_callback(statements.append)
         queue.recover_acceptance()
@@ -221,8 +221,8 @@ def test_private_receipt_decoder_preserves_every_legacy_json_value(
         path, relative_receipt = queue.db.execute('SELECT path,receipt_path FROM accepted_batches').fetchone()
         receipt_path = tmp_path / relative_receipt
         raw = '{"parquet_path":' + json.dumps(path) + ',"unchanged_extra":' + extra_json + '}'
-        # Generated fixture only. read_text keeps the original encoding and
-        # newline behavior; no untyped value is narrowed or newly encoded.
+        # Generated fixture only. Original default-text encoding/newline
+        # semantics persist; no untyped value is narrowed or newly encoded.
         receipt_path.write_text(raw)
         seen = []
         original_decode = module.decode_private_json

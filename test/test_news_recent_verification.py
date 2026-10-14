@@ -298,7 +298,7 @@ def test_selected_article_audit_never_fetches_or_takes_writer_lock(config, tmp_p
         queue.accept([fetch_article(http, queue.claim("publisher", 300))])
         before = tuple(queue.db.execute("SELECT key,value FROM queue_settings ORDER BY key"))
         result = audit_selected(tmp_path, ["https://publisher.test/a"])
-        assert result['contract_version'] == 7
+        assert result['contract_version'] == 8
         assert result["accepted"] and result["batch_proof"]["body_versions"] == 1
         assert result['articles'][0]['requested_url'] == result['articles'][0]['final_url'] == 'https://publisher.test/a'
         assert result["articles"][0]["body_characters"] > 100

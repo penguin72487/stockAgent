@@ -9,6 +9,16 @@ selected_python="$(resolve_fintech_python)"
 history_cache_dir="${SHIOAJI_TAIFEX_DASHBOARD_HISTORY_CACHE_DIR:-artifacts/cache/shioaji_taifex_volatility_dashboard}"
 mkdir -p "$history_cache_dir"
 export STOCKAGENT_TAIFEX_DASHBOARD_CACHE_DIR="$history_cache_dir"
+# Only this read-only display owner opts in. Capture, paper accounting and
+# training keep their original sources; set 0 to use the canonical raw reader.
+export STOCKAGENT_TAIFEX_HISTORY_COLUMN_CACHE="${STOCKAGENT_TAIFEX_HISTORY_COLUMN_CACHE:-1}"
+# Measured on this host's complete seven-range workflow, not a global CPU cap.
+# Keep an explicit operator pool override; acquisition/training are unaffected.
+export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-${STOCKAGENT_TAIFEX_DASHBOARD_POLARS_THREADS:-4}}"
+# Reclaim this display's unused native pages after computation. Measured over
+# all seven curves, ten seconds of idle and an exact subsequent warm read.
+# Preserve explicit overrides; never change the global acquisition allocator.
+export _RJEM_MALLOC_CONF="${_RJEM_MALLOC_CONF:-${STOCKAGENT_TAIFEX_DASHBOARD_ALLOCATOR_CONF:-muzzy_decay_ms:1000}}"
 exec "$selected_python" scripts/serve_shioaji_taifex_simulation_dashboard.py \
   --host "${SHIOAJI_TAIFEX_DASHBOARD_HOST:-127.0.0.1}" \
   --port "${SHIOAJI_TAIFEX_DASHBOARD_PORT:-8765}" \

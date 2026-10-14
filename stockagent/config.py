@@ -2747,6 +2747,8 @@ class TrainingConfig:
     cache_eval_tensors_on_gpu: bool = True
     cache_train_features_in_amp_dtype: bool = False
     learning_rate: float = 1e-3
+    optimizer_name: str = "adamw"
+    optimizer_options: dict[str, Any] = field(default_factory=dict)
     enable_lr_scheduler: bool = True
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
     lr_scheduler_t_max: int = 0
@@ -2937,6 +2939,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
 
     training = raw.setdefault("training", {})
+    from stockagent.training.optimizer_config import normalized_optimizer_options
+    optimizer_name = str(training.get("optimizer_name", "adamw")).strip().lower()
+    optimizer_options = training.get("optimizer_options", {})
+    normalized_optimizer_options(optimizer_name, optimizer_options)
+    training["optimizer_name"] = optimizer_name
+    training["optimizer_options"] = optimizer_options
     if "eval_backtest_engine" in training:
         raise ValueError(
             "training.eval_backtest_engine has been removed; "
@@ -5879,6 +5887,8 @@ def load_config(
                 "cache_train_features_in_amp_dtype"
             ],
             learning_rate=training_raw["learning_rate"],
+            optimizer_name=training_raw["optimizer_name"],
+            optimizer_options=training_raw["optimizer_options"],
             enable_lr_scheduler=training_raw["enable_lr_scheduler"],
             lr_scheduler=training_raw["lr_scheduler"],
             lr_scheduler_t_max=training_raw["lr_scheduler_t_max"],

@@ -1,11 +1,23 @@
 import json
 from datetime import date
+import os
+from pathlib import Path
+import subprocess
 import pytest
 
 from scripts import update_tw_day_trade_factorized_live as updater
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 from stockagent.live.market_status import TwStockDayDecision
 from scripts import prepare_tw_day_trade_factorized_live as builder
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native WSL direct executable entrypoint")
+def test_native_updater_is_executable_and_help_does_not_launch_the_data_owner():
+    path = Path(updater.__file__).resolve()
+    assert path.stat().st_mode & 0o111, "configured direct updater requires tracked executable mode"
+    result = subprocess.run([str(path), "--help"], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert "--phase {preopen,completed}" in result.stdout
 
 
 def _clock(monkeypatch):

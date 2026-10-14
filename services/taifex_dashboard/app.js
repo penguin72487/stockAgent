@@ -39,6 +39,8 @@ let lastHistoryEtag = "";
 let historyPayloadCache = new Map();
 let strategySearchFrame = null;
 let selectedTimeRange = "1d";
+let historyRetryTimer = null;
+let historyRetryCount = 0;
 
 try { selectedTimeRange = localStorage.getItem("taifex-equity-time-range") || "1d"; } catch (_error) { /* storage can be disabled */ }
 if (!(selectedTimeRange in TIME_RANGES)) selectedTimeRange = "1d";
@@ -103,6 +105,8 @@ function engineLabel(value) {
     intraday_active: "日內策略運作中",
     intraday_flat_for_day_close: "日盤已平倉",
     waiting_for_bootstrap: "等待新完整週期",
+    blocked_subscription_bootstrap_settlement: "結算／啟動阻擋",
+    waiting_expired_cycle_futures_reduction: "舊期貨減倉中",
     waiting: "等待合法交易時段",
     active: "策略運作中",
   };
@@ -164,6 +168,9 @@ function healthMessage(snapshot) {
   }
   if (snapshot.engine_status === "waiting_for_bootstrap") {
     return `正常等待：安全規則禁止補建已開始的週期，需等 ${snapshot.bootstrap_after_date} 結算後的新完整週期。`;
+  }
+  if (snapshot.engine_status === "waiting_expired_cycle_futures_reduction") {
+    return "過期期權已依官方資料結算；舊期貨仍等待同一合約的新鮮五檔報價減倉，未完成前不開新週期。這是模擬帳本修復，不是券商成交。";
   }
   if (snapshot.health === "active") return "週期已開啟；策略、行情與理想帳持續更新。";
   return `引擎狀態正常：${engineLabel(snapshot.engine_status)}。`;
@@ -267,7 +274,8 @@ function renderCycle(snapshot) {
   setText("day-official-session", "08:30–08:45 盤前 · 08:45–13:45 連續");
   setText("intersession-gap", "13:45–14:50 休市監控");
   setText("night-official-session", "14:50–15:00 盤前 · 15:00–05:00 夜盤");
-  setText("current-trading-date", snapshot.current_trading_date || "—");
+  setText("current-trading-date", snapshot.observed_trading_date || "—");
+  byId("current-trading-date").title = `最後策略快照交易日：${snapshot.current_trading_date || "—"}`;
   setText("decision-interval", snapshot.intraday_decision_interval_seconds == null ? "—" : `${snapshot.intraday_decision_interval_seconds} 秒`);
   setText("day-session-times", `${snapshot.intraday_entry_cutoff || "—"} / ${snapshot.intraday_flatten_time || "—"}`);
   setText("night-session-times", `${snapshot.night_entry_cutoff || "—"} / ${snapshot.night_flatten_time || "—"}`);
@@ -700,11 +708,28 @@ function renderChart(history) {
     && row.total_equity_twd != null
     && Number.isFinite(Number(row.total_equity_twd))
   ));
+  svg.dataset.range = selectedTimeRange;
+  svg.dataset.strategy = selectedStrategy;
+  svg.dataset.coverageEndNs = String(rows.at(-1)?.decision_ts_ns || 0);
+  const sourceMs = Date.parse(lastSnapshot?.source_updated_at_utc || "");
+  const endMs = rows.length ? Number(rows.at(-1).decision_ts_ns) / 1e6 : NaN;
+  const lagSeconds = Math.max(0, (sourceMs - endMs) / 1000);
+  const lagLimit = Math.max(120, 2 * Number(lastSnapshot?.intraday_decision_interval_seconds || 60));
+  const behind = Number.isFinite(lagSeconds) && lagSeconds > lagLimit;
+  const historyStatus = byId("history-status");
+  historyStatus.dataset.state = rows.length < 2 ? "waiting" : behind ? "degraded" : "ready";
+  historyStatus.textContent = !Number.isFinite(endMs)
+    ? "曲線尚在準備；即時策略狀態與歷史曲線分開驗證。"
+    : behind
+      ? `曲線尚未追上來源，落後 ${formatAge(lagSeconds)}；保留舊曲線並自動重試，不代表即時曲線已恢復。`
+      : `曲線最後紀錄 ${localTime(new Date(endMs).toISOString())}；每分鐘原位更新。`;
   if (rows.length < 2) {
     setText("chart-note", `${TIME_RANGE_LABELS[selectedTimeRange]}內資料點不足；至少累積兩個每分鐘 mark 後才繪圖。`);
     return;
   }
-  const width = 900, height = 300, left = 76, right = 22, top = 22, bottom = 70;
+  const width = Math.max(280, svg.getBoundingClientRect().width || 900);
+  const height = 300, left = width < 500 ? 65 : 76, right = 22, top = 22, bottom = 70;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   const values = rows.map((row) => Number(row.total_equity_twd));
   const capitalValues = rows.map((row) => Number(row.cumulative_contributed_capital_twd));
   const finiteCapitalValues = capitalValues.filter(Number.isFinite);
@@ -730,7 +755,7 @@ function renderChart(history) {
     const value = minY + (maxY - minY) * i / 4;
     const yPos = y(value);
     svg.appendChild(svgNode("line", { x1: left, y1: yPos, x2: width - right, y2: yPos, class: "chart-grid" }));
-    svg.appendChild(svgNode("text", { x: left - 10, y: yPos + 4, "text-anchor": "end", class: "chart-label" }, money.format(value)));
+    svg.appendChild(svgNode("text", { x: left - 10, y: yPos + 4, "text-anchor": "end", class: "chart-label" }, (width < 500 ? compactMoney : money).format(value)));
   }
   if (finiteCapitalValues.length === rows.length) {
     const capitalPoints = rows.map((row, index) => `${x(row).toFixed(2)},${y(capitalValues[index]).toFixed(2)}`).join(" ");
@@ -768,6 +793,16 @@ function renderChart(history) {
     ? `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}${missingIntervalNote}${replayNote}${coverageNote}；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
     : `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}${missingIntervalNote}${replayNote}${coverageNote}；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
 }
+
+let chartResizeFrame = null;
+const chartResizeObserver = new ResizeObserver(() => {
+  if (chartResizeFrame != null) cancelAnimationFrame(chartResizeFrame);
+  chartResizeFrame = requestAnimationFrame(() => {
+    chartResizeFrame = null;
+    if (lastSnapshot) renderChart(lastSnapshot.history);
+  });
+});
+chartResizeObserver.observe(byId("equity-chart"));
 
 function renderCounts(counts) {
   setText("count-trades", money.format(counts.ideal_trades));
@@ -865,6 +900,8 @@ function applyHistoryPayload(payload, etag = "") {
 
 async function refreshHistory({preferCache = false} = {}) {
   if (document.hidden) return;
+  if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+  historyRetryTimer = null;
   const requestedRange = selectedTimeRange;
   const cached = historyPayloadCache.get(requestedRange);
   if (preferCache) {
@@ -883,6 +920,11 @@ async function refreshHistory({preferCache = false} = {}) {
       cache: "default",
       signal: request.signal,
     });
+    if (response.status === 503 && request.isCurrent()) {
+      Dashboard.cancelResponse(response);
+      scheduleHistoryRetry(requestedRange);
+      return;
+    }
     const etag = response.headers.get("ETag") || "";
     if (!request.isCurrent() || requestedRange !== selectedTimeRange) {
       Dashboard.cancelResponse(response);
@@ -891,18 +933,36 @@ async function refreshHistory({preferCache = false} = {}) {
     if (etag && cached?.etag === etag) {
       Dashboard.cancelResponse(response);
       cached.receivedAt = Date.now();
+      historyRetryCount = 0;
+      applyHistoryPayload(cached.payload, cached.etag);
       return;
     }
     const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (!request.isCurrent() || requestedRange !== selectedTimeRange) return;
     historyPayloadCache.set(requestedRange, {payload, etag, receivedAt: Date.now()});
+    historyRetryCount = 0;
     applyHistoryPayload(payload, etag);
   } catch (error) {
     if (!request.isCurrent() || error?.name === "AbortError") return;
+    if (error?.name === "TimeoutError") {
+      scheduleHistoryRetry(requestedRange);
+      return;
+    }
     setText("curve-wall-note", `曲線歷史暫時無法更新：${error.message}`);
   } finally {
     request.finish();
   }
+}
+
+function scheduleHistoryRetry(range) {
+  const delayMs = Math.min(1500 * 2 ** Math.min(historyRetryCount++, 3), 12000);
+  const status = byId("history-status");
+  status.dataset.state = "degraded";
+  status.textContent = "來源曲線尚在建置或暫時無法取得；保留已驗證資料，自動重試，不代表建置完成。";
+  historyRetryTimer = setTimeout(() => {
+    historyRetryTimer = null;
+    if (selectedTimeRange === range) void refreshHistory();
+  }, delayMs);
 }
 
 byId("strategy-select").addEventListener("change", (event) => {
@@ -976,6 +1036,7 @@ byId("equity-time-range").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-range]");
   if (!button || !(button.dataset.range in TIME_RANGES)) return;
   selectedTimeRange = button.dataset.range;
+  historyRetryCount = 0;
   try { localStorage.setItem("taifex-equity-time-range", selectedTimeRange); } catch (_error) { /* optional */ }
   syncTimeRangeControl();
   void refreshHistory({preferCache: true});

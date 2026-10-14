@@ -34,6 +34,183 @@ def test_due_failed_missing_body_gets_pinned_read_only_grant(queue):
     assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone()) == before
 
 
+@pytest.mark.parametrize('code', ['article_attribution_not_verified', 'article_title_not_verified', 'article_identity_not_verified'])
+def test_attribution_failure_requires_explicit_exact_code_and_keeps_original_head(queue, code):
+    with queue.db:
+        queue.db.execute('UPDATE articles SET state=?,error_code=? WHERE url=?', (code, code, URL))
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    with pytest.raises(ValueError, match='probe_no_longer_a_due_failed_missing_body'):
+        require_current_missing_body_failures(queue.root, [URL], queue.registry)
+    assert select_current_failure_urls(queue.root, 'publisher', queue.registry,
+                                       maximum=1, failure_code=code) == [URL]
+    assert require_current_missing_body_failures(queue.root, [URL], queue.registry,
+                                                 failure_code=code) == [{k: before[k] for k in (
+        'provider', 'url', 'state', 'error_code', 'body_sha256', 'due', 'last_checked_at_utc', 'lease_owner', 'lease_until')}]
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone()) == before
+
+
+@pytest.mark.parametrize('code', ['article_attribution_not_verified', 'article_title_not_verified', 'article_identity_not_verified'])
+@pytest.mark.parametrize('changes', [
+    {'state': 'complete'}, {'body_sha256': 'a'*64}, {'state': 'pending'}, {'state': 'inflight'},
+    {'due': 1e12}, {'lease_owner': 'other'}, {'lease_until': 1e12},
+    {'error_code': 'http_403'}, {'error_code': 'http_429'}, {'error_code': 'paywall_or_login'},
+    {'last_checked_at_utc': None},
+])
+def test_attribution_failure_diagnosis_never_grants_saved_refused_future_or_leased_work(queue, changes, code):
+    with queue.db:
+        queue.db.execute('UPDATE articles SET state=?,error_code=? WHERE url=?', (code, code, URL))
+        for field, value in changes.items():
+            queue.db.execute(f'UPDATE articles SET {field}=? WHERE url=?', (value, URL))
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    with pytest.raises(ValueError, match='probe_no_longer_a_due_failed_missing_body'):
+        require_current_missing_body_failures(queue.root, [URL], queue.registry,
+                                             failure_code=code)
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone()) == before
+
+
+@pytest.mark.parametrize('code', ['http_403', 'http_429', 'paywall_or_login', 'transport_error', None])
+def test_failure_probe_code_cannot_become_an_arbitrary_retry_grant(queue, code):
+    with pytest.raises(ValueError, match='unsupported_missing_article_failure_probe'):
+        require_current_missing_body_failures(queue.root, [URL], queue.registry, failure_code=code)
+    with pytest.raises(ValueError, match='unsupported_missing_article_failure_probe'):
+        select_current_failure_urls(queue.root, 'publisher', queue.registry, failure_code=code)
+
+
+@pytest.mark.parametrize('code', ['body_not_found', 'article_attribution_not_verified', 'article_title_not_verified', 'article_identity_not_verified'])
+def test_future_failure_observation_cannot_grant_a_request_even_with_due_zero(queue, code):
+    future = datetime.fromtimestamp(time.time()+600, timezone.utc).isoformat()
+    with queue.db:
+        queue.db.execute('UPDATE articles SET state=?,error_code=?,last_checked_at_utc=?,due=0 WHERE url=?',
+                         (code, code, future, URL))
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    with pytest.raises(ValueError, match='probe_failure_observation_clock_not_verified'):
+        require_current_missing_body_failures(queue.root, [URL], queue.registry, failure_code=code)
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone()) == before
+
+
+@pytest.mark.parametrize('code', ['article_attribution_not_verified', 'article_title_not_verified', 'article_identity_not_verified'])
+@pytest.mark.parametrize('flags', [[], ['--retain-reviewed-response', '--require-current-missing-body-failure']])
+def test_attribution_cli_requires_pinned_current_head_and_metadata_only_before_any_http(queue, monkeypatch, flags, code):
+    from scripts import probe_news_sources as probes
+    monkeypatch.setattr(probes, 'NewsHTTP', lambda *_a, **_k: pytest.fail('invalid grant created HTTP owner'))
+    with pytest.raises(SystemExit):
+        main(['--probe', URL, '--failure-code', code,
+              '--output', str(queue.root/'invalid-attribution.json'), *flags])
+    assert not (queue.root/'invalid-attribution.json').exists()
+
+
+@pytest.mark.parametrize('code', ['article_attribution_not_verified', 'article_title_not_verified', 'article_identity_not_verified'])
+def test_explicit_author_diagnosis_uses_one_request_and_never_accepts_or_retains_body(queue, monkeypatch, capsys, code):
+    from types import SimpleNamespace
+    from downloader.news_fulltext_http import Response
+    from downloader.news_fulltext_policy import NewsError
+    from scripts import probe_news_sources as probes
+    with queue.db:
+        queue.db.execute('UPDATE articles SET state=?,error_code=? WHERE url=?', (code, code, URL))
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    calls, closed = [], []
+    def get(url):
+        calls.append(url)
+        return Response(url, 200, {'content-type': 'text/html'},
+                        b'<html><body><article><h1>Public headline</h1>'
+                        b'<p>BODY SHOULD NEVER BE RETAINED OR PRINTED</p></article></body></html>')
+    def reject_author(*_args, **_kwargs):
+        raise NewsError(code)
+    fake = SimpleNamespace(registry=queue.registry, provider_not_before={}, robot_delays={},
+        metrics=SimpleNamespace(snapshot=lambda: {}), get=get, close=lambda: closed.append(True))
+    monkeypatch.setattr(probes, 'load_config', lambda _p: ({'root': '.', 'workers': 1}, queue.registry, queue.root))
+    monkeypatch.setattr(probes, 'NewsHTTP', lambda *_a, **_k: fake)
+    monkeypatch.setattr(probes, 'extract_article', reject_author)
+    output = queue.root/'author-metadata.json'
+    assert main(['--probe', URL, '--failure-code', code,
+                 '--require-current-missing-body-failure', '--output', str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert calls == [URL] and closed == [True]
+    assert result['failure_probe_code'] == code
+    assert result['probes'][0]['extraction_error'] == code
+    assert result['current_failed_missing_body_preflight'][0]['last_checked_at_utc'] == before['last_checked_at_utc']
+    assert 'BODY SHOULD' not in output.read_text() and 'BODY SHOULD' not in capsys.readouterr().out
+    assert not list(queue.root.rglob('*.parquet')) and not (queue.root/'private-source-diagnostics').exists()
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone()) == before
+
+
+def test_parser_location_never_exports_traceback_message_locals_or_untrusted_paths():
+    from downloader.news_fulltext_policy import NewsError
+    from scripts.probe_news_sources import extraction_failure_location
+    private_value = 'untrusted secret query and body text'
+    try:
+        raise NewsError(private_value)
+    except NewsError as error:
+        result = extraction_failure_location(error)
+    assert result['sites'] == []
+    assert not result['source_text_or_locals_exported']
+    assert private_value not in json.dumps(result)
+    assert str(__file__) not in json.dumps(result)
+
+
+@pytest.mark.parametrize('change', ['wrong_canonical', 'wrong_id', 'wrong_og'])
+def test_actual_native_identity_error_has_code_sites_not_source_prose(tmp_path, change):
+    from test_news_cnyes_canonical_alias import MOBILE, TITLE, AUTHOR, mobile_page
+    from bs4 import BeautifulSoup
+    from downloader.news_fulltext_policy import NewsError, extract_article
+    from scripts.probe_news_sources import extraction_failure_location
+    # Use the production registry rather than a synthetic filename/traceback.
+    from downloader.news_fulltext import load_config
+    from pathlib import Path
+    _cfg, registry, _repo = load_config(Path('configs/news_fulltext.json'))
+    source = registry.sources['cnyes']
+    payload = mobile_page(changes={'newsId': 43}) if change == 'wrong_id' else mobile_page()
+    if change != 'wrong_id':
+        soup = BeautifulSoup(payload, 'lxml')
+        selector, attribute = ('link[rel="canonical"]', 'href') if change == 'wrong_canonical' else (
+            'meta[property="og:url"]', 'content')
+        soup.select_one(selector)[attribute] = MOBILE + '0'
+        payload = str(soup).encode()
+    with pytest.raises(NewsError, match='article_identity_not_verified') as caught:
+        extract_article(payload, source, page_url=MOBILE)
+    result = extraction_failure_location(caught.value)
+    assert result['sites'][-1]['module'] == 'news_fulltext_publishers.py'
+    assert result['sites'][-1]['function'] == '_cnyes_native_article_identity'
+    assert result['sites'][-1]['line'] > 0 and len(result['sites']) <= 8
+    assert result['line_numbers_are_code_generation_local'] and not result['source_text_or_locals_exported']
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert TITLE not in encoded and AUTHOR not in encoded and MOBILE not in encoded
+    assert str(tmp_path) not in encoded and '/root/' not in encoded
+
+
+@pytest.mark.parametrize('kind', ['paragraph_hidden', 'container_hidden', 'registered_ad_hidden'])
+def test_trusted_visibility_failure_exports_flags_not_hidden_text_attrs_or_links(kind):
+    from bs4 import BeautifulSoup
+    from downloader.news_fulltext import load_config
+    from downloader.news_fulltext_policy import NewsError, extract_article
+    from pathlib import Path
+    from scripts.probe_news_sources import extraction_failure_location
+    from test_news_cnyes_canonical_alias import MOBILE, mobile_page
+    _cfg, registry, _repo = load_config(Path('configs/news_fulltext.json'))
+    soup = BeautifulSoup(mobile_page(), 'lxml')
+    container = soup.select_one('#article-container')
+    private_text = 'PRIVATE HIDDEN AD TEXT'
+    if kind == 'registered_ad_hidden':
+        ad = BeautifulSoup('<div id="div-gpt-ad-cnyes_news_article_42" hidden><p>'
+                           + private_text + '</p></div>', 'lxml').div
+        container.append(ad)
+    elif kind == 'container_hidden':
+        container['hidden'] = ''
+    else:
+        container.p['hidden'] = ''
+    with pytest.raises(NewsError, match='article_identity_not_verified') as caught:
+        extract_article(str(soup).encode(), registry.sources['cnyes'], page_url=MOBILE)
+    value = extraction_failure_location(caught.value)
+    flags = value['visibility']
+    assert value['contract_version'] == 2 and flags['refusing_hidden']
+    assert flags['within_registered_cnyes_ad_slot'] is (kind == 'registered_ad_hidden')
+    assert flags['candidate_tag'] == ('div' if kind == 'container_hidden' else 'p')
+    assert flags['candidate_text_characters'] > 0
+    encoded = json.dumps(value, ensure_ascii=False)
+    assert private_text not in encoded and 'div-gpt-ad-cnyes_news_article_42' not in encoded
+    assert MOBILE not in encoded and 'visibility:hidden' not in encoded
+
+
 @pytest.mark.parametrize('column,value', [('body_sha256', 'a' * 64), ('state', 'complete'),
     ('state', 'pending'), ('state', 'inflight'), ('state', 'waiting_cohort'),
     ('state', 'source_article_empty_template'), ('error_code', 'http_403'),

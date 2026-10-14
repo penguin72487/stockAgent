@@ -171,3 +171,142 @@ def test_public_disclosure_notice_is_not_a_mobile_hidden_subtitle():
         assert 'id="quote-display-notice" class="subtitle' not in html
     shared = (root / "services/public_dashboards/dashboard-core.css").read_text(encoding="utf-8")
     assert ".quote-display-notice {" in shared
+
+
+def paper_position(**changes):
+    return {
+        "symbol": "2330", "market": "tw_day_trade", "session_date": "2026-10-13",
+        "entry_at": "2026-10-13T09:01:00+08:00", "entry_price": 112.123456789,
+        "inventory_basis_price": 112.123456789, "filled_shares": 3000, "signed_shares": 0,
+        "exit_price": 115.5, "last_exit_price": 115.5,
+        "exit_at": "2026-10-13T11:00:00+08:00", "last_exit_at": "2026-10-13T11:00:00+08:00",
+        "status": "closed", "entry_price_source": "shioaji:historical_kbar_0901_minute_close",
+        "last_mark_price": 116.0, "bid": 115.5, "ask": 116.0,
+        "reconciled_total_net_pnl_twd": 9000.12345,
+        **changes,
+    }
+
+
+@pytest.mark.parametrize("field", ["entry_price", "inventory_basis_price", "exit_price", "last_exit_price"])
+def test_owner_reports_preserve_original_price_and_explicit_paper_evidence(field):
+    row = paper_position()
+    before = deepcopy(row)
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    price, proof = policy.transaction_report_price(row, field, row[field], record_kind="paper_position", now=NOW)
+    assert price == row[field]
+    assert proof["publication_basis"] == quotes.PAPER_REPORT_CONTRACT
+    assert proof["evidence_kind"] == "paper_fill"
+    assert proof["broker_execution_verified"] is False
+    assert "license_reference" not in proof
+    assert row == before
+
+
+@pytest.mark.parametrize("change", [
+    {"filled_shares": 0}, {"filled_shares": True}, {"filled_shares": 0.5},
+    {"entry_at": None}, {"entry_at": "2026-10-13T09:01:00"},
+    {"entry_at": "2026-10-13T13:00:01+08:00"}, {"session_date": "2026-10-12"},
+    {"symbol": None}, {"entry_price": True}, {"entry_price": float("nan")},
+    {"entry_price": float("inf")}, {"entry_price": -1},
+])
+def test_owner_reports_do_not_invent_fills_or_clocks(change):
+    row = paper_position(**change)
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    assert policy.transaction_report_price(row, "entry_price", row["entry_price"], record_kind="paper_position", now=NOW) is None
+
+
+@pytest.mark.parametrize("field", ["bid", "ask", "last_mark_price", "open", "close", "sizing_open_price",
+                                    "take_profit_price", "order_limit_price", "price"])
+def test_own_transaction_report_is_not_a_blanket_quote_grant(field):
+    row = paper_position(**{field: 112.0, "public_display_authorized": True})
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    assert policy.transaction_report_price(row, field, 112.0, record_kind="paper_position", now=NOW) is None
+    assert quotes.PublicQuoteDisplayPolicy().transaction_report_price(row, "entry_price", row["entry_price"], record_kind="paper_position", now=NOW) is None
+    assert policy.transaction_report_price(row, "entry_price", row["entry_price"], record_kind=None, now=NOW) is None
+
+
+def test_only_recorded_partial_exit_is_disclosed_before_position_is_closed():
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    row = paper_position(status="open", signed_shares=1000)
+    assert policy.transaction_report_price(row, "last_exit_price", row["last_exit_price"], record_kind="paper_position", now=NOW)
+    assert policy.transaction_report_price(row, "exit_price", row["exit_price"], record_kind="paper_position", now=NOW) is None
+    for change in ({"last_exit_at": None}, {"last_exit_at": "2026-10-13T09:00:00+08:00"},
+                   {"last_exit_at": "2026-10-13T13:00:01+08:00"}, {"signed_shares": 3000}):
+        invalid = {**row, **change}
+        assert policy.transaction_report_price(invalid, "last_exit_price", invalid["last_exit_price"], record_kind="paper_position", now=NOW) is None
+
+
+@pytest.mark.parametrize("sanitizer", [public.sanitize_tw_status, public.sanitize_tw_positions, public.sanitize_tw_signals])
+def test_public_endpoints_use_trusted_record_context_without_mutation_or_raw_quote_leak(monkeypatch, sanitizer):
+    monkeypatch.setattr(public, "public_quote_display_policy", lambda: quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True))
+    position = paper_position()
+    row = position if sanitizer is not public.sanitize_tw_signals else {
+        "symbol": position["symbol"], "market": position["market"], "session_date": position["session_date"],
+        "filled_shares": position["filled_shares"], "execution_price": position["entry_price"], "position": position,
+        "bid": 111.0, "ask": 112.0,
+    }
+    payload = {"simulation_only": True, "production_order_possible": False, "rows": [row], "positions": [row]}
+    before = deepcopy(payload)
+    out = sanitizer(payload)
+    published = out["positions" if sanitizer is public.sanitize_tw_status else "rows"][0]
+    if sanitizer is public.sanitize_tw_signals:
+        assert published["execution_price"] == position["entry_price"]
+        assert published["bid"] is None and published["ask"] is None
+        published = published["position"]
+    assert published["entry_price"] == position["entry_price"]
+    assert published["exit_price"] == position["exit_price"]
+    assert published["last_mark_price"] is None
+    assert published["reconciled_total_net_pnl_twd"] == position["reconciled_total_net_pnl_twd"]
+    assert payload == before
+    # A direct arbitrary quote mapping cannot opt into the owner-report scope.
+    assert public._scrub_public_value({**position, "record_kind": "paper_position"})["entry_price"] is None
+
+
+def test_record_context_does_not_propagate_into_nested_quote_mappings(monkeypatch):
+    monkeypatch.setattr(public, "public_quote_display_policy", lambda: quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True))
+    row = {**paper_position(), "quotes": [paper_position()]}
+    result = public._scrub_public_value(row, record_kind="paper_position")
+    assert result["entry_price"] == row["entry_price"]
+    assert result["quotes"][0]["entry_price"] is None
+
+
+def test_signal_price_requires_matching_recorded_position_not_signal_clock_alone():
+    position = paper_position()
+    row = {"symbol": position["symbol"], "market": position["market"], "session_date": position["session_date"],
+           "signal_at": "2026-10-13T09:00:00+08:00", "filled_shares": 1000,
+           "execution_price": position["entry_price"], "position": position}
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    assert policy.transaction_report_price(row, "execution_price", row["execution_price"], record_kind="paper_signal", now=NOW)
+    for change in ({"position": None}, {"symbol": "0050"}, {"market": "other"}, {"filled_shares": 0},
+                   {"filled_shares": 4000}, {"execution_price": 112.0},
+                   {"position": {**position, "filled_shares": 0}}):
+        invalid = {**row, **change}
+        assert policy.transaction_report_price(invalid, "execution_price", invalid["execution_price"], record_kind="paper_signal", now=NOW) is None
+
+
+def test_order_prices_cannot_become_own_fills_and_fill_event_keeps_its_original_clock(monkeypatch):
+    monkeypatch.setattr(public, "public_quote_display_policy", lambda: quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True))
+    row = {"symbol": "2330", "event_kind": "fill", "simulation_only": True, "status": "filled",
+           "quantity": 1000, "price": 112.123456789, "recorded_at": "2026-10-13T11:02:00+08:00"}
+    out = public.sanitize_tw_events({"simulation_only": True, "production_order_possible": False,
+                                   "rows": [row, {**row, "event_kind": "order"}]})["rows"]
+    assert out[0]["price"] == row["price"] and out[1]["price"] is None
+    assert out[0]["public_price_display"]["visible_fields"]["price"]["recorded_at"] == row["recorded_at"]
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    for change in ({"quantity": 0}, {"simulation_only": False}, {"status": "pending"}, {"recorded_at": None}):
+        invalid = {**row, **change}
+        assert policy.transaction_report_price(invalid, "price", invalid["price"], record_kind="paper_event", now=NOW) is None
+
+
+@pytest.mark.parametrize("config", [None, {"enabled": True}, {"enabled": "true", "contract": quotes.PAPER_REPORT_CONTRACT},
+                                   {"enabled": True, "contract": quotes.PAPER_REPORT_CONTRACT, "record_scope": "all_quotes"}])
+def test_malformed_owner_report_config_cannot_expand_publication_scope(tmp_path, monkeypatch, config):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps({"schema_version": 1, "contract": quotes.CONTRACT,
+        "default_policy": "withhold_without_verified_public_display_grant", "authorized_sources": [],
+        "owner_transaction_reports": config}))
+    monkeypatch.setattr(quotes, "_POLICY_PATH", policy_path)
+    quotes.public_quote_display_policy.cache_clear()
+    try:
+        assert quotes.public_quote_display_policy().paper_transaction_reports is False
+    finally:
+        quotes.public_quote_display_policy.cache_clear()

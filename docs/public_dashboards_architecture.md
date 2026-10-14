@@ -60,6 +60,22 @@ services/public_dashboards/dashboard-core.js
 - API 時間一律附時區或明確標示 UTC；瀏覽器顯示轉為 `Asia/Taipei`。
 - 所有公開 API 回應根節點必須是 JSON object。錯誤回應不得被當成正常資料繼續渲染。
 
+### 價格發布與交易報告
+
+原始行情轉載與使用者的交易報告是不同的發布角色。`public_quote_display.json`
+的來源授權只適用指定 dataset／grain／price role；已取得 API 存取權或價格數值
+不構成行情公開轉載證據。官方開放日資料另列來源、行情日期和實際取得時間，
+不得以日開收價替代帳本的分鐘價、VWAP 或當時 bid／ask。
+
+使用者選擇公開的當沖／隔日沖模擬交易報告，由唯讀 endpoint 的可信 record context
+和 `owner_paper_transaction_report_v1` 開關共同決定。只公開已有股數、原始價格及
+有效交易紀錄時間的進出場；訊號執行價須對應同標的／模式／日期的持倉，成交事件
+不得用委託價格冒充。nested 行情不繼承交易報告權限，缺成交、缺時鐘或未來紀錄
+不補造。交易報告標為「模擬帳本成交・非券商成交」，這個使用者選擇不是行情
+轉載授權，也不是法律豁免認定。發布層不得改動持倉、費用、股數或損益。
+
+重測入口與查證範圍見 [價格發布分類修正](public_price_reports_2026-10-13.md)。
+
 ## 性能與更新契約
 
 ### 共用響應式與跨裝置契約
@@ -365,6 +381,43 @@ HTML 原文按 SHA256 保存在同層 `stock_futures_catalog_sources/`。
   兩種表示與 304 均攜帶 `Vary: Accept-Encoding`；GET/HEAD conditional request
   支援 weak comparison、ETag list 與 `*`。304 不傳輸本文，也不附錯誤的零長度表示。
   規範依據：[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8.3.3)。
+
+### IPv4／IPv6 公網與自動重綁（2026-10-13）
+
+Windows Caddy 以 `tcp4/0.0.0.0`、`tcp6/[::]` 同時監聽，不綁動態 IP；
+admin／WSL backend 仍僅 localhost。DDNS 的 A／AAAA 更新與 IPv6 轉送由路由器
+既有 owner 負責，不新增 Windows Dynu updater。路由器以 host MAC 找目前的 IPv6，
+保留 firewall-start 的延後重套與兩分鐘 reconciliation。
+
+Windows 防火牆比對實際 Caddy listener 的 executable image；Scoop `current`
+junction 不是 WFP 的實際執行檔路徑。一次管理員安裝後，獨立 SYSTEM task 在
+開機及每分鐘檢查，只有不一致才原地修正專用 TCP 80／443 rule。沒有 listener、
+路徑超出已核准的 Caddy install root、多個 executable owner 或 ActiveStore
+readback 不符都保留失敗／等待收據，不刪舊 rule、不重啟交易服務。
+SYSTEM 入口置於 ACL 保護的 ProgramData，非管理員僅可讀；不得從 AppData／WSL
+執行日常 privileged task。既有 limited Caddy／WSL supervisor 保持不變。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\wsl.localhost\Ubuntu-26.04\root\stockAgent\scripts\request_windows_public_caddy_firewall.ps1" -InstallMaintenance
+```
+
+維護收據：`C:\ProgramData\StockAgentPublicFirewallMaintenance\logs\firewall-maintenance.json`。
+`success` 只證明該次防火牆 readback，不替代外部 HTTPS 驗收。可重測工具沿用
+`scripts/audit_public_ipv6.py`；`--provider globalping` 同時要求三地各自的 IPv4／IPv6、
+新 measurement、目前 DNS、HTTP 200 及有效 TLS。provider／DNS 失敗列為未驗證，
+不能因同主機 WSL IPv6 curl 失敗就宣稱 WAN 中斷。每次工具使用六個外部 probe，
+須遵守 provider 配額；沒有另設高頻 Internet polling。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_public_ipv6.py penguin72487.ddnsgeek.com \
+  --provider globalping --url-path /tw-day-trade/ --timeout-seconds 55 \
+  --output artifacts/benchmarks/dashboards/public-dual-stack-https.json
+```
+
+本輪證據在 `artifacts/benchmarks/dashboards/dual-stack-recovery-20261013/`。
+自然 Windows 冷開機、強制 WAN 換前綴與所有客戶端的可達性須另外驗證；
+ISP／電力／客戶端 DNS 問題不能被本機自癒機制保證消失。
 
 ## 抓取頁的請求與呈現邊界（2026-10-03）
 

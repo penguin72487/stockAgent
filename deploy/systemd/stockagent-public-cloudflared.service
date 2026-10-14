@@ -1,0 +1,32 @@
+[Unit]
+Description=StockAgent public read-only dashboard Cloudflare Tunnel
+Wants=network-online.target stockagent-public-dashboards.service
+After=network-online.target stockagent-public-dashboards.service
+# Network/provider failure must not permanently exhaust a startup retry budget.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=true
+LoadCredential=tunnel-token:/etc/stockagent/cloudflared/tunnel-token
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 run --token-file %d/tunnel-token
+Restart=always
+RestartSec=3s
+TimeoutStopSec=35s
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

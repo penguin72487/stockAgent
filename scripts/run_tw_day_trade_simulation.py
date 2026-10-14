@@ -1070,7 +1070,7 @@ def _attach_terminal_official_close_context(quotes, *, engine, specs, configs, o
         for exchange in ("twse", "tpex"):
             try:
                 source_prices, _ = official_closes(
-                    root, observed.date(), exchanges=(exchange,)
+                    root, observed.date(), exchanges=(exchange,), pin_sources=True
                 )
             except FileNotFoundError:
                 continue  # Publication may follow the actual auction.

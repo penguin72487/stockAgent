@@ -1778,7 +1778,7 @@ def _close_quotes(
         from scripts.settle_tw_day_trade_official_close import official_closes
         if official_raw_root is None:
             raise ValueError("unlimited terminal replay requires retained official reports")
-        official_prices, official_sources = official_closes(official_raw_root, trading_date)
+        official_prices, official_sources = official_closes(official_raw_root, trading_date, pin_sources=True)
     from stockagent.live.tw_share_replacement import halted_symbols
     halted = set().union(*(halted_symbols(root, trading_date) for root in {
         twse_daily_ohlcv_path.parent, *(s.margin_corporate_action_reference_path.parent

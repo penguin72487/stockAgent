@@ -160,6 +160,67 @@ def test_outer_title_whitespace_uses_shared_source_match_without_exporting_title
     assert title not in json.dumps(metadata, ensure_ascii=False)
 
 
+@pytest.mark.parametrize('change', ['none', 'wrong_canonical', 'wrong_og', 'missing_og', 'wrong_main_entity'])
+def test_native_identity_diagnosis_reports_only_bounded_source_comparisons(cfg, tmp_path, change):
+    from bs4 import BeautifulSoup
+    from test_news_cnyes_canonical_alias import MOBILE, TITLE, mobile_page
+    source = PolicyRegistry(cfg, base=tmp_path).sources['cnyes']
+    raw = mobile_page()
+    soup = BeautifulSoup(raw, 'lxml')
+    if change == 'wrong_canonical':
+        soup.select_one('link[rel="canonical"]')['href'] = URL + '0'
+    elif change == 'wrong_og':
+        soup.select_one('meta[property="og:url"]')['content'] = URL + '0'
+    elif change == 'missing_og':
+        soup.select_one('meta[property="og:url"]').decompose()
+    elif change == 'wrong_main_entity':
+        # Alter the actual NewsArticle inside @graph and reparse its real
+        # script node; mutating a BeautifulSoup NavigableString is not an
+        # equivalent source response and get_text() may then be empty.
+        soup = BeautifulSoup(mobile_page(schema_changes={
+            'mainEntityOfPage': {'@id': URL + '0'}}), 'lxml')
+    result = inspector.cnyes_html_structure(soup, source, page_url=MOBILE)
+    assert result['contract_version'] == 5
+    assert result['canonical_path_matches_request'] is (change != 'wrong_canonical')
+    assert result['canonical_public_origin']
+    assert result['canonical_origin_kind'] == 'desktop_news'
+    assert result['og_url_count'] == (0 if change == 'missing_og' else 1)
+    assert result['og_url_matches_canonical'] is (change not in {'wrong_canonical', 'wrong_og', 'missing_og'})
+    if change != 'wrong_canonical':
+        assert result['schema_main_entity_matches_canonical'] is (change != 'wrong_main_entity')
+    # Shape metadata does not grant body/identity acceptance or export the
+    # source headline, author, query values or adjacent article prose.
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert TITLE not in encoded and URL not in encoded and MOBILE not in encoded
+    assert 'accepted_as_article' not in result
+
+
+def test_schema_identity_shape_survives_missing_current_data_without_granting_raw(cfg, tmp_path):
+    from bs4 import BeautifulSoup
+    from test_news_cnyes_canonical_alias import MOBILE, mobile_page
+    source = PolicyRegistry(cfg, base=tmp_path).sources['cnyes']
+    result = inspector.cnyes_html_structure(BeautifulSoup(mobile_page(changes={'newsId': 43}), 'lxml'),
+                                             source, page_url=MOBILE)
+    assert result['current_schema_count'] == 1 and result['schema_main_entity_matches_canonical']
+    assert not result['current_data_present'] and not result['raw_public_scope']
+    assert 'body_representations' not in result and 'declared_clock_raw' not in result
+
+
+@pytest.mark.parametrize('canonical,kind', [
+    (URL, 'desktop_news'), (URL.replace('news.cnyes.com', 'm.cnyes.com'), 'mobile_news'),
+    ('https://unknown.test/news/id/42', 'other'),
+])
+def test_diagnostic_distinguishes_canonical_origin_without_exporting_source_uri(cfg, tmp_path, canonical, kind):
+    from bs4 import BeautifulSoup
+    from test_news_cnyes_canonical_alias import MOBILE, mobile_page
+    source = PolicyRegistry(cfg, base=tmp_path).sources['cnyes']
+    soup = BeautifulSoup(mobile_page(), 'lxml')
+    soup.select_one('link[rel="canonical"]')['href'] = canonical
+    result = inspector.cnyes_html_structure(soup, source, page_url=MOBILE)
+    assert result['canonical_origin_kind'] == kind
+    assert canonical not in json.dumps(result, ensure_ascii=False)
+
+
 @pytest.mark.parametrize('payment,retained', [(0, True), (1, False), (False, False), (None, False)])
 def test_json_retention_requires_literal_public_payment_for_every_row(cfg, tmp_path, monkeypatch, payment, retained):
     _, output = environment(cfg, tmp_path, monkeypatch)
