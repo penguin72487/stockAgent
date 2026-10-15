@@ -124,6 +124,37 @@ def test_live_attachment_respects_existing_cache_budget(tmp_path):
     assert attached.features.source._cache.budget_bytes == 4096
 
 
+@pytest.mark.parametrize("workers", [1, 2])
+def test_member_validation_reports_real_progress_and_keeps_every_sha(tmp_path, workers):
+    import json
+    from stockagent.data.factorized_panel import factorized_member_proofs, verify_factorized_members
+    _, path, _ = example(tmp_path)
+    manifest = json.loads(path.read_bytes())
+    events = []
+    verify_factorized_members(path.parent, manifest, workers=workers,
+                              progress_callback=lambda *event: events.append(event))
+    count = len(factorized_member_proofs(manifest))
+    assert events == [("factorized_member_verify", done, count) for done in range(count + 1)]
+    (path.parent / manifest["common"]["path"]).write_bytes(b"corrupt")
+    events.clear()
+    with pytest.raises(ValueError, match="member identity mismatch"):
+        verify_factorized_members(path.parent, manifest, workers=workers,
+                                  progress_callback=lambda *event: events.append(event))
+    assert events == [("factorized_member_verify", 0, count)]
+
+
+def test_member_progress_observer_cannot_fail_valid_source(tmp_path):
+    import json
+    from stockagent.data.factorized_panel import verify_factorized_members
+    _, path, _ = example(tmp_path)
+
+    def broken_observer(*_):
+        raise OSError("monitor unavailable")
+
+    verify_factorized_members(path.parent, json.loads(path.read_bytes()),
+                              progress_callback=broken_observer)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_opening_adapter_preserves_complete_window_and_missing_price_sentinel(tmp_path, device):
     from stockagent.live.quote_provider import PriceSnapshot

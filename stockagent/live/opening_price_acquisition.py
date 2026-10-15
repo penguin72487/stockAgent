@@ -217,6 +217,13 @@ class OpeningPriceFanIn:
         quotes.seed_tw_opening_snapshot_cache(symbols, quotes.PriceSnapshot(prices=fallback, source="opening_request_scope", available_mask=np.zeros(len(symbols), dtype=bool)), parquet_root=key[0], session_date=date_text, persist=False)
         with session.condition:
             generation = session.generation
+            # A callback can finish after the optimistic cache read but before
+            # this dispatch lock is acquired. Re-read under the same lock used
+            # by callback merges/removal from inflight: otherwise a concurrent
+            # model can resubmit an already-resolved delta (and spend API quota).
+            observed = cache_reader()
+            opens = quotes.tw_session_open_observed_mask(observed, session_date=date_text)
+            resolved = opens | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text) if resolve_no_prints else False)
             # Initial pass requests the complete universe from EVERY provider,
             # even if another provider wins immediately. Later passes retry gaps.
             jobs = []

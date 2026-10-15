@@ -8,13 +8,17 @@ order or paper-ledger write. Results must not be relabelled opening acceptance.
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import threading
@@ -34,6 +38,161 @@ from downloader.ohlcv_hot_tail import logical_parts
 from stockagent.live import quote_provider as quotes
 from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
 
+# History-cleaned identities; the pinned baseline source blobs are unchanged.
+BASELINE_COMMIT = "8b094a64b720eeac7cd84b6515bb37566bc129d7"
+STAGE_BASELINE_COMMIT = "c6f4c70465c43efd4e9ed8d6314c92a4dfa977a9"
+
+
+def factorized_stage_trial(panel, config, *, checkpoint_payload, checkpoint_key,
+                           fold_dir, enabled, readers=2):
+    """Real verified attachment + alignment; exclude the already-built base.
+
+    The baseline executes the pinned original functions, not a cache-disabled
+    surrogate. Both variants retain their original capacities and validation.
+    Every request uses the complete feature/symbol/date axis. No model or CUDA.
+    """
+    from stockagent.live import signal_engine as engine
+    from stockagent.data import factorized_panel as source
+    engine.clear_live_panel_memory_cache()
+    build = engine._build_panel
+    align = engine._cached_aligned_panel
+    baseline_sha = None
+    if not enabled:
+        code = subprocess.run(
+            ["git", "show", f"{STAGE_BASELINE_COMMIT}:stockagent/live/signal_engine.py"],
+            cwd=ROOT, check=True, capture_output=True,
+        ).stdout
+        baseline_sha = hashlib.sha256(code).hexdigest()
+        names = {"_build_panel", "_cached_aligned_panel"}
+        nodes = [node for node in ast.parse(code).body
+                 if isinstance(node, ast.FunctionDef) and node.name in names]
+        if {node.name for node in nodes} != names:
+            raise RuntimeError("pinned stage baseline functions not found")
+        namespace = dict(vars(engine))
+        namespace.update(_LIVE_FACTORIZED_PANEL_CACHE=OrderedDict(),
+                         _LIVE_ALIGNED_PANEL_CACHE=OrderedDict(),
+                         _LIVE_ALIGNED_PANEL_CACHE_LOCK=threading.Lock())
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-panel-stages>", "exec"), namespace)
+        build, align = namespace["_build_panel"], namespace["_cached_aligned_panel"]
+    attachments, alignments, lock = [], [], threading.Lock()
+    original_attach = source.attach_factorized_live_features
+    original_align = engine.align_panel_to_checkpoint_universe
+
+    def attach(*a, **kw):
+        with lock:
+            attachments.append(1)
+        return original_attach(*a, **kw)
+
+    def aligned(*a, **kw):
+        with lock:
+            alignments.append(1)
+        return original_align(*a, **kw)
+
+    base = lambda *a, **kw: (panel, True, "frozen-base")
+    if not enabled:
+        namespace.update(_build_panel_from_stable_source=base,
+                         align_panel_to_checkpoint_universe=aligned)
+    barrier = threading.Barrier(readers)
+
+    def request(_):
+        barrier.wait(10)
+        value = build(config, live_tail=True)[0]
+        return align(value, checkpoint_key=checkpoint_key,
+                     checkpoint_payload=checkpoint_payload,
+                     state_dict=checkpoint_payload["model_state_dict"],
+                     fold_dir=fold_dir, context="offline opening ownership")[0]
+
+    with patch.object(engine, "_build_panel_from_stable_source", base), \
+            patch.object(source, "attach_factorized_live_features", attach), \
+            patch.object(engine, "align_panel_to_checkpoint_universe", aligned):
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=readers) as pool:
+            results = list(pool.map(request, range(readers)))
+        elapsed = (time.perf_counter() - started) * 1000
+    identities = {hashlib.sha256(json.dumps({
+        "symbols": value.symbols, "features": value.feature_names,
+        "dates": [str(day) for day in value.dates],
+        "full_feature_source_identity": value.features.content_fingerprint,
+    }, sort_keys=True).encode()).hexdigest() for value in results}
+    if len(identities) != 1:
+        raise AssertionError("concurrent full stage identities differ")
+    result = {"elapsed_ms": elapsed, "attachment_calls": len(attachments),
+              "alignment_calls": len(alignments), "readers": readers,
+              "unique_decoded_source_caches": len({id(value.features.source._cache) for value in results}),
+              "shape": list(results[0].features.shape), "output_identity_sha256": identities.pop(),
+              "oracle": "all_source_member_sha_and_complete_base_calendar_schema_axis_not_dense_output_bytes",
+              "baseline_code_sha256": baseline_sha}
+    engine.clear_live_panel_memory_cache()
+    return result
+
+
+def run_factorized_stages(market_config_path, output, *, repeats=3, readers=2):
+    import torch
+    import requests
+    from stockagent.live import signal_engine as engine
+    from stockagent.live.market_config import load_market_config
+    from stockagent.config import load_config
+    if torch.cuda.is_initialized():
+        raise RuntimeError("stage benchmark requires a CUDA-cold process")
+    market = load_market_config(market_config_path)
+    config = load_config(market.config_path)
+    if not config.data.factorized_feature_manifest:
+        raise ValueError("factorized market required")
+    _, checkpoint = engine._resolve_checkpoint(market.output_dir, market.fold_id, market.checkpoint_path)
+    payload, key, _ = engine._cached_checkpoint(checkpoint)
+    def no_network(*_a, **_kw):
+        raise AssertionError("offline stage benchmark forbids network")
+    with patch.object(requests.sessions.Session, "request", no_network), \
+            live_tw_public_source_read_guard(config.data.parquet_root):
+        manifest = Path(config.data.factorized_feature_manifest).resolve(strict=True)
+        signatures = engine._factorized_member_signatures(manifest)
+        began = time.perf_counter()
+        base, _hit, tier = engine._build_panel_from_stable_source(config, live_tail=True)
+        base_ms = (time.perf_counter() - began) * 1000
+        pairs = []
+        for index in range(repeats):
+            pair = {}
+            for enabled in ([False, True] if index % 2 == 0 else [True, False]):
+                pair["shared" if enabled else "original"] = factorized_stage_trial(
+                    base, config, checkpoint_payload=payload, checkpoint_key=key,
+                    fold_dir=Path(market.output_dir) / f"fold_{market.fold_id:02d}",
+                    enabled=enabled, readers=readers)
+            if pair["shared"]["output_identity_sha256"] != pair["original"]["output_identity_sha256"]:
+                raise AssertionError("paired full stage source identities differ")
+            pairs.append(pair)
+        if signatures != engine._factorized_member_signatures(manifest):
+            raise RuntimeError("factorized source generation changed during stage benchmark")
+    if torch.cuda.is_initialized():
+        raise AssertionError("stage benchmark initialized CUDA")
+    result = {"contract": "opening_factorized_stage_ownership_paired_offline_v1",
+              "scope": "complete_attachment_and_alignment_excludes_base_build_model_and_live_quotes",
+              "observed_at": datetime.now().astimezone().isoformat(),
+              "market_config": str(market_config_path), "config_path": str(market.config_path),
+              "checkpoint_sha256": sha256_file(checkpoint), "manifest": str(manifest),
+              "manifest_sha256": sha256_file(manifest), "baseline_commit": STAGE_BASELINE_COMMIT,
+              "base_preparation_ms_excluded": base_ms, "base_preparation_tier": tier,
+              "api_requests": 0, "broker_orders": 0, "ledger_writes": 0,
+              "cuda_initialized": False, "pairs": pairs,
+              "median": {name: {field: statistics.median(pair[name][field] for pair in pairs)
+                         for field in ("elapsed_ms", "attachment_calls", "alignment_calls", "unique_decoded_source_caches")}
+                         for name in ("original", "shared")}}
+    atomic_write_json(output, result)
+    return result
+
+
+@lru_cache(maxsize=1)
+def baseline_cache():
+    """Execute the pinned pre-change reader, with its original byte-bound LRU.
+
+    A disabled cache is not a fair substitute for the real concurrent-miss
+    baseline: it would also remove the original Arrow buffer compaction cost.
+    """
+    code = subprocess.run(["git", "show", f"{BASELINE_COMMIT}:downloader/live_tail_source_cache.py"],
+        cwd=ROOT, check=True, capture_output=True).stdout
+    namespace = {"__name__": "_opening_raw_baseline", "__file__": "<pinned-opening-baseline>"}
+    exec(compile(code, namespace["__file__"], "exec"), namespace)
+    return namespace["LiveTailSourceCache"], hashlib.sha256(code).hexdigest()
+
 
 def arrow_digest(table):
     sink = pa.BufferOutputStream()
@@ -50,7 +209,8 @@ def raw_trial(path, *, enabled, readers=3):
             calls.append(1)
         return _load(source, rows)
 
-    cache = LiveTailSourceCache(max_bytes=64 * 1024**2 if enabled else 0, loader=load)
+    cache_class = LiveTailSourceCache if enabled else baseline_cache()[0]
+    cache = cache_class(max_bytes=64 * 1024**2, loader=load)
 
     def read():
         barrier.wait(timeout=10)
@@ -140,6 +300,8 @@ def run(receipt_path, output, *, repeats=7, stall_ms=200):
         "symbol_count": len(symbols), "session_date": receipt["session_date"],
         "injected_ledger_stall_ms": stall_ms, "api_requests": 0, "broker_orders": 0,
         "ledger_writes": 0, "all_outputs_equal": True, "pairs": []}
+    result["raw_baseline"] = {"commit": BASELINE_COMMIT, "code_sha256": baseline_cache()[1],
+                              "same_cache_budget_bytes": 64 * 1024**2}
     with tempfile.TemporaryDirectory(prefix="stockagent-opening-ownership-") as temp:
         frozen = Path(temp) / "source" / source.name
         with live_tw_public_source_read_guard(source.parent):
@@ -177,13 +339,19 @@ def run(receipt_path, output, *, repeats=7, stall_ms=200):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--factorized-market-config", type=Path,
+                        help="Instead measure complete verified attachment/alignment, no model or quotes")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--stall-ms", type=float, default=200)
     args = parser.parse_args()
     if args.repeats < 1 or not 0 <= args.stall_ms <= 1000:
         parser.error("require repeats >= 1 and 0 <= stall-ms <= 1000")
-    measured = run(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms)
-    print(json.dumps({"symbol_count": measured["symbol_count"], "scope": measured["scope"],
+    if bool(args.receipt) == bool(args.factorized_market_config):
+        parser.error("select exactly one of --receipt or --factorized-market-config")
+    measured = (run_factorized_stages(args.factorized_market_config, args.output, repeats=args.repeats)
+                if args.factorized_market_config else
+                run(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms))
+    print(json.dumps({"symbol_count": measured.get("symbol_count"), "scope": measured["scope"],
                       "median": measured["median"]}, indent=2))

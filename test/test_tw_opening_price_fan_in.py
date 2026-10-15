@@ -319,6 +319,36 @@ def test_overlapping_models_only_request_universe_delta(owner, tmp_path):
     assert all(quotes.tw_session_open_observed_mask(row).all() for row in results)
 
 
+def test_completed_delta_is_revalidated_inside_dispatch_lock(owner, tmp_path):
+    calls = []
+
+    def provider(symbols, *_args):
+        calls.append(symbols)
+        return snapshot([100.] * len(symbols))
+
+    fetch(owner, tmp_path, ["A"], {"source": provider})
+    assert owner.wait_idle(timeout_seconds=2)
+    first_read = True
+
+    def reader():
+        nonlocal first_read
+        observed = quotes.fetch_tw_mis_opening_snapshot(["A", "B"], np.full(2, 99.),
+            parquet_root=tmp_path, allow_network=False)
+        if first_read:
+            first_read = False
+            # Deterministically complete B after the optimistic read, just as
+            # another worker can do while this caller waits for the condition.
+            quotes.seed_tw_opening_snapshot_cache(["B"], snapshot([101.]),
+                parquet_root=tmp_path, persist=False)
+        return observed
+
+    result = owner.fetch(["A", "B"], np.full(2, 99.), parquet_root=tmp_path,
+        providers={"source": provider}, minimum_coverage=1., cache_reader=reader)
+    assert owner.wait_idle(timeout_seconds=2)
+    assert calls == [["A"]], "a completed delta must not be requested twice"
+    assert result.open_prices.tolist() == [100., 101.]
+
+
 def test_overlapping_full_and_delta_receipts_keep_job_counts_and_unique_provider_coverage(owner, tmp_path):
     entered, release = threading.Event(), threading.Event()
 
@@ -590,7 +620,9 @@ def test_autonomous_broker_serves_while_engine_is_busy_and_requires_session(owne
     served = threading.Event()
 
     def serve(**kwargs):
-        path.unlink(missing_ok=True)
+        if not path.exists():
+            return []  # Canonical server never serves an already-drained inbox.
+        path.unlink()
         served.set()
         return [{"available_count": 1, "snapshot": {"large": "body"}}]
 

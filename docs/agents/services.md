@@ -102,6 +102,15 @@ Use the section for the service being changed. Operational acceptance requires f
   receipt is historical evidence, not current residency. The measured penguin
   ten-minute lead and actual cold-owner readback are scoped in
   [preparation and release evidence](../completed_session_inference_cache_2026-10-13.md#盤前暖機與釋放窗口).
+- A committed opening signal is not proof that a restarted Discord process has
+  warm model caches. After the protected opening window, the existing no-quote,
+  `write=False` warmup may recover cold caches even when the engine already
+  acknowledged today's signals; active opening attempts and interactive jobs
+  keep priority. The qualified reload tool defaults to plan-only; `--apply`
+  performs a cutover and `--discord-only` preserves the execution owner. Require
+  current model/entrypoint identities, same-run complete warmup, engine ACK and
+  preserved ledger prefixes; a connected Gateway alone is insufficient. See
+  [the 2026-10-15 continuation](../tw_opening_latency_stages_2026-10-14.md#discord-與完整特徵共享續修2026-10-15).
 
 ## TW Day-Trade Engine Responsiveness
 

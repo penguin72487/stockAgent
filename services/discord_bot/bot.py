@@ -61,6 +61,7 @@ if (discord.version_info.major, discord.version_info.minor) < (2, 4):
 
 from stockagent.live.completed_inference_cache import (
     identity_digest as _completed_identity_digest, loaded_implementation_identity,
+    file_identity as _completed_file_identity,
 )
 
 # Admit one stable tree before config/data/model modules enter sys.modules.
@@ -69,6 +70,7 @@ from stockagent.live.completed_inference_cache import (
 _LIVE_IMPLEMENTATION_ADMISSION = {
     "contract": "live_implementation_process_admission_v1",
     "code_sha256": _completed_identity_digest({"code": loaded_implementation_identity()}),
+    "entrypoint_sha256": _completed_file_identity(__file__)["sha256"],
     "requires_fresh_process_on_change": True,
 }
 
@@ -3966,6 +3968,7 @@ def _startup_inference_warmup_must_defer() -> bool:
     Keep the protected opening window and active signal attempt first. After
     that window, a restart must not stay model-cold until tomorrow's preparation.
     Recovery uses the existing no-quote/no-publication warmup under its mutex.
+    A committed signal does not make a restarted process's model cache hot.
     """
 
     warm_window_open = False
@@ -3995,8 +3998,7 @@ def _startup_inference_warmup_must_defer() -> bool:
             and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"
         ):
             return True
-        if (open_minutes + 5 < now_minutes < EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
-                and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"):
+        if open_minutes + 5 < now_minutes < EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute:
             if bot._opening_attempt_started_monotonic is not None:
                 return True
             warm_window_open = True
@@ -11630,7 +11632,7 @@ async def signal_now_job_resumer() -> None:
 async def startup_inference_warmup() -> None:
     """Retry background warmup until all active paper modes are process-hot."""
 
-    if _postclose_fast_priority_window_active():
+    if _postclose_fast_priority_window_active() or _interactive_signal_work_pending():
         return
     if (
         bot._startup_inference_warmup_complete

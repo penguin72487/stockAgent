@@ -891,16 +891,11 @@ def main() -> int:
         engine_sync: dict[str, Any] = {}
         discord_status: dict[str, Any] = {}
         revision_lag: int | None = None
-        for attempt in range(3):
-            engine_sync = _json(engine_sync_path)
-            discord_status = _json(discord_path)
-            revision_lag = int(engine_sync.get("state_revision") or 0) - int(
-                discord_status.get("engine_state_revision") or 0
-            )
-            if revision_lag == 0:
-                break
-            if attempt < 2:
-                time.sleep(1.0)
+        from stockagent.live.tw_day_trade_service_sync import read_service_ack_pair
+        engine_sync, discord_status, ack_observation = read_service_ack_pair(
+            engine_sync_path, discord_path, reader=_json,
+        )
+        revision_lag = ack_observation["revision_lag"]
         engine_age = _age_seconds(
             engine_sync.get("heartbeat_at") or engine_sync.get("published_at"),
             observed,
@@ -924,7 +919,7 @@ def main() -> int:
             and engine_age <= 20.0
             and discord_age is not None
             and discord_age <= 20.0
-            and revision_lag == 0
+            and ack_observation["matched"]
         )
         if not runtime_ready:
             failures.append("paper engine and Discord revisions are not synchronized")
@@ -1077,6 +1072,7 @@ def main() -> int:
                     "engine_age_seconds": engine_age,
                     "discord_age_seconds": discord_age,
                     "revision_lag": revision_lag,
+                    "ack_observation": ack_observation,
                     "engine_run_id": engine_sync.get("engine_run_id"),
                     "enabled_markets": engine_sync.get("enabled_markets"),
                     "scheduled_day_trade_markets": discord_status.get(

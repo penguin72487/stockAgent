@@ -166,7 +166,7 @@ class _LivePanelBuild:
     progress: tuple[str, int, int] | None = None
 
 
-_LIVE_PANEL_BUILDS: dict[tuple[int, str], _LivePanelBuild] = {}
+_LIVE_PANEL_BUILDS: dict[tuple, _LivePanelBuild] = {}
 _LIVE_CHECKPOINT_CACHE_MAX_ENTRIES = 8
 _LIVE_CHECKPOINT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _LIVE_CHECKPOINT_CACHE_LOCK = threading.Lock()
@@ -185,7 +185,6 @@ _LIVE_MODEL_INPUT_CACHE_LOCK = threading.Lock()
 _LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
     tuple[int, str], tuple[PanelData, PanelData]
 ] = OrderedDict()
-_LIVE_ALIGNED_PANEL_CACHE_LOCK = threading.Lock()
 _LIVE_FACTORIZED_PANEL_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 _LIVE_RAW_TAIL_SOURCE_CACHE: Any = None
 _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK = threading.Lock()
@@ -274,10 +273,9 @@ def clear_live_panel_memory_cache() -> None:
         _LIVE_PANEL_CACHE.clear()
         _LIVE_PANEL_SOURCE_KEY_CACHE.clear()
         _LIVE_FACTORIZED_PANEL_CACHE.clear()
+        _LIVE_ALIGNED_PANEL_CACHE.clear()
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         _LIVE_MODEL_INPUT_CACHE.clear()
-    with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
-        _LIVE_ALIGNED_PANEL_CACHE.clear()
     with _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK:
         if _LIVE_RAW_TAIL_SOURCE_CACHE is not None:
             # Increment its epoch too: an in-flight decode may return to its
@@ -301,16 +299,14 @@ def clear_live_inference_memory_cache() -> None:
 def _live_inference_cpu_cache_retained() -> bool:
     """Inspect existing references only; never allocate a cache or probe CUDA."""
     with _LIVE_PANEL_CACHE_LOCK:
-        if _LIVE_PANEL_CACHE or _LIVE_PANEL_SOURCE_KEY_CACHE or _LIVE_FACTORIZED_PANEL_CACHE:
+        if (_LIVE_PANEL_CACHE or _LIVE_PANEL_SOURCE_KEY_CACHE
+                or _LIVE_FACTORIZED_PANEL_CACHE or _LIVE_ALIGNED_PANEL_CACHE):
             return True
     with _LIVE_CHECKPOINT_CACHE_LOCK:
         if _LIVE_CHECKPOINT_CACHE:
             return True
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         if _LIVE_MODEL_INPUT_CACHE:
-            return True
-    with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
-        if _LIVE_ALIGNED_PANEL_CACHE:
             return True
     with _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK:
         return (_LIVE_RAW_TAIL_SOURCE_CACHE is not None
@@ -388,6 +384,7 @@ def _cached_aligned_panel(
     state_dict: dict[str, Any],
     fold_dir: Path,
     context: str,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[PanelData, bool]:
     """Retain the exact alignment of an immutable cached panel/checkpoint pair.
 
@@ -398,23 +395,23 @@ def _cached_aligned_panel(
 
     symbols = checkpoint_manifest_symbols(checkpoint_payload)
     key = (id(panel), checkpoint_key)
-    if symbols is not None:
-        with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
-            cached = _LIVE_ALIGNED_PANEL_CACHE.get(key)
-            if cached is not None and cached[0] is panel:
-                _LIVE_ALIGNED_PANEL_CACHE.move_to_end(key)
-                return cached[1], True
-    aligned = align_panel_to_checkpoint_universe(
-        panel, fold_dir, state_dict,
-        checkpoint_symbols=symbols, context=context, allow_missing_masked=True,
+    def build(progress):
+        progress("checkpoint_alignment", 0, 1)
+        aligned = align_panel_to_checkpoint_universe(
+            panel, fold_dir, state_dict,
+            checkpoint_symbols=symbols, context=context, allow_missing_masked=True,
+        )
+        progress("checkpoint_alignment", 1, 1)
+        return (panel, aligned), False, "aligned"
+
+    if symbols is None:
+        # Legacy weight-table membership is mutable, not a reusable identity.
+        return build(lambda *_: None)[0][1], False
+    cached, hit, _tier = _shared_live_panel_build(
+        key, build, progress_callback, cache=_LIVE_ALIGNED_PANEL_CACHE,
+        max_entries=_LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES,
     )
-    if symbols is not None:
-        with _LIVE_ALIGNED_PANEL_CACHE_LOCK:
-            _LIVE_ALIGNED_PANEL_CACHE[key] = (panel, aligned)
-            _LIVE_ALIGNED_PANEL_CACHE.move_to_end(key)
-            while len(_LIVE_ALIGNED_PANEL_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES:
-                _LIVE_ALIGNED_PANEL_CACHE.popitem(last=False)
-    return aligned, False
+    return cached[1], hit
 
 
 def _model_cache_key(
@@ -588,30 +585,21 @@ def _live_panel_disk_cache_root(*, repo_root: Path | None = None) -> Path:
     return root / "artifacts" / "cache" / "live_signal_panels"
 
 
-def _cached_live_panel(key: str) -> PanelData | None:
-    with _LIVE_PANEL_CACHE_LOCK:
-        panel = _LIVE_PANEL_CACHE.get(key)
-        if panel is not None:
-            _LIVE_PANEL_CACHE.move_to_end(key)
-        return panel
-
-
-def _remember_live_panel(key: str, panel: PanelData) -> None:
-    with _LIVE_PANEL_CACHE_LOCK:
-        _LIVE_PANEL_CACHE[key] = panel
-        _LIVE_PANEL_CACHE.move_to_end(key)
-        while len(_LIVE_PANEL_CACHE) > _LIVE_PANEL_CACHE_MAX_ENTRIES:
-            _LIVE_PANEL_CACHE.popitem(last=False)
-
-
-def _shared_live_panel_build(key, builder, progress_callback=None):
+def _shared_live_panel_build(key, builder, progress_callback=None, *,
+                             cache=None, max_entries=None):
     """One immutable panel per source/feature revision, not one per requester.
 
     Joiners relay only actual builder milestones, never a periodic heartbeat.
     Failures fan out unchanged and are retryable on the next call. Eviction
     fences an old build from repopulating caches or attracting new callers.
     The caller still owns the canonical source read lease for the entire read.
+    Base loading, factorized attachment and checkpoint alignment retain their
+    separate LRU capacities but share this same failure/epoch/progress owner.
     """
+    if cache is None:
+        cache = _LIVE_PANEL_CACHE
+    if max_entries is None:
+        max_entries = _LIVE_PANEL_CACHE_MAX_ENTRIES
     def report(event):
         if progress_callback is not None:
             try:
@@ -620,10 +608,10 @@ def _shared_live_panel_build(key, builder, progress_callback=None):
                 pass  # Observation cannot change a correct panel/result.
 
     with _LIVE_PANEL_CACHE_LOCK:
-        cached = _LIVE_PANEL_CACHE.get(key)
+        cached = cache.get(key)
         if cached is not None:
-            _LIVE_PANEL_CACHE.move_to_end(key)
-        flight_key = (_LIVE_PANEL_CACHE_EPOCH, key)
+            cache.move_to_end(key)
+        flight_key = (_LIVE_PANEL_CACHE_EPOCH, id(cache), key)
         flight = _LIVE_PANEL_BUILDS.get(flight_key)
         owner = flight is None
         if cached is None and owner:
@@ -659,10 +647,10 @@ def _shared_live_panel_build(key, builder, progress_callback=None):
         result = builder(progress)
         with _LIVE_PANEL_CACHE_LOCK:
             if flight_key[0] == _LIVE_PANEL_CACHE_EPOCH:
-                _LIVE_PANEL_CACHE[key] = result[0]
-                _LIVE_PANEL_CACHE.move_to_end(key)
-                while len(_LIVE_PANEL_CACHE) > _LIVE_PANEL_CACHE_MAX_ENTRIES:
-                    _LIVE_PANEL_CACHE.popitem(last=False)
+                cache[key] = result[0]
+                cache.move_to_end(key)
+                while len(cache) > max_entries:
+                    cache.popitem(last=False)
         flight.future.set_result(result)
         return result
     except BaseException as exc:
@@ -881,25 +869,38 @@ def _build_panel(
             config, live_tail=live_tail, progress_callback=progress_callback
         )
         if config.data.factorized_feature_manifest:
-            from stockagent.data.factorized_panel import attach_factorized_live_features
-            manifest_path = Path(config.data.factorized_feature_manifest).resolve(strict=True)
-            stat = manifest_path.stat()
-            key = (id(panel), str(manifest_path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
-                   config.data.factorized_host_cache_bytes)
-            with _LIVE_PANEL_CACHE_LOCK:
-                entry = _LIVE_FACTORIZED_PANEL_CACHE.get(key)
-            if entry is not None and entry[0] is panel and entry[2] == _factorized_member_signatures(manifest_path):
-                panel = entry[1]
-            else:
-                base = panel
-                panel = attach_factorized_live_features(base, manifest_path,
-                    host_cache_bytes=config.data.factorized_host_cache_bytes)
-                signatures = _factorized_member_signatures(manifest_path)
-                with _LIVE_PANEL_CACHE_LOCK:
-                    _LIVE_FACTORIZED_PANEL_CACHE[key] = (base, panel, signatures)
-                    while len(_LIVE_FACTORIZED_PANEL_CACHE) > 2:
-                        _LIVE_FACTORIZED_PANEL_CACHE.popitem(last=False)
+            panel = _cached_factorized_live_panel(panel, config, progress_callback)
         return panel, hit, tier
+
+
+def _cached_factorized_live_panel(panel, config, progress_callback=None):
+    """Retain one verified attachment/cache across warmup and quote prefetch.
+
+    The entire immutable-member identity belongs in the flight/cache key, not
+    just the manifest mtime. Checking it before AND after attachment rejects a
+    changed member rather than blessing new bytes with an old SHA receipt.
+    """
+    from stockagent.data.factorized_panel import attach_factorized_live_features
+    path = Path(config.data.factorized_feature_manifest).resolve(strict=True)
+    signatures = _factorized_member_signatures(path)
+    key = (id(panel), str(path), config.data.factorized_host_cache_bytes, signatures)
+
+    def build(progress):
+        progress("factorized_attachment", 0, 1)
+        attached = attach_factorized_live_features(
+            panel, path, host_cache_bytes=config.data.factorized_host_cache_bytes,
+            progress_callback=progress,
+        )
+        if _factorized_member_signatures(path) != signatures:
+            raise RuntimeError("factorized members changed during live attachment")
+        progress("factorized_attachment", 1, 1)
+        return (panel, attached), False, "attached"
+
+    entry, _hit, _tier = _shared_live_panel_build(
+        key, build, progress_callback, cache=_LIVE_FACTORIZED_PANEL_CACHE,
+        max_entries=2,
+    )
+    return entry[1]
 
 
 def _factorized_member_signatures(manifest_path: Path) -> tuple:
@@ -3373,6 +3374,7 @@ def prefetch_live_signal_prices(
         panel, checkpoint_key=checkpoint_key, checkpoint_payload=payload,
         state_dict=payload["model_state_dict"],
         fold_dir=root / f"fold_{resolved_fold:02d}", context="quote prefetch",
+        progress_callback=report,
     )
     index, _notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
     report("quote_request_prepare", 0)
@@ -3738,6 +3740,12 @@ def generate_live_signal(
         state_dict=state_dict,
         fold_dir=resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         context=f"live signal {market_id or resolved_fold_id}",
+        progress_callback=(
+            (lambda phase, done, total: _emit_progress(
+                progress_callback, label=progress_name, step=4,
+                total=progress_total, message=f"{phase} {done}/{total}",
+            )) if progress_callback is not None else None
+        ),
     )
     saved_fold_id = checkpoint_payload.get("fold_id")
     if saved_fold_id is not None and int(saved_fold_id) != int(resolved_fold_id):

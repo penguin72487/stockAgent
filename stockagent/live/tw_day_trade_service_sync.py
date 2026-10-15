@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import time
 from typing import Any, Final, Mapping
 
 
@@ -24,6 +25,47 @@ def read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
     return payload
+
+
+def read_service_ack_pair(engine_path: Path, discord_path: Path, *,
+                          timeout_seconds: float = 2., poll_seconds: float = .05,
+                          reader=None):
+    """Observe one stable committed engine revision and its exact Discord ACK.
+
+    Whole-second retries can phase-lock with the independent one-second owners
+    and report a perpetual one-revision lag. Short bounded observation is not a
+    looser ACK: require exact run/revision equality and bracket the bot read
+    with the same engine revision. Freshness/source/market checks stay with the
+    caller. This reads compact receipts only, never state, quotes or orders.
+    """
+    if not 0 < poll_seconds <= timeout_seconds <= 10:
+        raise ValueError("ACK observation requires 0 < poll <= timeout <= 10 seconds")
+    read = reader or read_json_object
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            before, bot, engine = read(engine_path), read(discord_path), read(engine_path)
+            if not all(isinstance(value, dict) for value in (before, bot, engine)):
+                raise ValueError("object service receipts required")
+        except (OSError, ValueError, TypeError):
+            before, bot, engine = {}, {}, {}
+        revision, acknowledged = engine.get("state_revision"), bot.get("engine_state_revision")
+        valid = type(revision) is int and revision > 0 and type(acknowledged) is int and acknowledged > 0
+        lag = revision - acknowledged if valid else None
+        run = engine.get("engine_run_id")
+        stable = bool(isinstance(run, str) and run and before.get("engine_run_id") == run
+                      and before.get("state_revision") == revision and type(before.get("state_revision")) is int)
+        matched = bool(valid and stable and lag == 0 and bot.get("engine_run_id") == run)
+        remaining = deadline - time.monotonic()
+        if matched or remaining <= 0:
+            return engine, bot, {"matched": matched, "stable_engine_pair": stable,
+                                 "revision_lag": lag, "attempts": attempts,
+                                 "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                                 "policy": "bounded_stable_exact_run_revision_ack_v1"}
+        time.sleep(min(poll_seconds, remaining))
 
 
 def load_service_sync(state_dir: Path) -> dict[str, Any] | None:
@@ -81,4 +123,5 @@ __all__ = [
     "mode_from_service_sync",
     "parse_timestamp",
     "read_json_object",
+    "read_service_ack_pair",
 ]

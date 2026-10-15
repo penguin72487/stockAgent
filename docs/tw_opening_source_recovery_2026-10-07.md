@@ -101,6 +101,9 @@ schema 3 收據保存請求清單、成功值、來源時間與尚缺清單，�
   `blocked_nonflat`／exit 75，不強制平倉或重啟。收據為
   `artifacts/live/tw_day_trade_simulation/safe_reload_receipt.json`。
   此次 timer 是 transient；不是已完成盤後載入或重開機驗收的證據。
+  2026-10-15 起，同一工具預設僅產生計畫；後續實際更新須明確指定 `--apply`。
+  `--discord-only --apply` 可在工作佇列閒置時只更新 Discord，不重啟持倉引擎；
+  全部更新仍須盤後、平倉且沒有待處理委託，並通過原生驗收。
 - 412 測試涵蓋 48／2302、42／2294、失敗續抓、日內成功保持、重啟恢復、
   四模式來源共用、過期價格拒絕、0 成交量、資料未齊不消耗訊號及真實空倉。
   未宣稱全 repository 測試已執行。

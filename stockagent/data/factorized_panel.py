@@ -723,7 +723,8 @@ def factorized_member_proofs(manifest: dict) -> list[dict]:
     return proofs
 
 
-def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None = None) -> None:
+def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None = None,
+                              progress_callback=None) -> None:
     """Verify every immutable model/raw member without expanding its arrays.
 
     Parallelism is an operational opt-in, not a weaker receipt/cache policy.
@@ -737,24 +738,32 @@ def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None
         workers=int(os.environ.get("STOCKAGENT_FEATURE_VERIFY_THREADS", "1"))
     if workers < 1 or workers > 16:
         raise ValueError("factorized SHA workers must be in [1,16]")
+    def progress(done):
+        if progress_callback is not None:
+            try:
+                progress_callback("factorized_member_verify", done, len(proofs))
+            except Exception:
+                pass  # An observer cannot weaken validation or fail a good source.
+    progress(0)
     def verify(proof):
         member = (root / proof["path"]).resolve(strict=True)
         if not member.is_relative_to(root) or file_sha256(member) != proof["sha256"]:
             raise ValueError(f"factorized member identity mismatch: {proof['path']}")
     if workers == 1:
-        for proof in proofs:
+        for done, proof in enumerate(proofs, 1):
             verify(proof)
+            progress(done)
     else:
         with ThreadPoolExecutor(max_workers=workers,thread_name_prefix="factorized-sha") as pool:
             # Python 3.12 Executor.map eagerly submits the inventory, but only
             # the bounded workers open/read files. Consume every future so a
             # missing, escaped or corrupt member cannot hide in another task.
-            for _ in pool.map(verify,proofs):
-                pass
+            for done, _ in enumerate(pool.map(verify,proofs), 1):
+                progress(done)
 
 
 def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu",
-                               host_cache_bytes: int | None = None):
+                               host_cache_bytes: int | None = None, progress_callback=None):
     """Attach model-only storage after the ordinary price/rule cache load."""
     if host_cache_bytes is not None and host_cache_bytes < 1:
         raise ValueError("factorized host cache budget must be positive")
@@ -778,7 +787,7 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
     if manifest["base_feature_names"] != panel.feature_names:
         raise ValueError("factorized base features differ from the declared base ABI")
     root = path.parent
-    verify_factorized_members(root,manifest)
+    verify_factorized_members(root,manifest,progress_callback=progress_callback)
     names = [*panel.feature_names, *manifest["individual_channels"], *manifest["common_channels"]]
     if len(names) != len(set(names)):
         raise ValueError("factorized logical features are not unique")
@@ -939,7 +948,8 @@ class FactorizedLiveWindow:
         return result
 
 
-def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_cache_bytes=None):
+def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_cache_bytes=None,
+                                   progress_callback=None):
     """Attach a receipt-bound research-paper projection to a live base panel."""
     from copy import copy
     from stockagent.training.checkpoint_contract import subset_panel_symbols
@@ -975,7 +985,8 @@ def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_ca
     rows = np.asarray([source_rows[day] for day in panel_days], dtype=np.int64)
     base[rows] = panel.features
     source_panel.features = base
-    source_panel = attach_factorized_features(source_panel, path, host_cache_bytes=host_cache_bytes)
+    source_panel = attach_factorized_features(source_panel, path, host_cache_bytes=host_cache_bytes,
+        progress_callback=progress_callback)
     result = copy(panel)
     result.features = FactorizedDateView(source_panel.features, rows)
     result.feature_names = source_panel.feature_names

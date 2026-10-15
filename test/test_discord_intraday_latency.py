@@ -47,7 +47,10 @@ def test_restart_recovers_original_observed_clock_not_new_process_wake(monkeypat
     ("09:02", None, True, "retry", True),
     ("09:20", None, True, "retry", False),
     ("09:20", 1., True, "retry", True),
-    ("09:20", None, True, "pending_confirmation", True),
+    ("09:20", None, True, "pending_confirmation", False),
+    ("09:20", None, True, "completed", False),
+    ("09:20", None, True, "blocked_open_position", False),
+    ("09:20", 1., True, "completed", True),
     ("13:20", None, True, "retry", True),
     ("09:20", None, False, "retry", True),
 ])
@@ -68,6 +71,13 @@ def test_cold_owner_can_warm_while_waiting_after_protected_opening(monkeypatch, 
     monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *args: state)
     monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", active)
     assert discord_bot._startup_inference_warmup_must_defer() is defer
+
+
+def test_background_warmup_does_not_steal_an_interactive_job(monkeypatch):
+    monkeypatch.setattr(discord_bot, "_postclose_fast_priority_window_active", lambda: False)
+    monkeypatch.setattr(discord_bot, "_interactive_signal_work_pending", lambda: True)
+    monkeypatch.setattr(discord_bot, "_warm_startup_inference_sync", lambda: pytest.fail("interactive job has priority"))
+    asyncio.run(discord_bot.startup_inference_warmup())
 
 
 def test_opening_input_wait_records_structured_counts_without_result():
