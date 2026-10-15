@@ -1,0 +1,57 @@
+contract: frontier_complete_fold_recipes_v1
+# All recipes preserve the selected full annual workflow. Each creates a fresh
+# artifact root; no optimizer/checkpoint donation or formal resume is allowed.
+full_fold_candidates:
+  - name: baseline_profile
+    profile_timing: true
+    overrides: {}
+  - name: numa_local
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+  - name: combined_bf16
+    overrides:
+      training:
+        financial_transformer: {compact_projection_compute_dtype: bf16, temporal_blocks_fp32: false, portfolio_blocks_fp32: false}
+  - name: explicit_retention
+    overrides:
+      training:
+        financial_transformer: {factorized_encoder_force_retention: true}
+  - name: uncached_encoder_packets
+    overrides:
+      training:
+        financial_transformer: {factorized_encoder_packet_cache: false}
+  - name: relaxed_precision_casts
+    overrides:
+      training:
+        financial_transformer: {factorized_relaxed_precision_casts: true}
+  - name: maximum_autotune
+    overrides:
+      training:
+        financial_transformer: {factorized_compile_autotune: true}
+  - name: partition_cuda_graphs
+    overrides:
+      training:
+        financial_transformer: {factorized_cuda_graphs: true}
+  - name: stream_4gib
+    overrides:
+      training:
+        financial_transformer: {factorized_compact_stream_chunk_bytes: 4294967296}
+  - name: fifo_checkpoint_32
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_CARRY_CHECKPOINT_BLOCK_ROWS: 32
+  - name: transport_block_32
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_TRANSPORT_BLOCK_ROWS: 32
+  - name: ddp_bucket_25
+    overrides:
+      training: {ddp_bucket_cap_mb: 25}
+  - name: batch_512
+    batch_size: 512
+    overrides: {}
+  - name: sdpa_cross_bf16
+    overrides:
+      training:
+        financial_transformer: {temporal_blocks_fp32: false, portfolio_blocks_fp32: false, compiled_cross_attention_backend: sdpa}

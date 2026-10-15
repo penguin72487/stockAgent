@@ -129,6 +129,9 @@ def register(c: dict) -> dict:
         paths = [Path("configs/data_sync/packed_datasets.json"), Path("configs/data_sync/backup_history_disposition_20261004.json"),
                  *sorted((Path(c["cold_root"]) / "heads").glob("*/*.json")),
                  *sorted((Path(c["cold_root"]) / "manifests").glob("*/*.json"))]
+        from stockagent.data_sync.testing_disposition import DEFAULT_POLICY
+        if DEFAULT_POLICY.exists():
+            paths.append(DEFAULT_POLICY)
         include_orphans = c.get("include_unreferenced_cold_objects", False)
         if type(include_orphans) is not bool:
             raise ValueError("unreferenced source inclusion must be an explicit boolean")
@@ -198,6 +201,11 @@ def register(c: dict) -> dict:
                 # Source objects are a persistent unique set. Mutable heads
                 # have new SHA entries; they are sealed only in version exports.
                 con.execute("INSERT INTO lake.source_objects SELECT i.* FROM incoming_objects i WHERE NOT EXISTS (SELECT 1 FROM lake.source_objects o WHERE o.relative=i.relative AND o.sha256=i.sha256)")
+                # Only the explicit test disposition waives these exact,
+                # otherwise unreferenced CAS payloads. Historical registry
+                # metadata stays auditable; unrelated object versions remain.
+                for relative in catalog.get("discarded_testing_objects", []):
+                    con.execute("DELETE FROM lake.source_objects WHERE relative=?", [relative])
                 con.execute("INSERT INTO lake.source_metadata SELECT i.* FROM incoming_metadata i WHERE NOT EXISTS (SELECT 1 FROM lake.source_metadata o WHERE o.relative=i.relative AND o.sha256=i.sha256)")
                 if not captured:
                     con.execute("INSERT INTO lake.catalog_captures VALUES (?, ?, ?, ?)", [catalog["identity_sha256"], catalog["observed_at_utc"], len(releases), sum(r["bytes"] for r in objects)])
@@ -315,11 +323,34 @@ def finish_export(c: dict, result: dict, journal: Path) -> dict:
     return finished
 
 
-def acceptance(c: dict, delivery_id: str, *, enrolled_source=None) -> dict:
+def catalog_enrollment(c: dict, delivery_id: str):
+    """Find this exact completed export; incomplete intents cannot admit ACKs."""
+    from stockagent.data_sync.immutable_replication import HASH
+    from stockagent.data_sync.offhost_backup import _regular
+    if not HASH.fullmatch(delivery_id):
+        raise ValueError("invalid catalog delivery identity")
+    for path in sorted(Path(c['state_root']).glob('export-*.json')):
+        _regular(path)
+        if path.stat().st_size > 1024**2:
+            raise ValueError('catalog export journal is oversized')
+        row = json.loads(path.read_bytes())
+        if not isinstance(row, dict):
+            raise ValueError('catalog export journal is not an enrollment')
+        if row.get('state') == 'published' and row.get('delivery_identity_sha256') == delivery_id:
+            snapshot = row.get('snapshot_id')
+            if type(snapshot) is not int or snapshot < 0 or path.name != 'export-' + str(snapshot) + '.json':
+                raise ValueError('catalog export enrollment identity differs')
+            return row
+    return None
+
+
+def acceptance(c: dict, delivery_id: str, *, enrolled_source=None, enrolled_catalog=None) -> dict:
     from stockagent.data_sync.immutable_replication import HASH
     from stockagent.data_sync.immutable_transport_cache import validate_archive_receipt, validate_sources
     if not HASH.fullmatch(delivery_id):
         raise ValueError("invalid lifecycle delivery identity")
+    if enrolled_source is not None and enrolled_catalog is not None:
+        raise ValueError('receipt admission has conflicting enrollment scopes')
     path = Path(c["receipt_root"]) / ("lake-" + delivery_id + ".json")
     if not path.exists():
         pending_scan = Path(c["state_root"]) / "pending-transport-scan.json"
@@ -330,7 +361,7 @@ def acceptance(c: dict, delivery_id: str, *, enrolled_source=None) -> dict:
     if not source.exists():
         source = Path(c["transport_root"]) / ("lake-" + delivery_id)
     if source.exists():
-        manifest = read_manifest(source) if enrolled_source is not None else verify(source)
+        manifest = read_manifest(source) if enrolled_source is not None or enrolled_catalog is not None else verify(source)
         manifest_bytes = (source / "manifest.json").read_bytes()
     else:
         cached = json.loads((Path(c["state_root"]) / ("cache-retirement-" + delivery_id + ".json")).read_bytes())
@@ -354,9 +385,36 @@ def acceptance(c: dict, delivery_id: str, *, enrolled_source=None) -> dict:
                    != set(enrolled_source['file_keys'])
                 or sum(item['bytes'] for item in manifest['files'].values()) != enrolled_source['bytes']):
             raise ValueError('NAS receipt differs from the enrolled source publication')
+    if enrolled_catalog is not None:
+        # Producer publication already sealed and fully verified this exact
+        # catalog, and NAS independently restored it. Admit that paired proof
+        # without a second HDD payload pass; the GC caller still performs every
+        # full local SHA/reconstruction/process gate before removing transport.
+        from stockagent.data_sync.immutable_replication import ACK
+        context = manifest['context']
+        row, copied = enrolled_catalog, enrolled_catalog.get('replication', {})
+        expected_root = Path(c['lake_root']) / 'releases' / ('lake-' + delivery_id)
+        expected_transport = Path(c['transport_root']) / ('lake-' + delivery_id)
+        expected_bytes = sum(item['bytes'] for item in manifest['files'].values()) + len(manifest_bytes) + 65
+        codes = copied.get('command_exit_codes')
+        if (row.get('state') != 'published' or row.get('delivery_identity_sha256') != delivery_id
+                or row.get('delivery_root') != str(expected_root) or row.get('transport_root') != str(expected_transport)
+                or type(row.get('snapshot_id')) is not int or row['snapshot_id'] < 0
+                or context.get('kind') != 'ducklake_catalog_and_data'
+                or context.get('ducklake_snapshot_id') != row['snapshot_id']
+                or any(context.get(k) != c[k] for k in ('producer_device_id', 'receiver_device_id'))
+                or copied.get('contract') != ACK or copied.get('delivery_identity_sha256') != delivery_id
+                or copied.get('manifest_file_sha256') != hashlib.sha256(manifest_bytes).hexdigest()
+                or copied.get('complete_files') != len(manifest['files']) + 2 or copied.get('complete_bytes') != expected_bytes
+                or any(copied.get(k) is not True for k in ('all_files_sha256_verified', 'exact_file_set_verified', 'source_unchanged_verified'))
+                or not isinstance(codes, list) or len(codes) != 2 or any(type(v) is not int or v != 0 for v in codes)):
+            raise ValueError('NAS receipt differs from the enrolled catalog publication')
     value = validate_archive_receipt(c, delivery_id, manifest, manifest_bytes)
-    return {"state": "nas_archive_file_recovery_verified", "delivery_identity_sha256": delivery_id, "receipt_identity_sha256": value["identity_sha256"],
-            "catalog_semantic_restore_verified": value.get("catalog_semantic_restore_verified", False)}
+    result = {"state": "nas_archive_file_recovery_verified", "delivery_identity_sha256": delivery_id, "receipt_identity_sha256": value["identity_sha256"],
+              "catalog_semantic_restore_verified": value.get("catalog_semantic_restore_verified", False)}
+    if enrolled_catalog is not None:
+        result['admission_basis'] = 'enrolled_closed_catalog_and_paired_nas_restore'
+    return result
 
 
 def retire_accepted_transport(c, delivery_id, proof):
@@ -371,7 +429,10 @@ def retire_accepted_transport(c, delivery_id, proof):
         notify_transport(c, ["lakehouse/lake-" + delivery_id])
         return {k: result[k] for k in ('state', 'reclaimed_bytes', 'primary_source_files_deleted', 'nas_archive_files_deleted')}
     except (OSError, ValueError) as error:
-        return {"state": "retirement_deferred", "error_type": type(error).__name__}
+        result = {"state": "retirement_deferred", "error_type": type(error).__name__}
+        if isinstance(error, OSError):
+            result.update(errno=error.errno, error_path=str(error.filename) if error.filename else None)
+        return result
 
 
 def _publish_source_wave(c, chosen, physical, ledger_path, ledger, *, redelivery=None):
@@ -603,8 +664,12 @@ def stage_source_wave(c: dict) -> dict:
                 already_nas = restic_keys(read_ledger(Path(policy['restic_state_root']) / 'ledger.json'))
             published = {key for row in ledger['deliveries'].values() for key in row['file_keys']}
             eligible = sorted(rows, key=lambda row: (row[0] + '@' + row[1] in already_nas, row[2], row[0], row[1]))
+            unpublished = [row for row in eligible if row[0] + '@' + row[1] not in published]
             room = (policy['maximum_retained_transport_bytes'] - retained_bytes if policy['decouple_nas_acceptance']
                     else policy['maximum_pending_bytes'] - pending_bytes)
+            result.update(publication_capacity_room_bytes=room,
+                          unpublished_source_object_count=len(unpublished),
+                          minimum_next_source_object_bytes=min((row[2] for row in unpublished), default=None))
             limit = min(policy['maximum_wave_bytes'], room)
             chosen = []
             size = 0
@@ -654,7 +719,7 @@ def stage_source_wave(c: dict) -> dict:
                               pending_bytes=pending_bytes + size, retained_transport_bytes=retained_bytes+size,
                               redelivery_attempts=sum(len(row.get('redeliveries', [])) for row in ledger['deliveries'].values()))
                 notify_transport(c, ["lakehouse/" + destination.name])
-            elif room <= 0:
+            elif room <= 0 or (unpublished and room < min(row[2] for row in unpublished)):
                 result['state'] = 'waiting_transport_capacity'
         atomic_write_json(state / "source-replication-status.json", result)
         return result
@@ -715,6 +780,7 @@ def requested_source_redelivery(c, ledger, room, policy):
     # NAS/capacity conditions need receiver retries, not duplicate payloads.
     failed_jobs = [j for j in value['jobs']
                    if j.get('state') in ('deferred', 'rejected', 'retry_wait')
+                   and j.get('transport_action') not in ('wait_for_Syncthing', 'waiting_for_manifest_and_READY')
                    and j.get('error_type') not in ('FileNotFoundError', 'TimeoutError',
                        'ConnectionError', 'CapacityError')]
     failed = {j.get('delivery', '').removeprefix('lake-') for j in failed_jobs}

@@ -1,8 +1,13 @@
 [Unit]
-Description=Trigger Discord post-close cache when the accepted TW session advances
+Description=Refresh Discord post-close cache on accepted close or eligibility revision
 
 [Path]
 PathChanged=@REPO_ROOT@/artifacts/data_refresh/tw_public/completed_session/latest.json
+# Canonical live rule root, matching the eligibility publisher's default.
+# Watch committed source files, not its periodic waiting/heartbeat receipt.
+# The cache-only owner still applies its close, source and opening guards.
+PathChanged=/srv/stockagent-live/data_tw_public/twse_day_trade_eligibility.parquet
+PathChanged=/srv/stockagent-live/data_tw_public/tpex_day_trade_eligibility.parquet
 Unit=stockagent-discord-postclose-cache.service
 
 [Install]

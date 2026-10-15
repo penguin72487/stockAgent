@@ -39,6 +39,25 @@ function Same-Session($a,$b) {
     }
     return $true
 }
+function Launcher-RetryBasis($previous,$old,$proof,[string]$workbook,[DateTime]$now,
+                            [bool]$addinAbsent,[bool]$excelReady) {
+    # An absent result is NOT proof of an unsent launch. The explicit desktop
+    # restart grant permits a bounded extra *launcher*, never a data query.
+    if($previous.contract -cne $proof.contract -or $previous.windows_boot_at_utc -cne $proof.windows_boot_at_utc -or
+       $previous.workbook -cne $workbook -or -not $proof.retired_window_absent -or -not $proof.retired_process_absent){
+        throw 'startup_launcher_outcome_unresolved'
+    }
+    if($previous.state -ceq 'confirmed' -and (Same-Session $previous.new_session $old)){
+        return 'exact_confirmed_desktop_retired_v1'
+    }
+    if($previous.state -cne 'prepared' -or $previous.method -cnotin @('owned_uia_toggle_once_v1','owned_uia_invoke_once_v1') -or
+       -not $addinAbsent -or -not $excelReady){throw 'startup_launcher_outcome_unresolved'}
+    $time=[DateTime]::Parse($previous.observed_at_utc).ToUniversalTime()
+    if($time -gt $now.ToUniversalTime() -or ($now.ToUniversalTime()-$time).TotalSeconds -lt 60){
+        throw 'desktop_restart_cooldown'
+    }
+    return 'exact_absent_desktop_authorized_prepared_launcher_replay_v1'
+}
 try {
     if($proof.windows_session_id -le 0 -or $proof.windows_session_id -ne $WindowsSessionId){throw 'interactive_session_required'}
     $owns=$mutex.WaitOne(0);if(-not $owns){throw 'desktop_writer_active'}
@@ -82,19 +101,19 @@ try {
         }
         if($book.FullName -cne $OwnedWorkbook -or $book.Windows.Count -ne 1){throw 'owned_workbook_identity_changed'}
         if($forms.Count -eq 0) {
-            # A durable one-shot launcher intent blocks repetition after a
-            # timeout in the same Windows boot. A new boot cannot retain it.
-            $history=@()
+            # Retain every original intent. A timed-out launch may recover only
+            # after fresh absence/context proof and the existing bounded grant.
+            $history=@();$retryBasis=$null
             if(Test-Path -LiteralPath $intent) {
                 $previous=Get-Content -LiteralPath $intent -Raw|ConvertFrom-Json
-                if($previous.windows_boot_at_utc -cne $proof.windows_boot_at_utc -or
-                   $previous.workbook -cne $OwnedWorkbook -or $previous.state -cne 'confirmed' -or
-                   -not (Same-Session $previous.new_session $old) -or
-                   -not $proof.retired_window_absent -or -not $proof.retired_process_absent){
-                    throw 'startup_launcher_outcome_unresolved'
-                }
+                $excelRoot=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$book.Windows.Item(1).Hwnd)
+                $addinAbsent=@(Get-Process -Name TEJAddin -ErrorAction SilentlyContinue).Count -eq 0
+                $excelReady=$excelRoot.Current.IsEnabled -and
+                    [TejBridgeNative]::Dialogs([long]$book.Windows.Item(1).Hwnd).Length -eq 0
+                $retryBasis=Launcher-RetryBasis $previous $old $proof $OwnedWorkbook ([DateTime]::UtcNow) $addinAbsent $excelReady
                 $history=@($previous.launch_history)
                 if($history.Count -eq 0){$history=@($previous.observed_at_utc)}
+                if($history.Count -gt 64){throw 'startup_launcher_outcome_unresolved'}
                 $cutoff=[DateTime]::UtcNow.AddHours(-1)
                 if(@($history|Where-Object{[DateTime]::Parse($_).ToUniversalTime() -gt $cutoff}).Count -ge 3){
                     throw 'desktop_restart_cooldown'
@@ -121,7 +140,9 @@ try {
             } else {throw 'tej_addin_not_ready'}
             $launch=@{contract=$proof.contract;windows_boot_at_utc=$proof.windows_boot_at_utc;
                 workbook=$OwnedWorkbook;observed_at_utc=[DateTime]::UtcNow.ToString('o');method=$method;provider_queries_sent=0;
-                state='prepared';launch_history=@($history)+@([DateTime]::UtcNow.ToString('o'))}
+                state='prepared';launch_history=@($history)+@([DateTime]::UtcNow.ToString('o'));
+                retry_basis=$retryBasis;original_unknown_intent_preserved=($null -ne $retryBasis)}
+            $proof.launcher_retry_basis=$retryBasis
             if(Test-Path -LiteralPath $intent){Copy-Item -LiteralPath $intent -Destination ($intent+'.'+[Guid]::NewGuid().ToString('N')+'.retained.json')}
             [IO.File]::WriteAllText($intent,($launch|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
             if($method -ceq 'owned_uia_toggle_once_v1'){$normal.Toggle()}else{$normal.Invoke()}

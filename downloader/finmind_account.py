@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import threading
 
 import requests
 
@@ -25,6 +26,8 @@ USER_INFO_URL = "https://api.web.finmindtrade.com/v2/user_info"
 _CACHE: tuple[str, datetime, dict[str, object]] | None = None
 ACCOUNT_CACHE_SECONDS = 60
 _DISPATCH_REFRESH_RETRY: dict[str, datetime] = {}
+_LIMITER: SharedRateLimiter | None = None
+_LIMITER_LOCK = threading.Lock()
 
 
 def _fresh_observation(stamp: datetime, now: datetime) -> bool:
@@ -116,7 +119,17 @@ def rate_limiter(account: dict[str, object]) -> SharedRateLimiter:
     subtract an arbitrary fixed spacing from a larger paid entitlement.
     402/429 still triggers the existing shared provider cooldown.
     """
-    return SharedRateLimiter(pacing_interval(account), name="finmind-v4-data")
+    global _LIMITER
+    interval = pacing_interval(account)
+    # Loop cycles used to leave an immortal FIFO dispatcher behind for every
+    # 120 requests. Reuse one per process; all processes still share the same
+    # named host-global state/cooldown. A tier change changes cadence, not owner.
+    with _LIMITER_LOCK:
+        if _LIMITER is None:
+            _LIMITER = SharedRateLimiter(interval, name="finmind-v4-data")
+        else:
+            _LIMITER.interval_seconds = interval
+        return _LIMITER
 
 
 def pacing_interval(account: dict) -> float:

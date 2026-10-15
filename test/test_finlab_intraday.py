@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import json
 from pathlib import Path
 import tempfile
@@ -9,7 +9,8 @@ import pytest
 from finlab.exceptions import DataError
 
 from scripts.download_finlab_intraday import (
-    _stored_receipt, _task_days, _validate_frame, fetch_partition, sync,
+    _checked_this_cycle, _partition_paths, _stored_receipt, _task_days, _validate_frame,
+    fetch_partition, record_failed_partition, sync,
 )
 from scripts.download_finlab_history import safe_stem
 
@@ -32,6 +33,49 @@ def _minute_frame() -> pd.DataFrame:
         "open": [100.0], "high": [101.0], "low": [99.0],
         "close": [100.5], "volume": [1000],
     })
+
+
+def test_source_cooldown_rechecks_when_expired_not_next_account_day(tmp_path):
+    day, key = date(2026, 6, 1), "tw_minute:2330"
+    with patch("scripts.download_finlab_intraday._transport_metrics", return_value={}):
+        assert record_failed_partition(tmp_path, key, day, DataError("rate_limited: fixture")) == "source_rate_limited"
+    path = _partition_paths(tmp_path, key, day)[1]
+    payload = json.loads(path.read_text())
+    before = datetime.fromisoformat(payload["attempted_at_utc"])
+    retry = datetime.fromisoformat(payload["retry_at_utc"])
+    assert _checked_this_cycle(path, "attempted_at_utc", before)
+    assert not _checked_this_cycle(path, "attempted_at_utc", retry)
+    assert retry-before == timedelta(seconds=60)
+
+
+def test_conflict_attempts_stop_at_three_but_resume_after_next_reset(tmp_path):
+    key, day = "tw_minute:2330", date(2026, 6, 1)
+    for _ in range(3):
+        record_failed_partition(tmp_path, key, day, DataError("request_conflict: fixture"))
+    path = _partition_paths(tmp_path, key, day)[1]
+    payload = json.loads(path.read_text())
+    assert payload["cycle_attempts"] == 3 and payload["retry_exhausted"] is True
+    retry = datetime.fromisoformat(payload["retry_at_utc"])
+    assert _checked_this_cycle(path, "attempted_at_utc", retry)
+    assert not _checked_this_cycle(path, "attempted_at_utc", retry+timedelta(days=1))
+
+
+@pytest.mark.parametrize("column,value", [("open", float("nan")), ("close", float("inf")), ("low", -1)])
+def test_minutes_reject_non_finite_or_non_positive_prices(column, value):
+    frame = _minute_frame()
+    frame.loc[0, column] = value
+    with pytest.raises(ValueError, match="minute prices"):
+        _validate_frame(frame, "tw_minute:2330", date(2026, 6, 1))
+
+
+def test_minute_timestamp_day_and_alignment_must_match_the_partition():
+    frame = _minute_frame()
+    frame["timestamp"] = pd.to_datetime(["2026-06-02T09:00:00+08:00"])
+    with pytest.raises(ValueError, match="Taipei trade date"):
+        _validate_frame(frame, "tw_minute:2330", date(2026, 6, 1))
+    frame["timestamp"] = pd.to_datetime(["2026-06-01T09:00:01+08:00"])
+    with pytest.raises(ValueError, match="minute aligned"):
+        _validate_frame(frame, "tw_minute:2330", date(2026, 6, 1))
 
 
 def test_tick_same_timestamp_keeps_both_provider_rows():

@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, time as wall_time, timezone
+from datetime import date, datetime, time as wall_time, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 
 discord_bot: ModuleType | None = None
 ARTIFACT_OWNER_UNIT = "stockagent-discord-artifact-maintenance.service"
@@ -113,6 +115,79 @@ def _retry_dispatch_state_path() -> Path:
         )
     )
     return path if path.is_absolute() else ROOT / path
+
+
+def _factorized_source_updater_receipt() -> Path:
+    return ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/updater_status.json"
+
+
+def _deferred_factorized_source_request() -> dict | None:
+    """A bounded wakeup hint, never acceptance of source/data/model readiness."""
+    state = _read_retry_json(_factorized_source_updater_receipt())
+    if state.get("status") != "cache_warming_required":
+        return None
+    from stockagent.data.annual_cache_admission import CONTRACT
+
+    admission = state.get("admission")
+    if (state.get("error_type") != "AnnualCacheBuildDeferred"
+            or not isinstance(admission, dict) or admission.get("contract") != CONTRACT
+            or state.get("last_good_generation_retained") is not True):
+        raise ValueError("unverified factorized warming request cannot invoke the source owner")
+    return state
+
+
+def _stale_factorized_projection_request() -> dict | None:
+    """A no-model wakeup hint for a preopen projection after an accepted close.
+
+    A decision-session label is not proof its calendar includes that session's
+    close. Only the canonical owner may extend the receipt-bound projection;
+    this bounded reader cannot accept features, fabricate dates, or run a model.
+    """
+    completed_path = Path(os.environ.get(
+        "STOCKAGENT_TW_COMPLETED_SESSION_RECEIPT",
+        "artifacts/data_refresh/tw_public/completed_session/latest.json"))
+    completed = _read_retry_json(completed_path if completed_path.is_absolute() else ROOT / completed_path)
+    if completed.get("status") != "ok" or (completed.get("after") or {}).get("current") is not True:
+        return None
+    expected = completed.get("expected_date")
+    if not isinstance(expected, str) or date.fromisoformat(expected).isoformat() != expected:
+        raise ValueError("completed projection refresh date must be a canonical date")
+    if date.fromisoformat(expected) > datetime.now(ZoneInfo("Asia/Taipei")).date():
+        raise ValueError("future completed projection refresh is not observable")
+    root = ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1"
+    pointer = root / "current/factorized_manifest.json"
+    if not pointer.is_file():
+        return None
+    path = pointer.resolve(strict=True)
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError("factorized projection pointer escapes the canonical source root")
+    manifest = _read_retry_json(path)
+    paper = manifest.get("paper_inference") or {}
+    if (manifest.get("status") != "complete" or manifest.get("research_only") is not True
+            or manifest.get("historical_point_in_time") is not False or manifest.get("feature_lag") != 1
+            or paper.get("contract") != "factorized_paper_projection_lag1_v1"
+            or paper.get("status") != "verified" or paper.get("raw_source_publication") is not False):
+        raise ValueError("unverified factorized projection cannot request source recovery")
+    dates = manifest.get("dates")
+    if (not isinstance(dates, list) or not dates
+            or any(not isinstance(day, str) or date.fromisoformat(day).isoformat() != day for day in dates)
+            or len(dates) != len(set(dates)) or dates != sorted(dates)):
+        raise ValueError("factorized projection dates must be unique ordered canonical dates")
+    if dates[-1] >= expected:
+        return None
+    return {"status": "projection_refresh_required", "expected_completed_session": expected,
+            "projection_end": dates[-1], "manifest": str(path),
+            "advisory_only": True, "model_executed": False,
+            "contract": "factorized_paper_projection_lag1_v1"}
+
+
+def _owns_factorized_source_updater(cfg) -> bool:
+    target = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
+    for item in (getattr(cfg, "completed_session_command", ()) or ()):
+        path = Path(str(item))
+        if (path if path.is_absolute() else ROOT / path).absolute() == target:
+            return True
+    return False
 
 
 def retry_probe(*, observed: datetime | None = None) -> dict:
@@ -203,7 +278,8 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
                 raise ValueError("artifact retry deadline must be timezone-aware")
             if deadline <= observed:
                 candidates.append((key, market))
-    if not candidates:
+    warming = _deferred_factorized_source_request() or _stale_factorized_projection_request()
+    if not candidates and warming is None:
         return finish()
 
     # Reuse the lightweight canonical YAML loader, never load the trading/model
@@ -244,13 +320,28 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
         fallback = os.environ.get("STOCKAGENT_DEFAULT_MARKET", "default")
         if (all_markets or fallback in selection) and enabled_override(fallback, True):
             enabled.add(fallback)
-    result["due_keys"] = sorted(key for key, market in candidates if market in enabled)
+    due_jobs = {key: jobs[key] for key, market in candidates if market in enabled}
+    if warming is not None:
+        # Headroom is a resource snapshot, not a source generation. Coalesce
+        # an unchanged warming request; committed source hints and the full
+        # worker retain the publication/resource gates and last-good proof.
+        if warming.get("status") == "projection_refresh_required":
+            hint = {key: warming.get(key) for key in
+                    ("status", "contract", "expected_completed_session", "projection_end", "manifest")}
+            prefix = "source_projection_refresh"
+        else:
+            admission = warming["admission"]
+            hint = {"phase": warming.get("phase"), "admission": {key: admission.get(key) for key in
+                    ("contract", "source", "immutable_seed", "required_headroom_bytes", "reason")}}
+            prefix = "source_cache_warming"
+        for name, cfg in configs.items():
+            if name in enabled and _owns_factorized_source_updater(cfg):
+                due_jobs[f"{prefix}:{name}"] = hint
+    result["due_keys"] = sorted(due_jobs)
     result["due"] = bool(result["due_keys"])
     result["reason"] = "retry_due" if result["due"] else "no_due_scheduled_retry"
     if result["due"]:
-        result["wakeup_fingerprint"] = _retry_wakeup_fingerprint(
-            {key: jobs[key] for key in result["due_keys"]}, markets_dir
-        )
+        result["wakeup_fingerprint"] = _retry_wakeup_fingerprint(due_jobs, markets_dir)
     return finish()
 
 
@@ -323,11 +414,120 @@ def request_due_retry() -> int:
     return 0
 
 
+def request_due_postclose_cache() -> int:
+    """Fallback when inotify is exhausted; this controller never imports Torch."""
+    from scripts import discord_postclose_wakeup as wakeup
+    from scripts.check_outside_tw_opening_resource_window import evaluate
+
+    started = time.perf_counter()
+    window = evaluate(datetime.now(timezone.utc), minimum_runway_minutes=wakeup.RUNWAY_MINUTES,
+                      protected_until=wall_time(13, 40))
+    if not window["allowed"]:
+        _emit(status="postclose_wakeup_idle", reason="protected_market_runway",
+              requested=False, model_runtime_imported="torch" in sys.modules)
+        return 0
+    status_path = wakeup.absolute(ROOT, os.environ.get("STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH") or
+                                  "artifacts/discord_bot/artifact_backfill_status.json")
+    source_lock = wakeup.absolute(ROOT, os.environ.get("STOCKAGENT_TW_PUBLIC_REFRESH_LOCK") or
+                                  "/srv/stockagent-live/.locks/tw-public-refresh.lock")
+    locks = (status_path.with_name("postclose_signal_cache.worker.lock"),
+             status_path.with_name(status_path.name + ".worker.lock"))
+    if (any(wakeup.lock_held(path) for path in locks)
+            or wakeup.lock_held(source_lock, producer_only=True)):
+        _emit(status="postclose_wakeup_idle", reason="canonical_owner_or_source_lock_held",
+              requested=False, model_runtime_imported="torch" in sys.modules)
+        return 0
+    accepted = wakeup.read_json(wakeup.accepted_path(ROOT))
+    dispatch_path = _retry_dispatch_state_path().with_name("postclose_dispatch_latest.json")
+    previous = _read_retry_json(dispatch_path)
+    snapshot = wakeup.observe(ROOT, previous=[accepted, previous])
+    fingerprint = snapshot.get("fingerprint")
+    reason = snapshot["reason"]
+    if (fingerprint and accepted.get("contract") == wakeup.CONTRACT
+            and accepted.get("status") == "canonical_artifacts_reusable"
+            and accepted.get("fingerprint") == fingerprint and wakeup.artifacts_unchanged(accepted)):
+        reason = "unchanged_verified_wakeup_generation"
+        fingerprint = None
+    now = datetime.now(timezone.utc)
+    if fingerprint and previous.get("fingerprint") == fingerprint:
+        accepted_at = datetime.fromisoformat(previous["dispatch_accepted_at"])
+        if accepted_at.tzinfo is None:
+            raise ValueError("postclose dispatch time must be timezone-aware")
+        if 0 <= (now - accepted_at).total_seconds() < UNCHANGED_RETRY_WAKEUP_SECONDS:
+            reason, fingerprint = "unchanged_postclose_wakeup_coalesced", None
+    if not fingerprint:
+        _emit(status="postclose_wakeup_idle", reason=reason, requested=False,
+              member_count=snapshot["member_count"], probe_seconds=time.perf_counter() - started,
+              model_runtime_imported="torch" in sys.modules)
+        return 0
+    subprocess.run(["systemctl", "start", "--no-block", wakeup.OWNER_UNIT], check=True, timeout=10)
+    from downloader.artifact_io import atomic_write_json
+
+    # Dispatch acceptance is deliberately separate from worker/data acceptance.
+    atomic_write_json(dispatch_path, {**snapshot, "dispatch_accepted_at": now.isoformat(),
+                                     "owner_unit": wakeup.OWNER_UNIT})
+    _emit(status="postclose_wakeup_requested", requested=True,
+          **{key: value for key, value in snapshot.items() if key != "observation_plan"},
+          probe_seconds=time.perf_counter() - started, model_runtime_imported="torch" in sys.modules)
+    return 0
+
+
+def request_due_work() -> int:
+    # The bounded latest-close worker and two-hour history owner have different
+    # runway budgets. Never let history's restriction silence the cheap bridge.
+    request_due_postclose_cache()
+    return request_due_retry()
+
+
 def _emit(**payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
+def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> bool:
+    """Let the existing isolated owner recover a gateway-denied cold cache.
+
+    Run only the configured canonical updater, after an accepted official close.
+    Do not require the derived panel to already be fresh: that is the missing
+    artifact this operation repairs. Ordinary cache passes incur no new source
+    command or memory probe. Opening and producer-lock gates remain with the
+    surrounding worker and source owner.
+    """
+    expected = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
+    if not _owns_factorized_source_updater(cfg):
+        return True
+    state = _deferred_factorized_source_request() or _stale_factorized_projection_request()
+    if state is None:
+        return True
+    projection_refresh = state.get("status") == "projection_refresh_required"
+    action = "factorized_projection_refresh" if projection_refresh else "factorized_cache_warming"
+    if not allow_warming:
+        _emit(status=f"{action}_deferred", market=cfg.market,
+              reason="isolated_source_owner_required", owner_unit=ARTIFACT_OWNER_UNIT,
+              model_executed=False)
+        return False
+    bot = _load_discord_bot()
+    status = bot._ensure_signal_ready(cfg)
+    if status.market_open or not bot._completed_session_publication_ready(status):
+        _emit(status=f"{action}_deferred", market=cfg.market,
+              reason="accepted_official_close_required", model_executed=False)
+        return False
+    _emit(status=f"{action}_started", market=cfg.market,
+          owner=ARTIFACT_OWNER_UNIT, source_owner=str(expected), model_executed=False)
+    bot._run_completed_session_command(cfg, bypass_cache=True)
+    if _read_retry_json(_factorized_source_updater_receipt()).get("status") not in {"verified", "already_current"}:
+        raise RuntimeError("canonical factorized source recovery has no accepted receipt")
+    if projection_refresh and (not (ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/factorized_manifest.json").is_file()
+                               or _stale_factorized_projection_request() is not None):
+        raise RuntimeError("canonical factorized source recovery still lacks the completed calendar")
+    _emit(status=f"{action}_verified", market=cfg.market,
+          source_owner=str(expected), model_executed=False)
+    return True
+
+
+def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int]:
+    from scripts import discord_postclose_wakeup as wakeup
+
+    wakeup_before = wakeup.observe(ROOT)
     discord_bot = _load_discord_bot()
     attempted = 0
     failures = 0
@@ -337,7 +537,14 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
             continue
         attempted += 1
         try:
+            if not _recover_deferred_factorized_source(cfg, allow_warming=allow_source_warming):
+                failures += 1
+                continue
             result = discord_bot._run_completed_session_signal_cache_sync(cfg)
+        except TWPublicSourceUpdatePending:
+            # A writer may acquire the lock just after the outer busy check.
+            # Stop this source-dependent pass, not the Gateway or source owner.
+            raise
         except Exception as exc:
             failures += 1
             discord_bot._log_exception(
@@ -359,7 +566,24 @@ def _populate_postclose_signal_caches(markets: list[str]) -> tuple[int, int]:
                 panel_date=result.summary.get("panel_date"),
                 output_dir=str(result.output_dir),
             )
+    if attempted and not failures:
+        acknowledged = wakeup.acknowledge(ROOT, wakeup_before, discord_bot)
+        _emit(status="postclose_wakeup_readback", acknowledged=acknowledged,
+              advisory_only=True)
     return attempted, failures
+
+
+def _populate_postclose_signal_caches_or_defer(
+        markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int] | None:
+    try:
+        return _populate_postclose_signal_caches(markets, allow_source_warming=allow_source_warming)
+    except TWPublicSourceUpdatePending as exc:
+        discord_bot = _load_discord_bot()
+        discord_bot._record_artifact_maintenance_run(
+            "waiting_source", reason="tw_public_refresh_in_progress", deferred=1,
+        )
+        _emit(status="waiting_source", **exc.details)
+        return None
 
 
 def _wait_for_tw_public_refresh() -> bool:
@@ -439,7 +663,10 @@ def run_once(*, signal_cache_only: bool = False) -> int:
 
         markets = discord_bot._artifact_maintenance_markets()
         if signal_cache_only:
-            cache_attempted, cache_failures = _populate_postclose_signal_caches(markets)
+            population = _populate_postclose_signal_caches_or_defer(markets, allow_source_warming=False)
+            if population is None:
+                return 0
+            cache_attempted, cache_failures = population
             _emit(
                 status="signal_cache_complete"
                 if cache_failures == 0
@@ -466,7 +693,8 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     reason="postclose_signal_cache_in_progress",
                 )
                 return 0
-            _populate_postclose_signal_caches(markets)
+            if _populate_postclose_signal_caches_or_defer(markets) is None:
+                return 0
 
         attempted = 0
         failures = 0
@@ -499,7 +727,9 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     key=key,
                     market=market,
                 )
-                if not recovered:
+                if recovered:
+                    continue
+                if not discord_bot._artifact_backfill_retry_allowed(key):
                     # Skipping a failed job during backoff does not prove its
                     # artifacts are current. Preserve its per-market receipt
                     # and make the worker's unfinished work visible as well.
@@ -511,7 +741,11 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                         market=market,
                         key=key,
                     )
-                continue
+                    continue
+                # A current readback can CAS an obsolete ready hint to failed
+                # with an immediate retry. Keep this same canonical serial
+                # owner: do not defer repairs behind a later hour-long job or
+                # spawn another inference worker. Recheck priority gates below.
 
             # A multi-market pass can run for hours. Recheck the independent
             # priority gates between expensive inferences, not only once at
@@ -612,12 +846,15 @@ def main() -> None:
     retry_mode = parser.add_mutually_exclusive_group()
     retry_mode.add_argument("--retry-check-only", action="store_true")
     retry_mode.add_argument("--request-due-retry", action="store_true")
+    retry_mode.add_argument("--request-due-work", action="store_true")
     args = parser.parse_args()
-    if args.signal_cache_only and (args.retry_check_only or args.request_due_retry):
+    if args.signal_cache_only and (args.retry_check_only or args.request_due_retry or args.request_due_work):
         parser.error("retry probe modes cannot generate signal caches")
-    if args.retry_check_only or args.request_due_retry:
+    if args.retry_check_only or args.request_due_retry or args.request_due_work:
         try:
-            if args.request_due_retry:
+            if args.request_due_work:
+                return_code = request_due_work()
+            elif args.request_due_retry:
                 return_code = request_due_retry()
             else:
                 probe = retry_probe()

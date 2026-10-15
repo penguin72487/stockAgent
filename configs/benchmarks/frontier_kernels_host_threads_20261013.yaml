@@ -1,0 +1,19 @@
+contract: frontier_complete_fold_recipes_v1
+# Keep the validated GPU-local CPU placement; vary only PyTorch's host pool.
+# Compilation, complete rows and annual optimizer cadence stay unchanged.
+full_fold_candidates:
+  - name: numa_cpu_1
+    cpu_threads: 1
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+  - name: numa_cpu_4
+    cpu_threads: 4
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+  - name: numa_cpu_16
+    cpu_threads: 16
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'

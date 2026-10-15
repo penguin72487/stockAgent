@@ -483,7 +483,10 @@ def _load_retained_historical_entry_books(
             )
             current_minute_receipt = (
                 isinstance(payload, dict)
-                and payload.get("schema_version") == 2
+                and (payload.get("schema_version") == 2 or (
+                    payload.get("schema_version") == 3
+                    and payload.get("query_contract") == "bounded_incremental_per_mode_source_queries_v3"
+                ))
                 and payload.get("execution_price_contract")
                 == "source_backed_right_labelled_09_01_minute_price_vwap_else_kbar_close"
             )
@@ -1778,7 +1781,7 @@ def _close_quotes(
         from scripts.settle_tw_day_trade_official_close import official_closes
         if official_raw_root is None:
             raise ValueError("unlimited terminal replay requires retained official reports")
-        official_prices, official_sources = official_closes(official_raw_root, trading_date)
+        official_prices, official_sources = official_closes(official_raw_root, trading_date, pin_sources=True)
     from stockagent.live.tw_share_replacement import halted_symbols
     halted = set().union(*(halted_symbols(root, trading_date) for root in {
         twse_daily_ohlcv_path.parent, *(s.margin_corporate_action_reference_path.parent

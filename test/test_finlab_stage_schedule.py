@@ -73,7 +73,7 @@ def job(key, size=100, seconds=10, stage="updates", pending=True, next_check=Non
             "next_source_check_at_utc": next_check, "record_count": 42, "record_unit": "wide_values"}
 
 
-def sdk_mock(*, publication=True, marker=True, fail=False):
+def sdk_mock(*, publication=True, marker=True, fail=False, content_hash="abc12345"):
     storage = SimpleNamespace(_publications={}, expiry=NOW, created=NOW)
     storage.get_time_created = lambda key: storage.created
     storage.get_time_expired = lambda key: storage.expiry
@@ -89,7 +89,7 @@ def sdk_mock(*, publication=True, marker=True, fail=False):
         progress_callback({"dataset": key, "phase": "download", "download_bytes": 100})
         progress_callback({"dataset": key, "phase": "complete", "download_bytes": 100})
         if marker:
-            storage._publications[key] = (storage.created, {"content_hash": "abc12345"} if publication else None)
+            storage._publications[key] = (storage.created, {"content_hash": content_hash} if publication else None)
         storage.expiry = datetime.now(UTC) + timedelta(hours=2)
         return pd.DataFrame({"v": [0, -3]}, index=pd.to_datetime(["2020-01-01", "2026-01-01"]))
     sdk = SimpleNamespace(_default_context=ctx, get=Mock(side_effect=get))
@@ -288,7 +288,7 @@ def test_unchanged_sdk_hash_skips_serialization_but_not_integrity(tmp_path):
            "parquet_size_bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
            "fetched_at_utc": "2020-01-01T00:00:00Z", "provider_content_hash": "abc12345",
            "provider_hash_basis": "sdk_validated_publication_v1", "incremental_adapter_version": 1,
-           "normalization_contract_version": 1,
+           "normalization_contract_version": 2,
            "finlab_sdk_version": version("finlab")}
     write(tmp_path, "receipts", "price:a", old)
     sdk, _, _ = sdk_mock()

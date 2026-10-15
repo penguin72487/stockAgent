@@ -56,6 +56,15 @@ Use for split ownership, model horizons, benchmark returns and stitched reportin
   not an active training default. Panel-slab densification and dynamic-symbol
   upper bounds must preserve the panel-history target endpoints; do not recompute
   a split-only start and silently drop the first `lookback-1` owned targets.
+- Annual ownership follows the selected `year_boundary_mode`. Calendar mode
+  preserves its historical boundaries. An explicit `lookback_shifted` experiment
+  owns `[first observed session of Y + lookback, first observed session of Y+1
+  + lookback)` using session indices from the full panel, even when lookback
+  crosses into a later calendar year. Reuse that same period contract in splits,
+  annual train-account resets, reports and deployment; never shift a subset
+  again or fabricate a boundary beyond the observed calendar. Such results are
+  not paired controls for old calendar-period metrics. See
+  [TW shifted annual ablations](../tw_scale_cash_annual_fold10_selected_2026-10-08.md).
 - For stitched deployment tests, the next model owns its new-year first target
   under panel history; the preceding model stops immediately before that target.
 - Incremental Taiwan stock-account reports replay only the earliest available

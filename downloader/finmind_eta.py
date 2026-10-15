@@ -17,7 +17,7 @@ from downloader.artifact_io import atomic_write_json
 
 TAIPEI = ZoneInfo('Asia/Taipei')
 SCOPE_LABEL = 'FinMind 已排程可執行工作（含次要校驗）'
-SNAPSHOT_CONTRACT_VERSION = 12  # Independent retry lanes and standalone stage cost evidence.
+SNAPSHOT_CONTRACT_VERSION = 14  # Current-profile JSON batch throughput, including validation/publication.
 
 
 def _number(value: Any) -> float | None:
@@ -84,16 +84,20 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
     central_rate = min(cap, max(0.0, observed_middle - reserved)) if None not in (cap, observed_middle, reserved) else None
     slow_rate = min(central_rate, max(0.0, observed_slow - reserved)) if None not in (central_rate, observed_slow, reserved) else None
     processing = telemetry.get('request_processing_rates')
+    own_service = False
     if processing is not None:
         # A signed whole-day file can take seconds/minutes per single quota
         # grant. Old JSON call rates are not evidence of that transfer speed.
         measured = processing.get('rates', {})
         if measured.get('fastest') is not None and fastest_rate is not None:
             fastest_rate = min(fastest_rate, measured['fastest'])
-        central_rate = (min(central_rate, measured['central'])
-                        if central_rate is not None and measured.get('central') is not None else None)
-        slow_rate = (min(slow_rate, measured['slowest'])
-                     if slow_rate is not None and measured.get('slowest') is not None else None)
+        own_service = processing.get('capacity_basis') in {'accepted_json_own_service_cost', 'accepted_parallel_pipeline_wall'}
+        central_base = cap if own_service else central_rate
+        slow_base = cap if own_service else slow_rate
+        central_rate = (min(central_base, measured['central'])
+                        if central_base is not None and measured.get('central') is not None else None)
+        slow_rate = (min(central_rate, slow_base, measured['slowest'])
+                     if None not in (central_rate, slow_base, measured.get('slowest')) else None)
     counts = {key: summary.get(key) for key in ('required_requests', 'validation_requests', 'unbatched_requests',
               'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets', 'inflight_tasks', 'local_derived_tasks',
               'batch_savings', 'calendar_wait_tasks', 'retry_tasks', 'retry_exhausted_tasks', 'candidate_requests',
@@ -126,8 +130,10 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
         'basis': '固定截止日剩餘工作量 ÷ 共用吞吐扣除未來週期性增量；當前追新欠帳僅計入分子一次。',
         'assumptions': [
             '最快為共用額度與現行限速可達的理想情境；不是保證能達到的速度。',
-            '中間採同一取樣時點的滾動 60 分鐘實發請求數，含閒置時間；未滿一小時不外推成完整樣本。',
-            f'保守採近 {window} 完整 15 分鐘窗的 P10（含零），且不快於中間；不是完成機率。',
+            ('中間採近期已接受工作的自有服務成本或本配置完整管線的總接受量／總牆鐘耗時；實發一小時流量另列，不作本階段容量上限。'
+             if own_service else '中間採同一取樣時點的滾動 60 分鐘實發請求數，含閒置時間；未滿一小時不外推成完整樣本。'),
+            ('保守採同類自有成本或已接受並行批次的慢端樣本，且不快於中間；不是完成機率或最遲期限。'
+             if own_service else f'保守採近 {window} 完整 15 分鐘窗的 P10（含零），且不快於中間；不是完成機率。'),
             '最慢另假設退回逐任務請求；它是保守情境，不是不可超過的期限。',
             '所有情境均假設請求成功、權限有效、持續運行及次要校驗准入；額外重試與停機會延長。',
             '當前追新欠帳只計入工作量一次；未來追新是模型負載，不把當下額度保留量再扣一次。',
@@ -149,9 +155,13 @@ def estimate_completion(workload: dict[str, Any], telemetry: dict[str, Any], now
                           'future_recurring_requests_per_hour': reserved,
                           'success_rate': None, 'success_rate_basis': 'no_complete_request_outcome_ledger'},
     }
-    if rates.get('idle_bin_count'):
+    if rates.get('idle_bin_count') and not own_service:
         estimate['assumptions'].append(
             f"保守觀察窗含 {rates['idle_bin_count']} 個完全閒置區間；若淨速度為零，不能給有限完成日。")
+    if processing and processing.get('capacity_basis') == 'accepted_json_own_service_cost':
+        estimate['assumptions'].insert(0, 'JSON 階段按近期已接受回應至本機完成的自身服務成本試算；無本資料集樣本時採同類 JSON 樣本代理，不把大檔彙總等待當 JSON 回應耗時。此為持續供給工作的條件模型，非目前實發流量。')
+    if processing and processing.get('capacity_basis') == 'accepted_parallel_pipeline_wall':
+        estimate['assumptions'].insert(0, '本階段按目前配置下已接受的並行批次牆鐘速度估算，含下載、驗證、必要彙總與發布；不以改版前的滾動一小時串行流量限制新配置，也不把官方配額當成檔案完成速度。')
     budget = quota.get('current_budget')
     quota_blocked = (isinstance(budget, dict) and budget.get('allowed') is False
                      and not (summary.get('incremental_requests', 0) > 0 and budget.get('remaining', 0) > 0))
@@ -275,8 +285,9 @@ def snapshot_finmind_estimate(root: Path, *, now: datetime | None = None) -> dic
     from downloader.acquisition_policy import evaluate_finmind_secondary_admission
 
     now = now or datetime.now(UTC)
-    workload = build_finmind_workload(root, now)
-    telemetry = build_finmind_eta_telemetry(root, now)
+    queue_snapshots = {}
+    workload = build_finmind_workload(root, now, queue_snapshots=queue_snapshots)
+    telemetry = build_finmind_eta_telemetry(root, now, queue_snapshots=queue_snapshots)
     public_root = Path(__file__).resolve().parents[1] / 'data_tw_public'
     calendar: dict[str, str] = {}
     def protected(day: date) -> bool:
@@ -290,9 +301,10 @@ def snapshot_finmind_estimate(root: Path, *, now: datetime | None = None) -> dic
             calendar[day.isoformat()] = decision.status
         state = calendar[day.isoformat()]
         return state != 'closed' and (state in {'actual_open', 'scheduled_open'} or day.weekday() < 5)
-    admission = evaluate_finmind_secondary_admission(root=root, now=now)
+    admission = evaluate_finmind_secondary_admission(root=root, now=now, _workload_snapshot=(root, workload))
     estimate = ordered_estimate(workload, telemetry, now, day_is_protected=protected,
                                 secondary_admission=admission)
+    estimate['scenario_projection_contract'] = 1
     estimate['assumptions'].append('台股現貨僅排除已驗證的休市日；上市存續期間及其他市場未知日曆仍保留為搜尋工作量上側投影，不是缺失 K 棒數。')
     estimate['assumptions'].append('超過一年的未公布日曆僅按平日保護時段投影；持續新增資料另依週期負載預留。')
     estimate['calendar_states'] = calendar

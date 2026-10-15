@@ -2,6 +2,18 @@
   "schema_version": 1,
   "datasets": [
     {
+      "dataset": "training-dataset-recipes",
+      "source": "artifacts/operations/training_dataset_recipes",
+      "role": "source-pinned-rebuild-methods-no-training-data",
+      "publish": true,
+      "pack_buckets": 8,
+      "loose_threshold_mib": 8,
+      "excluded_subtrees": ["status.json", "refresh.lock"],
+      "source_coordination_lock": "artifacts/operations/training_dataset_recipes/refresh.lock",
+      "active_process_substrings": ["maintain_training_dataset_recipes.py"],
+      "note": "Only methods, exact source/code hashes and version heads; no assembled panels, checkpoints or credentials. A recipe is not GPU/training acceptance and never starts a training job."
+    },
+    {
       "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v4",
       "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v4",
       "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
@@ -247,6 +259,8 @@
       "active_process_substrings": [
         "build_shioaji_tw_minute_dataset.py"
       ],
+      "validation_gate": {"kind": "stock_minute_dataset", "calendar_root": "data_tw_public"},
+      "source_coordination_lock": "artifacts/data_repair/shioaji_minute_full/runner.lock",
       "note": "Canonical audited one-minute partitions; excludes the known schema2 volume-bug quarantine tree."
     },
     {
@@ -259,6 +273,9 @@
       "active_process_substrings": [
         "download_shioaji_tw_minute_kbars.py"
       ],
+      "validation_gate": {"kind": "stock_minute_source"},
+      "source_coordination_lock": "artifacts/data_repair/shioaji_minute_full/runner.lock",
+      "freshness": {"receipt": "download_summary.json", "field": "end_date", "format": "iso-date", "required_values": {"resumable_collection_complete": true, "failed_symbols": 0, "partial_symbols": 0}},
       "note": "Resumable source chunks and receipts; pack only after downloader exit."
     },
     {

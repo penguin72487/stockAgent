@@ -8,11 +8,12 @@ from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
 @pytest.mark.parametrize('problem', [None, 'corrupt', 'changed-during-read'])
-def test_bounded_small_pack_keeps_complete_sha_and_final_generation(tmp_path, monkeypatch, problem):
+@pytest.mark.parametrize('members', [2, 67])
+def test_bounded_small_pack_keeps_complete_sha_and_final_generation(tmp_path, monkeypatch, problem, members):
     import os
     path=tmp_path/'pack.zip';payload=b'small exact encoded members'*100
     path.write_bytes(payload)
-    item={'bytes':len(payload),'sha256':hashlib.sha256(payload).hexdigest(),'file_count':2}
+    item={'bytes':len(payload),'sha256':hashlib.sha256(payload).hexdigest(),'file_count':members}
     if problem == 'corrupt':
         path.write_bytes(b'X'*len(payload))
     monkeypatch.setattr(native,'binary_reader',lambda *a:pytest.fail('bounded small pack launched native reader'))
@@ -28,7 +29,7 @@ def test_bounded_small_pack_keeps_complete_sha_and_final_generation(tmp_path, mo
 
 
 @pytest.mark.parametrize('bytes_count,members,stored', [
-    (512*1024+1,2,None), (1024,3,None), (1024,2,500)])
+    (1024**2+1,2,None), (1024,129,None), (1024,2,500)])
 def test_large_many_member_and_subset_packs_keep_native_admission(tmp_path, monkeypatch, bytes_count, members, stored):
     from contextlib import contextmanager
     from types import SimpleNamespace

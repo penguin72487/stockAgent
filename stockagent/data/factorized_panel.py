@@ -10,10 +10,12 @@ zeros, not fabricated raw observations.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -254,9 +256,9 @@ class FactorizedPanelFeatures:
         return FactorizedFeatureTensor(self)
 
     def compact_statistics_rows(self, rows):
-        """Skip proven positive-zero columns in statistical reductions only.
+        """Read a lossless column union for statistics or an admitted stem.
 
-        The model still receives its complete dense feature schema. PCA keeps
+        The logical model schema remains complete. PCA keeps
         the original logical observation count; omitted zeros contribute zero
         to its sums/products. RMS retains the full alive-cell denominator.
         """
@@ -460,7 +462,8 @@ def _reconstruct_transfer_packet(result, packet, layout, queued, base_width, com
         if operation == "base":
             result[..., :base_width].copy_(views[arguments[0]])
         elif operation == "common":
-            result[..., common_start:].copy_(views[arguments[0]][:, None, :])
+            width=views[arguments[0]].size(-1)
+            result[..., common_start:common_start+width].copy_(views[arguments[0]][:, None, :])
         elif operation == "rectangle":
             rows, stocks, payload, indices = arguments
             result[rows[0]:rows[-1]+1, stocks[0]:stocks[-1]+1].index_copy_(
@@ -508,6 +511,117 @@ class FactorizedPanelSlab:
     def pad_end(self,count):
         return FactorizedPanelSlab(self.source,np.concatenate([self.rows,np.repeat(self.rows[-1],count)]),
                                   pin_slabs=self.pin_slabs,device=self.device)
+    def _compact_column_packet(self,start,end):
+        """Pack immutable rectangle views, not a large NumPy column scatter.
+
+        Coordinates are remapped into one static-width column union. The
+        ordinary shared rectangle decoder reconstructs that union on device.
+        Keeping raw packets (rather than expanded unions) lets checkpoint
+        recomputation reuse far more of the same bounded GPU cache.
+        """
+        subset=self.source.subset_symbols(np.arange(start,end))
+        rectangles=list(subset.compact_transfer_rectangles(self.rows))
+        base_width=subset.base.shape[-1]
+        common_width=subset.common.shape[-1]
+        common_logical_start=base_width+len(subset.manifest["individual_channels"])
+        pieces=[np.arange(base_width,dtype=np.int64),
+                np.arange(common_logical_start,common_logical_start+common_width,dtype=np.int64)]
+        pieces.extend(columns for _,_,columns,_ in rectangles)
+        columns=np.unique(np.concatenate(pieces))
+        width=len(columns)
+        bucket=min(self.size(2),1 << (max(1,width)-1).bit_length())
+        if len(self.rows)*(end-start)*bucket*4>self.source.max_slab_bytes:
+            raise MemoryError("compact column bucket exceeds the bounded device budget")
+        if bucket==self.size(2):
+            columns=np.arange(bucket,dtype=np.int64)
+            common_start=common_logical_start
+        else:
+            common_start=width-common_width
+            columns=np.pad(columns,(0,bucket-width),constant_values=self.size(2))
+        values=[columns];queued=[]
+        def queue(value):
+            values.append(value)
+            return len(values)-1
+        if base_width:
+            queued.append(("base",queue(subset.base[
+                self.rows[:,None],subset.symbol_indices[None,:]])))
+        if common_width:
+            queued.append(("common",queue(subset.common[self.rows])))
+        for rows,stocks,logical,value in rectangles:
+            mapped=np.searchsorted(columns,logical).astype(np.int64)
+            payload,indices=queue(value),queue(mapped)
+            if np.all(np.diff(rows)==1) and np.all(np.diff(stocks)==1):
+                queued.append(("rectangle",rows,stocks,payload,indices))
+            else:
+                queued.append(("indexed",queue(rows),queue(stocks),payload,indices))
+        packet,layout=_pack_transfer_payloads(values,pin_memory=self.pin_slabs,
+            budget_bytes=self.source.max_slab_bytes)
+        return packet,layout,(queued,base_width,common_start,bucket)
+    def compact_stock_chunk(self, start, end):
+        """Return exact values/coordinates without reconstructing F-wide zeros.
+
+        Only admitted full-affine contraction consumers may use this method.
+        Cache lifetime and pin/H2D rules match stock_chunk; no optimizer state
+        or transformed observations are cached. A union also handles slabs
+        crossing physical date/symbol rectangles and padded/reordered rows.
+        Power-of-two widths avoid variable-K compiler guards. Padding uses a
+        sentinel F (never a model channel); an admitted consumer masks its
+        affine weights. A full-width bucket reconstructs native dense rows.
+        """
+        key = ("compact_columns", start, end)
+        cached = self._gpu_packets.get(key) if self.device.type == "cuda" else None
+        if self.device.type=="cuda":
+            if cached is not None:
+                packet,layout,metadata=cached
+                self.source.transfer_stats["payload_cache_hits"]+=1
+            else:
+                packet,layout,metadata=self._compact_column_packet(start,end)
+                payload_bytes=packet.numel()
+                packet=packet.to(device=self.device,non_blocking=self.pin_slabs)
+                if self._retain_gpu_packets and torch.is_grad_enabled():
+                    self._remember_gpu_packet(key,packet,layout,metadata)
+                self.source.transfer_stats["host_payload_bytes"]+=payload_bytes
+            queued,base_width,common_start,bucket=metadata
+            result=torch.zeros((len(self.rows),end-start,bucket),dtype=torch.float32,device=self.device)
+            _reconstruct_transfer_packet(result,packet,layout,queued,base_width,common_start)
+            columns=_transfer_packet_views(packet,layout)[0]
+            self.source.transfer_stats["chunks"]+=1
+            self.source.transfer_stats["logical_dense_bytes"]+=len(self.rows)*(end-start)*self.size(2)*4
+            return result,columns
+        if cached is not None:
+            packet, layout, queued = cached
+            packet.record_stream(torch.cuda.current_stream(self.device))
+            columns, values = _transfer_packet_views(packet, layout)
+            self.source.transfer_stats["payload_cache_hits"] += 1
+        else:
+            subset = self.source.subset_symbols(np.arange(start, end))
+            host_columns, host_values = subset.compact_statistics_rows(self.rows)
+            width = len(host_columns)
+            bucket = min(self.size(2), 1 << (max(1, width)-1).bit_length())
+            if bucket != width:
+                padded_bytes = len(self.rows)*(end-start)*bucket*4
+                if padded_bytes > self.source.max_slab_bytes:
+                    raise MemoryError("compact column bucket exceeds the bounded host budget")
+                prepared = np.zeros((*host_values.shape[:-1], bucket), dtype=np.float32)
+                if bucket == self.size(2):
+                    prepared[..., host_columns] = host_values
+                    host_columns = np.arange(bucket, dtype=np.int64)
+                else:
+                    prepared[..., :width] = host_values
+                    host_columns = np.pad(host_columns, (0, bucket-width), constant_values=self.size(2))
+                host_values = prepared
+            packet, layout = _pack_transfer_payloads([host_columns, host_values],
+                pin_memory=self.pin_slabs, budget_bytes=self.source.max_slab_bytes)
+            payload_bytes = packet.numel()
+            packet = packet.to(device=self.device, non_blocking=self.pin_slabs)
+            columns, values = _transfer_packet_views(packet, layout)
+            if (self.device.type == "cuda" and self._retain_gpu_packets
+                    and torch.is_grad_enabled()):
+                self._remember_gpu_packet(key, packet, layout, [])
+            self.source.transfer_stats["host_payload_bytes"] += payload_bytes
+        self.source.transfer_stats["chunks"] += 1
+        self.source.transfer_stats["logical_dense_bytes"] += len(self.rows)*(end-start)*self.size(2)*4
+        return values, columns
     def stock_chunk(self,start,end):
         subset=self.source.subset_symbols(np.arange(start,end))
         logical_bytes=len(self.rows)*(end-start)*self.source.shape[2]*4
@@ -609,18 +723,41 @@ def factorized_member_proofs(manifest: dict) -> list[dict]:
     return proofs
 
 
-def verify_factorized_members(root: Path, manifest: dict) -> None:
-    """Verify every immutable model/raw member without expanding its arrays."""
+def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None = None) -> None:
+    """Verify every immutable model/raw member without expanding its arrays.
+
+    Parallelism is an operational opt-in, not a weaker receipt/cache policy.
+    Each worker retains only one bounded SHA stream; every inventory member,
+    including nullable raw observations, remains mandatory. The launcher's
+    per-rank budget must also include these CPU/I/O workers.
+    """
     root=root.resolve(strict=True)
     proofs=factorized_member_proofs(manifest)
-    for proof in proofs:
+    if workers is None:
+        workers=int(os.environ.get("STOCKAGENT_FEATURE_VERIFY_THREADS", "1"))
+    if workers < 1 or workers > 16:
+        raise ValueError("factorized SHA workers must be in [1,16]")
+    def verify(proof):
         member = (root / proof["path"]).resolve(strict=True)
         if not member.is_relative_to(root) or file_sha256(member) != proof["sha256"]:
-            raise ValueError("factorized member identity mismatch")
+            raise ValueError(f"factorized member identity mismatch: {proof['path']}")
+    if workers == 1:
+        for proof in proofs:
+            verify(proof)
+    else:
+        with ThreadPoolExecutor(max_workers=workers,thread_name_prefix="factorized-sha") as pool:
+            # Python 3.12 Executor.map eagerly submits the inventory, but only
+            # the bounded workers open/read files. Consume every future so a
+            # missing, escaped or corrupt member cannot hide in another task.
+            for _ in pool.map(verify,proofs):
+                pass
 
 
-def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu"):
+def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu",
+                               host_cache_bytes: int | None = None):
     """Attach model-only storage after the ordinary price/rule cache load."""
+    if host_cache_bytes is not None and host_cache_bytes < 1:
+        raise ValueError("factorized host cache budget must be positive")
     path = Path(manifest_path).resolve(strict=True)
     manifest = json.loads(path.read_text())
     if manifest.get("contract") not in SUPPORTED_CONTRACTS or manifest.get("status") != "complete":
@@ -660,7 +797,8 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
     if rows != panel.num_dates:
         raise ValueError("factorized blocks do not cover the full executable calendar")
     features = FactorizedPanelFeatures(root, manifest, panel.features,
-        cache_bytes=int(manifest.get("host_cache_bytes", 512 * 1024**2)),
+        cache_bytes=(int(manifest.get("host_cache_bytes", 512 * 1024**2))
+                     if host_cache_bytes is None else int(host_cache_bytes)),
         max_slab_bytes=int(manifest.get("max_slab_bytes",2*1024**3)),transfer_mode=transfer_mode)
     panel.features, panel.feature_names = features, names
     panel.content_fingerprints = {**(panel.content_fingerprints or {}), "features": features.content_fingerprint}
@@ -673,7 +811,174 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
         f"individual={len(manifest['individual_channels'])}, "
         f"common={len(manifest['common_channels'])}; "
         f"factorized attachment complete, transfer={transfer_mode}, "
+        f"host_cache_bytes_per_rank={features._cache.budget_bytes}, "
         f"research_only=True, historical_point_in_time=False",
         flush=True,
     )
     return panel
+
+
+class FactorizedDateView:
+    """Bounded live calendar projection of the same lossless trained feature ABI.
+
+    Only source-backed dates are admitted. No forward-fill, interpolation or
+    new feature selection occurs here; release state is built by the canonical
+    causal sweep before this immutable view is published.
+    """
+    _stockagent_factorized_features = True
+    dtype = np.dtype("float32")
+    ndim = 3
+
+    def __init__(self, source, rows):
+        self.source = source
+        self.rows = np.asarray(rows, dtype=np.int64)
+        self.shape = (len(self.rows), *source.shape[1:])
+        self.content_fingerprint = {**source.content_fingerprint,
+            "shape": list(self.shape), "sha256": _digest({
+                "source": source.content_fingerprint, "rows": self.rows.tolist()})}
+
+    def __array__(self, *args, **kwargs):
+        raise TypeError("request a bounded live feature window")
+
+    def __getitem__(self, key):
+        keys = key if isinstance(key, tuple) else (key,)
+        return self.source[(self.rows[keys[0]], *keys[1:])]
+
+    def subset_symbols(self, indices):
+        return FactorizedDateView(self.source.subset_symbols(indices), self.rows)
+
+
+class FactorizedLiveWindow:
+    """Immutable bounded live input with an independent last-row quote overlay.
+
+    Reuses the exact training transport codec; omitted positive-zero storage
+    columns are reconstructed before the ordinary dense Candle Encoder. This
+    is neither feature selection nor the opt-in compact affine model path.
+    """
+    _stockagent_factorized_live_window = True
+
+    def __init__(self, features, start, stop, *, overlay=None):
+        self.features = features
+        self.start, self.stop = int(start), int(stop)
+        if not 0 <= self.start < self.stop <= features.shape[0]:
+            raise ValueError("factorized live window is outside the source calendar")
+        self.shape = (self.stop-self.start, *features.shape[1:])
+        self.overlay = overlay
+        self.nbytes = 0 if overlay is None else overlay[1].nbytes
+        self.transport_stats = {}
+
+    def with_last_feature(self, index, values):
+        if not 0 <= int(index) < self.shape[-1]:
+            raise ValueError("opening feature index is outside the model schema")
+        values = np.asarray(values, dtype=np.float32)
+        if values.shape != (self.shape[1],) or not np.isfinite(values).all():
+            raise ValueError("opening feature overlay must be finite and symbol-aligned")
+        values = values.copy()
+        values.setflags(write=False)
+        return type(self)(self.features, self.start, self.stop,
+                          overlay=(int(index), values))
+
+    def __getitem__(self, key):
+        # Only the final row is needed by existing feature diagnostics. Never
+        # materialize the full window through an accidental NumPy conversion.
+        if key != -1:
+            raise IndexError("bounded live feature diagnostics require the final row")
+        value = np.nan_to_num(self.features[self.stop-1], nan=0., posinf=0., neginf=0.)
+        if self.overlay is not None:
+            value[:, self.overlay[0]] = self.overlay[1]
+        return value
+
+    def stock_chunks(self, device, *, chunk_stocks=128):
+        if isinstance(self.features, FactorizedDateView):
+            source = self.features.source
+            rows = self.features.rows[self.start:self.stop]
+        else:
+            source = self.features
+            rows = np.arange(self.start, self.stop)
+        # Share the immutable verified block cache without modifying its
+        # transport policy for other callers. No transformed GPU cache lives
+        # across requests, devices, folds, or model-state changes.
+        from copy import copy
+        source = copy(source)
+        source.transfer_stats = dict(source.transfer_stats)
+        source.transfer_stats.update(logical_dense_bytes=0, host_payload_bytes=0)
+        source.transfer_mode = "compact_cuda_packed" if device.type == "cuda" else "dense_cpu"
+        slab = FactorizedPanelSlab(source, rows, pin_slabs=device.type == "cuda", device=device)
+        for begin in range(0, self.shape[1], chunk_stocks):
+            end = min(self.shape[1], begin+chunk_stocks)
+            raw = slab.stock_chunk(begin, end)
+            # Same nan/inf sentinel and FP32 storage as the canonical host
+            # normalizer. The freshly reconstructed tensor is privately owned.
+            raw.nan_to_num_(nan=0., posinf=0., neginf=0.)
+            if self.overlay is not None:
+                column, values = self.overlay
+                raw[-1, :, column].copy_(torch.from_numpy(values[begin:end].copy()).to(device))
+            yield raw.unsqueeze(0)
+        self.transport_stats.update({"logical_dense_bytes": source.transfer_stats["logical_dense_bytes"],
+                                     "host_payload_bytes": source.transfer_stats["host_payload_bytes"]})
+
+    def materialize(self, device):
+        """Reconstruct the full original tensor shape, not chunked model math."""
+        import time
+        started = time.perf_counter()
+        cache = (self.features.source if isinstance(self.features, FactorizedDateView)
+                 else self.features)._cache
+        self.transport_stats = {"layout": "lossless_packed_full_shape_owned_fp32_v1",
+            "source_cache_misses_before": cache.misses,
+            "source_cache_hits_before": cache.hits,
+            "source_cache_budget_bytes": cache.budget_bytes}
+        result = torch.empty((1, *self.shape), dtype=torch.float32, device=device)
+        begin = 0
+        for raw in self.stock_chunks(device):
+            end = begin+raw.size(2)
+            result[:, :, begin:end].copy_(raw)
+            begin = end
+        self.transport_stats.update(source_cache_misses_after=cache.misses,
+            source_cache_hits_after=cache.hits, source_cache_resident_bytes=cache.bytes)
+        self.transport_stats["input_reconstruct_enqueue_ms"] = round((time.perf_counter()-started)*1000, 3)
+        return result
+
+
+def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_cache_bytes=None):
+    """Attach a receipt-bound research-paper projection to a live base panel."""
+    from copy import copy
+    from stockagent.training.checkpoint_contract import subset_panel_symbols
+
+    path = Path(manifest_path).resolve(strict=True)
+    manifest = json.loads(path.read_text())
+    receipt = manifest.get("paper_inference") or {}
+    if (receipt.get("contract") != "factorized_paper_projection_lag1_v1"
+            or receipt.get("status") != "verified"
+            or receipt.get("raw_source_publication") is not False):
+        raise ValueError("factorized paper inference projection receipt is missing")
+    if (manifest.get("contract") not in SUPPORTED_CONTRACTS
+            or manifest.get("status") != "complete"
+            or manifest.get("research_only") is not True
+            or manifest.get("historical_point_in_time") is not False
+            or manifest.get("feature_lag") != 1):
+        raise ValueError("factorized live projection changed the selected research ABI")
+    dates = manifest["dates"]
+    if len(dates) != len(set(dates)) or dates != sorted(dates):
+        raise ValueError("factorized projection has duplicate or unordered dates")
+    panel = subset_panel_symbols(panel, manifest["symbols"], allow_missing_masked=True)
+    from stockagent.data.panel import slice_panel_start
+    panel = slice_panel_start(panel, dates[0])
+    source_rows = {day: i for i, day in enumerate(dates)}
+    panel_days = [str(d)[:10] for d in panel.dates]
+    if any(day not in source_rows for day in panel_days):
+        raise ValueError("factorized projection does not cover the requested live calendar")
+    # Reuse all partition/channel/member checks in the training attachment.
+    # The six-column base remains tiny even with the longer immutable calendar.
+    source_panel = copy(panel)
+    source_panel.dates = np.asarray(dates, dtype="datetime64[D]")
+    base = np.zeros((len(dates), panel.num_symbols, len(panel.feature_names)), dtype=np.float32)
+    rows = np.asarray([source_rows[day] for day in panel_days], dtype=np.int64)
+    base[rows] = panel.features
+    source_panel.features = base
+    source_panel = attach_factorized_features(source_panel, path, host_cache_bytes=host_cache_bytes)
+    result = copy(panel)
+    result.features = FactorizedDateView(source_panel.features, rows)
+    result.feature_names = source_panel.feature_names
+    result.content_fingerprints = {**(panel.content_fingerprints or {}),
+                                   "features": result.features.content_fingerprint}
+    return result

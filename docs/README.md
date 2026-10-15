@@ -30,9 +30,14 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## 資料與多機維運 Runbook
 
+- [分鐘資料全量驗證與自動入庫](minute_validation_and_recipes_2026-10-07.md)：下載終止、內容驗證與來源覆蓋分開驗收，保留真實缺口與試組合證據。
+- [訓練資料集組合方法](training_dataset_rebuild_methods.md)：各家族 canonical builder、歷史逐項清冊、固定來源配方及遠端按需重建。
+
 - [`ducklake_temporal_replication_2026-10-05.md`](ducklake_temporal_replication_2026-10-05.md)：最新正式四節點 lakehouse、PostgreSQL-backed Temporal、rclone 按需複寫、自動 NAS archive 與恢復證據。
 - [`lab203_immutable_lake_relay_install_2026-10-05.md`](lab203_immutable_lake_relay_install_2026-10-05.md)：已完成的一次性固定 relay 安裝；日常不需逐批轉貼。
 - [`nas_send_verify_parallel_2026-10-06.md`](nas_send_verify_parallel_2026-10-06.md)：來源持續發布、lab203 同時驗收、個別失敗固定重傳及實際暫存容量控制。
+- [`nas_source_backpressure_repair_2026-10-07.md`](nas_source_backpressure_repair_2026-10-07.md)：來源暫存回收的失敗批次飢餓修正、容量／SnapshotError 診斷，以及固定剩餘清冊驗收。
+- [`nas_sync_completion_2026-10-08.md`](nas_sync_completion_2026-10-08.md)：36,096 檔冷庫清冊全部 NAS 機器驗收、雙向傳輸收斂、immutable 來源積壓清空，以及後續增量的自動接續。
 
 - [`all_services_boot_recovery_2026-10-05.md`](all_services_boot_recovery_2026-10-05.md)：Windows／WSL 持續存活、正式 owner 退避與依賴接續、命名空間一致的自動稽核及跨節點驗收界線。
 - [`four_node_storage_architecture_2026-10-04.md`](four_node_storage_architecture_2026-10-04.md)：
@@ -45,6 +50,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 - [`continuous_nas_backup_2026-10-04.md`](continuous_nas_backup_2026-10-04.md)：來源端持續增量服務、lab203 既有 worker 回傳收據交接、固定 NAS snapshot 重建與受控 USB 金鑰保管。
 - [`lab203_nas_recovery_acceptance_2026-10-04.md`](lab203_nas_recovery_acceptance_2026-10-04.md)：lab203 本機執行三個固定 NAS snapshot 的 packed／SQL 獨立驗收；USB 保管已由使用者確認完成。
 - [`agent_workflow.md`](agent_workflow.md)：本機 agent 工具安裝、唯讀狀態、任務紀錄與 tmux／systemd 命令監督。
+- [`agent_terminal_tools_2026-10-07.md`](agent_terminal_tools_2026-10-07.md)：zsh／mosh／Herdr／tmux 實測、採用的 SSH 連線重用設定與完整操作方式。
 - [`codex_skill_sync_2026-10-06.md`](codex_skill_sync_2026-10-06.md)：penguin／Vastai1T 自訂 skills 的雙向聯集、共同基線三方合併、衝突保留、回復備份與實際載入驗收。
 - [`stockagent-storage-operations` skill](../.agents/skills/stockagent-storage-operations/SKILL.md)：供其他 agent 使用的四節點操作流程；含進度查詢、唯一 owner、自動 NAS 備份、遠端按需資料與恢復／回收判準。
 - [`control_plane_workflow.md`](control_plane_workflow.md)：正式固定程式碼驗證 owner，以及 PostgreSQL 工程工作、版本／lease／attempt、私有節點與備份還原。
@@ -57,6 +63,9 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
   四個研究目錄的完整 D 冷封存／立即回收、恢復指令及 117 個期貨解析版本的保留阻礙。
 - [`vastai_storage_cleanup_2026-10-04.md`](vastai_storage_cleanup_2026-10-04.md)：
   Vast 容量盤點、逐檔核 SHA 去重、到期熱副本回收及 QUIC 冷索引／產物 ingress 修復。
+- [`vastai1t_training_layout_2026-10-07.md`](vastai1t_training_layout_2026-10-07.md)：訓練結果與 panel／cache／code 分流，固定搬移排程、遺失結果還原及七天熱保留。
+- [`vastai1t_storage_cleanup_2026-10-06.md`](vastai1t_storage_cleanup_2026-10-06.md)：
+  現場清冊、unused materialization 回收、測試產物直接丟棄及活動訓練保護。
 - [`vast_all_artifacts_cold_return_2026-10-04.md`](vast_all_artifacts_cold_return_2026-10-04.md)：
   全部遠端 markets／ablations 的逐項 D 封存、獨立恢復、回收安全閘門和自助進度／恢復指令。
 - [`vast_bulk_compressed_return_2026-10-04.md`](vast_bulk_compressed_return_2026-10-04.md)：
@@ -83,6 +92,11 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 - [`acquisition_pages_engineering_2026-10-03.md`](acquisition_pages_engineering_2026-10-03.md)：抓取網頁全鏈架構、先行方案、故障／競態／按需工作量、安全與正式站驗收。
 
 ## 資料取得、修復與儲存
+
+- [TEJ 目錄故障自動恢復與下載驗收](tej_metadata_self_healing_2026-10-10.md)：未送出負證據、持久逐表退避、共享介面恢復、原始欄位逐值核對及唯讀網頁通道狀態。
+
+- [新聞逐來源自適應容量與正式驗收](news_adaptive_capacity_2026-10-09.md)：65 個鉅亨分類、批次／日期範圍、階梯測速與恢復、Fed PDF／舊版解析、清冊及可驗證的未完成邊界。
+- [鉅亨新聞抓取效率與分頁修復](cnyes_news_acquisition_efficiency_2026-10-09.md)：批次正文、日期自適應分區、實測速率、限流降速與同 owner 持久化驗收；不冒稱全歷史抓完。
 
 - [`tej_smart_wizard_acquisition_2026-10-02.md`](tej_smart_wizard_acquisition_2026-10-02.md)：TEJ 全 30 類／255 表／45,826 欄清冊、v4 可操作來源範圍驗證／下載器、桌面與 API 限額邊界、唯讀進度網站及未完成驗證。
 - [`tej_startup_search_2026-10-05.md`](tej_startup_search_2026-10-05.md)：登入後 Windows／WSL 自動恢復、精確搜尋／操作等待優化、通道 drain、收據／網頁／AB／BA 驗收，以及登入前任務的管理員權限缺口。
@@ -125,6 +139,7 @@ Syncthing 驗收、下載、訓練與服務操作的日常指令；本頁負責�
 
 ## Review 與歷史工程快照
 
+- [`prompt_audit_2026-10-13.md`](prompt_audit_2026-10-13.md) 合併雙節點新增偏好，修正機器訊息抽取與數值實驗限制，補上新增策略流程並同步驗證既有 7 個 skills。
 - [`prompt_audit_2026-10-06.md`](prompt_audit_2026-10-06.md) 納入 penguin／Vastai1T 主對話、後續偏好修正及既有技能整理；7 個自訂 skills 已合併同步並驗證兩邊實際載入。
 - [`prompt_audit_2026-10-05.md`](prompt_audit_2026-10-05.md) 是新增儲存 skill 與偏好的增量稽核，釐清低頻 NULL／訓練視圖、正式服務恢復、可攜交接及 dry run 的實際副作用。
 - [`prompt_audit_2026-10-04.md`](prompt_audit_2026-10-04.md) 是後續指令與偏好的增量稽核，涵蓋自動化／並行、重試、特徵 panel 與具名研究修正。

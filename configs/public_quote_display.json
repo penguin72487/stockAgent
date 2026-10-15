@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "contract": "public_quote_display_v2",
+  "default_policy": "withhold_without_verified_public_display_grant",
+  "owner_transaction_reports": {
+    "enabled": true,
+    "contract": "owner_paper_transaction_report_v1",
+    "record_scope": "tw_day_trade_and_overnight_paper_ledger",
+    "operator_request": "2026-10-13: publish my own transaction prices",
+    "notice": "Recorded paper transaction report only. This is not broker execution evidence or a grant to redistribute raw market quotations."
+  },
+  "owner_strategy_reports": {
+    "enabled": true,
+    "contract": "owner_paper_strategy_report_v1",
+    "record_scope": "tw_day_trade_and_overnight_paper_ledger",
+    "operator_request": "2026-10-14: publish my own TP/SL and strategy data",
+    "notice": "Persisted TP/SL and submitted strategy instructions only. Not raw quotes, sizing inputs, exchange limits or execution evidence."
+  },
+  "authorized_sources": [
+    {
+      "source_id": "twse_daily_ohlcv",
+      "dataset_id": "twse_daily_ohlcv",
+      "grant_id": "government-open-data-v1",
+      "public_label": "臺灣證券交易所",
+      "public_display": true,
+      "license_reference": "https://data.gov.tw/dataset/11549",
+      "valid_from": "2026-10-13",
+      "perpetual": true,
+      "venues": ["TWSE"],
+      "grain": "daily",
+      "daily_price_roles": {
+        "open": ["open"], "high": ["high"], "low": ["low"], "close": ["close"],
+        "sizing_open_price": ["open"], "entry_price": ["open", "close"],
+        "exit_price": ["open", "close"], "last_exit_price": ["open", "close"], "last_mark_price": ["close"],
+        "daily_return_previous_close": ["close"], "daily_return_reference_price": ["close"]
+      }
+    },
+    {
+      "source_id": "tpex_daily_ohlcv",
+      "dataset_id": "tpex_daily_ohlcv",
+      "grant_id": "government-open-data-v1",
+      "public_label": "證券櫃檯買賣中心",
+      "public_display": true,
+      "license_reference": "https://data.gov.tw/dataset/11370",
+      "valid_from": "2026-10-13",
+      "perpetual": true,
+      "venues": ["TPEX"],
+      "grain": "daily",
+      "daily_price_roles": {
+        "open": ["open"], "high": ["high"], "low": ["low"], "close": ["close"],
+        "sizing_open_price": ["open"], "entry_price": ["open", "close"],
+        "exit_price": ["open", "close"], "last_exit_price": ["open", "close"], "last_mark_price": ["close"],
+        "daily_return_previous_close": ["close"], "daily_return_reference_price": ["close"],
+        "last_bid": ["last_bid"], "last_ask": ["last_ask"], "average_price": ["average_price"],
+        "next_reference_price": ["next_reference_price"],
+        "next_upper_limit": ["next_upper_limit"], "next_lower_limit": ["next_lower_limit"]
+      }
+    }
+  ],
+  "usage_rules_review": {
+    "reviewed_on": "2026-10-14",
+    "scope": "public website price display; API entitlement and noncommercial intent are not a verified redistribution grant",
+    "sources": [
+      {
+        "source_id": "owner_paper_strategy_reports",
+        "status": "operator_requested_strategy_plan_not_quote_license",
+        "finding": "The owner explicitly requested publication of their own strategy outputs including TP/SL. Publish original persisted levels and limit/stop instructions in trusted paper endpoints, independently of whether they filled. Do not extend this scope to raw quotes, sizing inputs or broker/exchange redistribution permissions.",
+        "references": []
+      },
+      {
+        "source_id": "owner_paper_transaction_reports",
+        "status": "operator_requested_transaction_report_not_quote_license",
+        "finding": "The owner requested disclosure of their own transaction prices. Publish recorded paper fills separately from raw quote fields, with simulation labels. A simple number and a copyrightable work are distinct; this distinction does not establish a broker/exchange contractual exemption or blanket quote redistribution permission.",
+        "references": ["https://www.tipo.gov.tw/tw/copyright/692-11576.html", "https://www.twse.com.tw/zh/products/information/qa.html"]
+      },
+      {
+        "source_id": "shioaji_stocks",
+        "status": "public_display_permission_unverified",
+        "finding": "The public securities API consent describes trading and data risks, but does not establish a blanket external-display permission. TWSE FAQ item 2 requires consent and a written contract for value-added market information supplied to others; no general noncommercial exemption was found.",
+        "references": ["https://www.sinotrade.com.tw/newweb/signCenter/S_openAPI/", "https://www.twse.com.tw/zh/products/information/qa.html"]
+      },
+      {
+        "source_id": "shioaji_futures",
+        "status": "written_permission_required_by_api_terms",
+        "finding": "The futures API consent describes non-display use of TAIFEX real-time ticks and clause 10 requires prior written consent or authorization for the specified redistribution and other uses.",
+        "references": ["https://www.sinotrade.com.tw/newweb/signCenter/F_openApi/"]
+      },
+      {
+        "source_id": "mis_live_quotes",
+        "status": "public_display_permission_unverified",
+        "finding": "The official MIS website supplies free viewing, but this does not extend the named Government Open Data daily grants to live ticks or order-book quotations. Existing internal acquisition is unchanged; no blanket public quote grant is established by browser visibility or noncommercial intent.",
+        "references": ["https://mis.twse.com.tw/stock/fibest.jsp", "https://www.twse.com.tw/zh/products/information/qa.html", "https://www.twse.com.tw/zh/terms/use.html"]
+      },
+      {
+        "source_id": "tw_official_open_daily",
+        "status": "verified_open_dataset",
+        "finding": "TWSE 11549 licenses daily OHLC, share volume, turnover and trade count, but does not list full-universe final Bid/Ask. TPEx 11370 additionally lists average, final Bid/Ask, next reference and next upper/lower bounds. Scope applies only to these named fields and daily datasets, not broker minute/tick quotations. Preserve attribution, market date, units and acquisition time; next-session bounds are not today's limits.",
+        "references": ["https://data.gov.tw/dataset/11549", "https://data.gov.tw/dataset/11370", "https://data.gov.tw/license", "https://www.twse.com.tw/zh/terms/use.html"]
+      },
+      {
+        "source_id": "finmind",
+        "status": "original_source_license_required",
+        "finding": "FinMind's July 2026 disclaimer states service access does not include external redistribution. Government-open-data records may follow the original open license; historical or delayed status alone is not a blanket permission. Public prices currently use independently verified canonical official files, not a relabeled FinMind quote.",
+        "references": ["https://finmind.github.io/Disclaimer/", "https://finmind.github.io/PrivacyPolicy/"]
+      },
+      {
+        "source_id": "finlab",
+        "status": "account_and_dataset_display_rights_unverified",
+        "finding": "The existing Free/VIP entitlement and data-download success do not establish raw-data external-display rights. The public acquisition page exposes sanitized quota, progress and catalog metadata, not raw FinLab tables. Keep this separate from the official-source price projection.",
+        "references": ["https://finlab.finance/"]
+      },
+      {
+        "source_id": "tej",
+        "status": "actual_product_contract_required",
+        "finding": "TEJ E-Shop terms restrict external disclosure of subscribed products. The local Smart Wizard product/account contract must be checked separately; do not assume an E-Shop clause is the user's complete Smart Wizard agreement. Publish acquisition metadata, not a raw vendor-data mirror.",
+        "references": ["https://eshop.tej.com.tw/E-Shop/order_terms"]
+      }
+    ]
+  }
+}

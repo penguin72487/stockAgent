@@ -103,11 +103,17 @@ def test_remote_view_round_trip_has_causal_clocks_separate_rules_and_fresh_confi
         "private_delivery_authorized": True, "use_restriction": PRIVATE_USE, "files": files,
         "feature_specs": specs, "end_date": "2014-01-08"}))
     base = Path(__file__).resolve().parents[1]/"configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v10_research_143_no_bottleneck.yaml"
+    inherited = tmp_path / 'historical-base.yaml'
+    inherited.write_text(json.dumps({'base_config': str(base), 'data': {
+        'day_trade_minute_execution_cache_dir': str(tmp_path / 'artifacts/markets/old/runtime-cache')}}))
+    base = inherited
     out = tmp_path/"experiment/prepared"
     result = prepare(source=source, out=out, base_config=base, minute_root=tmp_path/"minutes", snapshot_id="test-source-id", chunk_sessions=1)
     assert result["feature_view_ready"] and not result["training_ready"]
     config = load_config(out/"training.yaml")
     assert config.runner.resume is False
+    assert 'artifacts/markets/' not in config.data.day_trade_minute_execution_cache_dir
+    assert '/artifacts/cache/experiment/' in config.data.day_trade_minute_execution_cache_dir
     assert config.training.pretrained_initialization_root is None
     assert config.data.feature_shift_next_session == []
     assert config.data.feature_availability_indicators == []

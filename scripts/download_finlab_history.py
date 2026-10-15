@@ -13,10 +13,13 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 import hashlib
+import gc
 import json
+import math
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -47,6 +50,7 @@ from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     safe_stem,
     source_check_due,
     process_owner,
+    last_acquisition_success,
 )
 
 
@@ -62,6 +66,72 @@ NON_NUMERIC_DEFERRED_KEYS = frozenset({
     "after_market_fixed_price:資料來源", "after_market_fixed_price:市場別",
 })
 _PLAN_READS = ContextVar("finlab_plan_reads", default=None)
+
+
+class DatasetFetchTimeout(BaseException):
+    """A collector deadline, not an HTTP failure swallowed by SDK retries."""
+
+
+@contextmanager
+def dataset_deadline(seconds: int):
+    """Bound each key in a reusable Unix worker; preserve outer watchdogs."""
+    if not seconds:
+        yield
+        return
+    old_handler = signal.getsignal(signal.SIGALRM)
+    old_timer = signal.getitimer(signal.ITIMER_REAL)
+    if old_timer != (0.0, 0.0):
+        raise RuntimeError("FinLab dataset deadline cannot replace an existing timer")
+
+    def expired(signum, frame):
+        raise DatasetFetchTimeout()
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def release_sdk_frames() -> bool:
+    """Drop only process-local frame references, never FileStorage.clear().
+
+    FileStorage.clear() deletes the on-disk source cache. Its in-memory _cache
+    and the SDK finalized-frame cache are ordinary dictionaries: emptying
+    those dictionaries preserves file generations, expiry/publication metadata
+    and all canonical source objects/receipts. An incompatible storage falls
+    back to process isolation instead of accumulating wide frames.
+    """
+    from finlab import data
+
+    context = getattr(data, "_default_context", None)
+    storage = getattr(context, "_storage", None)
+    cache = getattr(storage, "_cache", None)
+    finalized = getattr(context, "_finalized_cache", None)
+    if type(storage).__name__ != "FileStorage" or not isinstance(cache, dict) or not isinstance(finalized, dict):
+        return False
+    cache.clear()
+    finalized.clear()
+    loaded = getattr(context, "_loaded_datasets", None)
+    if isinstance(loaded, set):
+        loaded.clear()
+    gc.collect()
+    return True
+
+
+def sync_provider_catalog(output_root: Path, *, now: datetime) -> list[str]:
+    """Reuse only fresh discovery; membership never proves account entitlement."""
+    from stockagent.data.finlab_quota_policy import catalog_current, load_policy
+
+    try:
+        discovery = json.loads((output_root / "catalog/discovery.json").read_text())
+    except (OSError, ValueError):
+        discovery = {}
+    if catalog_current(discovery, now=now, policy=load_policy()):
+        return list(dict.fromkeys(discovery["keys"]))
+    return provider_catalog()
 
 
 @contextmanager
@@ -221,8 +291,8 @@ def recent_attempt(key: str, output_root: Path, *, now: datetime,
             return False
         if downloaded:
             receipt = read_key_state(key, output_root)
-            checked = datetime.fromisoformat(receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"])
-            if checked.tzinfo and attempted.tzinfo and checked >= attempted:
+            checked = last_acquisition_success(receipt)
+            if checked and attempted.tzinfo and checked >= attempted:
                 return False
         due = attempt_retry_at(attempt, downloaded=downloaded)
         return due is not None and now < due
@@ -271,6 +341,8 @@ def quota_room_mb() -> tuple[float, float] | None:
 
 
 def classify_provider_error(exc: Exception) -> str:
+    if isinstance(exc, DatasetFetchTimeout):
+        return "timed_out"
     """Persist only a bounded category; exception text may contain secrets."""
     if isinstance(exc, EmptyProviderFrame):
         if exc.evidence.get("raw_non_null_values", 0) > 0:
@@ -331,78 +403,101 @@ def _atomic_json(path: Path, payload: dict) -> None:
 
 def serialize_provider_frame(frame):
     """Keep exact source labels; do not convert monthly/quarterly periods to dates."""
-    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    from scripts.finlab_columnar import (
+        PROCESSING_CONTRACT_VERSION, PROCESSING_ENGINE, canonical_arrow, sdk_index_metadata,
+    )
 
-    if not isinstance(frame, pd.DataFrame):
+    if not hasattr(frame, "index") or not hasattr(frame, "columns"):
         raise TypeError("FinLab response was not a DataFrame")
-    source = pd.DataFrame(frame)
-    if source.columns.map(str).duplicated().any():
+    labels = [str(name) for name in frame.columns]
+    if len(set(labels)) != len(labels):
         raise ValueError("duplicate FinLab source field labels")
-    valid = source.notna().any(axis=1)
-    observed_per_column = source.notna().sum(axis=0)
-    index_frame = source.index.to_frame(index=False)
-    index_columns = [
-        "source_index" if len(index_frame.columns) == 1 else f"source_index_{n}"
-        for n in range(len(index_frame.columns))
-    ]
-    index_frame.columns = index_columns
-    for name in index_columns:
-        index_frame[name] = index_frame[name].map(str)
-    # Wide storage preserves every provider field and symbol without melting.
-    values = source.reset_index(drop=True)
-    values.columns = [str(column) for column in values.columns]
-    if set(index_columns) & set(values.columns):
+    values = canonical_arrow(frame)
+    index_metadata = sdk_index_metadata(frame)
+    index_columns = index_metadata["columns"]
+    if set(index_columns) & set(labels):
         raise ValueError("source field conflicts with reserved source_index column")
-    output = pd.concat([index_frame, values], axis=1)
-    observed_index = source.index[valid.to_numpy()]
-    first = str(observed_index.min()) if len(observed_index) else None
-    last = str(observed_index.max()) if len(observed_index) else None
-    sample = str(index_frame.iloc[0, 0]) if len(index_frame) else ""
+    arrays = index_metadata["arrays"]
+    valid = pa.array([False] * values.num_rows)
+    observed_per_column = {}
+    for name, column in zip(labels, values.columns):
+        observed_per_column[name] = pc.count(column).as_py()
+        valid = pc.or_(valid, pc.is_valid(column))
+    output = pa.Table.from_arrays(arrays + list(values.columns), names=index_columns + labels)
+    # Scalar source labels are an SDK boundary, not a second dataframe. Keep
+    # numeric and tuple ordering; do not compare formatted dates lexically.
+    observed_index = [value for value, present in zip(index_metadata["labels"], valid.to_pylist()) if present]
+    comparable_index = [value for value in observed_index
+        if value is not None and type(value).__name__ not in {"NAType", "NaTType"}
+        and not (isinstance(value, float) and math.isnan(value))]
+    first = str(min(comparable_index)) if comparable_index else None
+    last = str(max(comparable_index)) if comparable_index else None
+    sample = arrays[0][0].as_py() if values.num_rows else ""
     semantics = (
         "period_label_not_publication_date" if PERIOD_LABEL.fullmatch(sample)
         else "source_timestamp_not_verified_publication_date"
-        if isinstance(source.index, pd.DatetimeIndex)
+        if index_metadata["timestamp_index"]
         else "provider_index_unverified"
     )
-    event_bounds = _event_bounds(source["date"]) if "date" in source.columns else {}
+    event_bounds = _event_bounds(values["date"]) if "date" in labels else {}
     return output, {
-        "rows": len(source),
-        "rows_with_values": int(valid.sum()),
-        "field_columns": len(values.columns),
-        "non_null_values": int(observed_per_column.sum()),
+        "rows": values.num_rows,
+        "rows_with_values": int(pc.sum(valid).as_py() or 0),
+        "field_columns": len(labels),
+        "non_null_values": sum(observed_per_column.values()),
         "all_null_source_columns": [str(name) for name, count in observed_per_column.items() if count == 0],
         "column_axis_semantics": "source_instruments_or_dimensions_not_independent_model_features",
         "source_index_columns": index_columns,
-        "source_index_dtype": str(source.index.dtype),
+        "source_index_dtype": index_metadata["dtype"],
         "first_non_null_source_index": first,
         "last_non_null_source_index": last,
         "index_semantics": semantics,
+        "processing_contract_version": PROCESSING_CONTRACT_VERSION,
+        "processing_engine": PROCESSING_ENGINE,
         **event_bounds,
     }
 
 
 def _event_bounds(values) -> dict:
     """A long-table event date is distinct from its row index and key_date."""
-    import pandas as pd
+    import polars as pl
+    import pyarrow as pa
+    import pyarrow.compute as pc
 
-    parsed = pd.to_datetime(values, errors="coerce")
-    observed = parsed.dropna()
+    parsed = pl.from_arrow(values) if isinstance(values, (pa.Array, pa.ChunkedArray)) else pl.Series("date", values)
+    if parsed.dtype == pl.Date:
+        parsed = parsed.cast(pl.Datetime("ns"))
+    elif parsed.dtype.is_numeric():
+        parsed = parsed.cast(pl.Datetime("ns"), strict=False)
+    elif not isinstance(parsed.dtype, pl.Datetime):
+        parsed = parsed.cast(pl.String)
+        try:
+            parsed = parsed.str.to_datetime(strict=False, time_unit="ns") if len(parsed) else parsed.cast(pl.Datetime("ns"))
+        except pl.exceptions.ComputeError:
+            # No valid values from which to infer a format is an unknown event
+            # range, not a reason to refetch the full provider table forever.
+            parsed = parsed.str.to_datetime("%Y-%m-%d", strict=False, time_unit="ns")
+    observed = parsed.drop_nulls()
     if not len(observed):
         return {
             "event_time_column": "date", "event_date_rows": 0,
             "first_event_at": None, "last_event_at": None,
         }
+    bounds = pc.min_max(observed.to_arrow())
     return {
         "event_time_column": "date",
         "event_date_rows": len(observed),
-        "first_event_at": observed.min().isoformat(),
-        "last_event_at": observed.max().isoformat(),
+        "first_event_at": bounds["min"].as_py().isoformat(),
+        "last_event_at": bounds["max"].as_py().isoformat(),
     }
 
 
 def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, int]:
     """Recheck stored bytes and repair date bounds without another API request."""
-    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
     passed = failed = 0
@@ -440,7 +535,7 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
                 bounds = {"event_time_column": "date", "event_date_rows": 0,
                           "first_event_at": None, "last_event_at": None}
                 for batch in parquet.iter_batches(batch_size=65536, columns=["date"], use_threads=False):
-                    part = _event_bounds(batch.column(0).to_pandas())
+                    part = _event_bounds(batch.column(0))
                     bounds["event_date_rows"] += part["event_date_rows"]
                     for name, reduce in [("first_event_at", min), ("last_event_at", max)]:
                         if part[name] is not None:
@@ -449,12 +544,14 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
             if "source_index" in fields and receipt.get("rows_with_values") == receipt.get("rows"):
                 low = high = None
                 for batch in parquet.iter_batches(batch_size=65536, columns=["source_index"], use_threads=False):
-                    indexes = batch.column(0).to_pandas()
+                    indexes = batch.column(0)
                     if str(receipt.get("source_index_dtype")) in {"int32", "int64", "uint32", "uint64"}:
-                        indexes = pd.to_numeric(indexes, errors="raise")
+                        indexes = pc.cast(indexes, pa.int64() if str(receipt.get("source_index_dtype")).startswith("int") else pa.uint64())
                     if len(indexes):
-                        low = indexes.min() if low is None else min(low, indexes.min())
-                        high = indexes.max() if high is None else max(high, indexes.max())
+                        bounds = pc.min_max(indexes).as_py()
+                        if bounds["min"] is not None:
+                            low = bounds["min"] if low is None else min(low, bounds["min"])
+                            high = bounds["max"] if high is None else max(high, bounds["max"])
                 receipt["first_non_null_source_index"] = str(low) if low is not None else None
                 receipt["last_non_null_source_index"] = str(high) if high is not None else None
             receipt["schema_version"] = max(2, int(receipt.get("schema_version") or 0))
@@ -489,7 +586,15 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
         temp = Path(handle.name)
     try:
         if key in STREAMING_KEYS:
-            stats = prepare_arrow(key, output_root, stem, temp, refresh=refresh)
+            reusable_previous = previous if has_local_download(key, output_root) else None
+            stats = prepare_arrow(key, output_root, stem, temp, refresh=refresh, previous=reusable_previous)
+            if stats.pop("reuse_verified_normalized_object", False):
+                previous.update(stats)
+                previous["last_check_result"] = "unchanged"
+                previous["last_fetch_elapsed_seconds"] = round(time.monotonic()-started, 3)
+                previous["acquisition_completed_at_utc"] = datetime.now(UTC).isoformat()
+                _atomic_json(receipt_path, previous)
+                return previous
         else:
             from finlab import data
 
@@ -511,6 +616,7 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
                     previous.update(evidence)
                     previous["last_check_result"] = "unchanged"
                     previous["last_fetch_elapsed_seconds"] = round(time.monotonic() - started, 3)
+                    previous["acquisition_completed_at_utc"] = datetime.now(UTC).isoformat()
                     _atomic_json(receipt_path, previous)
                     return previous
             else:
@@ -520,7 +626,8 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
             if not stats["rows_with_values"]:
                 evidence = capture_empty_evidence(key, output_root, stem)
                 raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"], evidence=evidence)
-            table.to_parquet(temp, index=False, compression="zstd")
+            from scripts.finlab_columnar import source_attrs, write_parquet
+            write_parquet(table, temp, attrs=source_attrs(frame))
         if not stats["rows_with_values"]:
             raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"])
         digest = hashlib.sha256()
@@ -567,6 +674,7 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
                         previous["last_fetch_elapsed_seconds"] = round(time.monotonic() - started, 3)
                         previous["parquet_size_bytes"] = (output_root / old_relative).stat().st_size
                         previous.update(stats)
+                        previous["acquisition_completed_at_utc"] = datetime.now(UTC).isoformat()
                         unit_contract = volume_unit_contract(key)
                         if unit_contract is not None:
                             previous["volume_units"] = unit_contract
@@ -612,6 +720,7 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
             "status": "downloaded_unverified_for_pit",
             "fetched_at_utc": checked_at,
             "source_checked_at_utc": checked_at,
+            "acquisition_completed_at_utc": datetime.now(UTC).isoformat(),
             "source_check_mode": check_mode,
             "last_check_result": "downloaded",
             "last_fetch_elapsed_seconds": round(time.monotonic() - started, 3),
@@ -800,6 +909,10 @@ def _general_work_status(discovery, curated, output_root, *, now, refresh_days):
         "required_blocked_keys": plan["required_blocked"],
         "secondary_validation_pending": len(plan["validation"]),
         "supplemental_allowed": supplemental_allowed,
+        # A resource/source retry that cannot execute now must not starve
+        # minute backfill. Keep its evidence and future check reserve; Tick
+        # retains the stricter existing general-debt admission.
+        "minute_residual_allowed": not (set(pending) - empty_proofs),
         "unresolved_source_empty_keys": sorted(empty_proofs),
         "scheduled_reserve_mb": max(50.0, future_reserve_bytes / 1024**2 + 50.0,
                                     500.0 if unknown_reserve_keys else 0.0),
@@ -868,8 +981,8 @@ def _next_failure_streak(key: str, output_root: Path, status: str) -> int:
         receipt_path = output_root / "receipts" / f"{safe_stem(key)}.json"
         if receipt_path.is_file():
             receipt = json.loads(receipt_path.read_text())
-            checked = datetime.fromisoformat(receipt.get("source_checked_at_utc") or receipt["fetched_at_utc"])
-            if checked.tzinfo and checked >= attempted:
+            checked = last_acquisition_success(receipt)
+            if checked and checked >= attempted:
                 return 1
         return min(11, max(1, int(previous.get("failure_streak") or 1)) + 1)
     except (OSError, ValueError, KeyError, TypeError):
@@ -940,7 +1053,12 @@ def sync_catalog(
     available: list[str], curated: dict[str, dict], output_root: Path,
     *, limit: int, refresh_days: int, min_quota_remaining_mb: float,
     retry_unavailable: bool, attempt_id: str | None = None,
+    key_timeout_seconds: int = 0, maximum_consecutive_timeouts: int = 2,
 ) -> dict:
+    if type(key_timeout_seconds) is not int or not 0 <= key_timeout_seconds <= 3600:
+        raise ValueError("invalid FinLab key timeout")
+    if type(maximum_consecutive_timeouts) is not int or maximum_consecutive_timeouts < 1:
+        raise ValueError("invalid FinLab consecutive timeout limit")
     if not credential_available():
         raise RuntimeError("no usable FinLab session")
     now = datetime.now(UTC)
@@ -953,7 +1071,7 @@ def sync_catalog(
     summary = {
         "started_at_utc": now.isoformat(), "catalog_keys": len(available),
         "pending_before": len(pending), "attempted": 0, "downloaded": 0,
-        "unchanged": 0, "vip_only": 0, "provider_errors": 0,
+        "unchanged": 0, "vip_only": 0, "provider_errors": 0, "timed_out": 0,
         "state": "running", "quota_remaining_mb": None,
         "quota_limit_mb": None, "quota_reserve_mb": min_quota_remaining_mb,
         "quota_policy_version": QUOTA_POLICY_VERSION,
@@ -961,6 +1079,9 @@ def sync_catalog(
         "incremental_quota_exempt_attempted": 0, "quota_managed_deferred": 0,
         "attempt_id": attempt_id,
         "owner": process_owner(),
+        "processing_engine": "bounded_general_sdk_batch_v1", "key_limit": limit,
+        "key_timeout_seconds": key_timeout_seconds, "sdk_frame_releases": 0,
+        "consecutive_timeouts": 0,
     }
     quota_deferred_state = None
     try:
@@ -969,6 +1090,15 @@ def sync_catalog(
             # prefix must not starve SDK refreshes later in the same plan.
             if summary["attempted"] >= limit:
                 break
+            if key_timeout_seconds:
+                # A reusable group can straddle reset/opening. Check at every
+                # key, not only when Bash launched its first process.
+                from scripts.check_outside_tw_opening_resource_window import evaluate
+                runway = (key_timeout_seconds+30+59)//60
+                if not evaluate(datetime.now(UTC), minimum_runway_minutes=runway,
+                                official_calendar_root=ROOT / "data_tw_public")["allowed"]:
+                    summary["state"] = "opening_window_yield"
+                    break
             exempt = incremental_quota_exempt(key, downloaded=has_local_download(key, output_root))
             if not exempt:
                 room = quota_room_mb()
@@ -994,11 +1124,13 @@ def sync_catalog(
             try:
                 # A successful SDK cache read is not evidence that the provider
                 # was checked for current revisions. Sync must query upstream.
-                receipt = fetch_one(key, output_root, refresh=True, incremental=True)
+                with dataset_deadline(key_timeout_seconds):
+                    receipt = fetch_one(key, output_root, refresh=True, incremental=True)
                 result = receipt.get("last_check_result", "downloaded")
                 summary[result] += 1
+                summary["consecutive_timeouts"] = 0
                 print(f"[finlab] {key}: {result}; rows={receipt['rows_with_values']}", flush=True)
-            except Exception as exc:
+            except (Exception, DatasetFetchTimeout) as exc:
                 reason = record_attempt(
                     key, output_root, exc,
                     elapsed_seconds=time.monotonic() - attempt_started,
@@ -1007,10 +1139,20 @@ def sync_catalog(
                     summary["vip_only"] += 1
                 else:
                     summary["provider_errors"] += 1
+                summary["timed_out"] += int(reason == "timed_out")
+                summary["consecutive_timeouts"] = (summary["consecutive_timeouts"] + 1
+                                                   if reason == "timed_out" else 0)
                 print(f"[finlab] {key}: {reason}; provider message withheld", file=sys.stderr, flush=True)
                 if reason in {"quota_exhausted", "authentication_failed"}:
                     summary["state"] = reason
                     break
+            finally:
+                reusable = release_sdk_frames()
+                if reusable:
+                    summary["sdk_frame_releases"] += 1
+            if (not reusable and limit > 1
+                    or summary["consecutive_timeouts"] >= maximum_consecutive_timeouts):
+                break  # An incompatible adapter gets one key, never a growing frame cache.
         if summary["state"] == "running":
             scanned = summary["attempted"] + summary["quota_managed_deferred"]
             summary["state"] = ("partial" if len(pending) > scanned else
@@ -1061,6 +1203,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--attempt-id", default=None)
     parser.add_argument("--timeout-seconds", type=int, default=0)
+    parser.add_argument("--key-timeout-seconds", type=int, default=0,
+                        help="Per-dataset watchdog when reusing a bounded SDK process")
+    parser.add_argument("--maximum-consecutive-timeouts", type=int, default=2)
     args = parser.parse_args(argv)
     catalog = load_catalog()
     candidates = {item["key"]: item for item in catalog["datasets"]}
@@ -1100,7 +1245,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(status, ensure_ascii=False, sort_keys=True), flush=True)
         return 0 if status["state"] != "discovery_unverified" else 2
-    available = provider_catalog()
+    available = (sync_provider_catalog(args.output_root, now=datetime.now(UTC))
+                 if args.action == "sync" else provider_catalog())
     if args.action == "discover":
         missing = sorted(set(candidates) - set(available))
         payload = {
@@ -1124,6 +1270,8 @@ def main(argv: list[str] | None = None) -> int:
                 min_quota_remaining_mb=args.min_quota_remaining_mb,
                 retry_unavailable=args.retry_unavailable,
                 attempt_id=args.attempt_id,
+                key_timeout_seconds=args.key_timeout_seconds,
+                maximum_consecutive_timeouts=args.maximum_consecutive_timeouts,
             )
         except RuntimeError as exc:
             print(f"FinLab sync unavailable: {type(exc).__name__}", file=sys.stderr)

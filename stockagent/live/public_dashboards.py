@@ -16,10 +16,44 @@ import threading
 import time
 from typing import Any, Final
 
+from stockagent.live.public_quote_display import (
+    CONTRACT as PUBLIC_QUOTE_DISPLAY_CONTRACT,
+    PROTECTED_OBSERVATIONS_KEY,
+    is_quote_price_field,
+    public_quote_display_notice,
+    public_quote_display_policy,
+)
+from stockagent.live.public_daily_quotes import DAILY_QUOTE_FIELD, OfficialDailyQuoteSource
+from stockagent.live.public_price_metrics import public_entry_distances
+
 
 PUBLIC_MAX_EVENT_ROWS: Final[int] = 250
 PUBLIC_INITIAL_POSITION_ROWS: Final[int] = 100
 PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES: Final[int] = 2
+_TW_PUBLIC_POSITION_FIELDS: Final[set[str]] = {
+    "closing_auction_limit_price", "closing_auction_order_status", "closing_auction_order_submitted_at",
+    "counterfactual_open_replay", "counterfactual_0901_price_fill",
+    "entry_at", "entry_exchange_at", "entry_fee_twd", "entry_price",
+    "entry_price_source", "entry_completion_broker_fill",
+    "entry_completion_contract", "entry_completion_recorded_at",
+    "inventory_basis_price", "odd_lot_execution_policy",
+    "share_replacement_contract", "share_replacement_halted_until",
+    "eod_limit_order_status", "eod_limit_price", "eod_limit_submitted_at",
+    "exit_at", "exit_exchange_at", "exit_price", "exit_reason",
+    "exit_session_date", "filled_shares", "last_complete_net_pnl_twd",
+    "last_exit_at", "last_exit_price", "last_mark_price",
+    "last_mark_quote_source", "last_quote_at", "market",
+    "mandatory_exit_phase", "name", "net_pnl_twd", "open_reconstructed_at",
+    "opening_exit_limit_price", "opening_exit_order_session_date",
+    "opening_exit_order_status", "opening_exit_submitted_at",
+    "realized_net_pnl_twd", "reconciled_total_net_pnl_twd", "requested_shares",
+    "session_date", "security_type", "side", "signed_shares", "simulation_replay",
+    "source_signal_at", "status", "stop_order_status", "stop_trigger_price",
+    "symbol", "take_profit_price", "target_weight", "target_unsubmitted_shares",
+    "temporary_day_trade_model_adapter", "total_net_pnl_twd",
+    "unrealized_net_pnl_twd", "valuation_stale", "public_price_display",
+    PROTECTED_OBSERVATIONS_KEY,
+}
 _TAIFEX_HISTORY_ROW_FIELDS: Final[tuple[str, ...]] = (
     "cumulative_pnl_twd",
     "decision_ts_ns",
@@ -57,7 +91,7 @@ _PUBLIC_DROPPED_KEYS: Final[frozenset[str]] = frozenset({
     "checkpoint_fingerprint", "checkpoint_path", "config_fingerprint",
     "config_path", "daily_return_previous_close_source", "live_output_dir",
     "order_id", "path", "position_id", "previous_signal_id", "signal_id",
-    "source_file", "source_path",
+    "source_file", "source_path", PROTECTED_OBSERVATIONS_KEY,
 })
 _PUBLIC_CREDENTIAL_KEYS: Final[frozenset[str]] = frozenset({
     "apikey", "apisecret", "secret", "secretkey", "password", "passwd",
@@ -99,11 +133,23 @@ def _require_simulation_only(payload: Mapping[str, Any]) -> None:
         raise UnsafePublicDashboardPayload("production_order_possible must be false")
 
 
-def _scrub_public_value(value: Any) -> Any:
-    """Remove local paths and opaque execution identifiers recursively."""
+def _scrub_public_value(
+    value: Any, *, quote_source: OfficialDailyQuoteSource | None = None,
+    session_date: str | None = None,
+    record_kind: str | None = None,
+    record_collections: Mapping[str, str] | None = None,
+) -> Any:
+    """Strip private identifiers and unlicensed prices without mutating inputs."""
 
     if isinstance(value, Mapping):
+        session_date = value.get("session_date") or session_date
+        if quote_source is not None:
+            value = quote_source.enrich(value, session_date=session_date)
         output: dict[str, Any] = {}
+        withheld: list[str] = []
+        withheld_reasons: dict[str, str] = {}
+        visible: dict[str, Any] = {}
+        quote_policy = public_quote_display_policy()
         for raw_key, item in value.items():
             key = str(raw_key)
             disposition = _public_key_disposition(key)
@@ -112,10 +158,51 @@ def _scrub_public_value(value: Any) -> Any:
             if disposition == "redact_error":
                 output[key] = "unavailable" if item else None
                 continue
-            output[key] = _scrub_public_value(item)
+            # Publication is independent of the collector/model/ledger. A
+            # provider's API access or an upstream boolean is not a grant.
+            if is_quote_price_field(key):
+                permitted = quote_policy.observation(value, key, item)
+                if permitted is None and record_kind is not None:
+                    permitted = quote_policy.strategy_report_price(
+                        value, key, item, record_kind=record_kind,
+                    )
+                if permitted is None and record_kind is not None:
+                    permitted = quote_policy.transaction_report_price(
+                        value, key, item, record_kind=record_kind,
+                    )
+                if permitted is not None:
+                    output[key], visible[key] = permitted
+                else:
+                    output[key] = None
+                    if item is not None and not (
+                        isinstance(item, float) and not math.isfinite(item)
+                    ):
+                        withheld.append(key)
+                        withheld_reasons[key] = quote_policy.withheld_reason(value, key)
+                continue
+            output[key] = _scrub_public_value(
+                item, quote_source=None if key == DAILY_QUOTE_FIELD else quote_source,
+                session_date=session_date,
+                record_kind=((record_collections or {}).get(key)
+                             or ("paper_position" if record_kind == "paper_signal" and key == "position" else None)),
+            )
+        if withheld or visible:
+            output["public_price_display"] = {
+                "contract": PUBLIC_QUOTE_DISPLAY_CONTRACT,
+                "withheld_fields": withheld,
+                "withheld_reasons": withheld_reasons,
+                "visible_fields": visible,
+            }
+        if record_kind == "paper_position":
+            # Derived movements must never expose a withheld valuation. The
+            # canonical dated grid is consulted only on the already-public DTO.
+            distances = public_entry_distances(output)
+            if distances:
+                output["entry_price_distances"] = distances
         return output
     if isinstance(value, list):
-        return [_scrub_public_value(item) for item in value]
+        return [_scrub_public_value(item, quote_source=quote_source, session_date=session_date,
+                                   record_kind=record_kind) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
@@ -175,6 +262,7 @@ def sanitize_taifex_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     active_cycle = output.get("active_cycle")
     if isinstance(active_cycle, dict):
         active_cycle.pop("cycle_id", None)
+    output["price_display_policy"] = public_quote_display_notice()
     return output
 
 
@@ -240,7 +328,9 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
     return output
 
 
-def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
+def sanitize_tw_status(
+    payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+) -> dict[str, Any]:
     """Return the stock dashboard status with operational identities removed."""
 
     _require_simulation_only(payload)
@@ -249,6 +339,18 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     # Project before the recursive scrub so discarded fields are never copied
     # or inspected on the request path.
     projected = dict(payload)
+    if quote_source is not None:
+        # Independent public reference stays useful even when a strategy has
+        # no signals. It is not a position, fill, valuation or readiness proof.
+        selected_session = str(payload.get("session_date") or "")
+        reference_session = selected_session
+        if not quote_source.session(selected_session):
+            reference_session = quote_source.prior_completed_session(selected_session) or selected_session
+        projected["official_price_reference"] = {
+            "session_date": reference_session, "requested_session_date": selected_session,
+            "role": "reference_only",
+            "quotes": [{"symbol": symbol} for symbol in ("0050", "2330")],
+        }
     for key in ("signals", "orders", "fills", "events"):
         if isinstance(projected.get(key), list):
             projected[key] = []
@@ -276,6 +378,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "counterfactual_overnight_replay",
             "closing_auction_limit_price",
             "closing_auction_order_status",
+            "closing_auction_order_submitted_at",
             "entry_at",
             "entry_exchange_at",
             "entry_fee_twd",
@@ -312,6 +415,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "reconciled_total_net_pnl_twd",
             "requested_shares",
             "session_date",
+            "security_type",
             "side",
             "signed_shares",
             "simulation_replay",
@@ -326,6 +430,8 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "total_net_pnl_twd",
             "unrealized_net_pnl_twd",
             "valuation_stale",
+            "public_price_display",
+            PROTECTED_OBSERVATIONS_KEY,
         },
     )
     positions = projected.get("positions")
@@ -364,7 +470,8 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
         "benchmark_marks",
         series_field="benchmark_id",
     )
-    output = _scrub_public_value(projected)
+    output = _scrub_public_value(projected, quote_source=quote_source,
+                                 record_collections={"positions": "paper_position"})
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized status is not an object")
 
@@ -388,6 +495,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "complete selected-range order and fill ledgers are available through "
             "the bounded read-only event pages"
         )
+    output["price_display_policy"] = public_quote_display_notice(include_paper_reports=True)
     return output
 
 
@@ -604,7 +712,9 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
     return output
 
 
-def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
+def sanitize_tw_signals(
+    payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+) -> dict[str, Any]:
     """Return one public signal page without the internal signal identifiers."""
 
     _require_simulation_only(payload)
@@ -634,11 +744,10 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
         "feature_drivers_by_signal",
         "rows",
     }
-    output = _scrub_public_value(
-        {key: value for key, value in payload.items() if key in allowed}
-    )
-    if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
-        raise TypeError("sanitized signal page is not an object")
+    # Project first and scrub exactly once after nested lifecycle projection:
+    # stripping the authorized observation before that projection would lose
+    # its proof, and re-scrubbing a permitted public quote would hide it again.
+    output = {key: value for key, value in payload.items() if key in allowed}
     _project_rows(
         output,
         "rows",
@@ -684,22 +793,41 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "temporary_day_trade_model_adapter",
             "top_book_capacity_shares",
             "order_limit_price",
+            "position",
             "upper_limit",
             "model_trained_for_overnight",
             "stock_futures",
+            "public_price_display",
+            PROTECTED_OBSERVATIONS_KEY,
         },
     )
     # Keep the enrichment DTO bounded just like the surrounding signal row.
     for row in output.get("rows", []):
+        position = row.get("position")
+        if isinstance(position, dict):
+            # Reuse the lifecycle endpoint's public projection. Embedding a
+            # valuation must not expose internal ledger IDs or private fields.
+            projected = {
+                key: value for key, value in position.items()
+                if key in _TW_PUBLIC_POSITION_FIELDS
+            }
+            if position.get("contract") == "signal_ledger_valuation_v1":
+                projected["contract"] = "signal_ledger_valuation_v1"
+            row["position"] = projected
+        else:
+            row.pop("position", None)
         membership = row.get("stock_futures")
         if isinstance(membership, dict):
             row["stock_futures"] = {key: membership[key] for key in (
                 "status", "products", "as_of", "scope", "reason", "source_url"
             ) if key in membership}
-    return output
+    return _scrub_public_value(output, quote_source=quote_source,
+                               record_collections={"rows": "paper_signal"})
 
 
-def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
+def sanitize_tw_positions(
+    payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+) -> dict[str, Any]:
     """Return a bounded public position page without internal ledger IDs."""
 
     _require_simulation_only(payload)
@@ -720,79 +848,19 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
         "record_count",
         "rows",
     }
-    output = _scrub_public_value(
-        {key: value for key, value in payload.items() if key in allowed}
-    )
-    if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
-        raise TypeError("sanitized position page is not an object")
+    output = {key: value for key, value in payload.items() if key in allowed}
     _project_rows(
         output,
         "rows",
-        allowed_fields={
-            "closing_auction_limit_price",
-            "closing_auction_order_status",
-            "counterfactual_open_replay",
-            "counterfactual_0901_price_fill",
-            "entry_at",
-            "entry_exchange_at",
-            "entry_fee_twd",
-            "entry_price",
-            "entry_price_source",
-            "entry_completion_broker_fill",
-            "entry_completion_contract",
-            "entry_completion_recorded_at",
-            "inventory_basis_price",
-            "odd_lot_execution_policy",
-            "share_replacement_contract",
-            "share_replacement_halted_until",
-            "eod_limit_order_status",
-            "eod_limit_price",
-            "eod_limit_submitted_at",
-            "exit_at",
-            "exit_exchange_at",
-            "exit_price",
-            "exit_reason",
-            "exit_session_date",
-            "filled_shares",
-            "last_complete_net_pnl_twd",
-            "last_exit_at",
-            "last_exit_price",
-            "last_mark_price",
-            "last_quote_at",
-            "market",
-            "mandatory_exit_phase",
-            "name",
-            "net_pnl_twd",
-            "open_reconstructed_at",
-            "opening_exit_limit_price",
-            "opening_exit_order_session_date",
-            "opening_exit_order_status",
-            "opening_exit_submitted_at",
-            "realized_net_pnl_twd",
-            "reconciled_total_net_pnl_twd",
-            "requested_shares",
-            "session_date",
-            "side",
-            "signed_shares",
-            "simulation_replay",
-            "source_signal_at",
-            "status",
-            "stop_order_status",
-            "stop_trigger_price",
-            "symbol",
-            "take_profit_price",
-            "target_weight",
-            "target_unsubmitted_shares",
-            "temporary_day_trade_model_adapter",
-            "total_net_pnl_twd",
-            "unrealized_net_pnl_twd",
-            "valuation_stale",
-        },
+        allowed_fields=_TW_PUBLIC_POSITION_FIELDS,
     )
-    return output
+    return _scrub_public_value(output, quote_source=quote_source,
+                               record_collections={"rows": "paper_position"})
 
 
-def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
+def sanitize_tw_events(
+    payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+) -> dict[str, Any]:
     """Return one public event page after enforcing the simulation boundary."""
 
     _require_simulation_only(payload)
@@ -819,7 +887,9 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
         "rows",
     }
     output = _scrub_public_value(
-        {key: value for key, value in payload.items() if key in allowed}
+        {key: value for key, value in payload.items() if key in allowed},
+        quote_source=quote_source,
+        record_collections={"rows": "paper_event"},
     )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized event page is not an object")
@@ -845,6 +915,8 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
             "symbol",
             "depth_assumption",
             "odd_lot_execution_policy",
+            "public_price_display",
+            DAILY_QUOTE_FIELD,
         },
     )
     return output

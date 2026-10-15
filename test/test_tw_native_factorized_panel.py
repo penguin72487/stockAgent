@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -12,6 +13,25 @@ from stockagent.data.tw_native_panel_features import collapse_conflicting_observ
 
 def spec(name,rule="quarter",group=None):
     return {"feature":name,"rule":asdict(RULES[rule]),"report_group":group}
+
+
+def test_annual_events_use_release_dates_not_absolute_relative_path_spelling(tmp_path, monkeypatch):
+    from scripts.prepare_tw_day_trade_factorized_panel import AnnualObservationEvents
+    monkeypatch.chdir(tmp_path)
+    seed = pl.DataFrame({"date": [date(2026, 2, 25)], "symbol": ["2330"], "feature": ["a"],
+                         "value": [7.], "period": ["2026-02-24"], "_source_part": [0]})
+    seed.write_parquet(tmp_path / "z_seed.parquet")
+    seed.with_columns(pl.lit(date(2026, 10, 7)).alias("date"), pl.lit("2026-10-06").alias("period"),
+                      pl.lit(9.).alias("value")).write_parquet(tmp_path / "a_delta.parquet")
+    events = AnnualObservationEvents([Path("z_seed.parquet"), tmp_path / "a_delta.parquet"])
+    observed = [day for day, _ in events.iter_date_groups([spec("a", "daily")], ["2330"])]
+    assert observed == [date(2026, 2, 25), date(2026, 10, 7)]
+    rows = list(causal_state_blocks([date(2026, 2, 24), date(2026, 2, 25)], ["2330"],
+                [spec("a", "daily")], events, None, model_channel_policy="value_only"))
+    assert rows[0][1][0, 0, 0] == 7.
+    seed.write_parquet(tmp_path / "b_overlap.parquet")
+    with pytest.raises(ValueError, match="overlap"):
+        AnnualObservationEvents([tmp_path / "z_seed.parquet", tmp_path / "b_overlap.parquet"])
 
 
 def test_nullable_source_and_causal_age_zero_lifecycle_and_report_reset():
@@ -236,9 +256,20 @@ def test_complete_synthetic_prepare_raw_null_shared_axis_and_markdown(tmp_path,m
     monkeypatch.setattr(builder,"build_panel",lambda *a,**kw:panel)
     monkeypatch.setattr(builder,"_build_panel_kwargs",lambda config:{})
     config=Path("configs/deployments/tw_day_trade_last_last_only_training_vastai1t_v10_research_143_no_bottleneck.yaml")
+    inherited = tmp_path / 'historical-base.yaml'
+    inherited.write_text(json.dumps({'base_config': str(config.resolve()), 'data': {
+        'day_trade_minute_execution_cache_dir': str(tmp_path / 'artifacts/markets/old/runtime-cache')}}))
+    config = inherited
     out=tmp_path/"prepared"
+    temporary_cache = tmp_path/'owned-trial/runtime-cache' if channel_policy == 'value_only' else None
     result=builder.prepare(source,out,config,tmp_path/"minutes","pinned-synthetic-release",max_block_bytes=128,
-        model_channel_policy=channel_policy)
+        model_channel_policy=channel_policy, runtime_cache_root=temporary_cache)
+    generated = builder.load_config(out / 'training.yaml')
+    assert 'artifacts/markets/' not in generated.data.day_trade_minute_execution_cache_dir
+    if temporary_cache is None:
+        assert '/artifacts/cache/' in generated.data.day_trade_minute_execution_cache_dir
+    else:
+        assert generated.data.day_trade_minute_execution_cache_dir == str(temporary_cache)
     assert result["individual_quantities"]==1+int(native) and result["shared_quantities"]==1+int(native)
     channels = 1 if channel_policy == "value_only" else 4
     expected_width = 6 + channels * (2 + 2 * int(native))

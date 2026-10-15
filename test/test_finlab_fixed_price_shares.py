@@ -27,8 +27,8 @@ def test_fixed_price_lots_need_exact_price_amount_proof(tmp_path):
         }
         (tmp_path / "receipts" / f"{safe_stem(key)}.json").write_text(json.dumps(receipt))
     frame = load_fixed_price_shares(tmp_path, "2330")
-    assert frame["volume_shares"].tolist()[:2] == [15_000, 20]
-    assert pd.isna(frame.loc[2, "volume_shares"])
-    assert frame.loc[3, "volume_shares"] == 0
-    assert pd.isna(frame.loc[4, "volume_shares"])
-    assert frame["unit_multiplier"].tolist()[:2] == [1000, 10]
+    assert frame["volume_shares"].to_list()[:2] == [15_000, 20]
+    assert frame[2, "volume_shares"] is None
+    assert frame[3, "volume_shares"] == 0
+    assert frame[4, "volume_shares"] is None
+    assert frame["unit_multiplier"].to_list()[:2] == [1000, 10]

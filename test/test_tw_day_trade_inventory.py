@@ -537,6 +537,21 @@ def test_action_entitlement_excludes_new_shares_and_rejects_duplicate_or_missing
     assert state.shares == 3000 and state.claims.numel() == 0  # atomic failure
 
 
+def test_tensor_corporate_calendar_preserves_entitlement_and_rejects_bad_dates():
+    state = add(DayTradeInventoryState.empty(1))
+    kwargs = dict(event_mask=v(1), share_ratio=v(1.25), cash_per_old_share=v(10),
+        payment_day=v(DAY + 5), stock_delivery_day=v(DAY + 10))
+    integer = apply_inventory_action(state, event_day=DAY + 1, as_of_day=DAY + 1, **kwargs)
+    tensor = apply_inventory_action(state, event_day=torch.tensor(float(DAY + 1), dtype=torch.float64),
+        as_of_day=torch.tensor(float(DAY + 1), dtype=torch.float64), **kwargs)
+    for name in state.__dataclass_fields__:
+        torch.testing.assert_close(getattr(integer, name), getattr(tensor, name), rtol=0, atol=0)
+    for bad in (float('nan'), -1., DAY + 2., DAY + .5):
+        with pytest.raises(RuntimeError, match="not yet effective"):
+            apply_inventory_action(state, event_day=torch.tensor(bad, dtype=torch.float64),
+                as_of_day=DAY + 1, **kwargs)
+
+
 def test_missing_price_no_execution_and_no_invented_inventory_mark():
     state = add(DayTradeInventoryState.empty(1))
     result = reduce_inventory_fifo(

@@ -39,6 +39,14 @@ stockagent-agent status --architecture --output artifacts/operations/agent-workf
 Git remote refs、遠端節點、載入的服務程式版本、來源 freshness／完整性仍需對應驗收。
 快照檔案的 mtime 只表示檔案年齡；`active` 只表示程序活動。
 
+跨主機回傳的 run 收據可與本機紀錄並存；`status` 會保留為
+`foreign_unverified`，列出宣告的 host／checkout／結果與未驗證外地紀錄
+數量，不查它的 PID／log 在本機是否存在，不冒充遠端即時觀察。
+這些紀錄不阻塞無關本機 task 的 launcher；同 task／同名的未驗證紀錄
+仍不能授權重試或完成。定點 `run-status`／`_execute`／`run-reconcile`
+與收據寫入仍要求當前 host 和 checkout 完全一致。原收據不改寫，
+格式損壞的本機紀錄也不因這個分類被略過。
+
 ## 接手、執行與交付
 
 實作／維運的多步任務先查相關現況並建立紀錄。小型文字修改可直接完成，
@@ -105,6 +113,19 @@ tmux 使用獨立 `stockagent-agent` socket 與帶 checkout 指紋的 session，
 `work`、`logs`、`status` 三個 shell，不改使用者全域 tmux 設定。`session` 回傳 attach
 指令；它會補回準備未完成的視窗。tmux 保留斷線後的程序與終端，主機／WSL
 關閉後需另行恢復。Python shell 已 source 當前 checkout 的 runtime。
+
+重複遠端診斷可使用本機獨立 SSH profile，從現行已登錄 Vast policy 產生：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/prepare_agent_ssh_profile.py
+ssh -F /etc/stockagent/agent-ssh.conf stockagent-vast 'uname -s'
+```
+
+端點變更或重開機後重新 prepare；沿用 identity／known-hosts，連線閒置 60 秒後
+關閉，不改全域 SSH 設定。Herdr 已可作為按需互動介面；目前 repo runtime
+仍由 Bash 執行。zsh／mosh 的相容性、遠端 UDP 條件與完整實測見
+[終端工具比較及使用方式](agent_terminal_tools_2026-10-07.md)。
 
 通過驗收後以當次非空結果文件完成任務：
 

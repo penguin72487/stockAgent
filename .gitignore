@@ -216,6 +216,7 @@ data_bybit/*
 /data_crypto_reference/
 /data_finlab/
 /data_finmind/
+/data_news_fulltext/
 /data_tej/
 /data_finlab_training
 /data_dune_crypto/
@@ -247,3 +248,5 @@ data_bybit_daily_synced
 data_crypto_historical_public/*
 data_crypto_historical_public/raw/wikimedia/Blockchain.json.gz
 data_bybit_prepacked_20260926/*
+json
+data_bybit

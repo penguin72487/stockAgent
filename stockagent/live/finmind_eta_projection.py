@@ -15,6 +15,12 @@ RETRY_SNAPSHOT_VERSIONS = frozenset(range(7, SNAPSHOT_CONTRACT_VERSION + 1))
 PUBLIC_SNAPSHOT_VERSIONS = frozenset({3, 4, 5}) | ORDERED_SNAPSHOT_VERSIONS
 
 
+def _ordered(payload: dict) -> bool:
+    """Semantic capability, not a deployed producer's numeric version ceiling."""
+    capability = payload.get('scenario_projection_contract')
+    return (type(capability) is int and capability == 1) if capability is not None else payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS
+
+
 def _number(value: Any) -> int | float | None:
     return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
 
@@ -41,7 +47,7 @@ def public_completion_estimate(root: Path, now: datetime) -> dict[str, Any]:
                 payload = value['estimate']
     except (OSError, ValueError):
         pass
-    if payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS:
+    if _ordered(payload):
         children = payload.get('stages')
         keys = [item.get('key') for item in children if isinstance(item, dict)] if isinstance(children, list) else []
         if (payload.get('history_order') != history_order_metadata()
@@ -53,18 +59,22 @@ def public_completion_estimate(root: Path, now: datetime) -> dict[str, Any]:
     result = _public_estimate(payload, now)
     children = payload.get('milestones')
     if isinstance(children, dict):
-        result['milestones'] = {key: _public_estimate(children[key], now) for key in ('core', 'non_tick', 'all')
+        result['milestones'] = {key: _public_estimate({**children[key],
+                                  'scenario_projection_contract': payload.get('scenario_projection_contract'),
+                                  'observed_at_utc': payload.get('observed_at_utc'),
+                                  'valid_until_utc': payload.get('valid_until_utc')}, now) for key in ('core', 'non_tick', 'all')
                                 if isinstance(children.get(key), dict)}
     stages = payload.get('stages')
     if isinstance(stages, list):
         result['stages'] = []
-        stage_keys = tuple(key for key, _ in STAGES) if payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS else (
+        stage_keys = tuple(key for key, _ in STAGES) if _ordered(payload) else (
             'priority', 'core', 'detail', 'tick', 'validation')
         for key in stage_keys:
             raw = next((item for item in stages if isinstance(item, dict) and item.get('key') == key), None)
             if raw is not None:
                 # A child cannot outlive the evidence envelope that owns it.
                 item = _public_estimate({**raw, 'observed_at_utc': payload.get('observed_at_utc'),
+                                         'scenario_projection_contract': payload.get('scenario_projection_contract'),
                                          'valid_until_utc': payload.get('valid_until_utc')}, now)
                 history = next((stage for stage in HISTORY_STAGES if stage.key == key), None)
                 item.update(key=key, dataset=history.dataset if history else None,
@@ -84,10 +94,14 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         state = 'unavailable'
     if payload and not fresh:
         state = 'stale'
+    capability = payload.get('scenario_projection_contract')
+    if fresh and capability is not None and not (type(capability) is int and capability == 1):
+        state = 'unavailable'
     usable = fresh and state not in {'unavailable', 'stale'}
     result = {
-        'schema_version': payload['schema_version'] if payload.get('schema_version') in PUBLIC_SNAPSHOT_VERSIONS else 2,
-        'scenario_projection_contract': 1 if payload.get('schema_version') in ORDERED_SNAPSHOT_VERSIONS else None,
+        'schema_version': payload['schema_version'] if (type(payload.get('schema_version')) is int
+                            and (_ordered(payload) or payload['schema_version'] in PUBLIC_SNAPSHOT_VERSIONS)) else 2,
+        'scenario_projection_contract': 1 if _ordered(payload) else None,
         'state': state, 'observed_at_utc': observed.isoformat() if observed else None,
         'valid_until_utc': expiry.isoformat() if expiry else None,
         'scope_label': str(payload.get('scope_label', 'FinMind 已排程工作'))[:160],
@@ -152,6 +166,9 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             'gross_requests_per_hour', 'future_recurring_requests_per_hour',
             'effective_requests_per_hour', 'current_reserved_requests', 'priority_requests_per_hour')}
         result['rate_evidence'].update(
+            priority_cost_basis='accepted_json_own_service_cost' if rates.get('priority_cost_basis') == 'accepted_json_own_service_cost' else 'shared_wall_dispatch_proxy',
+            priority_cost_samples=_number(rates.get('priority_cost_samples')))
+        result['rate_evidence'].update(
             scheduling_basis='release_clock_events' if rates.get('scheduling_basis') == 'release_clock_events' else 'average_load',
             rolling_complete_window=rates.get('rolling_complete_window') is True,
             stage_label=str(rates.get('stage_label', '目前階段'))[:160],
@@ -163,11 +180,30 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         if isinstance(processing, dict):
             result['rate_evidence']['request_processing'] = {
                 'object_requests': _number(processing.get('object_requests')),
+                'capacity_basis': (processing.get('capacity_basis')
+                                   if processing.get('capacity_basis') in {'accepted_json_own_service_cost', 'accepted_parallel_pipeline_wall'} else 'object_cost'),
+                'sample_scope': (processing.get('sample_scope') if processing.get('sample_scope') in
+                                 {'dataset', 'pooled_json_proxy', 'dataset_current_configuration_full_batches'} else None),
                 'samples': _number(processing.get('samples')),
                 'dependent_processing_samples': _number(processing.get('dependent_processing_samples')),
                 'dependent_processing_unknown': processing.get('dependent_processing_unknown') is True,
-                'basis': 'observed_object_and_mandatory_local_cost_not_legacy_request_rate',
+                'processing_engine': (processing.get('processing_engine')
+                                      if processing.get('processing_engine') in {'arrow_decimal128_exact', 'arrow_decimal128_table_exact_v2', 'python_decimal_reference',
+                                                                                 'bounded_json_keepalive_single_publication_owner'} else None),
+                'basis': ('accepted_parallel_json_fetch_validate_publish_wall'
+                          if processing.get('capacity_basis') == 'accepted_parallel_pipeline_wall'
+                          and processing.get('processing_engine') == 'bounded_json_keepalive_single_publication_owner'
+                          else 'accepted_parallel_transfer_derive_publish_wall'
+                          if processing.get('capacity_basis') == 'accepted_parallel_pipeline_wall'
+                          else 'accepted_json_own_service_cost_conditional_not_current_dispatch_rate'
+                          if processing.get('capacity_basis') == 'accepted_json_own_service_cost'
+                          else 'observed_object_and_mandatory_local_cost_not_legacy_request_rate'),
                 'rates': {key: _number(processing.get('rates', {}).get(key)) for key in ('fastest', 'central', 'slowest')},
+                **{key: _number(processing.get(key)) for key in ('download_workers', 'derivation_workers', 'arrow_threads')},
+                'full_cycle_wall_verified': processing.get('full_cycle_wall_verified') is True,
+                'measured_preemption_time_excluded': processing.get('measured_preemption_time_excluded') is True,
+                **{key: _number(processing.get(key)) for key in
+                   ('full_owner_cycles', 'sampled_requests', 'sampled_wall_seconds', 'owner_cycle_wall_seconds')},
             }
     assumptions = payload.get('assumptions')
     if isinstance(assumptions, list):
@@ -180,7 +216,7 @@ def _public_estimate(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             and item.get('code') in {'blocked_tasks', 'unscheduled_datasets', 'unknown_datasets',
                                      'secondary_admission', 'unmeasured_tail', 'quota_pause', 'retry_tasks', 'retry_exhausted_tasks'}]
     condition = payload.get('retry_condition')
-    if (usable and payload.get('schema_version') in RETRY_SNAPSHOT_VERSIONS and isinstance(condition, dict)
+    if (usable and (_ordered(payload) or payload.get('schema_version') in RETRY_SNAPSHOT_VERSIONS) and isinstance(condition, dict)
             and condition.get('schema_version') == 1
             and condition.get('basis') == 'next_retry_succeeds_no_additional_failures'
             and (_number(condition.get('retry_tasks')) or 0) > 0):

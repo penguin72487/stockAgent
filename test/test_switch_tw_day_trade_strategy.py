@@ -106,6 +106,68 @@ def test_flat_live_state_refuses_an_open_position(tmp_path: Path) -> None:
         strategy_switch._flat_live_state(tmp_path, {"target"})
 
 
+def test_candidate_preflight_is_not_an_applicable_plan(monkeypatch) -> None:
+    args = strategy_switch.build_parser().parse_args(["plan", "--candidate-preflight"])
+    monkeypatch.setattr(strategy_switch.tempfile, "mkdtemp", lambda **_kwargs: pytest.fail("must not create a candidate directory"))
+    with pytest.raises(RuntimeError, match="read-only candidate preflight cannot be applied"):
+        strategy_switch._apply(args, {"plan_complete": False})
+    args.candidate_preflight = False
+    with pytest.raises(RuntimeError, match="read-only candidate preflight cannot be applied"):
+        strategy_switch._apply(args, {"plan_complete": False})
+
+
+def test_candidate_preflight_retains_modes_and_reports_blockers(monkeypatch, tmp_path):
+    args = strategy_switch.build_parser().parse_args([
+        "plan", "--candidate-preflight", "--live-dir", str(tmp_path),
+        "--markets-dir", str(tmp_path / "markets"),
+    ])
+    existing = {"mode1", "mode2", "mode3", "mode4"}
+    state = {"modes": {market: {"open_position_count": 1, "positions": {"2330": {"signed_shares": 1000}}} for market in existing}}
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state))
+    before = state_path.read_bytes()
+    monkeypatch.setattr(strategy_switch, "_active_specs", lambda _path: ([], {}, sorted(existing)))
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("source-config")
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"selected-checkpoint")
+    monkeypatch.setattr(strategy_switch, "_market_config_paths", lambda _path: {market: config_path for market in existing})
+    start, end = date(2026, 2, 25), date(2026, 10, 12)
+    monkeypatch.setattr(strategy_switch, "_latest_completed_session", lambda **_kwargs: (end, [start, end], "calendar-proof"))
+    monkeypatch.setattr(strategy_switch, "resolved_live_output_dir", lambda _config: tmp_path / "signals/new-model")
+    market_config = SimpleNamespace(
+        market="fifth", enabled=False, label="new mode", checkpoint_path=str(checkpoint), fold_id=11,
+    )
+    experiment = SimpleNamespace(data=SimpleNamespace(factorized_feature_manifest=str(tmp_path / "missing.json")))
+    result = strategy_switch._candidate_preflight(
+        args, market_config=market_config, market_config_path=tmp_path / "market.yaml",
+        experiment_path=config_path, experiment=experiment,
+        requested_artifact={"identity_matches": True}, lifecycle={"fold_status": "complete"}, capital=10000000,
+    )
+    assert result["status"] == "blocked_preflight"
+    assert result["read_only"] is True
+    assert result["plan_complete"] is False
+    assert set(result["active_markets"]) == existing
+    assert set(result["proposed_markets"]) == existing | {"fifth"}
+    assert result["mutations"] == []
+    assert state_path.read_bytes() == before
+    assert result["history"]["expected_strategy_minute_rows_after_addition"] == 2 * 5 * 270
+    codes = {row["code"] for row in result["blockers"]}
+    assert {"live_flat_gate_not_ready", "factorized_manifest_missing", "additive_cutover_not_verified"} <= codes
+
+
+def test_candidate_preflight_requires_a_disabled_new_market(monkeypatch, tmp_path):
+    args = strategy_switch.build_parser().parse_args(["plan", "--candidate-preflight"])
+    monkeypatch.setattr(strategy_switch, "_active_specs", lambda _path: ([], {}, ["existing"]))
+    for config in (SimpleNamespace(enabled=True, market="new"), SimpleNamespace(enabled=False, market="existing")):
+        with pytest.raises(ValueError, match="disabled independent market"):
+            strategy_switch._candidate_preflight(
+                args, market_config=config, market_config_path=tmp_path / "market",
+                experiment_path=tmp_path / "config", experiment=SimpleNamespace(),
+                requested_artifact=None, lifecycle={}, capital=10000000,
+            )
+
+
 def test_fold_lifecycle_requires_complete_matching_tw_day_trade_contract(
     tmp_path: Path,
 ) -> None:

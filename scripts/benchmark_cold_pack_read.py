@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -22,6 +24,22 @@ from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id, _l
 from stockagent.data_sync.legacy_artifact_archive import _decode_hash
 from stockagent.data_sync.bulk_archive import signature
 from stockagent.data_sync.training_return import admit_workspace
+
+
+@contextlib.contextmanager
+def _measured_pack_source(path, item, profile):
+    if profile in {"drvfs_inmemory", "drvfs_inmemory_ephemeral"}:
+        with path.open("rb") as stream:
+            payload = stream.read(int(item["bytes"]) + 1)
+        if len(payload) != item["bytes"] or hashlib.sha256(payload).hexdigest() != item["sha256"]:
+            raise SnapshotError("bounded immutable pack differs; scratch retained")
+        with io.BytesIO(payload) as source:
+            yield source
+        return
+    if profile == "drvfs" and sha256_file(path) != item["sha256"]:
+        raise SnapshotError("immutable real D pack differs; scratch retained")
+    with _native_pack_source(path, item, enabled=profile == "native_ssd_pack", prefer_memory=False) as source:
+        yield source
 
 
 def main():
@@ -43,7 +61,10 @@ def main():
     originals = {r["encoded_path"]: r for r in legacy["files"]}
     entries = _load_inventory(cold, resolved.manifest)
     _validate_inventory(resolved.manifest, entries)
-    items = [r for r in resolved.manifest["archive"]["objects"] if r["kind"] == "pack" and r["bytes"] <= 64 * 1024**2]
+    items = [r for r in resolved.manifest["archive"]["objects"]
+             if r["kind"] == "pack" and r["bytes"] <= 64 * 1024**2
+             and all(e["path"] in originals for e in entries
+                     if e["kind"] == "file" and e["storage"]["object_sha256"] == r["sha256"])]
     if not items:
         raise SnapshotError("no bounded complete real ZIP pack to compare")
     item = max(items, key=lambda r: r["file_count"])
@@ -55,14 +76,13 @@ def main():
     admit_workspace(Path("/var/lib"), 32 * 1024**3 + 2 * item["logical_bytes"])
     before = signature(path)
     records = []
+    profiles = ["drvfs", "native_ssd_pack", "drvfs_inmemory", "drvfs_inmemory_ephemeral"]
     for turn in range(3):
-        for profile in (["drvfs", "native_ssd_pack"] if turn % 2 == 0 else ["native_ssd_pack", "drvfs"]):
+        for profile in profiles[turn:] + profiles[:turn]:
             _check_d_primary_mount(cold)
             scratch = Path(tempfile.mkdtemp(prefix="stockagent-pack-recovery-benchmark-", dir="/var/lib"))
             started = time.perf_counter()
-            if profile == "drvfs" and sha256_file(path) != item["sha256"]:
-                raise SnapshotError("immutable real D pack differs; scratch retained")
-            with _native_pack_source(path, item, enabled=profile == "native_ssd_pack") as source, zipfile.ZipFile(source) as archive:
+            with _measured_pack_source(path, item, profile) as source, zipfile.ZipFile(source) as archive:
                 if archive.namelist() != [r["storage"]["member"] for r in expected] or archive.testzip() is not None:
                     raise SnapshotError("pack membership or CRC differs; scratch retained")
                 for number, row in enumerate(expected):
@@ -71,7 +91,9 @@ def main():
                     with archive.open(row["storage"]["member"]) as reader, target.open("xb") as output:
                         while block := reader.read(4 * 1024**2):
                             output.write(block); digest.update(block); size += len(block)
-                        output.flush(); os.fsync(output.fileno())
+                        output.flush()
+                        if profile != "drvfs_inmemory_ephemeral":
+                            os.fsync(output.fileno())
                     raw = originals[row["path"]]
                     if size != row["size"] or digest.hexdigest() != row["sha256"]:
                         raise SnapshotError("encoded member reconstruction differs; scratch retained")
@@ -86,15 +108,18 @@ def main():
             record = {"profile": profile, "round": turn + 1, "complete_workflow_seconds": time.perf_counter() - started,
                       "encoded_pack_bytes": item["bytes"], "decoded_original_bytes": total_original,
                       "files": len(expected), "full_pack_sha_crc_verified": True,
+                      "ephemeral_member_scratch": profile == "drvfs_inmemory_ephemeral",
+                      "forced_native_ssd_reader": profile == "native_ssd_pack",
                       "all_original_and_encoded_sha_verified": True, "own_scratch_removed": True}
             records.append(record); print(json.dumps(record), flush=True)
             atomic_write_json(args.output.with_suffix(".progress.json"), {"state": "running", "runs": records})
     medians = {p: statistics.median(r["complete_workflow_seconds"] for r in records if r["profile"] == p)
-               for p in ["drvfs", "native_ssd_pack"]}
+               for p in profiles}
     result = {"state": "real_pack_original_recovery_measured", "dataset": args.dataset,
               "snapshot_id": args.snapshot_id, "manifest_sha256": resolved.manifest_sha256,
               "pack_sha256": item["sha256"], "pack_signature": before, "runs": records, "medians": medians,
               "native_speedup": medians["drvfs"] / medians["native_ssd_pack"], "os_caches_flushed": False,
+              "fastest_profile": min(medians, key=medians.get),
               "authoritative_cold_changed": False, "source_changed": False,
               "scope": "one complete actual pack: object SHA, ZIP CRC, per-member fsync/encoded SHA, original decode/SHA, scratch removal; not whole-release completion"}
     atomic_write_json(args.output, result)

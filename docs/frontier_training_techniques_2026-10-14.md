@@ -5,6 +5,11 @@
 為準；只有 `complete=true` 且個別 trial 通過完整 lifecycle，才算完成該項實測。
 這是最後 fold 的 12 次更新診斷，不是收斂或投資績效的結論。
 
+2026-10-14 16:36 的獨立回讀確認九組短測均完成並通過 lifecycle，正式 v8 baseline
+完成 epoch208，Muon 到 epoch275、queue 繼續執行。GPU 現場量測、實際載入版本與
+下一版帳務／年度多卡分工假說見
+[GPU 利用率與結構診斷](gpu_utilization_first_principles_2026-10-14.md)。
+
 ## 第一性原理與適用性
 
 本 baseline 是 FinancialTransformer：d_model32、lookback32、global batch256、

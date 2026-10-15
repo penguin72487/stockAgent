@@ -15,7 +15,7 @@ from datetime import (
     timedelta,
     timezone,
 )
-from functools import lru_cache
+from functools import lru_cache, wraps
 import gzip
 import hashlib
 import heapq
@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Final
+from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
 from stockagent.backtest.tw_day_trade_contract import MARGIN_CARRY_CONTRACT
@@ -122,7 +123,7 @@ _LATEST_SESSION_BLOCK_CACHE: dict[
 ] = {}
 _LATEST_SESSION_BLOCK_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
-    tuple[int, int, int, int, int], list[dict[str, Any]]
+    tuple[int, int, int, int, int], dict[str, Any]
 ] = {}
 _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ENTRIES: Final[int] = 256
@@ -141,6 +142,8 @@ class _SignalPageCacheEntry:
 
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], _SignalPageCacheEntry] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
+_DETAIL_QUERY_LOCKS: WeakValueDictionary[tuple[Any, ...], Any] = WeakValueDictionary()
+_DETAIL_QUERY_LOCKS_GUARD = threading.Lock()
 _SIGNAL_RANGE_SUMMARY_CACHE: dict[
     tuple[Any, ...],
     tuple[dict[str, dict[str, float | int]], dict[str, dict[str, Any]]],
@@ -155,9 +158,9 @@ _EVENT_PAGE_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
-_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 2
+_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 3
 _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
-_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 3
+_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 4
 _HISTORY_SESSION_PROJECTION_MAX_COMPRESSED_BYTES: Final[int] = 4 * 1024 * 1024
 _HISTORY_SESSION_REBUILD_LIMIT: Final[int] = 8
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
@@ -166,6 +169,16 @@ _COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
 _COLUMNAR_LEDGER_WRITE_BUFFER_BYTES: Final[int] = 8 * 1024 * 1024
 _DETAIL_SESSION_PROJECTION_VERSION: Final[int] = 1
 _DETAIL_SESSION_PROJECTION_MAX_BYTES: Final[int] = 32 * 1024 * 1024
+_HISTORY_MARK_COLUMN_TYPES: Final[dict[str, str]] = {
+    "session_date": "string", "market": "string", "benchmark_id": "string",
+    "minute": "string", "recorded_at": "string", "initial_capital_twd": "float",
+    "total_equity_twd": "float", "return_pct": "float", "return_fraction": "float",
+    "valuation_stale": "bool", "historical_minute_replay": "bool",
+    "historical_counterfactual_replay": "bool", "minute_valuation_contract": "string",
+    "valuation_source": "string", "valuation_executable": "bool",
+    "fresh_trade_position_count": "int", "last_trade_carried_position_count": "int",
+    "missing_price_position_count": "int", "fresh_trade_notional_coverage_ratio": "float",
+}
 _SIGNAL_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "action": "string",
     "ask": "float",
@@ -775,11 +788,11 @@ def _as_path(path: Path, value: Any) -> Path | None:
     return candidate
 
 
-def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
+def _read_signal_feature_record(summary_path: Path) -> dict[str, Any]:
     try:
         signature = summary_path.stat()
     except OSError:
-        return []
+        return {"drivers": []}
     cache_key = (
         signature.st_dev,
         signature.st_ino,
@@ -790,12 +803,16 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
     with _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK:
         cached = _SIGNAL_FEATURE_SUMMARY_CACHE.get(cache_key)
         if cached is not None:
-            return list(cached)
+            return {**cached, "drivers": list(cached["drivers"])}
     try:
         summary = _object(summary_path)
     except (OSError, ValueError, json.JSONDecodeError):
-        return []
+        return {"drivers": []}
+    publication = summary.get("source_publication_contract") or {}
     explanation = summary.get("model_explanation")
+    withheld = (publication.get("feature_proxy_publication_allowed") is False
+                or isinstance(explanation, Mapping)
+                and explanation.get("feature_proxy_publication_allowed") is False)
     raw_drivers = (
         explanation.get("all_feature_drivers")
         if isinstance(explanation, Mapping)
@@ -807,8 +824,8 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
             if isinstance(explanation, Mapping)
             else None
         )
-    if not isinstance(raw_drivers, list):
-        return []
+    if withheld or not isinstance(raw_drivers, list):
+        raw_drivers = []  # Never return private input/proxy values, even from stale summaries.
     drivers: list[dict[str, Any]] = []
     for item in raw_drivers:
         if not isinstance(item, Mapping):
@@ -831,6 +848,13 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
             # Keep legacy fallback behavior for compatibility with older summaries.
             driver["weighted_abs_value"] = 0.0
         drivers.append(driver)
+    record = {"drivers": drivers}
+    if withheld:
+        record.update(feature_proxy_publication_allowed=False,
+                      publication_reason="model_derived_signals_only")
+    for field in ("research_only", "historical_point_in_time_proven"):
+        if type(publication.get(field)) is bool:
+            record[field] = publication[field]
     cacheable = (
         signature.st_size < 64 * 1024 * 1024
         and len(json.dumps(drivers, separators=(",", ":")).encode("utf-8"))
@@ -844,8 +868,12 @@ def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
                 _SIGNAL_FEATURE_SUMMARY_CACHE.pop(
                     next(iter(_SIGNAL_FEATURE_SUMMARY_CACHE))
                 )
-            _SIGNAL_FEATURE_SUMMARY_CACHE[cache_key] = list(drivers)
-    return drivers
+            _SIGNAL_FEATURE_SUMMARY_CACHE[cache_key] = record
+    return {**record, "drivers": list(drivers)}
+
+
+def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
+    return _read_signal_feature_record(summary_path)["drivers"]
 
 
 def _signal_row_key(row: Mapping[str, Any]) -> str:
@@ -858,6 +886,35 @@ def _signal_row_key(row: Mapping[str, Any]) -> str:
             return f"{session_date}|{market}|{symbol}|{signal_at}"
         return f"{session_date}|{market}|{symbol}"
     return ""
+
+
+def _committed_scoped_repair_superseded_signals(
+    state: Mapping[str, Any],
+) -> frozenset[tuple[str, str, str]]:
+    """Current read model hides only an explicitly committed failed attempt.
+
+    The original journal remains authoritative audit history. A candidate or
+    unrelated/newer signal cannot suppress another signal's observations.
+    """
+    identities = set()
+    for market, mode in (state.get("modes") or {}).items():
+        if not isinstance(mode, Mapping):
+            continue
+        proof = mode.get("opening_repair")
+        if not isinstance(proof, Mapping):
+            continue
+        original_id = str(proof.get("original_signal_id") or "")
+        committed_id = str(mode.get("signal_id") or "")
+        day = str(mode.get("session_date") or "")[:10]
+        if (proof.get("contract") == "never_filled_original_signal_append_only_minute_repair_v2"
+                and proof.get("simulation_only") is True
+                and proof.get("original_weights_preserved") is True
+                and mode.get("simulation_replay") is True
+                and original_id and day
+                and committed_id.startswith(original_id + ":minute-repair:")
+                and committed_id in (mode.get("processed_signal_ids") or ())):
+            identities.add((day, str(market), original_id))
+    return frozenset(identities)
 
 
 def _signal_feature_roots(
@@ -898,11 +955,15 @@ def _lookup_signal_feature_drivers(
         return output
     for row in rows:
         signal_id = str(row.get("signal_id") or "")
-        if not signal_id or signal_id in output:
+        if not signal_id:
             continue
         session_date = str(row.get("session_date") or "")[:10]
         market = str(row.get("market") or "")
         row_key = _signal_row_key(row)
+        if signal_id in output:
+            if row_key:
+                output.setdefault(row_key, output[signal_id])
+            continue
         candidates: list[Path] = []
         direct_path = _as_path(state_dir, row.get("signal_source_path"))
         if direct_path:
@@ -918,14 +979,28 @@ def _lookup_signal_feature_drivers(
         for candidate in candidates:
             if not candidate.is_file() or candidate.name != "summary.json":
                 continue
-            drivers = _read_signal_feature_drivers(candidate)
-            if drivers:
-                record = {"drivers": drivers}
+            record = _read_signal_feature_record(candidate)
+            if record["drivers"] or record.get("feature_proxy_publication_allowed") is False:
                 output[signal_id] = record
                 if row_key:
                     output.setdefault(row_key, record)
                 break
     return output
+
+
+def _signal_valuation_position(position: Mapping[str, Any]) -> dict[str, Any]:
+    """Reuse canonical accounting, exposing only the signal's valuation DTO."""
+    safe = _safe_position(position)
+    fields = (
+        "position_id", "market", "session_date", "symbol", "signal_id",
+        "filled_shares", "signed_shares", "entry_price", "entry_at",
+        "last_mark_price", "last_mark_quote_source", "last_quote_at", "last_complete_net_pnl_twd",
+        "realized_net_pnl_twd", "unrealized_net_pnl_twd", "total_net_pnl_twd",
+        "reconciled_total_net_pnl_twd", "net_pnl_twd", "valuation_stale",
+        "exit_price", "exit_at", "exit_exchange_at", "last_exit_price", "last_exit_at",
+    )
+    return {"contract": "signal_ledger_valuation_v1",
+            **{field: safe[field] for field in fields if field in safe}}
 
 
 def _signal_position_overlays(
@@ -962,6 +1037,7 @@ def _signal_position_overlays(
             str(completion.get("contract")),
             str(completion.get("recorded_at")),
             str(completion.get("broker_fill")),
+            _signal_valuation_position(position),
         ))
     encoded = json.dumps(material, separators=(",", ":")).encode("utf-8")
     return overlays, hashlib.sha256(encoded).hexdigest()
@@ -982,6 +1058,9 @@ def _overlay_signal_page_rows(
             str(row.get("signal_id") or ""),
         ))
         if isinstance(overlay, Mapping):
+            # A signal page must not rely on an independently paginated
+            # position page to establish whether this exact signal was filled.
+            row["position"] = _signal_valuation_position(overlay)
             current_filled = int(overlay.get("filled_shares") or 0)
             ledger_filled = int(row.get("filled_shares") or 0)
             if current_filled > ledger_filled:
@@ -1475,6 +1554,13 @@ def _write_recent_ledger_lines(
     return copied
 
 
+def _projected_ledger_schema(pl: Any, projected_schema: Mapping[str, str] | None) -> Any:
+    if projected_schema is None:
+        return None
+    types = {"bool": pl.Boolean, "float": pl.Float64, "int": pl.Int64, "string": pl.String}
+    return {field: types[kind] for field, kind in projected_schema.items()}
+
+
 def _columnar_ledger_frame(
     source: Path,
     *,
@@ -1508,17 +1594,7 @@ def _columnar_ledger_frame(
     except ImportError:
         return None
 
-    schema_types = {
-        "bool": pl.Boolean,
-        "float": pl.Float64,
-        "int": pl.Int64,
-        "string": pl.String,
-    }
-    schema = (
-        {field: schema_types[kind] for field, kind in projected_schema.items()}
-        if projected_schema is not None
-        else None
-    )
+    schema = _projected_ledger_schema(pl, projected_schema)
 
     def read_frame(source_stream: Any) -> Any:
         frame = pl.read_ndjson(
@@ -2332,6 +2408,11 @@ def _opening_signal_latency_summary(
 
     goal_ms = 1_000.0
     expected = sorted({str(value) for value in expected_markets if str(value)})
+    scheduled_ids = {
+        (str(row.get("session_date") or "")[:10], str(row.get("market") or ""), str(row["signal_id"]))
+        for row in rows
+        if row.get("source") == "discord_scheduled_signal" and row.get("status") == "ready" and row.get("signal_id")
+    }
     by_session: dict[str, dict[str, dict[str, Any]]] = {}
     failures_by_session: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -2344,12 +2425,35 @@ def _opening_signal_latency_summary(
             row_session = str(row.get("session_date") or "")[:10]
             if status != "ready":
                 if row_session:
+                    message = str(row.get("error_message") or "")
+                    reason_code = "opening_signal_attempt_failed"
+                    coverage = row.get("opening_input_coverage")
+                    if row.get("error_type") == "TWPublicSourceUpdatePending":
+                        reason_code = "tw_public_source_update_pending"
+                    elif row.get("error_type") == "TWTradingUniversePending":
+                        reason_code = "tw_official_trading_universe_pending"
+                    elif message.startswith("same-session TW model input coverage is not ready;"):
+                        reason_code = "tw_opening_input_coverage_pending"
+                        if not isinstance(coverage, Mapping):
+                            names = {"active": "active", "observed_opens": "opens", "observed_quotes": "responses", "required_inputs": "required", "observed_no_prints": "no_prints"}
+                            coverage = {public: int(value) for source, public in names.items()
+                                        if (match := re.search(r"\b" + source + r"=(\d+)\b", message))
+                                        and (value := match.group(1)) is not None}
+                    safe_coverage = {name: int(value) for name in ("active", "opens", "responses", "required", "no_prints", "official_trading_count")
+                                     if isinstance(coverage, Mapping)
+                                     and (value := coverage.get(name)) is not None
+                                     and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0}
+                    if isinstance(coverage, Mapping) and coverage.get("denominator_contract") == "official_current_trading_symbols_in_model_v1":
+                        safe_coverage["denominator_contract"] = coverage["denominator_contract"]
                     failures_by_session.setdefault(row_session, []).append(
                         {
                             "market": market,
                             "recorded_at": row.get("recorded_at"),
                             "error_type": row.get("error_type"),
                             "error_code": row.get("error_code"),
+                            "reason_code": reason_code,
+                            "failure_stage": row.get("failure_stage"),
+                            "opening_input_coverage": safe_coverage,
                         }
                     )
                 continue
@@ -2380,9 +2484,12 @@ def _opening_signal_latency_summary(
             if is_attempt and measured_ready_ms is not None
             else (ready - gate).total_seconds() * 1000.0
         )
-        # Exclude later manual/recovery runs from opening trend while retaining
-        # a five-minute window for explicitly recorded scheduled retries.
-        if queue_ms < -1_000.0 or queue_ms > 300_000.0 or ready_ms < 0.0:
+        # Scheduled recovery remains a real missed opening SLO, even after
+        # five minutes. Unrelated manual/replay samples keep their old window.
+        scheduled_signal_id = str(row.get("signal_id") or "")
+        scheduled_match = (row_session, market, scheduled_signal_id) in scheduled_ids
+        maximum_queue_ms = 15_600_000.0 if is_attempt or scheduled_match else 300_000.0
+        if queue_ms < -1_000.0 or queue_ms > maximum_queue_ms or ready_ms < 0.0:
             continue
         raw_stages = row.get("stages") or {}
         stages = {
@@ -2427,6 +2534,7 @@ def _opening_signal_latency_summary(
                 max(0.0, (ready - started).total_seconds() * 1000.0), 3
             ),
             "ready_from_0900_ms": round(ready_ms, 3),
+            "delayed_recovery": queue_ms > 300_000.0,
             "published_from_0900_ms": published_ms,
             "input_to_ledger_ms": _finite_float(row.get("input_to_ledger_ms")),
             "ready_to_ledger_ms": _finite_float(row.get("ready_to_ledger_ms")),
@@ -2528,6 +2636,11 @@ def _opening_signal_latency_summary(
         first_ready_ms = round(min(ready_values), 3) if ready_values else None
         final_ready_ms = round(max(ready_values), 3) if ready_values else None
         complete = bool(expected) and observed == expected
+        latest_failures: dict[str, dict[str, Any]] = {}
+        for failure in failures_by_session.get(day, ()):
+            market = str(failure["market"])
+            if market not in latest_failures or str(failure.get("recorded_at") or "") > str(latest_failures[market].get("recorded_at") or ""):
+                latest_failures[market] = failure
         trend.append(
             {
                 "session_date": day,
@@ -2538,6 +2651,7 @@ def _opening_signal_latency_summary(
                 "missing_markets": sorted(set(expected) - set(observed)),
                 "failure_count": len(failures_by_session.get(day, ())),
                 "failures": failures_by_session.get(day, ()),
+                "latest_failures": [latest_failures[market] for market in sorted(latest_failures)],
                 "first_ready_ms": first_ready_ms,
                 "final_ready_ms": final_ready_ms,
                 "ledger_observed_mode_count": len(ledger_markets),
@@ -2576,6 +2690,7 @@ def _opening_signal_latency_summary(
             "missing_markets": expected,
             "failure_count": 0,
             "failures": [],
+            "latest_failures": [],
             "first_ready_ms": None,
             "final_ready_ms": None,
             "ledger_observed_mode_count": 0,
@@ -2939,7 +3054,7 @@ def _history_session_projection_root(state_dir: Path) -> Path | None:
     if not root.is_dir():
         return None
     digest = hashlib.sha256(str(Path(state_dir).resolve()).encode("utf-8")).hexdigest()
-    return root / f"history-session-projection-v3-{digest}"
+    return root / f"history-session-projection-v{_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION}-{digest}"
 
 
 def _history_session_head(state_dir: Path) -> dict[str, Any] | None:
@@ -4951,6 +5066,10 @@ def _available_session_dates(
     return list(result)
 
 
+class DashboardSessionUnavailable(ValueError):
+    """Valid date selection with no retained session, not a service failure."""
+
+
 def _select_session_date(requested: str | None, available: list[str]) -> str:
     text = str(requested or "").strip()
     if text:
@@ -4959,10 +5078,10 @@ def _select_session_date(requested: str | None, available: list[str]) -> str:
         except ValueError as exc:
             raise ValueError(f"invalid dashboard session date: {text}") from exc
         if text not in available:
-            raise ValueError(f"dashboard session date is unavailable: {text}")
+            raise DashboardSessionUnavailable(f"dashboard session date is unavailable: {text}")
         return text
     if not available:
-        raise ValueError("dashboard has no available session dates")
+        raise DashboardSessionUnavailable("dashboard has no available session dates")
     return available[0]
 
 
@@ -4976,7 +5095,7 @@ def _select_session_range(
     """Resolve calendar boundaries over the actual retained trading sessions."""
 
     if not available:
-        raise ValueError("dashboard has no available session dates")
+        raise DashboardSessionUnavailable("dashboard has no available session dates")
     if session_date and not start_date and not end_date:
         selected_end = _select_session_date(session_date, available)
         selected_start = selected_end
@@ -5008,7 +5127,9 @@ def _all_json_objects(path: Path):
                 yield payload
 
 
-def _native_ledger_frame(path: Path) -> tuple[Any, Any] | None:
+def _native_ledger_frame(
+    path: Path, *, projected_schema: Mapping[str, str] | None = None,
+) -> tuple[Any, Any] | None:
     """Read a complete bounded ledger into a native columnar frame when safe."""
 
     source = Path(path)
@@ -5022,9 +5143,14 @@ def _native_ledger_frame(path: Path) -> tuple[Any, Any] | None:
         import polars as pl
 
         try:
+            # A valid optional field first appearing after row 1000 does not
+            # raise a parser error: bounded inference silently drops it. Chart
+            # readers therefore use their explicit financial/provenance schema.
+            schema = _projected_ledger_schema(pl, projected_schema)
             frame = pl.read_ndjson(
                 source,
-                infer_schema_length=1_000,
+                schema=schema,
+                infer_schema_length=None if schema is not None else 1_000,
                 rechunk=False,
             )
         except Exception:
@@ -5034,6 +5160,7 @@ def _native_ledger_frame(path: Path) -> tuple[Any, Any] | None:
             # thousands of Python ``json.loads`` calls.
             frame = pl.read_ndjson(
                 source,
+                schema=_projected_ledger_schema(pl, projected_schema),
                 infer_schema_length=None,
                 rechunk=False,
             )
@@ -5626,7 +5753,7 @@ def build_dashboard_history_snapshot(
     def add_complete_ledger(path: Path, *, series_type: str) -> None:
         """Project a full ledger positionally before entering Python."""
 
-        native = _native_ledger_frame(path)
+        native = _native_ledger_frame(path, projected_schema=_HISTORY_MARK_COLUMN_TYPES)
         if native is None:
             for source in _all_json_objects(path) or ():
                 add(source, series_type=series_type)
@@ -5649,6 +5776,7 @@ def build_dashboard_history_snapshot(
             selected_sessions,
             None,
             recorded_at_fallback=marks_recorded_at_fallback,
+            projected_schema=_HISTORY_MARK_COLUMN_TYPES,
         )
         for session_date in selected_sessions:
             for row in strategy_rows.get(session_date, ()):
@@ -6700,6 +6828,7 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "last_mark_at",
         "last_quote_at",
         "last_mark_price",
+        "last_mark_quote_source",
         "last_complete_net_pnl_twd",
         "total_net_pnl_twd",
         "realized_net_pnl_twd",
@@ -7693,6 +7822,8 @@ def build_dashboard_snapshot(
     )
     latency = _latency_summary(latency_rows)
     today_session_date = local_observed.date().isoformat()
+    from stockagent.data.tw_current_trading_universe import public_current_universe
+    current_trading_universe = public_current_universe(today_session_date)
     today_latency_rows = (
         latency_rows
         if selected_session_date == today_session_date
@@ -7947,6 +8078,15 @@ def build_dashboard_snapshot(
         observed=selected_observed,
         session_date=selected_session_date,
     )
+    published_models = {row["market"]: row for row in opening_signal_latency.get("modes", ())}
+    for mode in modes:
+        published = published_models.get(str(mode.get("market") or ""))
+        if published is not None:
+            mode["model_signal_ready_at"] = published.get("ready_at")
+            mode["model_signal_status"] = (
+                "engine_registered" if mode.get("signal_id") == published.get("signal_id")
+                else "published_waiting_engine"
+            )
     for mode in modes:
         committed_mode = (state.get("modes") or {}).get(mode["market"], {})
         same_session_state = bool(
@@ -8127,6 +8267,7 @@ def build_dashboard_snapshot(
         "latency": latency,
         "today_latency": today_latency,
         "opening_signal_latency": opening_signal_latency,
+        "current_trading_universe": current_trading_universe,
         "session_progress": session_progress,
         "modes": modes,
         "benchmarks": benchmarks,
@@ -8368,6 +8509,40 @@ def _summarize_columnar_signals(
     return direction_summary, audit
 
 
+def _detail_query_lock(name: str, arguments: Mapping[str, Any]) -> Any:
+    key = (name, Path(arguments["state_dir"]).resolve(), *(
+        arguments.get(field, default) for field, default in (
+            ("session_date", None), ("start_date", None), ("end_date", None),
+            ("mode", ""), ("symbol", ""), ("status", "all"),
+            ("offset", 0), ("limit", 250), ("maximum_scan_rows", 100_000),
+        )
+    ))
+    with _DETAIL_QUERY_LOCKS_GUARD:
+        lock = _DETAIL_QUERY_LOCKS.get(key)
+        if lock is None:
+            # Recursive narrow-projection fallback shares the same query key.
+            lock = threading.RLock()
+            _DETAIL_QUERY_LOCKS[key] = lock
+        return lock
+
+
+def _singleflight_detail_page(builder):
+    """Let identical cold queries reuse one build; other queries stay parallel."""
+    @wraps(builder)
+    def wrapped(**arguments):
+        lock = _detail_query_lock(builder.__name__, arguments)
+        started = time.perf_counter()
+        with lock:
+            timing = arguments.get("timing_ms")
+            if isinstance(timing, dict):
+                timing["query_singleflight_wait"] = round((time.perf_counter() - started) * 1000, 3)
+            # Re-enter with current source/state and the builder's existing
+            # cache validation, rather than return a stale shared payload.
+            return builder(**arguments)
+    return wrapped
+
+
+@_singleflight_detail_page
 def build_dashboard_signal_page(
     *,
     state_dir: Path,
@@ -8400,6 +8575,7 @@ def build_dashboard_signal_page(
         raise ValueError("limit must be between 1 and 1000")
     root = Path(state_dir)
     state = _object(root / "state.json")
+    superseded_signals = _committed_scoped_repair_superseded_signals(state)
     configured_markets = state.get("enabled_markets")
     enabled_markets = (
         frozenset(str(market) for market in configured_markets)
@@ -8413,6 +8589,7 @@ def build_dashboard_signal_page(
                 str(raw_mode.get("session_date") or ""),
                 str(raw_mode.get("initial_capital_twd") or ""),
                 str(raw_mode.get("signal_source_path") or ""),
+                str(raw_mode.get("target_symbol_count") or ""),
             )
             for market, raw_mode in (state.get("modes") or {}).items()
             if isinstance(raw_mode, Mapping)
@@ -8512,7 +8689,9 @@ def build_dashboard_signal_page(
         int(maximum_scan_rows),
         tuple(sorted(enabled_markets)) if enabled_markets is not None else None,
         state_signal_signature,
-        int(state.get("dashboard_content_revision") or 0),
+        tuple(sorted(superseded_signals)),
+        # Quote-only revisions are handled by the exact position overlay below.
+        # They must not rebuild the complete immutable signal-history query.
         futures_catalog.revision,
     )
     observed_monotonic = time.monotonic()
@@ -8774,6 +8953,9 @@ def build_dashboard_signal_page(
     mark_stage("source_projection")
 
     def included(row: Mapping[str, Any]) -> bool:
+        if (str(row.get("session_date") or "")[:10], str(row.get("market") or ""),
+                str(row.get("signal_id") or "")) in superseded_signals:
+            return False
         if (
             enabled_markets is not None
             and str(row.get("market") or "") not in enabled_markets
@@ -8815,6 +8997,12 @@ def build_dashboard_signal_page(
     else:
         pl = polars_module
         predicate = pl.lit(True)
+        for repaired_day, repaired_market, original_id in sorted(superseded_signals):
+            predicate &= ~(
+                (pl.col("session_date").fill_null("") == repaired_day)
+                & (pl.col("market").fill_null("") == repaired_market)
+                & (pl.col("signal_id").fill_null("") == original_id)
+            )
         if enabled_markets is not None:
             predicate &= pl.col("market").fill_null("").is_in(
                 sorted(enabled_markets)
@@ -9317,6 +9505,7 @@ def build_dashboard_position_page(
     }
 
 
+@_singleflight_detail_page
 def build_dashboard_event_page(
     *,
     state_dir: Path,
@@ -9901,6 +10090,7 @@ def build_dashboard_summary(
         "latency",
         "today_latency",
         "opening_signal_latency",
+        "current_trading_universe",
         "session_progress",
         "modes",
         "record_counts",
@@ -9913,7 +10103,21 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
     """Persist compact byte indexes for reboot-fast historical date reads."""
 
     root = Path(state_dir)
-    benchmark_history = _benchmark_history_index(root)
+    # The accepted head already is the session/date catalog. Warming dates
+    # must not eagerly retain every historical benchmark row when chart reads
+    # already use verified per-session projections. Do not publish this empty
+    # selection into the full-row cache: real reads still verify selected
+    # shards, or use the unchanged canonical fallback when the head is stale.
+    benchmark_catalog = load_benchmark_projection(
+        state_dir=root,
+        source_path=root / BENCHMARK_HISTORY_FILENAME,
+        selected_sessions=(),
+    )
+    benchmark_session_count = (
+        len(benchmark_catalog.session_entries)
+        if benchmark_catalog is not None
+        else len(_benchmark_history_index(root).marks_by_session)
+    )
     sources = (
         ("signals.jsonl", False),
         ("orders.jsonl", False),
@@ -9926,7 +10130,7 @@ def warm_dashboard_session_indexes(*, state_dir: Path) -> dict[str, int]:
         ("latency.jsonl", True),
     )
     indexed: dict[str, int] = {}
-    indexed[BENCHMARK_HISTORY_FILENAME] = len(benchmark_history.marks_by_session)
+    indexed[BENCHMARK_HISTORY_FILENAME] = benchmark_session_count
     indexed["position_history"] = len(_position_history_index(root).entries)
     for filename, recorded_at_fallback in sources:
         index = _ledger_session_index(

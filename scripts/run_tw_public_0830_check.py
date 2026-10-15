@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, TextIO
 from zoneinfo import ZoneInfo
 
 
@@ -31,6 +31,9 @@ if str(REPO_ROOT) not in sys.path:
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
 from scripts.check_tw_day_trade_preopen_readiness import _session_contract  # noqa: E402
 from stockagent.data.tw_public_features import _release_feature_content_receipt  # noqa: E402
+from stockagent.data.tw_public_source_receipts import (  # noqa: E402
+    DERIVED_INPUT_RECEIPTS,
+)
 from scripts.watch_tw_public_publication_group import (  # noqa: E402
     _latest_completed_taiex_session,
     _preopen_acceptance_errors,
@@ -45,6 +48,18 @@ from stockagent.live.tw_public_opening_revision import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def _downgrade_refresh_lock_for_audit(lock_handle: TextIO) -> None:
+    """Fence completed writes while allowing concurrent live panel readers.
+
+    The audit only reads canonical inputs and writes cache/report artifacts.
+    A shared lease still excludes source writers. Lock conversion can yield to
+    a waiting writer, so callers revalidate derived dependencies after it and
+    retain the final exclusive revision/receipt fence before acceptance.
+    """
+
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
 
 
 def parse_args() -> argparse.Namespace:
@@ -809,21 +824,14 @@ def _derived_data_status(
         _receipt_dependency_errors(
             reference_summary_path,
             live_root=live_root,
-            keys=("source_receipts",),
+            keys=DERIVED_INPUT_RECEIPTS["corporate_action_reference"][1],
         )
     )
     errors["stock_panel"].extend(
         _receipt_dependency_errors(
             stock_summary_path,
             live_root=live_root,
-            keys=(
-                "source_receipts",
-                "fallback_source_receipts",
-                "legacy_source_receipts",
-                "lifecycle_source_receipts",
-                "session_calendar_receipt",
-                "session_calendar_summary_receipt",
-            ),
+            keys=DERIVED_INPUT_RECEIPTS["stock_panel"][1],
         )
     )
     # The complete entitlement ledger is a derived historical projection, not
@@ -849,14 +857,14 @@ def _derived_data_status(
         _receipt_dependency_errors(
             entitlement_summary_path,
             live_root=live_root,
-            keys=("reference_receipt", "universe_receipt", "raw_receipt_manifest"),
+            keys=DERIVED_INPUT_RECEIPTS["corporate_action_entitlements"][1],
         )
     )
     errors["public_features"].extend(
         _receipt_dependency_errors(
             feature_summary_path,
             live_root=live_root,
-            keys=("source_receipts",),
+            keys=DERIVED_INPUT_RECEIPTS["public_features"][1],
         )
     )
     return {
@@ -1198,6 +1206,9 @@ def main() -> int:
                         f"derived_data:{step_name} failed rc={completed.returncode}"
                     )
                     break
+            _downgrade_refresh_lock_for_audit(lock_handle)
+            steps.append({"step": "source_read_lease", "status": "ok", "mode": "shared"})
+            print("[tw-public-0830] source phase=read_only_audit lock=shared", flush=True)
             derived_status_after = _derived_data_status(
                 live_root,
                 expected_latest=expected_latest,

@@ -141,6 +141,8 @@ def test_parquet_keeps_native_bytes_duplicates_and_receipt_history(tmp_path):
     first = store(kbars() * 2)
     assert first['rows'] == 2 and first['source_bytes_preserved']
     assert first['volume_units']['stock_share_unit_status'] == 'mixed_market_lots_or_shares_preserved'
+    assert first['volume_units']['documented_share_multipliers_by_market'] == {'twse': 1000, 'tpex': 1000, 'emerging': 1}
+    assert first['volume_units']['requires_same_symbol_dated_market_evidence']
     store(kbars())
     assert len(list((tmp_path / 'receipt_history').rglob('*.json'))) == 1
     assert (tmp_path / first['parquet_path']).is_file()
@@ -237,7 +239,7 @@ def test_broker_derivation_reads_whole_market_objects_without_per_id_validation(
         'endpoint': 'storage_objects', 'transfer_and_validation_seconds': 2})
     derived, metadata = worker._derive_broker_aggregate(tmp_path, worker.Task(
         'TaiwanStockTradingDailyReportSecIdAgg', '', DAY, 'derived', 7, 'pending'))
-    assert {row['stock_id'] for row in derived} == {'2330', '2317'}
+    assert {row['stock_id'] for row in derived.to_pylist()} == {'2330', '2317'}
     assert metadata['request_count'] == 0
     assert metadata['local_derivation_seconds'] > 0
 
@@ -250,9 +252,25 @@ def test_broker_transfer_cost_requires_and_includes_zero_call_aggregate(tmp_path
                      (dataset, DAY, 2., 100, 10, NOW.isoformat()))
         stats = objects.transfer_statistics(conn)[dataset]
         assert stats['dependent_processing_unknown'] is True
-        conn.execute('INSERT INTO finmind_object_derivation_samples VALUES (1,?,?,?,?)',
+        conn.execute('INSERT INTO finmind_object_derivation_samples (id,dataset,partition,seconds,observed_at_utc) VALUES (1,?,?,?,?)',
                      (dataset, DAY, 20., NOW.isoformat()))
         stats = objects.transfer_statistics(conn)[dataset]
         assert stats['dependent_processing_unknown'] is False
         assert stats['median_seconds'] == 22.
         assert stats['dependent_processing_samples'] == 1
+
+
+def test_broker_new_engine_cost_does_not_mix_obsolete_slow_engine(tmp_path):
+    dataset = 'TaiwanStockTradingDailyReport'
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        objects.configure(conn, {'tier': 'SponsorPro'}, NOW)
+        conn.execute('INSERT INTO finmind_object_transfer_samples VALUES (1,?,?,?,?,?,?)',
+                     (dataset, DAY, 2., 100, 10, NOW.isoformat()))
+        conn.executemany('INSERT INTO finmind_object_derivation_samples '
+                         '(dataset,partition,seconds,observed_at_utc,engine) VALUES (?,?,?,?,?)',
+                         [(dataset, DAY, 40., NOW.isoformat(), None),
+                          (dataset, DAY, 15., NOW.isoformat(), 'arrow_decimal128_exact')])
+        stats = objects.transfer_statistics(conn)[dataset]
+        assert stats['median_seconds'] == 17.
+        assert stats['dependent_processing_samples'] == 1
+        assert stats['processing_engine'] == 'arrow_decimal128_exact'

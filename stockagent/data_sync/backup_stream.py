@@ -41,7 +41,7 @@ def file_key(row: dict) -> str:
 
 
 def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: Path | None = None,
-                    *, include_unreferenced_objects: bool = False) -> dict:
+                    *, include_unreferenced_objects: bool = False, testing_disposition: Path | None = None) -> dict:
     """Fixed metadata inventory, with per-release missing-object diagnostics.
 
     Missing historical objects do not erase a historical manifest or obstruct
@@ -57,7 +57,14 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
     excluded_manifests = []
     metadata = {}
     all_referenced_objects = set()
+    retained_referenced_objects = set()
     orphan_scan_blocked = False
+    from stockagent.data_sync.testing_disposition import DEFAULT_POLICY, load_policy, manifest_discarded
+    disposition_path = testing_disposition or DEFAULT_POLICY
+    disposition = load_policy(disposition_path) if disposition_path.exists() else None
+    discarded_testing_releases = []
+    discarded_testing_metadata = {}
+    discarded_testing_objects = set()
 
     def add_metadata(path: Path) -> tuple[bytes, dict]:
         relative = path.relative_to(cold).as_posix()
@@ -71,6 +78,29 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
         rows[relative] = row
         return raw, row
 
+    def observe_manifest(path: Path) -> bool:
+        if path.parent.parent != cold / "manifests":
+            raise SnapshotError("head references a non-manifest path")
+        relative = path.relative_to(cold).as_posix()
+        raw, row = add_metadata(path)
+        manifest = json.loads(raw)
+        _validate_manifest(manifest)
+        if manifest["dataset"] != path.parent.name or manifest["snapshot_id"] != path.stem:
+            raise SnapshotError("retained manifest path identity differs")
+        refs = [manifest["archive"]["inventory"], *manifest["archive"]["objects"]]
+        all_referenced_objects.update(r["relpath"] for r in refs)
+        if disposition and manifest_discarded(manifest, disposition):
+            if not any(r["manifest_relative"] == relative for r in discarded_testing_releases):
+                discarded_testing_releases.append({"dataset": manifest["dataset"], "snapshot_id": manifest["snapshot_id"],
+                    "manifest_relative": relative, "manifest_sha256": row["sha256"],
+                    "policy_identity_sha256": disposition["identity_sha256"], "recovery_claimed": False})
+            discarded_testing_objects.update(r["relpath"] for r in refs)
+            discarded_testing_metadata[relative] = (manifest, row)
+            return False
+        retained_referenced_objects.update(r["relpath"] for r in refs)
+        metadata[relative] = (manifest, row)
+        return True
+
     for path in sorted((cold / "manifests").glob("*/*.json")):
         relative = path.relative_to(cold).as_posix()
         if path.parent.name in excluded:
@@ -81,19 +111,14 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
                     _validate_manifest(manifest)
                     all_referenced_objects.update(r["relpath"] for r in [
                         manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
+                    retained_referenced_objects.update(r["relpath"] for r in [
+                        manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
                 except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
                     orphan_scan_blocked = True
                     errors.append({"relative": relative, "reason": type(error).__name__})
             continue
         try:
-            raw, row = add_metadata(path)
-            manifest = json.loads(raw)
-            _validate_manifest(manifest)
-            if manifest["dataset"] != path.parent.name or manifest["snapshot_id"] != path.stem:
-                raise SnapshotError("retained manifest path identity differs")
-            all_referenced_objects.update(r["relpath"] for r in [
-                manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
-            metadata[relative] = (manifest, row)
+            observe_manifest(path)
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
             rows.pop(relative, None)
             errors.append({"relative": relative, "reason": type(error).__name__})
@@ -104,13 +129,22 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
         try:
             raw, row = add_metadata(path)
             head = json.loads(raw)
-            manifest, manifest_row = metadata[head["manifest_relpath"]]
+            if head.get("manifest_relpath") not in metadata and head.get("manifest_relpath") not in discarded_testing_metadata:
+                # A publisher may commit a new immutable manifest after our
+                # first scan and before the head scan. Capture those actual
+                # fixed bytes and validate the same head SHA, without guessing
+                # completeness or blocking unrelated publishers.
+                observe_manifest(safe_path(cold, head["manifest_relpath"]))
+            manifest, manifest_row = (metadata[head["manifest_relpath"]] if head["manifest_relpath"] in metadata
+                                      else discarded_testing_metadata[head["manifest_relpath"]])
             if (head["schema_version"] != PACKED_HEAD_SCHEMA_VERSION
                     or head["dataset"] != path.parent.name or head["node_id"] != path.stem
                     or ".sync-conflict-" in path.name or head["manifest_sha256"] != manifest_row["sha256"]
                     or head["snapshot_id"] != manifest["snapshot_id"] or head["hlc"] != manifest["hlc"]
                     or head["node_id"] != manifest["publisher"]["node_id"]):
                 raise SnapshotError("current head does not match its fixed retained manifest")
+            if head["manifest_relpath"] in discarded_testing_metadata:
+                continue
             head_snapshots.add((manifest["dataset"], manifest["snapshot_id"]))
             row["captured_bytes_utf8"] = raw.decode("utf-8")
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
@@ -126,12 +160,17 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
         try:
             raw, row = add_metadata(path)
             head = json.loads(raw)
-            manifest, manifest_row = metadata[head["manifest_relpath"]]
+            if head.get("manifest_relpath") not in metadata and head.get("manifest_relpath") not in discarded_testing_metadata:
+                observe_manifest(safe_path(cold, head["manifest_relpath"]))
+            manifest, manifest_row = (metadata[head["manifest_relpath"]] if head["manifest_relpath"] in metadata
+                                      else discarded_testing_metadata[head["manifest_relpath"]])
             if (head["schema_version"] != PACKED_HEAD_SCHEMA_VERSION or head["dataset"] != dataset
                     or head["node_id"] != node or path.stem != row["sha256"]
                     or head["manifest_sha256"] != manifest_row["sha256"]
                     or head["snapshot_id"] != manifest["snapshot_id"] or head["hlc"] != manifest["hlc"]):
                 raise SnapshotError("historical head does not match its fixed manifest")
+            if head["manifest_relpath"] in discarded_testing_metadata:
+                continue
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
             rows.pop(relative, None)
             errors.append({"relative": relative, "reason": type(error).__name__})
@@ -202,6 +241,10 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
             "scope": "all observed retained canonical manifests; current heads prioritized"}
     from stockagent.data_sync.backup_history import apply_disposition
     body = apply_disposition(body, history_disposition)
+    if disposition:
+        body["discarded_testing_releases"] = discarded_testing_releases
+        body["discarded_testing_objects"] = sorted(discarded_testing_objects - retained_referenced_objects)
+        body["testing_disposition_identity_sha256"] = disposition["identity_sha256"]
     # Filesystem signatures pin this execution, but are not content identity.
     content = {**body, "files": [{k: v for k, v in r.items() if k != "signature"} for r in body["files"]]}
     return {**body, "identity_sha256": identity_sha256(content),
@@ -492,6 +535,25 @@ class BackupStream:
                     "pending": bool(ledger.get("auxiliary_pending")), "source_or_staging_deleted": False}
 
     def transport_usage(self) -> dict:
+        # GC can rename/unlink an accepted wave while this read-only inventory
+        # traverses it. Restart the complete scan; skipping vanished entries
+        # could undercount a wave merely moved to another retained directory.
+        authority = self.transport.stat()
+        for _ in range(3):
+            try:
+                usage = self._transport_usage_once()
+            except FileNotFoundError as error:
+                after = self.transport.stat()
+                if (authority.st_dev, authority.st_ino) != (after.st_dev, after.st_ino):
+                    raise SnapshotError("transport authority changed during capacity inventory") from error
+                continue
+            after = self.transport.stat()
+            if (authority.st_dev, authority.st_ino) != (after.st_dev, after.st_ino):
+                raise SnapshotError("transport authority changed during capacity inventory")
+            return usage
+        raise SnapshotError("transport changed repeatedly during capacity inventory; retry cycle")
+
+    def _transport_usage_once(self) -> dict:
         # Include old pilots, orphaned failed copies and quarantined staging.
         # Journal counters alone would miss those retained physical bytes.
         total = staging = 0
@@ -580,11 +642,15 @@ class BackupStream:
                 "retired_deliveries": 0, "retired_logical_bytes": 0, "errors": [],
                 "deferred": bool(receipt_errors) or not publish}
             auxiliary_error = None
+            auxiliary_error_detail = None
             if self.config.get("auxiliary"):
                 try:
                     self.stage_auxiliary(ledger)
                 except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
                     auxiliary_error = type(error).__name__
+                    auxiliary_error_detail = {"error_type": auxiliary_error}
+                    if isinstance(error, SnapshotError):
+                        auxiliary_error_detail["reason"] = str(error)[:512]
             catalog = capture_catalog(self.backup_read_root(), Path(self.config["publication_catalog"]),
                                       Path(self.config["history_disposition"]) if self.config.get("history_disposition") else None,
                                       include_unreferenced_objects=self.config.get("include_unreferenced_cold_objects", False))
@@ -709,11 +775,24 @@ class BackupStream:
                     scans.append(scanner.submit(self.scan_transport, one))
                     published_waves.append(key)
                     state = "published_waiting_nas_receipt"
-                for future in scans:
-                    try:
-                        future.result()
-                    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-                        scan_errors.append(type(error).__name__)
+                # Published waves and their dispatches are already durable.
+                # A Syncthing scan can wait minutes; it owns no ledger mutation
+                # and must not block another producer's immutable publication.
+                private_json(self.ledger_path, ledger)
+                fcntl.flock(owner, fcntl.LOCK_UN)
+                try:
+                    for future in scans:
+                        try:
+                            future.result()
+                        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                            scan_errors.append(type(error).__name__)
+                finally:
+                    fcntl.flock(owner, fcntl.LOCK_EX)
+                    # Other owners can commit while scans wait. Reload before
+                    # any recovery/write so their deliveries are never lost.
+                    ledger = self.load_ledger()
+                    retries = ledger.setdefault("export_retries", {})
+                    receipt_errors.extend(self.ingest(ledger))
             if published_waves:
                 state = "published_waiting_nas_receipt"
             self.recover_publications(ledger)
@@ -725,6 +804,7 @@ class BackupStream:
                 **{k: v for k, v in covered.items() if not k.endswith("file_keys")},
                 "receipt_errors": receipt_errors, "readiness_error": readiness_error,
                 "auxiliary_error": auxiliary_error,
+                "auxiliary_error_detail": auxiliary_error_detail,
                 "pipeline": {"published_waves": published_waves, "export_errors": export_errors,
                     "scan_errors": scan_errors, "deferred_files": sum(
                         item["next_attempt_epoch"] > time.time() for item in retries.values()),
@@ -863,10 +943,10 @@ class BackupStream:
                     "sub": delivery["dispatch"]["batch_relative"]}, method="POST", timeout=timeout)
 
     def publish_closed(self, ledger: dict, rows: list[dict], staging: Path, envelope_id: str,
-                       catalog_identity: str, kind: str) -> None:
+                       catalog_identity: str, kind: str, *, native_windows_io: bool = False) -> None:
         from scripts.verify_backup_delivery import verify
         verified = verify(staging, envelope_id, include_file_signatures=kind == "incremental_cold_objects",
-                          workers=self.pipeline.get("verify_workers", 1))
+                          workers=self.pipeline.get("verify_workers", 1), native_windows_io=native_windows_io)
         batch = self.transport / ("batch-" + envelope_id)
         if batch.exists():
             raise SnapshotError("unrecorded existing batch needs explicit recovery")

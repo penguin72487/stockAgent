@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from stockagent.training.day_trade_carry_bridge import bind_physical_carry_loss
+from stockagent.training.day_trade_carry_bridge import PreparedDayTradeCarrySource, PreparedDayTradeCarryBatch
 from test_day_trade_carry_training import fixture, Policy, train_epoch
 from test_crypto_trajectory_optimizer import _LOSS_OPTIONS
 from stockagent.config import load_config
@@ -59,6 +60,37 @@ def test_annual_accounts_match_independent_year_losses(batch_size):
     assert timing.optimizer_steps == 1
     if batch_size == 5:
         torch.testing.assert_close(model.action.grad, expected_grad, rtol=1e-5, atol=1e-8)
+
+
+def test_annual_batch_decodes_once_and_never_allocates_unused_parent_tape(monkeypatch):
+    split, runtime, loss_fn = annual_fixture()
+    model = Policy()
+    expected = independent_year_reference(split, runtime, loss_fn, model)
+    expected.backward()
+    expected_grad = model.action.grad.clone()
+    model.zero_grad()
+    decoded = []
+    moved = []
+    original_prepare = PreparedDayTradeCarrySource.prepare_batch
+    original_sessions = PreparedDayTradeCarryBatch.sessions
+
+    def prepare(self, split, start, end, **kwargs):
+        decoded.append((start, end))
+        return original_prepare(self, split, start, end, **kwargs)
+
+    def sessions(self, device, **kwargs):
+        moved.append(self.count)
+        return original_sessions(self, device, **kwargs)
+
+    monkeypatch.setattr(PreparedDayTradeCarrySource, "prepare_batch", prepare)
+    monkeypatch.setattr(PreparedDayTradeCarryBatch, "sessions", sessions)
+    actual, timing = train_epoch(split, runtime, loss_fn, model,
+                                 batch_size=5, optimizer_step_per_trajectory=True)
+    assert decoded == [(0, 5)]
+    assert moved == [2, 3]
+    assert timing.optimizer_steps == 1
+    torch.testing.assert_close(actual.double(), expected.double(), rtol=1e-6, atol=1e-8)
+    torch.testing.assert_close(model.action.grad, expected_grad, rtol=1e-5, atol=1e-8)
 
 
 def test_annual_boundary_refuses_to_discard_carried_inventory():

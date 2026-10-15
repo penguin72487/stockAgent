@@ -807,7 +807,7 @@ def test_l1_sec_unknown_physical_proof_falls_back_to_true(
 ) -> None:
     _publish_tasks(tmp_path, ["aa", "bb"], endpoint=compactor.SCHEMA_GROUPED_ENDPOINT)
     original_identities = compactor.schema_identities
-    monkeypatch.setattr(compactor, "schema_identities", lambda pf: (original_identities(pf)[0], None))
+    monkeypatch.setattr(compactor, "schema_identities", lambda pf, **kwargs: (original_identities(pf, **kwargs)[0], None))
     assert run(_sec_grouped_args(tmp_path)) == 0
     assert _sec_action(tmp_path) == "rebuilt"
 
@@ -941,8 +941,8 @@ def test_l1_sec_grouping_policy_invalidates_reuse(
     else:
         original = compactor.schema_identities
 
-        def changed_identity(parquet_file):
-            arrow, physical = original(parquet_file)
+        def changed_identity(parquet_file, **kwargs):
+            arrow, physical = original(parquet_file, **kwargs)
             return arrow, "new:" + physical
 
         monkeypatch.setattr(compactor, "schema_identities", changed_identity)
@@ -1064,7 +1064,7 @@ def test_l1_sec_unknown_proof_fallback_still_fences_nonfirst_source(
     args = _sec_grouped_args(tmp_path)
     assert run(args) == 0
     original_identities = compactor.schema_identities
-    monkeypatch.setattr(compactor, "schema_identities", lambda pf: (original_identities(pf)[0], None))
+    monkeypatch.setattr(compactor, "schema_identities", lambda pf, **kwargs: (original_identities(pf, **kwargs)[0], None))
     original = compactor._schema_grouped_view
     target = _sec_segment_paths(tmp_path)[-1]
     old_database = (tmp_path / "openbb_l1.duckdb").read_bytes()
@@ -1131,8 +1131,9 @@ def test_unassigned_source_fast_path_preserves_global_task_order(
         connection.close()
 
 
+@pytest.mark.parametrize("limit", (2, 8192, 8193, 20_000, 32_768))
 def test_covering_compaction_task_index_preserves_global_order(
-    tmp_path: Path,
+    tmp_path: Path, limit: int,
 ) -> None:
     _publish_tasks(tmp_path, ["cc", "bb", "aa"])
     state_path = tmp_path / "_state" / "openbb_archive.sqlite3"
@@ -1144,7 +1145,7 @@ def test_covering_compaction_task_index_preserves_global_order(
     connection = _open_manifest(state_path)
     try:
         baseline = _load_unassigned_shards(
-            connection, (), limit=2, show_progress=False
+            connection, (), limit=limit, show_progress=False
         )
         connection.execute(
             f"CREATE INDEX {TASK_COMPACTION_INDEX} "
@@ -1153,10 +1154,11 @@ def test_covering_compaction_task_index_preserves_global_order(
         )
         timing: dict[str, float] = {}
         indexed = _load_unassigned_shards(
-            connection, (), limit=2, show_progress=False, timing=timing
+            connection, (), limit=limit, show_progress=False, timing=timing
         )
-        assert [row.task_id for row in indexed] == [row.task_id for row in baseline]
-        assert [row.task_id for row in indexed] == ["aa", "bb"]
+        # Keep every field of the real footer proof, not just the identifiers.
+        assert indexed == baseline
+        assert [row.task_id for row in indexed] == ["aa", "bb", "cc"][:limit]
         assert "unassigned_source_index_order" in timing
         assert "unassigned_source_endpoint_sort" not in timing
         selection_plan = connection.execute(
@@ -1165,7 +1167,7 @@ def test_covering_compaction_task_index_preserves_global_order(
             "LEFT JOIN l1_compaction_members AS m ON m.task_id=t.task_id "
             "WHERE t.active=1 AND t.plan_token=? AND t.status='success' "
             "AND m.task_id IS NULL ORDER BY t.endpoint, t.task_id LIMIT ?",
-            ("test-plan", 2),
+            ("test-plan", limit),
         ).fetchall()
         assert not any("TEMP B-TREE" in str(row[3]) for row in selection_plan)
         count_plan = connection.execute(
@@ -1176,6 +1178,44 @@ def test_covering_compaction_task_index_preserves_global_order(
             ("test-plan",),
         ).fetchall()
         assert any("COVERING INDEX" in str(row[3]) for row in count_plan)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("fallback", ("zero", "over_limit", "filtered", "no_plan", "no_index"))
+def test_covering_compaction_task_index_retains_fallback_boundaries(
+    tmp_path: Path, fallback: str,
+) -> None:
+    _publish_tasks(tmp_path, ["cc", "bb", "aa"])
+    connection = _open_manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    try:
+        limit = 0 if fallback == "zero" else 32_769 if fallback == "over_limit" else 32_768
+        filters = (ENDPOINT,) if fallback == "filtered" else ()
+        if fallback == "no_plan":
+            connection.execute("DELETE FROM archive_meta WHERE key='active_plan_token'")
+        if fallback == "no_index":
+            connection.execute(f"DROP INDEX {TASK_COMPACTION_INDEX}")
+        timing: dict[str, float] = {}
+        result = _load_unassigned_shards(
+            connection, filters, limit=limit, show_progress=False, timing=timing
+        )
+        assert [row.task_id for row in result] == ([] if fallback == "zero" else ["aa", "bb", "cc"])
+        assert "unassigned_source_global_fallback" in timing
+        assert "unassigned_source_index_order" not in timing
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("limit", (8193, 32_768))
+def test_covering_compaction_large_batch_keeps_source_row_validation(
+    tmp_path: Path, limit: int,
+) -> None:
+    _publish_tasks(tmp_path, ["aa"])
+    connection = _open_manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    try:
+        connection.execute("UPDATE tasks SET rows=2 WHERE task_id='aa'")
+        with pytest.raises(RuntimeError, match="successful source shard row mismatch"):
+            _load_unassigned_shards(connection, (), limit=limit, show_progress=False)
     finally:
         connection.close()
 

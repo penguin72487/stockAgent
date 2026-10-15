@@ -24,9 +24,47 @@ from scripts import watch_tw_public_publication_group as publication
 from scripts import watch_tw_public_source_events as source_events
 from stockagent.live import tw_public_opening_revision as opening_revision
 from stockagent.live.market_status import TwStockDayDecision
+from stockagent.live.tw_public_source_guard import (
+    TWPublicSourceUpdatePending,
+    live_tw_public_source_read_guard,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_0830_audit_read_lease_allows_live_readers_but_excludes_writers(tmp_path: Path) -> None:
+    live_root = tmp_path / "data_tw_public"
+    stocks = live_root / "stocks"
+    stocks.mkdir(parents=True)
+    (live_root / "tw_corporate_action_reference.parquet").touch()
+    lock_path = tmp_path / ".locks" / "tw-public-refresh.lock"
+    lock_path.parent.mkdir()
+    with lock_path.open("a+", encoding="utf-8") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        with pytest.raises(TWPublicSourceUpdatePending):
+            with live_tw_public_source_read_guard(stocks):
+                pytest.fail("derived writes must remain exclusive")
+        run_tw_public_0830_check._downgrade_refresh_lock_for_audit(owner)
+        with live_tw_public_source_read_guard(stocks):
+            with lock_path.open("a+", encoding="utf-8") as writer:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # The audit lease remains held after an inference reader finishes.
+        with lock_path.open("a+", encoding="utf-8") as writer:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with lock_path.open("a+", encoding="utf-8") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_0830_revalidates_after_lock_downgrade_before_audit() -> None:
+    source = Path("scripts/run_tw_public_0830_check.py").read_text(encoding="utf-8")
+    main_source = source[source.index("def main("):]
+    downgrade = main_source.index("_downgrade_refresh_lock_for_audit(lock_handle)")
+    revalidate = main_source.index("derived_status_after = _derived_data_status(", downgrade)
+    audit = main_source.index("audit_started = time.perf_counter()", revalidate)
+    assert downgrade < revalidate < audit
 
 
 def test_publication_receipt_separates_command_success_from_data_completeness() -> None:
@@ -305,11 +343,16 @@ def test_close_event_finalizer_uses_newest_accepted_phase(
         def poll(self):
             return self.returncode
 
-    monkeypatch.setattr(
-        source_events.subprocess,
-        "Popen",
-        lambda command, cwd: (captured.append(command) or Process()),
-    )
+    def launch(command, cwd):
+        captured.append(command)
+        receipt_path = Path(command[command.index("--receipt") + 1])
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({
+            "status": "ok", "expected_date": "2026-09-07", "after": {"current": True},
+        }), encoding="utf-8")
+        return Process()
+
+    monkeypatch.setattr(source_events.subprocess, "Popen", launch)
     result = source_events._finalize_completed_session_close_event(
         {
             "status": "ok",

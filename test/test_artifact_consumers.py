@@ -159,7 +159,7 @@ def test_experiment_inputs_and_initialization_are_protected(tmp_path, monkeypatc
 
     loaded = []
 
-    def load(path):
+    def load(path, *, source_signatures=None):
         loaded.append(path)
         return Config()
 
@@ -179,10 +179,29 @@ def test_resolved_experiment_path_objects_are_protected(tmp_path, monkeypatch):
     class Config:
         data: dict = field(default_factory=lambda: {
             "parquet_root": Path("data_tw_minute/research_dataset_developing_v5")})
-    monkeypatch.setattr("stockagent.config.load_config", lambda path: Config())
+    monkeypatch.setattr("stockagent.config.load_config", lambda path, **kwargs: Config())
     _market(tmp_path, enabled=True, config_path="configs/active.yaml")
     root = tmp_path / "data_tw_minute/research_dataset_developing_v5"
     assert artifact_service_references((root,), tmp_path)[str(root)]
+
+
+def test_inherited_config_source_is_a_service_dependency(tmp_path, monkeypatch):
+    from stockagent.config import _load_raw_config
+    @dataclass
+    class Config:
+        data: dict = field(default_factory=dict)
+    archived = tmp_path / "artifacts/markets/inherited-code/configs"
+    archived.mkdir(parents=True)
+    (archived / "base.yaml").write_text("{}\n")
+    current = tmp_path / "configs/active.yaml"
+    current.parent.mkdir()
+    current.write_text(yaml.safe_dump({"base_config": str(archived / "base.yaml")}))
+    def load(path, *, source_signatures=None):
+        _load_raw_config(path, source_signatures=source_signatures)
+        return Config()
+    monkeypatch.setattr("stockagent.config.load_config", load)
+    _market(tmp_path, enabled=True, config_path="configs/active.yaml")
+    assert any("config_source" in r for r in _refs(tmp_path, "inherited-code"))
 
 
 def test_managed_alias_and_resolved_target_both_protected(tmp_path):

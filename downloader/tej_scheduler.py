@@ -24,6 +24,7 @@ from typing import Callable
 from downloader.artifact_io import atomic_write_json
 from downloader.dataset_lock import DatasetLockTimeout, exclusive_dataset_lock
 from downloader.tej_history import CONTRACT_VERSION, connect, recover_evidence, run_one
+from downloader.tej_operation_clock import source_operation_clock
 RESPONSE_RECOVERY_CONTRACT = 'exact_retained_preview_no_resubmission_recovery_v1'
 
 CONTRACT = "persistent_serial_evidence_preserving_supervision_v1"
@@ -33,6 +34,8 @@ PROGRESS_STATES = frozenset({
     "source_validation_failed_deferred",
     "prequery_failure_deferred",
     "api_scope_repartitioned",
+    "selector_scope_repartitioned",
+    "metadata_retry_scheduled",
 })
 SAFETY_STATES = frozenset({
     "desktop_interface_recovery_required", "inflight_requires_recovery",
@@ -42,6 +45,7 @@ SAFETY_STATES = frozenset({
     "source_capacity_requires_review",
     "list_selection_prequery_needs_review", "query_activation_prequery_needs_review",
     "source_binding_prequery_needs_review", "query_preparation_prequery_needs_review",
+    "metadata_preparation_requires_recovery",
 })
 
 
@@ -62,8 +66,10 @@ class WatchPolicy:
             raise ValueError('Unreviewed automatic response recovery contract')
         from downloader.tej_desktop_attempts import authorized_replay_policy
         from downloader.tej_startup import startup_policy
+        from downloader.tej_metadata_recovery import metadata_recovery_policy
         authorized_replay_policy(config)
         startup_policy(config)
+        metadata_recovery_policy(config)
         values = {
             "idle_seconds": automatic.get("idle_poll_seconds", 60),
             "blocked_seconds": automatic.get("blocked_poll_seconds", 60),
@@ -164,8 +170,9 @@ def finished_discovery_response(root: Path, task_id: str) -> Path | None:
     for timestamp in (payload.get("observed_at_utc"), step.get("observed_at_utc")):
         if not isinstance(timestamp, str):
             return None
-        observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        if observed.tzinfo is None or not started <= observed <= failed:
+        try:
+            source_operation_clock(timestamp, started, failed)
+        except ValueError:
             return None
     return output
 
@@ -217,6 +224,11 @@ def recover_complete_local_response(root: Path) -> bool:
         except (ValueError, OSError, RuntimeError):
             continue
         recovered = True
+    # A source-negative metadata response can outlive the transaction that
+    # records its failure too. Finish only that exact local classification;
+    # the normal owned-interface/retreat policy still licenses any later retry.
+    from downloader.tej_metadata_recovery import reconcile_uncommitted_plan_failure
+    recovered = reconcile_uncommitted_plan_failure(root) or recovered
     from downloader.tej_startup import retire_expired_worker
     try:
         recovered = retire_expired_worker(root) or recovered
@@ -298,13 +310,12 @@ def recover_retained_desktop_response(root: Path, bridge, config: dict, *, befor
     try:
         checked=datetime.now(UTC)
         probe,readback,_=bridge.execute(root,{**task,'request_json':json.dumps({**req,'action':'inspect_notices'})})
-        observed=datetime.fromisoformat(probe['observed_at_utc'].replace('Z','+00:00'))
+        source_operation_clock(probe['observed_at_utc'], checked, datetime.now(UTC))
         if (probe.get('provider')!='tej_smart_wizard'
                 or probe.get('action')!='inspect_notices' or probe.get('task_id')!=task['task_id']
                 or probe.get('contract_version')!=CONTRACT_VERSION
                 or probe.get('data_query_repeated') is not False or probe.get('credentials_read') is not False
                 or not isinstance(probe.get('notices'),list)
-                or observed.tzinfo is None or not checked <= observed <= datetime.now(UTC)+timedelta(seconds=5)
                 or readback.resolve().parent!=(root/'raw').resolve()
                 or not readback.name.startswith(task['task_id']+'-') or readback.stat().st_size>2*1024**2
                 or json.loads(readback.read_text(encoding='utf-8-sig'))!=probe):
@@ -481,6 +492,8 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
     from downloader.tej_desktop_attempts import authorized_replay_policy
     from downloader.tej_startup import desktop_ready
     replay_policy = authorized_replay_policy(config)
+    from downloader.tej_metadata_recovery import metadata_recovery_policy, recover_failed_metadata
+    metadata_policy = metadata_recovery_policy(config)
     stop = stop if stop is not None else Event()
     started = datetime.now(UTC).isoformat()
     owner_ticks = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()[19]
@@ -488,12 +501,29 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
     paused_reason: str | None = None
     last_result: str | None = None
     last_completed: str | None = None
+    desktop_readiness: dict | None = None
+
+    def check_desktop_ready() -> bool:
+        """Publish the existing admission check, never poll just for display."""
+        nonlocal desktop_readiness
+        checked = datetime.now(UTC)
+        ready = desktop_ready(root,now=checked,require_recent=False)
+        recent = False
+        try:
+            startup = json.loads((root/'desktop_startup_status.json').read_text())
+            interface_clock = datetime.fromisoformat(startup['observed_at_utc'])
+            recent = bool(ready and interface_clock.tzinfo and -5 <= (checked-interface_clock).total_seconds() <= 180)
+        except (OSError,ValueError,KeyError,TypeError):
+            pass
+        desktop_readiness = {'contract':'owned_source_desktop_transport_readiness_v1',
+            'observed_at_utc':checked.isoformat(),'ready':ready,'recent_interface_check':recent}
+        return ready
 
     def publish(state: str, *, wait: float | None = None) -> None:
         observed = datetime.now(UTC)
         # A single query/metadata recovery is bounded separately by run_one.
         # This is supervisor liveness, never a renewal of a query's deadline.
-        deadline = 1800 if state in {"executing", "recovering_response", "replaying_authorized"} else max(60, policy.heartbeat_seconds * 2)
+        deadline = 1800 if state in {"executing", "recovering_response", "replaying_authorized", "recovering_metadata"} else max(60, policy.heartbeat_seconds * 2)
         atomic_write_json(root / "scheduler_status.json", {
             "contract": CONTRACT, "state": state, "observed_at_utc": observed.isoformat(),
             "deadline_at_utc": (observed + timedelta(seconds=deadline)).isoformat(),
@@ -505,6 +535,11 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
             "next_check_at_utc": (observed + timedelta(seconds=wait)).isoformat() if wait is not None else None,
             "unknown_outcome_auto_retry": False,
             "authorized_unknown_replay": replay_policy,
+            "metadata_recovery": metadata_policy,
+            # The hardened read-only gateway cannot read /proc/sys boot_id.
+            # Keep that isolation: publish only the source owner's verified
+            # relay readiness, not its PID/socket/workbook or a GUI claim.
+            "desktop_readiness": desktop_readiness,
             "query_deadline_renewed_by_heartbeat": False,
             "query_interval_contract": policy.interval_contract,
         })
@@ -523,7 +558,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                     tick = min(5, part)
                     stop.wait(tick)
                     part -= tick
-                    if not stop.is_set() and desktop_ready(root, require_recent=False):
+                    if not stop.is_set() and check_desktop_ready():
                         return
             else:
                 stop.wait(step)
@@ -562,8 +597,22 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         bridge.session = session  # Recovered private identity before replay too.
                     barrier = local_barrier()
                     if barrier == "inflight_requires_recovery":
+                        # Reconcile saved positive/negative outcomes BEFORE
+                        # choosing the matching interface-recovery path. A
+                        # successful local classification must not incur a
+                        # full blocked-poll interval or a second source call.
                         recover_complete_local_response(root)
                         barrier = local_barrier()
+                    # Metadata-only negative evidence has its own recovery
+                    # boundary. Do not route it into the unknown Preview gate.
+                    if (metadata_policy is not None and barrier in {None,'inflight_requires_recovery',
+                            'metadata_preparation_requires_recovery','desktop_interface_recovery_required'}
+                            and (config.get('automation', {}).get('desktop_startup', {}).get('enabled') is not True
+                                 or check_desktop_ready())):
+                        publish('recovering_metadata')
+                        recover_failed_metadata(root,bridge,policy=metadata_policy)
+                        barrier = local_barrier()
+                    if barrier == "inflight_requires_recovery":
                         from downloader.tej_startup import desktop_ready
                         startup_enabled = config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True
                         # A busy query prevents the GUI watchdog taking the
@@ -571,7 +620,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         # idle gap every three minutes. The live birth-pinned
                         # relay authorizes an attempt, whose native bridge
                         # independently verifies window/Excel/scope again.
-                        ready = not startup_enabled or desktop_ready(root, require_recent=False)
+                        ready = not startup_enabled or check_desktop_ready()
                         if barrier == 'inflight_requires_recovery' and ready:
                             publish('recovering_response')
                             recover_retained_desktop_response(root,bridge,config)
@@ -601,7 +650,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         wait_state, delay = "waiting_recovery", policy.blocked_seconds
                     elif ran_query:
                         paused_reason = None
-                    elif config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True and not desktop_ready(root, require_recent=False):
+                    elif config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True and not check_desktop_ready():
                         last_result = 'waiting_interactive_desktop'
                         wait_state, delay = 'waiting_desktop', policy.blocked_seconds
                     else:
@@ -656,8 +705,8 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                 # Next cycle reconciles the exact response/negative proof.
                 last_result = 'local_metadata_busy'
                 wait_state, delay = 'waiting_metadata', 5
-                atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,
-                    'state':'waiting_metadata','observed_at_utc':datetime.now(UTC).isoformat()})
+                from downloader.tej_history import mark_metadata_busy
+                mark_metadata_busy(root)
             wait(wait_state, delay)
     finally:
         publish("stopped")

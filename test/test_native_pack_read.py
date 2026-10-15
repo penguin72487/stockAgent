@@ -86,6 +86,24 @@ def test_default_pack_reader_keeps_existing_file_path(tmp_path):
         assert source == path
 
 
+def test_small_many_member_pack_recovers_all_members_without_native_scratch(tmp_path, monkeypatch):
+    path = tmp_path / "many-member-pack.zip"
+    originals = {f"source/{i:03d}.json": f'{{"value":{i}}}\n'.encode() for i in range(67)}
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in originals.items():
+            archive.writestr(name, payload)
+    item = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "file_count": len(originals)}
+    monkeypatch.setattr(native, "binary_reader", lambda *_: pytest.fail("small pack launched native reader"))
+    monkeypatch.setattr(training_return, "admit_workspace", lambda *_: pytest.fail("memory read wrote SSD scratch"))
+    with packed._native_pack_source(path, item, enabled=True) as source:
+        assert isinstance(source, io.BytesIO)
+        with zipfile.ZipFile(source) as archive:
+            assert archive.testzip() is None
+            assert {name: archive.read(name) for name in archive.namelist()} == originals
+    assert source.closed and path.exists()
+
+
 def test_native_pack_physical_capacity_cannot_use_virtual_free_space(tmp_path, monkeypatch):
     path, item = sample(tmp_path)
     monkeypatch.setattr(packed.shutil, "disk_usage", lambda _: SimpleNamespace(free=64 * 1024**3))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import weakref
@@ -9,6 +10,7 @@ import weakref
 import numpy as np
 import polars as pl
 import pytest
+from stockagent.live import signal_engine
 
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
 from stockagent.config import DataConfig, TrainingConfig
@@ -66,6 +68,8 @@ def test_idle_live_cuda_cache_release_is_noop_when_no_models(
 ) -> None:
     cleared: list[bool] = []
     monkeypatch.setattr(signal_engine, "_LIVE_MODEL_CACHE", {})
+    monkeypatch.setattr(signal_engine, "_LIVE_CUDA_CACHE_RELEASE_PENDING", False)
+    monkeypatch.setattr(signal_engine, "_live_inference_cpu_cache_retained", lambda: False)
     monkeypatch.setattr(
         signal_engine,
         "clear_live_inference_memory_cache",
@@ -81,6 +85,7 @@ def test_idle_live_cuda_cache_release_returns_allocator_memory(
     models = {"model": object()}
     events: list[str] = []
     monkeypatch.setattr(signal_engine, "_LIVE_MODEL_CACHE", models)
+    monkeypatch.setattr(signal_engine, "_LIVE_CUDA_CACHE_RELEASE_PENDING", False)
 
     def clear() -> None:
         models.clear()
@@ -88,13 +93,18 @@ def test_idle_live_cuda_cache_release_returns_allocator_memory(
 
     monkeypatch.setattr(signal_engine, "clear_live_inference_memory_cache", clear)
     monkeypatch.setattr(signal_engine.torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(signal_engine.torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(signal_engine.torch._C, "_cuda_clearCublasWorkspaces",
+                        lambda: events.append("clear_blas_workspaces"))
     monkeypatch.setattr(
         signal_engine.torch.cuda,
         "empty_cache",
         lambda: events.append("empty_cache"),
     )
+    monkeypatch.setattr(signal_engine.torch.accelerator, "empty_host_cache",
+                        lambda: events.append("empty_host_cache"))
     assert signal_engine.release_idle_live_cuda_cache() is True
-    assert events == ["clear", "empty_cache"]
+    assert events == ["clear", "synchronize", "clear_blas_workspaces", "empty_cache", "empty_host_cache"]
 
 
 def test_live_panel_worker_override_is_a_cap(
@@ -256,6 +266,66 @@ def test_normalized_window_cache_rejects_reused_identity_from_other_schema() -> 
     assert value.shape == (2, 1, 2)
     np.testing.assert_array_equal(value, panel.features)
     signal_engine.clear_live_panel_memory_cache()
+
+
+def test_factorized_rolling_window_preserves_bits_and_bounds_cache(monkeypatch):
+    class Features:
+        _stockagent_factorized_features = True
+        def __init__(self):
+            self.values = np.arange(16, dtype=np.float32).reshape(4, 2, 2)
+            self.values[1, 0] = [np.nan, -0.0]
+            self.values[3, 1] = [np.inf, -np.inf]
+            self.reads = []
+        def __getitem__(self, key):
+            self.reads.append(key)
+            return self.values[key].copy()
+    features = Features()
+    panel = SimpleNamespace(features=features, num_symbols=2, feature_names=["a", "b"])
+    monkeypatch.setattr(signal_engine, "_LIVE_MODEL_INPUT_CACHE_MAX_BYTES", 64)
+    signal_engine.clear_live_panel_memory_cache()
+    try:
+        before = signal_engine._cached_normalized_model_window(panel, panel_idx=2, lookback=3)
+        preserved = before.copy()
+        after = signal_engine._cached_normalized_model_window(panel, panel_idx=3, lookback=3)
+        expected = np.nan_to_num(features.values[1:4], nan=0.0, posinf=0.0, neginf=0.0)
+        np.testing.assert_array_equal(after.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_array_equal(before.view(np.uint32), preserved.view(np.uint32))
+        assert features.reads == [slice(0, 3), 3]
+        assert sum(v[1].nbytes for v in signal_engine._LIVE_MODEL_INPUT_CACHE.values()) <= 64
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
+
+
+@pytest.mark.parametrize("source_view", [False, True])
+def test_factorized_cold_window_sanitizes_bounded_private_chunks(monkeypatch, source_view):
+    class Features:
+        _stockagent_factorized_features = True
+        def __init__(self):
+            self.values = np.arange(2 * 1024 * 1024 + 10, dtype=np.float32).reshape(2, 1, -1)
+            self.values.reshape(-1)[:4] = [np.nan, np.inf, -np.inf, -0.0]
+        def __getitem__(self, key):
+            return self.values[key] if source_view else self.values[key].copy()
+    features = Features()
+    original = features.values.copy()
+    expected = np.nan_to_num(original, nan=0.0, posinf=0.0, neginf=0.0)
+    panel = SimpleNamespace(features=features, num_symbols=1,
+                            feature_names=["feature"] * features.values.shape[-1])
+    sanitize = np.nan_to_num
+    calls = []
+    def bounded(value, **kwargs):
+        calls.append((value.size, kwargs.get("copy")))
+        return sanitize(value, **kwargs)
+    monkeypatch.setattr(signal_engine.np, "nan_to_num", bounded)
+    signal_engine.clear_live_panel_memory_cache()
+    try:
+        actual = signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2)
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_array_equal(features.values.view(np.uint32), original.view(np.uint32))
+        assert not np.shares_memory(actual, features.values)
+        assert calls and all(size <= 1024 * 1024 and copy is False for size, copy in calls)
+        assert signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2) is actual
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
 
 
 def test_normalized_window_preserves_values_and_private_live_copy() -> None:
@@ -776,6 +846,79 @@ def test_reused_opening_snapshot_does_not_report_negative_transport_latency() ->
     assert timing["coverage_to_quote_response_ms"] is None
     assert timing["coverage_to_signal_ready_ms"] == pytest.approx(1100.0)
 
+
+def test_opening_input_receipt_clock_includes_proven_no_print_without_making_a_price() -> None:
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    stamps = np.array([int(gate.timestamp() * 1000) + n for n in (100, 350, 0)])
+    snapshot = PriceSnapshot(prices=np.array([10.0, np.nan, np.nan]),
+        open_prices=np.array([10.0, np.nan, np.nan]), source="opening:shared_opening_snapshot",
+        available_mask=np.array([True, True, False]), timestamps_ms=stamps,
+        exchange_timestamps_ms=stamps, no_open_print_timestamps_ms=np.array([0, stamps[1], 0]))
+    original = snapshot.open_prices.copy()
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True, False, False]),
+        no_print_mask=np.ones(3, dtype=bool), required_count=2, session_date="2026-10-14",
+        display_timezone="Asia/Taipei", quote_requested_at="2026-10-14T09:00:00.050+08:00",
+        quote_received_at="2026-10-14T09:00:01+08:00", signal_ready_at="2026-10-14T09:00:01.300+08:00",
+    )
+    assert timing["quality"] == "observed"
+    assert timing["observed_count"] == 1 and timing["observed_no_print_count"] == 1
+    assert timing["resolved_input_count"] == timing["timestamped_count"] == 2
+    assert timing["coverage_receipt_from_open_ms"] == 350
+    assert timing["coverage_to_signal_ready_ms"] == 950
+    np.testing.assert_array_equal(snapshot.open_prices, original)
+
+
+@pytest.mark.parametrize("absence_at", ["2026-10-13T09:00:00+08:00", "2026-10-14T08:59:59+08:00", None])
+def test_unproved_stale_or_premarket_absence_does_not_fill_receipt_coverage(absence_at) -> None:
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    stamp = int(gate.timestamp() * 1000) + 100
+    absence = int(datetime.fromisoformat(absence_at).timestamp() * 1000) if absence_at else 0
+    snapshot = PriceSnapshot(prices=np.array([10.0, np.nan]), open_prices=np.array([10.0, np.nan]),
+        source="opening:shared_opening_snapshot", available_mask=np.ones(2, dtype=bool),
+        timestamps_ms=np.array([stamp, stamp]), exchange_timestamps_ms=np.array([stamp, stamp]),
+        no_open_print_timestamps_ms=np.array([0, absence]))
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True, False]), no_print_mask=np.ones(2, dtype=bool),
+        required_count=2, session_date="2026-10-14", display_timezone="Asia/Taipei",
+        quote_requested_at="2026-10-14T09:00:00+08:00", quote_received_at="2026-10-14T09:00:01+08:00",
+        signal_ready_at="2026-10-14T09:00:01.300+08:00",
+    )
+    assert timing["quality"] == "insufficient_timestamped_coverage"
+    assert timing["resolved_input_count"] == 1
+    assert timing["coverage_receipt_from_open_ms"] is None
+
+
+@pytest.mark.parametrize("offset,received,ready", [
+    (-1, "09:00:01", "09:00:02"), (2000, "09:00:01", "09:00:02"),
+    (500, "09:00:01", "09:00:00.999"),
+])
+def test_invalid_receipt_clock_does_not_report_negative_or_future_latency(offset, received, ready) -> None:
+    gate = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+    snapshot = PriceSnapshot(prices=np.array([10.0]), source="fixture",
+        timestamps_ms=np.array([int(gate.timestamp() * 1000) + offset]))
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True]), required_count=1,
+        session_date="2026-10-14", display_timezone="Asia/Taipei",
+        quote_requested_at="2026-10-14T09:00:00+08:00", quote_received_at=f"2026-10-14T{received}+08:00",
+        signal_ready_at=f"2026-10-14T{ready}+08:00",
+    )
+    assert timing["quality"] == "invalid_receipt_clock_order"
+    assert timing["coverage_receipt_from_open_ms"] is None
+
+
+@pytest.mark.parametrize("timestamps", [np.array(["bad-clock"]), np.array([np.iinfo(np.int64).max])])
+def test_corrupt_telemetry_timestamp_is_unavailable_not_a_signal_failure(timestamps) -> None:
+    snapshot = PriceSnapshot(prices=np.array([10.0]), source="fixture", timestamps_ms=timestamps)
+    timing = _opening_price_receipt_timing(
+        price_snapshot=snapshot, observed_mask=np.array([True]), required_count=1,
+        session_date="2026-10-14", display_timezone="Asia/Taipei",
+        quote_requested_at="2026-10-14T09:00:00+08:00", quote_received_at="2026-10-14T09:00:01+08:00",
+        signal_ready_at="2026-10-14T09:00:02+08:00",
+    )
+    assert timing["quality"] == "invalid_receipt_timestamps"
+    assert timing["coverage_receipt_from_open_ms"] is None
+
 def test_period_title_ends_at_price_timestamp_when_live_quote_falls_back() -> None:
     message = format_signal_message(
         {
@@ -867,6 +1010,7 @@ def test_day_trade_shioaji_snapshot_queries_only_active_universe(monkeypatch) ->
 
 def test_day_trade_shared_mis_snapshot_queries_only_active_universe(
     monkeypatch,
+    opening_clock,
 ) -> None:
     requested: list[str] = []
 
@@ -883,7 +1027,7 @@ def test_day_trade_shared_mis_snapshot_queries_only_active_universe(
             requested_count=size,
             available_mask=np.ones((size,), dtype=bool),
             open_prices=values.copy(),
-            timestamps_ms=np.arange(1, size + 1, dtype=np.int64),
+            timestamps_ms=np.full(size, int(opening_clock.timestamp() * 1000), dtype=np.int64),
         )
 
     monkeypatch.setattr(
@@ -1067,168 +1211,88 @@ def test_postclose_latest_quote_reuses_one_session_snapshot_across_models(
     assert "shared_session_quote_snapshot" in snapshot.source
 
 
-def test_day_trade_opening_uses_preheated_shared_shioaji_before_mis(
-    monkeypatch,
-) -> None:
-    from datetime import datetime
+@pytest.fixture
+def opening_source_owner(monkeypatch, tmp_path):
     from zoneinfo import ZoneInfo
+    from stockagent.live import opening_price_acquisition as acquisition, quote_provider as quotes
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts"))
+    monkeypatch.setattr(quotes, "_TW_MIS_OPENING_CACHE_KEY", None)
+    monkeypatch.setattr(quotes, "_TW_MIS_OPENING_CACHE", {})
+    monkeypatch.setattr(quotes, "_TW_MIS_OPENING_REQUESTED", set())
+    monkeypatch.setattr(quotes, "_TW_MIS_OPENING_DIRTY", False)
+    monkeypatch.setattr(acquisition, "optional_opening_providers", lambda: {})
+    fixed = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=9, minute=0, second=0, microsecond=0)
 
-    now_ms = int(
-        np.datetime64(
-            datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None), "ms"
-        ).astype(np.int64)
-    )
-    backup_requests: list[list[str]] = []
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz or ZoneInfo("Asia/Taipei"))
 
-    monkeypatch.setenv("STOCKAGENT_TW_OPENING_MIN_COVERAGE", "0.90")
-
-    def cache_only_mis(symbols, fallback_prices, **kwargs):
-        if kwargs.get("allow_network") is not False:
-            raise AssertionError("full shared opening coverage must bypass MIS network")
-        return PriceSnapshot(
-            prices=np.asarray(fallback_prices, dtype=np.float64),
-            source="twse_tpex:mis+shared_opening_snapshot",
-            available_count=0,
-            requested_count=len(symbols),
-            available_mask=np.zeros((len(symbols),), dtype=bool),
-        )
-
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
-        cache_only_mis,
-    )
-
-    def fake_shioaji(symbols, fallback_prices, **kwargs):
-        assert kwargs.get("purpose") == "opening_signal"
-        assert kwargs.get("timeout_seconds") == 4.0
-        backup_requests.append(list(symbols))
-        return PriceSnapshot(
-            prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
-            source="shioaji:fixture",
-            timestamp=datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
-            available_count=len(symbols),
-            requested_count=len(symbols),
-            available_mask=np.ones((len(symbols),), dtype=bool),
-            open_prices=np.asarray(fallback_prices, dtype=np.float64) + 0.5,
-            timestamps_ms=np.full((len(symbols),), now_ms, dtype=np.int64),
-            exchange_timestamps_ms=np.full(
-                (len(symbols),), now_ms, dtype=np.int64
-            ),
-        )
-
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_shared_day_trade_stock_snapshots",
-        fake_shioaji,
-    )
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("opening shared session covered the missing universe")
-        ),
-    )
-
-    snapshot = _price_snapshot(
-        source="tw",
-        symbols=["A", "B"],
-        fallback_prices=np.array([100.0, 200.0]),
-        parquet_root="unused",
-        prices_csv=None,
-        yahoo_chunk_size=80,
-        require_official_tw_session_open=True,
-    )
-
-    assert backup_requests == [["A", "B"]]
-    assert snapshot.available_count == 2
-    np.testing.assert_allclose(snapshot.open_prices, [100.5, 200.5])
-    assert snapshot.source == "shioaji:fixture"
+    monkeypatch.setattr(acquisition, "datetime", Clock)
+    monkeypatch.setattr(quotes, "datetime", Clock)
+    owner = acquisition.OpeningPriceFanIn()
+    monkeypatch.setattr(acquisition, "OPENING_FAN_IN", owner)
+    yield owner
+    owner.close()
 
 
-def test_day_trade_partial_shared_opening_queries_mis_only_on_degraded_path(
-    monkeypatch,
+def test_day_trade_opening_races_shared_shioaji_and_mis_without_new_login(
+    monkeypatch, tmp_path, opening_source_owner,
 ) -> None:
-    from datetime import datetime
     from zoneinfo import ZoneInfo
+    from stockagent.live import quote_provider as quotes
+    requests = {"shared": [], "mis": []}
+    now_ms = int(quotes.datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
 
-    now_ms = int(
-        np.datetime64(
-            datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None), "ms"
-        ).astype(np.int64)
-    )
-    shared_calls: list[list[str]] = []
-    mis_calls: list[list[str]] = []
-    seeded: list[list[bool]] = []
-    monkeypatch.setenv("STOCKAGENT_TW_OPENING_MIN_COVERAGE", "0.90")
-
-    def shared(symbols, fallback_prices, **kwargs):
-        assert kwargs.get("purpose") == "opening_signal"
-        shared_calls.append(list(symbols))
+    def shared(symbols, fallback, **kwargs):
+        assert kwargs["purpose"] == "opening_signal"
+        assert kwargs["timeout_seconds"] == 4
+        requests["shared"].append(symbols)
         return PriceSnapshot(
-            prices=np.asarray(fallback_prices, dtype=np.float64),
-            source="shioaji:partial",
-            available_count=1,
-            requested_count=2,
-            available_mask=np.array([True, False]),
-            open_prices=np.array([100.5, np.nan]),
-            timestamps_ms=np.array([now_ms, 0]),
-            exchange_timestamps_ms=np.array([now_ms, 0]),
+            prices=fallback + 1, source="shioaji:fixture", open_prices=fallback + .5,
+            available_mask=np.ones(len(symbols), dtype=bool), available_count=len(symbols),
+            timestamps_ms=np.full(len(symbols), now_ms), exchange_timestamps_ms=np.full(len(symbols), now_ms),
         )
 
-    def mis(symbols, fallback_prices, **kwargs):
-        if kwargs.get("allow_network") is False:
-            return PriceSnapshot(
-                prices=np.asarray(fallback_prices, dtype=np.float64),
-                source="twse_tpex:mis+shared_opening_snapshot",
-                available_count=0,
-                requested_count=len(symbols),
-                available_mask=np.array([False, False]),
-            )
-        mis_calls.append(list(symbols))
-        return PriceSnapshot(
-            prices=np.asarray(fallback_prices, dtype=np.float64),
-            source="twse_tpex:mis+shared_opening_snapshot+shioaji_open_cache",
-            available_count=2,
-            requested_count=2,
-            available_mask=np.array([True, True]),
-            open_prices=np.array([100.5, 200.5]),
-            timestamps_ms=np.array([now_ms, now_ms]),
-        )
+    def mis(symbols, fallback, **kwargs):
+        requests["mis"].append(symbols)
+        return PriceSnapshot(prices=fallback, source="twse_tpex:mis", available_mask=np.zeros(len(symbols), dtype=bool))
 
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_shared_day_trade_stock_snapshots",
-        shared,
-    )
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
-        mis,
-    )
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.seed_tw_opening_snapshot_cache",
-        lambda symbols, snapshot, **kwargs: seeded.append(
-            np.asarray(snapshot.available_mask, dtype=bool).tolist()
-        ),
-    )
-    monkeypatch.setattr(
-        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("MIS completed the partial shared opening")
-        ),
-    )
+    monkeypatch.setattr("stockagent.live.signal_engine.fetch_shared_day_trade_stock_snapshots", shared)
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", mis)
+    result = _price_snapshot(source="tw", symbols=["A", "B"], fallback_prices=np.array([100., 200.]), parquet_root=tmp_path, prices_csv=None, yahoo_chunk_size=80, require_official_tw_session_open=True)
+    assert opening_source_owner.wait_idle()
+    assert requests == {"shared": [["A", "B"]], "mis": [["A", "B"]]}
+    assert result.available_count == 2
+    np.testing.assert_allclose(result.open_prices, [100.5, 200.5])
+    assert "shioaji" in result.source
+    assert quotes._TW_MIS_OPENING_CACHE["A"][1]["open_source"] == "shioaji:fixture"
 
-    snapshot = _price_snapshot(
-        source="tw",
-        symbols=["A", "B"],
-        fallback_prices=np.array([100.0, 200.0]),
-        parquet_root="unused",
-        prices_csv=None,
-        yahoo_chunk_size=80,
-        require_official_tw_session_open=True,
-    )
 
-    assert shared_calls == [["A", "B"]]
-    assert mis_calls == [["A", "B"]]
-    assert seeded == [[True, False], [True, True]]
-    assert snapshot.available_count == 2
-    np.testing.assert_allclose(snapshot.open_prices, [100.5, 200.5])
+def test_day_trade_opening_merges_actual_partial_provider_rows(
+    monkeypatch, tmp_path, opening_source_owner,
+) -> None:
+    from zoneinfo import ZoneInfo
+    from stockagent.live import quote_provider as quotes
+    calls = {"shared": [], "mis": []}
+    now_ms = int(quotes.datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+
+    def shared(symbols, fallback, **kwargs):
+        calls["shared"].append(symbols)
+        return PriceSnapshot(prices=fallback, source="shioaji:partial", available_count=1, available_mask=np.array([True, False]), open_prices=np.array([100.5, np.nan]), timestamps_ms=np.array([now_ms, 0]), exchange_timestamps_ms=np.array([now_ms, 0]))
+
+    def mis(symbols, fallback, **kwargs):
+        calls["mis"].append(symbols)
+        return PriceSnapshot(prices=fallback, source="twse_tpex:mis", available_count=1, available_mask=np.array([False, True]), open_prices=np.array([np.nan, 200.5]), timestamps_ms=np.array([0, now_ms]), exchange_timestamps_ms=np.array([0, now_ms]))
+
+    monkeypatch.setattr("stockagent.live.signal_engine.fetch_shared_day_trade_stock_snapshots", shared)
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", mis)
+    result = _price_snapshot(source="tw", symbols=["A", "B"], fallback_prices=np.array([100., 200.]), parquet_root=tmp_path, prices_csv=None, yahoo_chunk_size=80, require_official_tw_session_open=True)
+    assert calls == {"shared": [["A", "B"]], "mis": [["A", "B"]]}
+    assert result.available_count == 2
+    np.testing.assert_allclose(result.open_prices, [100.5, 200.5])
+    assert quotes._TW_MIS_OPENING_CACHE["A"][1]["open_source"] == "shioaji:partial"
+    assert quotes._TW_MIS_OPENING_CACHE["B"][1]["open_source"] == "twse_tpex:mis"
 
 
 def test_day_trade_shioaji_does_not_block_on_duplicate_mis_when_open_is_proven(
@@ -2636,6 +2700,44 @@ def test_format_signal_message_uses_daily_previous_period_label() -> None:
 
     assert "上個交易日到現在" in message
     assert "`2026-06-19`..`2026-06-22`" in message
+
+
+def test_json_publication_preserves_values_and_syncs_before_pointer(tmp_path, monkeypatch):
+    events = []
+    replace = os.replace
+    monkeypatch.setattr(signal_engine.os, "fsync", lambda fd: events.append("sync"))
+
+    def publish(source, target):
+        events.append("replace")
+        replace(source, target)
+
+    monkeypatch.setattr(signal_engine.os, "replace", publish)
+    payload = {"name": "台股", "rows": [{"value": 0.12345678901234567,
+                "shares": 1234000, "missing": None}], "ok": False}
+    path = tmp_path / "signal.json"
+    signal_engine._atomic_write_json(path, payload)
+    assert json.loads(path.read_text()) == payload
+    assert events[:2] == ["sync", "replace"]
+    if hasattr(os, "O_DIRECTORY"):
+        assert events == ["sync", "replace", "sync"]
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_failed_json_publication_keeps_previous_artifact_and_removes_owned_temp(tmp_path, monkeypatch):
+    path = tmp_path / "signal.json"
+    path.write_text('{"old":true}')
+    monkeypatch.setattr(signal_engine.os, "fsync", lambda _: (_ for _ in ()).throw(OSError("disk sync failed")))
+    with pytest.raises(OSError, match="disk sync failed"):
+        signal_engine._atomic_write_json(path, {"new": True})
+    assert json.loads(path.read_text()) == {"old": True}
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_compact_execution_json_remains_strict_about_nan(tmp_path):
+    path = tmp_path / "execution.json"
+    with pytest.raises(ValueError):
+        signal_engine._atomic_write_compact_json(path, {"price": float("nan")})
+    assert not path.exists()
 
 
 def test_format_signal_message_displays_crypto_times_in_taipei_timezone() -> None:

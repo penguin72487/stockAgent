@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "download_workers": 8,
+  "max_batch_requests": 1200,
+  "max_requests_per_cycle": 1200,
+  "max_buffered_response_bytes": 536870912
+}

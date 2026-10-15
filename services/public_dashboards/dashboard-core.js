@@ -20,6 +20,7 @@
     Object.freeze({id: "shioaji", label: "永豐 API", slug: "shioaji"}),
     Object.freeze({id: "finlab", label: "FinLab", slug: "finlab"}),
     Object.freeze({id: "finmind", label: "FinMind", slug: "finmind"}),
+    Object.freeze({id: "news", label: "新聞爬蟲", slug: "news"}),
     Object.freeze({id: "tej", label: "TEJ", slug: "tej"}),
     Object.freeze({id: "openbb", label: "OpenBB", slug: "openbb"}),
     Object.freeze({id: "data-monitor", label: "全資料", slug: "data-monitor"}),

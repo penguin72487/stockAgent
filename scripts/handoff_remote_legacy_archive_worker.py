@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -24,6 +25,12 @@ COMMON = Path("/run/lock/stockagent-remote-cold-artifact-ingress.lock")
 BULK_STATE = Path("/srv/stockagent-d-volume/stockagent-cold-primary/remote-artifact-incoming")
 COHORTS = {Path("/var/lib/stockagent-vast-legacy-return"),
            Path("/var/lib/stockagent-vast-legacy-return-partitions"), BULK_STATE}
+REVIEWED_COHORTS = {
+    Path("/var/lib/stockagent-vast-reviewed-return-20261006"): "reviewed-main-20261006",
+    Path("/var/lib/stockagent-vast-reviewed-partitions-20261006"): "reviewed-panel-20261006",
+    Path("/var/lib/stockagent-vast-reviewed-offline-return-20261006"): "reviewed-offline-20261006",
+}
+COHORTS |= REVIEWED_COHORTS.keys()
 LOCAL_CLEANUP = ROOT / "artifacts/operations/wsl-storage-cleanup-20261006"
 LOCAL_COHORTS = {
     LOCAL_CLEANUP / name: LOCAL_CLEANUP / inventory
@@ -48,9 +55,18 @@ SCRATCH_COHORTS = {
 def legacy_systemd_owner(state_root: Path) -> str:
     owners = {Path("/var/lib/stockagent-vast-legacy-return"): "main",
               Path("/var/lib/stockagent-vast-legacy-return-partitions"): "partitions"}
+    owners.update(REVIEWED_COHORTS)
     if state_root not in owners:
         raise SnapshotError("legacy service handoff requires an exact retained cohort")
     return "stockagent-legacy-return@" + owners[state_root] + ".service"
+
+
+def legacy_policy_path(state_root: Path, *, unit_environment: str = "") -> Path:
+    if REVIEWED_COHORTS.get(state_root) == "reviewed-offline-20261006":
+        return ROOT / "configs/data_sync/vastai_reviewed_offline_return_20261006.json"
+    if state_root in REVIEWED_COHORTS or "STOCKAGENT_LEGACY_REVIEWED_20261006=1" in shlex.split(unit_environment):
+        return ROOT / "configs/data_sync/vastai_reviewed_legacy_return_20261006.json"
+    return ROOT / "configs/data_sync/vastai_legacy_archive_return.json"
 
 
 def validate_worker_argv(argv: list[str], state_root: Path, *, scratch_prune: bool = False) -> None:
@@ -280,9 +296,13 @@ def main():
                 command += ["--batch", str(BULK_STATE / batch)]
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30, cwd=ROOT)
         run = ({"unit": unit} if unit else json.loads(result.stdout))
+        environment = (subprocess.check_output(
+            ["systemctl", "show", unit, "--property=Environment", "--value"], text=True, timeout=10)
+            if args.legacy_systemd else "")
         policy_path = (LOCAL_COHORTS[args.state_root] if args.state_root in LOCAL_COHORTS else
-                       ROOT / "configs/data_sync" / ("vastai_bulk_preservation.json"
-                       if args.state_root == BULK_STATE else "vastai_legacy_archive_return.json"))
+                       ROOT / "configs/data_sync/vastai_bulk_preservation.json"
+                       if args.state_root == BULK_STATE else
+                       legacy_policy_path(args.state_root, unit_environment=environment))
         receipt = {"state": "same_cohort_handed_off_at_unowned_boundary", "old_pid": args.pid,
             "old_start_ticks": start, "state_root": str(args.state_root), "before": before,
             "frozen": frozen, "summary_before": summary, "new_owner": run,

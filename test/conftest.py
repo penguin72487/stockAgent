@@ -34,3 +34,28 @@ def verified_dashboard_calendar(tmp_path, monkeypatch):
     dashboard._session_clock_cached.cache_clear()
     yield
     dashboard._session_clock_cached.cache_clear()
+
+
+@pytest.fixture
+def opening_clock(monkeypatch, tmp_path):
+    """Positive opening fixtures remain causal even when run before 09:00.
+
+    Freeze only market wall clocks, never stdlib time or monotonic deadlines.
+    Any source-cache publication is confined to the test's receipt directory.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from stockagent.live import opening_price_acquisition, quote_provider
+
+    fixed = datetime.now(ZoneInfo("Asia/Taipei")).replace(
+        hour=9, minute=0, second=2, microsecond=0)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(quote_provider, "datetime", Clock)
+    monkeypatch.setattr(opening_price_acquisition, "datetime", Clock)
+    monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "opening"))
+    return fixed

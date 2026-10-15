@@ -1,0 +1,49 @@
+{
+  "contract_version": 1,
+  "root": "artifacts/data_quality/news_goal_stage01_20261009/scope_growth_20261014/taiwanhot-http",
+  "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
+  "workers": 1,
+  "exclusive_http_owner": true,
+  "request_timeout_seconds": 8,
+  "response_deadline_seconds": 20,
+  "max_response_bytes": 2097152,
+  "max_attempts": 1,
+  "lease_seconds": 300,
+  "min_free_disk_bytes": 26843545600,
+  "batch_articles": 16,
+  "batch_text_bytes": 4194304,
+  "robots_ttl_seconds": 86400,
+  "metadata_refresh_seconds": 900,
+  "recent_article_recheck_seconds": 21600,
+  "recent_article_window_days": 3,
+  "unknown_source_policy": "awaiting_authorization",
+  "collection_purpose": "personal_research",
+  "publish": false,
+  "remote_training_export": false,
+  "providers": [
+    {
+      "id": "taiwanhot",
+      "name": "台灣好新聞：有限公開端點診斷，不接受正文",
+      "domains": ["www.taiwanhot.net"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "interval_seconds": 5,
+      "parallelism": 1,
+      "article_selectors": [".article-content", "[itemprop=articleBody]"],
+      "article_path_pattern": "^/news/(?:focus/)?[1-9][0-9]*/",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "html_parser": "lxml",
+      "index_pages": ["https://www.taiwanhot.net/"],
+      "index_path_pattern": "^/$",
+      "authorization": {
+        "kind": "personal_research",
+        "evidence_url": "https://www.taiwanhot.net/",
+        "scope": "Bounded private access/structure diagnosis of the home page and at most three literal locally known public article URLs covering the native news page, focus view and one legacy p query; retain a normal publicly readable response privately for offline layout review only after canonical refusal, challenge and paid/member guards. No article acceptance, guessed IDs, bulk history, export or redistribution. Preserve observed declared third-party bylines; publisher reuse rights, clocks and exact body identity remain unverified.",
+        "reviewed_on": "2026-10-14",
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "rights_restrictions": "No source archive, reuse or model-training grant inferred. Respect canonical robots, cooldowns and actual refusal; no alternative identity, login bypass or repeated denial probe."
+      }
+    }
+  ]
+}

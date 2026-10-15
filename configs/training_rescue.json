@@ -1,0 +1,16 @@
+{
+  "contract": "stockagent.training_rescue.v1",
+  "schema_version": 1,
+  "state_root": "/var/lib/stockagent-training-rescue",
+  "cold_root": "/srv/stockagent-packed/.local-state/training-rescue",
+  "cold_guard": "penguin-d-primary",
+  "windows_distribution": "Ubuntu-26.04",
+  "poll_seconds": 30,
+  "lease_seconds": 120,
+  "reserve_bytes": 68719476736,
+  "maximum_member_bytes": 34359738368,
+  "minimum_destination_free_bytes": 137438953472,
+  "automatic_destination_selection": false,
+  "automatic_provider_mutations": false,
+  "delete_source_files": false
+}

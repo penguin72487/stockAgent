@@ -8,22 +8,25 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.amp import GradScaler
-from torch.nn.parallel import DistributedDataParallel
 
 from stockagent.training import trainer
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors
+from types import SimpleNamespace
+from stockagent.config import TrainingConfig
 
 
 class _TinyPolicy(torch.nn.Module):
     def __init__(self, initial):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(initial))
+        self.unused = torch.nn.Parameter(torch.tensor(.123))
+        self.register_buffer("normalizer", torch.tensor(1.))
         self.seen = []
 
     def forward(self, x, mask, **kwargs):
         self.seen.append(self.scale.detach().item())
-        return self.scale * x[:, -1, :, 0]
+        return self.scale * self.normalizer * x[:, -1, :, 0]
 
 
 class _StepCounter(torch.optim.SGD):
@@ -68,9 +71,19 @@ def _split(batch_size, announced_exit=False):
     return trainer._pad_windowed_training_split(split, batch_size=batch_size)
 
 
-def _update(initial, batch_size, clipping, local_metadata, announced_exit=False, *, distributed):
+def _update(initial, batch_size, clipping, local_metadata, announced_exit=False, *, distributed,
+            gradient_sync="batch", broadcast_buffers=True):
     policy = _TinyPolicy(initial)
-    model = DistributedDataParallel(policy) if distributed else policy
+    if distributed:
+        if not broadcast_buffers:
+            policy.normalizer.fill_(1. + dist.get_rank())
+        config = SimpleNamespace(training=TrainingConfig(non_blocking_transfer=False,
+            ddp_broadcast_buffers=broadcast_buffers,
+            ddp_trajectory_gradient_sync=gradient_sync))
+        model = trainer._wrap_distributed_data_parallel_model(
+            policy, config=config, device=torch.device("cpu"))
+    else:
+        model = policy
     optimizer = _StepCounter(model.parameters())
     scheduler = _SchedulerCounter()
     loss_fn = partial(
@@ -98,6 +111,7 @@ def _update(initial, batch_size, clipping, local_metadata, announced_exit=False,
     if distributed:
         loss, timing = trainer._train_epoch_windowed_tensor_ddp(
             model, *args, replicated_ledger_local_metadata=local_metadata, **options,
+            ddp_trajectory_gradient_sync=gradient_sync,
         )
     else:
         loss, timing = trainer._train_epoch_windowed_tensor(model, None, *args, **options)
@@ -106,6 +120,7 @@ def _update(initial, batch_size, clipping, local_metadata, announced_exit=False,
     assert policy.seen == pytest.approx([initial] * timing.batches)
     assert timing.batches == (5 + batch_size - 1) // batch_size
     assert policy.scale.grad is not None and torch.isfinite(policy.scale.grad)
+    assert policy.unused.grad is None and policy.unused.item() == pytest.approx(.123)
     assert timing.gradient_norm_before_clip_sum > 0.
     return (loss.item(), policy.scale.item(), policy.scale.grad.item(),
             timing.gradient_norm_before_clip_sum)
@@ -117,12 +132,13 @@ _CASES = [(*case, local_metadata, announced_exit)
           for announced_exit in (False, True)]
 
 
-def _worker(rank, init_file, results):
+def _worker(rank, init_file, results, gradient_sync, broadcast_buffers):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank,
                             world_size=2, timeout=timedelta(seconds=20))
     try:
-        observed = [_update(*case, distributed=True) for case in _CASES]
+        observed = [_update(*case, distributed=True, gradient_sync=gradient_sync,
+                            broadcast_buffers=broadcast_buffers) for case in _CASES]
         results.put((rank, observed))
     except BaseException as exc:
         results.put((rank, f"{type(exc).__name__}: {exc}"))
@@ -130,13 +146,18 @@ def _worker(rank, init_file, results):
         dist.destroy_process_group()
 
 
-def test_real_two_rank_gradient_aggregation_clipping_tail_and_one_update(tmp_path, monkeypatch):
+@pytest.mark.parametrize("gradient_sync,broadcast_buffers", [
+    ("batch", True), ("batch", False), ("trajectory", True), ("trajectory", False),
+])
+def test_real_two_rank_gradient_aggregation_clipping_tail_and_one_update(
+        tmp_path, monkeypatch, gradient_sync, broadcast_buffers):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     reference = [_update(*case, distributed=False) for case in _CASES]
     context = mp.get_context("spawn")
     results = context.Queue()
     workers = [context.Process(target=_worker,
-                               args=(rank, str(tmp_path / "rendezvous"), results))
+                               args=(rank, str(tmp_path / "rendezvous"), results,
+                                     gradient_sync, broadcast_buffers))
                for rank in range(2)]
     try:
         for worker in workers:
@@ -156,3 +177,17 @@ def test_real_two_rank_gradient_aggregation_clipping_tail_and_one_update(tmp_pat
                 worker.terminate()
             worker.join(timeout=5)
         results.close()
+
+
+def test_immutable_buffer_contract_rejects_inplace_mutation_and_replacement():
+    policy = _TinyPolicy(.1)
+    wrapper = SimpleNamespace(module=policy, _stockagent_immutable_buffer_versions={
+        "normalizer": (policy.normalizer, policy.normalizer._version),
+    })
+    trainer._assert_immutable_ddp_buffers(wrapper)
+    policy.normalizer.add_(1.)
+    with pytest.raises(RuntimeError, match="buffers changed"):
+        trainer._assert_immutable_ddp_buffers(wrapper)
+    policy.normalizer = torch.tensor(1.)
+    with pytest.raises(RuntimeError, match="buffers changed"):
+        trainer._assert_immutable_ddp_buffers(wrapper)

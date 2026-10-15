@@ -18,13 +18,14 @@ from zoneinfo import ZoneInfo
 
 
 UPSTREAM_CHECK_MODES = frozenset({"upstream_forced", "upstream_incremental"})
-QUOTA_POLICY_VERSION = 1
+QUOTA_POLICY_VERSION = 2
 WORKLOAD_CONTRACT_VERSION = 4
 INTRADAY_PROGRESS_VERSION = 1
 DISPATCH_INTERVAL_SECONDS = 60
 # These adapters currently sign and stream whole objects, not SDK deltas.
 WHOLE_TABLE_KEYS = frozenset({
     "broker_transactions", "after_market_fixed_price:市場別", "after_market_fixed_price:資料來源",
+    "inventory",
 })
 TAIPEI = ZoneInfo("Asia/Taipei")
 
@@ -180,6 +181,17 @@ def source_check_due(receipt: dict, *, now: datetime, days: int = 1) -> bool:
     checked = utc_time(receipt.get("source_checked_at_utc") or receipt.get("fetched_at_utc"))
     due = next_source_check(receipt, days=days)
     return checked is None or checked > now or due is None or now >= due
+
+
+def last_acquisition_success(receipt: dict) -> datetime | None:
+    """Local persistence completion can supersede a decode failure, not freshness.
+
+    Reusing a verified raw object must not backdate source_checked_at or hide
+    a successful later conversion behind the earlier failed conversion.
+    """
+    times = [utc_time(receipt.get(field)) for field in (
+        "acquisition_completed_at_utc", "source_checked_at_utc", "fetched_at_utc")]
+    return max((stamp for stamp in times if stamp is not None), default=None)
 
 
 def proven_source_empty(key: str, attempt: dict) -> bool:

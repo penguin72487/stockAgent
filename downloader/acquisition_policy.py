@@ -258,7 +258,8 @@ def _finmind_spare_work(root: str, epoch: int) -> dict[str, Any]:
 
 def evaluate_finmind_secondary_admission(*, root: Path = ROOT / 'data_finmind',
                                         now: datetime | None = None,
-                                        config_path: Path = ROOT / 'configs/finmind_acquisition_policy.json') -> dict[str, Any]:
+                                        config_path: Path = ROOT / 'configs/finmind_acquisition_policy.json',
+                                        _workload_snapshot: tuple[Path, dict[str, Any]] | None = None) -> dict[str, Any]:
     """FinMind-only opt-in: other providers cannot spend its independent quota.
 
 This grants no quota itself. All calls still pass the existing shared budget,
@@ -275,7 +276,15 @@ executable requests. Unknown owner queues fail closed.
         return result
     checked = now or datetime.now(UTC)
     try:
-        workload = _finmind_spare_work(str(root.resolve()), int(checked.timestamp() // 30))
+        if _workload_snapshot is None:
+            workload = _finmind_spare_work(str(root.resolve()), int(checked.timestamp() // 30))
+        else:
+            # ETA already inventories this owner scope at this exact clock.
+            # Reuse only within that call, never as a stale dispatch permit.
+            snapshot_root, workload = _workload_snapshot
+            if (Path(snapshot_root).resolve() != root.resolve() or checked.tzinfo is None
+                    or _utc(workload.get('observed_at_utc')) != checked.astimezone(UTC)):
+                return result
         summary = workload['summary']
         result.update(required_requests=summary['required_requests'],
                       unknown_datasets=summary['unknown_datasets'],

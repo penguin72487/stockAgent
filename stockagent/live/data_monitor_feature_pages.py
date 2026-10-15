@@ -11,6 +11,11 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+try:
+    import msgspec as _native
+except ImportError:
+    _native = None
+
 from stockagent.live.data_monitor_api_contract import FeaturePagePayload
 
 
@@ -19,6 +24,58 @@ _SEARCH_FIELDS = (
 )
 FEATURE_PREVIEW_LIMIT = 80
 FEATURE_SOURCE_PAGE_MAX_ROWS = 512
+FEATURE_LABEL_POOL_LIMIT = 4096
+FEATURE_SHARED_LABEL_FIELDS = (
+    "dataset_id", "source_title", "provider", "market_category",
+    "market_category_label", "dataset_bounds_state", "dataset_first",
+    "dataset_last", "schema_state", "availability_note", "field_role",
+)
+
+
+def decode_feature_index_payload(body: bytes | str, *, observation: dict[str, Any] | None = None) -> Any:
+    """Decode one generation, sharing only equal immutable public labels.
+
+    Keep integer, float, Unicode and unknown-field values; a missing native
+    decoder or unsupported legacy JSON retains the strict stdlib parser.
+    Do not coerce values, intern globally, cache observations across
+    revisions or truncate the inventory. Pools are bounded and released after
+    decoding; the index keeps only the strings actually referenced by rows.
+    """
+    pools: dict[str, dict[str, str]] = {key: {} for key in FEATURE_SHARED_LABEL_FIELDS}
+
+    def shared_labels(row: dict[str, Any]) -> dict[str, Any]:
+        for key, pool in pools.items():
+            value = row.get(key)
+            if isinstance(value, str):
+                if len(pool) < FEATURE_LABEL_POOL_LIMIT:
+                    row[key] = pool.setdefault(value, value)
+                elif value in pool:
+                    row[key] = pool[value]
+        return row
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"data-monitor feature snapshot has non-finite JSON: {value}")
+
+    if _native is not None:
+        try:
+            payload = _native.json.decode(body)
+        except (ValueError, TypeError, OverflowError, RecursionError, UnicodeError):
+            pass
+        else:
+            # Untyped metadata only: no financial encoding/schema conversion.
+            # Label sharing cannot change validation; from_json/from_payload
+            # still validates every original row once before building an index.
+            rows = payload.get("rows") if isinstance(payload, Mapping) else None
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        shared_labels(row)
+            if observation is not None:
+                observation.update(backend="msgspec_shared_labels")
+            return payload
+    if observation is not None:
+        observation.update(backend="stdlib_shared_labels")
+    return json.loads(body, parse_constant=reject_nonfinite, object_hook=shared_labels)
 
 
 def feature_page_revision(source_signature: tuple[int, ...]) -> str:
@@ -207,6 +264,10 @@ class FeaturePageIndex:
     generated_at_utc: str | None
 
     @classmethod
+    def from_json(cls, body: bytes | str, *, source_signature: tuple[int, ...]) -> FeaturePageIndex:
+        return cls.from_payload(decode_feature_index_payload(body), source_signature=source_signature)
+
+    @classmethod
     def from_payload(
         cls, payload: Mapping[str, Any], *, source_signature: tuple[int, ...],
     ) -> FeaturePageIndex:
@@ -303,4 +364,5 @@ __all__ = [
     "feature_page_preview", "feature_page_projections", "feature_page_revision",
     "feature_source_pages",
     "page_from_source_rows", "valid_feature_page_preview", "valid_feature_source_pages",
+    "decode_feature_index_payload",
 ]

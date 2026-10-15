@@ -1555,6 +1555,9 @@ class DataConfig:
     # Lossless transport only: the compiled model still sees the complete
     # contiguous Float32 feature tensor, with every original value/column.
     factorized_transfer_mode: str = "dense_cpu"
+    # Node-local decoded FP32 LRU budget, per DDP rank. None retains the
+    # immutable manifest's budget; changing this does not alter observations.
+    factorized_host_cache_bytes: int | None = None
     live_tail_panel_rows: int = 0
     # Product-neutral point-in-time feature table.  It uses the same canonical
     # panel join as TW public data, but cannot carry Taiwan execution rules.
@@ -2244,6 +2247,20 @@ class TransformerBasePortfolioModelConfig:
 
 @dataclass(slots=True)
 class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
+    # Opt-in research kernels; defaults retain the historical compute contract.
+    kernel_norm_backend: str = "torch"
+    kernel_linear_backend: str = "torch"
+    kernel_swiglu_backend: str = "torch"
+    kernel_attention_backend: str = "torch"
+    kernel_softmax_backend: str = "torch"
+    compact_projection_compute_dtype: str = "fp32"
+    factorized_compile_autotune: bool = False
+    factorized_cuda_graphs: bool = False
+    factorized_portfolio_cuda_graphs: bool = False
+    factorized_relaxed_precision_casts: bool = False
+    factorized_encoder_force_retention: bool = False
+    factorized_encoder_packet_cache: bool = True
+    fused_swiglu_projection: bool = False
     candle_dropout: float = 0.0
     # Optional learned low-rank mixer over every continuous raw feature before
     # the multi-basis expansion. Zero preserves historical checkpoints. A
@@ -2288,6 +2305,16 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     # Optional stable wide feature stem: normalization/projection/activation
     # stay FP32 when independent stock chunks change GEMM/reduction shapes.
     candle_projection_fp32: bool = False
+    # Lossless zero-column LayerNorm/Linear contraction. No input/parameter is
+    # discarded; reordered FP32 sums opt into a fresh optimizer trajectory.
+    factorized_compact_projection: bool = False
+    # Versioned full-schema CSR projection; fixed input normalization and
+    # source bytes may persist on GPU across updates, learned tensors may not.
+    factorized_sparse_projection: bool = False
+    factorized_sparse_cache_bytes: int = 8 * 1024**3
+    # Zero preserves the existing 1 GiB / 128-stock compact stream limit.
+    # Positive values opt into a bounded larger stream, never feature pruning.
+    factorized_compact_stream_chunk_bytes: int = 0
     # Stabilize the compact stock/market attention and allocation head across
     # partitioned compilation and multiple optimizer steps; opt-in only.
     portfolio_blocks_fp32: bool = False
@@ -2452,6 +2479,12 @@ class TrainingConfig:
     seed: int = 42
     multi_gpu_strategy: str = "auto"
     ddp_bucket_cap_mb: int = 4
+    ddp_broadcast_buffers: bool = True
+    ddp_trajectory_gradient_sync: str = "batch"
+    # Independent configured annual physical accounts are owned by one rank.
+    # Local actions never leave that rank; date-weighted gradients reduce once.
+    day_trade_annual_episode_sharding: bool = False
+    day_trade_annual_episode_world_size: int = 2
     # Keep the policy model time-sharded under DDP, then transpose the action
     # and execution tensors to contiguous symbol shards for the recurrent
     # carrying ledger. PyTorch functional collectives own autograd; there is no
@@ -2722,6 +2755,8 @@ class TrainingConfig:
     cache_eval_tensors_on_gpu: bool = True
     cache_train_features_in_amp_dtype: bool = False
     learning_rate: float = 1e-3
+    optimizer_name: str = "adamw"
+    optimizer_options: dict[str, Any] = field(default_factory=dict)
     enable_lr_scheduler: bool = True
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
     lr_scheduler_t_max: int = 0
@@ -2912,6 +2947,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
 
     training = raw.setdefault("training", {})
+    from stockagent.training.optimizer_config import normalized_optimizer_options
+    optimizer_name = str(training.get("optimizer_name", "adamw")).strip().lower()
+    optimizer_options = training.get("optimizer_options", {})
+    normalized_optimizer_options(optimizer_name, optimizer_options)
+    training["optimizer_name"] = optimizer_name
+    training["optimizer_options"] = optimizer_options
     if "eval_backtest_engine" in training:
         raise ValueError(
             "training.eval_backtest_engine has been removed; "
@@ -3018,6 +3059,27 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
+    training["ddp_broadcast_buffers"] = bool(training["ddp_broadcast_buffers"])
+    trajectory_sync = str(training["ddp_trajectory_gradient_sync"]).strip().lower()
+    if trajectory_sync not in {"batch", "trajectory"}:
+        raise ValueError("training.ddp_trajectory_gradient_sync must be batch or trajectory")
+    if trajectory_sync == "trajectory" and not any(training[key] for key in (
+        "futures_portfolio_optimizer_step_per_trajectory",
+        "day_trade_optimizer_step_per_trajectory", "crypto_optimizer_step_per_trajectory",
+    )):
+        raise ValueError("trajectory DDP synchronization requires a full-trajectory optimizer update")
+    training["ddp_trajectory_gradient_sync"] = trajectory_sync
+    training["day_trade_annual_episode_sharding"] = bool(training["day_trade_annual_episode_sharding"])
+    training["day_trade_annual_episode_world_size"] = int(training["day_trade_annual_episode_world_size"])
+    if training["day_trade_annual_episode_world_size"] < 2:
+        raise ValueError("annual episode ownership requires at least two configured ranks")
+    if training["day_trade_annual_episode_sharding"] and (
+            not training["day_trade_training_annual_episodes"]
+            or not training["day_trade_optimizer_step_per_trajectory"]
+            or trajectory_sync != "trajectory" or training["ddp_broadcast_buffers"]
+            or training["distributed_symbol_sharded_ledger"]
+            or multi_gpu_strategy not in {"auto", "distributed_data_parallel"}):
+        raise ValueError("annual episode sharding requires annual physical accounts, trajectory synchronization, immutable buffers and DDP")
     training["temporal_basis_covariance_lag_batch_size"] = int(
         training["temporal_basis_covariance_lag_batch_size"]
     )
@@ -3498,6 +3560,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["candle_projection_fp32"] = bool(
         financial_transformer["candle_projection_fp32"]
     )
+    financial_transformer["factorized_compact_projection"] = bool(
+        financial_transformer["factorized_compact_projection"]
+    )
+    financial_transformer["factorized_sparse_projection"] = bool(
+        financial_transformer["factorized_sparse_projection"]
+    )
+    financial_transformer["factorized_sparse_cache_bytes"] = int(
+        financial_transformer["factorized_sparse_cache_bytes"]
+    )
+    if financial_transformer["factorized_sparse_cache_bytes"] < 1:
+        raise ValueError("factorized_sparse_cache_bytes must be positive")
+    financial_transformer["factorized_compact_stream_chunk_bytes"] = int(
+        financial_transformer["factorized_compact_stream_chunk_bytes"]
+    )
+    if financial_transformer["factorized_compact_stream_chunk_bytes"] < 0:
+        raise ValueError("factorized_compact_stream_chunk_bytes must be nonnegative")
     financial_transformer["portfolio_blocks_fp32"] = bool(
         financial_transformer["portfolio_blocks_fp32"]
     )
@@ -4023,6 +4101,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("factorized_transfer_mode must be dense_cpu, compact_cuda, compact_cuda_packed or compact_cuda_cached")
     if data["factorized_transfer_mode"] != "dense_cpu" and not data["factorized_feature_manifest"]:
         raise ValueError("compact CUDA transport requires a factorized feature manifest")
+    data["factorized_host_cache_bytes"] = _normalize_optional_positive_int(
+        data["factorized_host_cache_bytes"], field_name="data.factorized_host_cache_bytes"
+    )
     raw_physical_public_path = data["day_trade_physical_public_feature_path"]
     data["day_trade_physical_public_feature_path"] = (
         None
@@ -5525,6 +5606,10 @@ def load_config(
             seed=training_raw["seed"],
             multi_gpu_strategy=training_raw["multi_gpu_strategy"],
             ddp_bucket_cap_mb=training_raw["ddp_bucket_cap_mb"],
+            ddp_broadcast_buffers=training_raw["ddp_broadcast_buffers"],
+            ddp_trajectory_gradient_sync=training_raw["ddp_trajectory_gradient_sync"],
+            day_trade_annual_episode_sharding=training_raw["day_trade_annual_episode_sharding"],
+            day_trade_annual_episode_world_size=training_raw["day_trade_annual_episode_world_size"],
             distributed_symbol_sharded_ledger=training_raw[
                 "distributed_symbol_sharded_ledger"
             ],
@@ -5831,6 +5916,8 @@ def load_config(
                 "cache_train_features_in_amp_dtype"
             ],
             learning_rate=training_raw["learning_rate"],
+            optimizer_name=training_raw["optimizer_name"],
+            optimizer_options=training_raw["optimizer_options"],
             enable_lr_scheduler=training_raw["enable_lr_scheduler"],
             lr_scheduler=training_raw["lr_scheduler"],
             lr_scheduler_t_max=training_raw["lr_scheduler_t_max"],

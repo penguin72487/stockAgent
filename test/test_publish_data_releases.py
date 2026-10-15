@@ -35,6 +35,32 @@ def test_writer_gate_uses_script_argv_not_waiting_shell_text():
     assert [r["pid"] for r in module._blockers(entry, commands)] == [2]
 
 
+def test_writer_gate_also_recognizes_python_module_argv():
+    module = _module()
+    entry = {"active_process_substrings": ["build_shioaji_tw_minute_dataset.py"]}
+    commands = [(1, "python -m scripts.build_shioaji_tw_minute_dataset --output-root data"),
+                (2, "bash -c 'python -m scripts.build_shioaji_tw_minute_dataset'")]
+    assert [r["pid"] for r in module._blockers(entry, commands)] == [1]
+
+
+def test_all_ready_failure_is_isolated_from_other_datasets(tmp_path, monkeypatch, capsys):
+    module = _module()
+    entries = [{"dataset": "broken"}, {"dataset": "good"}]
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: entries)
+    source = _source(tmp_path, "2026-10-06")
+    release = publish_packed_snapshot(tmp_path/'cold', 'good', source, node_id='test-node')
+    def publish(entry, *_args):
+        if entry['dataset'] == 'broken':
+            raise SnapshotError('source validation rejected')
+        return {'publish_ready': True}, release
+    monkeypatch.setattr(module, '_publish_entry', publish)
+    assert module.main(['publish', '--all-ready', '--sync-root', str(tmp_path/'cold'),
+                        '--node-id', 'test-node']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [r['dataset'] for r in result['published']] == ['good']
+    assert result['skipped'][0]['validation_or_publication_error'] == 'source validation rejected'
+
+
 def test_bybit_release_keeps_data_but_excludes_rebuildable_panel_cache(
     tmp_path: Path,
 ) -> None:

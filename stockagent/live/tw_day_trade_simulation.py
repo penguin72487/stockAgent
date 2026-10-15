@@ -78,6 +78,9 @@ from stockagent.live.benchmark_accounting import (
     settle_roll_wealth,
 )
 from stockagent.live.quote_provider import PriceSnapshot
+from stockagent.live.opening_execution_latency import (
+    OpeningExecutionObserver, signal_registration_committed, unsized_target_count,
+)
 from stockagent.live.tw_day_trade_monitor_projection import build_shioaji_monitor_projection
 from stockagent.live.tw_day_trade_service_sync import (
     SERVICE_SYNC_FILENAME,
@@ -245,6 +248,38 @@ def _fresh_regular_execution_quote(
     return False
 
 
+def _completed_minute_replay_quote(
+    mode: Mapping[str, Any], quote: Mapping[str, Any], observed_at: datetime,
+) -> bool:
+    """Admit source-backed paper bars without fabricating live L1 metadata."""
+    now = _now_taipei(observed_at)
+    stamp = _parse_timestamp(quote.get("quote_at"))
+    low, high = _finite(quote.get("historical_bar_low")), _finite(quote.get("historical_bar_high"))
+    opening, close = _finite(quote.get("historical_bar_open")), _finite(quote.get("valuation_price_0901"))
+    return bool(
+        mode.get("simulation_replay") is True
+        and mode.get("counterfactual_open_replay") is True
+        and mode.get("historical_minute_valuation") is True
+        and mode.get("entry_fill_contract") in {
+            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+        }
+        and mode.get("session_date") == now.date().isoformat()
+        and quote.get("historical_minute_valuation") is True
+        and quote.get("source") == "retained_right_labelled_1m_ohlcv_counterfactual"
+        and quote.get("fill_contract") == (
+            "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
+            if mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+            else "historical_1m_ohlcv_counterfactual_not_executable_bid_ask"
+        )
+        and stamp == now and now.second == 0 and now.microsecond == 0
+        and ENTRY_GATE <= now.time() <= SESSION_CLOSE
+        and (_finite(quote.get("observed_minute_volume_lots")) or 0) > 0
+        and low is not None and high is not None and 0 < low <= high
+        and opening is not None and low <= opening <= high
+        and close is not None and low <= close <= high
+    )
+
+
 def _quote_after_signal(
     quote: Mapping[str, Any], signal_at: datetime, *, allow_equal: bool = False
 ) -> bool:
@@ -314,7 +349,7 @@ def _pending_entry_reason_counts(
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for order in orders.values():
-        if order.get("status") != "working":
+        if order.get("status") not in {"working", "waiting_source"}:
             continue
         reason = str(order.get("last_wait_reason") or "waiting_quote")
         counts[reason] = counts.get(reason, 0) + 1
@@ -566,6 +601,7 @@ def _prepare_entry_plan(
     status = "ready"
     reason: str | None = None
     sizing_price = _finite(quote_values.get("open")) or _finite(row.get("open_price"))
+    pending_opening_price = bool(row.get("opening_price_wait_reason"))
     synthetic_open_fill = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
     )
@@ -581,6 +617,11 @@ def _prepare_entry_plan(
     minute_price_at_0901 = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
     )
+    # register_signal admits this exception only for an explicitly labelled
+    # 09:01 counterfactual replay. Historical ticks/KBars have a completed
+    # minute clock, not a live L1 exchange clock. Preserve live quote freshness
+    # checks even when their provider prefix happens to be the same.
+    completed_minute_replay = minute_price_at_0901 and allow_quote_at_signal
     prior_fill = (
         quote_values.get("historical_prior_paper_fill")
         if spec.historical_full_fill_at_0901
@@ -626,9 +667,9 @@ def _prepare_entry_plan(
         status, reason = "hold", "zero_target_weight"
     elif not reduce_only and not bool(row.get("tradable")):
         status, reason = "blocked", "model_tradable_mask_false"
-    elif not reduce_only and side == "long" and not bool(row.get("can_buy")):
+    elif not reduce_only and side == "long" and not bool(row.get("can_buy")) and not pending_opening_price:
         status, reason = "blocked", "cannot_buy_open"
-    elif not reduce_only and side == "short" and not bool(row.get("can_sell")):
+    elif not reduce_only and side == "short" and not bool(row.get("can_sell")) and not pending_opening_price:
         status, reason = "blocked", "cannot_sell_open"
     elif not reduce_only and (evidence is None or not evidence.covered):
         status, reason = "blocked", "exact_session_eligibility_missing"
@@ -638,10 +679,15 @@ def _prepare_entry_plan(
         status, reason = "blocked", "sell_first_suspended"
     elif sizing_price is None:
         status, reason = (
-            ("blocked", "official_session_no_trade_print")
+            ("waiting_source" if pending_opening_price else "blocked", "official_session_no_trade_print")
             if bool(quote_values.get("official_session_no_trade_print"))
-            else ("blocked", "official_open_price_unavailable")
+            else ("waiting_source" if pending_opening_price else "blocked", "official_open_price_unavailable")
         )
+    elif pending_opening_price and (
+        side == "long" and _finite(quote_values.get("upper_limit")) == sizing_price
+        or side == "short" and _finite(quote_values.get("lower_limit")) == sizing_price
+    ):
+        status, reason = "blocked", "opening_direction_at_daily_limit"
 
     requested_shares = 0
     filled_shares = 0
@@ -669,7 +715,8 @@ def _prepare_entry_plan(
                 _quote_after_signal(
                     quote_values, signal_at, allow_equal=allow_quote_at_signal
                 )
-                if causal_market_full_target or spec.strict_intraday
+                if (causal_market_full_target or spec.strict_intraday)
+                and not completed_minute_replay
                 else (quote_at >= signal_at if allow_quote_at_signal else quote_at > signal_at)
             )
             and quote_at <= observation_at
@@ -1355,6 +1402,7 @@ class TwDayTradeSimulationEngine:
         self.benchmark_marks_path = self.state_dir / "benchmark_marks.jsonl"
         self.events_path = self.state_dir / "events.jsonl"
         self.latency_path = self.state_dir / "latency.jsonl"
+        self.execution_latency_path = self.state_dir / "execution_latency.jsonl"
         self.final_settlement_path = Path(final_settlement_path)
         self._tx_final_settlement_error: str | None = None
         self._corporate_action_reference_path: Path | None = None
@@ -1383,6 +1431,7 @@ class TwDayTradeSimulationEngine:
         self._restore_position_artifact_paths()
         if stock_benchmarks_migrated or tx_benchmark_migrated or entry_retry_recovered:
             _atomic_json(self.state_path, self.state)
+        self._opening_execution_observer = OpeningExecutionObserver(self.state.get("modes", {}))
 
     @staticmethod
     def _ledger_rows_for_order_ids(
@@ -1535,6 +1584,8 @@ class TwDayTradeSimulationEngine:
             if int(mode.get("entry_filled_shares") or 0)
             else "no_fill"
         )
+        if mode.get("pending_entry_source_count"):
+            mode["entry_fill_outcome"] = "partial_waiting_source" if mode.get("entry_filled_shares") else "waiting_source"
         mode["entry_retry_recovery"] = {
             "recovered_at": _iso(),
             "marker_contract": (
@@ -3401,6 +3452,7 @@ class TwDayTradeSimulationEngine:
         *,
         now: datetime | None = None,
         reason: str,
+        completed_session_replay: bool = False,
     ) -> str:
         """Allow one replacement signal only when the session never filled.
 
@@ -3413,7 +3465,11 @@ class TwDayTradeSimulationEngine:
 
         observed = _now_taipei(now)
         wall_time = observed.timetz().replace(tzinfo=None)
-        if wall_time < LIVE_ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
+        # A source-pinned, never-filled completed-session replay is separate
+        # from reopening live entry. Its audit event retains the real operation
+        # clock; callers must not backdate `now` to bypass the live window.
+        postclose_replay = completed_session_replay and wall_time >= SESSION_CLOSE
+        if not postclose_replay and (wall_time < LIVE_ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME):
             raise RuntimeError("flat-session rearm is outside the entry window")
         normalized_reason = str(reason or "").strip()
         if not normalized_reason:
@@ -3465,6 +3521,7 @@ class TwDayTradeSimulationEngine:
             previous_signal_id=previous_signal_id,
             previous_entry_completed_at=previous_entry_completed_at,
             previous_signal_counts=previous_signal_counts,
+            completed_session_replay=postclose_replay,
         )
         self._persist(observed)
         return "rearmed"
@@ -3601,6 +3658,8 @@ class TwDayTradeSimulationEngine:
         result: str,
         summary: Mapping[str, Any],
         consumer_detected_at: datetime,
+        signal_commit_attempt_at: datetime | None = None,
+        source_recovery_wait_reason: str | None = None,
         ledger_persisted_at: datetime,
         executor_quote_fetch_ms: float,
         eligibility_load_ms: float,
@@ -3677,6 +3736,9 @@ class TwDayTradeSimulationEngine:
             "signal_other_compute_ms": signal_other_ms,
             "artifact_publish_ms": _finite(live_latency.get("artifact_publish_ms")),
             "artifact_discovery_ms": elapsed_ms(published_at, consumer_detected_at),
+            "source_recovery_wait_ms": elapsed_ms(
+                consumer_detected_at, signal_commit_attempt_at or consumer_detected_at
+            ),
             "opening_signal_batch_wait_ms": round(
                 max(0.0, opening_signal_batch_wait_ms), 3
             ),
@@ -3717,6 +3779,9 @@ class TwDayTradeSimulationEngine:
                 "consumer_detected_at": consumer_detected_at.isoformat(
                     timespec="microseconds"
                 ),
+                "signal_commit_attempt_at": (signal_commit_attempt_at or consumer_detected_at).isoformat(timespec="microseconds"),
+                "source_recovery_wait_reason": source_recovery_wait_reason,
+                "latency_stage_contract": "first_pointer_detection_then_retry_wait_v2",
                 "ledger_persisted_at": ledger_persisted_at.isoformat(
                     timespec="microseconds"
                 ),
@@ -3893,6 +3958,28 @@ class TwDayTradeSimulationEngine:
         )
         if wall_time < entry_gate or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
+        inputs_ready = summary.get("opening_model_inputs_ready")
+        invalid_coverage = (
+            summary.get("opening_coverage_gate_basis") == "same_session_open_price"
+            and int(summary.get("opening_price_active_count") or 0) < int(summary.get("opening_price_required_count") or 0)
+        )
+        if summary.get("opening_coverage_gate_basis") == "same_session_open_or_observed_no_print":
+            resolved = int(summary.get("opening_input_resolved_count") or 0)
+            active = int(summary.get("opening_price_active_symbol_count") or 0)
+            invalid_coverage = (
+                resolved < int(summary.get("opening_input_required_count") or 0)
+                or resolved != int(summary.get("opening_price_active_count") or 0) + int(summary.get("opening_no_print_active_count") or 0)
+                or not 0 <= resolved <= active
+            )
+        if invalid_coverage or inputs_ready is False or (inputs_ready is None and summary.get("opening_source_complete") is False):
+            # Recoverable acquisition wait, not a model-selected cash day.
+            # Do not consume the signal or create orders from incomplete input.
+            mode["pending_signal_id"] = signal_id
+            mode["engine_status"] = "waiting_opening_source"
+            mode["opening_missing_symbols"] = list(summary.get("opening_missing_symbols") or [])
+            self._persist(observed)
+            return "waiting_source"
+        mode.pop("opening_missing_symbols", None)
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
                 mode, signal_id, "open_feature_not_observed", observed
@@ -4117,6 +4204,8 @@ class TwDayTradeSimulationEngine:
             self._archive_mode_positions(mode, archived_at=observed)
 
         mode["session_date"] = observed.date().isoformat()
+        mode.pop("entry_sweep_completed_at", None)
+        mode["entry_post_0901_minute_price_fill_count"] = 0
         mode["session_valid"] = True
         mode.pop("non_session_invalidated_at", None)
         mode.pop("non_session_invalidation_reason", None)
@@ -4436,6 +4525,14 @@ class TwDayTradeSimulationEngine:
                 and lower is not None
                 and sizing_price is not None
             )
+            # A source-waiting target has an unknown share count, not a zero
+            # target. Persist a private unpriced template and size it exactly
+            # once from a later genuine session open using frozen session NAV.
+            unsized_source_wait = bool(
+                not counterfactual_open_replay
+                and spec.entry_fill_policy in {ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET, ENTRY_FILL_POLICY_CAUSAL_BOOK}
+                and status == "waiting_source" and target_weight != 0.0
+            )
             if (
                 status
                 not in {
@@ -4444,13 +4541,13 @@ class TwDayTradeSimulationEngine:
                     "forced_synthetic_fill",
                 }
                 or entry_price is None
-            ) and not retryable:
+            ) and not retryable and not unsized_source_wait:
                 continue
             # A zero-fill template is private pending-order metadata. It never
             # enters positions/fills until an actual causal quote is consumed.
-            entry_price = entry_price if entry_price is not None else sizing_price
+            entry_price = None if unsized_source_wait else entry_price if entry_price is not None else sizing_price
 
-            upper_bracket = float(
+            upper_bracket = None if upper is None else float(
                 move_price_ticks_numpy(
                     np.asarray([upper], dtype=np.float64),
                     -offset_ticks,
@@ -4458,7 +4555,7 @@ class TwDayTradeSimulationEngine:
                     security_types=security_types_by_symbol[symbol],
                 )[0]
             )
-            lower_bracket = float(
+            lower_bracket = None if lower is None else float(
                 move_price_ticks_numpy(
                     np.asarray([lower], dtype=np.float64),
                     offset_ticks,
@@ -4472,8 +4569,8 @@ class TwDayTradeSimulationEngine:
                 symbol
             ]
             entry_rate = buy_rate if side == "long" else sell_rate
-            entry_gross_fee = filled_shares * entry_price * entry_rate
-            entry_rebate = filled_shares * entry_price * rebate_rate
+            entry_gross_fee = filled_shares * entry_price * entry_rate if filled_shares else 0.0
+            entry_rebate = filled_shares * entry_price * rebate_rate if filled_shares else 0.0
             entry_fee = entry_gross_fee - entry_rebate
             position_id = f"{spec.market}:{observed.date().isoformat()}:{symbol}"
             entry_order_id = f"{position_id}:entry"
@@ -4562,13 +4659,15 @@ class TwDayTradeSimulationEngine:
                     plan["counterfactual_open_price_fill"]
                 ),
             }
-            if retryable:
+            if retryable or unsized_source_wait:
                 mode["pending_entry_orders"][symbol] = {
                     "position": dict(position), "remaining_shares": requested_shares - filled_shares,
                     "last_cumulative_volume_lots": quote.get("cumulative_volume_lots"),
                     "minute": observed.strftime("%Y-%m-%dT%H:%M"),
                     "minute_used_shares": filled_shares,
-                    "status": "working", "sequence": 0,
+                    "status": "waiting_source" if unsized_source_wait else "working", "sequence": 0,
+                    "sizing_pending": unsized_source_wait,
+                    "last_wait_reason": row.get("opening_price_wait_reason") if unsized_source_wait else reason,
                 }
             if filled_shares <= 0:
                 continue
@@ -4777,12 +4876,20 @@ class TwDayTradeSimulationEngine:
             for order in (mode.get("pending_entry_orders") or {}).values()
             if order.get("status") == "working"
         )
+        mode["pending_entry_source_count"] = sum(
+            order.get("status") == "waiting_source" for order in mode["pending_entry_orders"].values()
+        )
+        if mode["pending_entry_source_count"]:
+            entry_fill_outcome = "partial_waiting_source" if entry_fill_count else "waiting_source"
         mode["pending_reduction_shares"] = sum(
             int(order.get("remaining_shares") or 0)
             for order in (mode.get("pending_reduction_orders") or {}).values()
             if order.get("status") == "working"
         )
         mode["entry_fill_outcome"] = entry_fill_outcome
+        if (deterministic_0901_minute_price_fill and entry_requested_shares > 0
+                and entry_filled_shares == entry_requested_shares):
+            mode["entry_sweep_completed_at"] = observed.isoformat(timespec="seconds")
         mode["entry_best_quote_fill_count"] = entry_best_quote_fill_count
         mode["entry_synthetic_fallback_fill_count"] = (
             entry_synthetic_fallback_fill_count
@@ -4846,6 +4953,8 @@ class TwDayTradeSimulationEngine:
                 int(item.get("signed_shares") or 0) != 0
                 for item in mode["positions"].values()
             )
+            else "waiting_opening_source"
+            if mode.get("pending_entry_source_count")
             else "entry_price_missing_no_fill"
             if entry_requested_shares > 0 and entry_fill_count == 0
             else "flat_no_executable_signal"
@@ -5359,6 +5468,61 @@ class TwDayTradeSimulationEngine:
                 timespec="seconds"
             )
 
+    def _size_pending_opening_orders(self, mode, quotes, now):
+        """Resolve only unsized names, retaining the published weights and NAV.
+
+        A private zero-fill template is not inventory. Only a fresh, causal,
+        non-trial source with today's real open and legal limits can turn it
+        into the existing market-order retry path. No inference or fake price.
+        """
+        orders = mode.get("pending_entry_orders") or {}
+        if mode.get("session_date") != now.date().isoformat():
+            return
+        signal_at = _parse_timestamp(mode.get("signal_at"))
+        for symbol, order in orders.items():
+            if order.get("status") != "waiting_source" or not order.get("sizing_pending"):
+                continue
+            if now.time() >= EXIT_LIMIT_TIME:
+                order["status"] = "cancelled_exit_priority"
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            if signal_at is None or not self._fresh_regular_quote(quote, now) or not _quote_after_signal(quote, signal_at):
+                continue
+            opening, upper, lower = (_finite(quote.get(key)) for key in ("open", "upper_limit", "lower_limit"))
+            if opening is None or upper is None or lower is None or not lower <= opening <= upper:
+                continue
+            template = order["position"]
+            side = template["side"]
+            if (side == "long" and opening == upper) or (side == "short" and opening == lower):
+                order["last_wait_reason"] = "opening_direction_at_daily_limit"
+                continue
+            quantity = whole_lot_target_shares(
+                float(template["target_weight"]), float(mode["session_sizing_nav_twd"]),
+                opening, int(template["lot_size"]),
+            )
+            if quantity <= 0:
+                order.update(status="skipped_below_one_board_lot", sizing_pending=False)
+                continue
+            security = template.get("security_type") or "stock"
+            if not bool(price_on_tick_grid_numpy(np.array([opening]), np.array([now.date()]), security_types=security)[0]):
+                order["last_wait_reason"] = "opening_price_off_tick_grid"
+                continue
+            offset = int(template["price_limit_offset_ticks"])
+            top = float(move_price_ticks_numpy(np.array([upper]), -offset, np.array([now.date()]), security_types=security)[0])
+            bottom = float(move_price_ticks_numpy(np.array([lower]), offset, np.array([now.date()]), security_types=security)[0])
+            template.update(
+                requested_shares=quantity, target_unsubmitted_shares=quantity,
+                sizing_open_price=opening, upper_limit=upper, lower_limit=lower,
+                take_profit_price=top if side == "long" else bottom,
+                stop_trigger_price=bottom if side == "long" else top,
+                entry_price=opening, last_mark_price=opening,
+            )
+            order.update(status="working", sizing_pending=False, remaining_shares=quantity,
+                         sized_at=now.isoformat(), sizing_quote_at=quote.get("quote_at"))
+            mode["entry_requested_shares"] = int(mode.get("entry_requested_shares") or 0) + quantity
+            mode["entry_unfilled_shares"] = int(mode.get("entry_unfilled_shares") or 0) + quantity
+        mode["pending_entry_source_count"] = sum(o.get("status") == "waiting_source" for o in orders.values())
+
     def _retry_entry_orders(self, mode, quotes, now):
         """Continue a frozen daily target; never re-infer, re-size, or reopen exits.
 
@@ -5370,6 +5534,7 @@ class TwDayTradeSimulationEngine:
         intent marker quarantines an interrupted append on restart.
         """
         orders = mode.get("pending_entry_orders") or {}
+        self._size_pending_opening_orders(mode, quotes, now)
         entry_fill_policy = str(
             mode.get("configured_entry_fill_policy")
             or mode.get("entry_fill_policy")
@@ -5733,6 +5898,8 @@ class TwDayTradeSimulationEngine:
             if int(mode.get("entry_filled_shares") or 0)
             else "no_fill"
         )
+        if mode.get("pending_entry_source_count"):
+            mode["entry_fill_outcome"] = "partial_waiting_source" if mode.get("entry_filled_shares") else "waiting_source"
         mode.pop("entry_retry_pending_commit", None)
         self._persist(now)
 
@@ -5903,7 +6070,7 @@ class TwDayTradeSimulationEngine:
         if signed == 0:
             return
         strict = mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT
-        if strict and not self._fresh_regular_quote(quote, now):
+        if strict and not (self._fresh_regular_quote(quote, now) or _completed_minute_replay_quote(mode, quote, now)):
             position["exit_quote_status"] = "waiting_fresh_non_trial_quote"
             return
         bid = _finite(quote.get("bid"))
@@ -6477,6 +6644,8 @@ class TwDayTradeSimulationEngine:
             return "critical_adverse_limit_exception"
         if int(mode.get("pending_entry_shares") or 0):
             return "entry_partial_retrying"
+        if int(mode.get("pending_entry_source_count") or 0):
+            return "waiting_opening_source"
         return None
 
     def _settle_intraday_auction(self, market, mode, quotes, now) -> None:
@@ -7078,12 +7247,16 @@ class TwDayTradeSimulationEngine:
         if signed == 0:
             return
         if mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
-            if not self._fresh_regular_quote(quote, now):
+            replay_quote = _completed_minute_replay_quote(mode, quote, now)
+            if not (self._fresh_regular_quote(quote, now) or replay_quote):
                 position["exit_quote_status"] = "waiting_fresh_non_trial_quote"
                 return
             lower, upper = _finite(position.get("lower_limit")), _finite(position.get("upper_limit"))
             if lower is None or upper is None or not lower <= price <= upper:
                 position["exit_quote_status"] = "invalid_execution_price_limits"
+                return
+            if replay_quote and not float(quote["historical_bar_low"]) <= price <= float(quote["historical_bar_high"]):
+                position["exit_quote_status"] = "execution_price_outside_historical_range"
                 return
         if str(position.get("share_replacement_halted_until") or "") > now.date().isoformat():
             return
@@ -7380,6 +7553,7 @@ class TwDayTradeSimulationEngine:
             - float(mode.get("cumulative_carry_cost_twd") or 0.0)
         )
         flat_status = "flat"
+        source_waiting = int(mode.get("pending_entry_source_count") or 0) > 0
         if str(mode.get("session_date") or "") == now.date().isoformat() and mode.get(
             "entry_completed_at"
         ):
@@ -7423,6 +7597,8 @@ class TwDayTradeSimulationEngine:
                     and open_count
                     else "active"
                     if open_count
+                    else "waiting_opening_source"
+                    if source_waiting
                     else flat_status
                 ),
             }
@@ -7653,6 +7829,12 @@ class TwDayTradeSimulationEngine:
                 "engine_run_id": self._engine_run_id,
                 "updated_at": observed.isoformat(timespec="seconds"),
                 "health": health,
+                "opening_execution_observer": {
+                    "contract": "state_fsync_then_paper_target_progress_v1",
+                    "progress_path": str(self.execution_latency_path),
+                    "unchanged_state_emits_no_rows": True,
+                    "broker_fill_measurement": False,
+                },
                 "shioaji_monitor_projection": build_shioaji_monitor_projection(
                     self.state, self.state_path, state_revision=revision,
                 ),
@@ -7751,6 +7933,7 @@ class TwDayTradeSimulationEngine:
                             "terminal_close_contract",
                             "configured_terminal_close_contract",
                             "pending_entry_shares",
+                            "pending_entry_source_count",
                             "pending_entry_reason_counts",
                             "manual_close_settlement",
                             "closing_auction_pending_count",
@@ -7780,7 +7963,8 @@ class TwDayTradeSimulationEngine:
                             "rebalance_reduction_fill_count",
                             "ledger_state_divergence",
                         )
-                    }
+                    } | {"unsized_entry_target_count": unsized_target_count(item),
+                         "signal_registration_committed": signal_registration_committed(item)}
                     for item in mode_rows
                 },
             },
@@ -7817,6 +8001,7 @@ class TwDayTradeSimulationEngine:
                             "entry_filled_shares",
                             "entry_unfilled_shares",
                             "pending_entry_shares",
+                            "pending_entry_source_count",
                             "pending_entry_reason_counts",
                             "entry_fill_outcome",
                             "signal_reason_counts",
@@ -7842,6 +8027,27 @@ class TwDayTradeSimulationEngine:
             "projection_fingerprint_ms": round((fingerprint_completed - persist_started) * 1000.0, 3),
             "files": writes,
         }
+        # This observer follows the committed state, not the economic event's
+        # 09:01 replay timestamp. It never changes a fill or readiness gate.
+        observer_started = perf_counter()
+        try:
+            samples = self._opening_execution_observer.samples(
+                self.state.get("modes", {}),
+                committed_at=_now_taipei(self._publication_clock() if self._publication_clock else now),
+                state_revision=revision, engine_run_id=self._engine_run_id,
+                clock_basis=("engine_publication_clock_not_economic_event" if self._publication_clock
+                             else "offline_event_clock_not_live_latency"),
+            )
+            if samples:
+                _append_jsonl_many(self.execution_latency_path, samples)
+                self._opening_execution_observer.acknowledge(self.state.get("modes", {}))
+            self.last_persist_metrics["execution_observer_rows"] = len(samples)
+        except Exception as exc:
+            # Losing telemetry must not interrupt liquidation or rewrite the
+            # economic state as failed. Preserve the observer error for audits.
+            self.last_persist_metrics["execution_observer_error"] = type(exc).__name__
+        self.last_persist_metrics["execution_observer_ms"] = round(
+            (perf_counter() - observer_started) * 1000, 3)
 
 
 __all__ = [

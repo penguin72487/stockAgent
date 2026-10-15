@@ -100,6 +100,9 @@ def test_source_identity_includes_untracked_code_but_not_private_files(tmp_path)
     code.write_text("value = 1\n")
     plotter = tmp_path / "plot_epoch_curves.py"
     plotter.write_text("plotter_version = 1\n")
+    cuda = tmp_path / "scripts/tile.cu"
+    cuda.parent.mkdir()
+    cuda.write_text("// compiled training dependency v1\n")
     private = tmp_path / ".env"
     private.write_text("SECRET=private\n")
     page = tmp_path / "services/public_dashboards/index.html"
@@ -107,10 +110,12 @@ def test_source_identity_includes_untracked_code_but_not_private_files(tmp_path)
     page.write_text("<p>real public application</p>\n")
     first = source_identity(tmp_path)
     assert set(first["files"]) == {
-        "stockagent/nested/runner.py", "services/public_dashboards/index.html", "plot_epoch_curves.py",
+        "stockagent/nested/runner.py", "services/public_dashboards/index.html", "plot_epoch_curves.py", "scripts/tile.cu",
     }
     private.write_text("SECRET=changed\n")
     assert source_identity(tmp_path)["source_sha256"] == first["source_sha256"]
+    cuda.write_text("// compiled training dependency v2\n")
+    assert source_identity(tmp_path)["files"]["scripts/tile.cu"] != first["files"]["scripts/tile.cu"]
     plotter.write_text("plotter_version = 2\n")
     assert source_identity(tmp_path)["files"]["plot_epoch_curves.py"] != first["files"]["plot_epoch_curves.py"]
     code.write_text("value = 2\n")

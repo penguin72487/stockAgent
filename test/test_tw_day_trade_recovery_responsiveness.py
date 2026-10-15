@@ -24,6 +24,87 @@ def _fetched(symbols):
     )
 
 
+@pytest.mark.parametrize("clock,expected", [
+    ((8, 54, 59), False), ((8, 55, 0), True), ((8, 59, 29), True),
+    ((8, 59, 30), False), ((9, 0, 0), False), ((9, 0, 14), False),
+    ((9, 0, 15), True), ((9, 9, 59), True), ((9, 10, 0), False),
+])
+def test_opening_stream_prearm_preserves_protected_window_and_execution_priority(clock, expected):
+    observed = NOW.replace(hour=clock[0], minute=clock[1], second=clock[2])
+    kwargs = dict(monotonic_now=100., last_attempt_at=98., reconciliation_pending=False)
+    assert runner._opening_stream_watch_due(observed, has_execution_symbols=False, **kwargs) is expected
+    assert not runner._opening_stream_watch_due(observed, has_execution_symbols=True, **kwargs)
+    assert not runner._opening_stream_watch_due(observed, has_execution_symbols=False, **{**kwargs, "last_attempt_at": 100.})
+
+
+def test_prearm_uses_exact_official_trading_scope_and_does_not_claim_full_stream(monkeypatch):
+    monkeypatch.setattr(runner, "load_current_universe", lambda date: {
+        "fingerprint": "official-version", "records": [
+            {"symbol": "2330", "trading_status": "listed_for_regular_trading"},
+            {"symbol": "4905", "trading_status": "listed_for_regular_trading"},
+            {"symbol": "1111", "trading_status": "halted"},
+        ],
+    })
+    calls = []
+
+    def stream(symbols, *, trading_date, allow_rotation):
+        calls.append((symbols, trading_date, allow_rotation))
+        return {s: {"stream_subscribed": s == "2330", "available": False,
+                    "stream_reconciliation_pending": False} for s in symbols}
+
+    monkeypatch.setattr(runner, "fetch_shioaji_stock_live_quotes", stream)
+    first = runner._prepare_opening_stream_watch(NOW.replace(hour=8, minute=59, second=10))
+    frozen = runner._prepare_opening_stream_watch(NOW.replace(hour=8, minute=59, second=25))
+    assert calls == [(["2330", "4905"], NOW.date(), True), (["2330", "4905"], NOW.date(), False)]
+    assert first == frozen
+    assert frozen["official_trading_count"] == 2
+    assert frozen["subscribed_count"] == 1
+    assert not frozen["full_market_stream_coverage"]
+    assert frozen["received_fresh_quote_count"] == 0
+
+
+def test_source_client_warm_does_not_require_all_execution_permissions_or_contracts(monkeypatch):
+    monkeypatch.setattr(runner, "load_current_universe", lambda _date: {
+        "fingerprint": "current", "records": [
+            {"symbol": "2330", "trading_status": "listed_for_regular_trading"},
+            {"symbol": "4905", "trading_status": "listed_for_regular_trading"},
+        ]})
+    calls = []
+    monkeypatch.setattr(runner, "warm_shioaji_stock_quote_client", lambda symbols: (
+        calls.append(symbols) or {"ready": False, "resolved_count": 1, "missing_count": 1}))
+    monkeypatch.setattr(runner, "_cached_live_eligibility", lambda *a, **k: (
+        _ for _ in ()).throw(AssertionError("opening data prewarm must not depend on trading permission")))
+    result = runner._warm_official_opening_quote_client(NOW)
+    assert result["authenticated_session_ready"]
+    assert not result["ready"]
+    assert result["official_trading_count"] == 2
+    assert result["missing_count"] == 1
+    assert calls == [["2330", "4905"]]
+
+
+def test_incomplete_opening_subscriptions_reconcile_fast_but_cannot_force_all_day_busy_poll():
+    kwargs = dict(fast_seconds=.1, has_pending_signal=False, has_open_position=False,
+                  has_pending_opening_stream=True)
+    assert runner._loop_sleep_seconds(NOW.replace(hour=8, minute=55), **kwargs) == .1
+    assert runner._loop_sleep_seconds(NOW.replace(hour=8, minute=54), **kwargs) == 1.
+    assert runner._loop_sleep_seconds(NOW.replace(hour=9, minute=20), **kwargs) == 1.
+
+
+@pytest.mark.parametrize("clock", [(8, 54), (8, 59, 30), (9, 0), (9, 5), (13, 0), (19, 0)])
+def test_partial_contracts_do_not_repeat_session_probes_in_hot_path_or_intraday(clock):
+    observed = NOW.replace(hour=clock[0], minute=clock[1], second=clock[2] if len(clock) > 2 else 0)
+    assert not runner._quote_client_prewarm_due(observed, client_warmed_session=NOW.date().isoformat(),
+        contracts_warmed_session=None, monotonic_now=100., retry_after=0.)
+
+
+def test_contract_retries_are_preopen_and_cold_restore_still_works():
+    kwargs = dict(client_warmed_session=NOW.date().isoformat(), contracts_warmed_session=None,
+                  monotonic_now=100., retry_after=0.)
+    assert runner._quote_client_prewarm_due(NOW.replace(hour=8, minute=55), **kwargs)
+    assert runner._quote_client_prewarm_due(NOW, **{**kwargs, "client_warmed_session": None})
+    assert not runner._quote_client_prewarm_due(NOW.replace(hour=9, minute=0), **{**kwargs, "client_warmed_session": None})
+
+
 def test_recovery_batches_are_durable_and_restart_skips_cached_prices(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(runner, "load_local_stock_0901_vwaps", _local_empty)
@@ -245,6 +326,8 @@ def test_large_quote_universe_reconciles_before_ttl_without_exceeding_subscripti
     first_target = set(subscribed)
     assert len(first_target) == 200
     clock[0] = provider._SHIOAJI_STREAM_ROTATION_AT + 0.01
+    provider.fetch_shioaji_stock_live_quotes(symbols, trading_date=NOW.date(), allow_rotation=False)
+    assert set(subscribed) == first_target
     started = clock[0]
     reconcile()
     assert len(subscribed) == 200

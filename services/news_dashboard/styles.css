@@ -1,0 +1,30 @@
+.news-search{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:16px 0}
+.news-search input,.news-search select{min-height:44px;min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--dashboard-surface);color:var(--ink);padding:10px;font:inherit}
+.news-search input{flex:1 1 240px;max-width:540px}
+.news-pagination{display:flex;gap:16px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:18px}
+.news-pagination button{min-height:44px;min-width:92px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--dashboard-surface);color:var(--ink);cursor:pointer}
+.news-pagination button:disabled{opacity:.45;cursor:default}
+.news-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.news-facts div{padding:14px;border:1px solid var(--line);border-radius:10px;min-width:0}
+.news-facts dt{color:var(--muted);font-size:12px}.news-facts dd{margin:8px 0 0;overflow-wrap:anywhere}
+.news-provider-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;font-size:13px}
+.news-provider-facts dt{color:var(--muted)}.news-provider-facts dd{margin:4px 0;overflow-wrap:anywhere}
+.news-provider-note{font-size:12px;line-height:1.7;color:var(--muted);overflow-wrap:anywhere;margin:10px 0 0}
+.news-provider-identity strong,.news-provider-identity small{display:block;overflow-wrap:anywhere}
+.news-provider-identity small{margin-top:4px;color:var(--muted);font-size:12px}
+.news-provider-progress{width:100%;height:10px;accent-color:var(--cyan);margin:12px 0 6px}
+.news-provider-states{font-size:12px;line-height:1.8;color:var(--muted);overflow-wrap:anywhere}
+.news-provider-list{margin-top:12px;border-top:1px solid var(--line);font-size:13px;overflow-wrap:anywhere}
+.news-provider-list>summary{min-height:44px;box-sizing:border-box;padding:12px 0;line-height:1.6;cursor:pointer}
+.news-provider-list>summary:focus-visible{outline:2px solid var(--cyan);outline-offset:3px;border-radius:4px}
+.news-provider-list>dl{margin-top:4px}
+.news-traffic-table td:last-child{white-space:pre-line}
+body[data-acquisition-page="news"] .table-scroll caption{text-align:left;font-size:12px;color:var(--muted);line-height:1.7;padding:10px 12px;overflow-wrap:anywhere}
+body[data-acquisition-page="news"] #backfill .progress-copy{grid-template-columns:minmax(0,1.6fr) minmax(0,1fr)}
+body[data-acquisition-page="news"] #download-progress-label{font-size:clamp(18px,2.3vw,28px)}
+@media(max-width:720px){.news-facts{grid-template-columns:1fr}.news-search input{flex-basis:100%;max-width:none}.news-search select{flex:1}body[data-acquisition-page="news"] #backfill .progress-copy{grid-template-columns:minmax(0,1fr)}}
+/* The shared narrow-layout turns tables into complete label cards with
+   visible overflow. The inherited FinLab desktop scroll cap must not keep a
+   720px layout box while thousands of pixels of cards paint into the next
+   section. Do not change other provider pages in this feature rollout. */
+@media(max-width:1100px){body[data-acquisition-page="news"] .finlab-table-scroll:has(>table.dashboard-responsive-table){max-height:none}body[data-acquisition-page="news"] table.dashboard-responsive-table caption{display:block;width:100%;box-sizing:border-box}}

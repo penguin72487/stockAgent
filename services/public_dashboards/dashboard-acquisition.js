@@ -25,17 +25,18 @@
       ],
     },
     finlab: {
-      title: "FinLab 資料抓取", lead: "先看下載工作、估計資料量與完成時間，再展開完整目錄。",
+      title: "FinLab 資料抓取", lead: "先看歷史取得／追新分工與實際逐筆範圍，再展開分類、估時和完整目錄。",
       metrics: [
         metric("下載器狀態", "capture-state", "capture-key"),
-        metric("估計下載量進度", "volume-progress-label", "volume-downloaded"),
+        metric("一般歷史已取得 → 追新", "history-incremental", "history-backfill"),
         metric("當日已用流量", "quota-used", "quota-limit"),
         metric("本輪待辦剩餘估時", "download-global-eta", "", "參考情境；未知歷史與 tick 另列"),
+        metric("Tick 近期回補完成 · 條件式", "market-eta", "tick-eta-summary"),
       ],
-      progress: ["volume-progress", "volume-progress-label", "估計下載量進度", "volume-basis"],
+      progress: ["volume-progress", "volume-progress-label", "一般表本輪追新查核進度 · 非全歷史完整率", "volume-basis"],
       next: ["download-next", "下次排程"],
       groups: [
-        group("progress", "進度與執行排程", "分階段估時、工作量與執行摘要", ["#workload", "#capture"]),
+        group("progress", "進度與執行排程", "一般資料與 Tick 分階段估時、工作量與執行摘要", ["#workload", "#market", "#capture"]),
         group("quota", "配額與流量", "每日用量、重置與曲線", ["#traffic"]),
         group("catalog", "完整資料清冊", "管線、全部資料鍵與全市場 tick", ["#pipelines", "#backfill"]),
         group("storage", "儲存與交付", "本機容量、冷庫與訓練守門", ["#storage"]),
@@ -58,6 +59,23 @@
         group("catalog", "完整資料清冊", "所有資料集、更新觀測與篩選", ["#pipelines"]),
         group("storage", "儲存與交付", "來源容量與訓練邊界", ["#storage"]),
         group("method", "統計口徑與限制", "來源空回、未知歷史與發布證據", ["#method"]),
+      ],
+    },
+    news: {
+      title: "新聞全文抓取", lead: "先看已保存正文、可回補範圍與來源阻塞，再查看全部媒體的進度與條件估時。",
+      metrics: [
+        metric("下載器狀態", "news-health", "news-freshness"),
+        metric("已保存正文", "body-count", "body-bytes"),
+        metric("可回補網址", "remaining-count", "remaining-note"),
+        metric("全來源完成估時", "global-eta", "global-eta-basis"),
+      ],
+      progress: ["download-progress", "download-progress-label", "已知網址正文取得比例 · 非全網完整率", "download-progress-detail"],
+      next: ["capture-next", "目前排程"], refresh: "refresh-now",
+      groups: [
+        group("progress", "進度與執行排程", "已知範圍、歷史回補與阻塞", ["#backfill", "#capture"]),
+        group("quota", "請求與來源限流", "本程序請求／回應流量、獨立限流與退避", ["#traffic"]),
+        group("catalog", "完整媒體清冊", "所有已發現來源、搜尋、分類與逐來源條件估時", ["#pipelines"]),
+        group("method", "統計口徑與限制", "正文、網址、metadata、未知歷史及私人儲存", ["#method"]),
       ],
     },
     tej: {

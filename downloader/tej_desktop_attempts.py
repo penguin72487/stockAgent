@@ -14,8 +14,10 @@ import sqlite3
 import uuid
 
 from downloader.artifact_io import atomic_write_json
+from downloader.tej_operation_clock import source_operation_clock
 
 ATTEMPT_CONTRACT = 'attempt_scoped_preview_v1'
+ANNOTATION_RECONCILIATION_CONTRACT = 'exact_unsent_attempt_annotation_reconciliation_v1'
 OPERATOR_REPLAY_CONTRACT = 'exact_unknown_download_operator_replay_v1'
 AUTHORIZED_REPLAY_CONTRACT = 'exact_unknown_download_user_authorized_replay_v1'
 
@@ -262,10 +264,11 @@ def begin_attempt(root: Path, task: dict, attempt_id: str, request_path: Path, o
 
 
 def finish_attempt(root: Path, attempt_id: str, state: str) -> None:
+    finished = datetime.now(UTC).isoformat()
     try:
         with closing(_connect(root)) as con, con:
             con.execute('UPDATE desktop_attempts SET state=?,finished_at_utc=? WHERE attempt_id=?',
-                        (state, datetime.now(UTC).isoformat(), attempt_id))
+                        (state, finished, attempt_id))
     except sqlite3.OperationalError as exc:
         if not metadata_busy(exc):
             raise
@@ -274,6 +277,7 @@ def finish_attempt(root: Path, attempt_id: str, state: str) -> None:
         # this secondary DB annotation must not hide that stronger evidence.
         atomic_write_json(root/'diagnostics'/(attempt_id+'-attempt_state_deferred.json'),{
             'contract':ATTEMPT_CONTRACT,'attempt_id':attempt_id,'requested_state':state,
+            'requested_finished_at_utc':finished,
             'state':'metadata_busy_annotation_deferred','observed_at_utc':datetime.now(UTC).isoformat(),
             'provider_queries_sent':0,'automatic_query_replay':False})
 
@@ -300,6 +304,8 @@ def proved_unsent_prequery(root: Path, con, task: dict, *, finished: bool = Fals
         raise ValueError('Ambiguous/adopted prequery outcome; no automatic recovery')
     body=outcome.read_bytes();proof=json.loads(body.decode('utf-8-sig'))
     original=_read_private(prepared,root/'requests',task_id);request=task_request(root,task)
+    if not isinstance(proof, dict) or not isinstance(original, dict):
+        raise ValueError('Exact prequery proof and prepared request objects required')
     if (request.get('action')!='download' or request.get('contract_version')!=CONTRACT_VERSION
             or original.get('query_attempt_id')!=attempt or not prepared_request_matches(original,request,task)
             or proof.get('contract_version')!=CONTRACT_VERSION or proof.get('provider')!='tej_smart_wizard'
@@ -321,20 +327,23 @@ def proved_unsent_prequery(root: Path, con, task: dict, *, finished: bool = Fals
             raise ValueError('Exact launch admission evidence required')
         validate_unpermitted(root, prepared, evidence)
     try:
-        clocks=[datetime.fromisoformat(value) for value in (registered['started_at_utc'],proof['observed_at_utc'])]
-        if (any(clock.tzinfo is None for clock in clocks)
-                or not 0 <= (clocks[1]-clocks[0]).total_seconds() <= 900):
-            raise ValueError('Prequery outcome is outside the exact attempt deadline')
+        started=datetime.fromisoformat(registered['started_at_utc'])
+        if started.tzinfo is None:
+            raise ValueError('Exact aware local prequery deadline required')
         if finished:
             end=datetime.fromisoformat(registered['finished_at_utc'])
-            if end.tzinfo is None or not clocks[1] <= end <= clocks[0]+timedelta(seconds=900):
+            if end.tzinfo is None or not started <= end <= started+timedelta(seconds=900):
                 raise ValueError('Prequery attempt finished outside its exact deadline')
+        else:
+            end=min(datetime.now(UTC),started+timedelta(seconds=900))
+        clock_evidence=source_operation_clock(proof['observed_at_utc'],started,end)
     except (KeyError,TypeError) as exc:
         raise ValueError('Exact aware prequery outcome clock required') from exc
     return {'attempt_id':attempt,'request':request,'outcome':proof,
             'prepared_path':prepared,'outcome_path':outcome,
             'prepared_request_sha256':hashlib.sha256(prepared.read_bytes()).hexdigest(),
-            'prequery_outcome_sha256':hashlib.sha256(body).hexdigest()}
+            'prequery_outcome_sha256':hashlib.sha256(body).hexdigest(),
+            'source_clock_evidence':clock_evidence}
 
 
 def recover_prequery_outcome(root: Path, task_id: str) -> bool:
@@ -391,6 +400,108 @@ EXHAUSTED_PREQUERY_ERRORS=frozenset({'date_input_prequery_needs_review',
     'source_binding_prequery_needs_review','query_preparation_prequery_needs_review'})
 
 
+def deferred_unsent_annotation_proof(root: Path, con, task: dict) -> dict | None:
+    """Prove a committed failure whose secondary attempt annotation rolled back.
+
+    Read-only: no query, retry-budget mutation, deadline renewal or inferred
+    success. A bare prepared attempt is insufficient; its original busy note,
+    unique committed negative traffic and immutable source release must agree.
+    """
+    from downloader.tej_history import PREQUERY_FAILURES
+    if (task['state'] != 'blocked' or task['last_error_code'] not in EXHAUSTED_PREQUERY_ERRORS
+            or task['safe_prequery_retries'] < 2):
+        return None
+    attempt = task.get('active_attempt_id')
+    registered = con.execute('SELECT * FROM desktop_attempts WHERE attempt_id=?', (attempt,)).fetchone()
+    if registered is None or registered['state'] not in {'prepared', 'unknown_outcome'}:
+        return None
+    note_path = root/'diagnostics'/(attempt+'-attempt_state_deferred.json')
+    if not note_path.is_file():
+        return None
+    if note_path.is_symlink() or note_path.stat().st_size > 16384:
+        raise ValueError('Bounded original deferred annotation required')
+    negative = proved_unsent_prequery(root, con, task)
+    note = _read_private(note_path, root/'diagnostics', task['task_id'])
+    events = con.execute("SELECT * FROM traffic WHERE action='download' AND started_at_utc=?",
+        (task['attempted_at_utc'],)).fetchall()
+    if (not isinstance(note, dict) or note.get('contract') != ATTEMPT_CONTRACT
+            or note.get('attempt_id') != attempt or note.get('requested_state') != 'proven_not_submitted'
+            or note.get('state') != 'metadata_busy_annotation_deferred'
+            or type(note.get('provider_queries_sent')) is not int or note['provider_queries_sent'] != 0
+            or note.get('automatic_query_replay') is not False or len(events) != 1
+            or events[0]['state'] != 'failed_before_preview'
+            or PREQUERY_FAILURES[negative['outcome']['error_code']] != task['last_error_code']):
+        raise ValueError('Exact classified unsent failure and original busy annotation required')
+    try:
+        values = [task['attempted_at_utc'], registered['started_at_utc'],
+            note.get('requested_finished_at_utc', note['observed_at_utc']),
+            note['observed_at_utc'], events[0]['completed_at_utc']]
+        started, registered_start, finished, deferred, committed = [datetime.fromisoformat(v) for v in values]
+        if (any(v.tzinfo is None for v in (started, registered_start, finished, deferred, committed))
+                or not started <= registered_start <= finished <= deferred <= committed <= started+timedelta(seconds=900)
+                or committed > datetime.now(UTC)):
+            raise ValueError('Original finite local completion window required')
+        clock = source_operation_clock(negative['outcome']['observed_at_utc'], registered_start, finished)
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError('Original aware annotation and committed failure clocks required') from exc
+    if any(p.is_symlink() or not started.timestamp() <= p.stat().st_mtime <= committed.timestamp()
+           for p in (negative['prepared_path'], negative['outcome_path'], note_path)):
+        raise ValueError('Original negative artifacts must precede the committed failure')
+    manifest_path = root/'launches'/(attempt+'.bridge.json')
+    if manifest_path.is_symlink() or not manifest_path.is_file() or manifest_path.stat().st_size > 4096:
+        raise ValueError('Bounded original immutable bridge manifest required')
+    manifest = _read_private(manifest_path, root/'launches', task['task_id'])
+    if not isinstance(manifest, dict):
+        raise ValueError('Original immutable bridge manifest object required')
+    script_digest = manifest.get('bridge_script_sha256', '')
+    if not isinstance(script_digest, str) or not re.fullmatch(r'[0-9a-f]{64}', script_digest):
+        raise ValueError('Original immutable bridge identity required')
+    release = root/'bridge_releases'/(script_digest+'.ps1')
+    if (manifest.get('contract') != 'immutable_bridge_release_bound_to_prepared_request_v1'
+            or manifest.get('attempt_id') != attempt
+            or manifest.get('request_path') != str(negative['prepared_path'].relative_to(root))
+            or manifest.get('request_sha256') != negative['prepared_request_sha256']
+            or manifest.get('bridge_release_path') != str(release.relative_to(root))
+            or release.is_symlink() or not release.is_file() or release.stat().st_size > 256*1024
+            or hashlib.sha256(release.read_bytes()).hexdigest() != script_digest):
+        raise ValueError('Exact immutable bridge binding required for annotation reconciliation')
+    return {**negative, 'annotation_path': note_path,
+        'annotation_sha256': hashlib.sha256(note_path.read_bytes()).hexdigest(),
+        'bridge_manifest_path': manifest_path, 'bridge_script_sha256': script_digest,
+        'failed_event_id': events[0]['event_id'], 'finished_at_utc': values[2],
+        'source_clock_evidence': clock}
+
+
+def reconcile_unsent_attempt_annotation(root: Path, task_id: str) -> bool:
+    """Finish only the original annotation under .download.lock, exactly once."""
+    with closing(_connect(root)) as con, con:
+        row = con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+        if row is None:
+            return False
+        proof = deferred_unsent_annotation_proof(root, con, dict(row))
+        if proof is None:
+            return False
+        audit_path = root/'local_prequery_recovery'/(proof['attempt_id']+'-annotation-'+uuid.uuid4().hex+'.json')
+        audit = {'contract': ANNOTATION_RECONCILIATION_CONTRACT, 'state': 'prepared', 'task_id': task_id,
+            'query_attempt_id': proof['attempt_id'], 'observed_at_utc': datetime.now(UTC).isoformat(),
+            'original_finished_at_utc': proof['finished_at_utc'],
+            'prepared_request_sha256': proof['prepared_request_sha256'],
+            'prequery_outcome_sha256': proof['prequery_outcome_sha256'],
+            'annotation_sha256': proof['annotation_sha256'], 'bridge_script_sha256': proof['bridge_script_sha256'],
+            'failed_event_id': proof['failed_event_id'], 'source_clock_evidence': proof['source_clock_evidence'],
+            'provider_queries_sent': 0, 'source_rows_adopted': False, 'retry_budget_changed': False,
+            'query_deadline_renewed': False, 'automatic_query_replay': False}
+        atomic_write_json(audit_path, audit, durable=True)
+        con.execute("UPDATE desktop_attempts SET state='proven_not_submitted',finished_at_utc=? WHERE attempt_id=?",
+            (proof['finished_at_utc'], proof['attempt_id']))
+    audit['state'] = 'committed'
+    try:
+        atomic_write_json(audit_path, audit, durable=True)
+    except OSError:
+        pass  # Durable intent and committed annotation; no retry budget was consumed.
+    return True
+
+
 def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int = 60,
                          max_seconds: int = 900) -> dict:
     """Retry one proved-unsent fragment after a durable per-table backoff.
@@ -405,6 +516,7 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
     from downloader.tej_history import CONTRACT_VERSION
     if type(base_seconds) is not int or type(max_seconds) is not int or not 5 <= base_seconds <= max_seconds <= 3600:
         raise ValueError('Invalid bounded proved-unsent backoff')
+    reconcile_unsent_attempt_annotation(root, task_id)
 
     def verified_task(con):
         row=con.execute('SELECT * FROM tasks WHERE task_id=?',(task_id,)).fetchone()
@@ -429,9 +541,7 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
     check_started=datetime.now(UTC)
     payload,readback,_=bridge.execute(root,{**task,'request_json':json.dumps(request)})
     try:
-        observed=datetime.fromisoformat(payload['observed_at_utc'].replace('Z','+00:00'))
-        if observed.tzinfo is None or not check_started <= observed <= datetime.now(UTC)+timedelta(seconds=5):
-            raise ValueError('Shared interface readback is not fresh')
+        source_operation_clock(payload['observed_at_utc'],check_started,datetime.now(UTC))
     except (KeyError,TypeError,AttributeError) as exc:
         raise ValueError('Fresh aware interface readback required') from exc
     if (payload.get('contract_version')!=CONTRACT_VERSION or payload.get('provider')!='tej_smart_wizard'
@@ -609,9 +719,8 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
     checked = datetime.now(UTC)
     payload, output, _ = bridge.execute(root, {**task, 'request_json':json.dumps({**request, 'action':'inspect_query_runtime'})})
     if automatic:
-        observed = datetime.fromisoformat(payload.get('observed_at_utc', '').replace('Z', '+00:00'))
-        if (observed.tzinfo is None or not checked <= observed <= datetime.now(UTC) + timedelta(seconds=5)
-                or _read_private(output, root / 'raw', task_id) != payload):
+        source_operation_clock(payload.get('observed_at_utc'),checked,datetime.now(UTC))
+        if (_read_private(output, root / 'raw', task_id) != payload):
             raise ValueError('Fresh exact owned no-query readback required for standing replay')
     expected_true = ('vendor_notices_absent', 'source_binding_stable', 'source_selectors_enabled',
                      'company_group_enabled', 'source_binding_unchanged')

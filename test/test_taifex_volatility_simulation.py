@@ -79,6 +79,7 @@ def _engine(
     catalog_expansion_entry_policy: str = "next_cycle",
     option_infos_override: list[FakeOptionInfo] | None = None,
     settlement_bootstrap_only: bool = False,
+    recover_expired_cycle_futures: bool = False,
     startup_now: datetime | None = None,
     active_strategy_ids: tuple[str, ...] | None = None,
 ) -> TaifexVolatilitySimulation:
@@ -128,6 +129,7 @@ def _engine(
         strategy_capital_buffer_multiple=strategy_capital_buffer_multiple,
         catalog_expansion_entry_policy=catalog_expansion_entry_policy,
         settlement_bootstrap_only=settlement_bootstrap_only,
+        recover_expired_cycle_futures=recover_expired_cycle_futures,
         startup_now=startup_now,
         active_strategy_ids=active_strategy_ids,
     )
@@ -2003,3 +2005,113 @@ def test_startup_settlement_bootstrap_fails_closed_without_official_price(
     assert state["active_cycle"] is not None
     assert state["engine_status"] == "blocked_subscription_bootstrap_settlement"
     assert state["blocked_reason"] == "missing_official_final_settlement:2026-08-12"
+
+
+def _expired_hedged_fixture(tmp_path: Path, quantity: int = 2) -> None:
+    initial = _engine(tmp_path, bootstrap_after=date(2026, 8, 10))
+    initial.state["active_cycle"] = {
+        "cycle_id": "expired_hedged", "expiry_date": "2026-08-12",
+        "series": "TXV:202608:2026-08-12",
+    }
+    ts = int(datetime(2026, 8, 12, 9, 0, tzinfo=TAIPEI).timestamp() * 1e9)
+    initial._record_ideal_trade(
+        strategy_id=CLASSIC_VARIANT_ID, instrument_type="future", product="MTX",
+        code=initial.hedge.code, delta_contracts=quantity, price_points=45_000,
+        decision_ns=ts, receive_ns=ts - 1, reason="fixture_hedge",
+    )
+    initial._record_ideal_trade(
+        strategy_id=CLASSIC_VARIANT_ID, instrument_type="option", product="TXO",
+        code="TXV-EXPIRED-C", delta_contracts=1, price_points=100,
+        decision_ns=ts, receive_ns=ts - 1, reason="fixture_option",
+        series="TXV:202608:2026-08-12", strike=45_000, option_right="C",
+    )
+    initial.close()
+    pl.DataFrame({
+        "settlement_date": [date(2026, 8, 12)],
+        "final_settlement_price": [45_100.0],
+        "source_file": ["official.html"], "source_sha256": ["c" * 64],
+    }).write_parquet(tmp_path / "settlements.parquet")
+
+
+def test_expired_hedge_recovery_requires_explicit_authorization(tmp_path: Path) -> None:
+    _expired_hedged_fixture(tmp_path)
+    before = (tmp_path / "ideal_ledger.jsonl").read_bytes()
+    with pytest.raises(RuntimeError, match="shadow futures hedge remains open"):
+        _engine(tmp_path, bootstrap_after=date(2026, 8, 10),
+                option_infos_override=[], settlement_bootstrap_only=True,
+                startup_now=datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI))
+    assert (tmp_path / "ideal_ledger.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("quantity", [2, -2])
+def test_expired_recovery_settles_options_but_retries_futures_without_new_risk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quantity: int,
+) -> None:
+    _expired_hedged_fixture(tmp_path, quantity)
+    now = datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI)
+    bootstrap = _engine(
+        tmp_path, bootstrap_after=date(2026, 8, 10), option_infos_override=[],
+        settlement_bootstrap_only=True, recover_expired_cycle_futures=True, startup_now=now,
+    )
+    assert not bootstrap.state["strategies"][CLASSIC_VARIANT_ID]["option_positions"]
+    assert bootstrap.state["strategies"][CLASSIC_VARIANT_ID]["futures_position"] == quantity
+    assert bootstrap.state["active_cycle"]["status"] == "settled_options_reducing_futures"
+    assert not bootstrap.state["broker_orders_enabled"]
+    bootstrap.close()
+    before = (tmp_path / "ideal_ledger.jsonl").read_bytes()
+    live = _engine(
+        tmp_path, bootstrap_after=date(2026, 8, 10), option_infos_override=[],
+        recover_expired_cycle_futures=True,
+    )
+    orders = []
+    monkeypatch.setattr(live.api, "place_order", lambda *args, **kwargs: orders.append((args, kwargs)), raising=False)
+    decision_ns = int(now.timestamp() * 1e9)
+    monkeypatch.setattr("stockagent.live.taifex_volatility_simulation.time.time_ns", lambda: decision_ns)
+    # Absent, stale, trial, insufficient depth and future-received books cannot fill.
+    for mode in ("absent", "stale", "trial", "depth", "future"):
+        live.latest_books.clear()
+        if mode != "absent":
+            book = _book(live.hedge.code, bid=45_110, ask=45_120,
+                         receive_ns=decision_ns - (3_000_000_000 if mode == "stale" else 1),
+                         simtrade=mode == "trial")
+            if mode == "depth":
+                book["bid_volume_1"] = 1
+                book["ask_volume_1"] = 1
+            if mode == "future":
+                book["receive_ts_ns"] = decision_ns + 1
+            live.latest_books[live.hedge.code] = book
+        live.step(now=now)
+        assert live.state["engine_status"] == "waiting_expired_cycle_futures_reduction"
+        assert live.state["strategies"][CLASSIC_VARIANT_ID]["futures_position"] == quantity
+        assert (tmp_path / "ideal_ledger.jsonl").read_bytes() == before
+    live.latest_books[live.hedge.code] = _book(
+        live.hedge.code, bid=45_110, ask=45_120, receive_ns=decision_ns - 1,
+    )
+    live._maybe_settle_expired_cycle(now, decision_ns)
+    assert live.state["active_cycle"] is None
+    assert live.state["strategies"][CLASSIC_VARIANT_ID]["futures_position"] == 0
+    rows = [json.loads(line) for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()]
+    assert len(rows) == 4
+    assert rows[-2]["paper_repair"] is True
+    assert rows[-1]["paper_repair"] is True
+    assert rows[-1]["price_points"] == (45_110 if quantity > 0 else 45_120)
+    assert rows[-1]["delta_contracts"] == -quantity
+    assert rows[-1]["reason"].startswith("paper_repair_expired_cycle_reduce_only")
+    assert not orders
+    live._maybe_settle_expired_cycle(now, decision_ns)
+    assert len((tmp_path / "ideal_ledger.jsonl").read_text().splitlines()) == 4
+    live.close()
+
+
+def test_expired_recovery_rejects_different_front_month_before_any_settlement(tmp_path: Path) -> None:
+    _expired_hedged_fixture(tmp_path)
+    before = (tmp_path / "ideal_ledger.jsonl").read_bytes()
+    status_path = tmp_path / "status.json"
+    status = json.loads(status_path.read_text())
+    status["hedge_contract"] = "MXF_DIFFERENT_MONTH"
+    status_path.write_text(json.dumps(status))
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        _engine(tmp_path, bootstrap_after=date(2026, 8, 10), option_infos_override=[],
+                settlement_bootstrap_only=True, recover_expired_cycle_futures=True,
+                startup_now=datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI))
+    assert (tmp_path / "ideal_ledger.jsonl").read_bytes() == before

@@ -411,6 +411,7 @@ PY
       run_fintech_python -m scripts.audit_shioaji_tw_minute_dataset \
         --all-partitions \
         --calendar-root data_tw_public \
+        --verification-cache artifacts/operations/source_validation/tw-minute-train/files.sqlite3 \
         --output data_tw_minute/audits/full_latest.json
     fi
     # Code tests run at deployment/CI, not once per unchanged data refresh.
@@ -422,8 +423,26 @@ PY
       --end-date "$BACKFILL_END_DATE"
     run_fintech_python -m scripts.build_tw_shioaji_dataset
     run_fintech_python -m scripts.audit_tw_shioaji_dataset
+    # The terminal collector owns FD 9. Borrow its exact catalog coordination
+    # lock so verification/publication cannot race the next downloader. This
+    # uses the canonical cold publisher, never raw small-file synchronization.
+    minute_publication_sync_root="${STOCKAGENT_PACKED_ROOT:-/srv/stockagent-packed}"
+    minute_raw_notification=()
+    minute_research_notification=()
+    if [[ -f "$minute_publication_sync_root/.stockagent-d-primary" ]]; then
+      mkdir -p "$RUN_ROOT/publications"
+      minute_publication_run="$(mktemp -d "$RUN_ROOT/publications/run.XXXXXXXX")"
+      minute_publication_run="$(cd "$minute_publication_run" && pwd)"
+      minute_raw_notification=(--defer-scan --result-receipt "$minute_publication_run/raw.json")
+      minute_research_notification=(--defer-scan --result-receipt "$minute_publication_run/research.json")
+    fi
+    bash scripts/run_data_release.sh publish tw-minute-source-cold \
+      --sync-root "$minute_publication_sync_root" --source-lock-fd 9 "${minute_raw_notification[@]}"
+    bash scripts/run_data_release.sh publish tw-minute-train \
+      --sync-root "$minute_publication_sync_root" --source-lock-fd 9 "${minute_research_notification[@]}"
     echo "[shioaji-minute-runner] research_ready=true contract=audited_available_source source_gaps_are_masked=true"
     echo "[shioaji-minute-runner] daily_ready=true materialization=verified_local_minute api_requests_started=0"
+    echo "[shioaji-minute-runner] cold_publication=committed recipe_refresh=automatic training_started=false"
     if [[ "$retry_source_gaps" == "1" ]]; then
       retry_marker_tmp="$SOURCE_GAP_RETRY_MARKER.tmp"
       printf '%s target=%s\n' "$(TZ=Asia/Taipei date --iso-8601=seconds)" "$BACKFILL_END_DATE" > "$retry_marker_tmp"

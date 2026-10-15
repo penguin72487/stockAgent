@@ -85,7 +85,7 @@ select, input { max-width: 280px; padding: 8px 10px; color: var(--ink); border: 
 button { padding: 8px 11px; color: var(--ink); border: 1px solid var(--line); background: var(--surface); cursor: pointer; }
 button:hover { border-color: #99bcd2; background: #f7fafc; }
 button:focus-visible, select:focus-visible, input:focus-visible, .table-scroll:focus-visible { outline: 3px solid var(--blue-open); border-color: var(--blue); }
-#equity-chart { display: block; width: 100%; max-width: 100%; min-height: 290px; background: #fbfcfd; border: 1px solid #edf1f3; }
+#equity-chart { display: block; width: 100%; max-width: 100%; height: 300px; background: #fbfcfd; border: 1px solid #edf1f3; }
 .chart-grid { stroke: var(--line); stroke-width: 1; }
 .chart-zero { stroke: #7c8994; stroke-width: 1.2; stroke-dasharray: 5 5; }
 .chart-baseline { fill: none; stroke: #7c8994; stroke-width: 1.2; stroke-dasharray: 5 5; }
@@ -96,6 +96,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, .table-scroll:f
 .chart-session-label { fill: var(--gold); font-weight: 700; }
 .chart-scroll { overflow-x: auto; }
 .chart-note { min-height: 20px; margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+#history-status[data-state="degraded"] { color: var(--gold); }
 .curve-wall { margin-bottom: 16px; }
 .exposure-controls { display: flex; justify-content: flex-end; gap: 8px; align-items: center; flex-wrap: wrap; }
 .exposure-controls label { display: grid; gap: 3px; font-size: 10px; font-weight: 700; letter-spacing: .04em; }
@@ -261,7 +262,6 @@ td:first-child { white-space: normal; font-family: inherit; min-width: 280px; }
   .panel-head { display: grid; }
   label, select { width: 100%; }
   .detail-list.two-col { grid-template-columns: 1fr; }
-  .chart-scroll #equity-chart { min-width: 820px; min-height: 230px; }
   .strategy-guide-grid { grid-template-columns: 1fr; }
   .curve-wall-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .exposure-controls { justify-content: stretch; }

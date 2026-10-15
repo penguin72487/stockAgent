@@ -59,7 +59,7 @@ def test_history_server_returns_verified_stale_curve_while_refreshing(
         if calls == 2:
             refreshed.set()
         return {
-            "dashboard_schema_version": 7,
+            "dashboard_schema_version": taifex_dashboard.DASHBOARD_SCHEMA_VERSION,
             "generated_at_utc": f"2026-08-17T00:00:0{calls}+00:00",
             "source_updated_at_utc": "2026-08-17T00:00:00+00:00",
             "range": "1d",
@@ -113,7 +113,7 @@ def test_history_server_restores_bounded_projected_disk_cache_before_refresh(
 ) -> None:
     cache_dir = tmp_path / "cache"
     snapshot = {
-        "dashboard_schema_version": 7,
+        "dashboard_schema_version": taifex_dashboard.DASHBOARD_SCHEMA_VERSION,
         "generated_at_utc": "2026-08-17T00:00:00+00:00",
         "source_updated_at_utc": "2026-08-17T00:00:00+00:00",
         "range": "1h",
@@ -201,14 +201,111 @@ def test_history_server_memory_cache_is_lru_bounded(tmp_path: Path) -> None:
         mark_limit_per_strategy=10,
     )
     try:
-        for index, range_key in enumerate(("1h", "1d", "1w", "1mo")):
+        for index, range_key in enumerate(("1h", "1d", "1w", "1mo", "1q")):
             server._remember_history(
                 range_key=range_key,
                 snapshot={"range": range_key},
                 observed_at=float(index),
             )
-        assert list(server._history_cache) == ["1d", "1w", "1mo"]
+        assert list(server._history_cache) == ["1d", "1w", "1mo", "1q"]
         assert len(server._history_cache) == dashboard_server.HISTORY_MEMORY_CACHE_ENTRIES
+    finally:
+        server.server_close()
+
+
+def test_history_cache_ignores_status_clock_but_invalidates_projection_inputs(tmp_path: Path) -> None:
+    state = {"strategy_ids": ["fixture"], "strategies": {"fixture": {"initial_capital_twd": 1000.0}}}
+    status = {"updated_at_utc": "2026-10-13T14:00:00+00:00", "strategies": {"fixture": {}}}
+    _write_json(tmp_path / "state.json", state)
+    _write_json(tmp_path / "status.json", status)
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0), state_dir=tmp_path, api_receipt_dir=tmp_path,
+        static_root=tmp_path, mark_limit_per_strategy=10,
+    )
+    try:
+        baseline = server._history_source_signature()
+        status["updated_at_utc"] = "2026-10-13T14:00:05+00:00"
+        status["strategies"]["fixture"]["futures_position"] = 2
+        _write_json(tmp_path / "status.json", status)
+        state["strategies"]["fixture"]["gross_cash_twd"] = 100.0
+        _write_json(tmp_path / "state.json", state)
+        assert server._history_source_signature() == baseline
+        status["strategies"]["fixture"]["cumulative_contributed_capital_twd"] = 2000.0
+        _write_json(tmp_path / "status.json", status)
+        assert server._history_source_signature() != baseline
+        baseline = server._history_source_signature()
+        state["strategy_ids"].append("new_strategy")
+        _write_json(tmp_path / "state.json", state)
+        assert server._history_source_signature() != baseline
+        baseline = server._history_source_signature()
+        _write_json(tmp_path / "marks.jsonl", {"decision_ts_ns": 1})
+        assert server._history_source_signature() != baseline
+    finally:
+        server.server_close()
+
+
+def test_history_disk_cache_rejects_superseded_dashboard_contract(tmp_path: Path) -> None:
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0), state_dir=tmp_path, api_receipt_dir=tmp_path,
+        static_root=tmp_path, mark_limit_per_strategy=10, history_cache_dir=tmp_path / "cache",
+    )
+    try:
+        server._persist_history(range_key="1d", snapshot={
+            "range": "1d", "dashboard_schema_version": taifex_dashboard.DASHBOARD_SCHEMA_VERSION - 1,
+            "history": [],
+        })
+        assert server._read_persisted_history(range_key="1d") is None
+    finally:
+        server.server_close()
+
+
+def test_default_history_maintenance_stops_with_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    observed = threading.Event()
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0), state_dir=tmp_path, api_receipt_dir=tmp_path,
+        static_root=tmp_path, mark_limit_per_strategy=10,
+    )
+    monkeypatch.setattr(server, "prewarm_default_history", observed.set)
+    thread = threading.Thread(target=server.maintain_default_history, kwargs={"poll_seconds": 0.01})
+    thread.start()
+    try:
+        assert observed.wait(1.0)
+    finally:
+        server.server_close()
+        thread.join(1.0)
+    assert not thread.is_alive()
+
+
+def test_history_cold_recovery_cannot_serve_days_old_cache_as_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    old_time, new_time = "2026-09-18T05:45:00+00:00", "2026-10-13T14:00:00+00:00"
+
+    def build(**_kwargs):
+        nonlocal calls
+        calls += 1
+        end = old_time if calls == 1 else new_time
+        return {"dashboard_schema_version": taifex_dashboard.DASHBOARD_SCHEMA_VERSION,
+                "range": "1d", "range_seconds": 86400, "generated_at_utc": end,
+                "source_updated_at_utc": end, "anchor_at_utc": end,
+                "coverage_start_utc": end, "coverage_end_utc": end, "history": [],
+                "downsampled": False, "record_counts": {}}
+
+    monkeypatch.setattr(dashboard_server, "build_dashboard_history_snapshot", build)
+    _write_json(tmp_path / "status.json", {"updated_at_utc": old_time})
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0), state_dir=tmp_path, api_receipt_dir=tmp_path,
+        static_root=tmp_path, mark_limit_per_strategy=10,
+    )
+    try:
+        assert server.history_snapshot(range_key="1d")["coverage_end_utc"] == old_time
+        _write_json(tmp_path / "status.json", {"updated_at_utc": new_time})
+        _write_json(tmp_path / "marks.jsonl", {"decision_ts_ns": 1})
+        assert server.history_snapshot(range_key="1d")["coverage_end_utc"] == new_time
+        assert calls == 2
+        assert server.history_snapshot(range_key="1d")["coverage_end_utc"] == new_time
+        assert calls == 2
     finally:
         server.server_close()
 
@@ -380,7 +477,7 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
         mark_limit_per_strategy=8,
     )
     assert payload["health"] == "active"
-    assert payload["dashboard_schema_version"] == 8
+    assert payload["dashboard_schema_version"] == 9
     assert payload["source_age_seconds"] == 2.0
     assert payload["market"]["book_coverage_ratio"] == 1.0
     assert payload["market"]["strategy_fresh_valuation_coverage_ratio"] == 1.0
@@ -476,6 +573,26 @@ def test_dashboard_snapshot_fails_visible_when_source_is_stale(tmp_path: Path) -
         now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
     )
     assert payload["health"] == "stale"
+    assert payload["market"]["strategy_fresh_valuation_count"] == 0
+    assert payload["market"]["strategy_timely_valuation_count"] == 0
+    assert all(row["valuation_stale"] for row in payload["strategies"])
+    assert all(row["valuation_age_seconds"] >= 20 for row in payload["strategies"])
+
+
+def test_observed_clock_does_not_relabel_old_snapshot_trading_date(tmp_path: Path) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    status_path = state_dir / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["current_trading_date"] = "2026-08-12"
+    _write_json(status_path, status)
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir, api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc),
+    )
+    assert payload["current_trading_date"] == "2026-08-12"
+    assert payload["observed_trading_date"] == "2026-08-13"
+    assert payload["observed_session"] == "night"
+    assert payload["market"]["strategy_timely_valuation_count"] == 0
 
 
 def test_newer_bootstrap_block_is_visible_without_relabeling_stale_quotes(
@@ -528,6 +645,95 @@ def test_dedicated_history_snapshot_is_range_aware_and_bounded(tmp_path: Path) -
     }
     assert history["history"][-1] == full["history"][-1]
     assert history["record_counts"] == {"history_rows_returned": 16}
+
+
+@pytest.mark.parametrize("native_reader", [True, False])
+def test_history_snapshot_freezes_anchor_during_concurrent_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_reader: bool,
+) -> None:
+    state_dir, _ = _fixture(tmp_path)
+    if not native_reader:
+        monkeypatch.setattr(taifex_dashboard, "pl", None)
+    path = state_dir / "marks.jsonl"
+    last = json.loads(path.read_text().splitlines()[-1])
+    original_ns = last["decision_ts_ns"]
+    future = {**last, "decision_ts_ns": original_ns + 60_000_000_000}
+    original = taifex_dashboard._build_history_rows
+
+    def concurrent_append(**kwargs):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(future) + "\n")
+        return original(**kwargs)
+
+    monkeypatch.setattr(taifex_dashboard, "_build_history_rows", concurrent_append)
+    first = build_dashboard_history_snapshot(state_dir=state_dir)
+    assert max(row["decision_ts_ns"] for row in first["history"]) == original_ns
+    assert first["coverage_end_utc"] == first["anchor_at_utc"]
+    monkeypatch.setattr(taifex_dashboard, "_build_history_rows", original)
+    second = build_dashboard_history_snapshot(state_dir=state_dir)
+    assert max(row["decision_ts_ns"] for row in second["history"]) == future["decision_ts_ns"]
+    assert second["coverage_end_utc"] == second["anchor_at_utc"]
+
+
+def test_history_anchor_includes_verified_replay_newer_than_live_tail(tmp_path: Path) -> None:
+    state_dir, _ = _fixture(tmp_path)
+    last = json.loads((state_dir / "marks.jsonl").read_text().splitlines()[-1])
+    replay = {**last, "decision_ts_ns": last["decision_ts_ns"] + 60_000_000_000}
+    root = state_dir / "backfills" / "newer-replay"
+    _write_json(root / "marks.jsonl", replay)
+    _write_json(root / "receipt.json", {"replay_id": "newer-replay", "output_sha256": {
+        "marks.jsonl": hashlib.sha256((root / "marks.jsonl").read_bytes()).hexdigest()}})
+    history = build_dashboard_history_snapshot(state_dir=state_dir)
+    assert max(row["decision_ts_ns"] for row in history["history"]) == replay["decision_ts_ns"]
+    assert history["coverage_end_utc"] == history["anchor_at_utc"]
+
+
+@pytest.mark.parametrize("requested_range", ["1q", "1h"])
+def test_history_cache_shares_only_identical_available_source_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requested_range: str,
+) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    path = state_dir / "marks.jsonl"
+    source = path.read_text(encoding="utf-8")
+    oldest = json.loads(source.splitlines()[0])
+    oldest["decision_ts_ns"] -= 63 * 86400 * 1_000_000_000
+    path.write_text(json.dumps(oldest) + "\n" + source, encoding="utf-8")
+    calls = []
+    original = dashboard_server.build_dashboard_history_snapshot
+
+    def build(**kwargs):
+        calls.append(kwargs["range_key"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(dashboard_server, "build_dashboard_history_snapshot", build)
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0), state_dir=state_dir, api_receipt_dir=receipts,
+        static_root=tmp_path, mark_limit_per_strategy=360,
+        history_cache_dir=tmp_path / "cache",
+    )
+    try:
+        first = server.history_snapshot(range_key=requested_range)
+        if requested_range == "1h":
+            assert "1q" not in server._history_cache
+            assert "all" not in server._history_cache
+            full = server.history_snapshot(range_key="1q")
+            assert calls == ["1h", "1q"]
+            assert full["coverage_start_utc"] != first["coverage_start_utc"]
+        else:
+            full = first
+        for key in ("1y", "all"):
+            aliased = server.history_snapshot(range_key=key)
+            expected = original(state_dir=state_dir, range_key=key, mark_limit_per_strategy=360)
+            assert aliased["range"] == key
+            assert aliased["range_seconds"] == expected["range_seconds"]
+            assert aliased["history"] == [dashboard_server._display_history_row(row) for row in expected["history"]]
+            assert aliased["history"] == full["history"]
+            assert aliased["coverage_end_utc"] == expected["coverage_end_utc"]
+            assert server._read_persisted_history(range_key=key)["history"] == aliased["history"]
+            assert "source_window_start_ns" not in aliased
+        assert calls == (["1h", "1q"] if requested_range == "1h" else ["1q"])
+    finally:
+        server.server_close()
 
 
 def test_modern_bounded_history_fast_reader_matches_canonical_fallback(
@@ -1197,9 +1403,18 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "curveVisibleCount" in javascript
     assert "guideVisibleCount" in javascript
     assert 'snapshot.health === "degraded"' in javascript
-    assert 'href="styles.css?v=14"' in html
+    assert 'href="styles.css?v=15"' in html
     assert 'src="../time-axis.js?v=4"' in html
-    assert 'src="app.js?v=24"' in html
+    assert 'src="app.js?v=29"' in html
+    assert 'rows.length < 2 ? "waiting" : behind ? "degraded" : "ready"' in javascript
+    assert "response.status === 503" in javascript
+    assert "scheduleHistoryRetry(requestedRange)" in javascript
+    assert 'id="history-status"' in html
+    assert "曲線尚未追上來源" in javascript
+    assert "new ResizeObserver(" in javascript
+    assert "min-width: 820px" not in stylesheet
+    assert 'id="quote-display-notice"' in html
+    assert "snapshot.price_display_policy?.message" in javascript
     assert "collapseEmptyIntervals: true" in javascript
     assert "全策略皆無資料的區段已略過、不補 0" in javascript
     assert 'id="equity-time-range"' in html

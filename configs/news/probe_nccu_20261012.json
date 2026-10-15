@@ -1,0 +1,51 @@
+{
+  "contract_version": 1,
+  "root": "artifacts/data_quality/news_goal_stage01_20261009/remaining_v99/nccu_probe_state",
+  "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
+  "workers": 1,
+  "exclusive_http_owner": true,
+  "request_timeout_seconds": 8,
+  "response_deadline_seconds": 20,
+  "max_response_bytes": 8388608,
+  "max_attempts": 6,
+  "lease_seconds": 300,
+  "min_free_disk_bytes": 26843545600,
+  "batch_articles": 16,
+  "batch_text_bytes": 4194304,
+  "robots_ttl_seconds": 86400,
+  "metadata_refresh_seconds": 900,
+  "recent_article_recheck_seconds": 21600,
+  "recent_article_window_days": 3,
+  "unknown_source_policy": "awaiting_authorization",
+  "collection_purpose": "personal_research",
+  "publish": false,
+  "remote_training_export": false,
+  "providers": [
+    {
+      "id": "nccu",
+      "name": "國立政治大學校訊",
+      "domains": ["www.nccu.edu.tw"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "embedded_article_layout": "nccu_visible_news_v1",
+      "article_path_pattern": "^/p/406-1000-9212,r17[.]php$",
+      "article_selectors": [":scope > .module-inner > section.mb > .mcont > .mpgdetail > .meditor"],
+      "exclude_selectors": [],
+      "title_selector": ".mpgtitle > h2.hdline",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "authorization": {
+        "kind": "open_license",
+        "license": "CC-BY-NC-ND-2.5-TW",
+        "evidence_url": "https://www.nccu.edu.tw/p/426-1000-30.php?Lang=zh-tw",
+        "scope": "One exact known main-host campus-news URL9212 for private noncommercial unchanged own text. Preserve title, native reporter credit, release unit, date-only publication and all article prose. Exclude separately credited SSU photographs, gallery captions, media, third-party works, subdomains, republication and automatic training export. No discovery or ID enumeration.",
+        "verified_on": "2026-10-12",
+        "rights_restrictions": "The main-host rights page links CC BY-NC-ND2.5TW, not blanket third-party or subdomain permission. Actual robots/access refusals stay authoritative. No intraday time or timezone is inferred from a date, event time, HTTP Last-Modified or local metadata."
+      },
+      "note": "Bounded canonical diagnostic configuration, not a parallel collector. Only use this separate private root while the host is absent from the authoritative live registry. Close all probes before production registration; subsequent fetches share the production owner. Native CMS identity and reviewed campus reporter verified against the retained original. No source-wide history or official numeric rate maximum established."
+    }
+  ]
+}

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import deque
 from datetime import date
 import sys
 import threading
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import numpy as np
+import pytest
 
 from stockagent.live import quote_provider
+
+
+@pytest.fixture(autouse=True)
+def _isolate_query_window(monkeypatch):
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_HISTORY_REQUEST_TIMES", deque())
 
 
 def test_fast_quote_scalar_parser_preserves_legacy_values():
@@ -56,7 +64,7 @@ class _FakeApi:
     def _snapshot_rows(self, contracts):
         now_ns = int(
             np.datetime64(
-                __import__("datetime").datetime.now().replace(tzinfo=None),
+                __import__("datetime").datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None),
                 "ns",
             ).astype(np.int64)
         )

@@ -320,12 +320,15 @@ NATIVE_COPY_MIN_BYTES = 8 * 1024**2  # Penguin full copy/flush/SHA comparison, 2
 
 
 def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha256: str,
-                        expected_bytes: int, payload: bytes | None = None) -> None:
+                        expected_bytes: int, payload: bytes | None = None,
+                        native_windows_io: bool = False) -> None:
     """One source read/hash while copying, then stable inode proof and fsync.
 
     The closed-delivery verifier independently hashes the destination. Avoid
     additional complete source passes merely to establish the same copy proof.
     """
+    if type(native_windows_io) is not bool:
+        raise SnapshotError('native backup copy I/O must be an explicit boolean')
     before = signature(_regular(source)) if source is not None else None
     if source is not None and NATIVE_COPY_MIN_BYTES <= expected_bytes <= 8*1024**3:
         from stockagent.data_sync.windows_cold_io import windows_path, copy_verified
@@ -336,7 +339,11 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
             if signature(source) != before:
                 raise SnapshotError('native incremental source changed during copy')
             return
-    stream = source.open("rb") if source is not None else io.BytesIO(payload)
+    if source is not None and native_windows_io:
+        from stockagent.data_sync.windows_cold_io import binary_reader
+        stream = binary_reader(source)
+    else:
+        stream = source.open("rb") if source is not None else io.BytesIO(payload)
     destination.parent.mkdir(parents=True, exist_ok=True)
     hashed = hashlib.sha256()
     count = 0

@@ -1,0 +1,57 @@
+{
+  "contract_version": 1,
+  "root": "data_news_fulltext",
+  "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
+  "workers": 4,
+  "exclusive_http_owner": true,
+  "request_timeout_seconds": 20,
+  "response_deadline_seconds": 35,
+  "max_response_bytes": 8388608,
+  "max_attempts": 6,
+  "lease_seconds": 300,
+  "min_free_disk_bytes": 26843545600,
+  "batch_articles": 16,
+  "batch_text_bytes": 4194304,
+  "robots_ttl_seconds": 86400,
+  "metadata_refresh_seconds": 900,
+  "recent_article_recheck_seconds": 21600,
+  "recent_article_window_days": 3,
+  "unknown_source_policy": "awaiting_authorization",
+  "collection_purpose": "personal_research",
+  "publish": false,
+  "remote_training_export": false,
+  "providers": [
+    {
+      "id": "gbimonthly", "name": "環球生技月刊", "domains": ["gbimonthly.com"],
+      "enabled": true, "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "require_configured_container": true,
+      "article_selectors": [".entry-content", "[itemprop=articleBody]", ".article-content"],
+      "require_author_attribution": true,
+      "authorization": {"kind": "personal_research", "evidence_url": "https://news.gbimonthly.com/tw/about/index.php?num=39", "additional_evidence_urls": ["https://news.gbimonthly.com/tw/about/index.php?num=40"], "scope": "Bounded private diagnostics for locally known public text only; no paid/member content, redistribution or training injection", "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified"}
+    },
+    {
+      "id": "genetinfo", "name": "基因線上", "domains": ["genetinfo.com"],
+      "enabled": true, "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "require_configured_container": true,
+      "article_selectors": [".entry-content", "[itemprop=articleBody]", ".article-content"],
+      "require_author_attribution": true,
+      "authorization": {"kind": "personal_research", "evidence_url": "https://www.genetinfo.com/", "additional_evidence_urls": ["https://www.genetinfo.com/contact.html"], "scope": "Bounded private diagnostics for locally known public text only; preserve authors, no paid/member content, redistribution or training injection", "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified"}
+    },
+    {
+      "id": "inside", "name": "INSIDE", "domains": ["inside.com.tw"],
+      "enabled": true, "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "require_configured_container": true,
+      "article_selectors": ["[itemprop=articleBody]", ".post-content", ".article-content"],
+      "require_author_attribution": true,
+      "authorization": {"kind": "personal_research", "evidence_url": "https://www.inside.com.tw/", "scope": "Bounded private diagnostics for locally known public articles; licensing remains with original owners, no redistribution or training injection", "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified"}
+    },
+    {
+      "id": "pansci", "name": "PanSci 泛科學", "domains": ["pansci.asia"],
+      "enabled": true, "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "require_configured_container": true,
+      "article_selectors": ["[itemprop=articleBody]", ".entry-content", ".article-content"],
+      "require_author_attribution": true,
+      "authorization": {"kind": "personal_research", "evidence_url": "https://pansci.asia/aboutus", "additional_evidence_urls": ["https://pansci.asia/"], "scope": "One known public article diagnostic; individual author rights retained; not a site-wide CC or training grant", "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified"}
+    }
+  ]
+}

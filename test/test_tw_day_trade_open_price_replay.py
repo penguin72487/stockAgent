@@ -465,13 +465,16 @@ def test_new_completed_session_can_rebuild_a_missing_retained_book_locally() -> 
     )
 
 
+@pytest.mark.parametrize("schema_version", [2, 3])
 def test_retained_missed_opening_price_receipt_replays_without_broker_query(
     tmp_path: Path,
+    schema_version: int,
 ) -> None:
     day = date(2026, 9, 22)
     (tmp_path / f"{day.isoformat()}.json").write_text(
         json.dumps({
-            "schema_version": 2,
+            "schema_version": schema_version,
+            "query_contract": "bounded_incremental_per_mode_source_queries_v3",
             "session_date": day.isoformat(),
             "simulation_only": True,
             "production_order_possible": False,

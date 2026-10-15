@@ -1,0 +1,79 @@
+{
+  "contract_version": 1,
+  "observed_at_utc": "2026-10-09T13:12:11+00:00",
+  "authorization_updated_on": "2026-10-09",
+  "purpose": "Explicit original-publisher repair candidates; not automatic collection permission, accepted body, source equality or historical vintage proof",
+  "publish_original_body": false,
+  "automatically_enable_source": false,
+  "original_raw_receipts_verified": false,
+  "source_credit_diagnostic": "artifacts/data_quality/news_goal_stage01_20261009/ftv_2022_structure_diagnosis_v13.json",
+  "official_access_options": [
+    {
+      "provider": "cna",
+      "public_official_service": "https://ask.cna.com.tw/",
+      "terms": "https://ask.cna.com.tw/ask/legal/terms",
+      "licensing_contact": "https://www.cna.com.tw/about/contact.aspx",
+      "user_authorization_declared": true,
+      "authorized_api_configuration": "configs/news/cna_authorized_api.json",
+      "documented_mcp_endpoint": "https://ask.cna.com.tw/mcp/connect",
+      "documented_api_key_environment_name": "CNA_API_KEY",
+      "actual_api_product_confirmed": false,
+      "numeric_quota_verified": false,
+      "bulk_history_permission_verified": false,
+      "next_action": "Existing authorization accepted from the user; configure the actual licensed API credentials/product, then verify available tools, body schema, historical scope and quota. Do not re-ask whether authorization exists or assume an unlimited archive"
+    }
+  ],
+  "candidates": [
+    {
+      "republisher": "ftvnews",
+      "republisher_url": "https://www.ftvnews.com.tw/news/detail/2022902W0018",
+      "republisher_visible_original_credit": "（中央社）",
+      "republisher_declared_publication_raw": "2022-09-02T08:58:22+08:00",
+      "republisher_schema_editor_raw": "劉致綸（社群中心） - 民視新聞網",
+      "original_provider": "cna",
+      "original_url": "https://www.cna.com.tw/news/afe/202209020018.aspx",
+      "original_headline": "成都封城 鴻海：廠區目前營運正常",
+      "original_visible_publication_raw": "2022/9/2 08:17",
+      "original_visible_revision_raw": null,
+      "candidate_basis": "Exact source credit in current retained republisher response; actual primary web page with matching title/date/lead. No URL generated from republisher ID",
+      "original_clock_precision": "visible minute; exact source metadata and independent raw receipt remain unverified",
+      "body_identity_comparison_complete": false,
+      "original_body_durably_captured": false,
+      "collector_state": "original_candidate_awaiting_authorized_api_configuration"
+    },
+    {
+      "republisher": "ftvnews",
+      "republisher_url": "https://www.ftvnews.com.tw/news/detail/2022902W0052",
+      "republisher_visible_original_credit": "（中央社）",
+      "republisher_declared_publication_raw": "2022-09-02T09:58:17+08:00",
+      "republisher_schema_editor_raw": "劉致綸（社群中心） - 民視新聞網",
+      "original_provider": "cna",
+      "original_url": "https://www.cna.com.tw/news/afe/202209020031.aspx",
+      "original_headline": "台積電聯發科走弱 台股早盤14800點狹幅震盪",
+      "original_visible_publication_raw": "2022/9/2 09:24",
+      "original_visible_revision_raw": "9/2 09:52 更新",
+      "candidate_basis": "Exact source credit in current retained republisher response; actual primary web page with matching title/date/lead. No URL generated from republisher ID",
+      "original_clock_precision": "visible minute; exact source metadata and independent raw receipt remain unverified",
+      "body_identity_comparison_complete": false,
+      "original_body_durably_captured": false,
+      "collector_state": "original_candidate_awaiting_authorized_api_configuration"
+    },
+    {
+      "republisher": "ftvnews",
+      "republisher_url": "https://www.ftvnews.com.tw/news/detail/2022902W0184",
+      "republisher_visible_original_credit": "（中央社）",
+      "republisher_declared_publication_raw": "2022-09-02T15:05:41+08:00",
+      "republisher_schema_editor_raw": "劉致綸（社群中心） - 民視新聞網",
+      "original_provider": "cna",
+      "original_url": "https://www.cna.com.tw/news/afe/202209020114.aspx",
+      "original_headline": "中華電500M用戶增2倍 光世代推優惠挺新鮮人",
+      "original_visible_publication_raw": "2022/9/2 13:32",
+      "original_visible_revision_raw": "9/2 14:21 更新",
+      "candidate_basis": "Exact source credit in current retained republisher response; actual primary web page with matching title/date/lead. No URL generated from republisher ID",
+      "original_clock_precision": "visible minute; exact source metadata and independent raw receipt remain unverified",
+      "body_identity_comparison_complete": false,
+      "original_body_durably_captured": false,
+      "collector_state": "original_candidate_awaiting_authorized_api_configuration"
+    }
+  ]
+}

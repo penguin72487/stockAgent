@@ -301,7 +301,7 @@ class FinLabHistoryTest(unittest.TestCase):
             index=pd.Index(["2014-M01", "2014-M02"]),
         )
         table, stats = serialize_provider_frame(source)
-        self.assertEqual(table["source_index"].tolist(), ["2014-M01", "2014-M02"])
+        self.assertEqual(table["source_index"].to_pylist(), ["2014-M01", "2014-M02"])
         self.assertEqual(stats["rows_with_values"], 1)
         self.assertEqual(stats["first_non_null_source_index"], "2014-M02")
         self.assertEqual(stats["index_semantics"], "period_label_not_publication_date")
@@ -318,7 +318,7 @@ class FinLabHistoryTest(unittest.TestCase):
             "stock_id": ["2330", "2317"],
         })
         table, stats = serialize_provider_frame(source)
-        self.assertEqual(table["source_index"].tolist(), ["0", "1"])
+        self.assertEqual(table["source_index"].to_pylist(), ["0", "1"])
         self.assertEqual(stats["first_event_at"], "2001-01-02T00:00:00")
         self.assertEqual(stats["last_event_at"], "2018-12-28T00:00:00")
         self.assertEqual(stats["event_time_column"], "date")

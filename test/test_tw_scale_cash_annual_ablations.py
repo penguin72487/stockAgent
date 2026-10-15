@@ -60,6 +60,80 @@ def test_list_never_prepares_or_launches(monkeypatch, capsys):
     run.assert_not_called()
 
 
+@pytest.mark.parametrize('live_status,frozen_status,expected_calls', [(1, 0, 1), (0, 1, 2), (0, 0, 2)])
+def test_operational_cuda_preflight_keeps_frozen_trainer_and_stops_on_failure(
+    monkeypatch, capsys, live_status, frozen_status, expected_calls,
+):
+    code = Path('/immutable/trainer')
+    env = {'CUDA_VISIBLE_DEVICES': '0,1'}
+    run = Mock(side_effect=[Mock(returncode=live_status), Mock(returncode=frozen_status)])
+    monkeypatch.setattr(entry.subprocess, 'run', run)
+    assert entry._training_preflight(code, env) == (live_status or frozen_status)
+    assert run.call_count == expected_calls
+    first = run.call_args_list[0]
+    assert first.args[0][1] == str(entry.ROOT / 'scripts/check_environment.py')
+    assert first.args[0][-4:] == ['--require-cuda', '--minimum-cuda-devices', '2', '--strict']
+    assert first.kwargs == {'cwd': code, 'env': env}
+    if expected_calls == 2:
+        assert run.call_args_list[1].args[0][1] == str(code / 'scripts/check_environment.py')
+    if live_status or frozen_status:
+        assert '尚未啟動訓練' in capsys.readouterr().out
+
+
+def test_repair_catalog_keeps_exact_same_selected_experiments():
+    legacy, old_rows = _experiment_rows(entry.SPEC)
+    repaired, new_rows = _experiment_rows(entry.REPAIR_SPEC)
+    assert old_rows == new_rows
+    assert legacy['matrix'] == repaired['matrix']
+    assert legacy['fold_selection'] == repaired['fold_selection'] == 'last'
+    assert repaired['output_root'].endswith('_v6')
+    assert legacy['output_root'] != repaired['output_root']
+
+
+def test_repair_list_never_prepares_or_launches(monkeypatch, capsys):
+    run = Mock(side_effect=AssertionError('must not launch'))
+    monkeypatch.setattr(entry.subprocess, 'run', run)
+    assert entry.main(['--numerical-repair', '--list']) == 0
+    assert 'choices=27' in capsys.readouterr().out
+    run.assert_not_called()
+
+
+def test_numerical_source_rejects_a_different_parent(tmp_path):
+    path = tmp_path / 'binding.json'
+    path.write_text(json.dumps({'contract': 'tw_ablation_numerical_source_v2',
+                               'parent_training_source_sha256': 'wrong',
+                               'parent_reporting_source_sha256': 'report'}))
+    with pytest.raises(ValueError, match='different immutable parent'):
+        entry._numerical_source({'source_sha256': 'train'}, {'source_sha256': 'report'}, path)
+
+
+@pytest.mark.parametrize('bad', [
+    {'head_compile_backend':'aot_eager'}, {'head_fullgraph_pass':False},
+    {'head_captured_adjoint_pass':False}, {'world_size':1},
+    {'complete_fold_lifecycle_pass':False}, {'canonical_resume_pass':False},
+])
+def test_numerical_source_requires_inductor_and_real_dual_ddp_acceptance(tmp_path,monkeypatch,bad):
+    import stockagent.runtime_identity as identity
+    monkeypatch.setattr(identity,'verify_source_release',lambda *a:{'source_sha256':'numeric'})
+    monkeypatch.setattr(identity,'verify_release_bundles',lambda *a:None)
+    allowed=['stockagent/models/factorized_input.py','stockagent/models/transformer_base_portfolio.py',
+             'stockagent/training/checkpoint_contract.py','stockagent/training/trainer.py']
+    parent=tmp_path/'parent.json';parent.write_text(json.dumps({'code':{'files':{n:'old' for n in allowed}}}))
+    child=tmp_path/'release.json';child.write_text(json.dumps({'code':{'files':{n:'new' for n in allowed}}}))
+    proof=tmp_path/'proof.json'
+    proof.write_text(json.dumps({'state':'accepted_narrow_head_inductor_dual_ddp_v2',
+        'source_sha256':'numeric','world_size':2,'complete_fold_lifecycle_pass':True,
+        'canonical_resume_pass':True,'head_compile_backend':'inductor','head_fullgraph_pass':True,
+        'head_captured_adjoint_pass':True,**bad}))
+    binding=tmp_path/'binding.json'
+    binding.write_text(json.dumps({'contract':'tw_ablation_numerical_source_v2',
+        'parent_training_source_sha256':'train','parent_reporting_source_sha256':'report',
+        'source_sha256':'numeric','source_receipt':str(child),'acceptance_receipt':str(proof)}))
+    with pytest.raises(ValueError,match='dual-DDP lifecycle/resume acceptance'):
+        entry._numerical_source({'source_sha256':'train'},
+            {'source_sha256':'report','source_receipt':str(parent)},binding)
+
+
 @pytest.mark.parametrize('raw', ['', ',', 'baseline,', ',baseline', 'baseline,,ffn__gelu'])
 def test_reject_empty_selection(raw):
     with pytest.raises(ValueError, match='non-empty'):
@@ -292,6 +366,8 @@ def test_default_full_queue_and_blocked_calendar_stop_before_gpu_work(tmp_path, 
     monkeypatch.setattr(entry, 'LAUNCH', launch_path)
     monkeypatch.setattr(entry, '_shifted_source', lambda launch, path: (
         {'source_receipt': str(code.parent / 'release.json'), 'source_sha256': 'shifted'}, code))
+    monkeypatch.setattr(entry, '_reporting_source', lambda source, path: (
+        {'source_receipt': '/report/release.json', 'source_sha256': 'report'}, code))
     monkeypatch.setattr(entry.subprocess, 'run', run)
     assert entry.main(args) == 2
     assert len(calls) == 3  # launch check-only, config dry-run, calendar check
@@ -321,3 +397,86 @@ def test_source_binding_rejects_unrelated_amendments(tmp_path, monkeypatch):
     monkeypatch.setattr(identity, 'verify_release_bundles', lambda *a: {})
     with pytest.raises(ValueError, match='unapproved source files'):
         entry._shifted_source({'source_receipt': str(parent), 'source_sha256': 'parent'}, binding)
+
+
+@pytest.mark.parametrize('extra', [False, True])
+def test_reporting_release_changes_only_plotter_and_scheduler(tmp_path, monkeypatch, extra):
+    import stockagent.runtime_identity as identity
+    parent_files = {'scripts/run_ablation_experiments.py': 'a',
+                    'scripts/plot_ablation_analysis.py': 'b', 'stockagent/training/trainer.py': 'stable'}
+    parent = tmp_path / 'training.json'
+    parent.write_text(json.dumps({'code': {'files': parent_files}}))
+    child_files = {**parent_files, 'scripts/run_ablation_experiments.py': 'c',
+                   'scripts/plot_ablation_analysis.py': 'd'}
+    if extra:
+        child_files['stockagent/training/trainer.py'] = 'not-report-only'
+    child = tmp_path / 'reports/release.json'
+    child.parent.mkdir()
+    child.write_text(json.dumps({'code': {'files': child_files}}))
+    binding = tmp_path / 'binding.json'
+    binding.write_text(json.dumps({'contract': 'tw_ablation_reporting_source_v1',
+        'source_receipt': str(child), 'source_sha256': 'reports', 'parent_source_sha256': 'training'}))
+    monkeypatch.setattr(identity, 'verify_source_release', lambda *a: {'source_sha256': 'reports'})
+    monkeypatch.setattr(identity, 'verify_release_bundles', lambda *a: {})
+    training = {'source_receipt': str(parent), 'source_sha256': 'training'}
+    if extra:
+        with pytest.raises(ValueError, match='optimizer/core files'):
+            entry._reporting_source(training, binding)
+    else:
+        report, code = entry._reporting_source(training, binding)
+        assert report['parent_source_sha256'] == 'training'
+        assert code == child.parent / 'build-source'
+
+
+def test_report_overlay_does_not_change_any_generated_training_config(tmp_path, cases, dated_manifest):
+    spec, rows = _experiment_rows(entry.SPEC)
+    spec['matrix']['base_overrides'] = {'data': {'factorized_feature_manifest': str(dated_manifest)}}
+    root = tmp_path / 'same-output'
+    before = _build_configs(entry.SPEC, spec, rows, root)
+    saved = {row['name']: row['config_path'].read_bytes() for row in before}
+    spec['postprocess_plots'] = entry._report_plot_specs(tmp_path / 'ops')
+    after = _build_configs(entry.SPEC, spec, rows, root)
+    assert {row['name']: row['config_path'].read_bytes() for row in after} == saved
+    assert len(after) == 27
+
+
+def test_plots_only_preserves_training_owner_and_skips_generation_and_gpu(tmp_path, monkeypatch):
+    training_code = tmp_path / 'training/build-source'
+    report_code = tmp_path / 'reports/build-source'
+    for name in ('scripts/run_ablation_experiments.py', 'scripts/check_environment.py', 'coda_runner.sh'):
+        path = training_code / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# engineering fixture\n')
+    proof = tmp_path / 'accepted.json'
+    proof.write_text(json.dumps({'feature_manifest_sha256': 'features', 'transport_block_rows': 16}))
+    launch = tmp_path / 'launch.json'
+    launch.write_text(json.dumps({'contract': 'accepted_annual_scale_cash_launch_v1', 'state': 'ready',
+        'source_receipt': '/original/release.json', 'acceptance_receipt': str(proof),
+        'config': '/accepted/config.yaml', 'transform_cache': '/shared/cache',
+        'source_sha256': 'original', 'config_sha256': 'config', 'source_manifest_sha256': 'input'}))
+    runtime = tmp_path / 'artifacts/operations/training_launches' / Path(_experiment_rows(entry.SPEC)[0]['output_root']).name
+    runtime.mkdir(parents=True)
+    (runtime / 'calendar-context.json').write_text(json.dumps({'state': 'accepted_calendar_context',
+        'feature_manifest_sha256': 'features'}))
+    calls = []
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        assert '--dry-run' not in command
+        assert '--require-cuda' not in command
+        return Mock(returncode=0)
+    monkeypatch.setattr(entry, 'ROOT', tmp_path)
+    monkeypatch.setattr(entry, 'LAUNCH', launch)
+    monkeypatch.setattr(entry, '_shifted_source', lambda *a: (
+        {'source_receipt': '/training/release.json', 'source_sha256': 'training'}, training_code))
+    monkeypatch.setattr(entry, '_reporting_source', lambda *a: (
+        {'source_receipt': '/reports/release.json', 'source_sha256': 'reports'}, report_code))
+    monkeypatch.setattr(entry.subprocess, 'run', run)
+    assert entry.main(['--plots-only']) == 0
+    assert len(calls) == 2  # check-only and actual reporting, no train/config generation
+    command, kwargs = calls[-1]
+    assert '--plots-only' in command
+    assert command[1] == str(report_code / 'scripts/run_ablation_experiments.py')
+    assert kwargs['env']['STOCKAGENT_CODE_RELEASE_RECEIPT'] == '/training/release.json'
+    assert kwargs['env']['STOCKAGENT_ABLATION_FROZEN_RUNNER'] == str(training_code / 'coda_runner.sh')
+    assert kwargs['env']['STOCKAGENT_ABLATION_REPORT_SOURCE_RECEIPT'] == '/reports/release.json'
+    assert not list(tmp_path.glob('artifacts/markets/**/generated_configs/*.yaml'))

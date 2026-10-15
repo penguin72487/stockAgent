@@ -7,6 +7,7 @@ the DuckDB version/settings policy. Unknown representations opt out of grouping.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 import re
@@ -75,18 +76,100 @@ def _schema_tree(schema: pq.ParquetSchema) -> str | None:
     return tree if depth == 0 else None
 
 
-def schema_identities(parquet_file: pq.ParquetFile) -> tuple[str, str | None]:
+class PhysicalSchemaIdentityCache:
+    """Attempt-local reuse of physical reflection, never of file validity.
+
+    Every caller must still open its own footer and compute its Arrow digest.
+    A hit additionally requires the exact full group tree, footer KV bytes,
+    revision/version and native leaf-descriptor equality. Native schemas retain
+    their parent FileMetaData: cap both entries and serialized retention, rather
+    than treating schema objects as tiny. The byte budget is NOT a decoded-RAM
+    guarantee; fresh-process RSS must still be measured before adoption.
+    """
+
+    def __init__(self, *, max_entries: int = 64, max_serialized_bytes: int = 2 * 1024**2):
+        if any(type(value) is not int or value < 1 for value in (max_entries, max_serialized_bytes)):
+            raise ValueError("positive integer cache bounds required")
+        self.max_entries = max_entries
+        self.max_serialized_bytes = max_serialized_bytes
+        self._entries: OrderedDict[tuple, tuple[pq.ParquetSchema, str, int]] = OrderedDict()
+        self.retained_serialized_bytes = 0
+        self.hits = self.misses = self.bypasses = self.evictions = 0
+
+    def identity(self, parquet_file: pq.ParquetFile, arrow_digest: bytes) -> str | None:
+        try:
+            schema = parquet_file.schema
+            tree = _schema_tree(schema) if type(schema) is pq.ParquetSchema else None
+            metadata = parquet_file.metadata.metadata
+            if metadata is None:
+                metadata = {}
+            footer_size = parquet_file.metadata.serialized_size
+            if (pa.__version__ not in _SUPPORTED_ARROW_VERSIONS or tree is None
+                    or type(footer_size) is not int or footer_size < 0
+                    or not isinstance(metadata, dict)
+                    or any(not isinstance(key, bytes) or not isinstance(value, bytes)
+                           for key, value in metadata.items())):
+                self.bypasses += 1
+                return _physical_schema_identity(parquet_file, arrow_digest)
+            items = tuple(sorted(metadata.items()))
+            key = (pa.__version__, SCHEMA_IDENTITY_REVISION, arrow_digest, tree, items)
+            retained_size = footer_size + len(tree.encode("utf-8")) + len(arrow_digest)
+            retained_size += sum(len(key) + len(value) for key, value in items)
+            if retained_size > self.max_serialized_bytes:
+                self.bypasses += 1
+                return _physical_schema_identity(parquet_file, arrow_digest)
+            entry = self._entries.get(key)
+            if entry is not None and schema.equals(entry[0]):
+                self._entries.move_to_end(key)
+                self.hits += 1
+                return entry[1]
+            self.misses += 1
+            identity = _physical_schema_identity(parquet_file, arrow_digest)
+            if identity is not None:
+                previous = self._entries.pop(key, None)
+                if previous is not None:
+                    self.retained_serialized_bytes -= previous[2]
+                while self._entries and (len(self._entries) >= self.max_entries
+                        or self.retained_serialized_bytes + retained_size > self.max_serialized_bytes):
+                    _, evicted = self._entries.popitem(last=False)
+                    self.retained_serialized_bytes -= evicted[2]
+                    self.evictions += 1
+                self._entries[key] = (schema, identity, retained_size)
+                self.retained_serialized_bytes += retained_size
+            return identity
+        except MemoryError:
+            raise
+        except Exception:
+            # Unknown APIs never authorize equivalence, even if a key exists.
+            self.bypasses += 1
+            return _physical_schema_identity(parquet_file, arrow_digest)
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "hits": self.hits, "misses": self.misses, "bypasses": self.bypasses,
+            "evictions": self.evictions, "entries": len(self._entries),
+            "retained_serialized_bytes": self.retained_serialized_bytes,
+            "max_entries": self.max_entries, "max_serialized_bytes": self.max_serialized_bytes,
+        }
+
+
+def schema_identities(
+    parquet_file: pq.ParquetFile, *, physical_cache: PhysicalSchemaIdentityCache | None = None,
+) -> tuple[str, str | None]:
     """Compute this open footer's Arrow digest once for both audit contracts.
 
-    No value is supplied by a manifest or reused across files. Invalid Arrow
-    metadata still raises for the mandatory integrity audit; an unsupported
-    physical representation only disables the optional reader optimization.
+    No Arrow value is supplied by a manifest or reused across files. Optional
+    physical reflection reuse requires strict native metadata equivalence.
+    Invalid Arrow metadata still raises for the mandatory integrity audit; an
+    unsupported physical representation disables optional reader optimization.
     """
 
     arrow_digest = hashlib.sha256(
         parquet_file.schema_arrow.remove_metadata().serialize().to_pybytes()
     ).digest()
-    return arrow_digest.hex(), _physical_schema_identity(parquet_file, arrow_digest)
+    identity = (_physical_schema_identity(parquet_file, arrow_digest) if physical_cache is None
+                else physical_cache.identity(parquet_file, arrow_digest))
+    return arrow_digest.hex(), identity
 
 
 def physical_schema_identity(parquet_file: pq.ParquetFile) -> str | None:

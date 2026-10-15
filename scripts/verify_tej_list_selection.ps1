@@ -35,14 +35,17 @@ public static class TejListFixture {
     public static ListBox Labels,Target;
     public static ComboBox Names;
     public static Button Select;
+    private static GroupBox group;
+    private static Panel listPanel;
     public static int Changes,SelectClicks;
-    public static bool DisableAfterSelect;
+    public static bool DisableAfterSelect,OnlyFirstItem;
     private static Thread thread;
     public static void Start() {
         var ready=new ManualResetEvent(false);
         thread=new Thread(()=> {
             Root=new PassiveForm {Text="StockAgent owned list fixture",Width=320,Height=200};
-            var group=new GroupBox {Text="Owned source list",Dock=DockStyle.Fill};
+            group=new GroupBox {Text="Owned source list",Dock=DockStyle.Fill};
+            listPanel=new Panel {Dock=DockStyle.Fill};
             Labels=new ListBox {Dock=DockStyle.Top,Height=80};
             Labels.Items.AddRange(new object[]{"First","Second","Third"});
             Names=new ComboBox {Dock=DockStyle.Top,DropDownStyle=ComboBoxStyle.DropDownList};
@@ -52,7 +55,7 @@ public static class TejListFixture {
             Select=new Button {Text="Select",Dock=DockStyle.Bottom};
             Select.Click+=(s,e)=> {
                 SelectClicks++;
-                foreach(object item in Labels.SelectedItems)Target.Items.Add(item);
+                foreach(object item in Labels.SelectedItems) {Target.Items.Add(item);if(OnlyFirstItem)break;}
                 if(DisableAfterSelect)Select.Enabled=false;
             };
             group.Controls.Add(Target);group.Controls.Add(Labels);group.Controls.Add(Names);group.Controls.Add(Select);Root.Controls.Add(group);
@@ -85,7 +88,17 @@ public static class TejListFixture {
     }
     public static void SelectCombo(int index) {Root.Invoke(new Action(()=>Names.SelectedIndex=index));}
     public static void BatchReset(bool disableAfterSelect) {
-        Root.Invoke(new Action(()=> {Target.Items.Clear();Select.Dock=DockStyle.Bottom;Select.Enabled=true;SelectClicks=0;DisableAfterSelect=disableAfterSelect;}));
+            Root.Invoke(new Action(()=> {Target.Items.Clear();Select.Dock=DockStyle.Bottom;Select.Enabled=true;SelectClicks=0;DisableAfterSelect=disableAfterSelect;OnlyFirstItem=false;}));
+    }
+    public static void PartialHandler() {Root.Invoke(new Action(()=>OnlyFirstItem=true));}
+    public static void NestedLists(bool nested) {
+        Root.Invoke(new Action(()=> {
+            if(nested) {
+                group.Controls.Add(listPanel);listPanel.Controls.Add(Target);listPanel.Controls.Add(Labels);
+            } else {
+                group.Controls.Add(Target);group.Controls.Add(Labels);group.Controls.Remove(listPanel);
+            }
+        }));
     }
     public static void WrongGeometry() {Root.Invoke(new Action(()=>{Select.Dock=DockStyle.None;Select.SetBounds(0,0,80,20);}));}
     public static void EnableRoot(bool enabled) {Root.Invoke(new Action(()=>Root.Enabled=enabled));}
@@ -217,6 +230,56 @@ try {
         [int[]]$indices,[string[]]@('First','first','台灣 café'),$PID,'StockAgent owned list fixture',$false)}catch{$rejected=$true}
     Check 'batch_midstream_disabled_button_stops_without_repeating' ($rejected -and [TejListFixture]::SelectClicks -eq 1 -and
         ([TejBridgeNative]::Items($target,$false)).Count -eq 1)
+    foreach($nested in @($false,$true)) {
+    [TejListFixture]::NestedLists($nested)
+    foreach($bound in @($false,$true)) {
+    foreach($mode in @('MultiSimple','MultiExtended')) {
+        [TejListFixture]::Mode($mode,$bound);[TejListFixture]::BatchReset($false)
+        $listHandle=[TejListFixture]::Labels.Handle.ToInt64();$target=[TejListFixture]::Target.Handle.ToInt64()
+        $parent=[TejBridgeNative]::GetParent([IntPtr]$batchButton).ToInt64()
+        $used=[TejBridgeNative]::TrySelectListBulk($rootHandle,$parent,$listHandle,$target,$batchButton,
+            [int[]]@(0,2),[string[]]@('First','Third'),$PID,'StockAgent owned list fixture',$false)
+        $case='bulk_'+$mode+$(if($bound){'_bound'}else{'_unbound'})+$(if($nested){'_nested'}else{'_direct'})
+        Check ($case+'_one_action_complete_exact_order') ($used -and [TejListFixture]::SelectClicks -eq 1 -and
+            (([TejBridgeNative]::Items($target,$false)) -join ',') -ceq 'First,Third')
+        Check ($case+'_managed_membership_agrees') (([TejListFixture]::Selected() -join ',') -ceq '0,2')
+        Check ($case+'_real_parent_notification_acknowledged') ([TejListFixture]::Changes -ge 1 -and
+            (([TejBridgeNative]::GetParent([IntPtr]$listHandle).ToInt64() -ne $parent) -eq $nested))
+        Check ($case+'_no_foreground_change') ([TejBridgeNative]::GetForegroundWindow() -eq $foreground)
+    }
+    }
+    }
+    [TejListFixture]::NestedLists($false);$target=[TejListFixture]::Target.Handle.ToInt64()
+    [TejListFixture]::Mode('One',$false);[TejListFixture]::BatchReset($false)
+    $listHandle=[TejListFixture]::Labels.Handle.ToInt64()
+    $used=[TejBridgeNative]::TrySelectListBulk($rootHandle,$parent,$listHandle,$target,$batchButton,
+        [int[]]@(0,2),[string[]]@('First','Third'),$PID,'StockAgent owned list fixture',$false)
+    Check 'bulk_single_style_returns_before_mutation' (-not $used -and [TejListFixture]::SelectClicks -eq 0 -and
+        ([TejListFixture]::Selected() -join ',') -ceq '0')
+    [TejListFixture]::Mode('MultiExtended',$false);[TejListFixture]::BatchReset($false)
+    $listHandle=[TejListFixture]::Labels.Handle.ToInt64()
+    $used=[TejBridgeNative]::TrySelectListBulk($rootHandle,$parent,$listHandle,$target,$batchButton,
+        [int[]]@(2,0),[string[]]@('Third','First'),$PID,'StockAgent owned list fixture',$false)
+    Check 'bulk_non_source_order_returns_before_mutation' (-not $used -and [TejListFixture]::SelectClicks -eq 0 -and
+        ([TejListFixture]::Selected() -join ',') -ceq '0')
+    foreach($bad in @('wrong_parent','wrong_pid','wrong_label','duplicate_request','wrong_geometry','disabled_root')) {
+        [TejListFixture]::BatchReset($false);$rejected=$false
+        try {
+            $batchParent=$(if($bad -ceq 'wrong_parent'){$target}else{$parent})
+            $owner=$(if($bad -ceq 'wrong_pid'){$PID+1}else{$PID})
+            $labels=[string[]]$(if($bad -ceq 'wrong_label'){@('First','Wrong')}elseif($bad -ceq 'duplicate_request'){@('First','First')}else{@('First','Third')})
+            if($bad -ceq 'wrong_geometry'){[TejListFixture]::WrongGeometry()}
+            if($bad -ceq 'disabled_root'){[TejListFixture]::EnableRoot($false)}
+            [void][TejBridgeNative]::TrySelectListBulk($rootHandle,$batchParent,$listHandle,$target,$batchButton,
+                [int[]]@(0,2),$labels,$owner,'StockAgent owned list fixture',($bad -ceq 'wrong_geometry'))
+        }catch{$rejected=$true}finally{[TejListFixture]::EnableRoot($true)}
+        Check ('bulk_'+$bad+'_refused_before_click') ($rejected -and [TejListFixture]::SelectClicks -eq 0)
+    }
+    [TejListFixture]::BatchReset($false);[TejListFixture]::PartialHandler();$rejected=$false
+    try{[void][TejBridgeNative]::TrySelectListBulk($rootHandle,$parent,$listHandle,$target,$batchButton,
+        [int[]]@(0,2),[string[]]@('First','Third'),$PID,'StockAgent owned list fixture',$false)}catch{$rejected=$true}
+    Check 'bulk_partial_vendor_handler_refused_after_one_action_no_fallback' ($rejected -and
+        [TejListFixture]::SelectClicks -eq 1 -and ([TejBridgeNative]::Items($target,$false)).Count -eq 1)
     [TejListFixture]::BatchReset($false)
     Check 'native_button_named_lookup_keeps_owned_identity' ([TejBridgeNative]::ExactButton($rootHandle,$rootHandle,'Select',[int]::MinValue,43) -eq [TejListFixture]::Select.Handle.ToInt64())
     $rejected=$false;try{[void][TejBridgeNative]::ExactButton($rootHandle,$rootHandle,'Select',[int]::MinValue,44)}catch{$rejected=$true}

@@ -50,6 +50,8 @@ _FAILURE_PATTERNS = (
     "OutOfMemoryError",
     "CUDA error",
     "ChildFailedError",
+    "hit config.recompile_limit",
+    "hit config.cache_size_limit",
 )
 _FALLBACK_KEYS = (
     "bt_compile_failures",
@@ -65,6 +67,34 @@ _GENERIC_FAILURE_KEYS = (
     "bt_runtime_fallback_calls",
     "futures_cuda_graph_busy_eager_calls",
 )
+
+
+_DISCARDED_AUTOTUNE_RESOURCE = re.compile(
+    r"^(?P<prefix>[^\n]*torch/_inductor/select_algorithm\.py:\d+\] \[[^\]\n]+\]) "
+    r"Runtime error during autotuning:\s*\n"
+    r"(?P=prefix) No valid triton configs\. OutOfMemoryError: out of resource: "
+    r"(?P<kernel>\w+) Required: (?P<required>\d+) Hardware limit:\s*(?P<limit>\d+) "
+    r"Reducing block sizes or `num_stages` may help\.\.\s*\n"
+    r"(?P=prefix) Ignoring this choice\.\s*$",
+    re.MULTILINE,
+)
+
+
+def _failure_log_evidence(log_text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """Keep fatal errors distinct from explicitly discarded search candidates.
+
+    Triton names a shared-memory/resource-limit rejection OutOfMemoryError.
+    Only the complete, same-prefix Inductor rejection/ignore block is removed
+    from fatal-pattern scanning. Selected-kernel, VRAM and unpaired errors stay
+    failures, and the original log and every discarded candidate stay evidence.
+    """
+    candidates = [
+        {"kernel": match["kernel"], "required_bytes": int(match["required"]),
+         "hardware_limit_bytes": int(match["limit"])}
+        for match in _DISCARDED_AUTOTUNE_RESOURCE.finditer(log_text)
+    ]
+    fatal_text = _DISCARDED_AUTOTUNE_RESOURCE.sub("", log_text)
+    return [pattern for pattern in _FAILURE_PATTERNS if pattern in fatal_text], candidates
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -202,6 +232,26 @@ def _gpu_memory_summary(path: Path, *, gpu_indices: set[int]) -> dict[str, Any]:
     }
 
 
+def _host_memory_summary(path: Path) -> dict[str, Any]:
+    """Shared cgroup memory, including evictable file cache; not rank RSS."""
+    samples = []
+    if path.is_file():
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    used = int(row["host_memory_used_bytes"])
+                    limit = int(row["host_memory_limit_bytes"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if limit > 0 and 0 <= used <= limit:
+                    samples.append((used, limit))
+    if not samples:
+        return {"observed": False, "scope": "shared_cgroup_including_file_cache"}
+    return {"observed": True, "scope": "shared_cgroup_including_file_cache",
+            "peak_used_gib": max(used for used, _ in samples) / 1024**3,
+            "min_headroom_gib": min(limit-used for used, limit in samples) / 1024**3}
+
+
 def _score_curve(
     rows: list[dict[str, Any]],
     *,
@@ -214,6 +264,8 @@ def _score_curve(
     min_headroom_gib: float,
     strict_compiled_backtest: bool = True,
     world_size: int = 1,
+    annual_ownership: dict[str, Any] | None = None,
+    require_explicit_carry_graph: bool = False,
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -255,6 +307,14 @@ def _score_curve(
         for key in failure_keys:
             if int(row.get(key, 0) or 0) != 0:
                 reasons.append(f"epoch {epoch} has {key}={row.get(key)!r}")
+        if require_explicit_carry_graph:
+            for counter in ("forward_replays", "backward_replays", "accepted_blocks"):
+                key = f"train_loss_day_trade_carry_explicit_graph_{counter}"
+                if int(row.get(key, 0) or 0) <= 0:
+                    reasons.append(f"epoch {epoch} requested ledger graph but has no {counter}")
+            key = "train_loss_day_trade_carry_explicit_graph_certificate_fallbacks"
+            if int(row.get(key, 0) or 0):
+                reasons.append(f"epoch {epoch} has ledger graph certificate fallback")
 
     for key in ("futures_cuda_graph_constructors", "futures_cuda_graph_evictions"):
         observed = [int(row[key]) for row in steady if key in row]
@@ -286,7 +346,16 @@ def _score_curve(
     epoch_wall = [float(row[epoch_wall_key]) for row in steady]
     train_wall = [float(row[train_wall_key]) for row in steady]
     train_batches = [int(row.get("train_batches", 0) or 0) for row in steady]
-    expected_batches = math.ceil(train_rows / global_batch_size)
+    ownership_validation = None
+    if annual_ownership is not None:
+        from stockagent.training.episode_parallel import validate_annual_episode_receipt
+        try:
+            ownership_validation = validate_annual_episode_receipt(annual_ownership,
+                train_rows=train_rows, global_batch_rows=global_batch_size, world_size=world_size)
+        except (ValueError, TypeError, KeyError) as exc:
+            return {"ok": False, "reasons": [str(exc)], "memory": memory}
+    expected_batches = (ownership_validation["reporting_rank_batches"] if ownership_validation
+                        else math.ceil(train_rows / global_batch_size))
     if any(value != expected_batches for value in train_batches):
         return {
             "ok": False,
@@ -300,7 +369,8 @@ def _score_curve(
 
     median_epoch_wall = _median(epoch_wall)
     median_train_wall = _median(train_wall)
-    padded_slots = expected_batches * global_batch_size
+    padded_slots = (ownership_validation["padded_slots"] if ownership_validation
+                    else expected_batches * global_batch_size)
     return {
         "ok": True,
         "steady_epochs": [int(row.get("epoch", 0) or 0) for row in steady],
@@ -310,6 +380,7 @@ def _score_curve(
         "train_batches": expected_batches,
         "padded_slots": padded_slots,
         "padding_fraction": (padded_slots - train_rows) / padded_slots,
+        "annual_ownership_validation": ownership_validation,
         "median_epoch_wall_s": median_epoch_wall,
         "timing_scope": "maximum_rank" if max_rank or trajectory_max_rank else "legacy_reporting_rank",
         "epoch_wall_field": epoch_wall_key,
@@ -385,7 +456,7 @@ def _sample_gpus(stop: threading.Event, path: Path, interval_s: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(fields.split(","))
+        writer.writerow([*fields.split(","), "host_memory_used_bytes", "host_memory_limit_bytes"])
         while not stop.is_set():
             result = subprocess.run(
                 [
@@ -399,9 +470,14 @@ def _sample_gpus(stop: threading.Event, path: Path, interval_s: float) -> None:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            try:
+                host_memory = [Path("/sys/fs/cgroup/memory.current").read_text().strip(),
+                               Path("/sys/fs/cgroup/memory.max").read_text().strip()]
+            except OSError:
+                host_memory = ["", ""]
             for line in result.stdout.splitlines():
                 if line.strip():
-                    writer.writerow([part.strip() for part in line.split(",")])
+                    writer.writerow([*[part.strip() for part in line.split(",")], *host_memory])
             handle.flush()
             stop.wait(interval_s)
 
@@ -730,7 +806,8 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         "gpu_samples_path": str(gpu_path),
     }
     log_text = log_path.read_text(errors="replace")
-    result["failure_patterns"] = [pattern for pattern in _FAILURE_PATTERNS if pattern in log_text]
+    result["failure_patterns"], result["discarded_autotune_candidates"] = _failure_log_evidence(log_text)
+    result["host_memory"] = _host_memory_summary(gpu_path)
     if return_code == 0 and status == "ok":
         try:
             from stockagent.training.lifecycle import validate_completed_training_artifacts
@@ -747,6 +824,9 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
             rows = _read_jsonl(curve_path)
             train_rows = _parse_train_rows(log_path)
             memory = _gpu_memory_summary(gpu_path, gpu_indices=args.gpu_indices)
+            annual_ownership = None
+            if base.get("training", {}).get("day_trade_annual_episode_sharding", False):
+                annual_ownership = json.loads((curve_path.parent / "annual_episode_ownership.json").read_text())
             score = _score_curve(
                 rows,
                 skip_epochs=args.skip_epochs,
@@ -760,6 +840,10 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                     args.expected_execution_mode == "tw_day_trade"
                 ),
                 world_size=args.world_size,
+                annual_ownership=annual_ownership,
+                require_explicit_carry_graph=(
+                    env.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0") == "1"
+                ),
             )
             result.update(score)
             result["epoch_curve"] = str(curve_path)
@@ -774,6 +858,16 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
     else:
         result["reasons"] = [f"training failed: status={status} return_code={return_code}"]
 
+    # Dynamo can warn and return zero after falling back. Never score that as
+    # a successful compiled throughput candidate, even with complete artifacts.
+    if result["failure_patterns"]:
+        result["ok"] = False
+        result.setdefault("reasons", []).append("observed failure/fallback: " + ", ".join(result["failure_patterns"]))
+    minimum_host = getattr(args, "min_host_headroom_gib", 0.)
+    if minimum_host > 0 and (not result["host_memory"]["observed"]
+                            or result["host_memory"]["min_headroom_gib"] < minimum_host):
+        result["ok"] = False
+        result.setdefault("reasons", []).append("insufficient observed shared-cgroup RAM headroom")
     batch_dir.mkdir(parents=True, exist_ok=True)
     prior_result.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(
@@ -843,6 +937,8 @@ def main() -> None:
         ),
     )
     parser.add_argument("--batch-size-eval", type=int, default=128)
+    parser.add_argument("--min-host-headroom-gib", type=float, default=0.,
+                        help="optional shared-cgroup RAM acceptance, including file cache")
     parser.add_argument(
         "--expected-execution-mode",
         choices=("tw_day_trade", "naive", "tw_stock_context_futures_portfolio"),
@@ -860,7 +956,8 @@ def main() -> None:
         default="distributed_data_parallel",
         help="production training topology to benchmark",
     )
-    parser.add_argument("--python", type=Path, default=Path(sys.executable).resolve())
+    # Resolving a venv symlink switches site-packages to the base interpreter.
+    parser.add_argument("--python", type=Path, default=Path(sys.executable).absolute())
     parser.add_argument("--cpu-threads", type=int, default=112)
     parser.add_argument("--compile-threads", type=int, default=16)
     parser.add_argument("--profile-timing", action="store_true",
@@ -885,6 +982,8 @@ def main() -> None:
     args.output_root = (
         args.output_root.expanduser().resolve() if args.output_root is not None else _default_output_root()
     )
+    # Admission must not preload the helper checkout's stockagent package:
+    # the trainer/config imports below belong to --project-root.
     runpy.run_path(str(Path(__file__).resolve().parents[1] / "stockagent/storage_layout.py"))["admit_output"](
         args.output_root, "benchmark"
     )
@@ -923,6 +1022,8 @@ def main() -> None:
         raise SystemExit("--max-peak-vram-fraction must be in (0, 1]")
     if args.min_vram_headroom_gib < 0:
         raise SystemExit("--min-vram-headroom-gib must be non-negative")
+    if args.min_host_headroom_gib < 0:
+        raise SystemExit("--min-host-headroom-gib must be non-negative")
 
     try:
         _wait_for_idle_gpus(wait=args.wait_for_idle, poll_s=args.idle_poll_s)

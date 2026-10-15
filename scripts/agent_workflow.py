@@ -208,6 +208,37 @@ def run_view(record: dict) -> dict:
     return result
 
 
+def external_run_view(path: Path, record: dict) -> dict:
+    """Retain foreign evidence without probing its PIDs/logs on this host.
+
+    A returned run receipt is not a local runner or a live remote observation.
+    Keep its declared outcome separate; targeted read/execute/reconcile still
+    requires the exact local host and checkout via Workflow.read().
+    """
+    return {
+        "run_id": path.parent.name,
+        "task_id": record.get("task_id")
+        if isinstance(record.get("task_id"), str)
+        else "",
+        "name": record.get("name") if isinstance(record.get("name"), str) else "",
+        "queued_at_utc": record.get("queued_at_utc")
+        if isinstance(record.get("queued_at_utc"), str)
+        else "",
+        "host": record["host"],
+        "repo_root": record["repo_root"],
+        "state": "foreign_unverified",
+        "exit_code": None,
+        "reported_state": record.get("state")
+        if isinstance(record.get("state"), str)
+        else None,
+        "reported_exit_code": record.get("exit_code")
+        if type(record.get("exit_code")) is int
+        else None,
+        "receipt_path": str(path),
+        "authority": "external_receipt_only_not_local_or_live_remote_execution",
+    }
+
+
 class Workflow:
     def __init__(self, root: Path = REPO_ROOT, state_dir: Path | None = None):
         self.root = root.resolve()
@@ -223,6 +254,9 @@ class Workflow:
 
     def read(self, path: Path) -> dict:
         data = json.loads(path.read_text())
+        return self._require_local_receipt(path, data)
+
+    def _require_local_receipt(self, path: Path, data: object) -> dict:
         if (
             not isinstance(data, dict)
             or data.get("schema_version") != SCHEMA_VERSION
@@ -361,7 +395,8 @@ class Workflow:
                 Path(proof["path"]), allow_empty=proof is resolution.get("failed_log")
             )
             if (current["sha256"], current["size_bytes"]) != (
-                proof["sha256"], proof["size_bytes"]
+                proof["sha256"],
+                proof["size_bytes"],
             ):
                 raise ValueError("failure resolution evidence changed")
         if resolution["outcome"] == "expected-rejection":
@@ -385,7 +420,9 @@ class Workflow:
                 ):
                     declared = True
             if not declared:
-                raise ValueError("expected rejection requires a bound criterion receipt")
+                raise ValueError(
+                    "expected rejection requires a bound criterion receipt"
+                )
 
     def resolve_run(
         self,
@@ -415,7 +452,9 @@ class Workflow:
                 "note": note,
                 "failed_receipt": file_evidence(self.run_path(run_id)),
                 "verification_receipt": file_evidence(self.run_path(verified_by)),
-                "failed_log": file_evidence(log, allow_empty=True) if log.exists() else None,
+                "failed_log": file_evidence(log, allow_empty=True)
+                if log.exists()
+                else None,
                 "evidence": [
                     file_evidence(p if p.is_absolute() else self.root / p)
                     for p in evidence
@@ -443,10 +482,29 @@ class Workflow:
         ]
 
     def runs(self, task_id: str | None = None) -> list[dict]:
-        records = [
-            run_view(self.read(path))
-            for path in sorted((self.state_dir / "runs").glob("*/run.json"))
-        ]
+        records = []
+        for path in sorted((self.state_dir / "runs").glob("*/run.json")):
+            data = json.loads(path.read_text())
+            # Imported, well-formed foreign metadata must remain visible, but
+            # cannot poison unrelated local dispatch or describe a reused PID.
+            # Malformed/local-incompatible records continue to fail closed.
+            foreign = (
+                isinstance(data, dict)
+                and data.get("schema_version") == SCHEMA_VERSION
+                and isinstance(data.get("host"), str)
+                and bool(data["host"])
+                and isinstance(data.get("repo_root"), str)
+                and bool(data["repo_root"])
+                and (
+                    data["host"] != socket.gethostname()
+                    or data["repo_root"] != str(self.root)
+                )
+            )
+            records.append(
+                external_run_view(path, data)
+                if foreign
+                else run_view(self._require_local_receipt(path, data))
+            )
         return sorted(
             (
                 record
@@ -735,6 +793,7 @@ class Workflow:
                 "running",
                 "interrupted",
                 "launch_unverified",
+                "foreign_unverified",
             }:
                 if not previous[-1].get("recovery_verified"):
                     raise ValueError(
@@ -869,6 +928,12 @@ def status(workflow: Workflow, *, architecture: bool = False) -> dict:
             "Remote peers and refs have not been live-verified.",
         ],
     }
+    external_count = sum(row["state"] == "foreign_unverified" for row in result["runs"])
+    result["run_receipt_inventory"] = {
+        "local_scope_count": len(result["runs"]) - external_count,
+        "unverified_external_count": external_count,
+        "boundary": "external outcomes are declared metadata, never local or live remote acceptance",
+    }
     try:
         lines = command(
             [
@@ -998,7 +1063,9 @@ def parser() -> argparse.ArgumentParser:
     sub = tasks.add_parser("resolve-run")
     sub.add_argument("id")
     sub.add_argument("run_id")
-    sub.add_argument("--outcome", choices=("superseded", "expected-rejection"), required=True)
+    sub.add_argument(
+        "--outcome", choices=("superseded", "expected-rejection"), required=True
+    )
     sub.add_argument("--verified-by", required=True)
     sub.add_argument("--note", required=True)
     sub.add_argument("--evidence", type=Path, action="append", required=True)

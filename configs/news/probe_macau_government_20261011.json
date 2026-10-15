@@ -1,0 +1,51 @@
+{
+  "contract_version": 1,
+  "root": "artifacts/data_quality/news_goal_stage01_20261009/remaining_v60/macau_probe_state",
+  "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
+  "workers": 1,
+  "exclusive_http_owner": true,
+  "request_timeout_seconds": 8,
+  "response_deadline_seconds": 20,
+  "max_response_bytes": 8388608,
+  "max_attempts": 6,
+  "lease_seconds": 300,
+  "min_free_disk_bytes": 26843545600,
+  "batch_articles": 16,
+  "batch_text_bytes": 4194304,
+  "robots_ttl_seconds": 86400,
+  "metadata_refresh_seconds": 900,
+  "recent_article_recheck_seconds": 21600,
+  "recent_article_window_days": 3,
+  "unknown_source_policy": "awaiting_authorization",
+  "collection_purpose": "personal_research",
+  "publish": false,
+  "remote_training_export": false,
+  "providers": [
+    {
+      "id": "macau_gov",
+      "name": "澳門特別行政區政府入口網站",
+      "domains": ["www.gov.mo"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "article_path_pattern": "^/zh-hans/news/607199/$",
+      "embedded_article_layout": "macau_visible_news_v1",
+      "article_selectors": [":scope > article"],
+      "exclude_selectors": [".gallery", "img.gcs-counter", "a.btn[href^='javascript:viewGallery(']"],
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "title_selector": ".news-title > h1",
+      "authorization": {
+        "kind": "open_license",
+        "license": "Macau-Government-Portal-Noncommercial-Unmodified",
+        "evidence_url": "https://www.gov.mo/zh-hant/terms-of-use/",
+        "scope": "One explicitly selected locally known labour-department public news URL for private diagnosis. Preserve exact government-owned text, release department, source clock and capture date; exclude third-party or specially restricted works and all media. No publication, public deep-linking, automatic training export, endpoint guessing or numeric-ID enumeration.",
+        "verified_on": "2026-10-11",
+        "rights_restrictions": "Official portal terms allow noncommercial unmodified copying with source/capture-date attribution, not a commercial or third-party license. Non-homepage linking by external websites requires separate authorization; no public article links or body export. Terms/refusals/robots stay authoritative."
+      },
+      "note": "Bounded diagnosis uses a separate private state root because the canonical live owner has no source for this host. No shared-host overlap or queue writes. The native adapter verifies one current article against canonical/og/schema/visible headline, the reviewed labour-department credit and its own naive release datetime. Preserve visible captions and financial/employment values, exclude gallery controls/media, never infer a timezone from the schema offset alone; exact raw schema retained. Source diagnosis alone is not durable article coverage."
+    }
+  ]
+}

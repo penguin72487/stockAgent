@@ -1,0 +1,56 @@
+contract: frontier_complete_fold_recipes_v1
+# Interaction trials; admission is checked against preceding full-fold receipts.
+full_fold_candidates:
+  - name: numa_funding_packed_cpu1
+    cpu_threads: 1
+    overrides:
+      training:
+        financial_transformer: {fused_swiglu_projection: true}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: numa_funding_deferred_ddp_cpu1
+    cpu_threads: 1
+    overrides:
+      training: {ddp_broadcast_buffers: false, ddp_trajectory_gradient_sync: trajectory}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: numa_funding_packed_bf16_cpu1
+    cpu_threads: 1
+    overrides:
+      training:
+        financial_transformer:
+          fused_swiglu_projection: true
+          compact_projection_compute_dtype: bf16
+          temporal_blocks_fp32: false
+          portfolio_blocks_fp32: false
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: numa_funding_packed_fp32_last_cpu1
+    cpu_threads: 1
+    overrides:
+      training:
+        financial_transformer:
+          fused_swiglu_projection: true
+          compiled_cross_attention_backend: manual_fp32_last
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
+  - name: quack_softmax_temporal_bf16
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer:
+          compiled_cross_attention_backend: manual
+          temporal_blocks_fp32: false
+          kernel_softmax_backend: quack
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1

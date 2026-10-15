@@ -701,6 +701,29 @@ def test_cuda_unknown_held_action_is_atomic_and_does_not_poison_device():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime unavailable")
+def test_cuda_financial_graphs_capture_real_ledger_and_preserve_repeated_credit(monkeypatch):
+    from torch._inductor.cudagraph_trees import get_container
+    import stockagent.backtest.tw_day_trade_carry as carry
+
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CUDAGRAPHS", "1")
+    monkeypatch.setenv("STOCKAGENT_STRICT_NO_FALLBACK", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    for _ in range(2):
+        torch.compiler.cudagraph_mark_step_begin()
+        test_cuda_compiled_pending_stock_delivery_matches_cpu_and_gradient()
+        torch.cuda.synchronize()
+    manager = get_container(torch.cuda.current_device()).tree_manager
+    assert manager is not None
+    roots = [node for nodes in manager.roots.values() for node in nodes]
+    assert roots, "the empty memory-pool bootstrap is not a financial graph"
+    assert all(isinstance(node.graph, torch.cuda.CUDAGraph) and node.graph is not manager.graph
+        for node in roots)
+    stats = carry.get_day_trade_carry_compile_stats()
+    assert stats["compiled_session_calls"] > 0
+    assert stats["compile_failures"] == stats["eager_fallback_calls"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime unavailable")
 def test_cuda_compiled_pending_stock_delivery_matches_cpu_and_gradient():
     from dataclasses import fields
 
@@ -1076,3 +1099,174 @@ def test_cuda_source_failure_stays_nan_without_poisoning_context_or_financial_de
         state.checkpoint_state(universe=("2330",), release_id="test-pinned-release")
     # A device-side assertion would also break this unrelated CUDA work.
     torch.testing.assert_close(torch.ones(2, device="cuda") * 3, torch.full((2,), 3., device="cuda"))
+
+
+@pytest.mark.parametrize("day", [DAY, DAY + 1, DAY + 3000])
+def test_tensor_calendar_restoration_preserves_ordinals_and_all_adjoints(day):
+    import stockagent.backtest.tw_day_trade_carry as carry
+    from stockagent.backtest.tw_day_trade_inventory import CohortField
+    torch.manual_seed(9)
+    before = torch.randn(2, 3, len(CohortField), dtype=torch.float64, requires_grad=True)
+    normalized = torch.randn(3, 3, len(CohortField), dtype=torch.float64, requires_grad=True)
+    expected = normalized.clone()
+    for field in (CohortField.ACQUIRED_DAY, CohortField.ACCRUED_THROUGH, CohortField.LOCKED_UNTIL_DAY):
+        expected[:-1, :, field] = before[..., field]
+        expected[-1, :, field] = 0 if field == CohortField.LOCKED_UNTIL_DAY else day
+    actual = carry._restore_session_calendar(normalized, before, day=before.new_tensor(day))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    multiplier = torch.randn_like(actual)
+    reference_grad = torch.autograd.grad((expected * multiplier).sum(), (normalized, before), retain_graph=True)
+    actual_grad = torch.autograd.grad((actual * multiplier).sum(), (normalized, before))
+    for observed, reference in zip(actual_grad, reference_grad, strict=True):
+        torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires initialized CUDA")
+def test_cuda_calendar_cache_has_independent_state_and_compiled_adjoints(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+    from stockagent.backtest.tw_day_trade_inventory import CohortField
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "1")
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CALENDAR_COMPILE", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    template = torch.tensor(0., device="cuda", dtype=torch.float64)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        first = carry._session_day_tensor(template, day=DAY)
+    stream.synchronize()
+    first.fill_(-1.)
+    second = carry._session_day_tensor(template, day=DAY)
+    assert second.item() == DAY
+    before = torch.randn(2, 3, len(CohortField), device="cuda", dtype=torch.float64, requires_grad=True)
+    normalized = torch.randn(3, 3, len(CohortField), device="cuda", dtype=torch.float64, requires_grad=True)
+    for day in (DAY, DAY + 1, DAY + 3000):
+        expected = carry._restore_session_calendar(normalized, before, day=day)
+        actual = carry._restore_compiled_calendar(normalized, before, day=carry._session_day_tensor(template, day=day))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        reference = torch.autograd.grad(expected.sum(), (normalized, before), retain_graph=True)
+        observed = torch.autograd.grad(actual.sum(), (normalized, before), retain_graph=True)
+        for a, b in zip(observed, reference, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert carry.get_day_trade_carry_compile_stats()["calendar_cache_hits"] >= 2
+    assert len(carry._COMPILED_CALENDARS) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires initialized CUDA")
+def test_cuda_compiled_funding_uses_one_graph_for_different_gregorian_dates(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+    from torch._dynamo.utils import counters
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    state = DayTradeCarryState.empty(1, 10_000_000., torch.device('cuda'))
+    weights = v(.2).cuda().requires_grad_()
+    begin = counters['stats']['unique_graphs']
+    for day in (DAY, DAY + 1, DAY + 3000):
+        row = session(day)
+        row = replace(row, **{field.name: getattr(row, field.name).cuda()
+            for field in fields(row) if isinstance(getattr(row, field.name), torch.Tensor)})
+        options = dict(weights=weights, can_enter=torch.ones_like(weights), initial_capital=10_000_000.)
+        expected = carry._prepare_session_funding_core(state, row, **options)
+        observed = carry._prepare_session_funding(state, row, **options)
+        for a, b in zip(observed, expected, strict=True):
+            if isinstance(a, DayTradeInventoryState):
+                for field in fields(a):
+                    torch.testing.assert_close(getattr(a, field.name), getattr(b, field.name), rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert carry.get_day_trade_carry_compile_stats()['session_prepare_compile_constructors'] == 1
+    assert counters['stats']['unique_graphs'] - begin == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires initialized CUDA")
+def test_cuda_funding_claim_bucket_preserves_history_payment_and_adjoints(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+    from torch._dynamo.utils import counters
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    begin = counters["stats"]["unique_graphs"]
+    for rows in (0, 1, 3, 31, 32):
+        state = DayTradeCarryState.empty(1, 10_000_000., torch.device("cuda"))
+        claims = torch.zeros((rows, 1, 3), device="cuda", dtype=torch.float64)
+        if rows:
+            claims[:, 0, 0] = torch.arange(1, rows + 1, device="cuda")
+            claims[:, 0, 1] = DAY - 1
+        claims.requires_grad_()
+        state = replace(state, inventory=replace(state.inventory, claims=claims))
+        row = replace(session(DAY + rows), action_mask=v(0), share_ratio=v(1),
+                      cash_per_old_share=v(0), payment_day=v(DAY + rows))
+        row = replace(row, **{field.name: getattr(row, field.name).cuda()
+            for field in fields(row) if isinstance(getattr(row, field.name), torch.Tensor)})
+        weights = v(.2).cuda().requires_grad_()
+        options = dict(weights=weights, can_enter=torch.ones_like(weights),
+                       initial_capital=10_000_000.)
+        expected = carry._prepare_session_funding_core(state, row, **options)
+        observed = carry._prepare_session_funding(state, row, **options)
+        for a, b in zip(observed, expected, strict=True):
+            if isinstance(a, DayTradeInventoryState):
+                for field in fields(a):
+                    torch.testing.assert_close(getattr(a, field.name), getattr(b, field.name),
+                                               rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+        assert observed[1].claims.shape[0] == rows + 1
+        assert observed[2].claims.shape[0] == rows
+        expected_loss = expected[1].corporate_action_net + expected[3].sum()
+        observed_loss = observed[1].corporate_action_net + observed[3].sum()
+        expected_grads = torch.autograd.grad(expected_loss, (claims, weights), retain_graph=True)
+        observed_grads = torch.autograd.grad(observed_loss, (claims, weights))
+        for a, b in zip(observed_grads, expected_grads, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert carry.get_day_trade_carry_compile_stats()["session_prepare_compile_constructors"] == 2
+    assert counters["stats"]["unique_graphs"] - begin == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires initialized CUDA")
+def test_cuda_funding_cohort_bucket_preserves_logical_zero_rows_and_adjoints(monkeypatch):
+    import stockagent.backtest.tw_day_trade_carry as carry
+    from torch._dynamo.utils import counters
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "1")
+    carry.reset_day_trade_carry_compile_stats(clear_cache=True)
+    begin = counters["stats"]["unique_graphs"]
+    for rows in (1, 3, 31, 32):
+        state = DayTradeCarryState.empty(1, 10_000_000., torch.device("cuda"))
+        zero = v(0).cuda()
+        inventory = append_inventory_fill(state.inventory, signed_shares=v(1000).cuda(),
+            price=v(1000).cuda(), buy_fee_rate=zero, day_sell_fee_rate=zero,
+            normal_sell_fee_rate=zero, rebate_rate=zero, day=DAY - 2)
+        state, _ = carry._pad_carry_state_cohorts(replace(state, inventory=inventory),
+                                                target_rows=rows)
+        cohorts = state.inventory.cohorts.detach().requires_grad_()
+        claims = torch.tensor([[[11., DAY - 1, 0]], [[13., DAY + 100, 0]],
+                               [[17., DAY - 1, 1]]], device="cuda",
+                              dtype=torch.float64, requires_grad=True)
+        state = replace(state, inventory=replace(state.inventory, cohorts=cohorts, claims=claims))
+        row = replace(session(DAY + rows), action_mask=v(0), share_ratio=v(1),
+                      cash_per_old_share=v(0), payment_day=v(DAY + rows))
+        row = replace(row, **{field.name: getattr(row, field.name).cuda()
+            for field in fields(row) if isinstance(getattr(row, field.name), torch.Tensor)})
+        weights = v(.2).cuda().requires_grad_()
+        options = dict(weights=weights, can_enter=torch.ones_like(weights),
+                       initial_capital=10_000_000.)
+        expected = carry._prepare_session_funding_core(state, row, **options)
+        observed = carry._prepare_session_funding(state, row, **options)
+        for a, b in zip(observed, expected, strict=True):
+            if isinstance(a, DayTradeInventoryState):
+                for field in fields(a):
+                    torch.testing.assert_close(getattr(a, field.name), getattr(b, field.name),
+                                               rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+        for result in (observed[1], observed[2], observed[6]):
+            assert result.cohorts.shape[0] == rows
+        def objective(result):
+            return inventory_nav(result[6], initial_capital=10_000_000.,
+                                 marks=row.opening_marks) + result[3].sum()
+        expected_grads = torch.autograd.grad(objective(expected), (cohorts, claims, weights),
+                                             retain_graph=True)
+        observed_grads = torch.autograd.grad(objective(observed), (cohorts, claims, weights))
+        for a, b in zip(observed_grads, expected_grads, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert carry.get_day_trade_carry_compile_stats()["session_prepare_compile_constructors"] == 1
+    assert counters["stats"]["unique_graphs"] - begin == 1

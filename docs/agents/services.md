@@ -2,6 +2,30 @@
 
 Use the section for the service being changed. Operational acceptance requires fresh runtime evidence; historical service observations do not establish current readiness.
 
+## Shioaji SDK maintenance
+
+- `scripts/maintain_shioaji_sdk.py` queries official PyPI stable releases,
+  rejects yanked/pre-release/incompatible wheels, verifies SHA256 and validates
+  the native Python API plus focused quote, volume, scheduling and execution
+  tests in an isolated target. It never logs in or submits an order and never
+  upgrades unrelated CUDA/data packages to make a candidate pass.
+- Install with `source scripts/runtime_env.sh` followed by
+  `run_fintech_python scripts/install_shioaji_sdk_maintenance.py`. The canonical
+  timer checks hourly at `:40` and runs daily at 05:30 Asia/Taipei. Promotion is
+  allowed only 05:15–06:30, after the night session and before preopen; a late
+  boot catch-up checks versions without restarting trading owners.
+- Native SDKs are process-local. Stop reviewed existing SDK owners before
+  replacing the package, then restore only previously active services/timers.
+  Coordinate with the existing paper-service control lease; an unmanaged SDK
+  process defers promotion rather than being killed. Installation failures use
+  the preserved exact previous wheel; a durable journal and `ExecStopPost`
+  recover interrupted replacement. Preserve the original failure receipts.
+- Inspect `artifacts/operations/shioaji_sdk/status.json`, candidate acceptance,
+  transaction and private logs. Installed version, mapped native inode,
+  successful owner restart, real login/quotes and market readiness are distinct
+  proofs. Use existing source/owner receipts and preopen gates for the latter;
+  offline compatibility tests never imply a broker fill or complete live data.
+
 ## Discord Service Reliability Contract
 
 - Treat Discord/Gateway liveness and private artifact maintenance as separate
@@ -27,22 +51,115 @@ Use the section for the service being changed. Operational acceptance requires f
   eligibility, MIS opening quote, or opening activation for this calculation;
   those remain mandatory only for executable 09:00 paper orders. Never relabel
   an after-close calculation as a fill at that already-completed close.
+- Live TW panel/cache reads share the canonical producer's
+  `tw-public-refresh.lock` across the source read. An exclusive producer means
+  retryable `waiting_source`, not a completed mixed reference/entitlement
+  generation. Once that owner releases, strict SHA/count/dependency checks still
+  reject real corruption. Postclose cache telemetry is owned by the current bot
+  run and may recover after the provisional window only from an accepted
+  official-close signal or a matching deployment's complete existing cache;
+  this does not establish formal-history or broker-fill acceptance. See
+  [2026-10-08 source-coherence repair](../tw_corporate_action_generation_repair_2026-10-08.md).
+- The postclose path notification is a latency hint, not the only recovery
+  mechanism: the canonical receipt-only retry controller also checks completed
+  cache dependencies without importing Torch. Latest-close and full-history
+  owners retain separate runtime/runway budgets; do not place the two-hour
+  history restriction around their shared controller. Probe a source lock with
+  a shared lease so a legitimate reader is not mistaken for an exclusive
+  producer; job locks still suppress duplicate workers. Only complete canonical
+  summary/weights readback across a stable generation acknowledges a wakeup.
+  A dispatch, deferred exit, partial artifact or metadata-only plan is not data
+  acceptance. Unchanged plans avoid repeated YAML/Arrow/model imports while
+  preserving per-file and membership invalidation; actual signal consumers
+  retain their full validation. Scoped maintenance installation must not restart
+  Gateway, source, quote or execution owners. Measurements and native evidence
+  are in [the running-service report](../running_service_optimization_2026-10-13.md).
 - Set the outer systemd watchdog above measured legitimate event-loop stalls.
   Keep the tighter opening path protected by its progress-aware hot/cold
   watchdog so relaxing the outer process watchdog does not relax 09:00 recovery.
+  During `preopen_catch_up`, respect the existing source timeout only while
+  that resolved shared command has a real live child or a recently verified
+  blocked writer-lock wait. Its deadline must not slide, and waiting is not
+  data readiness/model progress. Quote/model/input stages retain their original
+  watchdog. Evidence and bounded owner checks are in the
+  [2026-10-14 source-watchdog repair](../running_service_optimization_2026-10-13.md#0900-開盤現場入口權限與來源-watchdog-修復).
 - Bound and rotate traceback logs. Service acceptance requires the Gateway to
   be connected, command sync to succeed or be explicitly deferred, all enabled
   TW modes to acknowledge the engine revision with zero lag, and logs
   since the current restart to contain no watchdog or fatal error.
+- Scheduled latency-critical input work uses one session/config-fenced job per
+  mode across bounded scheduler polls. A slow source preparation cannot prevent
+  another mode's existing retry; cancelling a `to_thread` await is not proof
+  its builder stopped, so do not replace a running job with a duplicate. Discard
+  stale results after completion and retain canonical inference revalidation.
+  Reports/chat run in their original delivery order after immutable publication,
+  outside the input-retry loop. See the measured
+  [opening dispatch and execution boundaries](../tw_opening_latency_stages_2026-10-14.md).
+- GPU residency follows the same verified session/preparation window as model
+  warmup, not a separate hard-coded 07:00 retention rule. Successful serialized
+  idle eviction invalidates the process-hot flag; it does not change signals,
+  inputs, precision or permanent-failure classification. A completed warmup
+  receipt is historical evidence, not current residency. The measured penguin
+  ten-minute lead and actual cold-owner readback are scoped in
+  [preparation and release evidence](../completed_session_inference_cache_2026-10-13.md#盤前暖機與釋放窗口).
 
 ## TW Day-Trade Engine Responsiveness
 
 - The ledger/execution loop owns watchdog liveness. Historical-query progress
   may publish status, but must not keep a stalled execution loop falsely alive.
+- Opening execution timing observes changed target quantities only after the
+  canonical state/projections are durably committed. Original publication,
+  registration, first paper fill and full-target completion are separate clocks.
+  Replay event times, cash-only modes, cancelled unsized targets and completion
+  found after restore cannot manufacture live opening SLO success. Observer I/O
+  failure stays visible without blocking liquidation or changing the ledger.
 - Missed-open source recovery runs off the ledger loop, publishes each resolved
   symbol durably, and releases each mode from its own source dependencies rather
   than waiting for every mode. Prune only provably zero whole-lot targets using
   frozen session sizing NAV; carried inventory and unknown prices remain in scope.
+- Opening acquisition contract v4 distinguishes positive same-session opens,
+  fresh official zero-volume/no-first-print evidence, and unknown source failures.
+  The existing input quorum may count the first two as resolved observations;
+  response rows alone, stale timestamps, or a ready flag cannot prove readiness.
+  Observed absence uses the existing zero-gap feature sentinel, never a fabricated
+  price. Positive-open completeness remains a separate, truthfully incomplete metric.
+  Preserve accepted opens and retry unknown inputs through the shared source owner.
+  A mode's retry must not starve source repair between actual inference attempts.
+  After publishing the immutable original model weights once, an unpriced target
+  remains a per-symbol unsized `waiting_source` order, not a discarded cash target
+  or a reason to rerun the whole model. Freeze its original session NAV; size only
+  after real same-session price/limits and causal non-trial evidence arrive, and
+  cancel unopened targets when the 13:20 exit window begins. Preserve eligibility,
+  short permissions, lot/tick rules, causal quotes, and the original fill policy.
+  Exchange timestamps and local receipt timestamps remain distinct; a fresh
+  delivery of yesterday's row is not today's opening. See the initial
+  [2026-10-07 repair](../tw_opening_source_recovery_2026-10-07.md) and its
+  [2026-10-08 quorum/pending-target correction](../tw_opening_latency_repair_2026-10-08.md).
+- The live TW opening source owner starts every configured provider over the
+  current official TWSE/TPEx regular stock/ETF trading universe concurrently.
+  A dated ISIN registry plus official halt/status receipt is refreshed during
+  preopen preparation (final-arm rechecks receipts older than 15 minutes), not
+  fetched under the opening/model lock. Model coverage uses its intersection
+  with that official universe; historical `alive_mask`, positive volume and a
+  fixed count are not current market-membership authorities. Keep the complete
+  checkpoint symbol axis, report official symbols absent from each model, and
+  never backdate a midday registry observation into a historical signal.
+  The owner accepts incremental batches and persists verified
+  inputs before releasing the existing quorum. Slow/failed providers cannot
+  cancel winners or hold the model mutex; later attempts reuse accepted facts
+  and retry only unresolved deltas. Preserve conflicting raw observations and
+  the complete requested universe. Shared IPC progress is cumulative, and native
+  callback parsing/network waits stay outside the stock-cache and execution locks.
+  The pre-open transport probes are also independent: one proven responding
+  source may warm the model, but cannot bypass actual 09:00 source coverage,
+  eligibility or execution evidence. Daily `*.acquisition.jsonl`, the scheduled
+  opening-attempt log and engine entry telemetry have separate measurement
+  boundaries; a source quorum, paper fill and broker fill are different proofs.
+  Native Shioaji stock Snapshot wall-clock timestamps are localized to Taipei
+  before conversion to UTC milliseconds; do not shift their clock by eight hours
+  or silently rewrite historical receipts. The shared quote worker remains in
+  the existing simulation engine process/session, not another login. See the
+  [multi-source implementation and bounded measurements](../tw_opening_latency_repair_2026-10-08.md#多源平行開盤取價2026-10-08-續作).
 - A current-session Snapshot book may supply explicitly labelled indicative
   valuation only. Unknown `simtrade` remains unknown; these fields must not
   supply execution prices, volume, bracket triggers or non-trial evidence.
@@ -59,9 +176,54 @@ Use the section for the service being changed. Operational acceptance requires f
   engine lock.  Cash-settle an expired weekly cycle and any expired
   `put_call_parity_tx` package only from the official TAIFEX final-settlement
   parquet, then snapshot the remaining current contracts.  Missing official
-  settlement, a residual futures hedge, or malformed leg metadata must fail
-  closed.  Do not require an expired contract to remain in the next trading
+  settlement or malformed leg metadata must fail closed. A residual futures
+  hedge fails closed unless the explicit paper-recovery policy below is enabled.
+  Do not require an expired contract to remain in the next trading
   date's Shioaji catalogue; that ordering deadlocks settlement before startup.
+- Contract v13 adds user-authorized `--recover-expired-cycle-futures` (runner
+  `SHIOAJI_TAIFEX_RECOVER_EXPIRED_CYCLE_FUTURES=true`, default false). Preserve a
+  verified backup before enabling it. Settle expired options from the official
+  receipt, freeze futures identities from the matching original-cycle status,
+  and preserve nonzero futures until fresh non-trial same-contract five-level
+  depth can completely reduce that strategy to zero. Missing/mismatched contract
+  evidence remains blocked; insufficient depth retries without inventing a fill.
+  No new cycle, calibration, parity entry or risk expansion runs while reduction
+  is pending. Paper repair disables broker orders persistently, records its
+  actual receipt/execution times and explicit repair reason, and resumes through
+  the existing worker 0 after reduction. It is not a backdated 9/18 or broker fill.
+- Dashboard v9 ages valuation evidence against the observer clock. Preserve the
+  original source trading date; `observed_trading_date` describes today's session,
+  not a backdated mark. Historical cache invalidation uses marks/backfill versions
+  plus the shared strategy/capital projection inputs, not every status heartbeat.
+  Reject persisted caches from an old dashboard schema. If a changed source is
+  more than two minutes ahead of a cached curve, rebuild the actual projection
+  instead of amplifying days-old data through stacked stale-while-refresh caches.
+  The UI distinguishes current strategy health from a curve still catching up.
+  The native prewarmer keeps the default 1d generation current on mark changes
+  and stops with the server. TAIFEX public history does not add a second SWR
+  layer; the native projection is its single refresh owner.
+  History cache v2 freezes one source timestamp upper bound across native and
+  canonical readers; marks appended during a rebuild belong to the next query.
+  The anchor includes verified replay generations as well as the live ledger.
+  Ranges share a projection only when their effective source window and bucket
+  geometry are identical; on a short history, quarter/year/all need one full
+  scan, not three. Warmup 503/timeout observations remain visible and are retried
+  without a page reload. They are not accepted as data completion or zero latency.
+- Verify paper repair with `scripts/verify_taifex_web_recovery.py`: supply the
+  verified `--backup-dir`, original `--capture-id`, output directory and local /
+  public `--url` values. It checks preserved ledger prefixes, official source
+  hashes/intrinsic values, raw captured five-level fills, every strategy's current
+  curve endpoint, read-only HTTP behavior and native responsive interactions.
+  With `--observe-minute-refresh`, the browser must observe the actual scheduler
+  advancing its endpoint without reloads. The public warmup probe injects one
+  browser-only 503 and verifies waiting/retry/real-API recovery without changing
+  production sources or caches; real HTTP failures remain separate in receipts.
+  Browser `cpu-2d` verification is explicit and does not prove GPU/WebGL readiness.
+  The [2026-10-13 recovery acceptance](../../artifacts/operations/taifex_web_repair_20261013/accepted-release/acceptance.json)
+  verified 28 original futures reductions and 108 option settlements against
+  preserved ledger prefixes and original price evidence, plus all seven ranges
+  on local/public APIs and laptop/tablet/phone browser widths. It did not replay
+  the historical interruption or establish actual broker fills.
 - Successful expiry settlement is a continuous-roll boundary, not a terminal
   strategy state.  On the first complete fresh Bid/Ask set, alive weekly
   strategies select the nearest listed weekly expiry strictly after the current

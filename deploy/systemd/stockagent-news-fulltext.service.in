@@ -1,0 +1,24 @@
+[Unit]
+Description=Private personal-research news text enrichment from local FinLab/FinMind metadata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+UMask=0077
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_news_fulltext.sh"
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=1G
+MemoryMax=2G
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=60s
+KillMode=control-group
+NoNewPrivileges=true

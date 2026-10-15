@@ -1,0 +1,5 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: native_timeline
+    nsys_trace: true
+    overrides: {}

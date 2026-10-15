@@ -261,7 +261,7 @@ def main(argv=None):
                 if state == 'idle':
                     mark_batch_finished(root,reason='no_ready_tasks_in_selected_mode',attempted=index,mode=kind or 'interleaved')
                     return 0
-                if state not in {'completed_task','source_key_layout_replanned','source_capacity_replanned','metadata_preparation_failed_deferred','vendor_metadata_allocation_failed_deferred','source_validation_failed_deferred','prequery_failure_deferred','api_scope_repartitioned'}:
+                if state not in {'completed_task','source_key_layout_replanned','source_capacity_replanned','metadata_preparation_failed_deferred','vendor_metadata_allocation_failed_deferred','source_validation_failed_deferred','prequery_failure_deferred','api_scope_repartitioned','metadata_retry_scheduled'}:
                     return 1
                 from downloader.tej_scheduler import remaining_query_interval
                 delay=remaining_query_interval(config,time.monotonic()-query_started)

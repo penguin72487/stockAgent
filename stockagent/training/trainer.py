@@ -150,6 +150,7 @@ from stockagent.data.tw_index_options_daily import (
 from stockagent.data.walkforward import (
     WalkForwardFold, normalize_lookback_context, period_labels_from_contract,
     normalize_year_boundary_mode, year_boundary_offset_sessions,
+    annual_period_years, year_period_contract,
 )
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import (
@@ -164,6 +165,7 @@ from stockagent.models.temporal_basis_fit import (
 )
 from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.training.checkpoint_contract import (
+    day_trade_training_episode_contract,
     _active_model_config,
     _align_panel_to_state_dict_universe,
     _checkpoint_manifest,
@@ -923,6 +925,7 @@ def _route_ddp_batch_replicated(
     include_volume_notional: bool,
     include_short_capacity_notional: bool,
     global_metadata: Mapping[str, torch.Tensor] | None = None,
+    gather_actions: bool = True,
 ) -> dict[str, torch.Tensor | None]:
     """Gather actions while keeping the full-symbol ledger replicated.
 
@@ -933,12 +936,16 @@ def _route_ddp_batch_replicated(
     ``None`` preserves the historical all-gather oracle.
     """
 
+    if not gather_actions and global_metadata is None:
+        raise ValueError("local account actions require locally owned execution metadata")
+
     routed: dict[str, torch.Tensor | None] = {
-        "weights": _all_gather_autograd(local_weights.contiguous()),
+        "weights": (_all_gather_autograd(local_weights.contiguous())
+                    if gather_actions else local_weights),
     }
     source = batch if global_metadata is None else global_metadata
     if global_metadata is not None:
-        expected_rows = int(local_weights.size(0)) * _distributed_world_size()
+        expected_rows = int(local_weights.size(0)) * (_distributed_world_size() if gather_actions else 1)
         sample_mask = source.get("sample_mask")
         if sample_mask is None or int(sample_mask.size(0)) != expected_rows:
             raise RuntimeError(
@@ -2449,6 +2456,7 @@ class _ExecutionRuntime:
     derivatives_maximum_capital_fraction: float = 0.98
     day_trade_carry_source: PreparedDayTradeCarrySource | None = None
     day_trade_training_annual_episodes: bool = False
+    day_trade_training_period_contract: Mapping[str, Any] | None = None
     # CPU identity references only; resolved exclusively after a crypto error.
     diagnostic_panel_dates: np.ndarray | None = None
     diagnostic_panel_symbols: Sequence[str] | None = None
@@ -2866,6 +2874,12 @@ def _build_execution_runtime(
             else None
         ),
         day_trade_training_annual_episodes=bool(config.training.day_trade_training_annual_episodes),
+        day_trade_training_period_contract=(
+            year_period_contract(panel.dates, year_boundary_offset_sessions(config))
+            if config.training.day_trade_training_annual_episodes
+            and year_boundary_offset_sessions(config)
+            else None
+        ),
     )
 
 
@@ -6660,6 +6674,7 @@ def _write_loss_contract_metadata(
     factor_aug_kwargs: Mapping[str, float] | None,
     day_trade_training_annual_episodes: bool = False,
     day_trade_sub_lot_recovery: bool = False,
+    day_trade_annual_episode_boundary: str = "calendar_year_first_session_fresh_capital_v2",
 ) -> None:
     """Persist which loss components are shared with evaluation versus train-only."""
     if not _distributed_should_write():
@@ -6686,7 +6701,7 @@ def _write_loss_contract_metadata(
         payload["day_trade_training_contract"] = {
             "annual_independent_accounts": bool(day_trade_training_annual_episodes),
             "annual_episode_boundary": (
-                "calendar_year_first_session_fresh_capital_v2"
+                day_trade_annual_episode_boundary
                 if day_trade_training_annual_episodes
                 else None
             ),
@@ -7740,26 +7755,40 @@ def _unwrap_distributed_data_parallel(model: nn.Module) -> nn.Module:
 
 
 def _clip_model_gradients_(model: nn.Module, max_norm: float) -> torch.Tensor | None:
-    params = [param for param in _unwrap_model(model).parameters() if param.grad is not None]
-    if not params:
+    gradients = [param.grad for param in _unwrap_model(model).parameters() if param.grad is not None]
+    if not gradients:
         return None
+    # FP32 parameters can have entirely finite gradients whose squared sum
+    # overflows FP32 (observed at 1.37e25 in the d16 annual DDP trajectory).
+    # Promote only the reduction, not model/gradient storage or AMP. FP64 is
+    # sufficient for the norm of every finite FP32 model gradient tensor.
     try:
-        return torch.nn.utils.clip_grad_norm_(
-            params,
-            max_norm=float(max_norm),
-            error_if_nonfinite=False,
-            foreach=True,
-        )
+        norms = torch._foreach_norm(gradients, 2.0, dtype=torch.float64)
     except RuntimeError as exc:
         message = str(exc).lower()
         if "foreach" not in message and "not implemented" not in message and "not support" not in message:
             raise
-    return torch.nn.utils.clip_grad_norm_(
-        params,
-        max_norm=float(max_norm),
-        error_if_nonfinite=False,
-        foreach=False,
-    )
+        norms = [torch.linalg.vector_norm(gradient, dtype=torch.float64) for gradient in gradients]
+    first_device = gradients[0].device
+    total_norm = torch.linalg.vector_norm(torch.stack([norm.to(first_device) for norm in norms]))
+    coefficient = (float(max_norm) / (total_norm + 1e-6)).clamp(max=1.0)
+    # Keep actual NaN/Inf gradients intact for the existing fail-closed gate.
+    # Do not erase their evidence by multiplying Inf by zero during clipping.
+    coefficient = torch.where(torch.isfinite(total_norm), coefficient, torch.ones_like(coefficient))
+    # Two sqrt-factor multiplies also avoid an FP32 subnormal coefficient
+    # flushing to zero when finite gradients approach the FP32 upper bound.
+    factor = coefficient.sqrt()
+    try:
+        torch._foreach_mul_(gradients, factor)
+        torch._foreach_mul_(gradients, factor)
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "foreach" not in message and "not implemented" not in message and "not support" not in message:
+            raise
+        for gradient in gradients:
+            local_factor = factor.to(device=gradient.device, dtype=gradient.dtype)
+            gradient.mul_(local_factor).mul_(local_factor)
+    return total_norm
 
 
 def _run_gradient_clip_(
@@ -9210,8 +9239,16 @@ def _create_adamw_optimizer(
     device: torch.device,
     *,
     label: str,
-) -> torch.optim.AdamW:
+) -> torch.optim.Optimizer:
     """Create the canonical neural-training optimizer for every executor."""
+    if config.training.optimizer_name != "adamw":
+        from stockagent.training.optimizers import create_frontier_optimizer
+        optimizer = create_frontier_optimizer(model, config.training, device)
+        partition = getattr(optimizer, "parameter_partition_manifest", {})
+        print(f"[{label}] optimizer={config.training.optimizer_name}; "
+              f"matrix_tensors={len(partition.get('matrix', []))}; "
+              f"auxiliary_tensors={len(partition.get('auxiliary', []))}")
+        return optimizer
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
@@ -11265,9 +11302,16 @@ def _save_fold_output_artifacts(
     def _copy_plot(name: str, source: Path, target: Path) -> None:
         item_start = time.perf_counter()
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+        # Historical artifact aliases can be hardlinks or symlinks to the
+        # canonical plot. It has just been regenerated; copying onto the same
+        # inode both adds no work and aborts an otherwise complete inference.
+        # Missing or distinct targets still take the ordinary checked copy.
+        same_file = target.exists() and source.samefile(target)
+        if not same_file:
+            shutil.copyfile(source, target)
         plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
         plot_timing[f"{name}_copied_from"] = str(source.name)
+        plot_timing[f"{name}_same_file_reused"] = same_file
 
     if write_plots:
         benchmark_label = _benchmark_plot_label(config)
@@ -13555,10 +13599,10 @@ def _validate_annual_day_trade_training_boundaries(
     folds: Sequence[WalkForwardFold],
     config: ExperimentConfig,
 ) -> dict[str, Any] | None:
-    """Prove that lookback is context and never shifts an annual account.
+    """Prove every annual account covers exactly its configured owned period.
 
     The annual objective claims one fresh-capital account for every complete
-    target calendar year. Its authoritative rows are therefore the fold's
+    target annual period. Its authoritative rows are therefore the fold's
     owned training sessions, while the rolling window may read older panel
     rows. Comparing the two index sets catches both a delayed first decision
     and an accidental spill into the following year before optimizer state is
@@ -13571,7 +13615,8 @@ def _validate_annual_day_trade_training_boundaries(
         raise ValueError("annual day-trade boundary validation requires tw_day_trade")
 
     panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
-    panel_years = panel_dates.astype("datetime64[Y]").astype(np.int64) + 1970
+    offset = year_boundary_offset_sessions(config)
+    panel_years = annual_period_years(panel_dates, offset)
     groups: list[dict[str, Any]] = []
     seen: set[tuple[int, ...]] = set()
     for fold in folds:
@@ -13598,13 +13643,14 @@ def _validate_annual_day_trade_training_boundaries(
                 actual_end = "none" if actual.size == 0 else str(panel_dates[actual[-1]])
                 raise ValueError(
                     "annual training episode must cover every owned session from "
-                    "the calendar year's first trading day through its last: "
+                    "the configured annual period's first trading day through its last: "
                     f"year={year} expected={panel_dates[expected[0]]}.."
                     f"{panel_dates[expected[-1]]} ({expected.size} rows), "
                     f"actual={actual_start}..{actual_end} ({actual.size} rows). "
                     "Use causal rows before the first target year as panel_history "
-                    "lookback context, or extend the validated panel; do not shift "
-                    "the account by lookback rows."
+                    "lookback context, or select an explicit lookback_shifted "
+                    "annual contract; do not shift the account silently or discard "
+                    "owned sessions."
                 )
             year_reports.append(
                 {
@@ -13627,7 +13673,9 @@ def _validate_annual_day_trade_training_boundaries(
         )
     return {
         "schema_version": 1,
-        "contract": "calendar_year_first_session_fresh_capital_v2",
+        "contract": day_trade_training_episode_contract(config),
+        "year_boundary_mode": normalize_year_boundary_mode(config.walk_forward.year_boundary_mode),
+        "year_boundary_offset_sessions": offset,
         "lookback": int(config.training.lookback),
         "lookback_context": str(config.walk_forward.lookback_context),
         "lookback_role": "causal_feature_context_only",
@@ -14112,6 +14160,7 @@ def _physical_source_cache_snapshot(runtime: _ExecutionRuntime) -> dict[str, Any
         scope="rank_local_shared_source_lifetime_before_fold_reporting",
         rank=int(os.environ.get("RANK", "0")),
         effective_universe_count=len(source.universe),
+        prepared_transport_cache=source.prepared_batch_cache_info(),
         **source.runtime_cache_info(),
     )
 
@@ -19706,6 +19755,7 @@ def _wrap_distributed_data_parallel_model(
         "output_device": device.index if device.type == "cuda" else None,
         "bucket_cap_mb": int(getattr(config.training, "ddp_bucket_cap_mb", 4)),
         "find_unused_parameters": False,
+        "broadcast_buffers": bool(config.training.ddp_broadcast_buffers),
     }
     try:
         ddp_params = inspect.signature(DistributedDataParallel).parameters
@@ -19713,14 +19763,29 @@ def _wrap_distributed_data_parallel_model(
             ddp_kwargs["gradient_as_bucket_view"] = True
     except (TypeError, ValueError):
         pass
+    if not config.training.ddp_broadcast_buffers and any(
+        isinstance(child, nn.modules.batchnorm._BatchNorm) for child in module.modules()
+    ):
+        raise ValueError("disabling DDP buffer broadcasts requires immutable model buffers")
     try:
-        return DistributedDataParallel(
+        wrapped = DistributedDataParallel(
             module,
-            static_graph=bool(static_graph),
+            static_graph=bool(static_graph) and config.training.ddp_trajectory_gradient_sync != "trajectory",
             **ddp_kwargs,
         )
     except TypeError:
-        return DistributedDataParallel(module, **ddp_kwargs)
+        wrapped = DistributedDataParallel(module, **ddp_kwargs)
+    if not config.training.ddp_broadcast_buffers:
+        # Keep rank-zero initialization authoritative, including fitted
+        # normalizers. Subsequent immutable reads need no per-forward broadcast.
+        with torch.no_grad():
+            for buffer in wrapped.module.buffers():
+                if buffer.numel():
+                    dist.broadcast(buffer, src=0)
+        wrapped._stockagent_immutable_buffer_versions = {
+            name: (buffer, buffer._version) for name, buffer in wrapped.module.named_buffers()
+        }
+    return wrapped
 
 
 def _resolve_host_compilers() -> tuple[str | None, str | None]:
@@ -19758,6 +19823,34 @@ def _resolve_host_compilers() -> tuple[str | None, str | None]:
         return None
 
     return _resolve(cc_candidates), _resolve(cxx_candidates)
+
+
+def _cuda_graph_capture_snapshot(config: ExperimentConfig) -> dict[str, Any]:
+    """Inspect opt-in graph captures; unavailable evidence stays unknown."""
+    settings = config.training.financial_transformer
+    enabled = (getattr(settings, "factorized_cuda_graphs", False)
+        or getattr(settings, "factorized_portfolio_cuda_graphs", False)
+        or os.environ.get("STOCKAGENT_DAY_TRADE_CUDAGRAPHS", "0") == "1")
+    if not enabled:
+        return {}
+    try:
+        from torch._inductor.cudagraph_trees import get_container
+        device = torch.cuda.current_device()
+        manager = get_container(device).tree_manager
+        roots = [node for nodes in manager.roots.values() for node in nodes] if manager is not None else []
+        pending, visited = list(roots), set()
+        while pending:
+            node = pending.pop()
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            pending.extend(child for children in getattr(node, "children", {}).values() for child in children)
+        return {"cuda_graph_root_count_local": len(roots), "cuda_graph_node_count_local": len(visited),
+            "cuda_graph_runtime_inspection_ok": True, "cuda_graph_device_index_local": device}
+    except Exception as exc:
+        return {"cuda_graph_root_count_local": None, "cuda_graph_node_count_local": None,
+            "cuda_graph_runtime_inspection_ok": False,
+            "cuda_graph_runtime_inspection_error": type(exc).__name__}
 
 
 def _dynamo_compile_counter_snapshot() -> dict[str, int]:
@@ -20457,6 +20550,7 @@ def _probe_compiled_loss_forward_backward(
                 device=device,
                 previous=None,
                 reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
+                reset_period_contract=execution_runtime.day_trade_training_period_contract,
             )
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = probed_loss_fn(
@@ -21269,12 +21363,17 @@ def _train_epoch_windowed_tensor(
                 split,
                 batch_order,
                 batch_size,
+                device=device,
             )
         )
     )
 
     for step_idx, batch_idx in enumerate(batch_order, start=1):
         _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
+        # Backward has consumed the previous exact tape. Release its closure
+        # before constructing the next one: assignment otherwise evaluates the
+        # RHS while the old full FP64 session tensors are still referenced.
+        batch_loss_fn = None
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
@@ -21291,6 +21390,7 @@ def _train_epoch_windowed_tensor(
             loss_fn, source=physical_source, split=split, start=start, end=end,
             device=device, previous=physical_previous,
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
+            reset_period_contract=execution_runtime.day_trade_training_period_contract,
             prepared_batch=prepared_physical_batch))
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
@@ -21974,6 +22074,72 @@ def _train_epoch_windowed_tensor(
     ), timing
 
 
+def _defer_trajectory_ddp_sync(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Include every forward/backward in no_sync; reduce before the sole update."""
+    @wraps(function)
+    def run(model: nn.Module, *args: Any, **kwargs: Any) -> Any:
+        deferred = kwargs.get("ddp_trajectory_gradient_sync", "batch") == "trajectory"
+        if not deferred:
+            return function(model, *args, **kwargs)
+        if not kwargs.get("optimizer_step_per_trajectory", False):
+            raise ValueError("deferred DDP synchronization requires trajectory accumulation")
+        if not isinstance(model, DistributedDataParallel) or model.static_graph:
+            raise ValueError("deferred synchronization requires DDP with static_graph=False")
+        with model.no_sync():
+            return function(model, *args, **kwargs)
+    return run
+
+
+def _synchronize_trajectory_gradients(model: nn.Module, *, allow_partial_presence: bool = False) -> None:
+    """Average accumulated dense gradients with the same scaling as DDP."""
+    parameters = [(name, parameter) for name, parameter in model.named_parameters()
+        if parameter.requires_grad]
+    if not parameters:
+        return
+    presence = torch.tensor([int(parameter.grad is not None) for _, parameter in parameters],
+        dtype=torch.int32, device=parameters[0][1].device)
+    dist.all_reduce(presence, op=dist.ReduceOp.SUM)
+    counts = presence.cpu().tolist()
+    world_size = _distributed_world_size()
+    if not allow_partial_presence and any(count not in (0, world_size) for count in counts):
+        raise RuntimeError("trajectory gradients are absent on only some DDP ranks")
+    groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for (name, parameter), count in zip(parameters, counts, strict=True):
+        if count == 0:
+            continue
+        if parameter.grad is None:
+            # An independent account can legitimately leave a parameter unused
+            # locally. Globally unused parameters retain None (no weight decay).
+            parameter.grad = torch.zeros_like(parameter)
+        if parameter.grad.is_sparse:
+            raise RuntimeError(f"trajectory synchronization requires a dense gradient: {name}")
+        gradient = parameter.grad
+        groups.setdefault((gradient.device, gradient.dtype), []).append(gradient)
+    with torch.no_grad():
+        for gradients in groups.values():
+            packed = torch.cat([gradient.reshape(-1) for gradient in gradients])
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            packed.div_(world_size)
+            offset = 0
+            for gradient in gradients:
+                size = gradient.numel()
+                gradient.copy_(packed[offset:offset + size].view_as(gradient))
+                offset += size
+
+
+def _assert_immutable_ddp_buffers(model: nn.Module) -> None:
+    expected = getattr(model, "_stockagent_immutable_buffer_versions", None)
+    if expected is None:
+        return
+    current = dict(model.module.named_buffers())
+    if current.keys() != expected.keys() or any(
+        current[name] is not buffer or buffer._version != version
+        for name, (buffer, version) in expected.items()
+    ):
+        raise RuntimeError("model buffers changed with DDP buffer broadcasts disabled")
+
+
+@_defer_trajectory_ddp_sync
 def _train_epoch_windowed_tensor_ddp(
     model: nn.Module,
     loss_fn: Callable[..., torch.Tensor],
@@ -22028,6 +22194,9 @@ def _train_epoch_windowed_tensor_ddp(
     replicated_ledger_local_metadata: bool = False,
     optimizer_step_per_trajectory: bool = False,
     log_return_weights: torch.Tensor | None = None,
+    ddp_trajectory_gradient_sync: str = "batch",
+    day_trade_annual_episode_sharding: bool = False,
+    day_trade_annual_episode_world_size: int = 2,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -22041,6 +22210,7 @@ def _train_epoch_windowed_tensor_ddp(
         raise RuntimeError("DDP windowed hotpath requires log_utility, sharpe, sortino, or another return-series objective")
     world_size = _distributed_world_size()
     rank = _distributed_rank()
+    policy_model = model.module if day_trade_annual_episode_sharding else model
     physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
     physical_previous: DayTradeCarryState | None = None
     if physical_source is not None and (
@@ -22051,6 +22221,13 @@ def _train_epoch_windowed_tensor_ddp(
         raise ValueError("physical DDP requires chronological replicated 50%-minute carry accounting")
     if world_size <= 1 or not _distributed_is_initialized():
         raise RuntimeError("DDP windowed hotpath requires an initialized distributed process group")
+    if day_trade_annual_episode_sharding and world_size != day_trade_annual_episode_world_size:
+        raise ValueError("annual ownership world size differs from its checkpoint contract")
+    if day_trade_annual_episode_sharding and (
+            physical_source is None or not execution_runtime.day_trade_training_annual_episodes
+            or not optimizer_step_per_trajectory or ddp_trajectory_gradient_sync != "trajectory"
+            or symbol_sharded_ledger or model.broadcast_buffers or model.static_graph):
+        raise ValueError("whole-account episode sharding requires immutable-buffer trajectory DDP and annual physical accounts")
     if int(batch_size) % world_size != 0:
         raise RuntimeError(
             f"DDP global batch_size must be divisible by world_size; got batch_size={batch_size}, world_size={world_size}"
@@ -22094,6 +22271,23 @@ def _train_epoch_windowed_tensor_ddp(
         )
 
     num_batches = total_rows // int(batch_size)
+    episode_spans = None
+    if day_trade_annual_episode_sharding:
+        from stockagent.training.episode_parallel import plan_annual_episode_ownership
+        cache_key = (id(split), id(physical_source), world_size, int(batch_size),
+                     json.dumps(execution_runtime.day_trade_training_period_contract, sort_keys=True))
+        cached = model.__dict__.get("_annual_episode_plan")
+        if cached is None or cached[0] != cache_key:
+            plan = plan_annual_episode_ownership(
+                split, physical_source, period_contract=execution_runtime.day_trade_training_period_contract,
+                world_size=world_size, global_batch_rows=int(batch_size))
+            model.__dict__["_annual_episode_plan"] = (cache_key, plan)
+            if _distributed_is_rank0():
+                _progress("annual episode ownership: " + json.dumps(plan.receipt(), sort_keys=True))
+        else:
+            plan = cached[1]
+        episode_spans = plan.spans_by_rank[rank]
+        num_batches = len(episode_spans)
     ledger_symbol_count = (
         recurrent_symbol_count // world_size
         if symbol_sharded_ledger
@@ -22180,14 +22374,23 @@ def _train_epoch_windowed_tensor_ddp(
                 split,
                 list(range(num_batches)),
                 int(batch_size),
+                batch_spans=episode_spans,
+                device=device,
             )
         )
     )
     for step_idx in range(1, num_batches + 1):
         _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
+        # Keep only carried account state, not the previous batch's immutable
+        # source closure, alive while staging the next chronological batch.
+        batch_loss_fn = None
         batch_start = time.perf_counter()
-        global_start = (step_idx - 1) * int(batch_size)
-        local_start = global_start + rank * local_batch_size
+        global_start, global_end = (episode_spans[step_idx - 1] if episode_spans is not None
+                                   else ((step_idx - 1) * int(batch_size), step_idx * int(batch_size)))
+        local_start = (min(global_start, total_rows - local_batch_size)
+                       if episode_spans is not None else global_start + rank * local_batch_size)
+        # NN shape stays fixed. Outputs outside this account span are discarded
+        # before the physical loss; they cannot carry another account's state.
         local_end = local_start + local_batch_size
         prepared_physical_batch = None
         if physical_prefetch is not None:
@@ -22200,9 +22403,10 @@ def _train_epoch_windowed_tensor_ddp(
                 )
         batch_loss_fn = (loss_fn if physical_source is None else bind_physical_carry_loss(
             loss_fn, source=physical_source, split=split, start=global_start,
-            end=global_start + int(batch_size), device=device,
+            end=global_end, device=device,
             previous=physical_previous,
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
+            reset_period_contract=execution_runtime.day_trade_training_period_contract,
             prepared_batch=prepared_physical_batch))
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
@@ -22271,7 +22475,7 @@ def _train_epoch_windowed_tensor_ddp(
                 enabled=profile_timing,
             ):
                 if use_panel_slab:
-                    model_output = model(
+                    model_output = policy_model(
                         batch["feature_slab"],
                         batch_mask,
                         batch.get("symbol_indices"),
@@ -22282,7 +22486,7 @@ def _train_epoch_windowed_tensor_ddp(
                                 batch,
                                 target_rows=int(batch_mask.size(0)),
                             )
-                            if _model_requires_execution_context(model)
+                            if _model_requires_execution_context(policy_model)
                             else None
                         ),
                     )
@@ -22290,13 +22494,13 @@ def _train_epoch_windowed_tensor_ddp(
                     if batch_x is None:
                         raise RuntimeError("DDP materialized window batch is unavailable")
                     model_output = _call_model(
-                        model,
+                        policy_model,
                         batch_x,
                         batch_mask,
                         return_aux=False,
                         symbol_indices=batch.get("symbol_indices"),
                         portfolio_context=_portfolio_context_for_model(
-                            model,
+                            policy_model,
                             batch,
                             target_rows=int(batch_mask.size(0)),
                         ),
@@ -22307,11 +22511,14 @@ def _train_epoch_windowed_tensor_ddp(
 
             gather_start = time.perf_counter()
             global_metadata: Mapping[str, torch.Tensor] | None = None
-            if replicated_ledger_local_metadata:
+            if replicated_ledger_local_metadata or episode_spans is not None:
+                if episode_spans is not None:
+                    offset = global_start - local_start
+                    local_weights = local_weights[offset:offset + global_end - global_start]
                 metadata_start = time.perf_counter()
                 global_metadata = split.batch_metadata_by_rows(
                     global_start,
-                    global_start + int(batch_size),
+                    global_end,
                     device=prepare_device,
                     non_blocking=False,
                     prepare_timing=timing,
@@ -22350,7 +22557,7 @@ def _train_epoch_windowed_tensor_ddp(
                     and "short_capacity_notional" in batch
                 ),
                 **(
-                    {"global_metadata": global_metadata}
+                    {"global_metadata": global_metadata, "gather_actions": episode_spans is None}
                     if not symbol_sharded_ledger
                     else {}
                 ),
@@ -22553,6 +22760,10 @@ def _train_epoch_windowed_tensor_ddp(
             loss_for_backward = loss * (
                 batch_valid_rows / float(trajectory_valid_rows)
             )
+            if episode_spans is not None:
+                # Dense synchronization averages ranks; compensate once so an
+                # uneven 6/5-account split still has the global date weighting.
+                loss_for_backward = loss_for_backward * world_size
 
         next_prev = (aux_outputs or {}).get("_final_weights")
         portfolio_prev_futures_carry_state = _detach_portfolio_state((aux_outputs or {}).get("_final_futures_carry_state"))
@@ -22796,7 +23007,15 @@ def _train_epoch_windowed_tensor_ddp(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    _assert_immutable_ddp_buffers(model)
     if optimizer_step_per_trajectory and steps > 0:
+        if ddp_trajectory_gradient_sync == "trajectory":
+            sync_start = time.perf_counter()
+            _synchronize_trajectory_gradients(model, allow_partial_presence=episode_spans is not None)
+            _maybe_sync_cuda(device, profile_timing)
+            sync_elapsed = time.perf_counter() - sync_start
+            timing.grad_s += sync_elapsed
+            timing.backward_s += sync_elapsed
         _finalize_trajectory_optimizer_step(
             model=model,
             optimizer=optimizer,
@@ -22820,6 +23039,9 @@ def _train_epoch_windowed_tensor_ddp(
     timing.portfolio_first_default_row = int(gradient_norm_values[6])
     timing.portfolio_first_default_reason = int(gradient_norm_values[7])
     timing.portfolio_final_alive = int(gradient_norm_values[5])
+    if episode_spans is not None:
+        dist.all_reduce(total_loss_t, op=dist.ReduceOp.SUM)
+        total_loss_t.div_(world_size)
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -25544,6 +25766,7 @@ def _run_training_impl(
                     factor_aug_kwargs=factor_aug_kwargs,
                     day_trade_training_annual_episodes=config.training.day_trade_training_annual_episodes,
                     day_trade_sub_lot_recovery=config.training.day_trade_sub_lot_recovery,
+                    day_trade_annual_episode_boundary=day_trade_training_episode_contract(config),
                 )
         except BaseException as exc:
             loss_contract_error = exc
@@ -27991,6 +28214,8 @@ def _run_training_impl(
             # zero-step stateless optimizer. It never updates Adam or its clock.
             active_optimizer = optimizer if log_return_weights is None else torch.optim.SGD(model.parameters(), lr=0.)
             active_scheduler = scheduler if log_return_weights is None else None
+            if config.training.day_trade_annual_episode_sharding and not ddp_enabled:
+                raise RuntimeError("annual episode sharding requires the canonical multi-rank DDP executor")
             if train_windowed is not None:
                 if ddp_enabled:
                     return _train_epoch_windowed_tensor_ddp(
@@ -27999,6 +28224,9 @@ def _run_training_impl(
                         train_windowed,
                         active_optimizer,
                         scaler,
+                        ddp_trajectory_gradient_sync=config.training.ddp_trajectory_gradient_sync,
+                        day_trade_annual_episode_sharding=config.training.day_trade_annual_episode_sharding,
+                        day_trade_annual_episode_world_size=config.training.day_trade_annual_episode_world_size,
                         batch_size=train_batch_size,
                         device=device,
                         amp_dtype=amp_dtype,
@@ -28497,6 +28725,13 @@ def _run_training_impl(
             policy_step_prepare_s = time.perf_counter() - policy_step_started
             carry_compile_before = get_day_trade_carry_compile_stats()
             train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
+            if config.training.day_trade_annual_episode_sharding and _distributed_should_write():
+                from downloader.artifact_io import atomic_write_json
+                cached_plan = compiled_train_model.__dict__.get("_annual_episode_plan")
+                if cached_plan is None:
+                    raise RuntimeError("annual training did not produce an ownership plan")
+                atomic_write_json(_group_dir(output_path, train_years) / "annual_episode_ownership.json",
+                                  cached_plan[1].receipt())
             train_bt_runtime_after = get_backtest_runtime_stats()
             train_loss_runtime_after = get_loss_runtime_stats()
             train_carry_compile_delta = {
@@ -28634,6 +28869,7 @@ def _run_training_impl(
                                               if math.isfinite(c.best_val_loss)), default=None),
                         "improved": None,
                         **policy_step_payload,
+                        **_cuda_graph_capture_snapshot(config),
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -29296,6 +29532,7 @@ def _run_training_impl(
                                               if math.isfinite(c.best_val_loss)), default=None),
                         "improved": bool(any_fold_improved),
                         **policy_step_payload,
+                        **_cuda_graph_capture_snapshot(config),
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),

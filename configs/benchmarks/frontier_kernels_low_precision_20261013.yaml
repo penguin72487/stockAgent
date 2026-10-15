@@ -1,0 +1,25 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: torchao_fp8_model
+    kernel_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_linear_backend: torchao_fp8}
+  - name: deepgemm_bf16_model
+    kernel_environment: true
+    cuda_home: /usr/local/cuda
+    overrides:
+      training:
+        financial_transformer: {kernel_linear_backend: deepgemm_bf16}
+  - name: transformer_engine_fp8_model
+    kernel_environment: true
+    transformer_engine_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_linear_backend: te_fp8}
+  - name: transformer_engine_nvfp4_model
+    kernel_environment: true
+    transformer_engine_environment: true
+    overrides:
+      training:
+        financial_transformer: {kernel_linear_backend: te_nvfp4}

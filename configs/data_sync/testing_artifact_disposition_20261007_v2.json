@@ -1,0 +1,748 @@
+{
+  "contract": "explicit-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "vastai1T",
+  "authorization": "使用者 2026-10-07 明確要求：smoke tests、benchmark 等測試產物直接刪除，冷儲藏的也直接刪除；完全不留。僅限逐項清冊測試產物，不授權刪除活動工作、正式成果或來源觀察。 本追加清冊核對 baseline 的舊 markets smoke 目錄和 benchmark logs，原清冊身分 f20a4c9b2380d1d75c43a9d17ba477d7c6d1fe45b493de7693016442654f46f2 保留。",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-backward-off-v1",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-casts-v1",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-factory-l32-b32-fp32-v11",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-factory-l32-b32-v10",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-fp32-kernel-trial-v1",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-lag-gemm-batch32-v9",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-lag-gemm-batch32-v9-casts",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-lag-gemm-batch32-v9-casts-high",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-lag-gemm-batch32-v9-r2",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-production-v7",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-reduction-dense-lag-v12",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-reduction-einsum-v12",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-v1",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-v2",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-cuda-v3",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_factorized_panel_20261004_v1/validation-tests",
+      "kind": "directory",
+      "reason": "validation-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_carry_quarantine_repair_20260910/checkpoint_replay",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_carry_quarantine_repair_20260910/checkpoint_replay_v3",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_carry_quarantine_repair_20260910/ddp_acceptance",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_carry_quarantine_repair_20260910/ddp_acceptance_v3",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_contract_quarantine_20260909/benchmarks",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_fold4_transition_repair_20260910/checkpoint_replay",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_fold4_transition_repair_20260910/final_checkpoint_replay",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_fold4_transition_repair_20260910/fold4_acceptance",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_fold4_transition_repair_20260910/fold4_acceptance_v14",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_fold4_transition_repair_20260910/kg_checkpoint_replay",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_minute_gap_repair_20260909/benchmarks",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_mkf_repair_20260910/checkpoint_replay",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_mkf_repair_20260910/fold5_acceptance",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_pl1_remote_repair_20260910/checkpoint_replay",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_pl1_remote_repair_20260910/checkpoint_replay_exact",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/futures_pl1_remote_repair_20260910/ddp_acceptance",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/vastai1t_futures_historical_20260908/benchmark_data",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/vastai1t_futures_historical_20260908/benchmarks",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/vastai1t_futures_historical_20260908/preflight_missing_benchmark_receipt",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/vastai1t_futures_prepare_20260906/minute_execution_smoke",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/vastai1t_futures_prepare_20260907/minute_execution_smoke",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/.training_transform_cache_v1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/bybit_free_remote_20260927",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/bybit_free_v7_remote_20260927",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/bybit_perpetual_daily_0000_execution_22_effective_rank_carry_syncthing_20260823_1epoch_v2",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/bybit_perpetual_daily_0000_execution_22_effective_rank_carry_syncthing_20260823_1epoch_v3",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/bybit_perpetual_daily_22_effective_rank_carry_syncthing_20260823_1epoch",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/bybit_perpetual_daily_syncthing_20260823_1epoch",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_capacity_ceil_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_carry_v9_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_carry_v9_final_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_carry_v9_integrated_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_carry_v9_settlement32_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_carry_v9_stress32_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_cash_audit_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_gradient_audit_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_gradient_v3_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_v4_followup_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/futures_v5_deep_audit_20260909",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/interrupted_gpu_conflict_tw_minute_daily_guided_v12_attention_cost2_no_qk_norm_ddp_v1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_day_trade_executable_portfolio_transformer_22_basis_cuda_smoke_20260822",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_day_trade_executable_portfolio_transformer_22_basis_ddp_smoke_20260822",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_day_trade_executable_portfolio_transformer_22_basis_v2_algebraic_scoped_20260822",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_futures_margin_current_fold10_20261004",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1_rerun1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1_rerun2",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1_rerun3",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1_rerun4",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1_rerun5",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v1_fold1_epoch1_rerun6",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v2_grouped_surrogate_fold1_epoch1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v3_underlying_link_fold1_epoch1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v3_underlying_link_fold1_epoch100",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v3_underlying_link_fold1_epoch1b",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v4_fake_floor_underlying_link_fold1_epoch30",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v5_fake_floor_underlying_link_rank_aux_fold1_epoch30",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_context_all_futures_carry_0900_integer_v5_fake_floor_underlying_link_rank_aux_fold1_epoch30b",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_futures_day_trade_0900_integer_v5_fold1_epoch1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/tw_stock_futures_day_trade_0900_integer_v5_fold1_epoch1_rerun",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "smoke/vastai1t_futures_carry_3207765abbe75296_epoch1",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-1f37c4d39ec5/derived-tw-public-final/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-5e2027d898aa/derived-tw-public-final/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-9a631ac98ed3/derivation-benchmark-20261003T032756-1-threads2/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-9a631ac98ed3/derivation-benchmark-20261003T032756-2-threads8/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-9a631ac98ed3/derivation-benchmark-20261003T032756-3-threads8/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-9a631ac98ed3/derivation-benchmark-20261003T032756-4-threads2/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-9a631ac98ed3/derived-tw-public/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-control-pilot-9a631ac98ed3/derived-tw-public/independent.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/001-pool-screen-7442a94db4bd/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/002-pool-screen-7bc903736640/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/003-pool-screen-2abb6054be92/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/004-arrow-screen-7e81a601d4a3/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/005-arrow-screen-106be25d7897/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/006-numa-screen-d70afc5d0de9/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/007-numa-screen-d65717873916/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/008-numa-screen-42c00161e9a1/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/009-numa-screen-bb81898dc794/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/010-numa-screen-54bb730f3d60/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/011-finalist-repeat-d70afc5d0de9/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/012-finalist-repeat-d65717873916/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/013-finalist-repeat-d65717873916/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/014-finalist-repeat-d70afc5d0de9/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/016-balanced-repeat-268578ea0fea/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/017-balanced-repeat-268578ea0fea/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/018-balanced-repeat-268578ea0fea/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "engineering",
+      "relative": "stockagent-remote-build-measurement-20261003-714bd89eecf5/measurements/019-selected-application-d70afc5d0de9/first.parquet",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/benchmarks",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_cpu112_compile_cold.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_cpu112_repeat.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_cpu24_direct_ddp.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_cpu48_direct_ddp.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_cudnnfixed_cpu48_ddp_a.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_cudnnfixed_cpu48_ddp_b.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_deterministic_cpu48_ddp_a.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_deterministic_cpu48_ddp_b.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_deterministic_sparse_cpu48_ddp.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_sparse_cpu48_direct_ddp.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_day_trade_v8_7e9a08bb7548fd88_benchmark_true_sparse_cpu48_ddp.log",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_intraday_capital100m_fold5_smoke3_20260927",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_intraday_capital100m_fold5_smoke3_20260927_r2",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_margin_account6_slots2816_regression_fold10_smoke3_20260930",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_margin_carry_abi2_tx_mtx_regression_fold10_smoke3_v2_20260929",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_margin_components_smoke_fold10_20261003",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_margin_dual_limits_tx_mtx_regression_fold10_smoke3_v2_20260929",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_margin_scoped_stock_fold10_smoke3_v11_20260930",
+      "kind": "directory",
+      "reason": "smoke-test"
+    },
+    {
+      "base": "artifact",
+      "relative": "markets/tw_futures_v8_margin_verified_2011_capital100m_v17_fold1_smoke3_20260929",
+      "kind": "directory",
+      "reason": "smoke-test"
+    }
+  ],
+  "identity_sha256": "9ca7717dbc33ca7d5c09d32260385b2225b1563e5c39ff76509f8ec99c0fac1b"
+}

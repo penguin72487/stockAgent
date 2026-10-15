@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,6 +41,7 @@ from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     _fresh_regular_execution_quote,
+    _completed_minute_replay_quote,
     _quote_after_signal,
     LiveEligibility,
     ModeSpec,
@@ -97,6 +99,137 @@ def _summary(signal_id: str = "signal-1") -> dict[str, object]:
         "symbol_count": 1,
         "target_risk": {"gross": 0.1, "long_gross": 0.1, "short_gross": 0.0},
     }
+
+
+def test_incomplete_opening_source_waits_without_consuming_daily_signal(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = _spec(tmp_path)
+    summary = {**_summary(), "opening_source_complete": False, "opening_missing_symbols": ["2330"]}
+    args = dict(spec=spec, signal_rows=[_row()], quotes={"2330": _quote()},
+                eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7))
+    assert engine.register_signal(summary=summary, **args) == "waiting_source"
+    mode = engine.state["modes"][spec.market]
+    assert not mode.get("entry_completed_at")
+    assert not mode.get("processed_signal_ids")
+    assert not mode.get("positions")
+    summary["opening_source_complete"] = True
+    assert engine.register_signal(summary=summary, **args) == "registered"
+    assert engine.register_signal(summary=summary, **args) == "already_processed"
+
+
+def test_complete_genuine_cash_model_can_still_complete_once(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = _spec(tmp_path)
+    args = dict(spec=spec, summary={**_summary(), "opening_source_complete": True},
+                signal_rows=[_row(0.0)], quotes={"2330": _quote()},
+                eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7))
+    assert engine.register_signal(**args) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["entry_fill_outcome"] == "no_order" and mode["entry_completed_at"]
+    assert engine.register_signal(**args) == "already_processed"
+
+
+def test_opening_ready_flag_cannot_override_insufficient_price_evidence(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = _spec(tmp_path)
+    summary = {**_summary(), "opening_model_inputs_ready": True,
+               "opening_coverage_gate_basis": "same_session_open_price",
+               "opening_price_active_count": 42, "opening_price_required_count": 2065}
+    assert engine.register_signal(
+        spec=spec, summary=summary, signal_rows=[_row()], quotes={"2330": _quote()},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7),
+    ) == "waiting_source"
+    assert not engine.state["modes"][spec.market].get("entry_completed_at")
+
+
+def test_unsized_opening_target_survives_restart_and_recovers_without_new_inference(tmp_path):
+    from scripts.run_tw_day_trade_simulation import _active_symbols
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    row = {**_row(), "open_price": None, "can_buy": False,
+           "opening_price_wait_reason": "awaiting_first_trade_print"}
+    quote = {**_quote(), "open": None}
+    assert engine.register_signal(spec=spec, summary=_summary(), signal_rows=[row],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 0, 7)) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert not mode["positions"] and mode["entry_fill_outcome"] == "waiting_source"
+    assert mode["pending_entry_source_count"] == 1
+    assert mode["pending_entry_orders"]["2330"]["position"]["entry_price"] is None
+    assert _active_symbols(engine)[0] == ["2330"]
+    before = engine.fills_path.read_text() if engine.fills_path.exists() else ""
+    # Missing, stale, and trial prices cannot turn unknown sizing into a fill.
+    for bad in ({}, {**_quote(), "simtrade": 1}, {**_quote(), "quote_at": _now(9, 0, 4).isoformat()}):
+        engine.process_quotes(quotes={"2330": bad}, now=_now(9, 0, 8))
+        assert not mode["positions"] and mode["pending_entry_source_count"] == 1
+    assert (engine.fills_path.read_text() if engine.fills_path.exists() else "") == before
+    recovered = TwDayTradeSimulationEngine(tmp_path / "state")
+    good = {**_quote(), "quote_at": _now(9, 0, 9).isoformat(), "simtrade": False}
+    recovered.process_quotes(quotes={"2330": good}, now=_now(9, 0, 10))
+    mode = recovered.state["modes"][spec.market]
+    assert mode["pending_entry_source_count"] == 0 and mode["entry_filled_shares"] > 0
+    filled = mode["entry_filled_shares"]
+    recovered.process_quotes(quotes={"2330": good}, now=_now(9, 0, 11))
+    assert mode["entry_filled_shares"] == filled
+    assert mode["processed_signal_ids"] == ["signal-1"]
+
+
+def test_unsized_source_wait_is_cancelled_at_exit_priority(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    row = {**_row(), "open_price": None, "can_buy": False,
+           "opening_price_wait_reason": "opening_price_unavailable"}
+    engine.register_signal(spec=spec, summary=_summary(), signal_rows=[row],
+        quotes={"2330": {**_quote(), "open": None}}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 0, 7))
+    engine.process_quotes(quotes={"2330": _quote()}, now=_now(13, 20))
+    mode = engine.state["modes"][spec.market]
+    assert mode["pending_entry_orders"]["2330"]["status"] == "cancelled_exit_priority"
+    assert not mode["positions"] and mode["pending_entry_source_count"] == 0
+
+
+def test_one_unpriced_target_does_not_block_other_targets_or_rescale_weights(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    rows = [_row(0.1), {**_row(0.2), "symbol": "0050", "open_price": None,
+                       "can_buy": False, "opening_price_wait_reason": "opening_price_unavailable"}]
+    good = {**_quote(), "simtrade": False, "quote_at": _now(9, 0, 6).isoformat()}
+    eligibility = {**_eligibility(), "0050": _eligibility()["2330"]}
+    summary = {**_summary(), "symbol_count": 2,
+               "opening_model_inputs_ready": True, "opening_acquisition_contract_version": 4,
+               "opening_coverage_gate_basis": "same_session_open_or_observed_no_print",
+               "opening_price_active_symbol_count": 2, "opening_price_active_count": 1,
+               "opening_no_print_active_count": 1, "opening_input_resolved_count": 2,
+               "opening_input_required_count": 2}
+    assert engine.register_signal(spec=spec, summary=summary, signal_rows=rows,
+        quotes={"2330": good, "0050": {**good, "open": None}},
+        eligibility=eligibility, eligibility_coverage={}, now=_now(9, 0, 7)) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["entry_fill_outcome"] == "partial_waiting_source"
+    first = next(p for p in mode["positions"].values() if p["symbol"] == "2330")
+    assert first["target_weight"] == pytest.approx(0.1)
+    assert mode["pending_entry_orders"]["0050"]["position"]["target_weight"] == pytest.approx(0.2)
+    frozen_nav = mode["session_sizing_nav_twd"]
+    recovered = TwDayTradeSimulationEngine(tmp_path / "state")
+    recovered.process_quotes(quotes={"0050": {**good, "quote_at": _now(9, 0, 8).isoformat()}}, now=_now(9, 0, 9))
+    mode = recovered.state["modes"][spec.market]
+    assert mode["pending_entry_source_count"] == 0
+    assert mode["session_sizing_nav_twd"] == frozen_nav
+    later = next(p for p in mode["positions"].values() if p["symbol"] == "0050")
+    assert later["target_weight"] == pytest.approx(0.2)
+    assert mode["processed_signal_ids"] == ["signal-1"]
+
+
+def test_resolved_opening_coverage_cannot_be_forged_by_ready_flag(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    summary = {**_summary(), "opening_model_inputs_ready": True,
+               "opening_acquisition_contract_version": 4,
+               "opening_coverage_gate_basis": "same_session_open_or_observed_no_print",
+               "opening_price_active_symbol_count": 2300, "opening_price_active_count": 42,
+               "opening_no_print_active_count": 0, "opening_input_resolved_count": 2300,
+               "opening_input_required_count": 2070}
+    assert engine.register_signal(spec=_spec(tmp_path), summary=summary,
+        signal_rows=[_row()], quotes={"2330": _quote()}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 0, 7)) == "waiting_source"
+    assert not engine.state["modes"]["tw_day_trade"].get("processed_signal_ids")
 
 
 def test_process_quotes_can_isolate_one_replay_market(tmp_path: Path) -> None:
@@ -452,6 +585,92 @@ def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
     assert compact["positions"] == []
 
 
+def test_latency_separates_first_artifact_detection_from_source_recovery(tmp_path: Path) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    published = _now(9, 0, 2)
+    detected = published + timedelta(milliseconds=2)
+    attempted = detected + timedelta(seconds=520)
+    engine.record_latency_sample(
+        market="test", signal_id="original-immutable", result="registered",
+        summary={"signal_ready_at": published.isoformat(), "artifact_published_at": published.isoformat()},
+        consumer_detected_at=detected, signal_commit_attempt_at=attempted,
+        source_recovery_wait_reason="missed_opening_0901_source",
+        ledger_persisted_at=attempted + timedelta(milliseconds=5),
+        executor_quote_fetch_ms=1, eligibility_load_ms=1, ledger_compute_persist_ms=3,
+    )
+    record = json.loads(engine.latency_path.read_text().strip())
+    assert record["stages"]["artifact_discovery_ms"] == 2.0
+    assert record["stages"]["source_recovery_wait_ms"] == 520_000.0
+    assert record["ready_to_ledger_ms"] == 520_007.0
+    assert record["bottleneck_stage"] == "source_recovery_wait_ms"
+    assert record["latency_stage_contract"] == "first_pointer_detection_then_retry_wait_v2"
+    assert record["simulation_only"] is True
+
+
+def test_execution_progress_follows_durable_state_and_unchanged_marks_do_not_fsync(tmp_path, monkeypatch):
+    import stockagent.live.tw_day_trade_simulation as module
+    spec = _spec(tmp_path)
+    clock = _now(11, 5)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state", publication_clock=lambda: clock)
+    engine.update_readiness([spec], now=_now(8, 59))
+    mode = engine.state["modes"][spec.market]
+    mode.update(signal_id="new-signal", session_date=clock.date().isoformat(),
+                processed_signal_ids=["new-signal"], entry_completed_at=_now(9, 1).isoformat(),
+                entry_requested_shares=1000, entry_filled_shares=1000, entry_unfilled_shares=0,
+                pending_entry_shares=0, pending_entry_source_count=0, pending_entry_orders={},
+                entry_fill_outcome="filled", entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    original_append = module._append_jsonl_many
+    writes = []
+
+    def append(path, rows):
+        if path == engine.execution_latency_path:
+            # Actual commit order: ledger/state first, measured observer second.
+            durable = json.loads(engine.state_path.read_text())
+            assert durable["state_revision"] == rows[0]["state_revision"]
+            assert durable["modes"][spec.market]["entry_filled_shares"] == 1000
+            writes.append(len(rows))
+        original_append(path, rows)
+
+    monkeypatch.setattr(module, "_append_jsonl_many", append)
+    engine._persist(_now(9, 1))
+    record = json.loads(engine.execution_latency_path.read_text().strip())
+    assert record["recorded_at"] == clock.isoformat(timespec="microseconds")
+    assert record["clock_basis"] == "engine_publication_clock_not_economic_event"
+    assert record["all_target_complete"] is True
+    assert record["first_fill_observed_this_commit"] is True
+    engine._persist(_now(9, 2))
+    assert writes == [1]
+    assert mode["entry_filled_shares"] == 1000
+    assert engine.last_persist_metrics["execution_observer_rows"] == 0
+
+
+def test_execution_observer_failure_cannot_fail_committed_accounting_or_liquidation(tmp_path, monkeypatch):
+    import stockagent.live.tw_day_trade_simulation as module
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state", publication_clock=lambda: _now(11, 5))
+    engine.update_readiness([spec], now=_now(8, 59))
+    mode = engine.state["modes"][spec.market]
+    mode.update(signal_id="new-signal", session_date="2026-08-13",
+                processed_signal_ids=["new-signal"], entry_completed_at=_now(9, 1).isoformat(),
+                entry_requested_shares=1000, entry_filled_shares=1000, entry_unfilled_shares=0,
+                pending_entry_shares=0, pending_entry_source_count=0, pending_entry_orders={},
+                entry_fill_outcome="filled", entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    original_append = module._append_jsonl_many
+
+    def fail_observer(path, rows):
+        if path == engine.execution_latency_path:
+            raise OSError("observer-disk-error")
+        original_append(path, rows)
+
+    monkeypatch.setattr(module, "_append_jsonl_many", fail_observer)
+    engine._persist(_now(9, 1))
+    assert engine.last_persist_metrics["execution_observer_error"] == "OSError"
+    assert json.loads(engine.state_path.read_text())["modes"][spec.market]["entry_filled_shares"] == 1000
+    monkeypatch.setattr(module, "_append_jsonl_many", original_append)
+    engine._persist(_now(9, 2))
+    assert len(engine.execution_latency_path.read_text().splitlines()) == 1
+
+
 def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -643,6 +862,48 @@ def test_opening_latency_uses_dedicated_source_and_stage_telemetry() -> None:
     assert summary["modes"][0]["telemetry_source"] == (
         "opening_attempt_v2+executor_latency_v1"
     )
+
+
+def test_delayed_scheduled_opening_is_measured_not_hidden_or_backdated() -> None:
+    scheduled = {
+        "source": "discord_scheduled_signal", "status": "ready", "market": "mode",
+        "session_date": "2026-10-12", "signal_id": "late-scheduled",
+        "gate_at": "2026-10-12T09:00:00+08:00",
+        "signal_started_at": "2026-10-12T09:22:00+08:00",
+        "signal_ready_at": "2026-10-12T09:22:00.200+08:00",
+    }
+    engine = {**scheduled, "source": "executor", "result": "registered",
+              "ledger_persisted_at": "2026-10-12T09:22:00.400+08:00"}
+    manual = {**engine, "market": "manual", "signal_id": "manual-signal"}
+    summary = dashboard_module._opening_signal_latency_summary(
+        [scheduled, engine, manual], expected_markets=["mode", "manual"], session_date="2026-10-12",
+    )
+    assert summary["observed_markets"] == ["mode"]
+    assert summary["first_ready_ms"] == 1_320_200.0
+    assert summary["modes"][0]["delayed_recovery"] is True
+    assert summary["modes"][0]["ledger_from_0900_ms"] == 1_320_400.0
+    assert summary["first_signal_goal_met"] is False
+    assert summary["all_modes_goal_met"] is False
+
+
+def test_opening_wait_reason_is_safe_current_and_keeps_failure_history() -> None:
+    rows = [
+        {"source": "discord_scheduled_signal", "status": "failed", "market": "mode",
+         "session_date": "2026-10-12", "recorded_at": "2026-10-12T09:10:00+08:00",
+         "error_type": "TWPublicSourceUpdatePending", "error_message": "private /local/path"},
+        {"source": "discord_scheduled_signal", "status": "failed", "market": "mode",
+         "session_date": "2026-10-12", "recorded_at": "2026-10-12T09:11:00+08:00",
+         "error_type": "RuntimeError", "failure_stage": "input_validation",
+         "error_message": "same-session TW model input coverage is not ready; retry immediately: observed_inputs=1890 required_inputs=2061 observed_quotes=2290 observed_opens=1889 active=2290 observed_no_prints=1 basis=session_open"},
+    ]
+    result = dashboard_module._opening_signal_latency_summary(
+        list(reversed(rows)), expected_markets=["mode"], session_date="2026-10-12",
+    )
+    assert result["failure_count"] == 2
+    failure = result["latest_failures"][0]
+    assert failure["reason_code"] == "tw_opening_input_coverage_pending"
+    assert failure["opening_input_coverage"] == {"active": 2290, "opens": 1889, "responses": 2290, "required": 2061, "no_prints": 1}
+    assert "private /local/path" not in str(result)
 
 
 def test_opening_ledger_latency_uses_real_commit_not_reconstructed_fill_time() -> None:
@@ -914,6 +1175,40 @@ def test_signal_pointer_watcher_wakes_on_atomic_publish(tmp_path: Path) -> None:
         watcher.close()
 
 
+def test_quote_wakeup_targets_include_unsized_source_waits_but_exclude_replay():
+    from scripts.run_tw_day_trade_simulation import _causal_pending_quote_symbols
+    from stockagent.live.tw_day_trade_simulation import ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
+
+    orders = {"2330": {"status": "working", "remaining_shares": 1000},
+              "0050": {"status": "waiting_source", "sizing_pending": True},
+              "2317": {"status": "working", "remaining_shares": 0},
+              "6488": {"status": "cancelled", "remaining_shares": 1000}}
+    modes = {"normal": {"entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+                        "pending_entry_orders": orders},
+             "replay": {"entry_fill_policy": "official_open_signal_0900_execute_0901_vwap",
+                        "pending_entry_orders": {"9999": orders["2330"]}}}
+    assert _causal_pending_quote_symbols(modes) == {"2330", "0050"}
+
+
+def test_signal_watcher_uses_quote_fd_without_inotify() -> None:
+    from scripts.run_tw_day_trade_simulation import _SignalPointerWatcher
+    from stockagent.live.quote_provider import StockQuoteWakeup
+
+    watcher, wakeup = _SignalPointerWatcher(), StockQuoteWakeup()
+    watcher.close()  # Portable timeout fallback may still use the quote pipe.
+    try:
+        if wakeup.fd is None:
+            pytest.skip("nonblocking pipe unavailable")
+        wakeup.arm({"2330"})
+        wakeup.notify("2330", simtrade=False)
+        assert watcher.wait(0.25, additional_fd=wakeup.fd) is True
+        assert wakeup.consume() is True  # Watcher must not swallow quote events.
+        assert watcher.wait(0.0, additional_fd=wakeup.fd) is False
+    finally:
+        watcher.close()
+        wakeup.close()
+
+
 def test_jsonl_batch_uses_one_durability_sync(tmp_path: Path, monkeypatch) -> None:
     from stockagent.live.tw_day_trade_simulation import _append_jsonl_many
 
@@ -1022,7 +1317,7 @@ def test_committed_account_drops_obsolete_missing_open_diagnostic(tmp_path):
 
 def test_runner_loads_all_configured_day_trade_modes() -> None:
     from scripts.run_tw_day_trade_simulation import _mode_specs
-    from stockagent.live.market_config import enabled_day_trade_markets
+    from stockagent.live.market_config import enabled_day_trade_markets, load_market_configs
 
     repo_root = Path(__file__).resolve().parents[1]
     specs, live_configs, errors = _mode_specs(
@@ -1038,7 +1333,10 @@ def test_runner_loads_all_configured_day_trade_modes() -> None:
     active_expected = set(
         enabled_day_trade_markets(repo_root / "services/discord_bot/markets")
     )
-    assert active_baseline == active_expected
+    # Current canonical configs can add another independently authorized mode.
+    # Retain the baseline and require the runner to load the ENTIRE enabled set
+    # below; an unrelated model addition must not make this test four-only.
+    assert active_baseline <= active_expected
 
     assert errors == {}
     assert set(by_market) == active_expected
@@ -1055,8 +1353,10 @@ def test_runner_loads_all_configured_day_trade_modes() -> None:
         include_disabled=True,
     )
     assert errors == {}
-    assert {spec.market for spec in specs} == active_expected
-    assert set(live_configs) == active_expected
+    all_configured = {name for name, config in load_market_configs(
+        repo_root / "services/discord_bot/markets").items() if config.day_trade_simulation_enabled}
+    assert {spec.market for spec in specs} == all_configured
+    assert set(live_configs) == all_configured
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
     assert all(
@@ -1734,14 +2034,17 @@ def test_official_open_policy_does_not_execute_before_0901(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("weight", (0.1, -0.1))
+@pytest.mark.parametrize("strict_intraday", (False, True))
 def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     tmp_path: Path,
     weight: float,
+    strict_intraday: bool,
 ) -> None:
     spec = replace(
         _spec(tmp_path),
         entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
         entry_price_offset_ticks=0,
+        strict_intraday=strict_intraday,
     )
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     summary = {
@@ -1752,6 +2055,7 @@ def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
     quote = _quote(open_price=1_000.0, bid=900.0, ask=1_100.0)
     quote.update(
         {
+            "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
             "execution_price_0901": 1_007.5,
             "quote_at": _now(9, 1).isoformat(),
             "historical_source_quote_at": _now(9, 0, 59).isoformat(),
@@ -2093,6 +2397,31 @@ def test_paper_market_order_fills_full_request_at_best_quote_without_depth_cap(
     assert signal["top_book_capacity_shares"] == 1_000
     assert signal["filled_shares"] == 10_000
     assert signal["synthetic_fill"] is False
+
+
+@pytest.mark.parametrize("damage", [None, "live_mode", "wrong_contract", "stale", "future", "wrong_source", "zero_volume", "invalid_range"])
+def test_completed_minute_exit_evidence_never_becomes_live_non_trial_quote(damage):
+    from scripts.rebuild_tw_day_trade_open_price_replay import _bar_quote
+    now = _now(9, 2)
+    mode = {"simulation_replay": True, "counterfactual_open_replay": True,
+            "historical_minute_valuation": True, "session_date": str(now.date()),
+            "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
+    quote = _bar_quote({"symbol": "2330"}, {"open": 101, "low": 100, "high": 103,
+                       "close": 102, "volume_shares": 10_000}, observed=now, bid=102, ask=None)
+    if damage == "live_mode":
+        mode["simulation_replay"] = False
+    elif damage == "wrong_contract":
+        mode["entry_fill_contract"] = "live"
+    elif damage in {"stale", "future"}:
+        quote["quote_at"] = _now(9, 1 if damage == "stale" else 3).isoformat()
+    elif damage == "wrong_source":
+        quote["source"] = "shioaji:stock_snapshot"
+    elif damage == "zero_volume":
+        quote["observed_minute_volume_lots"] = 0
+    elif damage == "invalid_range":
+        quote["historical_bar_low"] = 104
+    assert _completed_minute_replay_quote(mode, quote, now) is (damage is None)
+    assert not _fresh_regular_execution_quote(quote, now)  # No simtrade/exchange time fabricated.
 
 
 def test_causal_paper_market_fills_full_target_from_shioaji_stream_without_depth_claim(
@@ -3209,6 +3538,31 @@ def test_rearm_flat_session_refuses_any_position_history(tmp_path: Path) -> None
             now=_now(9, 30),
             reason="must not double enter",
         )
+
+
+@pytest.mark.parametrize("replay, hour, minute, accepted", [
+    (False, 14, 0, False), (True, 14, 0, True), (True, 13, 29, False),
+])
+def test_postclose_never_filled_rearm_needs_explicit_completed_replay(
+    tmp_path: Path, replay: bool, hour: int, minute: int, accepted: bool,
+) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = _spec(tmp_path)
+    engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[_row()],
+        quotes={}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7),
+    )
+    kwargs = dict(now=_now(hour, minute), reason="source-pinned completed paper replay",
+                  completed_session_replay=replay)
+    if not accepted:
+        with pytest.raises(RuntimeError, match="outside the entry window"):
+            engine.rearm_flat_session(spec.market, **kwargs)
+        return
+    assert engine.rearm_flat_session(spec.market, **kwargs) == "rearmed"
+    event = json.loads(engine.events_path.read_text().splitlines()[-1])
+    assert event["recorded_at"] == _now(hour, minute).isoformat()
+    assert event["completed_session_replay"] is True
+    assert engine.state["modes"][spec.market]["processed_signal_ids"] == ["signal-1"]
 
 
 def test_non_session_invalidation_voids_only_zero_fill_signal(tmp_path: Path) -> None:
@@ -5605,7 +5959,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="load-more-positions"' in html
     assert 'id="signal-direction-summary"' in html
     assert "signalOpeningExecutionAudit" in javascript
-    assert "開盤計價 ${money(openingPrice)}" in javascript
+    # Published prices must use the shared disclosure-aware renderer rather
+    # than bypassing its withholding contract with a raw money formatter.
+    assert "開盤計價 ${quoteText(row," in javascript
     assert "configured_entry_fill_policy" in javascript
     assert "市價買進／回補取第一筆較晚最佳 Ask" in javascript
     assert "市價賣出／放空取第一筆較晚最佳 Bid" in javascript
@@ -5695,8 +6051,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert 'src="app.js?v=94"' in html
-    assert 'src="chart-renderer.js?v=4"' in html
+    assert re.search(r'src="app\.js\?v=[1-9][0-9]*"', html)
+    assert re.search(r'src="chart-renderer\.js\?v=[1-9][0-9]*"', html)
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript
     assert "function decodeChartHistory(payload)" in javascript
@@ -5707,14 +6063,14 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "function matchesMode(" not in javascript
     assert "function matchesSymbol(" not in javascript
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
-    assert 'src="presentation.js?v=4"' in html
-    assert 'src="detail-components.js?v=7"' in html
+    assert re.search(r'src="presentation\.js\?v=[1-9][0-9]*"', html)
+    assert re.search(r'src="detail-components\.js\?v=[1-9][0-9]*"', html)
     assert "let followLatestSession = true;" in javascript
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript
     assert "historyRows || data.benchmark_marks" not in javascript
-    assert 'href="styles.css?v=25"' in html
+    assert re.search(r'href="styles\.css\?v=[1-9][0-9]*"', html)
     assert 'class="compact-table event-table"' in html
     assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript
@@ -6660,6 +7016,26 @@ def test_signal_page_cache_refreshes_position_completion_without_ledger_append(
     assert updated["rows"][0]["filled_shares"] == 1_000
     assert updated["rows"][0]["status"] == "ready"
     assert updated["rows"][0]["entry_completion_broker_fill"] is True
+    assert updated["rows"][0]["position"]["filled_shares"] == 1_000
+
+    position["signed_shares"] = 1_000
+    state["dashboard_content_revision"] = 2
+    position["last_mark_price"] = 103.0
+    position["last_complete_net_pnl_twd"] = 2_500.0
+    position["realized_net_pnl_twd"] = 20.0
+    position["private_token"] = "must-not-be-published"
+    state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    repriced = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    valuation = repriced["rows"][0]["position"]
+    assert valuation["contract"] == "signal_ledger_valuation_v1"
+    assert valuation["last_mark_price"] == 103.0
+    assert valuation["reconciled_total_net_pnl_twd"] == 2_520.0
+    assert "private_token" not in valuation
+
+    position["signal_id"] = "different-signal-same-stock"
+    state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    unrelated = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    assert "position" not in unrelated["rows"][0]
 
     state["modes"]["mode_a"]["positions"] = {}
     state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
@@ -6667,6 +7043,68 @@ def test_signal_page_cache_refreshes_position_completion_without_ledger_append(
     assert removed["rows"][0]["filled_shares"] == 0
     assert removed["rows"][0]["status"] == "partial_depth"
     assert "entry_completion_broker_fill" not in removed["rows"][0]
+    assert "position" not in removed["rows"][0]
+
+
+def test_identical_cold_signal_queries_coalesce_without_skipping_source_validation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    day = "2026-08-13"
+    (tmp_path / "state.json").write_text(json.dumps({"modes": {"mode_a": {
+        "session_date": day, "initial_capital_twd": 10_000_000, "positions": {},
+    }}}))
+    (tmp_path / "signals.jsonl").write_text(json.dumps({
+        "session_date": day, "market": "mode_a", "signal_id": "signal-a",
+        "symbol": "2330", "target_weight": 0.1, "status": "ready",
+    }) + "\n")
+    source_started, release_source, second_lookup = (threading.Event() for _ in range(3))
+    original_reader = dashboard_module._latest_contiguous_session_rows
+    original_locker = dashboard_module._detail_query_lock
+    reads = 0
+    lookups = 0
+
+    def reader(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        source_started.set()
+        assert release_source.wait(5)
+        return original_reader(*args, **kwargs)
+
+    def locker(*args, **kwargs):
+        nonlocal lookups
+        lock = original_locker(*args, **kwargs)
+        lookups += 1
+        if lookups == 2:
+            second_lookup.set()
+        return lock
+
+    monkeypatch.setattr(dashboard_module, "_latest_contiguous_session_rows", reader)
+    monkeypatch.setattr(dashboard_module, "_detail_query_lock", locker)
+    request = dict(state_dir=tmp_path, session_date=day, limit=10)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(build_dashboard_signal_page, **request)
+        try:
+            assert source_started.wait(5)
+            second = pool.submit(build_dashboard_signal_page, **request)
+            assert second_lookup.wait(5)
+        finally:
+            release_source.set()
+        assert first.result(timeout=5) == second.result(timeout=5)
+    assert reads == 1
+
+
+def test_detail_coalescing_is_per_query_and_reentrant(tmp_path: Path) -> None:
+    request = {"state_dir": tmp_path}
+    same = dashboard_module._detail_query_lock("signals", request)
+    assert same is dashboard_module._detail_query_lock("signals", request)
+    assert same is not dashboard_module._detail_query_lock("events", request)
+    assert same is not dashboard_module._detail_query_lock("signals", {**request, "symbol": "2330"})
+    with same:
+        assert same.acquire(blocking=False)
+        same.release()
 
 
 def test_historical_signal_range_skips_current_session_calendar(
@@ -6806,7 +7244,7 @@ def test_columnar_signal_range_matches_strict_json_path(
         )
     assert set(timing_ms) == {
         "date_selection", "cache_lookup", "source_projection", "filter",
-        "summary", "page", "payload_cache",
+        "summary", "page", "payload_cache", "query_singleflight_wait",
     }
     assert all(value >= 0 for value in timing_ms.values())
     assert complete["rows"] == strict["rows"]
@@ -6816,8 +7254,8 @@ def test_columnar_signal_range_matches_strict_json_path(
     assert complete["opening_execution_audit"] == strict["opening_execution_audit"]
     assert complete["scan_limit_reached"] is False
 
-    # A content revision can change live overlays, so the finished page must
-    # rebuild; the unchanged immutable ledger projection need not be decoded.
+    # Quote-only content revisions refresh exact overlays without rebuilding
+    # the immutable signal range. Source/feature changes still invalidate it.
     (state_dir / "state.json").write_text(
         json.dumps(
             {

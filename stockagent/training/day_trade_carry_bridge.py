@@ -8,11 +8,13 @@ callers bind this same contract.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from datetime import date
 import os
-from typing import Any, Callable
+import threading
+from typing import Any, Callable, Mapping
 import warnings
 
 import numpy as np
@@ -26,6 +28,7 @@ from stockagent.backtest.tw_day_trade_carry import (
     invalidate_day_trade_carry_compiled_caches,
 )
 from stockagent.backtest.tw_day_trade_inventory import _validate_checkpoint_identity
+from stockagent.data.walkforward import period_labels_from_contract
 
 
 def _diagnostic_failure_value(value: Any, device: torch.device) -> Any:
@@ -291,6 +294,28 @@ class PreparedDayTradeCarryBatch:
     event_compression: bool = False
     packed_transport: bool = False
     transport_symbols: int = 0
+    _device_sessions: tuple[DayTradeCarrySession, ...] = field(default=(), repr=False, compare=False)
+    _device_allocations: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
+    _device_ready: object = field(default=None, repr=False, compare=False)
+    _device: torch.device | None = field(default=None, repr=False, compare=False)
+
+    def row_slice(self, begin: int, end: int) -> PreparedDayTradeCarryBatch:
+        """Reuse immutable field-major staging for an exact real-row interval.
+
+        Annual account boundaries change state ownership, not observations.
+        Slicing the existing CPU tape avoids decoding/padding those days again;
+        consumers still reconstruct the ordinary dense session ABI.
+        """
+        if begin < 0 or end <= begin or end > self.count:
+            raise ValueError("physical staging slice requires a nonempty real-row interval")
+        return replace(
+            self,
+            days=self.days[begin:end],
+            tensors={name: tensor[begin:end] for name, tensor in self.tensors.items()},
+            count=end - begin,
+            cpu_sessions=self.cpu_sessions[begin:end] if self.cpu_sessions else (),
+            _device_sessions=self._device_sessions[begin:end] if self._device_sessions else (),
+        )
 
     @classmethod
     def from_sessions(
@@ -457,13 +482,58 @@ class PreparedDayTradeCarryBatch:
             transport_symbols=symbols,
         )
 
-    def sessions(self, device: torch.device) -> tuple[DayTradeCarrySession, ...]:
+    def sessions(self, device: torch.device, *, transport_block_rows: int | None = None) -> tuple[DayTradeCarrySession, ...]:
+        if self._device_sessions and device == self._device:
+            stream = torch.cuda.current_stream(device)
+            stream.wait_event(self._device_ready)
+            # The consumer may release its source closure before its stream
+            # finishes. Record every allocation on that stream, including
+            # views sliced at an annual boundary.
+            for value in self._device_allocations:
+                value.record_stream(stream)
+            count = len(self._device_sessions)
+            if count < self.count:
+                # Only a bounded prefix occupies the next GPU tape while the
+                # current tape is live. Expand the suffix on the consumer
+                # stream after its previous closure has been released.
+                return (*self._device_sessions, *self.row_slice(count, self.count).sessions(device))
+            return self._device_sessions
         if device.type == "cpu" and self.cpu_sessions:
             return self.cpu_sessions
-        moved = {name: tensor.to(device=device) for name, tensor in self.tensors.items()}
+        block_rows = (int(os.environ.get("STOCKAGENT_DAY_TRADE_TRANSPORT_BLOCK_ROWS", "0"))
+                      if transport_block_rows is None else int(transport_block_rows))
+        if block_rows < 0:
+            raise ValueError("physical transport block rows must be non-negative")
+        transport_fields = {"_transport_exit_flat", "_transport_exit_price", "_transport_exit_capacity"}
+        blocked = (self.packed_transport and block_rows > 0 and all(
+            self.tensors[name].device.type == "cpu" and not self.tensors[name].requires_grad
+            for name in transport_fields))
+        moved = {name: _move_physical_transport(tensor, device) for name, tensor in self.tensors.items()
+                 if not blocked or name not in transport_fields}
         if self.packed_transport:
             symbols = int(self.transport_symbols)
             exit_size = symbols * 270 * 2
+            if blocked:
+                # Keep the full, unchanged dense session ABI. Only bound the
+                # *temporary* padded transport live set to K rows: allocating
+                # all B padded FP64/index packets before their dense scatter
+                # can consume more VRAM than the final tensors themselves.
+                dense_prices = torch.full((self.count, exit_size + 1), float("nan"),
+                                          device=device, dtype=torch.float64)
+                dense_capacity = torch.zeros_like(dense_prices)
+                for begin in range(0, self.count, block_rows):
+                    end = min(begin + block_rows, self.count)
+                    flat = _move_physical_transport(self.tensors["_transport_exit_flat"][begin:end], device)
+                    values = _move_physical_transport(self.tensors["_transport_exit_price"][begin:end], device)
+                    dense_prices[begin:end].scatter_(1, flat, values)
+                    del values
+                    values = _move_physical_transport(self.tensors["_transport_exit_capacity"][begin:end], device)
+                    dense_capacity[begin:end].scatter_(1, flat, values)
+                    del flat, values
+                moved["exit_prices"] = dense_prices[:, :exit_size].reshape(self.count, symbols, 270, 2)
+                moved["exit_capacity"] = dense_capacity[:, :exit_size].reshape(self.count, symbols, 270, 2)
+                return tuple(DayTradeCarrySession(day=day, **{name: value[i] for name, value in moved.items()})
+                             for i, day in enumerate(self.days))
             flat = moved.pop("_transport_exit_flat").to(dtype=torch.int64)
             exit_values = moved.pop("_transport_exit_price")
             capacity_values = moved.pop("_transport_exit_capacity")
@@ -493,6 +563,107 @@ class PreparedDayTradeCarryBatch:
             values = {name: tensor[index] for name, tensor in moved.items()}
             result.append(DayTradeCarrySession(day=day, **values))
         return tuple(result)
+
+    @torch.inference_mode(False)
+    def prefetch_device(self, device: torch.device, stream) -> PreparedDayTradeCarryBatch:
+        """A transient next-batch tape; never insert CUDA data in the CPU cache."""
+        if device.type != "cuda":
+            raise ValueError("physical device prefetch requires CUDA")
+        limit = int(os.environ.get("STOCKAGENT_DAY_TRADE_DEVICE_PREFETCH_ROWS", "32"))
+        if not 1 <= limit <= 64:
+            raise ValueError("physical device prefetch rows must be between 1 and 64")
+        prefix = self if self.count <= limit else self.row_slice(0, limit)
+        # Serialize host allocations with ledger graph construction. All copy
+        # and scatter work is enqueued on a separate stream; current model and
+        # ledger work can continue while that stream expands the exact source.
+        from stockagent.backtest.tw_day_trade_graph import _LOCK
+        with _LOCK, torch.cuda.device(device), torch.cuda.stream(stream):
+            sessions = prefix.sessions(device)
+            ready = torch.cuda.Event()
+            ready.record(stream)
+        # Every session is a row view of the same field-major transport.
+        # Register allocation lifetimes once per field, rather than once per
+        # day/field: repeated record_stream calls serialize the host hotpath.
+        allocations = {}
+        for name in sessions[0].__dataclass_fields__:
+            value = getattr(sessions[0], name)
+            if isinstance(value, torch.Tensor):
+                while value._base is not None:
+                    value = value._base
+                allocations[id(value)] = value
+        return replace(self, _device_sessions=sessions, _device_allocations=tuple(allocations.values()),
+                       _device_ready=ready, _device=device)
+
+
+def _move_physical_transport(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # Pinned cache storage is immutable. Its allocator records completion of
+    # asynchronous copies, including when a byte-budget eviction releases it.
+    return tensor.to(device=device, non_blocking=(device.type == "cuda" and tensor.is_pinned()))
+
+
+class _PreparedCarryBatchCache:
+    """Byte-bounded source-local cache, never model outputs or account state."""
+
+    def __init__(self):
+        self.entries = OrderedDict()
+        self.lock = threading.RLock()
+        self.bytes = 0
+        self.stats = dict(hits=0, misses=0, evictions=0, oversize=0, pinned_bytes=0)
+
+    @staticmethod
+    def budget():
+        value = int(os.environ.get("STOCKAGENT_DAY_TRADE_PREPARED_CACHE_BYTES", "0"))
+        if value < 0:
+            raise ValueError("prepared physical cache byte budget must be non-negative")
+        return value
+
+    def get(self, key):
+        with self.lock:
+            item = self.entries.get(key)
+            if item is None:
+                self.stats["misses"] += 1
+                return None
+            batch, size, versions, pinned = item
+            if versions != tuple(t._version for t in batch.tensors.values()):
+                raise RuntimeError("immutable prepared physical cache was mutated")
+            self.entries.move_to_end(key)
+            self.stats["hits"] += 1
+            return batch
+
+    @torch.inference_mode(False)
+    def put(self, key, batch):
+        budget = self.budget()
+        size = sum(t.untyped_storage().nbytes() for t in batch.tensors.values())
+        if size > budget:
+            with self.lock:
+                self.stats["oversize"] += 1
+            return batch
+        with self.lock:
+            if key in self.entries:
+                return self.get(key)
+            while self.entries and self.bytes + size > budget:
+                _, (_, old_size, _, pinned) = self.entries.popitem(last=False)
+                self.bytes -= old_size
+                self.stats["pinned_bytes"] -= pinned
+                self.stats["evictions"] += 1
+            if any(torch.is_inference(t) for t in batch.tensors.values()):
+                with torch.inference_mode(False):
+                    batch = replace(batch, tensors={k: t.clone() for k, t in batch.tensors.items()})
+            if (os.environ.get("STOCKAGENT_DAY_TRADE_PREPARED_CACHE_PINNED", "0") == "1"
+                    and torch.cuda.is_available()):
+                # Decoder/prefetch threads have their own current device.
+                with torch.cuda.device(int(os.environ.get("LOCAL_RANK", "0"))):
+                    batch = replace(batch, tensors={k: t.pin_memory() for k, t in batch.tensors.items()})
+            pinned = sum(t.untyped_storage().nbytes() for t in batch.tensors.values() if t.is_pinned())
+            self.entries[key] = (batch, size, tuple(t._version for t in batch.tensors.values()), pinned)
+            self.bytes += size
+            self.stats["pinned_bytes"] += pinned
+            return batch
+
+    def info(self):
+        with self.lock:
+            return dict(contract="immutable_source_local_prepared_transport_v1", budget_bytes=self.budget(),
+                        resident_bytes=self.bytes, entries=len(self.entries), **self.stats)
 
 
 def _project_carry_session(
@@ -586,6 +757,8 @@ class PreparedDayTradeCarrySource:
         repr=False,
     )
     runtime_cache_info: Callable[[], dict[str, Any]] | None = field(default=None, repr=False, compare=False)
+    _prepared_batch_cache: _PreparedCarryBatchCache = field(
+        default_factory=_PreparedCarryBatchCache, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _validate_checkpoint_identity(self.universe, self.release_id, len(self.universe))
@@ -614,6 +787,9 @@ class PreparedDayTradeCarrySource:
 
     def day_at(self, row: int) -> int:
         return self.session_days[int(row)]
+
+    def prepared_batch_cache_info(self) -> dict[str, Any]:
+        return self._prepared_batch_cache.info()
 
     def project_universe(self, symbols: tuple[str, ...]) -> PreparedDayTradeCarrySource:
         """Retain the receipt-bound release while lazily projecting every executor field.
@@ -735,7 +911,7 @@ class PreparedDayTradeCarrySource:
     def prepare_batch(
         self, split, start: int, end: int, *, event_compression: bool = False
     ) -> PreparedDayTradeCarryBatch:
-        """Decode and pack the next chronological batch without touching CUDA."""
+        """Decode, stage and optionally cache immutable chronological source."""
         if split.execution_mode != "tw_day_trade":
             raise ValueError("physical source attached to a different execution mode")
         if start < 0 or end <= start or start >= len(split):
@@ -785,6 +961,12 @@ class PreparedDayTradeCarrySource:
             and identity
             and self.packed_session_loader is not None
         )
+        cache_key = (tuple(rows), tuple(indices), bool(event_compression))
+        cache_enabled = packed_transport and self._prepared_batch_cache.budget() > 0
+        if cache_enabled:
+            cached = self._prepared_batch_cache.get(cache_key)
+            if cached is not None:
+                return cached
         if sparse_events:
             row_loader = self.compact_session_at
         elif packed_transport:
@@ -805,11 +987,12 @@ class PreparedDayTradeCarrySource:
             else:
                 sessions = self.rows(rows, indices, torch.device("cpu"))
         if packed_transport:
-            return PreparedDayTradeCarryBatch.from_packed_sessions(
+            prepared = PreparedDayTradeCarryBatch.from_packed_sessions(
                 sessions,  # type: ignore[arg-type]
                 count,
                 event_compression=event_compression,
             )
+            return self._prepared_batch_cache.put(cache_key, prepared) if cache_enabled else prepared
         return PreparedDayTradeCarryBatch.from_sessions(
             sessions,  # type: ignore[arg-type]
             count,
@@ -826,12 +1009,21 @@ def prefetch_physical_carry_batches(
     batch_size: int,
     *,
     event_compression: bool | None = None,
+    batch_spans: tuple[tuple[int, int], ...] | None = None,
+    device: torch.device | None = None,
 ):
     """Overlap next-batch NPZ decode/CPU packing with current CUDA training."""
     if batch_size <= 0 or not batch_order:
         raise ValueError("physical prefetch requires a nonempty positive batch plan")
     if batch_order != list(range(len(batch_order))):
         raise ValueError("physical carry prefetch requires chronological batch order")
+    if batch_spans is not None:
+        if len(batch_spans) != len(batch_order) or any(
+                start < 0 or end <= start or end > len(split)
+                for start, end in batch_spans):
+            raise ValueError("physical prefetch spans differ from the bounded batch plan")
+        if any(left[1] > right[0] for left, right in zip(batch_spans[:-1], batch_spans[1:])):
+            raise ValueError("physical prefetch spans must remain chronological and disjoint")
 
     if event_compression is None:
         raw_compression = str(
@@ -839,12 +1031,21 @@ def prefetch_physical_carry_batches(
         ).strip().lower()
         event_compression = raw_compression not in {"0", "false", "off", "no"}
 
+    # Whole-account DDP spans are bounded by local batch capacity. The
+    # replicated/global tape and arbitrary single-device callers keep their
+    # existing CPU-only prefetch rather than doubling an unbounded GPU tape.
+    device_prefetch = (device is not None and device.type == "cuda"
+        and batch_spans is not None
+        and os.environ.get("STOCKAGENT_DAY_TRADE_DEVICE_PREFETCH", "0") == "1")
+    copy_stream = torch.cuda.Stream(device=device) if device_prefetch else None
+
     def prepare(batch_index: int):
-        start = batch_index * batch_size
-        end = min(start + batch_size, len(split))
-        return source.prepare_batch(
+        start, end = (batch_spans[batch_index] if batch_spans is not None
+                      else (batch_index * batch_size, min((batch_index + 1) * batch_size, len(split))))
+        batch = source.prepare_batch(
             split, start, end, event_compression=bool(event_compression)
         )
+        return batch.prefetch_device(device, copy_stream) if device_prefetch else batch
 
     raw_depth = os.environ.get("STOCKAGENT_DAY_TRADE_PREFETCH_DEPTH", "2")
     try:
@@ -853,7 +1054,7 @@ def prefetch_physical_carry_batches(
         raise ValueError("STOCKAGENT_DAY_TRADE_PREFETCH_DEPTH must be positive") from exc
     if depth <= 0:
         raise ValueError("STOCKAGENT_DAY_TRADE_PREFETCH_DEPTH must be positive")
-    depth = min(depth, len(batch_order))
+    depth = 1 if device_prefetch else min(depth, len(batch_order))
     with ThreadPoolExecutor(
         max_workers=depth, thread_name_prefix="physical-carry-prefetch"
     ) as pool:
@@ -981,6 +1182,7 @@ def bind_physical_carry_loss(
     prepared_batch: PreparedDayTradeCarryBatch | None = None,
     event_compression: bool = True,
     reset_calendar_year: bool = False,
+    reset_period_contract: Mapping[str, Any] | None = None,
 ) -> Callable:
     """Bind an exact batch; model padding never advances inventory or interest."""
     staged = (
@@ -998,7 +1200,7 @@ def bind_physical_carry_loss(
         staged = source.prepare_batch(
             split, start, end, event_compression=compression_enabled
         )
-    sessions, count = staged.sessions(device), staged.count
+    count = staged.count
     expected_rows = split._valid_indices_cpu[start : start + count].tolist()
     if (
         not expected_rows
@@ -1007,27 +1209,31 @@ def bind_physical_carry_loss(
         raise ValueError("prefetched physical batch differs from the requested interval")
     year_cuts = [0]
     if reset_calendar_year:
-        years = [date.fromordinal(day).year for day in staged.days]
+        def period_years(days):
+            if reset_period_contract is None:
+                return [date.fromordinal(day).year for day in days]
+            dates = np.asarray([date.fromordinal(day) for day in days], dtype="datetime64[D]")
+            return period_labels_from_contract(dates, reset_period_contract).tolist()
+
+        years = period_years(staged.days)
         if start == 0:
-            # The rolling feature window is context, not part of the account
-            # horizon. A calendar-year account must therefore begin on that
-            # year's first physical session. Without this guard a panel that
-            # begins at the first target year silently labels
-            # ``year + lookback`` as a complete annual episode.
+            # Feature warmup must not consume owned account rows. A supplied
+            # full-calendar contract deliberately shifts ownership once; the
+            # historical default still uses calendar-year first sessions.
             first_row = int(expected_rows[0])
             if (
                 first_row > 0
-                and date.fromordinal(source.day_at(first_row - 1)).year
+                and period_years([source.day_at(first_row - 1)])[0]
                 == years[0]
             ):
                 raise ValueError(
-                    "annual training episode begins after the calendar year's "
+                    "annual training episode begins after the configured annual period's "
                     "first physical session; lookback rows may provide feature "
                     "context but may not shift the account boundary"
                 )
         year_cuts.extend(i for i in range(1, count) if years[i] != years[i - 1])
         first_row = int(expected_rows[0])
-        starts_new_year = first_row > 0 and date.fromordinal(source.day_at(first_row - 1)).year != years[0]
+        starts_new_year = first_row > 0 and period_years([source.day_at(first_row - 1)])[0] != years[0]
         if starts_new_year and previous is not None:
             _require_flat_episode_boundary(previous)
             previous = None
@@ -1036,6 +1242,13 @@ def bind_physical_carry_loss(
         first_row = int(split._valid_indices_cpu[start])
         if first_row <= 0 or previous.last_session_day != source.day_at(first_row - 1):
             raise ValueError("physical batch skipped or repeated a source session")
+
+    # A cross-year outer call never consumes a full parent GPU tape. Its exact
+    # chronological children own that tape once, retaining their usual
+    # gradients and state boundaries. Previously the unused parent plus each
+    # re-decoded child coexisted, making larger annual batches needlessly OOM.
+    sessions = (() if reset_calendar_year and len(year_cuts) > 2
+                else staged.sessions(device))
 
     def call(weights, returns, mask, **kwargs):
         if reset_calendar_year and len(year_cuts) > 2:
@@ -1062,6 +1275,7 @@ def bind_physical_carry_loss(
                 bound = bind_physical_carry_loss(
                     loss_fn, source=source, split=split, start=start + offset, end=start + stop,
                     device=device, previous=segment_previous, event_compression=event_compression,
+                    prepared_batch=staged.row_slice(offset, stop),
                 )
                 value = bound(weights[offset:stop], returns[offset:stop], mask[offset:stop], **supplied)
                 total = total + value * ((stop - offset) / count)

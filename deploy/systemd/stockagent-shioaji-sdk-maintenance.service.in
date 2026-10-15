@@ -1,0 +1,31 @@
+[Unit]
+Description=Check official Shioaji stable release and update in the closed-session window
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_shioaji_sdk_maintenance.sh" maintain --apply
+ExecStopPost=/usr/bin/bash "__REPO_ROOT__/scripts/run_shioaji_sdk_maintenance.sh" recover
+UMask=0077
+Nice=10
+CPUWeight=20
+IOWeight=20
+TimeoutStartSec=20min
+TimeoutStopSec=5min
+KillMode=control-group
+Restart=on-failure
+RestartSec=5min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictRealtime=true
+

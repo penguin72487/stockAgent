@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -70,11 +71,13 @@ def test_scalar_finite_contract(value):
     assert signal_engine._finite_float_or_none(value) == expected
 
 
-def test_opening_cache_hit_is_read_only(monkeypatch, tmp_path):
+def test_opening_cache_hit_is_read_only(monkeypatch, tmp_path, opening_clock):
     snapshot = PriceSnapshot(
         prices=np.array([100.]), open_prices=np.array([99.]),
         source="shioaji:stock_snapshot+shared_opening_snapshot+cache_hit",
         available_mask=np.array([True]), available_count=1, requested_count=1,
+        timestamps_ms=np.array([int(opening_clock.timestamp() * 1000)]),
+        exchange_timestamps_ms=np.array([int(opening_clock.timestamp() * 1000)]),
     )
     monkeypatch.setattr(signal_engine, "fetch_tw_mis_opening_snapshot", lambda *a, **k: snapshot)
     for name in ("seed_tw_opening_snapshot_cache", "fetch_shared_day_trade_stock_snapshots",
@@ -135,7 +138,7 @@ def test_scheduler_prepares_together_publishes_before_reports_and_isolates_failu
     monkeypatch.setattr(discord_bot, "datetime", Clock)
     monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: list(configs))
     monkeypatch.setattr(discord_bot, "_resolve_market", configs.__getitem__)
-    monkeypatch.setattr(discord_bot, "_preopen_market_symbol_count", lambda cfg: 10)
+    monkeypatch.setattr(discord_bot, "_preopen_market_symbol_count", lambda cfg, **_kwargs: 10)
     monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *a: (True, "test"))
     monkeypatch.setattr(discord_bot, "_scheduled_signal_key", lambda cfg, now: f"{now.date()}:{cfg.market}")
     monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *a: "retry")
@@ -170,14 +173,28 @@ def test_scheduler_prepares_together_publishes_before_reports_and_isolates_failu
         pass
 
     monkeypatch.setattr(discord_bot, "_prepare_realtime_signal_sync", prepare)
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **kw: kw)
+    monkeypatch.setattr(discord_bot, "prefetch_live_signal_prices", lambda **kw: SimpleNamespace(snapshot=SimpleNamespace(transport_timing={})))
     monkeypatch.setattr(discord_bot, "_run_market_signal", generate)
     monkeypatch.setattr(discord_bot, "_scheduled_broadcast_channel", noop)
     monkeypatch.setattr(discord_bot, "_send_subscription_notifications", noop)
     monkeypatch.setattr(discord_bot, "_enrich_signal_performance_for_discord", lambda cfg, result, **kw: result)
     monkeypatch.setattr(discord_bot, "_signal_sanity_issues", lambda *a: [])
-    asyncio.run(discord_bot.scheduled_signal.coro())
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {})
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_delivery_task", None)
+
+    async def exercise():
+        await discord_bot.scheduled_signal.coro()
+        # Only the observer is awaited by this test. The scheduler returns
+        # after immutable publication, not after report/chat completion.
+        if discord_bot.bot._scheduled_delivery_task is not None:
+            await discord_bot.bot._scheduled_delivery_task
+
+    asyncio.run(exercise())
     published = [m for phase, m in events if phase == "publish"]
-    assert published == [m for m in "abc" if m != failed_market]
+    # Ready modes may overtake slower independent inputs, but never duplicate
+    # a signal or publish the failed preparation.
+    assert sorted(published) == [m for m in "abc" if m != failed_market]
     assert max(i for i, e in enumerate(events) if e[0] == "publish") < min(
         i for i, e in enumerate(events) if e[0] == "report")
     assert len(receipts) == 3

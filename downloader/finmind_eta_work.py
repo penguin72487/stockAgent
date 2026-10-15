@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 import json
 from itertools import islice
@@ -37,6 +38,24 @@ COUNT_FIELDS = ("required_requests", "incremental_requests", "backfill_requests"
                 "inflight_requests", "local_derived_tasks", "excluded_tasks", "uncertain_requests",
                 "calendar_wait_tasks", "retry_tasks", "retry_exhausted_tasks", "candidate_requests",
                 "independent_retry_tasks", "independent_retry_requests", "independent_inflight_tasks")
+
+
+@dataclass(frozen=True)
+class QueueAggregateSnapshot:
+    """Ephemeral aggregates from one read transaction, not a persisted cache.
+
+    Consumers must match both the exact queue path and observation clock. Only
+    successful inventories produce a snapshot; malformed queues keep their
+    ordinary unknown/fail-closed behavior. Never use it to claim provider work.
+    """
+
+    path: Path
+    observed_at: datetime
+    states: dict[str, int]
+    renewals: tuple[tuple[str, str, int, str, int], ...]
+
+    def matches(self, path: Path, now: datetime) -> bool:
+        return path.resolve() == self.path and now == self.observed_at
 
 
 def _registry() -> dict[str, dict[str, Any]]:
@@ -90,10 +109,13 @@ def _work_class(state: str, priority: int, due: bool) -> str:
     return "blocked"
 
 
-def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+def _queue(path: Path, owner: str, now: datetime, *,
+           queue_snapshots: dict[str, QueueAggregateSnapshot] | None = None
+           ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     if not path.is_file():
         return {}, {"state": "missing_queue"}
     aggregate: dict[str, dict[str, Any]] = {}
+    states, renewals = Counter(), Counter()
     try:
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.15)) as conn:
             conn.execute("PRAGMA query_only=ON")
@@ -108,9 +130,10 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
             query = """SELECT dataset,kind,priority,state,
                 CASE WHEN (state='pending' AND next_attempt_at_utc IS NULL)
                     OR next_attempt_at_utc<=? THEN 1 ELSE 0 END,
-                count(*),min(next_attempt_at_utc),max(next_attempt_at_utc)
+                count(*),min(next_attempt_at_utc),max(next_attempt_at_utc),
+                count(next_attempt_at_utc)
                 FROM tasks GROUP BY dataset,kind,priority,state,5"""
-            for dataset, kind, priority, state, due, count, first, last in conn.execute(query, (now.isoformat(),)):
+            for dataset, kind, priority, state, due, count, first, last, renewal_count in conn.execute(query, (now.isoformat(),)):
                 if any(value is not None and _stamp(value) is None for value in (first, last)):
                     raise ValueError("invalid_queue_retry_timestamp")
                 item = aggregate.setdefault(dataset, {"classes": Counter(), "range_classes": Counter(),
@@ -118,6 +141,9 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                                                       "inflight_network": 0, "retry_first": None, "retry_last": None,
                                                       "retries_by_class": Counter(), "wait_by_class": {}})
                 item["states"][state] += count
+                states[state] += count
+                if state in DONE_STATES and kind is not None and kind != 'derived' and renewal_count:
+                    renewals[dataset, kind, priority, state] += renewal_count
                 work = _work_class(state, priority, bool(due))
                 if work == 'validation' and owner == 'complement':
                     from downloader.finmind_supplemental import SOURCES as SUPPLEMENTAL_SOURCES
@@ -149,8 +175,9 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                 # not as extra work or a whole-dataset priority promotion.
                 for dataset, kind, state, count, last, has_id in conn.execute('''
                     SELECT t.dataset,t.kind,t.state,count(*),max(t.next_attempt_at_utc),t.data_id!=''
-                    FROM tasks t WHERE t.priority!=0 AND EXISTS (SELECT 1 FROM finmind_priority_tasks p
-                        WHERE p.dataset=t.dataset AND p.data_id=t.data_id AND p.partition=t.partition)
+                    FROM (SELECT DISTINCT dataset,data_id,partition FROM finmind_priority_tasks) p
+                    CROSS JOIN tasks t
+                    WHERE t.priority!=0 AND p.dataset=t.dataset AND p.data_id=t.data_id AND p.partition=t.partition
                     GROUP BY t.dataset,t.kind,t.state,6'''):
                     item = aggregate[dataset].setdefault('priority_override', {
                         'requests': 0, 'inflight_tasks': 0, 'blocked_tasks': 0,
@@ -213,6 +240,10 @@ def _queue(path: Path, owner: str, now: datetime) -> tuple[dict[str, dict[str, A
                     "WHERE t.state='inflight' GROUP BY c.dataset"
                 ):
                     aggregate[dataset]["inflight_network"] -= parts - requests
+            if queue_snapshots is not None:
+                queue_snapshots[owner] = QueueAggregateSnapshot(
+                    path.resolve(), now, dict(sorted(states.items())),
+                    tuple((*key, count) for key, count in sorted(renewals.items())))
             return aggregate, {"state": "observed", "basis": "readonly_sqlite_snapshot",
                                "learned_batch_limits": limits, "batching_disabled": sorted(disabled)}
     except (sqlite3.Error, OSError, ValueError, TypeError) as error:
@@ -391,7 +422,8 @@ def _free_rows(root: Path, now: datetime, catalog: dict[str, dict[str, Any]]) ->
         return {}, {"state": "free_status_unreadable_or_stale", "error_type": type(error).__name__}
 
 
-def build_finmind_workload(root: Path, now: datetime | None = None) -> dict[str, Any]:
+def build_finmind_workload(root: Path, now: datetime | None = None, *,
+                          queue_snapshots: dict[str, QueueAggregateSnapshot] | None = None) -> dict[str, Any]:
     """Count unique-owner network work without altering a source or a queue.
 
     The finite horizon is the currently seeded registry, not all future refreshes
@@ -406,8 +438,11 @@ def build_finmind_workload(root: Path, now: datetime | None = None) -> dict[str,
     root = Path(root)
     catalog = _registry()
     observations, sources = {}, {}
+    if queue_snapshots is not None:
+        queue_snapshots.clear()
     for owner in ("sponsor", "complement"):
-        observations[owner], sources[owner] = _queue(root / owner / "queue.sqlite3", owner, now)
+        observations[owner], sources[owner] = _queue(root / owner / "queue.sqlite3", owner, now,
+                                                  queue_snapshots=queue_snapshots)
     free, sources["free"] = _free_rows(root, now, catalog)
     rows = []
     for dataset, spec in sorted(catalog.items()):

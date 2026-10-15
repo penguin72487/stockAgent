@@ -1,0 +1,467 @@
+{
+  "contract_version": 1,
+  "observed_at_utc": "2026-10-08T19:25:44.021057+00:00",
+  "evidence_artifact": "artifacts/data_quality/news_adaptive_capacity_20261009/navigation-probes-all.json",
+  "publisher_navigation": {
+    "url": "https://news.cnyes.com/_next/static/chunks/7486-7f51ddd98962fe77.js",
+    "response_sha256": "81d1b68cecf69f3f089eb70d37f2f2dca4fc238c8e044ec21c0fc5439f632d6a"
+  },
+  "purpose": "Reviewed endpoint capability, not a reuse license or all-history claim.",
+  "response_rows_limit_observed": 30,
+  "page_number_limit_observed": 30,
+  "endpoints": [
+    {
+      "slug": "headline",
+      "response_sha256": "545fba76cfeab5f899b123f77f61f1941a1105a0942413ef34255271ac9a0426",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "stock_report",
+      "response_sha256": "aefd617c62671de0d873f4d4e5e873fe524a8c96cc764d31fef0ca7e8251b010",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "announcement",
+      "response_sha256": "a94818fc72ecdc8a7ab682def2196e2ecd460ea088e42940f4aafdd8f3dda8b5",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "anue_live",
+      "response_sha256": "4c14a1a0c30bc91b88f1ad0369b92e6e484ed66e324f5d89f95b1eabba54af6f",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "bank",
+      "response_sha256": "30d8761d26d7fb56a82d05b88ec04d9e96464a314de1c8e70653ac7c92cbc1ed",
+      "returned_rows": 10,
+      "validated_body_rows": 10
+    },
+    {
+      "slug": "bc",
+      "response_sha256": "ab722ee7a96126c7c76f055a3a343a32bb15287e6f727fd498f24177173423bf",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "bc_crypto",
+      "response_sha256": "5df17871175ae8e4af3d6e9436bf2bfa95a5f102f93e8ae1f4fc8316cb797921",
+      "returned_rows": 6,
+      "validated_body_rows": 6
+    },
+    {
+      "slug": "bc_live",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "bc_news",
+      "response_sha256": "fe172552a13abcee85bdc9161cde4f65d497d2042b5f5a8a31b800c9d458a22a",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "bc_tutorial",
+      "response_sha256": "63538547c559bc01e469ea6126a5145ed7c76fbab716ca6ec334823c4a52ff05",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "celebrity_area",
+      "response_sha256": "4125c491bb2f5ddb4c2ac3fca9b56bd77de5e30956d0744e33f699409b153b25",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "cn_housenews",
+      "response_sha256": "1cfebbe49dd06423ed444ef35b43e161c21971a36439891593ae1510e0165ee6",
+      "returned_rows": 2,
+      "validated_body_rows": 2
+    },
+    {
+      "slug": "cn_macro",
+      "response_sha256": "139319faec13b7cb2cad0b4dce21f95c8d5494c4a6b3883c49d7adaa21530a68",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "cn_stock",
+      "response_sha256": "e18eb1ece06e1808bd71e8e88af4c09cd8b4b5955d1bfa50afb671d51af1bb6f",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "cnyeshouse",
+      "response_sha256": "3905814d1201b1e83df26e95c9836b982696f1a5c3b1d269359855cbadd94511",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "crypto_live",
+      "response_sha256": "05ef9dbe91f12369d44f17cae2e56ec6a2adb57c466d4c2834e46d9c432cb26d",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "eme_bull",
+      "response_sha256": "b364c9a3f023f7d554213351faea3963126047b984322f16171500804bf51d5d",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "energy",
+      "response_sha256": "7d98ebf9c09616d4b25b5d3c4008df34c5d9942b4f64e4eb79e32afd502277fd",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "etf",
+      "response_sha256": "39d651d0558b0a998b1c77a0369712badabb92dbc9c4d07961e77339cc1d4ac6",
+      "returned_rows": 24,
+      "validated_body_rows": 24
+    },
+    {
+      "slug": "eu_asia_stock",
+      "response_sha256": "bfab5622316c0ceeba61db37326fce43e139aeb1a0d4d7fb2e6cdd21f5b31694",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "financial",
+      "response_sha256": "95bbbff5c381a554e6e0d5fa69522fb901c6a5c67d080df1768484058e74a4d9",
+      "returned_rows": 4,
+      "validated_body_rows": 4
+    },
+    {
+      "slug": "forex",
+      "response_sha256": "3daa6ad47316599a149623bd1f35b789e9727cc29d6a4000ab39f594046d372e",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "forex_live",
+      "response_sha256": "1c8c54e6ab4592212eb870fd06bc8924b42c3698f2986af6c573a3285619f325",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "fund",
+      "response_sha256": "69ac7a2635f59332a6c7256b81f384d419e649de8364751a9a6b960fd8d64887",
+      "returned_rows": 28,
+      "validated_body_rows": 28
+    },
+    {
+      "slug": "fund_comment",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "futu_bond",
+      "response_sha256": "89e5358f92d6b05dece91ed0ef6e8eeec463c00ceb3f83ca1f04d89f374981ad",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "futu_produce",
+      "response_sha256": "23e3b6d62521216245a5fdb3a23905bf275be4417ce1a58679b5c793244ef915",
+      "returned_rows": 3,
+      "validated_body_rows": 3
+    },
+    {
+      "slug": "future",
+      "response_sha256": "d8aaed7d0ec52948ae0e12f775de17307c8ed04f79117fbfa57f3115e909342f",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "fx_report",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "global_report",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "hk_housenews",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "hk_ipo",
+      "response_sha256": "1a0874bb0d78242be1b3c129f4fb4d8c88f6c3fd11a2812e45174637fac275cb",
+      "returned_rows": 1,
+      "validated_body_rows": 1
+    },
+    {
+      "slug": "hk_macro",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "hk_report",
+      "response_sha256": "01dfd343adb0010fafdf6a827ae65d2bc0a3b3bef521d1e876b9a519a991e420",
+      "returned_rows": 1,
+      "validated_body_rows": 1
+    },
+    {
+      "slug": "hk_stock",
+      "response_sha256": "336462fabb84105a9c22fc21689c7323d5469cb6792cc4e4852f0a7388a02281",
+      "returned_rows": 22,
+      "validated_body_rows": 22
+    },
+    {
+      "slug": "hk_warrant",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "index_futures",
+      "response_sha256": "31516d2feeb0621bee9e3c2f58c310ec13cd5531b1c8a606e9b705802b5a7df1",
+      "returned_rows": 20,
+      "validated_body_rows": 20
+    },
+    {
+      "slug": "mag",
+      "response_sha256": "a316367e37577ee057cab6d86f5b3046f465976242b91cbc786c444920b0f984",
+      "returned_rows": 30,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "precious_metals",
+      "response_sha256": "b1cad38aac24f7d53e9a623ad27d4e2478029e57e2e55f2a574677f12c17f0fd",
+      "returned_rows": 18,
+      "validated_body_rows": 18
+    },
+    {
+      "slug": "sh_stock",
+      "response_sha256": "bcdea05e0f73bb0375a42ed4e553b3b54d54cd41145796d0b83c079b6618c374",
+      "returned_rows": 11,
+      "validated_body_rows": 11
+    },
+    {
+      "slug": "spending",
+      "response_sha256": "341e9106bb83dfa648d83f2628123e9ea919248567b098ef6f64752a3e22cee6",
+      "returned_rows": 11,
+      "validated_body_rows": 11
+    },
+    {
+      "slug": "stock_futures",
+      "response_sha256": "95f17ed02021bd42a8413b67e4efe611badd3d4bdf70e12d322e735709cc4703",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "stock_tutorial",
+      "response_sha256": "a87b5599e3d568ff92955544efa2b1ccb59f3e43f1c3c617eec4b6987edca675",
+      "returned_rows": 3,
+      "validated_body_rows": 3
+    },
+    {
+      "slug": "tech",
+      "response_sha256": "9d4fa3cf7c0943989a09456cf3ed09008b7c2155fb9532ab7f9f9d962c06fe3f",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_afterhours",
+      "response_sha256": "88e2f2b60d7732e55930289a51280c0b453f5655af838f020c48b09f59b3e580",
+      "returned_rows": 20,
+      "validated_body_rows": 20
+    },
+    {
+      "slug": "tw_bull",
+      "response_sha256": "188006d907f8cfec23e2322b0433efcde7290d47dd2f7f7943925ae6d05256eb",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_calc",
+      "response_sha256": "9ca146c3353f4e47304180257b89496a90ea9cf6342ee0bebe2bc291f07bfbe2",
+      "returned_rows": 13,
+      "validated_body_rows": 13
+    },
+    {
+      "slug": "tw_forecast",
+      "response_sha256": "6c4a8631939d0cac73a136545c543b5620075c2edb06615c5a0f17087c74c40a",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_housenews",
+      "response_sha256": "d4dcfa6fad9d5cad76b9ee88b22746b93fa836e073786a84f96eb88e59d61ea7",
+      "returned_rows": 21,
+      "validated_body_rows": 21
+    },
+    {
+      "slug": "tw_insurance",
+      "response_sha256": "134f5bb1b6f8d26614add0fb120af54d463e04c1474c19a5f813168c33f1e6ce",
+      "returned_rows": 3,
+      "validated_body_rows": 3
+    },
+    {
+      "slug": "tw_live",
+      "response_sha256": "1ad87f630765fedc71c6c73adb3a483d87e90b2e161154e3ab820c98486e34cc",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_macro",
+      "response_sha256": "d4a93a84a35a34ca8a9c138634f77b8385556346c18264e38c39d42ae497e362",
+      "returned_rows": 28,
+      "validated_body_rows": 28
+    },
+    {
+      "slug": "tw_money",
+      "response_sha256": "5e7178d323930fdb75cfe3c0c09bae5b371a4e9d8a8aeeb7d935af9f7e893e81",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_premarket",
+      "response_sha256": "a450c0f58acdab0b34505bbd9703c37d5c863d8045f8225d779203e455895816",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_quo",
+      "response_sha256": "a60f5b5da468e31b14eb89259581f41ac737df35468831af79f8eaf66054c514",
+      "returned_rows": 16,
+      "validated_body_rows": 16
+    },
+    {
+      "slug": "tw_report",
+      "response_sha256": "9eaf98098e0cecd92232badd6ff11d0780cafd0c2474c33833ec1de2ad0307e1",
+      "returned_rows": 0,
+      "validated_body_rows": 0
+    },
+    {
+      "slug": "tw_revenue",
+      "response_sha256": "eb11168f8f9c6e88de0b80afc45d4f599717b9a97368bea59a5255cc47f29e83",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_stock",
+      "response_sha256": "b2861968140ecb8a8d908e462c9df04b8546ea379f9173583b3325d90f7839d6",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "tw_stock_news",
+      "response_sha256": "0d0971f89d398616455645cfb6dfb85129453e22b38002f2adff0571b48037d9",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "us_forecast",
+      "response_sha256": "d33ea69ea33dcf3e0755d07794e0e72d64e2baec8f1a15338f0f1fccec768dad",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "us_live",
+      "response_sha256": "470b85fc601012042f03b7293eb55fde0afb262c0177de0fcfadf6f0a4ffdff2",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "us_stock",
+      "response_sha256": "00b4c702932c9f331e219fbff577a71c19f7608c02e0e1f86a4d1fdf338b1b74",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "wd_housenews",
+      "response_sha256": "aaa29ae069509c0cfb0b1e7be23a228eb1dece3f040808945d2c4e72aa3e0d5e",
+      "returned_rows": 4,
+      "validated_body_rows": 4
+    },
+    {
+      "slug": "wd_macro",
+      "response_sha256": "b062523cb0e7f790aea4e99039334a530a2f302b5e142fa51ab8e5f8c319d8c5",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    },
+    {
+      "slug": "wd_stock",
+      "response_sha256": "8efeb8d83de94d999630129a22ac0289d5d7ade7faf3556f105390a46cdbe2a1",
+      "returned_rows": 30,
+      "validated_body_rows": 30
+    }
+  ],
+  "rejected_candidates": [
+    {
+      "slug": "hotai",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "headline_ai",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "news24h",
+      "status": 200,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "4f7b9bf9679b34fb670270e8a395dfc8788a5a430c2faced7c61e422cfebd20d"
+    },
+    {
+      "slug": "top",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "news",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "all",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "headline_all",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "bc_virtual",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "tw_stock_ai",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    },
+    {
+      "slug": "wd_stock_ai",
+      "status": 422,
+      "error": "bulk_pagination_totals_invalid",
+      "response_sha256": "dea0f582052527c3954cb6105a49b9da48cbb94c5c9ab9279984d529f5bd3df7"
+    }
+  ],
+  "all_history_complete": false
+}

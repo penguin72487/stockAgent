@@ -83,11 +83,14 @@ def _retained_entry_book_source_days(
     raw_path, expected_sha = proof.get("path"), proof.get("sha256")
     if not raw_path or not expected_sha:
         return {}
-    path = Path(str(raw_path))
+    recorded_path = Path(str(raw_path))
     expected_dir = (state_dir / "replay_entry_books").resolve()
-    if (not path.is_absolute() or path.resolve().parent != expected_dir
-            or path.name != f"{session['session_date']}.parquet"):
-        raise ValueError(f"retained entry book is outside candidate: {path}")
+    path = expected_dir / f"{session['session_date']}.parquet"
+    # Atomic promotion moves directories. Retain the recorded path as
+    # provenance, but read only the local canonical book with its exact SHA.
+    if (not recorded_path.is_absolute() or recorded_path.parent.name != "replay_entry_books"
+            or recorded_path.name != path.name or not path.is_file()):
+        raise ValueError(f"retained entry book is outside candidate: {recorded_path}")
     stat = path.stat()
     signature = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     source_signatures[str(path)] = signature
@@ -333,7 +336,8 @@ def _verify_terminal_close_fills(fills, rebuild, modes, *, verify_sources=True):
     return source_hashes
 
 
-def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: bool = False) -> dict:
+def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: bool = False,
+          require_margin_carry: bool = True) -> dict:
     names = ("state.json", "rebuild_receipt.json", "fills.jsonl", "marks.jsonl", "orders.jsonl")
     before = {name: _sha256(state_dir / name) for name in names}
     state, rebuild = _read_json(state_dir / "state.json"), _read_json(state_dir / "rebuild_receipt.json")
@@ -360,6 +364,17 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     fills, marks = _read_jsonl(state_dir / "fills.jsonl"), _read_jsonl(state_dir / "marks.jsonl")
     terminal_source_hashes = _verify_terminal_close_fills(
         fills, rebuild, state["modes"], verify_sources=verify_sources)
+    if not require_margin_carry:
+        # Share the source, fee, inventory and minute-NAV audit without
+        # authorizing overnight borrowing merely to validate terminal closes.
+        for session in sessions:
+            if any(int((row.get("after_close") or {}).get("open_position_rows") or 0)
+                   for row in session["modes"]):
+                raise ValueError("strict intraday audit requires every session flat")
+        for mode in state["modes"].values():
+            if any(mode.get(name) for name in ("carry_cost_ledger", "corporate_action_ledger",
+                                              "share_replacement_ledger")):
+                raise ValueError("strict intraday audit cannot admit carried-account events")
     order_sides = {}
     for order in _read_jsonl(state_dir / "orders.jsonl"):
         key, side = (order["market"], order["order_id"]), order.get("side")
@@ -393,13 +408,13 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
         by_market[fill["market"]].append(fill)
     accounts, action_sources, action_source_hashes = {}, {}, {}
     for market, mode in state["modes"].items():
-        if mode.get("margin_carry_contract") != MARGIN_CARRY_CONTRACT or mode["session_date"] != dates[-1]:
+        if (require_margin_carry and mode.get("margin_carry_contract") != MARGIN_CARRY_CONTRACT) or mode["session_date"] != dates[-1]:
             errors.append(f"{market}: wrong carry contract or unfinished session")
         actions = mode.get("share_replacement_ledger") or []
         if len({a["action_id"] for a in actions}) != len(actions):
             errors.append(f"{market}: duplicate share replacement")
         action_map = {a["action_id"]: a for a in actions}
-        if verify_sources:
+        if verify_sources and require_margin_carry:
             source_path = mode.get("margin_corporate_action_reference_path")
             if not source_path:
                 raise ValueError(f"{market}: carried-history audit requires corporate-action sources")
@@ -764,7 +779,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
         stat = Path(name).stat()
         if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != signature:
             raise RuntimeError(f"minute source changed during audit: {name}")
-    return {"contract": "carried_inventory_fill_cash_cost_minute_reconciliation_v1", "passed": not errors,
+    return {"contract": ("carried_inventory_fill_cash_cost_minute_reconciliation_v1" if require_margin_carry
+                         else "strict_intraday_fill_cash_cost_minute_reconciliation_v1"), "passed": not errors,
             "scope": "completed_prefix_only" if incomplete else "requested_range",
             "full_requested_range_passed": not errors and not incomplete and verify_sources,
             "sources_verified": bool(verify_sources),

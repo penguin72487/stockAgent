@@ -163,6 +163,42 @@ def test_checkpointed_mean_pooling_compiles_fullgraph_without_capture_side_effec
     assert torch.isfinite(x.grad).all()
 
 
+def test_fullgraph_eval_panel_slab_with_causal_rms_keeps_log_cash_outputs(monkeypatch) -> None:
+    # A CPU trace reproduces the native V8 graph boundary without allocating
+    # another GPU context or replacing its full formal-history acceptance.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = _make_model(
+        causal_feature_rms_normalization=True,
+        temporal_pooling="last", temporal_query_mode="last_only",
+        portfolio_output_mode="score_entmax_log_cash",
+        center_long_short_logits=False,
+        return_aux=False, return_aux_details=False,
+    ).eval()
+    model.set_causal_feature_rms_normalizer(
+        torch.logspace(-2, 2, 10), torch.tensor([True] * 9 + [False]),
+    )
+
+    class Slab(torch.nn.Module):
+        def __init__(self, selected):
+            super().__init__()
+            self.model = selected
+
+        def forward(self, feature_slab, mask):
+            return self.model.forward_from_panel_slab(feature_slab, mask)
+
+    slab = torch.randn(8, 7, 10)
+    original = slab.view(torch.int32).clone()
+    mask = torch.ones(4, 7, dtype=torch.bool)
+    mask[1, -2:] = False
+    compiled = torch.compile(Slab(model), backend="eager", fullgraph=True)
+    with torch.inference_mode():
+        eager = model.forward_from_panel_slab(slab, mask)
+        actual = compiled(slab, mask)
+        torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+    assert not actual[~mask].any()
+    assert torch.equal(slab.view(torch.int32), original)
+
+
 def test_candle_encoder_directly_replaces_feature_projection() -> None:
     device = _device()
     model = _make_model().eval()

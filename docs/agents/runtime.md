@@ -18,6 +18,18 @@ production services keep their existing owners. Run success alone does not prove
 their acceptance. Installation, commands and recovery boundaries are documented
 in [Agent workflow](../agent_workflow.md).
 
+Optional terminal tools and the enrolled-endpoint SSH multiplexing profile are
+documented in [Measured terminal tools](../agent_terminal_tools_2026-10-07.md).
+The current runtime executes through Bash; interactive frontends keep the same
+task/run receipts and formal service owners.
+
+Vast training rescue has a Penguin preservation timer and a destination
+Supervisor guardian, not another training executor. Its original runtime
+capsule stays on guarded D; short SSH bootstrap keys expire/revoke, while
+ongoing run-scoped control keys cannot execute shell commands. Old GPU loss is
+not Stop proof; lease/generation fencing and strict target CUDA are separate
+acceptance boundaries. See [Vast training rescue](../vast_training_rescue_2026-10-13.md).
+
 The isolated cross-node engineering role is documented in
 [Control workflow](../control_plane_workflow.md). Its PostgreSQL and Mamba Python role
 are independent of acquisition, CUDA and intraday services. Penguin's registered

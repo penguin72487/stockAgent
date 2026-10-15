@@ -18,6 +18,36 @@ BRIDGE = (REPO / 'scripts/tej_smart_wizard_bridge.ps1').read_text()
 CATALOG = (REPO / 'scripts/inventory_tej_smart_wizard_catalog.ps1').read_text()
 
 
+def test_bulk_selection_keeps_model_notification_one_action_and_full_order_readback():
+    bulk = BRIDGE.split('public static bool TrySelectListBulk', 1)[1].split('private static void DateScope', 1)[0]
+    for proof in ('VerifyLookupList(root,source)', 'indices[i]<=indices[i-1]', '(style&0x808)==0',
+                  'actual.ToString()!=labels[i]', 'NotifyBinding(nativeParent.ToInt64(),source,',
+                  'AssertControlScope(root,nativeParent.ToInt64()', 'IsChild(new IntPtr(parent),nativeParent)',
+                  'GetParent(new IntPtr(source))!=nativeParent',
+                  'Message(source,0x190,0,0)!=indices.Length', 'Message(source,0x187,indices[i],0)<=0',
+                  'actualTarget[i]!=labels[i]', 'VerifyResolvedButton'):
+        assert proof in bulk
+    assert bulk.count('Message(button,0xF5u,0,0)') == 1
+    assert bulk.index('NotifyBinding(nativeParent.ToInt64(),source,') < bulk.index('Message(button,0xF5u,0,0)')
+    for forbidden in ('Activate(', 'SendKeys', 'SelectListBatch(', 'catch('):
+        assert forbidden not in bulk
+
+
+def test_native_code_cache_binds_code_compiler_runtime_and_never_reuses_query_state():
+    cache = BRIDGE.split('function Initialize-TejNativeHelper', 1)[1].split('if(Test-Path -LiteralPath $Output)', 1)[0]
+    for proof in ('compiler_sha256', 'process_64bit', 'powershell', 'clr', 'references=',
+                  'bridge_sha256', 'source_sha256', 'dll_sha256', 'ReparsePoint',
+                  '2097152', '16384', 'StockAgentTEJNativeCompile', 'WaitOne(10000)',
+                  'Compile-TejNativeHelper $dll', 'Add-Type -LiteralPath $dll',
+                  'Assembly.Location', '.retained.json', '[IO.File]::Replace'):
+        assert proof in cache
+    assert cache.index('Digest-File $candidate') < cache.index('Add-Type -LiteralPath $dll')
+    for forbidden in ('NotifyBinding(', 'PreviewAction(', 'GetActiveObject(', 'Invoke-Expression',
+                      'Remove-Item', 'Stop-Process', 'credentials'):
+        assert forbidden not in cache
+
+
+
 @pytest.mark.parametrize('source', [BRIDGE, CATALOG])
 @pytest.mark.parametrize('forbidden', ['SetCursorPos', 'mouse_event', 'SendInput', 'WM_LBUTTON', 'pyautogui'])
 def test_no_mouse_injection_or_coordinate_fallback(source, forbidden):

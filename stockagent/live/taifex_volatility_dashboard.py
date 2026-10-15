@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - the fintech runtime includes Polars.
 from stockagent.data.taifex_sessions import (
     TAIPEI,
     taifex_market_phase,
+    taifex_session_kind,
     taifex_trading_date,
 )
 from stockagent.research.taifex_volatility_metadata import (
@@ -42,7 +43,7 @@ from stockagent.research.taifex_volatility_metadata import (
 )
 
 
-DASHBOARD_SCHEMA_VERSION: Final[int] = 8
+DASHBOARD_SCHEMA_VERSION: Final[int] = 9
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 15.0
 DEFAULT_MARK_LIMIT_PER_STRATEGY: Final[int] = 360
 HISTORY_RANGE_SECONDS: Final[dict[str, int | None]] = {
@@ -324,6 +325,31 @@ def _filtered_history_rows_polars(
     path: Path,
     *,
     minimum_decision_ts_ns: int,
+    maximum_decision_ts_ns: int | None = None,
+    excluded_intervals: Mapping[str, tuple[int, int]] | None = None,
+    bucket_width_ns: int | None = None,
+    capital_by_strategy: Mapping[str, float] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Apply the canonical curve projection to raw or verified column inputs."""
+    if pl is None or not path.is_file():
+        return None
+    from stockagent.live.taifex_history_column_cache import history_scan
+
+    try:
+        with history_scan(path, schema=_HISTORY_POLARS_SCHEMA) as frame:
+            return _project_history_rows_polars(
+                path, frame=frame, minimum_decision_ts_ns=minimum_decision_ts_ns,
+                maximum_decision_ts_ns=maximum_decision_ts_ns,
+                excluded_intervals=excluded_intervals, bucket_width_ns=bucket_width_ns,
+                capital_by_strategy=capital_by_strategy,
+            )
+    except (OSError, PolarsError):
+        return None
+
+
+def _project_history_rows_polars(
+    path: Path, *, frame: Any, minimum_decision_ts_ns: int,
+    maximum_decision_ts_ns: int | None = None,
     excluded_intervals: Mapping[str, tuple[int, int]] | None = None,
     bucket_width_ns: int | None = None,
     capital_by_strategy: Mapping[str, float] | None = None,
@@ -337,14 +363,7 @@ def _filtered_history_rows_polars(
     deliberately falls back to the canonical complete scan.
     """
 
-    if pl is None or not path.is_file():
-        return None
     try:
-        frame = pl.scan_ndjson(
-            path,
-            schema=_HISTORY_POLARS_SCHEMA,
-            low_memory=True,
-        )
         allowed = pl.lit(True)
         grouped_exclusions: dict[tuple[int, int], list[str]] = {}
         for strategy_id, interval in (excluded_intervals or {}).items():
@@ -366,6 +385,8 @@ def _filtered_history_rows_polars(
         selected = frame.filter(
             pl.col("decision_ts_ns").fill_null(0) >= int(minimum_decision_ts_ns)
         )
+        if maximum_decision_ts_ns is not None:
+            selected = selected.filter(pl.col("decision_ts_ns") <= int(maximum_decision_ts_ns))
         if bucket_width_ns is not None:
             capital_fallback = pl.col("strategy_id").replace_strict(
                 {
@@ -416,67 +437,13 @@ def _filtered_history_rows_polars(
                     // max(1, int(bucket_width_ns))
                 ).alias("__bucket"),
             )
-            group_columns = ["strategy_id", "__bucket"]
-            selected = selected.with_columns(
-                pl.col("__selection_return")
-                .min()
-                .over(group_columns)
-                .alias("__minimum_return"),
-                pl.col("__selection_return")
-                .max()
-                .over(group_columns)
-                .alias("__maximum_return"),
+            from stockagent.live.taifex_history_selection import (
+                select_window_rows,
             )
-            selected = selected.with_columns(
-                pl.when(pl.col("__selection_return") == pl.col("__minimum_return"))
-                .then(pl.col("decision_ts_ns"))
-                .otherwise(None)
-                .min()
-                .over(group_columns)
-                .alias("__minimum_ts"),
-                pl.when(pl.col("__selection_return") == pl.col("__maximum_return"))
-                .then(pl.col("decision_ts_ns"))
-                .otherwise(None)
-                .min()
-                .over(group_columns)
-                .alias("__maximum_ts"),
-            )
-            selected = selected.with_columns(
-                pl.when(pl.col("__selection_return").is_not_null())
-                .then(pl.col("decision_ts_ns"))
-                .otherwise(None)
-                .min()
-                .over("strategy_id")
-                .alias("__first_strategy_ts"),
-                pl.when(pl.col("__selection_return").is_not_null())
-                .then(pl.col("decision_ts_ns"))
-                .otherwise(None)
-                .max()
-                .over("strategy_id")
-                .alias("__last_strategy_ts"),
-            )
-            selected = selected.filter(
-                pl.col("valuation_available").is_null()
-                | (
-                    pl.col("valuation_carried_forward").fill_null(False)
-                    & pl.col("valuation_age_seconds").is_null()
-                )
-                | (pl.col("decision_ts_ns") == pl.col("__minimum_ts"))
-                | (pl.col("decision_ts_ns") == pl.col("__maximum_ts"))
-                | (pl.col("decision_ts_ns") == pl.col("__first_strategy_ts"))
-                | (pl.col("decision_ts_ns") == pl.col("__last_strategy_ts"))
-            ).drop(
-                (
-                    "__selection_return",
-                    "__bucket",
-                    "__minimum_return",
-                    "__maximum_return",
-                    "__minimum_ts",
-                    "__maximum_ts",
-                    "__first_strategy_ts",
-                    "__last_strategy_ts",
-                )
-            )
+
+            # Grouped keys were measured on immutable engineering fixtures;
+            # their full-workflow overhead did not justify production adoption.
+            selected = select_window_rows(selected)
     except (OSError, PolarsError):
         return None
     try:
@@ -1410,6 +1377,7 @@ def _build_history_rows(
     capital_by_strategy: Mapping[str, float],
     mark_limit_per_strategy: int,
     minimum_decision_ts_ns: int | None = None,
+    maximum_decision_ts_ns: int | None = None,
     bucket_width_ns: int | None = None,
     scan_all: bool = False,
     backfill_receipts: list[dict[str, Any]] | None = None,
@@ -1446,6 +1414,7 @@ def _build_history_rows(
             _filtered_history_rows_polars(
                 mark_path,
                 minimum_decision_ts_ns=int(minimum_decision_ts_ns),
+                maximum_decision_ts_ns=maximum_decision_ts_ns,
                 excluded_intervals=excluded_intervals,
                 bucket_width_ns=bucket_width_ns,
                 capital_by_strategy=capital_by_strategy,
@@ -1466,6 +1435,8 @@ def _build_history_rows(
         for mark in source_rows or ():
             strategy_id = str(mark.get("strategy_id") or "")
             decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
+            if maximum_decision_ts_ns is not None and decision_ts_ns > maximum_decision_ts_ns:
+                continue
             authority = authoritative_intervals.get(strategy_id)
             if (
                 authority is not None
@@ -1669,19 +1640,11 @@ def _build_history_rows(
     return history
 
 
-def build_dashboard_history_snapshot(
-    *,
-    state_dir: Path,
-    now: datetime | None = None,
-    mark_limit_per_strategy: int = DEFAULT_MARK_LIMIT_PER_STRATEGY,
-    range_key: str = "1d",
-) -> dict[str, Any]:
-    """Build the curve endpoint without scanning unrelated dashboard ledgers."""
+def _history_strategy_inputs(
+    state: Mapping[str, Any], status: Mapping[str, Any],
+) -> tuple[tuple[str, ...], dict[str, float]]:
+    """Shared projection inputs; status clocks/positions do not change curves."""
 
-    selected_state_dir = Path(state_dir)
-    status = _load_object(selected_state_dir / "status.json")
-    state = _load_object(selected_state_dir / "state.json")
-    observed_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     strategy_ids = tuple(
         str(strategy_id)
         for strategy_id in (state.get("strategy_ids") or status.get("strategies") or ())
@@ -1705,10 +1668,26 @@ def build_dashboard_history_snapshot(
             )
             or 0.0
         )
+    return strategy_ids, capital_by_strategy
+
+
+def build_dashboard_history_snapshot(
+    *,
+    state_dir: Path,
+    now: datetime | None = None,
+    mark_limit_per_strategy: int = DEFAULT_MARK_LIMIT_PER_STRATEGY,
+    range_key: str = "1d",
+) -> dict[str, Any]:
+    """Build the curve endpoint without scanning unrelated dashboard ledgers."""
+
+    selected_state_dir = Path(state_dir)
+    status = _load_object(selected_state_dir / "status.json")
+    state = _load_object(selected_state_dir / "state.json")
+    observed_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    strategy_ids, capital_by_strategy = _history_strategy_inputs(state, status)
     normalized_range = str(range_key or "1d").strip().lower()
     if normalized_range not in HISTORY_RANGE_SECONDS:
         raise ValueError(f"unsupported dashboard history range: {range_key}")
-    mark_path = selected_state_dir / "marks.jsonl"
     backfill_receipts = _history_backfill_receipts(selected_state_dir)
     history_mark_paths = _history_mark_paths(
         selected_state_dir,
@@ -1720,7 +1699,8 @@ def build_dashboard_history_snapshot(
         if timestamp is not None
     ]
     earliest_ns = min(earliest_candidates) if earliest_candidates else None
-    tail = _tail_json_objects(mark_path, maximum_rows=max(1, len(strategy_ids) * 2))
+    tail = [row for path in history_mark_paths for row in _tail_json_objects(
+        path, maximum_rows=max(1, len(strategy_ids) * 2))]
     anchor_ns = max((int(row.get("decision_ts_ns") or 0) for row in tail), default=0)
     duration_seconds = HISTORY_RANGE_SECONDS[normalized_range]
     requested_cutoff_ns = (
@@ -1742,6 +1722,7 @@ def build_dashboard_history_snapshot(
         capital_by_strategy=capital_by_strategy,
         mark_limit_per_strategy=mark_limit_per_strategy,
         minimum_decision_ts_ns=cutoff_ns,
+        maximum_decision_ts_ns=anchor_ns if anchor_ns > 0 else None,
         bucket_width_ns=bucket_width_ns,
         scan_all=True,
         backfill_receipts=backfill_receipts,
@@ -1753,6 +1734,11 @@ def build_dashboard_history_snapshot(
         "source_updated_at_utc": source_updated.isoformat(),
         "range": normalized_range,
         "range_seconds": duration_seconds,
+        # Internal projection metadata lets native range caches share identical
+        # available-source windows without pretending a partial window is full.
+        "source_window_start_ns": earliest_ns,
+        "source_window_end_ns": anchor_ns,
+        "range_window_start_ns": cutoff_ns,
         "anchor_at_utc": (
             datetime.fromtimestamp(anchor_ns / 1e9, tz=timezone.utc).isoformat()
             if anchor_ns > 0
@@ -1897,6 +1883,14 @@ def build_dashboard_snapshot(
         )
         valuation_stale = bool(
             mark.get("valuation_stale") or mark.get("valuation_carried_forward")
+            or source_age > float(max_source_age_seconds)
+        )
+        recorded_valuation_age = _optional_float(mark.get("valuation_age_seconds"))
+        valuation_age = (
+            max(0.0, recorded_valuation_age) + source_age
+            if recorded_valuation_age is not None else source_age
+            if valuation_available and not mark.get("valuation_stale")
+            and not mark.get("valuation_carried_forward") else None
         )
         strategy_rows.append(
             {
@@ -2011,9 +2005,7 @@ def build_dashboard_snapshot(
                 "valuation_carried_forward": bool(
                     mark.get("valuation_carried_forward")
                 ),
-                "valuation_age_seconds": _optional_float(
-                    mark.get("valuation_age_seconds")
-                ),
+                "valuation_age_seconds": valuation_age,
                 "valuation_source": mark.get("valuation_source"),
                 **_live_position_exposure(
                     mark.get("option_positions", ledger.get("option_positions")),
@@ -2138,6 +2130,8 @@ def build_dashboard_snapshot(
         "history_included": include_history,
         "runner_mode": "always_on_scheduled_capture",
         "current_market_phase": current_market_phase,
+        "observed_session": taifex_session_kind(observed_now.astimezone(TAIPEI)),
+        "observed_trading_date": taifex_trading_date(observed_now.astimezone(TAIPEI)).isoformat(),
         "source_fresh_expected": source_fresh_expected,
         "trading_schedule": [
             {

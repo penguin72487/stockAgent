@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import os
+import shutil
 import subprocess
 
 from scripts.check_finlab_refresh_due import refresh_due
@@ -26,6 +28,23 @@ def setup(root, *, pending=False, retry=None, remaining=0):
 def test_minute_dispatch_does_not_start_a_heavy_idle_sweep(tmp_path):
     setup(tmp_path)
     assert refresh_due(tmp_path, now=NOW) == (False, "nothing_actionable_now")
+
+
+def test_shared_intraday_cooldown_skips_pool_but_not_due_general_data(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/intraday/source_backoff.json", {
+        "retry_at_utc": (NOW+timedelta(minutes=15)).isoformat()})
+    assert refresh_due(tmp_path, now=NOW) == (False, "intraday_source_cooldown")
+    setup(tmp_path, pending=True, remaining=1000)
+    assert refresh_due(tmp_path, now=NOW) == (True, "general_work_due")
+
+
+def test_expired_or_invalid_intraday_cooldown_does_not_suppress_recovery(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": True})
+    for at in ("invalid", (NOW-timedelta(seconds=1)).isoformat()):
+        write(tmp_path / "data_finlab/intraday/source_backoff.json", {"retry_at_utc": at})
+        assert refresh_due(tmp_path, now=NOW) == (True, "residual_tick_capacity")
 
 
 def test_verified_sdk_due_update_bypasses_local_history_reserve(tmp_path):
@@ -58,6 +77,56 @@ def test_tick_only_uses_proven_residual_capacity(tmp_path):
     assert not refresh_due(tmp_path, now=NOW)[0]
 
 
+def test_minute_work_is_admitted_even_when_tick_backlog_is_zero(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": True, "scheduled_reserve_mb": 50})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {"acquisition_mode": "minute_first_tick_residual",
+        "by_kind": {"tw_tick": {"remaining_partitions": 0}, "tw_minute": {"remaining_partitions": 100}}})
+    assert refresh_due(tmp_path, now=NOW) == (True, "minute_first_residual_capacity")
+
+
+def test_minute_dispatch_uses_50mb_not_tick_scheduled_reserve(tmp_path):
+    setup(tmp_path, remaining=60)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {
+        "minute_residual_allowed": True, "supplemental_allowed": False, "scheduled_reserve_mb": 800})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {
+        "acquisition_mode": "minute_first_tick_residual", "by_kind": {"tw_minute": {"remaining_partitions": 1}}})
+    assert refresh_due(tmp_path, now=NOW) == (True, "minute_first_residual_capacity")
+    write(tmp_path / "artifacts/live/finlab/quota_latest.json", {"observed_at_utc": NOW.isoformat(), "remaining_mb": 50})
+    assert refresh_due(tmp_path, now=NOW) == (False, "minute_quota_floor_reached")
+
+
+def test_pre_reset_dispatch_drain_runs_even_on_closed_market_and_under_50mb(tmp_path):
+    before_reset = NOW.replace(hour=23)
+    setup(tmp_path, remaining=20)
+    workload = tmp_path / "artifacts/live/finlab/workload_latest.json"
+    value = json.loads(workload.read_text())
+    value["generated_at_utc"] = before_reset.isoformat()
+    value["datasets"][0]["next_source_check_at_utc"] = (before_reset+timedelta(hours=2)).isoformat()
+    write(workload, value)
+    write(tmp_path / "artifacts/live/finlab/quota_latest.json", {
+        "observed_at_utc": before_reset.isoformat(), "remaining_mb": 20})
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {
+        "minute_residual_allowed": True, "supplemental_allowed": True, "scheduled_reserve_mb": 800})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {
+        "acquisition_mode": "minute_first_tick_residual", "by_kind": {"tw_minute": {"remaining_partitions": 1}}})
+    assert refresh_due(tmp_path, now=before_reset) == (True, "minute_pre_reset_drain")
+    write(tmp_path / "artifacts/live/finlab/quota_latest.json", {
+        "observed_at_utc": before_reset.isoformat(), "remaining_mb": 0})
+    assert refresh_due(tmp_path, now=before_reset) == (False, "minute_quota_floor_reached")
+
+
+def test_known_minute_source_wait_does_not_restart_heavy_sweep_every_minute(tmp_path):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": False,
+        "minute_residual_allowed": True, "scheduled_reserve_mb": 50})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {"acquisition_mode": "minute_first_tick_residual",
+        "minute_priority": {"pending_known_window_partitions": 0, "due_publication_rechecks": 0,
+                            "next_source_check_at_utc": (NOW+timedelta(hours=2)).isoformat()}})
+    assert refresh_due(tmp_path, now=NOW) == (False, "minute_source_wait_tick_general_debt")
+    assert refresh_due(tmp_path, now=NOW+timedelta(minutes=1))[0] is False
+
+
 def test_exhausted_frontier_is_not_rescanned_every_minute(tmp_path):
     setup(tmp_path, remaining=1000)
     write(tmp_path / "data_finlab/core_acquisition_status.json", {"supplemental_allowed": True})
@@ -72,7 +141,54 @@ def test_deployed_timer_contract_has_real_runtime_entrypoint():
     timer = (root / "deploy/systemd/stockagent-finlab-local-refresh.timer.in").read_text()
     assert 'ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_due.sh"' in service
     assert "OnUnitInactiveSec=1min" in timer
+    assert "OnActiveSec=1min" in timer  # A previous boot's deactivation cannot seed retries.
     subprocess.run(["bash", "-n", str(root / "scripts/run_finlab_refresh_due.sh")], check=True)
+
+
+def test_timer_only_installer_does_not_replace_or_restart_workers(tmp_path):
+    """Exercise the real installer with privileged mutations replaced by logs."""
+    root = Path(__file__).resolve().parents[1]
+    isolated = tmp_path / "repo"
+    scripts = isolated / "scripts"
+    templates = isolated / "deploy/systemd"
+    scripts.mkdir(parents=True)
+    templates.mkdir(parents=True)
+    for name in ("install_registered_data_refresh_services.sh", "run_finlab_refresh.sh",
+                 "run_finlab_refresh_frozen.sh"):
+        shutil.copyfile(root / "scripts" / name, scripts / name)
+    timer = "stockagent-finlab-local-refresh.timer"
+    shutil.copyfile(root / "deploy/systemd" / f"{timer}.in", templates / f"{timer}.in")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    for command in ("systemctl", "systemd-analyze", "install"):
+        fake = bin_dir / command
+        fake.write_text(
+            '#!/bin/bash\n'
+            'printf "%s %s\\n" "${0##*/}" "$*" >> "$FINLAB_TEST_COMMAND_LOG"\n'
+            'if [[ "${0##*/}" == "systemctl" && "${1:-}" == "show" ]]; then echo waiting; fi\n'
+        )
+        fake.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(scripts / "install_registered_data_refresh_services.sh"), "finlab-timer-only"],
+        env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+             "FINLAB_TEST_COMMAND_LOG": str(command_log)},
+        text=True, capture_output=True,
+    )
+    # The installer intentionally retains its existing root requirement.
+    if os.geteuid() != 0:
+        assert result.returncode == 2 and not command_log.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    commands = command_log.read_text().splitlines()
+    assert [row for row in commands if row.startswith("systemctl ")] == [
+        "systemctl daemon-reload", f"systemctl enable {timer}",
+        f"systemctl restart {timer}", f"systemctl show {timer} -p SubState --value",
+    ]
+    installed = [row for row in commands if row.startswith("install ")]
+    assert len(installed) == 1 and timer in installed[0]
+    assert ".service" not in installed[0] and "quota-snapshot" not in "\n".join(commands)
+    assert "worker and other units left untouched" in result.stdout
 
 
 def test_dead_owner_and_overrun_are_not_fake_running_or_eta(tmp_path):

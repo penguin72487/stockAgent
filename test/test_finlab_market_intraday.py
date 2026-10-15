@@ -43,6 +43,47 @@ def test_cached_and_ineligible_candidates_never_call_account_quota(tmp_path):
     assert quota.call_count == 0
 
 
+def test_batch_eta_includes_quota_before_acquire_not_just_source_fetch(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    output.mkdir()
+    clock = [0.0]
+
+    def quota():
+        clock[0] += 9  # shared-account quota round trip is outside fetch()
+        return (1000, 5000)
+
+    def fetch(*args, **kwargs):
+        clock[0] += 1
+        return {"status": "verified_no_trade", "rows": 0, "parquet_size_bytes": 0}
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {"supplemental_allowed": True})
+    monkeypatch.setattr(module, "quota_room_mb", quota)
+    monkeypatch.setattr(module, "derive_partition", lambda *a, **kw: {
+        "status": "derived_no_regular_trades", "rows": 0, "parquet_size_bytes": 0})
+    module.sync_market(output, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+                       limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), fetch=fetch)
+    progress = json.loads((output / "intraday/active_run.json").read_text())
+    assert progress["completed_attempts"] == 3
+    assert progress["eta_measurement_contract_version"] == 2
+    assert progress["seconds_per_attempt_estimate"] == 10  # not fetch's one second
+    assert progress["remaining_batch_seconds_estimate"] == 0
+    assert progress["estimated_batch_finish_at_utc"] is None
+    batches = json.loads((output / "intraday/batch_metrics.json").read_text())["batches"]
+    assert len(batches) == 1
+    assert batches[0]["completed_attempts"] == 3
+    assert batches[0]["new_receipted_partitions"] == 3
+    assert batches[0]["elapsed_seconds"] == 30
+    assert batches[0]["quota_sample_successes"] == 2  # final request has no later quota sample
+    assert sum(item["cycle_seconds"] for item in batches[0]["phases"].values()) == 30
+
+
 def test_derived_error_repair_is_bounded_local_work_not_an_api_retry(tmp_path, monkeypatch):
     now = datetime.now(UTC)
     db = _open_index(tmp_path / "index.sqlite3")
@@ -50,8 +91,8 @@ def test_derived_error_repair_is_bounded_local_work_not_an_api_retry(tmp_path, m
         _record(db, "tw_minute_derived", str(2300+i), date(2026, 10, 2), "derivation_error")
     db.execute("UPDATE partitions SET checked_at_utc=?", ((now-timedelta(hours=2)).isoformat(),))
     db.commit()
-    monkeypatch.setattr("scripts.download_finlab_market_intraday._stored_receipt", lambda *args: {
-        "status": "downloaded_unverified_for_pit", "rows": 2})
+    monkeypatch.setattr("scripts.download_finlab_market_intraday._stored_receipt", lambda path, root, key, day:
+        {"status": "downloaded_unverified_for_pit", "rows": 2} if key.startswith("tw_tick:") else None)
     monkeypatch.setattr("scripts.download_finlab_market_intraday.derive_partition", lambda *args: {
         "status": "derived_unverified_for_pit", "rows": 1})
     monkeypatch.setattr("scripts.download_finlab_market_intraday.fetch_partition",
@@ -192,7 +233,7 @@ def test_tick_batch_yields_when_general_admission_changes_mid_batch(tmp_path):
         @classmethod
         def now(cls, tz=None):
             cls.calls += 1
-            return datetime(2026, 9, 25, 1, tzinfo=UTC) + timedelta(minutes=cls.calls)
+            return datetime(2026, 9, 25, 3, tzinfo=UTC) + timedelta(minutes=cls.calls)
 
     with patch("scripts.download_finlab_market_intraday.credential_available", return_value=True), patch(
         "scripts.download_finlab_market_intraday.datetime", MovingClock,
@@ -238,6 +279,254 @@ def _fixture(root: Path) -> None:
         root / "tpex_delisted_company.parquet")
     pl.DataFrame({"date": ["2026-08-19", "2026-09-24"]}).write_parquet(
         root / "twse_market_index.parquet")
+
+
+def test_direct_minutes_have_separate_cursor_and_never_request_ticks(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    calls = []
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {"supplemental_allowed": True})
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (1000, 5000))
+    monkeypatch.setattr(module, "derive_partition", lambda *a: pytest.fail("direct minutes do not download or derive Tick"))
+    def fetch(root, key, day, *, now):
+        calls.append((key, day))
+        return {"status": "downloaded_unverified_for_pit", "rows": 100, "parquet_size_bytes": 1024}
+    summary = sync_market(output, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=2, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), fetch=fetch, kind="tw_minute")
+    assert calls[0] == ("tw_minute:2330", date(2026, 9, 24))
+    assert len(calls) == 2 and all(key.startswith("tw_minute:") for key, _ in calls)
+    assert (output / "intraday/minute_cursor.json").is_file()
+    assert not (output / "intraday/market_cursor.json").exists()
+    assert summary["active_kind"] == "tw_minute"
+    assert summary["by_kind"]["tw_minute"]["direct_api_partitions"] == 2
+    assert summary["by_kind"]["tw_tick"]["receipted_partitions"] == 0
+    batches = json.loads((output / "intraday/batch_metrics.json").read_text())["batches"]
+    assert batches[-1]["kind"] == "tw_minute"
+
+
+def test_minute_direct_and_derived_are_deduplicated_and_tick_failure_is_independent(tmp_path):
+    _fixture(tmp_path)
+    db = _open_index(tmp_path / "index.sqlite3")
+    day = date(2026, 9, 24)
+    _record(db, "tw_minute", "2330", day, "downloaded_unverified_for_pit", 100, 1000)
+    _record(db, "tw_minute_derived", "2330", day, "derived_unverified_for_pit", 90, 900)
+    _record(db, "tw_tick", "2330", day, "partition_not_ready")
+    summary = _summarize(db, load_universe(tmp_path), [day], started=datetime.now(UTC),
+                         attempts=0, successes=0, state="inventory_only", active_kind="tw_minute")
+    minute = summary["by_kind"]["tw_minute"]
+    assert (minute["receipted_partitions"], minute["rows"], minute["parquet_bytes"]) == (1, 100, 1000)
+    assert minute["provider_not_ready_partitions"] == 0
+    assert summary["by_kind"]["tw_tick"]["provider_not_ready_partitions"] == 1
+    assert summary["minute_priority"]["tick_residual_allowed"]
+    _record(db, "tw_minute", "2330", day, "partition_not_ready")
+    summary = _summarize(db, load_universe(tmp_path), [day], started=datetime.now(UTC),
+                         attempts=0, successes=0, state="inventory_only")
+    assert summary["by_kind"]["tw_minute"]["rows"] == 90
+    assert summary["by_kind"]["tw_minute"]["derived_partitions"] == 1
+    db.close()
+
+
+def test_minute_reuses_stored_ticks_without_quota_or_source_calls(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    for symbol, day in (("2330", date(2026, 8, 19)), ("2330", date(2026, 9, 24)), ("2867", date(2026, 8, 19))):
+        path, _ = _partition_paths(output, f"tw_tick:{symbol}", day)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"dataset": f"tw_tick:{symbol}", "trade_date": day.isoformat(),
+                                   "status": "verified_no_trade", "rows": 0,
+                                   "source_checked_at_utc": datetime.now(UTC).isoformat()}))
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "quota_room_mb", lambda: pytest.fail("no quota request for local reuse"))
+    summary = sync_market(output, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), kind="tw_minute",
+        fetch=lambda *a, **kw: pytest.fail("no duplicate download"))
+    assert summary["attempted_this_run"] == 0
+    assert summary["by_kind"]["tw_minute"]["derived_partitions"] == 3
+
+
+def test_tick_does_not_rebuild_minutes_already_received_directly(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    day = date(2026, 9, 24)
+    path, _ = _partition_paths(tmp_path, "tw_minute:2330", day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"dataset": "tw_minute:2330", "trade_date": day.isoformat(),
+        "status": "verified_no_trade", "rows": 0}))
+    db = _open_index(tmp_path / "index.sqlite3")
+    monkeypatch.setattr(module, "derive_partition", lambda *a: pytest.fail("do not recompute existing minutes"))
+    module._record_tick_and_minute(db, tmp_path, "2330", day, {"status": "verified_no_trade"})
+    assert db.execute("SELECT COUNT(*) FROM effective_partitions WHERE kind='tw_minute'").fetchone()[0] == 1
+    db.close()
+
+
+def test_inventory_only_cannot_race_an_active_account_writer(tmp_path, monkeypatch, capsys):
+    from scripts import download_finlab_market_intraday as module
+    monkeypatch.setattr(module.sys, "argv", ["finlab-market", "--status-only", "--output-root", str(tmp_path)])
+    monkeypatch.setattr(module, "load_universe", lambda *a, **kw: pytest.fail("must not inspect the writer index"))
+    with _account_sync_lock(tmp_path):
+        assert module.main() == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "account_sync_active"
+
+
+def test_tick_admission_cannot_bypass_pending_minutes(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "quota_room_mb", lambda: pytest.fail("priority gate precedes quota call"))
+    summary = sync_market(tmp_path / "finlab", public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), kind="tw_tick",
+        enforce_minute_priority=True, fetch=lambda *a, **kw: pytest.fail("minutes must come first"))
+    assert summary["state"] == "waiting_required_minutes"
+    assert summary["attempted_this_run"] == 0
+
+
+def test_blocked_general_table_and_tick_reserve_cannot_starve_minutes_above_50mb(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {
+        "supplemental_allowed": False, "minute_residual_allowed": True, "scheduled_reserve_mb": 800})
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (700, 5000))
+    kwargs = dict(start=date(2026, 8, 19), end=date(2026, 9, 24), limit=1, reserve_mb=50,
+                  minimum_free_gb=0, now=datetime.now(UTC), kind="tw_minute",
+                  fetch=lambda *a, **kw: {"status": "verified_no_trade"})
+    assert sync_market(tmp_path / "finlab", public, **kwargs)["successes_this_run"] == 1
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (50, 5000))
+    result = sync_market(tmp_path / "below", public, **kwargs)
+    assert result["state"] == "quota_margin_reached" and result["attempted_this_run"] == 0
+    assert result["quota_policy"]["effective_reserve_mb"] == 50
+
+
+def test_minute_quota_sampling_is_bounded_and_metrics_exclude_unsampled_tail(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data.finlab_quota_policy import QuotaPolicy
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (700, 5000))
+    result = sync_market(output, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), kind="tw_minute",
+        quota_policy=QuotaPolicy(quota_sample_interval_seconds=60),
+        fetch=lambda *a, **kw: {"status": "verified_no_trade"})
+    assert result["successes_this_run"] == 3
+    progress = json.loads((output / "intraday/active_run.json").read_text())
+    assert progress["quota_checks"] == 1 and progress["quota_cache_hits"] == 2
+    batch = json.loads((output / "intraday/batch_metrics.json").read_text())["batches"][-1]
+    assert batch["quota_sample_successes"] == 0  # No later authoritative quota observation.
+    assert batch["account_delta_bytes"] == 0
+
+
+def test_minute_drain_under_50mb_still_stops_at_official_quota_error(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    class BeforeReset(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 9, 23, 15, tzinfo=UTC)
+    monkeypatch.setattr(module, "datetime", BeforeReset)
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (30, 5000))
+    with patch("scripts.download_finlab_market_intraday.fetch_partition", side_effect=RuntimeError("quota exceeded")) as fetch:
+        result = sync_market(tmp_path / "finlab", public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+            limit=3, reserve_mb=50, minimum_free_gb=0, now=BeforeReset.now(), kind="tw_minute", fetch=fetch)
+    assert result["quota_policy"]["effective_reserve_mb"] == 0
+    assert result["state"] == "quota_exhausted" and fetch.call_count == 1
+
+
+def test_long_lived_drain_owner_yields_before_opening_without_api_calls(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    class OpeningRunway(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 12, 0, 11, tzinfo=UTC)  # Monday 08:11.
+    monkeypatch.setattr(module, "datetime", OpeningRunway)
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "opening_admission", lambda *a, **kw: {"allowed": False})
+    monkeypatch.setattr(module, "quota_room_mb", lambda: pytest.fail("no network within opening runway"))
+    result = sync_market(tmp_path / "finlab", public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=3, reserve_mb=50, minimum_free_gb=0, now=OpeningRunway.now(), kind="tw_minute",
+        fetch=lambda *a, **kw: pytest.fail("no source request within opening runway"))
+    assert result["state"] == "opening_window_yield" and result["attempted_this_run"] == 0
+
+
+def test_minute_interruption_preserves_its_own_inflight_cursor(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {"supplemental_allowed": True})
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (1000, 5000))
+    calls = []
+    def fetch(root, key, day, *, now):
+        calls.append((key, day))
+        if len(calls) == 1:
+            raise SystemExit(143)
+        return {"status": "verified_no_trade"}
+    kwargs = dict(start=date(2026, 8, 19), end=date(2026, 9, 24), limit=1,
+                  reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), kind="tw_minute", fetch=fetch)
+    with pytest.raises(SystemExit):
+        sync_market(output, public, **kwargs)
+    cursor = json.loads((output / "intraday/minute_cursor.json").read_text())
+    assert cursor["recent_queue"][0]["next"] == 0
+    assert json.loads((output / "intraday/active_run.json").read_text())["state"] == "interrupted"
+    assert sync_market(output, public, **kwargs)["successes_this_run"] == 1
+    assert calls == [("tw_minute:2330", date(2026, 9, 24))]*2
+
+
+def test_older_minute_probes_are_bounded_per_cycle_without_retry_starvation(tmp_path, monkeypatch):
+    from scripts import download_finlab_market_intraday as module
+    public = tmp_path / "public"
+    public.mkdir()
+    _fixture(public)
+    output = tmp_path / "finlab"
+    floor = date(2026, 9, 24)
+    observed_days = [date(2026, 8, 19)+timedelta(days=i) for i in range(37)]
+    pl.DataFrame({"date": [day.isoformat() for day in observed_days]}).write_parquet(public / "twse_market_index.parquet")
+    db = _open_index(output / "intraday/market_index.sqlite3")
+    _record(db, "tw_minute", "2330", floor, "downloaded_unverified_for_pit", 1, 1)
+    db.close()
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {"supplemental_allowed": True})
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (1000, 5000))
+    monkeypatch.setattr(module, "_available_receipt", lambda root, kind, symbol, day:
+                        {"status": "verified_no_trade"} if day >= floor else None)
+    calls = []
+    def unavailable(root, key, day, *, now):
+        calls.append((key, day))
+        raise DataError("not_ready: partition unpublished")
+    kwargs = dict(start=observed_days[0], end=floor, limit=64, reserve_mb=50,
+                  minimum_free_gb=0, kind="tw_minute", fetch=unavailable)
+    now = datetime.now(UTC)
+    first = sync_market(output, public, now=now, **kwargs)
+    assert first["attempted_this_run"] == 16
+    assert first["state"] == "waiting_older_publication"
+    assert sync_market(output, public, now=now, **kwargs)["attempted_this_run"] == 0
+    previous = set(calls)
+    calls.clear()
+    sync_market(output, public, now=now+timedelta(days=1), **kwargs)
+    cursor = json.loads((output / "intraday/minute_cursor.json").read_text())
+    assert cursor["older_retry_attempts"] <= 4
+    assert len(calls) <= 16
+    assert set(calls) - previous  # retries cannot monopolize the discovery budget
 
 
 def test_official_current_snapshot_does_not_relabel_former_symbol_as_current(tmp_path):

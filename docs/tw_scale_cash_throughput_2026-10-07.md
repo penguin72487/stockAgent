@@ -183,3 +183,20 @@ Vast接受與來源：
 - `artifacts/code_releases/tw_scale_cash_throughput_20261007/20261007T023917044440Z-5369520914dd/release.json`及其原有build-source；不修改immutable release。
 
 沿用training-reuse與exact-optimization既有canonical executor、source／fit cache、financial accounting與resume，沒有另建trainer。這是工程效能与所選年度訓練契約驗收，不是已跑完正式1000 epoch、全庫test suite、當沖網站部署或投資結果；模型／batch數值軌跡並非逐位等價。仍保留歷史PIT未證明的research-only資料邊界，以及其他硬體／冷啟動／未測演算法可能更快的邊界。
+
+## 12. 從 fold1 執行完整年度訓練
+
+依使用者最新要求，年度入口支援 canonical fold 範圍參數。在 vastai1T 執行：
+
+```bash
+cd /root/stockAgent
+bash scripts/run_tw_no_basis_scale_separated_cash_annual_vastai1t.sh --start-fold 1
+```
+
+此命令不傳 `--max-folds`，由原凍結 `train.py` 選取 fold1–fold10；如只需要一個 fold，可另加 `--max-folds 1`。2014 仍僅作歷史上下文，fold1 訓練 2015／驗證 2016／測試 2017–2026；fold10 訓練 2015–2024／驗證 2025／測試 2026。保留原有後續全年度測試範圍，不改成只測單一年度。
+
+遠端 standalone config 已由 `runner.start_fold: 10` 改為 `1`，逐位核對確認只有這一個 selector 不同。共用入口允許將該欄位還原為原接受值後核對原 SHA，其他任何位元組變更仍拒絕；不覆蓋使用者設定、不修改原 fold10 效能接受收據。因此目前遠端不帶參數的年度命令也會從 fold1 開始。其他設定、來源、frozen code 與 optimizer 相容性仍由原 gates 驗證。
+
+既有 training-reuse 流程保留 `--resume`、`--no-retrain-completed-folds`、foreground、兩卡 DDP 與完整 validation/test/plot/checkpoint；不開 profiling、不捐贈工程 optimizer、不修改金融或 feature 契約。已完成 fold 仍經 canonical 驗收後略過；未完成 fold 從相容 checkpoint 接續。原固定 fold11 入口不受此次 fold 範圍擴充影響。
+
+驗收：61 項年度 config／selector／SHA／source lease／layout 測試及 31 項 resume／完成標記／walk-forward 測試通過；在實際 vastai1T，明確 `--check-only --start-fold 1` 與無 fold 參數的 `--check-only` 都 exit0，回報 14726 通道、同一正式 root、`--start-fold 1`，且無 `--max-folds`。本次只驗收入參與入口；原完整雙卡效能收據仍僅證明 fold10，未另跑 fold1–9 GPU 訓練或啟動正式 optimizer。

@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 
 from scripts.download_finlab_history import safe_stem
@@ -25,7 +24,7 @@ FIELDS = {
 }
 
 
-def _source_column(root: Path, key: str, symbol: str) -> tuple[pd.DataFrame, str]:
+def _source_column(root: Path, key: str, symbol: str) -> tuple[pl.DataFrame, str]:
     receipt = json.loads((root / "receipts" / f"{safe_stem(key)}.json").read_text(encoding="utf-8"))
     relative = Path(receipt["parquet_path"])
     if (receipt.get("dataset") != key
@@ -47,13 +46,13 @@ def _source_column(root: Path, key: str, symbol: str) -> tuple[pd.DataFrame, str
         raise ValueError(f"symbol {symbol} absent from {key}")
     if parquet.metadata.num_rows != receipt["rows"]:
         raise ValueError("FinLab fixed-price row count mismatch")
-    frame = parquet.read(columns=["source_index", symbol]).to_pandas()
-    if frame["source_index"].duplicated().any():
+    frame = pl.from_arrow(parquet.read(columns=["source_index", symbol], use_threads=False))
+    if frame["source_index"].is_duplicated().any():
         raise ValueError("duplicate FinLab fixed-price date")
-    return frame.rename(columns={symbol: next(name for name, value in FIELDS.items() if value == key)}), digest.hexdigest()
+    return frame.rename({symbol: next(name for name, value in FIELDS.items() if value == key)}), digest.hexdigest()
 
 
-def load_fixed_price_shares(root: Path, symbol: str) -> pd.DataFrame:
+def load_fixed_price_shares(root: Path, symbol: str) -> pl.DataFrame:
     """Return all source dates, with nullable `volume_shares` for unsafe rows."""
 
     if not symbol or any(part in symbol for part in ("/", "\\", "..")):
@@ -63,36 +62,29 @@ def load_fixed_price_shares(root: Path, symbol: str) -> pd.DataFrame:
         raise ValueError("FinLab fixed-price source dates do not align")
     out = frames[0]
     for frame in frames[1:]:
-        out = out.merge(frame, on="source_index", validate="one_to_one")
-    out.insert(1, "symbol", symbol)
-    shares: list[int | None] = []
-    multipliers: list[int | None] = []
-    proofs: list[str] = []
-    for lots_raw, price_raw, amount_raw in out[["raw_lots", "price", "amount"]].itertuples(index=False, name=None):
-        try:
-            lots, price, amount = float(lots_raw), float(price_raw), float(amount_raw)
-        except (ValueError, TypeError):
-            lots = price = amount = float("nan")
-        if not all(map(math.isfinite, (lots, price, amount))) or lots < 0 or price <= 0 or amount < 0:
-            shares.append(None); multipliers.append(None); proofs.append("missing_or_invalid")
-            continue
-        if lots == 0 and amount == 0:
-            shares.append(0); multipliers.append(None); proofs.append("zero_trade")
-            continue
-        if lots <= 0 or amount <= 0:
-            shares.append(None); multipliers.append(None); proofs.append("amount_lot_disagreement")
-            continue
-        factor = amount / (price * lots)
-        rounded = round(factor)
-        share_count = round(lots * rounded)
-        if (not 1 <= rounded <= 100_000
-                or not math.isclose(factor, rounded, rel_tol=1e-8, abs_tol=1e-8)
-                or not math.isclose(lots * rounded, share_count, rel_tol=0, abs_tol=1e-6)
-                or share_count > 2**63 - 1):
-            shares.append(None); multipliers.append(None); proofs.append("unproved_lot_size")
-            continue
-        shares.append(share_count); multipliers.append(rounded); proofs.append("price_amount_exact")
-    out["volume_shares"] = pd.Series(shares, dtype="Int64")
-    out["unit_multiplier"] = pd.Series(multipliers, dtype="Int64")
-    out["unit_proof"] = proofs
-    return out
+        out = out.hstack(frame.drop("source_index"))  # Alignment already proved above.
+    lots, price, amount = [pl.col(name).cast(pl.Float64, strict=False)
+                           for name in ("raw_lots", "price", "amount")]
+    valid = (pl.all_horizontal(lots.is_finite(), price.is_finite(), amount.is_finite())
+             & (lots >= 0) & (price > 0) & (amount >= 0)).fill_null(False)
+    factor = amount / (price * lots)
+    rounded = factor.round(0)
+    share_count = (lots * rounded).round(0)
+    proved = (rounded.is_between(1, 100_000)
+              & ((factor-rounded).abs() <= pl.max_horizontal(pl.lit(1e-8),
+                    pl.max_horizontal(factor.abs(), rounded.abs()) * 1e-8))
+              & ((lots * rounded-share_count).abs() <= 1e-6)
+              & share_count.is_finite() & (share_count < float(2**63))).fill_null(False)
+    proof = (pl.when(~valid).then(pl.lit("missing_or_invalid"))
+        .when((lots == 0) & (amount == 0)).then(pl.lit("zero_trade"))
+        .when((lots <= 0) | (amount <= 0)).then(pl.lit("amount_lot_disagreement"))
+        .when(proved).then(pl.lit("price_amount_exact"))
+        .otherwise(pl.lit("unproved_lot_size")))
+    out = out.with_columns(pl.lit(symbol).alias("symbol"), proof.alias("unit_proof"))
+    return out.with_columns(
+        pl.when(pl.col("unit_proof") == "zero_trade").then(pl.lit(0, dtype=pl.Int64))
+          .when(pl.col("unit_proof") == "price_amount_exact").then(share_count.cast(pl.Int64, strict=False))
+          .otherwise(None).alias("volume_shares"),
+        pl.when(pl.col("unit_proof") == "price_amount_exact").then(rounded.cast(pl.Int64, strict=False))
+          .otherwise(None).alias("unit_multiplier")).select(
+              "source_index", "symbol", "raw_lots", "price", "amount", "volume_shares", "unit_multiplier", "unit_proof")

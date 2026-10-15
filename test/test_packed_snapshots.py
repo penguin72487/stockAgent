@@ -89,6 +89,74 @@ def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
     ]
 
 
+def test_verification_reconstruction_preserves_all_bytes_without_ready_or_hot_exposure(tmp_path):
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    resolved = publish_packed_snapshot(sync_root, "prices", source, loose_file_threshold_bytes=1024)
+    scratch = tmp_path / "private-recovery"
+    scratch.mkdir(mode=0o700)
+    target = fetch_packed_snapshot(sync_root, scratch, resolved, verification_only=True)
+    assert target.name.startswith("." + resolved.manifest["snapshot_id"] + ".partial.")
+    assert not (scratch / "prices" / resolved.manifest["snapshot_id"]).exists()
+    assert not list(scratch.rglob("*.READY.json"))
+    assert scan_tree(target)["portable_fingerprint_sha256"] == scan_tree(source)["portable_fingerprint_sha256"]
+    assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)["materialized_verified"]
+    hot = fetch_packed_snapshot(sync_root, tmp_path / "managed", resolved)
+    assert hot.name == resolved.manifest["snapshot_id"]
+    assert list((tmp_path / "managed").rglob("*.READY.json"))
+
+
+@pytest.mark.parametrize("problem", ["non-private", "not-empty", "redirected"])
+def test_verification_reconstruction_cannot_reuse_or_redirect_a_consumer_root(tmp_path, problem):
+    parent = tmp_path / "scratch"
+    parent.mkdir(mode=0o700)
+    if problem == "non-private":
+        parent.chmod(0o755)
+    elif problem == "not-empty":
+        (parent / "important").write_text("preserve")
+    else:
+        redirected = tmp_path / "alias"
+        redirected.symlink_to(parent, target_is_directory=True)
+        parent = redirected
+    with pytest.raises(SnapshotError, match="fresh private"):
+        fetch_packed_snapshot(tmp_path / "cold", parent, None, verification_only=True)
+    assert parent.exists()
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_verification_reconstruction_flag_rejects_ambiguous_values(tmp_path, value):
+    with pytest.raises(SnapshotError, match="explicit boolean"):
+        fetch_packed_snapshot(tmp_path / "cold", tmp_path / "unused", None, verification_only=value)
+
+
+def test_blob_alias_reconstruction_reuses_verified_copy_and_preserves_each_mode(tmp_path, monkeypatch):
+    source = _source_tree(tmp_path)
+    (source / "large-a.bin").chmod(0o600)
+    (source / "large-b.bin").chmod(0o640)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    resolved = publish_packed_snapshot(sync_root, "prices", source, loose_file_threshold_bytes=1024)
+    calls = []
+    original = packed_snapshots._copy_member_and_verify
+
+    def traced(reader, path, **kwargs):
+        if path.name in {"large-a.bin", "large-b.bin"}:
+            calls.append((path.name, Path(reader.name)))
+        return original(reader, path, **kwargs)
+
+    monkeypatch.setattr(packed_snapshots, "_copy_member_and_verify", traced)
+    target = fetch_packed_snapshot(sync_root, tmp_path / "materialized", resolved)
+    assert [name for name, _ in calls] == ["large-a.bin", "large-b.bin"]
+    assert sync_root in calls[0][1].parents
+    assert calls[1][1].name == "large-a.bin" and sync_root not in calls[1][1].parents
+    assert (target / "large-a.bin").read_bytes() == (target / "large-b.bin").read_bytes()
+    assert (target / "large-a.bin").stat().st_ino != (target / "large-b.bin").stat().st_ino
+    assert stat.S_IMODE((target / "large-a.bin").stat().st_mode) == 0o600
+    assert stat.S_IMODE((target / "large-b.bin").stat().st_mode) == 0o640
+    assert scan_tree(target)["portable_fingerprint_sha256"] == scan_tree(source)["portable_fingerprint_sha256"]
+
+
 def test_batch_object_directory_barrier_precedes_manifest_and_head(tmp_path, monkeypatch):
     source = _source_tree(tmp_path)
     cold = tmp_path / "cold"

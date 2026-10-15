@@ -207,6 +207,82 @@ def test_merge_fills_only_pending_availability_without_rewriting_receipts(tmp_pa
     assert collector._valid_receipt(tmp_path, "institutional_futures", latest_day.isoformat())
 
 
+def test_verified_merge_noop_skips_data_decode_but_checks_every_source(tmp_path, monkeypatch):
+    day = date(2026, 9, 1)
+    receipt = _save_test_shard(tmp_path, day, None)
+    first = collector._merge_dataset(tmp_path, "institutional_futures", {})
+    output = tmp_path / first["output_path"]
+    modified = output.stat().st_mtime_ns
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unchanged verified projection must not decode or rewrite")
+    monkeypatch.setattr(collector.pq, "read_table", forbidden)
+    second = collector._merge_dataset(tmp_path, "institutional_futures", {})
+    assert second["merge_reused"]
+    assert output.stat().st_mtime_ns == modified
+    assert second["output_sha256"] == first["output_sha256"]
+    raw = tmp_path / receipt["raw_path"]
+    content = raw.read_bytes()
+    raw.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+    with pytest.raises(RuntimeError, match="invalid receipt"):
+        collector._merge_dataset(tmp_path, "institutional_futures", {})
+
+
+def test_columnar_merge_preserves_former_timestamp_extension_metadata(tmp_path):
+    import pyarrow as pa
+
+    receipt = _save_test_shard(tmp_path, date(2026, 9, 1), None)
+    source = pq.read_table(tmp_path / receipt["normalized_path"])
+    # Parquet's physical millisecond unit can differ from the original pandas
+    # metadata. The former merge regenerated metadata through a round trip.
+    expected = pa.Table.from_pandas(source.to_pandas(), preserve_index=False)
+    merged = collector._merge_dataset(tmp_path, "institutional_futures", {})
+    actual = pq.read_table(tmp_path / merged["output_path"])
+    assert actual.equals(expected, check_metadata=True)
+
+
+def test_optional_merge_checkpoint_failure_keeps_verified_output_usable(tmp_path, monkeypatch):
+    import downloader.verified_merge as cache
+
+    _save_test_shard(tmp_path, date(2026, 9, 1), None)
+    def unavailable(*args, **kwargs):
+        raise OSError("checkpoint disk unavailable")
+    monkeypatch.setattr(cache, "atomic_write_json", unavailable)
+    result = collector._merge_dataset(tmp_path, "institutional_futures", {})
+    assert result["status"] == "complete"
+    assert result["merge_cache_state"] == "unavailable"
+    assert collector.sha256_path(tmp_path / result["output_path"]) == result["output_sha256"]
+
+
+def test_verified_merge_calendar_change_and_corrupt_output_rebuild(tmp_path):
+    day, following = date(2026, 9, 1), date(2026, 9, 2)
+    _save_test_shard(tmp_path, day, None)
+    first = collector._merge_dataset(tmp_path, "institutional_futures", {})
+    second = collector._merge_dataset(tmp_path, "institutional_futures", {day: following})
+    assert not second["merge_reused"]
+    assert second["availability_pending_rows"] == 0
+    output = tmp_path / first["output_path"]
+    import os
+    before = output.stat()
+    body = output.read_bytes()
+    output.write_bytes(body[:-1] + bytes([body[-1] ^ 1]))
+    os.utime(output, ns=(before.st_atime_ns, before.st_mtime_ns))
+    third = collector._merge_dataset(tmp_path, "institutional_futures", {day: following})
+    assert not third["merge_reused"]
+    assert third["output_sha256"] == second["output_sha256"]
+
+
+def test_verified_merge_rejects_stale_parser_or_broken_checkpoint(tmp_path, monkeypatch):
+    day = date(2026, 9, 1)
+    _save_test_shard(tmp_path, day, None)
+    collector._merge_dataset(tmp_path, "institutional_futures", {})
+    monkeypatch.setattr(collector, "LARGE_TRADER_ALIGNMENT_VERSION", 999)
+    result = collector._merge_dataset(tmp_path, "institutional_futures", {})
+    assert not result["merge_reused"]
+    checkpoint = tmp_path / "state/merge_projections/institutional_futures.json"
+    checkpoint.write_text("null")
+    assert not collector._merge_dataset(tmp_path, "institutional_futures", {})["merge_reused"]
+
+
 def test_main_downloads_latest_session_and_reuses_completed_receipt(tmp_path, monkeypatch) -> None:
     calendar = tmp_path / "calendar.parquet"
     pd.DataFrame({"date": [pd.Timestamp("2026-09-01")]}).to_parquet(calendar)

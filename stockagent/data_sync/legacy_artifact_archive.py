@@ -1001,6 +1001,7 @@ def restore_archive(
     destination: Path,
     *,
     materialized_root: Path,
+    include_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     if destination.exists() or destination.is_symlink():
         raise SnapshotError(f"refusing to overwrite existing restore path: {destination}")
@@ -1019,13 +1020,26 @@ def restore_archive(
         raise SnapshotError("restored legacy manifest differs from cold release metadata")
     proof = verify_archive_directory(archive, spec=spec)
     manifest = proof["manifest"]
+    selected = manifest["files"]
+    if include_paths is not None:
+        requested = {_safe_relative_path(p, "requested restore member").as_posix()
+                     for p in include_paths}
+        if not requested:
+            raise SnapshotError("selective restore requires at least one exact member")
+        selected = [row for row in selected if row["path"] in requested]
+        if {row["path"] for row in selected} != requested:
+            raise SnapshotError("selected restore members are absent from the fixed archive")
     temporary = destination.with_name(destination.name + f".partial-{os.getpid()}")
     if temporary.exists() or temporary.is_symlink():
         raise SnapshotError(f"stale restore staging path needs audit: {temporary}")
     temporary.mkdir(parents=True, exist_ok=False)
-    for row in manifest.get("directories", []):
+    directories = [row for row in manifest.get("directories", [])
+                   if include_paths is None or any(
+                       PurePosixPath(row["path"]) in PurePosixPath(item["path"]).parents
+                       for item in selected)]
+    for row in directories:
         temporary.joinpath(*PurePosixPath(row["path"]).parts).mkdir(parents=True, exist_ok=True)
-    for row in manifest["files"]:
+    for row in selected:
         relative = PurePosixPath(row["path"])
         target = temporary.joinpath(*relative.parts)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1039,15 +1053,19 @@ def restore_archive(
             raise SnapshotError(f"restored legacy file differs: {relative}")
         target.chmod(row["source"]["mode"])
         os.utime(target, ns=(target.stat().st_atime_ns, row["source"]["mtime_ns"]))
-    for row in sorted(manifest.get("directories", []), key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
+    for row in sorted(directories, key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
         target = temporary.joinpath(*PurePosixPath(row["path"]).parts)
         target.chmod(row["mode"])
         os.utime(target, ns=(target.stat().st_atime_ns, row["mtime_ns"]))
     atomic_write_json(
         temporary / ".LEGACY_RESTORED.json",
-        {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256, "deployable": False},
+        {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256, "deployable": False,
+         "restored_members": [row["path"] for row in selected],
+         "restore_scope": "selected_exact_members" if include_paths is not None else "complete_archive"},
     )
     if destination.exists() or destination.is_symlink():
         raise SnapshotError(f"restore destination appeared during verification: {destination}")
     os.replace(temporary, destination)
-    return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "destination": str(destination), "files": proof["files"], "original_bytes": proof["original_bytes"]}
+    return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "destination": str(destination),
+            "files": len(selected), "original_bytes": sum(row["source"]["size"] for row in selected),
+            "archive_files_verified": proof["files"], "restore_scope": "selected_exact_members" if include_paths is not None else "complete_archive"}

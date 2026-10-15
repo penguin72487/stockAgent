@@ -1553,7 +1553,7 @@ def test_day_trade_settlement_backfill_skips_current_history(monkeypatch) -> Non
         )
     )
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: "2026-07-21",
     )
 
@@ -1585,7 +1585,7 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(
     )
     dates = iter(["2026-07-17", "2026-07-22"])
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: next(dates),
     )
     calls = []
@@ -1631,7 +1631,7 @@ def test_formal_history_backfill_discovers_fold_from_checkpoint(
     dates = iter(["2026-07-24", "2026-07-27"])
     calls = []
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: next(dates),
     )
     monkeypatch.setattr(
@@ -1735,14 +1735,14 @@ def test_naive_artifact_current_requires_contiguous_formal_history_and_close_sig
         lambda cfg, target: True,
     )
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: "2026-07-23",
     )
 
     assert not _artifact_backfill_is_current(cfg, status, "naive")
 
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda cfg: "2026-07-24",
     )
     assert _artifact_backfill_is_current(cfg, status, "naive")
@@ -1759,7 +1759,7 @@ def test_day_trade_artifact_current_requires_latest_close_signal(monkeypatch) ->
         )
     )
     monkeypatch.setattr(
-        "services.discord_bot.bot._formal_history_latest_date",
+        "services.discord_bot.bot._formal_history_completed_date",
         lambda _cfg: "2026-09-07",
     )
     monkeypatch.setattr(
@@ -1801,6 +1801,8 @@ def test_completed_session_cache_runs_before_formal_history(monkeypatch) -> None
     monkeypatch.setattr(discord_bot, "_effective_market_config", lambda value: value)
     monkeypatch.setattr(discord_bot, "_ensure_signal_ready", lambda _cfg: status)
     monkeypatch.setattr(discord_bot, "_completed_session_receipt_ready", lambda _status: True)
+    monkeypatch.setattr(discord_bot, "_latest_market_signal", lambda _: None)
+    monkeypatch.setattr(discord_bot, "_offhours_gpu_cache_release_allowed", lambda: False)
     monkeypatch.setattr(
         discord_bot,
         "_market_has_panel_close_signal_for_date",
@@ -1811,7 +1813,8 @@ def test_completed_session_cache_runs_before_formal_history(monkeypatch) -> None
     monkeypatch.setattr(
         discord_bot,
         "generate_live_signal",
-        lambda **kwargs: calls.append(("signal", kwargs["price_source"])) or result,
+        lambda **kwargs: calls.append(("signal", kwargs["price_source"],
+            kwargs["ensure_previous_signal"], kwargs["previous_signal_backfill_limit"])) or result,
     )
     monkeypatch.setattr(
         discord_bot,
@@ -1825,7 +1828,7 @@ def test_completed_session_cache_runs_before_formal_history(monkeypatch) -> None
     )
 
     assert discord_bot._run_completed_session_signal_cache_sync(cfg) is result
-    assert calls == [("signal", "panel"), "presentation", "sync"]
+    assert calls == [("signal", "panel", False, 0), "presentation", "sync"]
 
 
 def test_latest_signal_artifact_result_prepares_summary_only_once(

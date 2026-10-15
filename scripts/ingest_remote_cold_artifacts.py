@@ -415,6 +415,7 @@ result = {'state': 'retirement_blocked' if plan['blockers'] else 'would_retire_v
           'deleted': False, 'relative_root': plan['relative_root'],
           'plan_fingerprint': plan['plan_fingerprint'], 'blockers': plan['blockers'],
           'service_dependency_error': plan['service_dependency_error'],
+          'hot_retention': plan['hot_retention'],
           'reclaimable_allocated_bytes': plan['allocated_bytes']}
 if request['apply'] and not plan['blockers']:
     result = apply_retirement(artifact, state, Path(request['repo_root']), request['ack'],
@@ -460,6 +461,43 @@ def waiting_return(state_root: Path, policy: dict) -> dict | None:
     return value
 
 
+def retry_training_layout(args) -> dict:
+    """Retry one private enrolled layout using this existing owner, never Syncthing commands."""
+    plan_path = os.environ.get("COLD_ARTIFACT_INGRESS_LAYOUT_PLAN", "").strip()
+    if not plan_path:
+        return {"state": "not-enrolled"}
+    plan_path = _validate_remote_absolute(plan_path, "remote fixed layout plan")
+    if not plan_path.startswith("/var/lib/stockagent-training-layout/"):
+        raise SnapshotError("layout plan must be privately enrolled on the origin")
+    repo = _validate_remote_absolute(args.remote_repo_root, "remote repo root")
+    target = _validate_ssh_target(args.ssh_target)
+    command = (f"cd {shlex.quote(repo)} && source scripts/runtime_env.sh && run_fintech_python "
+               f"scripts/reorganize_training_storage.py --plan {shlex.quote(plan_path)} "
+               "--state /var/lib/stockagent-training-layout/state --maximum-moves 32")
+    try:
+        completed = subprocess.run([*_ssh_base(args.identity_file, args.ssh_port), target, command],
+                                   capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as error:
+        result = {"state": "retry-failed", "error_type": type(error).__name__,
+                  "observed_at_epoch": time.time()}
+        atomic_write_json(args.state_root / "remote-training-layout-status.json", result)
+        return result
+    for line in reversed(completed.stdout.splitlines()):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if completed.returncode == 0 and isinstance(result, dict) and "plan_identity" in result:
+            atomic_write_json(args.state_root / "remote-training-layout-status.json", result)
+            return result
+    # Layout retries must not stop an independent backup wave. Keep an
+    # explicit failure for the next timer; never report it as a successful move.
+    result = {"state": "retry-failed", "remote_exit_code": completed.returncode,
+              "observed_at_epoch": time.time()}
+    atomic_write_json(args.state_root / "remote-training-layout-status.json", result)
+    return result
+
+
 def returned_source(args, candidate, resolved, policy, *, retire_source: bool = True) -> dict:
     if policy is None:
         return {}
@@ -482,6 +520,20 @@ def returned_source(args, candidate, resolved, policy, *, retire_source: bool = 
     if not convergence["ok"]:
         return {"deleted": False, "state": "waiting-packed-peer-convergence",
                 "transport_checks": convergence["checks"]}
+    # A recent source is a cheap negative gate. It is already preserved and
+    # delivered, but needs no repeated full D decode or remote hashing during
+    # its seven-day hot wait. Expiry only re-enables the ordinary full proof;
+    # the remote canonical completion timestamp is checked again before unlink.
+    minimum_hours = load_policy(policy)["minimum_hot_retention_hours"]
+    retain_until = candidate.newest_mtime_ns / 1_000_000_000 + minimum_hours * 3600
+    if retire_source and time.time() < retain_until:
+        if args.apply:
+            if waiting_return(args.state_root, policy) != wave:
+                raise SnapshotError("training return waiting wave changed during retention deferral")
+            waiting_path.unlink()
+        return {"deleted": False, "state": "waiting-training-hot-retention",
+                "retain_until_epoch": retain_until, "minimum_hot_retention_hours": minimum_hours,
+                "cold_recovery_reused_or_claimed": False}
     ack = make_ack(args.sync_root, resolved, relative_root=candidate.relative_root,
                    origin=args.origin_node_id)
     # Exact cold reconstruction may be slow. An earlier transport observation
@@ -598,6 +650,8 @@ def _run_cycle(args, cycle_started: float) -> int:
         policy = load_policy(args.policy) if args.policy else None
         if policy and args.origin_node_id != policy["origin_node_id"]:
             raise SnapshotError("remote origin differs from completed return policy")
+        if args.apply:
+            retry_training_layout(args)
         include_roots = list(args.include_root)
         if not include_roots:
             include_roots = [

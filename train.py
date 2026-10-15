@@ -863,7 +863,8 @@ def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
                 raise ValueError("factorized lag-one research features require tw_day_trade")
             from stockagent.data.factorized_panel import attach_factorized_features
             panel = attach_factorized_features(panel, manifest,
-                transfer_mode=config.data.factorized_transfer_mode)
+                transfer_mode=config.data.factorized_transfer_mode,
+                host_cache_bytes=getattr(config.data, "factorized_host_cache_bytes", None))
         return panel
     if active_strategy != "distributed_data_parallel" or _distributed_world_size() <= 1:
         return attach_features(build_panel(config.data.parquet_root, **kwargs))

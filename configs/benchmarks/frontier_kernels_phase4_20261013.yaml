@@ -1,0 +1,21 @@
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: immutable_ddp_buffers
+    overrides:
+      training: {ddp_broadcast_buffers: false}
+  - name: trajectory_gradient_sync
+    overrides:
+      training: {ddp_trajectory_gradient_sync: trajectory}
+  - name: numa_and_deferred_ddp
+    overrides:
+      training: {ddp_broadcast_buffers: false, ddp_trajectory_gradient_sync: trajectory}
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+  - name: fifo_fusion_16
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_MAX_FUSION_SIZE: 16
+  - name: fifo_fusion_32
+    overrides: {}
+    runtime_overrides:
+      STOCKAGENT_DAY_TRADE_MAX_FUSION_SIZE: 32

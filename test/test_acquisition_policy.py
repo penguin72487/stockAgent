@@ -7,6 +7,23 @@ from downloader.acquisition_policy import evaluate_snapshot, source_admission_cl
 NOW = datetime(2026, 9, 27, tzinfo=UTC)
 
 
+@pytest.mark.parametrize('scope_matches,seconds,allowed', [(True, 0, True), (True, 1, False), (False, 0, False)])
+def test_eta_admission_reuses_only_exact_clock_and_owner_scope(tmp_path, monkeypatch, scope_matches, seconds, allowed):
+    from downloader import acquisition_policy as policy
+    monkeypatch.setattr(policy, 'finmind_secondary_mode', lambda _: 'provider_spare_quota')
+    def unexpected_inventory(*args):
+        pytest.fail('ETA must not recalculate an already observed workload')
+    monkeypatch.setattr(policy, '_finmind_spare_work', unexpected_inventory)
+    workload = {'state': 'observed', 'observed_at_utc': (NOW + timedelta(seconds=seconds)).isoformat(),
+                'summary': {'required_requests': 0, 'unknown_datasets': 0, 'blocked_tasks': 2}}
+    result = policy.evaluate_finmind_secondary_admission(
+        root=tmp_path, now=NOW,
+        _workload_snapshot=(tmp_path if scope_matches else tmp_path / 'other', workload))
+    assert result['allowed'] is allowed
+    if allowed:
+        assert result['blocked_tasks'] == 2  # Terminal source failures never become completed.
+
+
 def row(name="official:price", **kw):
     return {"id": name, "scope": "logical_source", "in_active_scope": True,
             "automation_eligible": True, "acquisition_progress": {

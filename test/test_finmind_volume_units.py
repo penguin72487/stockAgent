@@ -15,6 +15,16 @@ def test_finmind_daily_price_volume_is_already_shares() -> None:
     assert output[0]["Trading_Volume"] == 14557662
 
 
+@pytest.mark.parametrize("dataset", ["TaiwanStockKBar", "TaiwanStockPriceTick"])
+def test_intraday_provider_receipt_records_mixed_documented_units_without_backcast(dataset):
+    rows = [{"stock_id": "2330", "date": "2019-01-02", "volume": 3}]
+    output, units = annotate_stock_share_units(dataset, rows)
+    assert output is rows and output[0]["volume"] == 3
+    assert units["documented_share_multipliers_by_market"] == {"twse": 1000, "tpex": 1000, "emerging": 1}
+    assert units["requires_same_symbol_dated_market_evidence"]
+    assert "volume_shares" not in output[0]
+
+
 def test_finmind_collateral_thousand_shares_gets_explicit_share_fields(tmp_path) -> None:
     source = [{"date": "2026-04-01", "stock_id": "2330", "market": "集中市場",
                "MarginBuy": 1268, "MarginCurrentDayBalance": 26353,

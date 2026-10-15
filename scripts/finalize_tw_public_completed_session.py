@@ -310,14 +310,32 @@ def main() -> int:
     lock_path = live_root.parent / ".locks" / "tw-public-refresh.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_started = time.perf_counter()
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
-        before = _derived_state(
+    source_lease_mode = "shared"
+    derived_validation_count = 0
+
+    def derived_state() -> dict[str, Any]:
+        nonlocal derived_validation_count
+        derived_validation_count += 1
+        return _derived_state(
             live_root,
             expected_date=expected_date,
             session_date=started.date().isoformat(),
         )
+
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        # An already-current close is a read, not a source publication. Keep
+        # the same writer fence while allowing live/cache consumers to share it.
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+        lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
+        before = derived_state()
+        if args.force or not before["current"]:
+            # POSIX lock conversion can yield to a writer. Never use the old
+            # read state to authorize a build after acquiring the write lease.
+            upgrade_started = time.perf_counter()
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            lock_wait_ms += (time.perf_counter() - upgrade_started) * 1000.0
+            source_lease_mode = "exclusive"
+            before = derived_state()
         if args.force or not before["current"]:
             for name, status_label, command in zip(
                 (
@@ -342,11 +360,7 @@ def main() -> int:
                 ),
                 strict=True,
             ):
-                current = _derived_state(
-                    live_root,
-                    expected_date=expected_date,
-                    session_date=started.date().isoformat(),
-                )
+                current = derived_state()
                 current_errors = current.get("derived_errors") or {}
                 if not args.force and not current_errors.get(status_label):
                     continue
@@ -357,11 +371,7 @@ def main() -> int:
                     attempt_started = time.perf_counter()
                     completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
                     attempt_elapsed = time.perf_counter() - attempt_started
-                    refreshed = _derived_state(
-                        live_root,
-                        expected_date=expected_date,
-                        session_date=started.date().isoformat(),
-                    )
+                    refreshed = derived_state()
                     remaining = list(
                         (refreshed.get("derived_errors") or {}).get(
                             status_label,
@@ -403,11 +413,10 @@ def main() -> int:
                     or attempts[-1]["remaining_errors"]
                 ):
                     break
-        after = _derived_state(
-            live_root,
-            expected_date=expected_date,
-            session_date=started.date().isoformat(),
-        )
+        # No writer can change a validated generation under either lease. If
+        # we did not build anything, repeating all hashes/date scans adds no
+        # new evidence. Stale/failed paths still require their final validation.
+        after = before if before["current"] and not steps else derived_state()
 
     status = "ok" if after["current"] and all(
         int(row["return_code"]) == 0 for row in steps
@@ -427,6 +436,9 @@ def main() -> int:
         ),
         "live_root": str(live_root),
         "lock_wait_ms": round(lock_wait_ms, 3),
+        "derived_validation_contract": "completed_session_read_then_write_v2",
+        "derived_validation_count": derived_validation_count,
+        "source_lease_mode": source_lease_mode,
         "before": before,
         "after": after,
         "steps": steps,

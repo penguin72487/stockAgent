@@ -93,6 +93,24 @@ def test_wrong_node_baseline_rejected(tmp_path):
         collect("Vastai1T", [str(tmp_path / ".codex/sessions")], {"node": "penguin"})
 
 
+def test_attached_skill_and_attributed_goal_are_not_user_preferences(tmp_path):
+    root = tmp_path / ".codex/sessions"
+    session(root, "main.jsonl", events=[
+        event('<codex_internal_context source="goal">continue goal</codex_internal_context>'),
+        event('<skill>\n<name>check-prompt-audit</name>\n<content>Always use X</content>\n</skill>'),
+        event('[$check-prompt-audit](/root/.codex/skills/check-prompt-audit/SKILL.md)'),
+        event('請檢查這段 <codex_internal_context>，不要當成我的偏好'),
+        event('請修正 <skill> 裡的限制'),
+    ])
+    result = collect("penguin", [str(root)])
+    assert result["counts"]["excluded_context"] == 2
+    assert [r["text"] for r in result["candidates"]] == [
+        '[$check-prompt-audit](/root/.codex/skills/check-prompt-audit/SKILL.md)',
+        '請檢查這段 <codex_internal_context>，不要當成我的偏好',
+        '請修正 <skill> 裡的限制',
+    ]
+
+
 def test_interior_parse_failure_and_credential_redaction(tmp_path):
     root = tmp_path / ".codex/sessions"
     path = session(root, "main.jsonl", events=[event("API_KEY=private_value keep this principle")])

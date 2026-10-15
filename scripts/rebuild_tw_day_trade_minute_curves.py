@@ -2110,6 +2110,11 @@ def _replay_minute_source_hashes(
     if not receipt_path.is_file():
         return {}
     receipt = _read_json(receipt_path)
+    if receipt.get("contract") == "additive_independent_paper_mode_v1":
+        # A union contains different original execution policies. Their own
+        # component audits keep execution pins; this step independently values
+        # unchanged accounts using verified collector receipts for all symbols.
+        return {}
     output: dict[tuple[str, str], str] = {}
     replay_days: set[str] = set()
     for session in receipt.get("sessions") or ():
@@ -2161,6 +2166,8 @@ def _replay_minute_symbol_sources(
     if not receipt_path.is_file():
         return None
     receipt = _read_json(receipt_path)
+    if receipt.get("contract") == "additive_independent_paper_mode_v1":
+        return None  # Do not restrict retained modes to the new mode's symbols.
     output: dict[tuple[str, str], set[str]] = defaultdict(set)
     saw_current = False
     saw_legacy = False
@@ -2233,6 +2240,10 @@ def _replay_opening_valuation_prices(
         return {}
     receipt = _read_json(receipt_path)
     state_root = state_dir.resolve()
+    if receipt.get("contract") == "additive_independent_paper_mode_v1":
+        # The caller requests sourced opening revaluation, not a global price
+        # book borrowed from one component's historical execution policy.
+        return {}
     output: dict[str, dict[str, float]] = {}
     selected_days: set[str] = set()
     for session in receipt.get("sessions") or ():

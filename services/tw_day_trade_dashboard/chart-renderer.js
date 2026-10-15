@@ -22,12 +22,13 @@
     return `${String(local.getUTCMonth() + 1).padStart(2, "0")}/${String(local.getUTCDate()).padStart(2, "0")}`;
   }
 
-  function tickPlan(minutes) {
+  function tickPlan(minutes, maximumTicks = 10) {
     if (!minutes.length) return {positions: [], labels: new Map()};
+    const limit = Math.max(2, Math.floor(Number(maximumTicks) || 10));
     const oneSession = taipeiDayNumber(minutes[0]) === taipeiDayNumber(minutes.at(-1));
     let positions;
     if (oneSession) {
-      const tickCount = Math.min(7, minutes.length);
+      const tickCount = Math.min(7, limit, minutes.length);
       positions = [...new Set(Array.from({length: tickCount}, (_value, index) => (
         Math.round(index * (minutes.length - 1) / Math.max(1, tickCount - 1))
       )))];
@@ -39,10 +40,10 @@
         if (day !== previousDay) sessionStarts.push(index);
         previousDay = day;
       });
-      const step = Math.max(1, Math.ceil(sessionStarts.length / 10));
-      positions = sessionStarts.filter((_value, index) => (
-        index % step === 0 || index === sessionStarts.length - 1
-      ));
+      const tickCount = Math.min(limit, sessionStarts.length);
+      positions = [...new Set(Array.from({length: tickCount}, (_value, index) => (
+        sessionStarts[Math.round(index * (sessionStarts.length - 1) / Math.max(1, tickCount - 1))]
+      )))];
     }
     return {
       positions,
@@ -279,12 +280,12 @@
     }
     const staleObservationCount = stalePoints.reduce((total, points) => total + points.length, 0);
 
-    const ticks = tickPlan(selectedMinutes);
+    let ticks;
     const size = dimensions(host);
     const options = {
       width: size.width,
       height: size.height,
-      padding: [12, 10, 0, 0],
+      padding: [12, 24, 0, 0],
       cursor: {drag: {x: true, y: false}, focus: {prox: 24}},
       legend: {show: false},
       scales: {
@@ -298,7 +299,13 @@
           ticks: {show: true, stroke: "#2c4054", width: 1, size: 5},
           font: "10px Inter, Noto Sans TC, sans-serif",
           size: 42,
-          splits: () => ticks.positions,
+          splits: (_chart) => {
+            // Retain every minute; adapt only axis labels to CSS width on each
+            // layout/resize so narrow phones do not overprint the date labels.
+            const budget = Math.min(10, Math.max(2, Math.floor((_chart.width - 90) / 60)));
+            ticks = tickPlan(selectedMinutes, budget);
+            return ticks.positions;
+          },
           values: (_chart, splits) => splits.map((value) => ticks.labels.get(value) || ""),
         },
         {

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import run_discord_artifact_maintenance as runner
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 
 
 @pytest.fixture
@@ -20,7 +21,7 @@ def isolated_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(bot, "_opening_critical_work_pending", lambda: False)
     monkeypatch.setattr(bot, "_interactive_signal_work_pending", lambda: False)
     monkeypatch.setattr(runner, "_wait_for_tw_public_refresh", lambda: True)
-    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", lambda _: (0, 0))
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", lambda _, **_kw: (0, 0))
     monkeypatch.setattr(bot, "_artifact_maintenance_markets", lambda: ["market"])
     monkeypatch.setattr(
         bot,
@@ -54,6 +55,39 @@ def _pending_job(state: str) -> dict:
         "error_type": "FileNotFoundError" if state == "failed" else None,
         "error_message": "retained source is missing" if state == "failed" else None,
     }
+
+
+@pytest.mark.parametrize("cache_only", [True, False])
+def test_source_writer_race_waits_without_failure_or_false_completion(
+    isolated_worker, monkeypatch, tmp_path, cache_only,
+):
+    status_path, emissions = isolated_worker
+    def updating(_markets, **_kwargs):
+        raise TWPublicSourceUpdatePending(tmp_path, tmp_path / "tw-public-refresh.lock")
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", updating)
+    assert runner.run_once(signal_cache_only=cache_only) == 0
+    status = json.loads(status_path.read_text())
+    assert status["maintenance_run"]["status"] == "waiting_source"
+    assert status["maintenance_run"]["reason"] == "tw_public_refresh_in_progress"
+    assert emissions[-1]["status"] == "waiting_source"
+    assert emissions[-1]["producer_lock_held"] and emissions[-1]["retryable"]
+    assert not any(row.get("status") in {"signal_cache_complete", "complete", "degraded"} for row in emissions)
+
+
+@pytest.mark.parametrize("cache_only", [False, True])
+def test_only_the_full_isolated_worker_can_request_cold_source_warming(isolated_worker, monkeypatch, cache_only):
+    status_path, _emissions = isolated_worker
+    # Full maintenance has a subsequent historical-backfill phase. Keep it
+    # under its real future retry deadline while measuring warming ownership.
+    status_path.write_text(json.dumps({"schema_version": 2,
+                                      "jobs": {"market": _pending_job("failed")}}))
+    observed = []
+    def caches(_markets, *, allow_source_warming):
+        observed.append(allow_source_warming)
+        return 0, 0
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", caches)
+    assert runner.run_once(signal_cache_only=cache_only) == 0
+    assert observed == [not cache_only]
 
 
 @pytest.mark.parametrize("state", ["failed", "ready", "running"])
@@ -93,6 +127,29 @@ def test_proven_recovery_can_complete_without_retry(isolated_worker, monkeypatch
     assert status["jobs"]["market"]["status"] == "ready"
     assert status["maintenance_run"]["status"] == "complete"
     assert status["maintenance_run"]["deferred"] == 0
+    assert emissions[-1]["retry_deferred"] == 0
+
+
+def test_obsolete_ready_hint_is_repaired_by_the_same_serial_owner(isolated_worker, monkeypatch):
+    status_path, emissions = isolated_worker
+    status_path.write_text(json.dumps({"jobs": {"market": _pending_job("ready")}}))
+    calls = []
+
+    def invalidate(_cfg, *, key, market):
+        assert runner.discord_bot._invalidate_ready_artifact_backfill(key, market)
+        return False
+
+    monkeypatch.setattr(runner.discord_bot, "_reconcile_artifact_backfill_if_current", invalidate)
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", lambda cfg: calls.append(cfg.market))
+    assert runner.run_once() == 0
+    assert calls == ["market"]
+    status = json.loads(status_path.read_text())
+    assert status["jobs"]["market"]["status"] == "ready"
+    assert status["jobs"]["market"]["attempt"] == 5
+    assert status["jobs"]["market"]["prior_ready_receipt"]["status"] == "ready"
+    assert status["jobs"]["market"]["prior_ready_receipt"]["attempt"] == 4
+    assert status["jobs"]["market"]["ready_invalidated_by_run_id"] == runner.discord_bot._BOT_RUN_ID
+    assert status["maintenance_run"]["attempted"] == 1
     assert emissions[-1]["retry_deferred"] == 0
 
 

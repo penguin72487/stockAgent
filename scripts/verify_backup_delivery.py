@@ -47,9 +47,12 @@ def regular(root: Path, relative: str) -> Path:
 
 
 def verify(root: Path, expected_identity: str, *, require_ready: bool = True,
-           include_file_signatures: bool = False, workers: int = 1) -> dict:
+           include_file_signatures: bool = False, workers: int = 1,
+           native_windows_io: bool = False) -> dict:
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("delivery verification needs 1 to 32 bounded workers")
+    if type(native_windows_io) is not bool:
+        raise ValueError("native delivery I/O must be an explicit boolean")
     if not HASH.fullmatch(expected_identity):
         raise ValueError("a source-pinned full envelope identity is required")
     root = root.absolute()
@@ -71,13 +74,21 @@ def verify(root: Path, expected_identity: str, *, require_ready: bool = True,
     def verify_member(row):
         path = regular(root, row["relative"])
         before = path.stat()
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(4 * 1024**2), b""):
-                digest.update(chunk)
+        if native_windows_io and row['bytes'] >= 8 * 1024**2:
+            # Optional Penguin adapter; the portable lab203/Windows verifier
+            # keeps its dependency-free default. The enrolled adapter checks
+            # the actual D volume and stable inode while hashing every byte.
+            from stockagent.data_sync.windows_cold_io import hash_file
+            digest_hex = hash_file(path)
+        else:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(4 * 1024**2), b""):
+                    digest.update(chunk)
+            digest_hex = digest.hexdigest()
         after = path.stat()
         signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-        if signature(before) != signature(after) or before.st_size != row["bytes"] or digest.hexdigest() != row["sha256"]:
+        if signature(before) != signature(after) or before.st_size != row["bytes"] or digest_hex != row["sha256"]:
             raise ValueError("backup delivery member changed or its content differs")
         return row["relative"], row["bytes"], list(signature(after))
 

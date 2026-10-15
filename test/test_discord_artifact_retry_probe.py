@@ -52,6 +52,100 @@ def _write(path, *jobs):
     path.write_text(json.dumps({"schema_version": 2, "jobs": dict(jobs)}))
 
 
+def _write_source_warming(scope):
+    from stockagent.data.annual_cache_admission import CONTRACT
+
+    root, _path, configs = scope
+    cfg = configs / "market.yaml"
+    cfg.write_text(cfg.read_text() + "completed_session_command:\n"
+        "- scripts/update_tw_day_trade_factorized_live.py\n- --phase\n- completed\n")
+    receipt = runner._factorized_source_updater_receipt()
+    assert receipt.is_relative_to(root)
+    receipt.parent.mkdir(parents=True)
+    state = {"status": "cache_warming_required", "phase": "completed",
+             "error_type": "AnnualCacheBuildDeferred", "last_good_generation_retained": True,
+             "admission": {"contract": CONTRACT, "source": str(root / "2025.parquet"),
+                           "immutable_seed": True, "required_headroom_bytes": 26 << 30,
+                           "observed_headroom_bytes": 23 << 30,
+                           "reason": "insufficient_memory_headroom"}}
+    receipt.write_text(json.dumps(state))
+    return receipt, state
+
+
+def test_warming_without_history_jobs_wakes_only_the_same_canonical_owner(receipt_scope):
+    _root, jobs, _configs = receipt_scope
+    receipt, _state = _write_source_warming(receipt_scope)
+    original = receipt.read_bytes()
+    result = runner.retry_probe(observed=NOW)
+    assert result["due_keys"] == ["source_cache_warming:retry_test_market"]
+    assert result["due"] and result["advisory_only"] and result["job_count"] == 0
+    assert receipt.read_bytes() == original and not jobs.exists()
+
+
+@pytest.mark.parametrize("disabled_by", ["selection", "yaml", "state", "different_updater"])
+def test_source_warming_cannot_wake_an_unselected_or_different_source(receipt_scope, monkeypatch, disabled_by):
+    root, _jobs, configs = receipt_scope
+    _write_source_warming(receipt_scope)
+    cfg = configs / "market.yaml"
+    if disabled_by == "selection":
+        monkeypatch.setenv("STOCKAGENT_SCHEDULED_MARKETS", "other")
+    elif disabled_by == "yaml":
+        cfg.write_text(cfg.read_text().replace("enabled: true", "enabled: false"))
+    elif disabled_by == "state":
+        (root / "artifacts/discord_bot/state.json").write_text(
+            '{"markets":{"retry_test_market":{"enabled":false}}}')
+    else:
+        cfg.write_text(cfg.read_text().replace("update_tw_day_trade_factorized_live.py", "other_source.py"))
+    assert not runner.retry_probe(observed=NOW)["due"]
+
+
+def test_resource_snapshot_changes_coalesce_but_source_request_changes_do_not(receipt_scope):
+    receipt, state = _write_source_warming(receipt_scope)
+    original = runner.retry_probe(observed=NOW)["wakeup_fingerprint"]
+    state["admission"]["observed_headroom_bytes"] = 22 << 30
+    receipt.write_text(json.dumps(state))
+    assert runner.retry_probe(observed=NOW)["wakeup_fingerprint"] == original
+    state["admission"]["source"] = "a different immutable source"
+    receipt.write_text(json.dumps(state))
+    assert runner.retry_probe(observed=NOW)["wakeup_fingerprint"] != original
+
+
+def test_warming_receipt_cannot_override_a_live_canonical_worker_lock(receipt_scope):
+    _root, path, _configs = receipt_scope
+    _write_source_warming(receipt_scope)
+    with path.with_name(path.name + ".worker.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = runner.retry_probe(observed=NOW)
+    assert not result["due"] and result["reason"] == "canonical_worker_running"
+
+
+def test_successful_source_readback_removes_the_wakeup_without_rewriting_history(receipt_scope):
+    _root, jobs, _configs = receipt_scope
+    receipt, _state = _write_source_warming(receipt_scope)
+    receipt.write_text('{"status":"verified"}')
+    assert not runner.retry_probe(observed=NOW)["due"] and not jobs.exists()
+
+
+def test_fresh_warming_probe_does_not_import_model_runtime_or_dispatch(receipt_scope):
+    root, jobs, _configs = receipt_scope
+    receipt, _state = _write_source_warming(receipt_scope)
+    original = receipt.read_bytes()
+    code = """
+import json, sys
+from pathlib import Path
+from scripts import run_discord_artifact_maintenance as runner
+runner.ROOT = Path(sys.argv[1])
+probe = runner.retry_probe()
+assert probe['due'] and 'torch' not in sys.modules and runner.discord_bot is None
+print(json.dumps(probe))
+"""
+    child = subprocess.run([sys.executable, "-c", code, str(root)], env=dict(os.environ),
+                           capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout)["model_runtime_imported"] is False
+    assert receipt.read_bytes() == original and not jobs.exists()
+
+
 def test_absent_receipt_is_nonmutating_idle(receipt_scope):
     _, path, _ = receipt_scope
     result = runner.retry_probe(observed=NOW)
@@ -394,16 +488,15 @@ def test_retry_unit_is_lightweight_and_uses_original_worker():
         root / "deploy/systemd/stockagent-discord-artifact-retry.timer.in"
     ).read_text()
     installer = (root / "scripts/install_discord_bot_service.sh").read_text()
-    assert "--request-due-retry" in service
-    assert (
-        f"--minimum-runway-minutes {runner.ARTIFACT_RETRY_RUNWAY_MINUTES} "
-        "--protected-until 13:40"
-    ) in service
+    assert "--request-due-work" in service
+    # Runway is checked separately inside each dispatch; a 2h ExecCondition
+    # here would incorrectly silence the bounded latest-close owner.
+    assert "ExecCondition=" not in service
+    assert runner.ARTIFACT_RETRY_RUNWAY_MINUTES == 123
     assert "ProtectSystem=strict" in service
     assert "RestrictAddressFamilies=AF_UNIX" in service
     assert "StateDirectory=stockagent-discord-artifact-retry" in service
-    assert "00..06:*:00 Asia/Taipei" in timer
-    assert "13..23:*:00 Asia/Taipei" in timer
+    assert "OnCalendar=*-*-* *:*:00 Asia/Taipei" in timer
     assert "Persistent=true" in timer
     assert "RETRY_SERVICE_NAME" in installer and "RETRY_TIMER_NAME" in installer
 

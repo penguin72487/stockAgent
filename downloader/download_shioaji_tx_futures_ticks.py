@@ -150,7 +150,12 @@ def _valid_receipt(root: Path, trading_date: date) -> dict[str, Any] | None:
     if payload.get("status") == "source_empty":
         return payload
     data_path = _data_path(root, trading_date)
-    if not data_path.is_file() or verified_sha(data_path) != payload.get("sha256"):
+    try:
+        valid_data = data_path.is_file() and verified_sha(data_path) == payload.get("sha256")
+    except OSError:
+        # A writer may publish between discovery and hashing; retry normally.
+        return None
+    if not valid_data:
         return None
     return payload
 

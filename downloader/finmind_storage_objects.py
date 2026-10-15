@@ -109,7 +109,9 @@ def configure(connection: sqlite3.Connection, account: dict, now: datetime) -> N
     connection.execute('CREATE INDEX IF NOT EXISTS idx_finmind_object_samples '
                        'ON finmind_object_transfer_samples(dataset,id DESC)')
     connection.execute('CREATE TABLE IF NOT EXISTS finmind_object_derivation_samples ('
-                       'id INTEGER PRIMARY KEY,dataset TEXT,partition TEXT,seconds REAL,observed_at_utc TEXT)')
+                       'id INTEGER PRIMARY KEY,dataset TEXT,partition TEXT,seconds REAL,observed_at_utc TEXT,engine TEXT)')
+    if 'engine' not in {row[1] for row in connection.execute('PRAGMA table_info(finmind_object_derivation_samples)')}:
+        connection.execute('ALTER TABLE finmind_object_derivation_samples ADD COLUMN engine TEXT')
     connection.execute('CREATE INDEX IF NOT EXISTS idx_finmind_object_derivation_samples '
                        'ON finmind_object_derivation_samples(dataset,id DESC)')
     enabled = account.get('tier') == 'SponsorPro'
@@ -281,10 +283,18 @@ def transfer_statistics(connection: sqlite3.Connection) -> dict:
             # Each raw file also schedules a mandatory zero-call local
             # aggregate. Account for its CPU/store time, not just HTTP time.
             exists = connection.execute("SELECT 1 FROM sqlite_master WHERE name='finmind_object_derivation_samples'").fetchone()
+            has_engine = exists and 'engine' in {row[1] for row in connection.execute(
+                'PRAGMA table_info(finmind_object_derivation_samples)')}
+            latest = (connection.execute('SELECT engine FROM finmind_object_derivation_samples '
+                      'WHERE dataset=? AND seconds>0 ORDER BY id DESC LIMIT 1', (dataset,)).fetchone()
+                      if has_engine else None)
+            engine = latest[0] if latest else None
             dependent = (connection.execute(
                 'SELECT seconds FROM finmind_object_derivation_samples WHERE dataset=? AND seconds>0 '
-                'ORDER BY id DESC LIMIT 32', (dataset,)).fetchall() if exists else [])
+                + ('AND engine IS ? ' if has_engine else '') + 'ORDER BY id DESC LIMIT 32',
+                (dataset, engine) if has_engine else (dataset,)).fetchall() if exists else [])
             costs = sorted(row[0] for row in dependent)
+            result[dataset]['processing_engine'] = engine or 'python_decimal_reference'
             result[dataset]['dependent_processing_samples'] = len(costs)
             result[dataset]['dependent_processing_unknown'] = not bool(costs)
             if costs:
@@ -292,6 +302,10 @@ def transfer_statistics(connection: sqlite3.Connection) -> dict:
                                      ('p90_seconds', min(len(costs)-1, int(len(costs)*0.9)))):
                     result[dataset][field] += costs[index]
             result[dataset]['basis'] = 'serial_transfer_validation_store_plus_mandatory_local_aggregate'
+        from downloader.finmind_object_pipeline import measured_rates
+        parallel = measured_rates(connection, dataset)
+        if parallel:
+            result[dataset]['parallel_pipeline'] = parallel
     return result
 
 

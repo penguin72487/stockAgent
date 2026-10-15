@@ -101,7 +101,7 @@ def test_shared_inventory_reuses_discovery_but_rechecks_changed_and_deleted_file
     record = build_record_inventory(tmp_path, refresh=True, snapshot=snapshot)
     assert set(record["timing_ms"]) == {
         "quick_index_probe", "cache_decode", "discover", "signature_scan",
-        "aggregate_and_persist",
+        "aggregate_and_persist", "cache_encode", "cache_write",
     }
     assert all(value >= 0 for value in record["timing_ms"].values())
     original = build_feature_inventory(tmp_path)

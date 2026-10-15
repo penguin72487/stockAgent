@@ -1436,8 +1436,16 @@ class IndexDerivativesTickDataset:
         total = np.zeros(len(feature_names), dtype=np.float64)
         total_sq = np.zeros(len(feature_names), dtype=np.float64)
         counts = np.zeros(len(feature_names), dtype=np.int64)
+        # Execution books/provenance are irrelevant to fitted moments. Project
+        # before decoding; retain the exact day/row order and FP64 reductions.
+        columns = list(TICK_FEATURE_COLUMNS)
+        if option_mode:
+            columns.extend(("tx_last_price", "option_strike", "call_last_price",
+                            "put_last_price", "option_expiry_date", "trading_date",
+                            "option_executable"))
+        columns = list(dict.fromkeys(columns))
         for raw_index in indices:
-            frame = pl.read_parquet(self.partition_paths[int(raw_index)])
+            frame = pl.read_parquet(self.partition_paths[int(raw_index)], columns=columns)
             if option_mode:
                 frame = frame.filter(pl.col("option_executable"))
             values = (

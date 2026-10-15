@@ -1,10 +1,9 @@
 [Unit]
-Description=Recover due and interrupted Discord artifact jobs without daytime polling
+Description=Recover due Discord work with a model-free receipt probe
 
 [Timer]
 # A receipt-only probe; no Torch imports, inference or receipt writes when idle.
-OnCalendar=Mon..Fri *-*-* 00..06:*:00 Asia/Taipei
-OnCalendar=Mon..Fri *-*-* 13..23:*:00 Asia/Taipei
+OnCalendar=*-*-* *:*:00 Asia/Taipei
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=true

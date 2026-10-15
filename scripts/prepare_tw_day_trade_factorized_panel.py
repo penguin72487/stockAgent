@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 import json
+import hashlib
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import sys
@@ -20,6 +21,7 @@ import time
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
@@ -109,24 +111,116 @@ def causal_report_events(events,definitions,*,period_order=None,current_periods=
     return table.filter(pl.col("_rank")==pl.col("_latest")).select(events.columns)
 
 
+def prepare_annual_coordinates(path, names, symbols):
+    """One canonical source-part precedence policy for cold and uncached reads."""
+    table = pl.scan_parquet(path).filter(
+        pl.col("feature").is_in(names) & pl.col("symbol").is_in(symbols)
+    ).collect(engine="streaming")
+    if table.is_empty():
+        return table.drop("_source_part")
+    # Masked conflicts and approved NULL-only fills were resolved upstream.
+    # Later parts do not vote across incompatible economic observations.
+    table = table.sort("_source_part").unique(
+        ["date", "symbol", "feature", "period"], keep="last", maintain_order=True
+    ).drop("_source_part")
+    return table.sort("date", "symbol", "feature", "period").unique(
+        ["date", "symbol", "feature"], keep="last", maintain_order=True
+    )
+
+
+def annual_preparation_identity():
+    """Bind derived events to the actual causal implementation and runtime."""
+    from stockagent.data import annual_event_cache, tw_day_trade_mixed_frequency, tw_public_release_schedule
+
+    return {
+        "contract": "canonical_annual_prefix_causal_cache_v1",
+        "code_sha256": {
+            "sweep": sha256(Path(__file__)),
+            "mixed_frequency": sha256(Path(tw_day_trade_mixed_frequency.__file__)),
+            "release_schedule": sha256(Path(tw_public_release_schedule.__file__)),
+            "cache": sha256(Path(annual_event_cache.__file__)),
+        },
+        "runtime": {"polars": pl.__version__, "arrow": pa.__version__},
+    }
+
+
 class AnnualObservationEvents:
     """Bound memory by a single year, not the complete multi-source history."""
-    def __init__(self,paths):
-        self.paths=sorted(paths)
+    def __init__(self,paths,*,cache_root=None):
+        self._cache = None
+        if cache_root is not None:
+            from stockagent.data.annual_event_cache import PreparedObservationCache
+            self._cache = PreparedObservationCache(cache_root)
+        # Filesystem spelling is not a release clock. A relative seed path
+        # sorted after an absolute delta path used to hide the entire past
+        # behind the delta's first future event. Keep the one-file memory
+        # bound, order by actual dates and reject overlapping event streams.
+        ranges=[]
+        for raw_path in paths:
+            path=Path(raw_path).resolve(strict=True)
+            bounds=pl.scan_parquet(path).select(pl.col("date").min().alias("start"),pl.col("date").max().alias("end")).collect()
+            start,end=bounds.row(0)
+            if start is not None:ranges.append((start,end,path))
+        ranges.sort(key=lambda item:(item[0],str(item[2])))
+        if any(current[0]<=previous[1] for previous,current in zip(ranges,ranges[1:])):
+            raise ValueError("annual observation streams overlap; merge by release date before the causal sweep")
+        self.paths=[item[2] for item in ranges]
         periods=pl.scan_parquet(self.paths).select(
             pl.col("period").fill_null(pl.col("date").cast(pl.String)).alias("subject")).unique().collect(engine="streaming")["subject"]
         self.period_order={subject:i for i,subject in enumerate(sorted(periods.to_list()))}
 
+    def cache_stats(self):
+        return self._cache.stats() if self._cache is not None else None
+
+    def _iter_cached(self, definitions, symbols):
+        from stockagent.data.annual_event_cache import PERIOD_SCHEMA, PreparedAnnualCoordinates
+
+        names = [definition["feature"] for definition in definitions]
+        current = {}
+        prefix = []
+        subjects = {rank: subject for subject, rank in self.period_order.items()}
+        implementation = annual_preparation_identity()
+
+        def prepare(path, names, symbols):
+            table = prepare_annual_coordinates(path, names, symbols)
+            if not table.is_empty():
+                table = causal_report_events(
+                    table, definitions, period_order=self.period_order, current_periods=current
+                )
+            floors = pl.DataFrame([
+                (symbol, key, subjects[rank]) for (symbol, key), rank in current.items()
+            ], schema=PERIOD_SCHEMA, orient="row")
+            return PreparedAnnualCoordinates(table, floors)
+
+        def restore(generation, metadata):
+            floors = self._cache.read_terminal_periods(generation, metadata)
+            restored = {
+                (symbol, key): self.period_order[subject]
+                for symbol, key, subject in floors.iter_rows()
+            }
+            current.clear()
+            current.update(restored)
+            prefix.append(metadata["identity"]["source_sha256"])
+
+        for path in self.paths:
+            # Bind all preceding source bytes and definitions, not this year's
+            # bytes alone. Dense ranks are rebuilt from stored subject strings:
+            # a later delta can insert ranks but cannot reorder older subjects.
+            identity = hashlib.sha256(json.dumps({
+                "implementation": implementation, "definitions": definitions, "prefix": prefix
+            }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            yield from self._cache.iter_dates(
+                path, names, symbols, prepare, prepare_identity=identity, on_prepared=restore
+            )
+
     def iter_date_groups(self,definitions,symbols):
+        if self._cache is not None:
+            yield from self._iter_cached(definitions, symbols)
+            return
         names=[d["feature"] for d in definitions];current={}
         for path in self.paths:
-            table=pl.scan_parquet(path).filter(pl.col("feature").is_in(names)&pl.col("symbol").is_in(symbols)).collect(engine="streaming")
+            table=prepare_annual_coordinates(path,names,symbols)
             if table.is_empty():continue
-            # Each source part has already masked its conflicting keys. Later
-            # parts can only replace an existing NULL under approved alias/fill
-            # contracts; they do not vote across incompatible source values.
-            table=table.sort("_source_part").unique(["date","symbol","feature","period"],keep="last",maintain_order=True).drop("_source_part")
-            table=table.sort("date","symbol","feature","period").unique(["date","symbol","feature"],keep="last",maintain_order=True)
             table=causal_report_events(table,definitions,period_order=self.period_order,current_periods=current)
             for (day,),part in sorted(table.partition_by("date",as_dict=True).items()):yield day,part
 
@@ -317,7 +411,7 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
 
 def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snapshot_id: str,
             *, max_block_bytes=128*1024**2, base_panel_cache_root: Path | None=None,
-            model_channel_policy="value_available_age_updated"):
+            model_channel_policy="value_available_age_updated", runtime_cache_root: Path | None=None):
     out = admit_output(out, "prepared")
     if model_channel_policy not in {"value_only", "value_available_age_updated"}:
         raise ValueError("unknown factorized model channel policy")
@@ -335,7 +429,7 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
         "runner":{"output_dir":str(node_root(ROOT)/"artifacts/markets"/out.parent.name/"training"),"resume":False,"post_train_infer":False},
         "data":{"parquet_root":str((source/"stocks").resolve()),"tw_public_feature_path":str(rule_path.resolve()),
             "day_trade_physical_public_feature_path":str(public.resolve()),"day_trade_minute_execution_root":str(minute_root.resolve()),
-            "day_trade_minute_execution_cache_dir":str(node_root(ROOT)/"artifacts/cache"/out.parent.name/"runtime-cache/physical-source"),
+            "day_trade_minute_execution_cache_dir":str(admit_output(runtime_cache_root,"cache") if runtime_cache_root is not None else node_root(ROOT)/"artifacts/cache"/out.parent.name/"runtime-cache/physical-source"),
             "panel_cache_root":str((base_panel_cache_root or out/"base_panel_cache").resolve()),"factorized_feature_manifest":str((out/"factorized_manifest.json").resolve()),
             "feature_include":BASE_FEATURES,"feature_exclude":[],"feature_zero_fill":[],
             "feature_shift_next_session":[],"feature_availability_indicators":[]},
@@ -601,6 +695,7 @@ def main():
     for arg in ["source-root","base-config","minute-root"]:p.add_argument("--"+arg,type=Path)
     p.add_argument("--snapshot-id");p.add_argument("--max-block-mib",type=int,default=128)
     p.add_argument("--base-panel-cache-root",type=Path,help="Canonical cache only; original fingerprint gates still apply")
+    p.add_argument("--runtime-cache-root",type=Path,help="Explicit owned cache root for temporary reconstruction; defaults remain unchanged")
     p.add_argument("--model-channel-policy",choices=("value_available_age_updated","value_only"),default="value_available_age_updated")
     p.add_argument("--project-prepared-manifest",type=Path,help="Incrementally derive value-only blocks from an already verified four-channel panel")
     a=p.parse_args()
@@ -609,7 +704,7 @@ def main():
         a.base_panel_cache_root = admit_output(a.base_panel_cache_root, "cache")
     if a.project_prepared_manifest is not None:
         if a.model_channel_policy != "value_only":p.error("prepared projection requires --model-channel-policy value_only")
-        if any(v is not None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id,a.base_panel_cache_root)):
+        if any(v is not None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id,a.base_panel_cache_root,a.runtime_cache_root)):
             p.error("prepared projection does not download/rebuild provider or execution sources")
         from stockagent.data.factorized_panel_projection import project_factorized_values
         result=project_factorized_values(a.project_prepared_manifest,a.output_root)
@@ -618,7 +713,7 @@ def main():
             p.error("source-root, base-config, minute-root and snapshot-id are required for a new source build")
         result=prepare(a.source_root,a.output_root,a.base_config,a.minute_root,a.snapshot_id,
             max_block_bytes=a.max_block_mib*1024**2,base_panel_cache_root=a.base_panel_cache_root,
-            model_channel_policy=a.model_channel_policy)
+            model_channel_policy=a.model_channel_policy,runtime_cache_root=a.runtime_cache_root)
     print(json.dumps(result,ensure_ascii=False))
 
 

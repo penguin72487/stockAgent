@@ -1,0 +1,42 @@
+# Annual-reset experiment: 2014 is causal context, not an incomplete account.
+# Retain the complete value-only panel and the selected scale-separated head.
+# Global batch256 / local128, 48 GiB/rank decoded LRU and a 2 GiB bounded
+# stock stream passed two-GPU complete-fold admission. No feature is removed.
+# The foreground launcher binds this configuration to the accepted receipt.
+base_config: tw_day_trade_factorized_values_20261006_no_basis_runtime_optimized_v1.yaml
+experiment_name: tw-day-trade-factorized-values-20261007-scale-separated-cash-annual-v1
+
+environment:
+  amp_dtype: bf16
+  use_tensor_cores: true
+  cpu_threads: 8
+
+data:
+  factorized_feature_manifest: /root/stockAgent/artifacts/data_preparation/tw_day_trade_factorized_values_20261005_gaprepair_v4/prepared/factorized_manifest.json
+  factorized_host_cache_bytes: 51539607552
+  tw_public_feature_path: /root/stockAgent/artifacts/data_preparation/tw_day_trade_factorized_panel_20261005_gaprepair_v4/prepared/execution_rules.parquet
+  panel_cache_root: /root/stockAgent/artifacts/data_preparation/tw_day_trade_factorized_panel_20261005_gaprepair_v4/prepared/base_panel_cache
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_day_trade_factorized_panel_20261005_gaprepair_v4/runtime-cache/physical-source
+
+walk_forward:
+  lookback_context: panel_history
+  split_start_year: 2015
+  year_boundary_mode: calendar
+
+training:
+  batch_size_train: 256
+  factorized_encoder_checkpoint: true
+  epochs: 1000
+  day_trade_training_annual_episodes: true
+  day_trade_sub_lot_recovery: false
+  financial_transformer:
+    portfolio_output_mode: score_entmax_scale_separated_cash
+    factorized_compact_projection: true
+    factorized_compact_stream_chunk_bytes: 2147483648
+
+runner:
+  output_dir: /root/stockAgent/artifacts/markets/tw_day_trade_factorized_values_20261007_no_basis_scale_separated_cash_annual_v1/training-bf16
+  start_fold: 10
+  require_cuda: true
+  resume: true
+  isolate_train_folds: false

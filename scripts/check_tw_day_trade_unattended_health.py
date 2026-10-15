@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
 from scripts.check_tw_day_trade_preopen_readiness import _session_contract  # noqa: E402
 from stockagent.live.market_config import enabled_day_trade_markets  # noqa: E402
+from stockagent.live.day_trade_maintenance import control_lease  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -679,18 +680,20 @@ def main() -> int:
     state_root = _repo_path(args.state_root)
     state_root.mkdir(parents=True, exist_ok=True)
     lock_path = state_root / "guardian.lock"
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+    with lock_path.open("a+", encoding="utf-8") as lock_handle, control_lease() as control:
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
 
-        repair = not bool(args.no_repair)
+        repair = not bool(args.no_repair) and control["acquired"]
         action_path = state_root / "action_state.json"
         action_state = _json(action_path)
         actions: list[dict[str, Any]] = []
         failures: list[str] = []
         warnings: list[str] = []
+        if not control["acquired"]:
+            warnings.append("planned paper-service maintenance is active; unattended repair deferred")
         try:
             session_state, session_reason, session_markets = _session_contract(observed)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1012,7 +1015,9 @@ def main() -> int:
                 "disk free space is inside the early-warning band; no data was deleted"
             )
 
-        if actions:
+        if not control["acquired"]:
+            status = "planned_maintenance"
+        elif actions:
             status = "repairing"
         elif failures:
             status = "failed"
@@ -1037,6 +1042,7 @@ def main() -> int:
             "warnings": warnings,
             "actions": actions,
             "components": {
+                "planned_maintenance": control,
                 "time_sync": time_health,
                 "opening_resource_guard": opening_resource_guard,
                 "services": services,

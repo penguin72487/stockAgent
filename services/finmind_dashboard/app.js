@@ -74,7 +74,8 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
   // A missing sample in one scenario must not hide another valid scenario.
   // Prefer the DTO capability, retaining known older ordered snapshots only.
   const orderedProjection = info.scenario_projection_contract === 1
-    || [6, 7, 8, 9, 10, 11, 12].includes(info.schema_version);
+    || (info.scenario_projection_contract == null && Number.isInteger(info.schema_version)
+      && info.schema_version >= 6 && info.schema_version <= 12);
   const usable = !expired && (["estimated", "conditional", "current"].includes(info.state)
     || (orderedProjection && info.state === "warming_up"));
   const workload = info.workload || {};
@@ -144,7 +145,7 @@ function completionEstimateView(estimate, nowMs = Date.now()) {
       : "滾動一小時或追新負載證據不足；不以舊的活躍區間中位數替代。";
   return {
     stateLabel, scenarios, rateBridge,
-    rateWindow: `估算流量窗 ${timeLabel(rates.rolling_window_start_at_utc)} → ${timeLabel(rates.rolling_window_end_at_utc)}（台北）。流量卡與估算各有每分鐘快照；對帳請比較各自取樣時間，官方帳號用量是另一項觀測。`,
+    rateWindow: `估算流量窗 ${timeLabel(rates.rolling_window_start_at_utc)} → ${timeLabel(rates.rolling_window_end_at_utc)}（台北）。流量卡與估算各有每分鐘快照；對帳請比較各自取樣時間，官方帳號用量是另一項觀測。${rates.priority_cost_basis === "accepted_json_own_service_cost" ? " 追新使用已接受 JSON 的自身耗時；不以大型檔彙總期間的低呼叫量估算。" : ""}${rates.request_processing?.capacity_basis === "accepted_parallel_pipeline_wall" ? " 並行速度取已驗證的下載→彙總→發布整批耗時，不等於官方配額上限。" : ""}`,
     scope: typeof info.scope_label === "string" ? info.scope_label : "FinMind 已排程可執行工作（含次要校驗）",
     basis: typeof info.basis === "string" ? info.basis : "分割數不等於請求數；等待合批後工作量、共用額度與實際速度估算。",
     observed: `估算基準 ${timeLabel(info.observed_at_utc)}（台北）；依背景觀測更新，不以畫面倒數代替下載進度。`,

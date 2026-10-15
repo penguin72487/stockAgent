@@ -64,6 +64,93 @@ def test_postprocess_plot_spec_rejects_duplicate_prefixes() -> None:
         )
 
 
+def test_absolute_postprocess_does_not_need_baseline_and_passes_calendar(monkeypatch, tmp_path):
+    plots = _postprocess_plot_specs({'postprocess_plots': [
+        {'split': 'val', 'prefix': 'val', 'comparison_mode': 'absolute',
+         'calendar_receipt': '/accepted/calendar.json'},
+        {'split': 'test', 'prefix': 'paired'}]})
+    available = ablation_module._available_postprocess_plots(tmp_path, plots, None)
+    assert available == plots[:1]
+    commands = []
+    monkeypatch.setattr(ablation_module.subprocess, 'run', lambda command, **k: commands.append(command))
+    _render_postprocess_plots(tmp_path, available, baseline_root=None)
+    assert commands[0][commands[0].index('--comparison-mode') + 1] == 'absolute'
+    assert commands[0][commands[0].index('--calendar-receipt') + 1] == '/accepted/calendar.json'
+    with pytest.raises(ValueError, match='comparison_mode'):
+        _postprocess_plot_specs({'postprocess_plots': [{'split': 'test', 'prefix': 'test',
+                                                       'comparison_mode': 'invent-reference'}]})
+
+
+def _absolute_scheduler_spec(tmp_path):
+    # Portable engineering fixture: the frozen production bundle deliberately
+    # does not include unrelated repository deployment configurations.
+    base = tmp_path / 'engineering-base.yaml'
+    base.write_text(yaml.safe_dump({
+        'experiment_name': 'plot-scheduler-engineering',
+        'runner': {'start_fold': 1},
+        'environment': {'device': 'cpu', 'use_tensor_cores': False, 'amp_dtype': 'fp32'},
+        'data': {'parquet_root': 'engineering-not-read', 'benchmark_name': 'fixture'},
+        'trading': {'frequency': 'daily', 'buy_fee_rate': 0., 'sell_fee_rate': 0., 'long_only': False},
+        'training': {'non_blocking_transfer': False}}))
+    path = tmp_path / 'plots.yaml'
+    path.write_text(yaml.safe_dump({
+        'base_config': str(base),
+        'expected_fold_count': 1,
+        'matrix': {'include_baseline': False, 'dimensions': [
+            {'name': 'learning_rate', 'enabled': True, 'path': 'training.learning_rate',
+             'values': [{'name': 'first', 'value': .0002}, {'name': 'second', 'value': .0003}]}]},
+        'postprocess_plots': [{'split': 'test', 'prefix': 'test', 'comparison_mode': 'absolute'}]}))
+    return path
+
+
+def test_scheduler_refreshes_after_each_completed_variant_and_before_next_worker(tmp_path, monkeypatch):
+    spec = _absolute_scheduler_spec(tmp_path)
+    output = tmp_path / 'output'
+    events = []
+    class CompleteWorker:
+        def __init__(self, command, **k):
+            self.name = Path(command[command.index('-c') + 1]).stem
+            events.append('worker:' + self.name)
+            self.pid = 99900
+            self.returncode = None
+        def poll(self):
+            marker = output / self.name / 'fold_01/fold_complete.json'
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text('{}')
+            self.returncode = 0
+            return 0
+    monkeypatch.setattr(ablation_module.subprocess, 'Popen', CompleteWorker)
+    monkeypatch.setattr(ablation_module, '_render_postprocess_plots',
+                        lambda *a, **k: events.append('plots'))
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--runner', '/bin/true', '--max-folds', '1'])
+    ablation_module.main()
+    assert events == ['worker:learning_rate__first', 'plots', 'worker:learning_rate__second', 'plots']
+    events.clear()
+    ablation_module.main()
+    assert events == ['plots']  # Refresh skipped completed results once, without retraining.
+
+
+def test_shared_plots_only_never_builds_configs_or_rewrites_training_summary(tmp_path, monkeypatch):
+    spec = _absolute_scheduler_spec(tmp_path)
+    output = tmp_path / 'output'
+    output.mkdir()
+    summary = output / 'summary.json'
+    summary.write_text('[{"name":"interrupted","status":"failed"}]')
+    original = summary.read_bytes()
+    calls = []
+    def forbidden(*a, **k):
+        raise AssertionError('plots-only must not write training configs or launch workers')
+    monkeypatch.setattr(ablation_module, '_build_configs', forbidden)
+    monkeypatch.setattr(ablation_module.subprocess, 'Popen', forbidden)
+    monkeypatch.setattr(ablation_module, '_render_postprocess_plots', lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--plots-only'])
+    ablation_module.main()
+    assert len(calls) == 1
+    assert summary.read_bytes() == original
+
+
 def test_temporal_basis_configuration_failure_is_not_a_distributed_retry() -> None:
     assert _failure_kind(
         1,

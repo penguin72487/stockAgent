@@ -173,7 +173,7 @@ def test_live_incremental_policy_reuses_compatible_footer_cache(tmp_path, cache_
     cache["contract_version"] = cache_version
     result, _ = build_workload(tmp_path, sdk_cache_root=tmp_path/"sdk", now=NOW,
                                quota=quota(.001), cache=cache, footer_budget_seconds=0)
-    assert result["contract_version"] == 4 and result["quota_policy_version"] == 1
+    assert result["contract_version"] == 4 and result["quota_policy_version"] == 2
     assert result["measurement"]["footer_reads"] == 0
     row = next(r for r in result["datasets"] if r["key"] == "price:b")
     assert row["incremental_quota_exempt"] is True and row["record_count"] == 1

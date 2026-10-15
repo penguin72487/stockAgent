@@ -32,10 +32,11 @@ CPUWeight=200
 IOWeight=200
 # The Gateway and live command plane must survive best-effort maintenance OOM.
 OOMScoreAdjust=-500
-# The observed peak is about 5 GiB including formal-history work.  These bounds
-# preserve substantial headroom while preventing a leak from exhausting WSL.
+# Factorized fold11 keeps a 4.84 GiB FP32 base window plus a private opening
+# copy. The measured 7.77 GiB warm owner plus that copy needs about 12.61 GiB;
+# avoid memory.high reclaim stalls without removing the 24 GiB hard boundary.
 MemoryAccounting=true
-MemoryHigh=12G
+MemoryHigh=16G
 MemoryMax=24G
 MemorySwapMax=4G
 TasksMax=2048

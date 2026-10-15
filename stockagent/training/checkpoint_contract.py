@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.metadata
 import json
+import os
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
@@ -41,6 +43,7 @@ from stockagent.backtest.tw_futures_portfolio import (
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
 )
 from stockagent.config import ExperimentConfig
+from stockagent.training.optimizer_config import optimizer_checkpoint_fields
 from stockagent.data.panel import PanelData, _TIFRS_MAX_CARRY_DAYS
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
@@ -54,7 +57,9 @@ from stockagent.data.tw_day_trade_execution import (
 )
 from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.data.panel_cache import array_content_fingerprint
-from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
+from stockagent.data.walkforward import (
+    WalkForwardFold, normalize_lookback_context, year_boundary_offset_sessions,
+)
 from stockagent.models.factory import _feature_indices_from_patterns
 from stockagent.models.transformer_base_portfolio import (
     TransformerBasePortfolioModel,
@@ -66,6 +71,13 @@ from stockagent.portfolio_contract import (
     normalize_portfolio_mode,
     normalize_portfolio_output_mode,
 )
+
+
+def day_trade_training_episode_contract(config: ExperimentConfig) -> str:
+    """Keep calendar checkpoints stable; bind opted-in accounts to split periods."""
+    if year_boundary_offset_sessions(config):
+        return "observed_session_shifted_fresh_capital_v1"
+    return "calendar_year_first_session_fresh_capital_v2"
 
 
 def _normalize_risk_objective(loss_type: str) -> str:
@@ -183,6 +195,28 @@ def _project_temporal_basis_model_config(
     """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
+    if projected.get("compiled_cross_attention_backend") == "sdpa_explicit":
+        projected["sdpa_dispatch_contract"] = "masked_credit_math_only_v2"
+    if projected.get("compiled_cross_attention_backend") == "sdpa_padded":
+        projected["sdpa_dispatch_contract"] = "masked_credit_aligned_key128_channel16_excludes_cudnn_v1"
+    if projected.get("compiled_cross_attention_backend") == "manual_fp32_last":
+        projected["last_query_mask_contract"] = "empty_key_mask_zero_credit_v1"
+    if projected.get("kernel_attention_backend") in {"flash4", "flash4_temporal"}:
+        projected["flash4_unmasked_contract"] = "vendor_forward_backward_custom_op_v2"
+    if projected.get("kernel_linear_backend") == "torchao_fp8":
+        projected["torchao_padding_contract"] = "neutral_mnk16_crop_full_credit_v2"
+    for name, default in {"kernel_norm_backend": "torch", "kernel_linear_backend": "torch",
+            "kernel_swiglu_backend": "torch", "kernel_attention_backend": "torch",
+            "kernel_softmax_backend": "torch",
+            "compact_projection_compute_dtype": "fp32", "factorized_compile_autotune": False,
+            "factorized_cuda_graphs": False, "factorized_portfolio_cuda_graphs": False,
+            "factorized_relaxed_precision_casts": False,
+            "factorized_encoder_force_retention": False,
+            "factorized_encoder_packet_cache": True, "fused_swiglu_projection": False}.items():
+        if projected.get(name, default) == default:
+            projected.pop(name, None)
+        else:
+            projected["training_kernel_contract"] = "explicit_training_kernel_dispatch_v1"
     if not projected.get("temporal_basis_disabled_families"):
         # Empty is the historical all-paths-enabled forward and adds neither
         # parameters nor behavior.  Keep completed pre-switch checkpoints
@@ -228,6 +262,19 @@ def _project_temporal_basis_model_config(
         projected.pop("candle_projection_fp32", None)
     else:
         projected["candle_projection_precision_contract"] = "fp32_full_feature_joint_stem_v1"
+    if not bool(projected.get("factorized_compact_projection", False)):
+        projected.pop("factorized_compact_projection", None)
+    else:
+        projected["factorized_compact_projection_contract"] = "full_layernorm_affine_zero_column_contraction_v2"
+    if not int(projected.get("factorized_compact_stream_chunk_bytes", 0)):
+        projected.pop("factorized_compact_stream_chunk_bytes", None)
+    else:
+        projected["factorized_compact_stream_contract"] = "bounded_logical_width_stock_stream_v1"
+    if not bool(projected.get("factorized_sparse_projection", False)):
+        projected.pop("factorized_sparse_projection", None)
+        projected.pop("factorized_sparse_cache_bytes", None)
+    else:
+        projected["factorized_sparse_projection_contract"] = "full_schema_csr_affine_stable_full_rows_gpu_resident_v2"
     if int(projected.get("feature_bottleneck_dim", 0) or 0) == 0:
         # Zero is the historical direct-input architecture.  Omit the disabled
         # post-schema field so merely upgrading the runtime cannot invalidate
@@ -310,6 +357,17 @@ def _project_temporal_basis_model_config(
 
 def _factorized_input_graph_contract(config: ExperimentConfig) -> str:
     model = config.training.financial_transformer
+    if bool(getattr(model, "factorized_sparse_projection", False)):
+        return "compiled_partition_resident_csr_stem_narrow_temporal_abi_v10"
+    from stockagent.models.factorized_input import factorized_head_backend_contract
+    if factorized_head_backend_contract(model) != "inductor_v1":
+        # Never resume an optimizer produced by the faulty narrow-head
+        # Inductor adjoint, even when model dimensions and data are unchanged.
+        return "compiled_partition_sm12_narrow_fp32_head_only_aligned_sdpa_adjoint_abi_v9"
+    if bool(getattr(model, "factorized_compact_projection", False)):
+        if int(getattr(model, "factorized_compact_stream_chunk_bytes", 0)):
+            return "compiled_partition_full_affine_bounded_stream_abi_v6"
+        return "compiled_partition_full_affine_compact_static_abi_v5"
     if (config.training.model_name == "financial_transformer"
             and not model.temporal_basis_families
             and not model.feature_svd_components
@@ -322,14 +380,74 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if snapshot["training"]["ddp_broadcast_buffers"]:
+        snapshot["training"].pop("ddp_broadcast_buffers")
+    if snapshot["training"]["ddp_trajectory_gradient_sync"] == "batch":
+        snapshot["training"].pop("ddp_trajectory_gradient_sync")
+    if not snapshot["training"]["day_trade_annual_episode_sharding"]:
+        snapshot["training"].pop("day_trade_annual_episode_sharding")
+        snapshot["training"].pop("day_trade_annual_episode_world_size")
+    if config.training.model_name == "financial_transformer":
+        model = config.training.financial_transformer
+        backends = {model.kernel_norm_backend, model.kernel_linear_backend,
+            model.kernel_swiglu_backend, model.kernel_attention_backend, model.kernel_softmax_backend}
+        packages = set()
+        if any(name.startswith("quack") for name in backends):
+            packages.update(("quack-kernels", "nvidia-cutlass-dsl"))
+        if "liger" in backends:
+            packages.update(("liger-kernel", "triton"))
+        if any(name.startswith("flash4") for name in backends):
+            packages.update(("flash-attn-4", "nvidia-cutlass-dsl"))
+        if "torchao_fp8" in backends:
+            packages.update(("torchao", "triton"))
+        if "deepgemm_bf16" in backends:
+            packages.add("deep-gemm")
+        if backends.intersection(("te_fp8", "te_nvfp4")):
+            packages.add("transformer-engine")
+        versions = {}
+        for package in sorted(packages):
+            try:
+                versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                # Config inspection is useful before optional installation;
+                # execution itself still requires the package without fallback.
+                versions[package] = "not-installed"
+        if versions:
+            snapshot["training"]["financial_transformer"]["kernel_package_versions"] = versions
     # Bit-preserving CPU/CUDA reconstruction changes transport scheduling,
     # not observations, shapes, graph arithmetic or the optimizer trajectory.
     # Exact runtime/config/source receipts still record the selected mode.
     snapshot["data"].pop("factorized_transfer_mode", None)
+    # Decoded immutable FP32 LRU size only changes repeated I/O/decompression.
+    # Keep the budget in runtime receipts, not the semantic optimizer ABI.
+    snapshot["data"].pop("factorized_host_cache_bytes", None)
     # Activation retention changes storage/recomputation, not the compiled
     # encoder mathematics, RNG or optimizer. Exact release/config receipts
     # retain this executor setting; canonical semantic resume stays unchanged.
     snapshot["training"].pop("factorized_encoder_checkpoint", None)
+    if normalize_execution_mode(config.trading.execution_mode) == "tw_day_trade":
+        from stockagent.backtest.tw_day_trade_carry import _carry_compile_options
+        options = _carry_compile_options()
+        default = {"triton.cudagraphs": False, "max_fusion_size": 8,
+            "triton.coalesce_tiling_analysis": False}
+        if options != default:
+            # Compiler fusion can alter rounding and its adjoint. The actual
+            # environment is consumed by the shared physical FIFO compiler;
+            # retain native/default checkpoint compatibility only at defaults.
+            snapshot["training"]["physical_fifo_compile_contract"] = {
+                "version": "explicit_physical_fifo_compile_options_v1", "options": options}
+        calendar = {name: str(os.environ.get(name, "0")).lower() not in {"0", "false", "off", "no"}
+            for name in ("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "STOCKAGENT_DAY_TRADE_CALENDAR_COMPILE")}
+        if any(calendar.values()):
+            snapshot["training"]["physical_fifo_calendar_contract"] = {
+                "version": "immutable_cuda_ordinal_and_compiled_restore_v1", "options": calendar}
+        if str(os.environ.get("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "0")).lower() not in {"0", "false", "off", "no"}:
+            snapshot["training"]["physical_fifo_prepare_contract"] = "tensor_gregorian_bucketed_inventory_funding_preparation_v3"
+        if str(os.environ.get("STOCKAGENT_DAY_TRADE_FINALIZE_COMPILE", "0")).lower() not in {"0", "false", "off", "no"}:
+            snapshot["training"]["physical_fifo_finalize_contract"] = "fused_close_nav_absorbing_default_atomic_commit_fp64_v1"
+        if str(os.environ.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0")).lower() not in {"0", "false", "off", "no"}:
+            from stockagent.backtest.tw_day_trade_graph import explicit_carry_graph_contract
+            snapshot["training"]["physical_fifo_explicit_graph_contract"] = explicit_carry_graph_contract()
     if not getattr(config.data, "factorized_feature_manifest", ""):
         snapshot["data"].pop("factorized_feature_manifest", None)
     elif config.training.enable_torch_compile:
@@ -723,6 +841,20 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         "auto_batch_size": bool(training.auto_batch_size),
         "train_symbol_compaction": compaction_mode,
     }
+    if not training.ddp_broadcast_buffers:
+        batching_contract["ddp_broadcast_buffers"] = False
+    if training.ddp_trajectory_gradient_sync == "trajectory":
+        batching_contract["gradient_sync"] = "once_per_trajectory_dense_mean_v1"
+    if training.day_trade_annual_episode_sharding:
+        from stockagent.training.episode_parallel import EPISODE_PARALLEL_ABI
+        batching_contract["annual_episode_sharding"] = {
+            "abi": EPISODE_PARALLEL_ABI,
+            "world_size": int(training.day_trade_annual_episode_world_size),
+            "ownership": "whole_configured_accounts_greedy_valid_rows_chronological_v1",
+            "local_financial_block_rows": "global_batch_size_divided_by_world_size",
+            "bptt": "detach_at_local_block_and_annual_account_boundaries",
+            "gradient_weighting": "global_valid_date_weighted_mean",
+        }
     if compaction_mode != "none":
         batching_contract["train_symbol_compaction_bucket_size"] = (
             _normalize_train_symbol_compaction_bucket_size(
@@ -769,13 +901,13 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         fold_continuation_contract["day_trade_sub_lot_recovery"] = "one_lot_fifo_utility_v1"
     if training.day_trade_training_annual_episodes:
         fold_continuation_contract["day_trade_training_annual_episodes"] = (
-            "calendar_year_first_session_fresh_capital_v2"
+            day_trade_training_episode_contract(config)
         )
     contract: dict[str, Any] = {
         "seed": int(training.seed),
         "objective": objective,
         "optimizer": {
-            "name": "AdamW",
+            **optimizer_checkpoint_fields(training),
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),
@@ -867,6 +999,11 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         contract["integer_gradient_contract_version"] = int(
             TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION
         )
+    if (execution_mode == "tw_day_trade" and
+        str(os.environ.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0")).lower()
+            not in {"0", "false", "off", "no"}):
+        from stockagent.backtest.tw_day_trade_graph import explicit_carry_graph_contract
+        contract["physical_fifo_explicit_graph_contract"] = explicit_carry_graph_contract()
     if (
         execution_mode in TW_CARRYING_EXECUTION_MODES
         or execution_mode == "tw_day_trade"
@@ -945,6 +1082,8 @@ def _training_checkpoint_contract_schema_3(
     contract.pop("day_trade_optimizer_step_per_trajectory", None)
     contract.pop("day_trade_sub_lot_recovery", None)
     contract.pop("day_trade_training_annual_episodes", None)
+    contract.pop("day_trade_annual_episode_sharding", None)
+    contract.pop("day_trade_annual_episode_world_size", None)
     contract.pop("crypto_optimizer_step_per_trajectory", None)
     contract.pop("futures_training_max_drawdown", None)
     contract.pop("futures_training_risk_tangent", None)
@@ -978,7 +1117,7 @@ def _training_checkpoint_contract_schema_2(
         "loss_type": str(training.loss_type),
         "loss_portfolio_activation": str(training.loss_portfolio_activation),
         "optimizer": {
-            "name": "AdamW",
+            **optimizer_checkpoint_fields(training),
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),
@@ -3232,6 +3371,7 @@ def _validate_checkpoint_manifest(
     continuation = expected.get("contracts", {}).get("training", {}).get("fold_continuation", {})
     new_day_trade_training = any(continuation.get(name) for name in (
         "day_trade_training_annual_episodes", "day_trade_sub_lot_recovery",
+        "day_trade_annual_episode_sharding",
     ))
     if actual is None:
         if normalized_scope in {"resume", "artifact"} and new_day_trade_training:

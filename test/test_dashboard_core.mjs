@@ -142,16 +142,17 @@ test("one broken disclosure callback cannot prevent other visibility consumers u
 
 test("shared navigation renders one canonical route list and current page", () => {
   const {core, nav} = loadCore({current: "tw-day-trade"});
-  assert.equal(core.NAV_ITEMS.length, 11);
-  assert.equal(nav.children.length, 11);
+  assert.equal(core.NAV_ITEMS.length, 12);
+  assert.equal(nav.children.length, 12);
   assert.deepEqual(nav.children.map((link) => link.textContent), [
-    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "FinLab", "FinMind", "TEJ", "OpenBB", "全資料", "流量",
+    "總覽", "TAIFEX", "台股當沖", "隔日沖", "永豐 API", "FinLab", "FinMind", "新聞爬蟲", "TEJ", "OpenBB", "全資料", "流量",
   ]);
   assert.equal(nav.children[0].href, "/");
   assert.equal(nav.children[2].href, "/tw-day-trade/");
   assert.equal(nav.children[2].attributes["aria-current"], "page");
   assert.equal(nav.children[6].href, "/finmind/");
-  assert.equal(nav.children[9].href, "/data-monitor/");
+  assert.equal(nav.children[7].href, "/news/");
+  assert.equal(nav.children.find(link => link.href === "/data-monitor/").textContent, "全資料");
   assert.equal(nav.dataset.dashboardNavMounted, "true");
   assert.ok(Object.isFrozen(core));
   assert.ok(Object.isFrozen(core.NAV_ITEMS));
@@ -164,7 +165,7 @@ test("provider detail navigation resolves to canonical root routes, not nested s
   }});
   const resolved = nav.children.map(link => new URL(link.href, sandbox.location.href).pathname);
   assert.deepEqual(resolved, Array.from(core.NAV_ITEMS, item => item.slug ? `/${item.slug}/` : "/"));
-  assert.equal(nav.children[9].attributes["aria-current"], "page");
+  assert.equal(nav.children.find(link => link.href === "/data-monitor/").attributes["aria-current"], "page");
 });
 
 test("Escape closes the expanded menu when focus remains on its toggle", () => {

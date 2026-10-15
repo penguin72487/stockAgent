@@ -7,7 +7,7 @@ with workflow.unsafe.imports_passed_through():
     from contextlib import contextmanager
     import contextvars
     import threading
-    from stockagent.control.lakehouse import configuration, register, export, acceptance, stage_source_wave, retire_accepted_transport
+    from stockagent.control.lakehouse import configuration, register, export, acceptance, catalog_enrollment, stage_source_wave, retire_accepted_transport
     from downloader.artifact_io import atomic_write_json
     from pathlib import Path
 
@@ -52,7 +52,8 @@ def export_version(snapshot_id: int) -> dict:
 def check_nas_acceptance(delivery_id: str) -> dict:
     c = configuration()
     with activity_lease():
-        result = acceptance(c, delivery_id)
+        enrolled = catalog_enrollment(c, delivery_id)
+        result = acceptance(c, delivery_id, **({'enrolled_catalog': enrolled} if enrolled is not None else {}))
         if result['state'] == 'nas_archive_file_recovery_verified':
             atomic_write_json(Path(c['state_root']) / ('catalog-acceptance-'+delivery_id+'.json'), result, durable=True)
             result['transport_retirement'] = {'state': 'delegated_to_transport_gc'}

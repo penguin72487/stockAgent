@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -237,9 +238,12 @@ def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> N
 
 def test_market_schedule_import_does_not_load_training_config() -> None:
     root = Path(__file__).resolve().parents[1]
-    market_status = (root / "stockagent/live/market_status.py").read_text()
-    prefix = market_status.split("def data_freshness", maxsplit=1)[0]
-    assert "from stockagent.config import load_config" not in prefix
+    # A lazy import inside a status helper is valid; only importing the shared
+    # schedule must stay light. Check actual transitive imports in a fresh
+    # interpreter instead of rejecting text anywhere before data_freshness.
+    subprocess.run([sys.executable, "-c", "import sys; import stockagent.live.shioaji_schedule; "
+                    "assert 'stockagent.config' not in sys.modules; "
+                    "assert 'torch' not in sys.modules"], cwd=root, check=True, timeout=15)
 
 
 def test_minute_runner_reserves_live_connections_and_does_not_gate_on_futures_calendar() -> None:

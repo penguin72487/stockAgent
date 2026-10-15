@@ -1,5 +1,7 @@
 {
-	default_bind 192.168.50.211 [::]
+	# Separate address-family wildcards survive DHCP and IPv6 prefix changes.
+	# DNS and WAN forwarding remain router-owned; admin stays loopback-only.
+	default_bind tcp4/0.0.0.0 tcp6/[::]
 	admin 127.0.0.1:2019
 	grace_period 10s
 	log default {
@@ -24,13 +26,11 @@
 }
 
 http://penguin72487.ddnsgeek.com {
-	bind 192.168.50.211 [::]
 	header -Server
 	redir https://penguin72487.ddnsgeek.com{uri} permanent
 }
 
 penguin72487.ddnsgeek.com {
-	bind 192.168.50.211 [::]
 	encode zstd gzip
 
 	header {

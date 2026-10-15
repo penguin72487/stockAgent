@@ -38,6 +38,7 @@ import time
 from typing import Final, Iterable
 
 import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -53,6 +54,10 @@ from downloader.artifact_io import (  # noqa: E402
     atomic_write_parquet,
 )
 from downloader.common import SharedRateLimiter, atomic_write_text  # noqa: E402
+from downloader.verified_merge import (  # noqa: E402
+    VerifiedMergeProjection,
+    pandas_timestamp_schema,
+)
 from scripts.taifex_daily_download_common import (  # noqa: E402
     month_ranges,
     sha256_path,
@@ -211,8 +216,8 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
     atomic_write_bytes(path, content, durable=True)
 
 
-def _atomic_write_parquet(frame: pd.DataFrame, path: Path) -> None:
-    table = pa.Table.from_pandas(frame, preserve_index=False)
+def _atomic_write_parquet(frame: pd.DataFrame | pa.Table, path: Path) -> None:
+    table = frame if isinstance(frame, pa.Table) else pa.Table.from_pandas(frame, preserve_index=False)
     atomic_write_parquet(path, table, compression="zstd")
 
 
@@ -1078,40 +1083,54 @@ def _merge_dataset(
         return _merge_range_dataset(root, dataset, next_sessions or {})
     receipt_paths = sorted((root / "receipts" / dataset).glob("*/*.json"))
     shard_paths: list[Path] = []
+    receipts: list[dict[str, object]] = []
     for receipt_path in receipt_paths:
         payload = json.loads(receipt_path.read_text(encoding="utf-8"))
         valid = _valid_receipt(root, dataset, str(payload.get("request_key", "")))
         if valid is None:
             raise RuntimeError(f"invalid receipt blocks merge: {receipt_path}")
         shard_paths.append(root / str(valid["normalized_path"]))
+        receipts.append(valid)
     if not shard_paths:
         raise RuntimeError(f"no verified shards found for {dataset}")
+    projection = _merge_projection(root, dataset, receipts, next_sessions or {})
+    cached = projection.load()
+    if cached is not None:
+        return cached
     tables = [pq.read_table(path) for path in shard_paths]
     table = pa.concat_tables(tables, promote_options="default")
-    frame = table.to_pandas()
     # Reuse the immutable request receipts and source shards.  Only the merged
     # calendar projection evolves when a newly verified next session arrives.
     # Previously aligned dates remain unchanged, including for a narrower
     # subsequent CLI request; the calendar is not a source revision.
-    pending = frame["available_date"].isna()
-    if next_sessions is not None and pending.any():
-        frame["available_date"] = pd.to_datetime(frame["available_date"])
-        frame.loc[pending, "available_date"] = pd.to_datetime(
-            [next_sessions.get(item.date()) for item in pd.to_datetime(frame.loc[pending, "date"])]
-        ).to_numpy()
+    if next_sessions is not None and table["available_date"].null_count:
+        dates = pc.unique(table["date"])
+        mapped = pa.array([next_sessions.get(item.date()) for item in dates.to_pylist()],
+                          type=pa.date32()).cast(table["available_date"].type)
+        aligned = pc.coalesce(table["available_date"],
+                              pc.take(mapped, pc.index_in(table["date"], value_set=dates)))
+        index = table.schema.get_field_index("available_date")
+        table = table.set_column(index, table.schema.field(index), aligned)
+    frame = pl.from_arrow(table)
     sort_columns = [
         column for column in ("date", "sequence", "expiry_bucket") if column in frame
     ]
     if sort_columns:
-        frame = frame.sort_values(sort_columns, kind="stable")
-    frame = frame.drop_duplicates().reset_index(drop=True)
+        frame = frame.sort(sort_columns, nulls_last=True, maintain_order=True)
+    frame = frame.unique(keep="first", maintain_order=True)
     target = root / "normalized" / f"{dataset}.parquet"
-    _atomic_write_parquet(frame, target)
-    dates = pd.to_datetime(frame["date"], errors="raise")
-    return {
+    # Preserve the existing Arrow types, nullable integer metadata and clocks.
+    output = frame.to_arrow().cast(pandas_timestamp_schema(table.schema))
+    _atomic_write_parquet(output, target)
+    dates = frame["date"]
+    pending = output["available_date"].null_count
+    return projection.save({
         "dataset": dataset,
         "status": "complete",
-        **_availability_summary(frame),
+        "completion_claim": "source_acquisition_not_full_pit_readiness",
+        "availability_state": "waiting_verified_next_session" if pending else "aligned",
+        "availability_pending_rows": pending,
+        "availability_aligned_rows": len(frame) - pending,
         "requests": len(shard_paths),
         "rows": len(frame),
         "first_date": dates.min().date().isoformat(),
@@ -1119,7 +1138,25 @@ def _merge_dataset(
         "output_path": _relative(target, root),
         "output_bytes": target.stat().st_size,
         "output_sha256": sha256_path(target),
-    }
+    })
+
+
+def _merge_projection(root, dataset, receipts, next_sessions) -> VerifiedMergeProjection:
+    return VerifiedMergeProjection(
+        root / "state" / "merge_projections" / f"{dataset}.json",
+        root / "normalized" / f"{dataset}.parquet",
+        inputs={
+            "merge_contract": 2,
+            "implementation_sha256": sha256_path(Path(__file__)),
+            "helper_sha256": sha256_path(Path(sys.modules[VerifiedMergeProjection.__module__].__file__)),
+            "writer_sha256": sha256_path(Path(sys.modules[atomic_write_parquet.__module__].__file__)),
+            "runtime": {"polars": pl.__version__, "pyarrow": pa.__version__, "pandas": pd.__version__},
+            "receipts": receipts,
+            "next_sessions": sorted((day.isoformat(), following.isoformat())
+                                    for day, following in next_sessions.items()),
+            "availability_alignment_version": LARGE_TRADER_ALIGNMENT_VERSION,
+        },
+    )
 
 
 def _merge_range_dataset(
@@ -1147,6 +1184,10 @@ def _merge_range_dataset(
         receipts.append(valid)
     if not receipts:
         raise RuntimeError(f"no verified shards found for {dataset}")
+    projection = _merge_projection(root, dataset, receipts, next_sessions)
+    cached = projection.load()
+    if cached is not None:
+        return cached
     target = root / "normalized" / f"{dataset}.parquet"
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = _temporary_path(target)
@@ -1249,7 +1290,7 @@ def _merge_range_dataset(
         if writer is not None:
             writer.close()
         temporary.unlink(missing_ok=True)
-    return {
+    return projection.save({
         "dataset": dataset, "status": "complete", "requests": len(receipts), "rows": rows,
         "first_date": min(seen).isoformat(), "last_date": max(seen).isoformat(),
         "completion_claim": "source_acquisition_not_full_pit_readiness",
@@ -1271,7 +1312,7 @@ def _merge_range_dataset(
         "physical_order": "receipt_shards_not_global_date_order",
         "output_path": _relative(target, root), "output_bytes": target.stat().st_size,
         "output_sha256": sha256_path(target),
-    }
+    })
 
 
 def main() -> int:

@@ -30,6 +30,25 @@ def test_catalog_ack_is_checkpointed_without_waiting_for_transport_gc(tmp_path):
     assert (tmp_path/('catalog-acceptance-'+'a'*64+'.json')).is_file()
 
 
+def test_catalog_activity_admits_the_exact_enrolled_export_and_keeps_gc_separate(tmp_path):
+    proof = {'state': 'nas_archive_file_recovery_verified', 'delivery_identity_sha256': 'a' * 64,
+             'catalog_semantic_restore_verified': True}
+    enrollment = {'state': 'published', 'snapshot_id': 7, 'delivery_identity_sha256': 'a' * 64}
+    seen = []
+    def admit(c, identity, **options):
+        seen.append((identity, options))
+        return dict(proof)
+    with patch.object(sw, 'configuration', lambda: {'state_root': str(tmp_path)}), \
+         patch.object(sw, 'activity_lease', lambda: nullcontext()), \
+         patch.object(sw, 'catalog_enrollment', lambda *args: enrollment), \
+         patch.object(sw, 'acceptance', admit), \
+         patch.object(sw, 'retire_accepted_transport', side_effect=AssertionError('inline GC is forbidden')):
+        result = sw.check_nas_acceptance('a' * 64)
+    assert seen == [('a' * 64, {'enrolled_catalog': enrollment})]
+    assert result['transport_retirement']['state'] == 'delegated_to_transport_gc'
+    assert (tmp_path / ('catalog-acceptance-' + 'a' * 64 + '.json')).is_file()
+
+
 def test_nas_outage_continuation_keeps_exact_unaccepted_delivery():
     fixed = {'snapshot_id': 10, 'delivery_identity_sha256': 'a' * 64, 'state': 'published'}
     async def execute(handler, *args, **options):

@@ -635,7 +635,7 @@ def build_model(
                     config.trading.tw_futures_portfolio_integer_initial_capital
                 ),
             )
-        return model_type(
+        model = model_type(
             lookback=lookback,
             num_features=num_features,
             num_symbols=num_symbols,
@@ -736,6 +736,10 @@ def build_model(
             temporal_blocks_fp32=fin_cfg.temporal_blocks_fp32,
             portfolio_blocks_fp32=fin_cfg.portfolio_blocks_fp32,
             candle_projection_fp32=fin_cfg.candle_projection_fp32,
+            factorized_compact_projection=fin_cfg.factorized_compact_projection,
+            factorized_sparse_projection=fin_cfg.factorized_sparse_projection,
+            factorized_sparse_cache_bytes=fin_cfg.factorized_sparse_cache_bytes,
+            factorized_compact_stream_chunk_bytes=fin_cfg.factorized_compact_stream_chunk_bytes,
             daily_context_num_features=len(daily_context_feature_names or ()),
             daily_context_categorical_feature_indices=(
                 _feature_indices_from_patterns(
@@ -751,6 +755,9 @@ def build_model(
             **derivative_kwargs,
             **executable_kwargs,
         )
+        from stockagent.models.kernel_backends import configure_model_kernels
+        configure_model_kernels(model, fin_cfg)
+        return model
 
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
         gbpt_cfg = config.training.gradient_boosted_portfolio_transformer

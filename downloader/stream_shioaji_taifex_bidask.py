@@ -228,6 +228,10 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/live/shioaji_taifex_volatility_simulation"),
     )
     parser.add_argument(
+        "--recover-expired-cycle-futures", action="store_true",
+        help="Explicit paper repair: settle expired options, then reduce same-contract futures from fresh books only.",
+    )
+    parser.add_argument(
         "--strategy-required-option-codes",
         default=None,
         help=(
@@ -699,6 +703,7 @@ def _build_strategy_engine(
             args.strategy_catalog_expansion_entry_policy
         ),
         settlement_bootstrap_only=settlement_bootstrap_only,
+        recover_expired_cycle_futures=bool(getattr(args, "recover_expired_cycle_futures", False)),
         startup_now=datetime.now(TAIPEI),
     )
 

@@ -19,6 +19,29 @@ from scripts.ingest_remote_cold_artifacts import (
     eligible_candidates,
 )
 from stockagent.data_sync.desync_snapshots import SnapshotError
+
+
+def test_recent_preserved_run_waits_without_repeated_decode_or_global_wave_block(tmp_path, monkeypatch):
+    args = SimpleNamespace(sync_root=tmp_path / "cold", state_root=tmp_path / "state", apply=True,
+                           origin_node_id="vastai1T")
+    policy = ingress.load_policy(Path("configs/data_sync/training_return.json"))
+    candidate = RemoteCandidate("markets/finished", 1, 10, "a" * 64,
+                                ingress.time.time_ns(), ())
+    resolved = SimpleNamespace(manifest={"dataset": "artifact-auto-finished-94d77c3e4f5a8756",
+                                         "snapshot_id": "fixed-release"}, manifest_sha256="b" * 64)
+    from stockagent.data_sync.artifact_maintenance import automatic_dataset_name
+    resolved.manifest["dataset"] = automatic_dataset_name(candidate.relative_root)
+    monkeypatch.setattr("stockagent.data_sync.cold_primary.verify_cold_resilience",
+                        lambda *a: {"cold_primary_verified": True})
+    monkeypatch.setattr("scripts.configure_artifact_ingress_syncthing.credentials",
+                        lambda: ("http://local", "unit-key"))
+    monkeypatch.setattr("scripts.manage_packed_edge._convergence", lambda *a: {"ok": True})
+    monkeypatch.setattr(ingress, "make_ack", lambda *a, **k: pytest.fail("recent run repeated full cold decode"))
+    monkeypatch.setattr(ingress, "remote_retirement", lambda *a, **k: pytest.fail("recent run attempted unlink"))
+    result = ingress.returned_source(args, candidate, resolved, policy)
+    assert result["state"] == "waiting-training-hot-retention" and result["deleted"] is False
+    assert result["minimum_hot_retention_hours"] == 168
+    assert not (args.state_root / "training-return-waiting-peer.json").exists()
 from stockagent.training.lifecycle import TrainingRunLifecycle
 from test_training_lifecycle import _write_minimal_completed_artifacts
 

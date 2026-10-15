@@ -4,6 +4,12 @@
   "workbench.editor.limit.perEditorGroup": false,
   "workbench.editor.limit.excludeDirty": true,
   "files.watcherExclude": {
+    "**/artifacts/**": true,
+    "**/artifacts_*/**": true,
+    "**/data_*/**": true,
+    "/root/stockAgent/artifacts/**": true,
+    "/root/stockAgent/artifacts_*/**": true,
+    "/root/stockAgent/data_*/**": true,
     "artifacts/**": true,
     "artifacts_*/**": true,
     "data_*/**": true,
@@ -13,6 +19,16 @@
     "**/.ruff_cache/**": true,
     "**/.cache/**": true,
     "**/.venv/**": true
+  },
+  "js/ts.tsserver.watchOptions": {
+    "excludeDirectories": [
+      "/root/stockAgent/artifacts",
+      "/root/stockAgent/artifacts/**",
+      "/root/stockAgent/artifacts_*",
+      "/root/stockAgent/artifacts_*/**",
+      "/root/stockAgent/data_*",
+      "/root/stockAgent/data_*/**"
+    ]
   },
   "search.exclude": {
     "artifacts/**": true,

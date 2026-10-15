@@ -10,14 +10,53 @@ to expose the two physical files as one timestamp-deduplicated logical table.
 Periodic non-tail reconciliation compacts the tail back into the base.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
 HOT_TAIL_DIRNAME = "_hot_tail"
+
+
+def tail_newer_summary(
+    frame: pl.DataFrame,
+    *,
+    base_latest_ms: int,
+    normalize: Callable[[pl.DataFrame], pl.DataFrame],
+) -> tuple[int, datetime | None]:
+    """Count/min actual tail dates without a canonical string round trip.
+
+    Only non-null, exact second-resolution writer strings take the native
+    path. Everything else retains the caller's complete legacy normalization
+    (including its invalid-date handling and exceptions). This computes the
+    same overlap facts, not a footer-only or inferred-contiguity certificate.
+    No input frame, source file, timestamp or provider policy is modified.
+    """
+    dates = None
+    if not frame.is_empty() and frame.schema.get("date") == pl.String:
+        values = frame.get_column("date")
+        if values.null_count() == 0 and bool((values.str.len_bytes() == 19).all()):
+            try:
+                parsed = values.str.to_datetime(
+                    format="%Y-%m-%d %H:%M:%S", time_unit="us",
+                    strict=False, exact=True,
+                )
+            except pl.exceptions.PolarsError:
+                parsed = None
+            if parsed is not None and parsed.null_count() == 0:
+                dates = parsed
+    if dates is None:
+        # Keep the same post-normalization parse as all three CEX callers.
+        dates = normalize(frame).select(
+            pl.col("date").str.to_datetime(strict=False).alias("__ts")
+        ).get_column("__ts")
+    cutoff = datetime.fromtimestamp(base_latest_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+    newer = dates.filter(dates > cutoff)
+    return len(newer), newer.min() if len(newer) else None
 
 
 def hot_tail_path(base_path: Path) -> Path:
@@ -43,11 +82,31 @@ def remove_hot_tail(base_path: Path) -> None:
         pass
 
 
-def _read_tail_row_groups(path: Path, rows: int):
+def _native_tail_schema_supported(schema: pa.Schema) -> bool:
+    """Keep Arrow's established decoding for nested, dictionary/extension types."""
+    return all(
+        pa.types.is_integer(field.type)
+        or pa.types.is_float32(field.type)
+        or pa.types.is_float64(field.type)
+        or pa.types.is_boolean(field.type)
+        or pa.types.is_string(field.type)
+        or pa.types.is_large_string(field.type)
+        or pa.types.is_timestamp(field.type)
+        or pa.types.is_date32(field.type)
+        or pa.types.is_date64(field.type)
+        or pa.types.is_null(field.type)
+        for field in schema
+    )
+
+
+def _read_tail_row_groups(
+    path: Path, rows: int, *, columns: Sequence[str] | None = None,
+):
+    before = path.stat()
     parquet = pq.ParquetFile(path, memory_map=True)
     metadata = parquet.metadata
     if metadata is None or int(metadata.num_row_groups) <= 0:
-        return pq.read_table(path, memory_map=True)
+        return pq.read_table(path, columns=columns, memory_map=True)
 
     wanted = max(1, int(rows))
     row_groups: list[int] = []
@@ -57,7 +116,29 @@ def _read_tail_row_groups(path: Path, rows: int):
         row_count += int(metadata.row_group(group_idx).num_rows)
         if row_count >= wanted:
             break
-    table = parquet.read_row_groups(sorted(row_groups))
+    # Decode only requested rows/pages instead of a potentially million-row
+    # final group. Small reads retain Arrow to avoid another engine's startup.
+    schema = parquet.schema_arrow
+    selected_schema = (schema if columns is None else
+                       pa.schema([schema.field(name) for name in columns]))
+    if row_count > max(8192, wanted) and _native_tail_schema_supported(selected_schema):
+        query = pl.scan_parquet(path, glob=False)
+        if columns is not None:
+            query = query.select(list(columns))
+        frame = query.tail(wanted).collect()
+        after = path.stat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise OSError(f"Parquet generation changed during bounded read: {path}")
+        expected_schema = pl.from_arrow(pa.Table.from_batches([], schema=selected_schema)).schema
+        if frame.schema != expected_schema:
+            # An unfamiliar scalar mapping is not permission to change dtype.
+            table = parquet.read_row_groups(sorted(row_groups), columns=columns)
+        else:
+            return frame.to_arrow()
+    else:
+        table = parquet.read_row_groups(sorted(row_groups), columns=columns)
     if int(table.num_rows) <= wanted:
         return table
     return table.slice(int(table.num_rows) - wanted, wanted)
@@ -78,9 +159,7 @@ def _read_part(
             return pl.DataFrame({name: [] for name in columns})
 
     if base_tail_rows is not None:
-        table = _read_tail_row_groups(path, base_tail_rows)
-        if selected is not None:
-            table = table.select(selected)
+        table = _read_tail_row_groups(path, base_tail_rows, columns=selected)
     else:
         table = pq.read_table(
             path,

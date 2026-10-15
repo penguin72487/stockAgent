@@ -1,0 +1,21 @@
+# Runtime input localization only. The immutable original run configuration,
+# checkpoint, fitted RMS, model and execution assumptions are unchanged.
+base_config: tw_day_trade_factorized_scale_separated_cash_fold11_candidate_v1.yaml
+data:
+  parquet_root: /srv/stockagent-live/data_tw_public/stocks
+  tw_public_feature_path: /srv/stockagent-live/data_tw_public/features/tw_public_stock_daily.parquet
+  factorized_feature_manifest: /root/stockAgent/artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/factorized_manifest.json
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/base
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/physical-source
+  live_tail_panel_rows: 48
+  # Preserve the verified 32-session lossless working set across live calls.
+  # Runtime cache capacity only; no feature/model/checkpoint ABI change.
+  factorized_host_cache_bytes: 2147483648
+training:
+  financial_transformer:
+    # Exact scalar spelling stored in the checkpoint's model contract.
+    # Numeric values are unchanged; do not weaken fingerprint validation.
+    input_dropout: 0.0
+    candle_dropout: 0.0
+    dropout: 0.0
+    rope_base: 10000.0

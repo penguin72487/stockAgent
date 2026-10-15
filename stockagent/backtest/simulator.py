@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -307,18 +308,15 @@ def _asset_log_returns_to_simple_torch(
 def _portfolio_simple_returns_to_log_torch(
     simple_returns: torch.Tensor,
 ) -> torch.Tensor:
-    floor = torch.as_tensor(
-        _MIN_PORTFOLIO_SIMPLE_RETURN,
-        device=simple_returns.device,
-        dtype=simple_returns.dtype,
-    )
     clean = torch.nan_to_num(
         simple_returns,
         nan=0.0,
         posinf=torch.finfo(simple_returns.dtype).max,
         neginf=_MIN_PORTFOLIO_SIMPLE_RETURN,
     )
-    return torch.log1p(clean.clamp_min(floor))
+    # A scalar clamp is capture-safe; constructing a CUDA tensor from a Python
+    # number performs an unpinned host copy inside every daily ledger call.
+    return torch.log1p(clean.clamp_min(_MIN_PORTFOLIO_SIMPLE_RETURN))
 
 
 def _drift_weights_after_return_numpy(
@@ -2382,7 +2380,6 @@ def _prepare_compile_key(
 ) -> tuple:
     return (
         str(weights.device),
-        int(weights.size(0)),
         int(weights.size(1)),
         str(weights.dtype),
         str(tradable_mask.dtype),
@@ -2394,7 +2391,7 @@ def _prepare_compile_key(
         normalize_portfolio_activation(portfolio_activation),
         bool(side_masks_require_tradable),
         bool(symbol_sharded),
-        bool(_compile_dynamic_enabled()),
+        "prepare_dynamic_rows_v1",
     )
 
 
@@ -2465,7 +2462,13 @@ def _resolve_prepare_runner(
     try:
         _PREP_COMPILE_STATS["misses"] += 1
         _configure_inductor_cudagraphs()
-        compile_dynamic = _compile_dynamic_enabled()
+        # Preparation is independent across dates: annual boundaries and final
+        # chunks need not create a new graph for every row count. The recurrent
+        # account scan retains its separate, explicitly selected compile mode.
+        # Do not pad dates or raise Dynamo's global limit to hide these variants.
+        for value in (weights, tradable_mask, can_buy_mask, can_sell_mask):
+            _mark_static_shape(value, [1])
+        compile_dynamic = True
         compiled = torch.compile(
             base_runner,
             fullgraph=True,
@@ -2529,7 +2532,15 @@ def _prepare_scan_inputs(
         symbol_sharded=symbol_sharded,
     )
     try:
-        return runner(weights, tradable_mask, buy_input, sell_input)
+        if _torch_dynamo_is_compiling():
+            return runner(weights, tradable_mask, buy_input, sell_input)
+        # Match the exact ledger's narrow handling of Dynamo's metadata probe.
+        # This framework warning does not read a financial gradient or change
+        # arithmetic; all accounting warnings and compile failures still fail.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning,
+                message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*")
+            return runner(weights, tradable_mask, buy_input, sell_input)
     except Exception as e:
         if _torch_dynamo_is_compiling() or not (
             _compile_prep_enabled()

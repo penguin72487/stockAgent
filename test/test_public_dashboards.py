@@ -13,6 +13,7 @@ import pytest
 
 from scripts import snapshot_data_refresh_services as snapshot_service
 from scripts.serve_public_dashboards import (
+    DashboardSessionUnavailable,
     InvalidPublicRequest,
     PublicRouteNotFound,
     PublicDashboardHandler,
@@ -49,6 +50,38 @@ def _keys(value: object) -> set[str]:
         for item in value:
             found.update(_keys(item))
     return found
+
+
+@pytest.mark.parametrize("product", ["tw-day-trade", "tw-overnight"])
+def test_unrecorded_session_is_not_reported_as_a_service_failure(monkeypatch, product):
+    def unavailable(*args, **kwargs):
+        raise DashboardSessionUnavailable("private source path and source internals must stay private")
+    monkeypatch.setattr(PublicDashboardHandler, "_api_response", unavailable)
+    server = _test_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        connection.request("GET", f"/{product}/api/signals?date=2026-10-13")
+        response = connection.getresponse()
+        assert response.status == 404
+        assert json.loads(response.read()) == {"health": "waiting", "error": "session_unavailable", "data_complete": False}
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_taifex_history_has_one_refresh_owner_not_stacked_stale_cache() -> None:
+    calls = []
+    server = SimpleNamespace(taifex_upstream="http://127.0.0.1:8765",
+                             cached_json=lambda **kwargs: calls.append(kwargs))
+    handler = PublicDashboardHandler.__new__(PublicDashboardHandler)
+    handler.server = server
+    handler._api_response("/taifex/api/history", "range=1d")
+    assert calls[0]["cache_key"] == "taifex-history:1d"
+    assert calls[0]["stale_grace_seconds"] == 0.0
 
 
 def test_public_projections_fail_closed_on_non_simulation_payload() -> None:
@@ -367,8 +400,14 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                 "bid": None,
                 "counterfactual_overnight_replay": True,
                 "sizing_capital_twd": 10_000_000.0,
-                "sizing_open_price": 100.0,
+                "sizing_open_price": None,
                 "open_reconstructed_at": "2026-09-03T09:01:00+08:00",
+                "public_price_display": {
+                    "contract": "public_quote_display_v2",
+                    "withheld_fields": ["sizing_open_price"],
+                    "withheld_reasons": {"sizing_open_price": "public_source_not_connected"},
+                    "visible_fields": {},
+                },
             }
         ],
     }
@@ -378,6 +417,32 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
         sanitize_tw_signals(
             {"simulation_only": False, "production_order_possible": False}
         )
+
+
+def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
+    public = sanitize_tw_signals({
+        "simulation_only": True,
+        "production_order_possible": False,
+        "rows": [{"symbol": "2330", "filled_shares": 1000,
+                  "position": {"contract": "signal_ledger_valuation_v1",
+                               "symbol": "2330", "filled_shares": 1000,
+                               "last_mark_price": 103.0,
+                               "last_mark_quote_source": "shioaji:stock_snapshot",
+                               "reconciled_total_net_pnl_twd": 2520.0,
+                               "position_id": "private-position", "signal_id": "private-signal",
+                               "api_key": "must-not-publish", "unknown_debug": "must-not-publish"}}],
+    })
+    position = public["rows"][0]["position"]
+    assert position == {"contract": "signal_ledger_valuation_v1", "symbol": "2330",
+                        "filled_shares": 1000, "last_mark_price": None,
+                        "last_mark_quote_source": "shioaji:stock_snapshot",
+                        "reconciled_total_net_pnl_twd": 2520.0,
+                        "public_price_display": {
+                            "contract": "public_quote_display_v2",
+                            "withheld_fields": ["last_mark_price"],
+                            "withheld_reasons": {"last_mark_price": "public_display_permission_unverified"},
+                            "visible_fields": {},
+                        }}
 
 
 def test_tw_signal_nested_scrub_keeps_security_rules_after_key_cache_hits() -> None:
@@ -620,7 +685,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=14"' in html
+    assert 'src="dashboard-core.js?v=15"' in html
     assert 'src="public.js?v=15"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
@@ -654,6 +719,9 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
         "session_date": "2026-08-13",
         "modes": [{"market": "tw"}, {"market": "tw_cash"}],
         "execution_records": {"executed_count": 2, "mode_count": 2},
+        "current_trading_universe": {"status": "ready", "listed_count": 2311,
+                                     "halted_count": 8, "trading_count": 2303,
+                                     "observed_at_taipei": "2026-10-13T10:10:25+08:00"},
         "positions": [
             {"signed_shares": 1000, "valuation_stale": True},
             {"signed_shares": 0, "valuation_stale": False},
@@ -665,6 +733,7 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
     assert summary["open_position_count"] == 1
     assert summary["stale_position_count"] == 1
     assert summary["execution_records"] == {"executed_count": 2, "mode_count": 2}
+    assert summary["current_trading_universe"] == tw["current_trading_universe"]
     assert not ({"positions", "marks", "orders"} & set(summary))
 
     overview = build_public_overview(
@@ -914,8 +983,27 @@ def test_day_trade_clock_ends_at_auction_without_overnight_contract_details() ->
     ):
         assert requirement in closing_step.group(0)
     assert '<template id="overnight-source-contract"><dl class="source-list">' in panel
-    assert 'timeline.after(sourceTemplate.content.cloneNode(true))' in javascript
+    assert 'sourceFooter.append(sourceTemplate.content.cloneNode(true))' in javascript
+    assert 'id="execution-source-contract"' in html.split('<section id="price-sources"')[1]
     assert "if (!IS_OVERNIGHT) return;" in javascript
+
+
+def test_tw_price_source_disclosures_are_the_last_page_section_and_shared() -> None:
+    root = Path(__file__).resolve().parents[1] / "services" / "tw_day_trade_dashboard"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    detail = (root / "detail-components.js").read_text(encoding="utf-8")
+    main = html.split('<main id="main-content">')[1].split("</main>")[0]
+    footer = main.split('<section id="price-sources"')[1]
+    assert 'id="quote-display-notice"' in footer
+    assert 'id="quote-display-notice"' not in main.split('<section id="price-sources"')[0]
+    assert footer.rstrip().endswith("</section>")
+    assert 'id="price-source-list"' in footer and 'id="price-reference-list"' in footer
+    assert 'data-reference-key' in javascript and 'details.open = true' in javascript
+    renderers = detail.split('function positionRow(row)')[1]
+    assert 'dailyReference(row)' not in renderers
+    assert 'entry_price_source' not in renderers
+    assert 'priceDistanceText' in renderers and 'renderPriceSources' in javascript
 
 
 def test_public_pages_share_visual_tokens() -> None:
@@ -946,11 +1034,12 @@ def test_public_pages_share_visual_tokens() -> None:
     }
     for relative, dashboard_id in pages.items():
         html = (root / relative).read_text(encoding="utf-8")
-        assert "dashboard-core.css?v=6" in html
+        core_version = 7 if "quote-display-notice" in html else 6
+        assert f"dashboard-core.css?v={core_version}" in html
         assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=14" defer' in html
-        assert html.index("dashboard-core.js?v=14") < html.index(
+        assert 'dashboard-core.js?v=15" defer' in html
+        assert html.index("dashboard-core.js?v=15") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
@@ -963,7 +1052,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f'src="../time-axis.js?v={version}"' in html
     tw_html = (root / "tw_day_trade_dashboard/index.html").read_text(encoding="utf-8")
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in tw_html
-    assert 'src="chart-renderer.js?v=4"' in tw_html
+    assert 'src="chart-renderer.js?v=6"' in tw_html
     assert "https://" not in tw_html and "http://" not in tw_html
 
     shared_javascript = (root / "public_dashboards" / "dashboard-core.js").read_text(
@@ -1045,7 +1134,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "function renderBenchmarks" in tw_javascript
     assert "timeAxis.buildTimeAxis" not in tw_javascript
     assert "new global.uPlot(options, plotData, host)" in tw_chart_javascript
-    assert "function tickPlan(minutes)" in tw_chart_javascript
+    assert "function tickPlan(minutes, maximumTicks = 10)" in tw_chart_javascript
     assert "selectedMinuteMask" in tw_chart_javascript
     assert 'id="detail-start-date" type="date"' in tw_html
     assert 'id="detail-end-date" type="date"' in tw_html
@@ -1330,9 +1419,12 @@ def test_public_gateway_serves_finlab_page_and_assets() -> None:
             if path in {"/finlab/", "/finlab/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
         page = PublicDashboardHandler._static_response(handler, "/finlab/").body
-        assert b'app.js?v=17' in page
+        assert re.search(rb'src="app\.js\?v=\d+"', page)
         assert b'id="volume-progress"' in page
         assert b'id="volume-total"' in page
+        assert b'id="history-overview"' in page
+        assert b'id="dataset-group"' in page
+        assert b'id="dataset-sort"' in page
     finally:
         server.server_close()
 
@@ -1352,6 +1444,34 @@ def test_public_gateway_serves_finmind_page_and_assets() -> None:
             assert needle in response.body
             if path in {"/finmind/", "/finmind/app.js"}:
                 assert response.cache_control == "no-cache, must-revalidate"
+    finally:
+        server.server_close()
+
+
+def test_finmind_cache_reads_new_estimate_generation_before_ttl(tmp_path, monkeypatch):
+    from scripts import serve_public_dashboards as module
+    from downloader.artifact_io import atomic_write_json
+
+    snapshot = tmp_path / 'data_finmind/eta_status.json'
+    snapshot.parent.mkdir()
+    calls = []
+    def status(root):
+        calls.append(root)
+        return {'generated_at_utc': 'safe', 'revision': json.loads(snapshot.read_text())['revision']}
+    monkeypatch.setattr(module, 'build_finmind_public_status', status)
+    server = _test_server()
+    server.repo_root = tmp_path
+    handler = SimpleNamespace(server=server)
+    try:
+        atomic_write_json(snapshot, {'revision': 1})
+        first = PublicDashboardHandler._api_response(handler, '/finmind/api/status', '')
+        again = PublicDashboardHandler._api_response(handler, '/finmind/api/status', '')
+        assert first is again and len(calls) == 1
+        atomic_write_json(snapshot, {'revision': 2})
+        latest = PublicDashboardHandler._api_response(handler, '/finmind/api/status', '')
+        assert json.loads(latest.body)['revision'] == 2
+        assert len(calls) == 2
+        assert latest.cache_control == 'no-store'
     finally:
         server.server_close()
 
@@ -1503,7 +1623,9 @@ def test_finlab_browser_recovers_from_temporary_status_failure(protocol_server) 
                 # Read-only assertions must not depend on Chromium animation frames:
                 # headless WSL may suppress rAF, making scroll_into_view hang.
                 assert page.locator("#volume-progress-label").is_visible()
-                assert page.locator("#volume-progress-label").text_content() == "50.0% · 可估範圍"
+                # General tables have their own denominator; minute history
+                # is a separate workload, not silently included in this bar.
+                assert page.locator("#volume-progress-label").text_content() == "50.0% · 一般表可估範圍（分鐘另列）"
                 assert page.locator("#volume-progress").get_attribute("value") == "0.5"
                 assert page.locator("#workload-time-progress").get_attribute("value") == "0.75"
                 assert "75.0%" in page.locator("#workload-time-ratio").text_content()
@@ -1678,6 +1800,7 @@ def test_data_monitor_provider_page_and_filtered_api(tmp_path: Path) -> None:
 def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) -> None:
     playwright = pytest.importorskip("playwright.sync_api")
     from playwright.sync_api import Error as PlaywrightError
+    from scripts.probe_browser_runtime import browser_profile_launch_options
 
     rows = [
         {"id": "finlab:price:收盤價", "endpoint_id": "finlab:price:收盤價", "title": "收盤價",
@@ -1717,7 +1840,10 @@ def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) ->
 
     try:
         with playwright.sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # This checks HTML/2D disclosure/search behavior, not GPU/WebGL.
+            # Keep the default compositor control probe as a separate failure;
+            # an explicit software profile still requires native actionable clicks.
+            browser = p.chromium.launch(**browser_profile_launch_options("cpu-2d"))
             try:
                 for width in (1280, 390):
                     page = browser.new_page(viewport={"width": width, "height": 800})
@@ -1731,7 +1857,8 @@ def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) ->
                     page.locator("#provider-name").get_by_text("FinLab").wait_for(timeout=8000)
                     assert page.locator("#provider-ratio").text_content() == "不適用"
                     assert page.locator("#provider-source-rows tr").count() == 0
-                    page.evaluate("() => {StockAgentAcquisition.reveal('provider-sources');document.getElementById('provider-sources').scrollIntoView({block:'start',behavior:'instant'});}")
+                    page.locator("#acq-catalog > summary").click()
+                    page.locator("#provider-sources").scroll_into_view_if_needed()
                     page.wait_for_function("() => document.querySelectorAll('#provider-source-rows tr').length === 2")
                     page.locator("#provider-source-search").fill("收盤")
                     page.get_by_text("1/1 項符合結果").wait_for(timeout=8000)
@@ -2268,7 +2395,7 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         assert build_started.wait(1.0)
         release_build.set()
         deadline = time.monotonic() + 1.0
-        while "tw-status:latest:revision-2" not in server._cache:
+        while not any(key.startswith("tw-status:latest:revision-2:registry:") for key in server._cache):
             assert time.monotonic() < deadline
             time.sleep(0.01)
         refreshed = json.loads(server.tw_status().body)
@@ -2276,6 +2403,41 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         assert calls == 2
     finally:
         release_build.set()
+        server.server_close()
+
+
+def test_tw_status_registry_generation_invalidates_cache_without_engine_commit(tmp_path, monkeypatch):
+    server = _test_server()
+    registry_root = tmp_path / "official_registry"
+    registry_root.mkdir()
+    monkeypatch.setenv("STOCKAGENT_TW_TRADING_UNIVERSE_ROOT", str(registry_root))
+    server.tw_revision = lambda: server.cached_local_json(
+        cache_key="stable-engine-revision", ttl_seconds=60, cache_control="no-store",
+        builder=lambda: {"revision_token": "engine-unchanged"})
+    calls = []
+    def build_snapshot(**_kwargs):
+        calls.append(True)
+        return {"simulation_only": True, "production_order_possible": False, "modes": []}
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", build_snapshot)
+    try:
+        server.tw_status()
+        before = {key for key in server._cache if key.startswith("tw-status:")}
+        from stockagent.data.tw_current_trading_universe import receipt_path, TAIPEI
+        from datetime import datetime
+        receipt_path(datetime.now(TAIPEI).date().isoformat()).write_text('{"new_source_generation": true}')
+        server.tw_status()
+        deadline = time.monotonic() + 1.0
+        # Entering the asynchronous builder is not a cache-commit receipt.
+        # Observe the publication itself before asserting generation change.
+        while True:
+            with server._cache_lock:
+                after = {key for key in server._cache if key.startswith("tw-status:")}
+            if any(key not in before for key in after):
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert len(calls) == 2
+    finally:
         server.server_close()
 
 

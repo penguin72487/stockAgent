@@ -73,20 +73,30 @@ def atomic_write_bytes(
     payload: bytes,
     *,
     durable: bool = False,
+    mode: int | None = None,
 ) -> None:
     """Atomically replace ``path`` with complete bytes.
 
     ``durable=True`` also fsyncs the temporary file and parent directory.  Use
     it for small run receipts/checkpoints that must survive a sudden restart;
     bulk raw payloads and reproducible Parquet normally leave it disabled to
-    avoid one storage barrier per response.
+    avoid one storage barrier per response. ``mode`` creates a private sibling
+    with restrictive permissions before writing any bytes; an existing sibling
+    is never overwritten or removed in that explicit-permission path.
     """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = _temporary_path(target)
+    created = False
     try:
-        with temporary.open("wb") as handle:
+        if mode is None:
+            stream = temporary.open("wb")
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            stream = os.fdopen(os.open(temporary, flags, mode), "wb")
+        created = True
+        with stream as handle:
             handle.write(payload)
             if durable:
                 handle.flush()
@@ -95,7 +105,8 @@ def atomic_write_bytes(
         if durable:
             _sync_parent(target)
     finally:
-        temporary.unlink(missing_ok=True)
+        if created:
+            temporary.unlink(missing_ok=True)
 
 
 def atomic_write_text(
@@ -104,8 +115,9 @@ def atomic_write_text(
     *,
     encoding: str = "utf-8",
     durable: bool = False,
+    mode: int | None = None,
 ) -> None:
-    atomic_write_bytes(path, str(text).encode(encoding), durable=durable)
+    atomic_write_bytes(path, str(text).encode(encoding), durable=durable, mode=mode)
 
 
 def atomic_write_json(
@@ -115,13 +127,15 @@ def atomic_write_json(
     durable: bool = True,
     ensure_ascii: bool = False,
     sort_keys: bool = False,
+    compact: bool = False,
 ) -> None:
     atomic_write_text(
         path,
         json.dumps(
             payload,
             ensure_ascii=ensure_ascii,
-            indent=2,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
             sort_keys=sort_keys,
         )
         + "\n",

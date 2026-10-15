@@ -1,0 +1,93 @@
+{
+  "contract_version": 1,
+  "root": "data_news_fulltext",
+  "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
+  "workers": 3,
+  "exclusive_http_owner": true,
+  "request_timeout_seconds": 8,
+  "response_deadline_seconds": 20,
+  "max_response_bytes": 8388608,
+  "max_attempts": 6,
+  "lease_seconds": 300,
+  "min_free_disk_bytes": 26843545600,
+  "batch_articles": 16,
+  "batch_text_bytes": 4194304,
+  "robots_ttl_seconds": 86400,
+  "metadata_refresh_seconds": 900,
+  "recent_article_recheck_seconds": 21600,
+  "recent_article_window_days": 3,
+  "unknown_source_policy": "awaiting_authorization",
+  "collection_purpose": "personal_research",
+  "publish": false,
+  "remote_training_export": false,
+  "providers": [
+    {
+      "id": "nownews", "name": "NOWnews：有限公開原文診斷",
+      "domains": ["www.nownews.com"], "enabled": true,
+      "acquisition_mode": "finite", "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "article_path_pattern": "^/(?:amp/)?news/[1-9][0-9]*/?$",
+      "embedded_article_layout": "nownews_visible_article_v1",
+      "article_selectors": ["#articleContent.article-content-edtor", ".newsMsg"],
+      "exclude_selectors": [".ad-blk1", ".ad-blk", ".related", ".related-item", ".author-card", ".social-bar", ".keywordBox"],
+      "title_selector": "h1", "require_configured_container": true,
+      "require_author_attribution": true, "author_selectors": ["[itemprop=author]", "[rel=author]"],
+      "authorization": {
+        "kind": "personal_research", "evidence_url": "https://www.nownews.com/copyright",
+        "additional_evidence_urls": ["https://www.nownews.com/terms"],
+        "scope": "Bounded private diagnosis of explicitly selected locally known public originals. Preserve credits, copyright and actual clocks. Publisher copyright section 3 names individual noncommercial use; no redistribution, paid/member content, linked media, third-party work or training export. Source membership terms prohibit improper BOT operation and interference; no numeric rate inferred and actual robots/refusals remain binding.",
+        "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified",
+        "rights_restrictions": "Not a blanket full-history or model-training license or legal fair-use verdict. This is a bounded ordinary public path probe, never a bot-interference or protection bypass."
+      }
+    },
+    {
+      "id": "ftvnews", "name": "民視：有限原始媒體身分診斷",
+      "domains": ["www.ftvnews.com.tw", "finance.ftvnews.com.tw", "sport.ftvnews.com.tw", "health.ftvnews.com.tw"], "enabled": true,
+      "acquisition_mode": "finite", "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "article_path_pattern": "^/news/detail/[A-Za-z0-9]+/?$",
+      "embedded_article_layout": "ftv_visible_article_v1",
+      "article_selectors": ["#contentarea[itemprop=articleBody]"],
+      "title_selector": "h1", "require_configured_container": true,
+      "require_author_attribution": true, "author_selectors": ["[itemprop=author]", "[rel=author]"],
+      "authorization": {
+        "kind": "personal_research", "evidence_url": "https://www.ftvnews.com.tw/news/detail/2026317W0044",
+        "additional_evidence_urls": ["https://www.ftvnews.com.tw/privacy", "https://www.ftvnews.com.tw/robots.txt"],
+        "scope": "Bounded user-requested private personal-reading diagnosis of explicitly selected public original article routes and source identity only. Preserve the actual original credits and copyright; exclude syndicated text, media, paid/member content, redistribution and training export. A permitted robots path is not a reuse license; production capture remains disabled until current-article rights and adapter checks.",
+        "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified",
+        "rights_restrictions": "Source retains copyright; no blanket archive, reuse or training grant or numeric quota verified. Only a few explicit ordinary requests, no source search, ID enumeration, identity/proxy change or refusal reset."
+      }
+    },
+    {
+      "id": "pse_redirector", "name": "原站明列短網址：僅回應標頭診斷",
+      "domains": ["pse.is"], "enabled": true,
+      "acquisition_mode": "finite", "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml", "article_path_pattern": "^/8328n8$",
+      "article_selectors": ["[itemprop=articleBody]"],
+      "require_configured_container": true, "require_author_attribution": true,
+      "authorization": {
+        "kind": "personal_research",
+        "evidence_url": "https://cnews.com.tw/%E3%80%90%E6%9C%89%E5%BD%B1%E3%80%91%E6%B5%AAlive%E7%AC%AC7%E5%B1%86%E6%98%9F%E6%BD%AE%E4%B9%8B%E5%A4%9C%E5%AA%B2%E7%BE%8E%E4%B8%89%E9%87%91%E7%B4%85%E6%AF%AF%E3%80%80%E5%A3%93%E8%BB%B8%E7%BE%85/",
+        "scope": "Inspect only the ordinary response headers of the exact link explicitly published by the reviewed CNEWS article, respecting robots and refusals. Never follow another host, extract or retain article text, enumerate links or enable production capture. This metadata-only original-link diagnostic is not a source text/reuse grant.",
+        "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified",
+        "rights_restrictions": "No redirected destination permission or article identity inferred; verify actual original separately before any queue or parser change."
+      }
+    },
+    {
+      "id": "cnews", "name": "匯流：失效原文連結診斷",
+      "domains": ["cnews.com.tw"], "enabled": true,
+      "acquisition_mode": "finite", "interval_seconds": 2, "parallelism": 1,
+      "html_parser": "lxml",
+      "article_path_pattern": "^/(?!author(?:/|$)|category(?:/|$)|tag(?:/|$)|news(?:/|$)|wp-)[^/?#]+/?$",
+      "embedded_article_layout": "cnews_visible_article_v1",
+      "article_selectors": ["article[id^='post-']"],
+      "title_selector": "#articleTitle .special-format > ._line > strong",
+      "require_configured_container": true, "require_author_attribution": true,
+      "index_pages": ["https://cnews.com.tw/"], "index_path_pattern": "^/$",
+      "authorization": {
+        "kind": "personal_research", "evidence_url": "https://cnews.com.tw/%E7%89%88%E6%AC%8A%E8%81%B2%E6%98%8E/",
+        "scope": "Bounded private personal-reading diagnosis of exact publisher-linked public originals to resolve a known failed URL, within the existing original-reporting policy. Preserve original reporter attribution, source clock, failed URL and links. No syndication scope expansion, media, login/paid, guessed IDs/API, redistribution or training export.",
+        "reviewed_on": "2026-10-09", "automated_access_review": "no_explicit_prohibition_identified",
+        "rights_restrictions": "The existing publisher copyright and original-source exclusions remain binding. This probe does not requeue refused URLs or grant bulk archive, reuse or training rights."
+      }
+    }
+  ]
+}

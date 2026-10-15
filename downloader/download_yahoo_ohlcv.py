@@ -2310,49 +2310,58 @@ def _load_tw_symbols_from_local_parquet() -> list[SymbolRecord]:
     return records
 
 
-def _load_tw_symbols_from_exchange() -> list[SymbolRecord]:
+def _parse_tw_exchange_rows(rows: list[list[str]], market: str) -> list[SymbolRecord]:
+    """Shared official ISIN stock/ETF scope, never a local historical union."""
     records: list[SymbolRecord] = []
     seen_codes: set[str] = set()
     section_labels = set().union(*TW_INCLUDED_SECTION_LABELS.values())
-    for market, (url, suffix) in TWSE_SOURCES.items():
-        rows = _read_html_table_rows(url)
-        current_section: str | None = None
-        for row in rows:
-            values = [str(value).strip() for value in row]
-            nonempty = [value for value in values if value]
-            if nonempty and (
-                (len(set(nonempty)) == 1 and len(nonempty) >= 3)
-                or (len(nonempty) == 1 and nonempty[0] in section_labels)
-            ):
-                current_section = nonempty[0]
-                continue
-            if current_section not in TW_INCLUDED_SECTION_LABELS.get(market, set()):
-                continue
-            if len(values) < 4:
-                continue
-            raw_value = values[0]
-            market_value = values[3]
-            if market == "listed" and market_value != "上市":
-                continue
-            if market == "otc" and market_value != "上櫃":
-                continue
-            match = TWSE_CODE_NAME_PATTERN.match(raw_value)
-            if not match:
-                continue
-            code = match.group("code").upper()
-            name = match.group("name").strip()
-            if code in seen_codes:
-                continue
-            record = SymbolRecord(
-                code=code,
-                name=name,
-                market=market,
-                yahoo_symbol=f"{code}{suffix}",
-            )
-            if not _is_supported_tw_active_record(record):
-                continue
-            seen_codes.add(code)
-            records.append(record)
+    suffix = TWSE_SOURCES[market][1]
+    # Keep the established section/type/name policy exactly the same for the
+    # historical downloader and the current-session official registry.
+    current_section: str | None = None
+    for row in rows:
+        values = [str(value).strip() for value in row]
+        nonempty = [value for value in values if value]
+        if nonempty and (
+            (len(set(nonempty)) == 1 and len(nonempty) >= 3)
+            or (len(nonempty) == 1 and nonempty[0] in section_labels)
+        ):
+            current_section = nonempty[0]
+            continue
+        if current_section not in TW_INCLUDED_SECTION_LABELS.get(market, set()):
+            continue
+        if len(values) < 4:
+            continue
+        raw_value = values[0]
+        market_value = values[3]
+        if market == "listed" and market_value != "上市":
+            continue
+        if market == "otc" and market_value != "上櫃":
+            continue
+        match = TWSE_CODE_NAME_PATTERN.match(raw_value)
+        if not match:
+            continue
+        code = match.group("code").upper()
+        name = match.group("name").strip()
+        if code in seen_codes:
+            continue
+        record = SymbolRecord(code=code, name=name, market=market,
+                              yahoo_symbol=f"{code}{suffix}")
+        if not _is_supported_tw_active_record(record):
+            continue
+        seen_codes.add(code)
+        records.append(record)
+    return records
+
+
+def _load_tw_symbols_from_exchange() -> list[SymbolRecord]:
+    records: list[SymbolRecord] = []
+    seen: set[str] = set()
+    for market, (url, _suffix) in TWSE_SOURCES.items():
+        for record in _parse_tw_exchange_rows(_read_html_table_rows(url), market):
+            if record.code not in seen:
+                seen.add(record.code)
+                records.append(record)
     return records
 
 

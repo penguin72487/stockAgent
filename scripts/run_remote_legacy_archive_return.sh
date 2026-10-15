@@ -16,6 +16,7 @@ if [[ "${1:-}" == "--cohort" ]]; then
     main) cohort_root=/var/lib/stockagent-vast-legacy-return ;;
     partitions) cohort_root=/var/lib/stockagent-vast-legacy-return-partitions ;;
     reviewed-main-20261006) cohort_root=/var/lib/stockagent-vast-reviewed-return-20261006 ;;
+    reviewed-offline-20261006) cohort_root=/var/lib/stockagent-vast-reviewed-offline-return-20261006 ;;
     reviewed-panel-20261006)
       cohort_root=/var/lib/stockagent-vast-reviewed-partitions-20261006
       readiness_args=(--selection "$cohort_root/scope-selection.json")
@@ -24,7 +25,9 @@ if [[ "${1:-}" == "--cohort" ]]; then
   esac
   shift 2
   cohort_args=(--state-root "$cohort_root")
-  if [[ "$cohort_root" == /var/lib/stockagent-vast-reviewed-* || "${STOCKAGENT_LEGACY_REVIEWED_20261006:-0}" == 1 ]]; then
+  if [[ "$cohort_root" == /var/lib/stockagent-vast-reviewed-offline-return-20261006 ]]; then
+    cohort_args+=(--policy configs/data_sync/vastai_reviewed_offline_return_20261006.json)
+  elif [[ "$cohort_root" == /var/lib/stockagent-vast-reviewed-* || "${STOCKAGENT_LEGACY_REVIEWED_20261006:-0}" == 1 ]]; then
     cohort_args+=(--policy configs/data_sync/vastai_reviewed_legacy_return_20261006.json)
   fi
   cohort_args+=("${readiness_args[@]}")

@@ -13,6 +13,9 @@ errors.source_validation_failed_deferred="來源結果驗證未過 · 此表隔�
 labels.waiting_local_retry="此表等待重試 · 其他表可續抓";
 order.waiting_local_retry=2;
 errors.prequery_failure_deferred="已證明未送查詢 · 此表排定重試";
+errors.metadata_preparation_requires_recovery="目錄準備失敗 · 正在自動核對介面，未送資料查詢";
+errors.metadata_retry_scheduled="目錄故障已核對 · 此表排定重試，其他表繼續下載";
+waitLabels.recovering_metadata="自動修復目錄介面 · 未送資料查詢";
 errors.unknown_outcome_no_auto_retry="原查詢結果未明 · 核對後依授權重排";
 const int = new Intl.NumberFormat("zh-TW",{maximumFractionDigits:0});
 function num(v){return v===null||v===undefined||v===""?null:Number.isFinite(Number(v))?Number(v):null;}
@@ -124,6 +127,7 @@ function renderStatus(data){
   text("tej-health",({running:"桌面回補進行中",needs_review:"下載需檢查",paused_for_storage:"磁碟餘裕不足 · 已停抓",queued:"已排工作 · 待執行",not_registered:"清冊未註冊",metadata_unavailable:"本機中繼資料不可讀",query_grid_exported:"已匯出目前格點",query_scope_checked:"查詢範圍完成 · 含來源空回"})[data.state]||"狀態待核實");
   if(data.state==="running")text("tej-health",data.worker?.kind==="discover"?"歷史範圍清點中":"歷史資料下載中");
   if(data.state==="running"&&data.worker?.state==="between_tasks")text("tej-health","批次執行中 · 工作間隔");
+  if(data.worker?.state==="recovering_metadata"||data.scheduler?.state==="recovering_metadata")text("tej-health","正在自動修復目錄介面 · 未送資料查詢");
   if(data.state==="running"&&data.worker?.state==="waiting_local_retry")text("tej-health","本機輸入重試等待 · 未送 Preview");
   if(data.state==="running"&&data.worker?.state==="recovering_metadata")text("tej-health","安全核對選單失敗 · 未重送資料查詢");
   if(data.worker?.state==="desktop_interface_recovery_required")text("tej-health","桌面查詢介面停用 · 等待安全恢復");
@@ -137,10 +141,15 @@ function renderStatus(data){
   text("tej-automation",scheduler.alive?`自動排程存活 · heartbeat ${time(scheduler.observed_at_utc)}${scheduler.next_check_at_utc?` · 下次檢查 ${time(scheduler.next_check_at_utc)}`:""}（臺北）；排程存活不等於正在下載。`:"自動排程未運行；已下載來源與收據保留。");
   const startup=data.desktop_startup||{};
   if(startup.enabled){
-    const startupLabels={desktop_ready:startup.ready?"桌面已核對可用":"桌面或互動通道尚待重新核對",interactive_session_required:"等待 Windows 使用者登入",interactive_windows_transport_unavailable:"等待互動 Windows 通道恢復",desktop_writer_active:"保留目前下載操作",owned_query_needs_reconciliation:"等待原查詢結果恢復",retired_addin_still_present:"舊外掛仍在，未另開查詢",startup_launcher_outcome_unresolved:"查詢視窗開啟結果待核對，未重複開啟",desktop_restart_cooldown:"短時間已恢復三次；保留原查詢，稍後再核對",tej_addin_not_ready:"等待 Excel／TEJ 外掛就緒",desktop_waiting_login_or_addin:"等待 TEJ 登入／外掛就緒"};
+    const startupLabels={desktop_ready:startup.ready?(startup.recent_interface_check===false?"互動通道仍可用 · 查詢前重新核對桌面":"桌面已核對可用"):"桌面或互動通道尚待重新核對",interactive_session_required:"等待 Windows 使用者登入",interactive_windows_transport_unavailable:"等待互動 Windows 通道恢復",desktop_writer_active:"保留目前下載操作",owned_query_needs_reconciliation:"等待原查詢結果恢復",retired_addin_still_present:"舊外掛仍在，未另開查詢",startup_launcher_outcome_unresolved:"查詢視窗開啟結果待核對，未重複開啟",desktop_restart_cooldown:"短時間已恢復三次；保留原查詢，稍後再核對",tej_addin_not_ready:"等待 Excel／TEJ 外掛就緒",desktop_waiting_login_or_addin:"等待 TEJ 登入／外掛就緒"};
     $("tej-automation").textContent+=` 開機恢復已設定：Windows 登入後每 ${count(startup.check_interval_seconds)} 秒核對 · ${startupLabels[startup.state]||"專用桌面恢復狀態待核對"} · 觀測 ${time(startup.observed_at_utc)}（臺北）。`;
   }
   const replay=scheduler.authorized_unknown_replay||{};
+  const metadata=scheduler.metadata_recovery||{};
+  if(metadata.enabled){
+    const recoveryLabels={waiting_metadata_interface:"介面仍待恢復",metadata_retry_scheduled:"已排定目錄重試，其他表可續抓",metadata_retry_ready:"目錄重試已到期，依資料價值順序執行",metadata_retry_running:"正在重新清點目錄，未送資料查詢",metadata_recovered:"此目錄已恢復，後續資料沿原排程下載"};
+    $("tej-automation").textContent+=` 目錄故障會依未送出證據自動核對、逐表退避重試；${recoveryLabels[metadata.state]||"先核對介面，不重送未知資料查詢"}${metadata.next_check_at_utc?` · 下次檢查 ${time(metadata.next_check_at_utc)}（臺北）`:""}。`;
+  }
   if(replay.enabled){
     const reasons={authorized_replay_cooldown:"重排冷卻中",authorized_replay_task_budget:"此筆重排額度等待",authorized_replay_global_budget:"全域重排額度等待",authorized_replay_context_unverified:"介面／原範圍尚未可驗證",checking_authorized_replay:"核對授權重排條件"};
     $("tej-automation").textContent+=` 已授權有界自動重排：每筆滾動一小時最多 ${count(replay.max_replays_per_task_hour)} 次、全域 ${count(replay.max_replays_per_hour)} 次（本機恢復上限，非官方配額）；${reasons[replay.state]||"先核對原結果"}${replay.next_check_at_utc?` · 重排條件下次到期 ${time(replay.next_check_at_utc)}（臺北）`:""}。`;

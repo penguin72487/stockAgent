@@ -91,7 +91,8 @@ def test_fill_inventory_and_all_minute_nav_reconcile(tmp_path):
     state = {"modes": {"a": {"margin_carry_contract": MARGIN_CARRY_CONTRACT, "session_date": "2026-08-13",
                            "total_equity_twd": 10098., "positions": {"p": {"position_id": "p", "signed_shares": 0}}}}}
     (tmp_path / "state.json").write_text(json.dumps(state))
-    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({"sessions": [{"session_date": "2026-08-13"}]}))
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({"sessions": [{"session_date": "2026-08-13",
+        "modes": [{"market": "a", "after_close": {"open_position_rows": 0}}]}]}))
     for i, fill in enumerate(fills):
         fill["order_id"] = f"order-{i}"
     (tmp_path / "orders.jsonl").write_text(''.join(json.dumps(x)+'\n' for x in fills))
@@ -100,6 +101,9 @@ def test_fill_inventory_and_all_minute_nav_reconcile(tmp_path):
     (tmp_path / "fills.jsonl").write_text(''.join(json.dumps(x)+'\n' for x in fills))
     (tmp_path / "marks.jsonl").write_text(''.join(json.dumps(x)+'\n' for x in rows))
     assert audit(tmp_path, verify_sources=False)["passed"]
+    strict = audit(tmp_path, verify_sources=False, require_margin_carry=False)
+    assert strict["passed"] and strict["contract"].startswith("strict_intraday_")
+    assert strict["full_requested_range_passed"] is False  # Arithmetic is not source acceptance.
     fills[1]["quantity"] = 2000
     (tmp_path / "fills.jsonl").write_text(''.join(json.dumps(x)+'\n' for x in fills))
     result = audit(tmp_path, verify_sources=False)

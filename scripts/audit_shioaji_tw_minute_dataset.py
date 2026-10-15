@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--allow-research-subset', action='store_true',
                         help='Audit an explicitly selected repair subset without marking it research_ready.')
+    parser.add_argument('--verification-cache', type=Path,
+                        help='Reuse previously SHA/semantics-verified unchanged partitions; local evidence only.')
     parser.add_argument(
         "--output",
         type=Path,
@@ -474,18 +476,31 @@ def main() -> None:
         }
         seen_dates: set[str] = set()
         maximum_symbols = 0
+        cache = None
+        cache_path = getattr(args, 'verification_cache', None)
+        if cache_path is not None:
+            from stockagent.data_sync.source_validation import VerificationCache, validator_identity
+            import stockagent.data.tw_price_rules as price_rules
+            import downloader.stock_volume_units as volume_rules
+            cache = VerificationCache(cache_path, validator_identity(
+                Path(__file__), Path(price_rules.__file__), Path(volume_rules.__file__),
+                REPO_ROOT / 'scripts/build_shioaji_tw_minute_dataset.py',
+                REPO_ROOT / 'stockagent/data/tw_exchange_price_classification.py',
+                REPO_ROOT / 'stockagent/data_sync/source_validation.py'))
         for position, summary in enumerate(partitions, start=1):
             date_text = str(summary["trade_date"])
             if date_text in seen_dates:
                 raise RuntimeError(f"duplicate minute partition date: {date_text}")
             seen_dates.add(date_text)
             path = _partition_path(args.dataset_root, date_text)
-            actual_sha256 = _sha256(path)
-            if actual_sha256 != str(summary.get("output_sha256", "")):
-                raise RuntimeError(f"minute partition fingerprint mismatch: {path}")
-            result = audit_frame(
-                pl.read_parquet(path), trade_date=date.fromisoformat(date_text)
-            )
+            if cache is None:
+                actual_sha256 = _sha256(path)
+                if actual_sha256 != str(summary.get("output_sha256", "")):
+                    raise RuntimeError(f"minute partition fingerprint mismatch: {path}")
+                result = audit_frame(pl.read_parquet(path), trade_date=date.fromisoformat(date_text))
+            else:
+                result = cache.check(path, str(summary.get('output_sha256', '')),
+                    lambda: audit_frame(pl.read_parquet(path), trade_date=date.fromisoformat(date_text)))
             if int(result["rows"]) != int(summary["rows"]):
                 raise RuntimeError(f"minute partition row count changed: {path}")
             for name in totals:
@@ -499,6 +514,10 @@ def main() -> None:
                 )
         if seen_dates != set(manifest.get("dates", [])):
             raise RuntimeError("minute manifest dates differ from audited partitions")
+        cache_counts = ({'checked_files': cache.checked, 'reused_files': cache.reused,
+                         'validator_sha256': cache.contract} if cache is not None else {})
+        if cache is not None:
+            cache.close()
         if _sha256(manifest_path) != manifest_sha256:
             raise RuntimeError("minute manifest changed during audit")
         result = {
@@ -524,6 +543,7 @@ def main() -> None:
             "maximum_symbols_per_day": maximum_symbols,
             **totals,
             "failures": {},
+            "incremental_verification": cache_counts,
         }
         output = args.output
         if output == Path("data_tw_minute/audits/latest.json"):

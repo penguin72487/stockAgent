@@ -1,0 +1,21 @@
+{
+  "contract_version": 1,
+  "provider": "cna",
+  "access_channel": "official_mcp",
+  "endpoint": "https://ask.cna.com.tw/mcp/connect",
+  "key_env_name": "CNA_API_KEY",
+  "documentation_url": "https://ask.cna.com.tw/ask/onboarding/mcp",
+  "terms_url": "https://ask.cna.com.tw/ask/legal/terms",
+  "user_authorization_declared": true,
+  "authorization_basis": "User explicitly confirmed existing authorization for historical batch download or official API access and requested connection within that authorization; do not ask the same permission question again",
+  "actual_api_product_confirmed": false,
+  "actual_bulk_scope_confirmed": false,
+  "phase": "capability_discovery_only",
+  "fulltext_pipeline_enabled": false,
+  "article_tool_calls_enabled": false,
+  "quota_verified": false,
+  "history_start_verified": false,
+  "publish": false,
+  "remote_training_export": false,
+  "next_action": "User supplies CNA_API_KEY locally or identifies a different licensed API product; verify real tools/schema/quota before mapping original articles into the existing canonical body queue"
+}

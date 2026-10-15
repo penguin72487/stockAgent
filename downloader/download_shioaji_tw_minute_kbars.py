@@ -2352,10 +2352,13 @@ def main() -> None:
     calendar_root = args.calendar_root or args.base_stock_root.parent
     official_sessions, calendar_sha256 = _validated_taiex_session_dates(
         calendar_root,
-        start,
+        # A single-day publication-lag repair needs the preceding reference
+        # session to prove its provisional tail. Keep that calendar context;
+        # the actual request/chunk range remains exactly start..end.
+        max(SHIOAJI_STOCK_HISTORY_START, start - timedelta(days=14)),
         end,
     )
-    if not official_sessions:
+    if not any(start <= day <= end for day in official_sessions):
         raise RuntimeError("receipt-backed official calendar has no selected sessions")
     args.resolved_calendar_root = str(calendar_root.resolve())
     args.official_calendar_sha256 = calendar_sha256
@@ -2366,6 +2369,10 @@ def main() -> None:
         for row in selected:
             expected_dates = _positive_volume_dates(row.base_path, start, end)
             expected_dates &= set(args.official_session_dates)
+            expected_dates |= provisional_publication_tail_dates(
+                row.base_path, start=start, end=end, expected_dates=expected_dates,
+                official_dates=args.official_session_dates,
+            )
             api_query_chunks += len(
                 {
                     (value - start).days // int(args.chunk_days)

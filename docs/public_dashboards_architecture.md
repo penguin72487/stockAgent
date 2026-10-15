@@ -25,7 +25,7 @@ services/public_dashboards/dashboard-core.js
   └─ 跳過未變更文字／HTML DOM 寫入
         │
         ▼
-十個公開頁面（首頁與九個面板；隔日沖重用當沖 renderer）
+所有已註冊公開頁面（隔日沖重用當沖 renderer）
 ```
 
 公開閘道是唯讀檢視層，不是交易控制面。它不得送單、修改帳本、啟動訓練、觸發下載或將反事實回放改稱即時成交。面板部署只能重啟 `stockagent-public-dashboards.service`；不得為了更新 UI 重啟當沖模擬或交易引擎。
@@ -41,6 +41,8 @@ services/public_dashboards/dashboard-core.js
 | `/shioaji/` | `/shioaji/api/status` | 永豐資料流程、配額、流量與儲存量 |
 | `/finlab/` | `/finlab/api/status` | FinLab 帳號流量與研究來源下載 |
 | `/finmind/` | `/finmind/api/status` | FinMind 共用帳號來源回補、新聞、本站請求流量及原始資料容量；九類歷史依明確順序，US 分鐘最後 |
+| `/news/` | `/news/api/status` | 新聞全文 owner 的唯讀心跳投影；已知網址、實存正文、獨立媒體限流／退避與條件估時；不提供正文 |
+| `/tej/` | `/tej/api/status` | TEJ 桌面／API 工作、完整欄位清冊、查驗範圍與條件估時 |
 | `/openbb/` | `/openbb/api/status`, `/openbb/api/history` | OpenBB 封存與歷史進度 |
 | `/data-monitor/` | `/data-monitor/api/summary`, `/data-monitor/api/details`, `/data-monitor/api/features`（完整相容回應：`status`） | 全資料來源的 receipt、覆蓋、freshness 與實存 Parquet 逐欄位清冊 |
 | `/traffic/` | `/traffic/api/status`, `/traffic/api/history` | 匿名請求延遲、分階段耗時、吞吐、錯誤率、快取容量及 90 天趨勢 |
@@ -57,6 +59,22 @@ services/public_dashboards/dashboard-core.js
 - 0050、2330 與 TXFR1 是 Buy-and-Hold 基準；跨日報酬以同一實體部位相對前一收盤計算。TXFR1 換月價差只調整外部現金，不製造投資報酬或槓桿。
 - API 時間一律附時區或明確標示 UTC；瀏覽器顯示轉為 `Asia/Taipei`。
 - 所有公開 API 回應根節點必須是 JSON object。錯誤回應不得被當成正常資料繼續渲染。
+
+### 價格發布與交易報告
+
+原始行情轉載與使用者的交易報告是不同的發布角色。`public_quote_display.json`
+的來源授權只適用指定 dataset／grain／price role；已取得 API 存取權或價格數值
+不構成行情公開轉載證據。官方開放日資料另列來源、行情日期和實際取得時間，
+不得以日開收價替代帳本的分鐘價、VWAP 或當時 bid／ask。
+
+使用者選擇公開的當沖／隔日沖模擬交易報告，由唯讀 endpoint 的可信 record context
+和 `owner_paper_transaction_report_v1` 開關共同決定。只公開已有股數、原始價格及
+有效交易紀錄時間的進出場；訊號執行價須對應同標的／模式／日期的持倉，成交事件
+不得用委託價格冒充。nested 行情不繼承交易報告權限，缺成交、缺時鐘或未來紀錄
+不補造。交易報告標為「模擬帳本成交・非券商成交」，這個使用者選擇不是行情
+轉載授權，也不是法律豁免認定。發布層不得改動持倉、費用、股數或損益。
+
+重測入口與查證範圍見 [價格發布分類修正](public_price_reports_2026-10-13.md)。
 
 ## 性能與更新契約
 
@@ -102,7 +120,7 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
 ```
 
 固定矩陣涵蓋 320／390 手機直向、手機橫向、768／1024 平板、720p／標準／HiDPI
-筆電、1080p、2K 與 ultrawide。每個 profile 必須跑完十頁，檢查文件／導覽／筆電表格
+筆電、1080p、2K 與 ultrawide。每個 profile 必須跑完已註冊頁面，檢查文件／導覽／筆電表格
 溢位、裁切與重疊操作元件、console／API 錯誤、代表性互動、延後明細及實際截圖。
 
 ### 2026-09-12／13 可重測的請求與快取邊界
@@ -212,7 +230,7 @@ node scripts/audit_public_dashboards_responsive.mjs 9229 \
 
 重測入口：`scripts/benchmark_dashboard_latency.py`（32 條路由、原始樣本、p50/p95/p99、
 first/new-session/warm-reuse、吞吐、JSON 正確性、隔離 SSE、可選原始 history profiler），
-以及 `scripts/audit_public_dashboards_browser.mjs`（十頁、Resource Timing、long tasks、
+以及 `scripts/audit_public_dashboards_browser.mjs`（已註冊頁面、Resource Timing、long tasks、
 更新按鈕、無重載、截圖、API／版面錯誤）。測速工具遇錯仍留 receipt，HTTP／瀏覽器驗收失敗
 回傳非零。HTTP timeout 是 connect/read inactivity timeout，不是單次完整下載的硬期限。
 
@@ -364,6 +382,43 @@ HTML 原文按 SHA256 保存在同層 `stock_futures_catalog_sources/`。
   支援 weak comparison、ETag list 與 `*`。304 不傳輸本文，也不附錯誤的零長度表示。
   規範依據：[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8.3.3)。
 
+### IPv4／IPv6 公網與自動重綁（2026-10-13）
+
+Windows Caddy 以 `tcp4/0.0.0.0`、`tcp6/[::]` 同時監聽，不綁動態 IP；
+admin／WSL backend 仍僅 localhost。DDNS 的 A／AAAA 更新與 IPv6 轉送由路由器
+既有 owner 負責，不新增 Windows Dynu updater。路由器以 host MAC 找目前的 IPv6，
+保留 firewall-start 的延後重套與兩分鐘 reconciliation。
+
+Windows 防火牆比對實際 Caddy listener 的 executable image；Scoop `current`
+junction 不是 WFP 的實際執行檔路徑。一次管理員安裝後，獨立 SYSTEM task 在
+開機及每分鐘檢查，只有不一致才原地修正專用 TCP 80／443 rule。沒有 listener、
+路徑超出已核准的 Caddy install root、多個 executable owner 或 ActiveStore
+readback 不符都保留失敗／等待收據，不刪舊 rule、不重啟交易服務。
+SYSTEM 入口置於 ACL 保護的 ProgramData，非管理員僅可讀；不得從 AppData／WSL
+執行日常 privileged task。既有 limited Caddy／WSL supervisor 保持不變。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\wsl.localhost\Ubuntu-26.04\root\stockAgent\scripts\request_windows_public_caddy_firewall.ps1" -InstallMaintenance
+```
+
+維護收據：`C:\ProgramData\StockAgentPublicFirewallMaintenance\logs\firewall-maintenance.json`。
+`success` 只證明該次防火牆 readback，不替代外部 HTTPS 驗收。可重測工具沿用
+`scripts/audit_public_ipv6.py`；`--provider globalping` 同時要求三地各自的 IPv4／IPv6、
+新 measurement、目前 DNS、HTTP 200 及有效 TLS。provider／DNS 失敗列為未驗證，
+不能因同主機 WSL IPv6 curl 失敗就宣稱 WAN 中斷。每次工具使用六個外部 probe，
+須遵守 provider 配額；沒有另設高頻 Internet polling。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_public_ipv6.py penguin72487.ddnsgeek.com \
+  --provider globalping --url-path /tw-day-trade/ --timeout-seconds 55 \
+  --output artifacts/benchmarks/dashboards/public-dual-stack-https.json
+```
+
+本輪證據在 `artifacts/benchmarks/dashboards/dual-stack-recovery-20261013/`。
+自然 Windows 冷開機、強制 WAN 換前綴與所有客戶端的可達性須另外驗證；
+ISP／電力／客戶端 DNS 問題不能被本機自癒機制保證消失。
+
 ## 抓取頁的請求與呈現邊界（2026-10-03）
 
 完整先行方案、逐頁清冊與本次證據見
@@ -407,11 +462,14 @@ run_fintech_python -m scripts.verify_acquisition_dashboards \
 這些是公開 UI、API、安全與工作量驗收；不代表 156 個來源標籤的底層歷史資料
 全部抓齊，也不代表交易或訓練就緒。
 
-## FinMind 估時與實際排程（2026-10-06，快照契約 12）
+## FinMind 估時與實際排程（2026-10-07，快照契約 13）
 
 FinMind 的每分鐘背景快照、公開欄位投影與 renderer 必須共同支援
 `scenario_projection_contract=1`。整體缺少某個情境的樣本，不可隱藏其他有效情境；
 未知或過期快照仍不提供可靠倒數。既有九類歷史順序與追新插隊規則不變。
+明確支援的能力契約，不應因生產者增加快照版本號而遭前後端的數字上限拒絕；
+未知能力仍拒絕。公開 status cache key 包含最新原子快照的 inode／mtime／size，
+新一代預估立即失效舊快取；瀏覽器只讀本機快照，不為顯示而呼叫 provider。
 
 - 實際工作、下一筆候選取自近期 worker 狀態，與 ETA 的條件試算分開。
   超過三分鐘的工作取樣不繼續宣稱正在下載。零待發的歷史階段顯示
@@ -422,7 +480,11 @@ FinMind 的每分鐘背景快照、公開欄位投影與 renderer 必須共同�
 - 分點本機彙總歸屬原始分點階段，既有在途／本機尾端仍需完成收據。
   本階段有量測工時但前置條件未知時，可以顯示本階段工時，不能顯示累計完成日。
 - 大型檔案含本機彙總的服務成本，不可套用到每一個小型追新請求。
-  追新按共用帳號限速／實發流量代理插入；兩類工作均不突破同一帳號配額。
+  追新優先使用近期已接受 JSON 請求的自有服務成本；樣本不足時標記代理或未知。
+  滾動一小時流量是實際發出量，不是不同工作類型的共同容量上限。
+  並行大型檔案使用相同配置至少兩批已接受的完整牆鐘耗時，含下載、驗證、
+  必要本機彙總與持久化；不得把單一檔案工時乘 worker 數冒充容量。
+  兩類工作均不突破同一帳號配額。
   追新模型請求、既有重試欠帳與歷史候選分開列出，欠帳不得重複計入分母。
 - 僅獨立重試的條件試算重用同一串行容量投影；有其他前置重試時仍重算。
   全域工時不可誤用最後一階段的本階段工時。重試耗盡紀錄與 25 GiB 容量保護保留。
@@ -431,6 +493,49 @@ FinMind 的每分鐘背景快照、公開欄位投影與 renderer 必須共同�
 數字／台北完成日期、已查驗標籤、九類進度及零瀏覽器 provider 呼叫；
 只有 API 200、列數正確或 spinner 不算估時驗收。
 當次證據：[FinMind 面板修復驗收](../artifacts/data_quality/finmind_web_schedule_eta_2026-10-06/acceptance.json)。
+最新版／並行吞吐驗收與量測邊界見
+[FinMind 並行管線報告](finmind_parallel_throughput_2026-10-07.md)。
+
+## 新聞全文進度頁（2026-10-08）
+
+`/news/` 沿用 FinMind CSS、共用導覽和 `dashboard-acquisition.js` 的摘要／原生
+折疊資訊層級；首頁與各面板導覽都有入口。`/news/api/status` 只讀 canonical
+`data_news_fulltext/status.json` 與來源設定，投影 `schema_version=1` 的 allowlist DTO。
+不開 SQLite writer、不掃正文／Parquet、不呼叫新聞、FinLab 或 FinMind API；
+正文、HTML、金鑰、授權文件、文章 URL、私人路徑與自由格式錯誤不公開。
+
+- 全域分子是實存正文唯一網址，分母是已清點唯一網址。股票關聯 metadata 列、
+  正文版本及 complete 狀態分開；這不是全網／所有歷史完整率。全來源清冊不截成
+  Top K，前端每頁 24 個，保留搜尋、分類、排序及最後一頁。
+- 原始 UTF-8 正文大小、owner HTTP 回應 bytes 與壓縮磁碟容量不同；總下載量未知。
+  流量是目前 owner 累計，不冒充 FinMind 的滾動一小時數字。
+  client 配置間隔／並行與實測請求間隔分開，未確認的官方總配額、餘額及重置時間
+  都不捏造。
+- 條件估時只以當前 owner 全經過時間（含等待／失敗）和耐久保存版本外推已知可
+  回補網址。獨立來源工時取最長，不相加；無有效速率、冷卻、磁碟等待、排空、
+  設定交接、停止、數量不一致或過期時不給有效 ETA。未知／被拒絕來源仍在，
+  `all_sources_eta_seconds=null`，不提供全網歷史完成承諾。
+- owner 的 `cycle_complete`／`waiting_next_due` 是正常續批／等待，不能誤報停止。
+  `draining`、`waiting_disk` 與終止的 CLI 狀態另列。快照年齡上限 180 秒；
+  前端每 15 秒唯讀刷新，隱藏頁停止輪詢，失敗保留數量與篩選、暫停 ETA 並有限退避。
+- API 為 `no-store`，伺服器 15 秒內共用已清理回應，來源快照／設定世代變更立即失效。
+  news cache 命名空間只留一個世代，避免每 15 秒累積數百個媒體清冊；
+  其他頁快取不受影響。API 沒有 stale grace，過期估時不可藉舊快取續用。
+
+相關測試為 `test/test_news_dashboard.py`，包括來源數量、秘密不外洩、owner 各階段、
+冷卻／過期／無效數字、全清冊／cache 世代，以及真實 Chromium 手機控制、
+更新失敗恢復和零 publisher 請求。部署後另跑：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/verify_news_dashboard.py \
+  --output-dir artifacts/data_quality/news_dashboard_20261008/public-v1
+```
+
+這個入口明確使用 `cpu-2d`，驗證桌機／平板／390 和 320 CSS-pixel 手機的實際值、
+原生控制、全部分頁、HTTP 唯讀邊界及截圖；不宣稱 GPU/WebGL 或全文品質／
+所有歷史完整性已驗收。當次部署與剩餘界限記於
+[新聞管線紀錄](finmind_news_schedule_eta_2026-09-29.md)。
 
 ## 修改與驗收清單
 
@@ -440,7 +545,7 @@ FinMind 的每分鐘背景快照、公開欄位投影與 renderer 必須共同�
 2. 對所有前端 JS 執行 `node --check`。
 3. 執行公開閘道、對應資料建置器與頁面 shell 測試。
 4. 驗證同一冷 cache key 的併發請求只建置一次、回應快取不超過筆數／bytes 上限，範圍切換只有最新請求可提交。
-5. 以 GET 驗證十個頁面與所有公開 API；檢查 status、Content-Type、gzip、ETag、CSP 及敏感欄位掃描。
+5. 以 GET 驗證本次影響的已註冊頁面與公開 API；檢查 status、Content-Type、gzip、ETag、CSP 及敏感欄位掃描。全站驗收仍須跑完全部註冊頁面與 API。
 6. 重啟前記錄交易引擎 PID／restart count，只重啟公開面板服務；部署後證明交易引擎 PID 未變。
 7. 分別量測冷請求、熱快取、本機閘道及公網端到端時間。網路／TLS 與應用建置時間要分開報告，不能用熱快取數字冒充冷路徑。
 8. 檢查本次啟動後 journal 無 traceback、fatal、watchdog 或持續重試。

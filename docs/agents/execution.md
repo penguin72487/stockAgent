@@ -51,6 +51,24 @@ Guidelines:
   pre-fetch and post-fetch source coverage. Never re-download a locally covered
   pair or substitute an interpolated/fabricated price.
 
+- A source-pinned completed-minute replay must not be rejected for lacking a
+  live Shioaji L1 `book_exchange_at`. Keep the live causal predicate unchanged;
+  admit historical entry/exit quotes only within the explicit replay contract,
+  exact minute clock, observed OHLC and shared volume budget. For an original
+  signal that never filled, `repair_tw_day_trade_flat_opening.py
+  --preserve-original-signal` can append a private, verified completed-session
+  repair without promoting/replacing the ledger or changing other modes.
+  Retain the original signal clock/weights and real repair time. Its committed
+  read model supersedes only the named failed attempt, not the audit journal.
+  Independently verify journal-prefix SHA, source pins, fills, 270 marks and
+  redacted public DTO economics with `verify_tw_day_trade_scoped_repair.py`.
+  After apply, an official collector can refresh its dated raw alias. Keep
+  pre-apply SHA gates strict; post-apply verification may accept only declared
+  eligibility aliases whose complete dated security/rule values match the
+  still-byte-pinned private normalized snapshot. Record both raw hashes and
+  never claim the refreshed raw bytes stayed unchanged.
+  Evidence: `artifacts/operations/tw_factorized_replay_20261014/acceptance.json`.
+
 - Every day-trade ledger replay/backfill must rebuild and validate one-minute
   curves before promotion. Each completed session and active paper mode must
   contain exactly 270 right-labelled points from 09:01 through 13:30; a daily

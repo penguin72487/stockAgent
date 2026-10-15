@@ -49,6 +49,103 @@ def test_stock_delivery_progress_handles_zero_elapsed(capsys) -> None:
     assert "rate=0.00/s eta=unknown" in capsys.readouterr().out
 
 
+def test_delivery_disclosures_do_not_query_unobservable_future_year(monkeypatch, tmp_path):
+    from datetime import datetime
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat("2026-10-08T14:30:00+08:00")
+    monkeypatch.setattr(entitlement_downloader, "datetime", Clock)
+    keys = []
+    monkeypatch.setattr(entitlement_downloader, "_fetch_stock_delivery_listing_with_market_fallback", lambda _r,key,_a: keys.append(key) or [])
+    rows = [{"market":"twse","symbol":"2330","date":date(year,9,1),"stock_dividend_ratio":0.1,"stock_terms_complete":True,"subscription_ratio":0.0} for year in (2025,2026)]
+    result, failures, counts, limited = entitlement_downloader._attach_exact_stock_delivery_dates(rows,raw_root=tmp_path,args=Namespace(max_list_requests=0,max_detail_requests=0),workers=1)
+    assert {key.roc_year for key in keys} == {114,115}
+    assert counts["stock_delivery_disclosure_through_year"] == 2026
+    assert all(row["stock_delivery_date"] is None for row in result)
+    assert not failures and not limited
+
+
+def test_entitlement_commit_fence_rejects_reference_or_universe_mutation(monkeypatch, tmp_path):
+    reference = tmp_path / "reference.parquet"
+    universe = tmp_path / "universe.csv"
+    reference.write_bytes(b"reference-v1")
+    universe.write_bytes(b"universe-v1")
+    ref_receipt = entitlement_downloader._file_receipt(reference)
+    uni_receipt = entitlement_downloader._file_receipt(universe)
+    monkeypatch.setattr(entitlement_downloader,"_verified_reference_receipt",entitlement_downloader._file_receipt)
+    check = entitlement_downloader._entitlement_input_change_errors
+    assert check(ref_receipt,uni_receipt) == []
+    reference.write_bytes(b"reference-v2")  # equal byte count still changes SHA
+    errors = check(ref_receipt,uni_receipt)
+    assert len(errors) == 1 and errors[0]["key"] == "reference"
+    assert errors[0]["stage"] == "input_dependency_changed"
+    reference.write_bytes(b"reference-v1")
+    universe.write_bytes(b"universe-v2")
+    errors = check(ref_receipt,uni_receipt)
+    assert len(errors) == 1 and errors[0]["key"] == "universe"
+
+
+@pytest.mark.parametrize("changed_input", ["reference", "universe", None])
+def test_collector_preserves_accepted_output_if_input_changes_during_build(
+    monkeypatch, tmp_path, changed_input,
+):
+    module = entitlement_downloader
+    reference_path = tmp_path / "reference.parquet"
+    universe_path = tmp_path / "universe.csv"
+    reference_path.write_bytes(b"reference-v1")
+    universe_path.write_bytes(b"universe-v1")
+    reference = pl.DataFrame({
+        "date": [date(2026, 10, 8)], "symbol": ["2330"],
+        "market": ["twse"], "event_type": ["息"], "reference_price": [990.0],
+    })
+    universe = pl.DataFrame({
+        "symbol": ["2330"], "security_type": ["stock"], "universe_market": ["twse"],
+    })
+    reference_receipt = module._file_receipt(reference_path)
+    universe_receipt = module._file_receipt(universe_path)
+    output = tmp_path / "tw_corporate_action_entitlements.parquet"
+    summary_path = output.with_suffix(".summary.json")
+    pl.DataFrame({"accepted_generation": [1]}).write_parquet(output)
+    summary_path.write_text('{"accepted_generation": 1}')
+    before = (output.read_bytes(), summary_path.read_bytes())
+    monkeypatch.setattr(module, "_configure_tw_public_rate_limiter", lambda _: 0.0)
+    monkeypatch.setattr(module, "_verified_reference_receipt", module._file_receipt)
+    monkeypatch.setattr(module, "_load_reference", lambda _: (
+        reference, universe, reference_receipt, universe_receipt,
+    ))
+    monkeypatch.setattr(module, "_requested_bulk_dividend_keys", lambda **_: [])
+    monkeypatch.setattr(module, "_recover_retained_bulk_rows", lambda *_, **__: [])
+    def finish_source_stage(rows, **_):
+        if changed_input is not None:
+            target = reference_path if changed_input == "reference" else universe_path
+            target.write_bytes(target.read_bytes().replace(b"v1", b"v2"))
+        return rows, [], {}, False
+    monkeypatch.setattr(module, "_attach_exact_stock_delivery_dates", finish_source_stage)
+    args = Namespace(
+        output_dir=tmp_path, request_interval=0.0, start_date="2026-10-08",
+        end_date="2026-10-08", max_list_requests=0, max_detail_requests=0,
+        workers=1, retained_source_dir=[], mode="history",
+    )
+    if changed_input is not None:
+        with pytest.raises(SystemExit) as caught:
+            module._run(args)
+        assert caught.value.code == 2
+        assert (output.read_bytes(), summary_path.read_bytes()) == before
+        attempt = json.loads(output.with_suffix(".attempt.summary.json").read_text())
+        assert not attempt["coverage_complete"]
+        assert attempt["failure_count"] == 1
+        assert attempt["failures"][0]["key"] == changed_input
+        assert attempt["failures"][0]["stage"] == "input_dependency_changed"
+        assert attempt["output_receipt"] is None
+    else:
+        module._run(args)
+        accepted = json.loads(summary_path.read_text())
+        assert accepted["coverage_complete"] and accepted["failure_count"] == 0
+        assert accepted["reference_receipt"] == reference_receipt
+        assert pl.read_parquet(output)["handling"].to_list() == ["avoid"]
+
+
 def test_stock_delivery_stage_timing_keeps_exact_event(monkeypatch, tmp_path) -> None:
     detail_key = StockDeliveryDetailKey(
         market="twse",
@@ -231,11 +328,10 @@ def test_http_200_denial_is_never_a_successful_receipt_and_can_recover(tmp_path,
     with pytest.raises(RuntimeError, match="throttle/access-denial"):
         module._cached_or_post(path, **kwargs)
     assert len(calls) == 1 and registrations == []
+    rejected = path.parent / "rejected" / f"{hashlib.sha256(denial).hexdigest()}.response"
+    assert rejected.read_bytes() == denial
     if not cached:
         assert not path.exists()
-    else:
-        rejected = path.parent / "rejected" / f"{hashlib.sha256(denial).hexdigest()}.response"
-        assert rejected.read_bytes() == denial
     body[0] = b'{"stat": "OK", "data": []}'
     assert module._cached_or_post(path, **kwargs) == body[0]
     assert path.read_bytes() == body[0] and registrations == [body[0]]
