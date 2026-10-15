@@ -708,6 +708,7 @@ def masked_score_entmax_scale_separated_cash_weights(
     *,
     short_mask: torch.Tensor | None = None,
     return_parts: bool = False,
+    dense_backward: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Choose sparse stock legs by score shape and cash by raw score strength.
 
@@ -761,6 +762,16 @@ def masked_score_entmax_scale_separated_cash_weights(
     weights = weights.masked_fill(~mask_bool, 0.0)
     gross = weights.abs().sum(dim=1, keepdim=True)
     weights = weights * torch.minimum(torch.ones_like(gross), gross.clamp_min(1.0).reciprocal())
+    if dense_backward and torch.is_grad_enabled():
+        # Declared surrogate: executed actions remain exactly sparse. A dense
+        # smooth allocator supplies discovery gradients before entmax support
+        # selection. Physical sub-lot secants provide the missing payoff signal.
+        dense_relative = torch.softmax(
+            shape.masked_fill(~mask_bool, torch.finfo(shape.dtype).min), dim=1
+        ).masked_fill(~mask_bool, 0.0)
+        dense_q = (dense_relative * scaled_evidence).sum(dim=1, keepdim=True)
+        dense = dense_relative * (legal_scores / scale) / (scale.reciprocal() + dense_q)
+        weights = weights.detach() + (dense - dense.detach())
     if not return_parts:
         return weights
     gross = weights.abs().sum(dim=1)

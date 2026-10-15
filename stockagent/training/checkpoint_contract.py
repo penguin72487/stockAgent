@@ -899,6 +899,8 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         ] = True
     if training.day_trade_sub_lot_recovery:
         fold_continuation_contract["day_trade_sub_lot_recovery"] = "one_lot_fifo_utility_v1"
+    if training.day_trade_dense_allocation_backward:
+        fold_continuation_contract["day_trade_dense_allocation_backward"] = "dense_softmax_adjoint_sparse_exact_forward_v1"
     if training.day_trade_training_annual_episodes:
         fold_continuation_contract["day_trade_training_annual_episodes"] = (
             day_trade_training_episode_contract(config)
@@ -1189,6 +1191,16 @@ def _trading_checkpoint_contract_schema_2(config: ExperimentConfig) -> dict[str,
     return contract
 
 
+def _evaluation_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
+    contract = asdict(config.evaluation)
+    # Preserve exact compatibility for inactive opt-in research controls.
+    for name in ("log_utility_risk_aversion", "log_utility_downside_aversion",
+                 "log_utility_benchmark_shortfall_aversion"):
+        if contract[name] == 0:
+            contract.pop(name)
+    return contract
+
+
 def _legacy_checkpoint_setting_contract(
     config: ExperimentConfig,
     active_model: Mapping[str, Any],
@@ -1206,7 +1218,7 @@ def _legacy_checkpoint_setting_contract(
         "loss_type": str(config.training.loss_type),
         "loss_portfolio_activation": str(config.training.loss_portfolio_activation),
         "trading": _trading_checkpoint_contract_schema_2(config),
-        "evaluation": asdict(config.evaluation),
+        "evaluation": _evaluation_checkpoint_contract(config),
         "multitask_loss": asdict(config.training.multitask_loss),
         "optimizer": {
             "learning_rate": float(config.training.learning_rate),
@@ -2032,6 +2044,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             _normalize_risk_objective(config.training.loss_type)
             in benchmark_sensitive_objectives
             or float(config.training.multitask_loss.volatility_regime_weight) > 0.0
+            or float(config.evaluation.log_utility_benchmark_shortfall_aversion) > 0.0
         )
         if execution_mode == "tw_day_trade" and benchmark_affects_optimizer:
             # Reporting-only benchmark repairs are checkpoint-compatible with
@@ -3062,7 +3075,7 @@ def _checkpoint_manifest(
         "data": data_contract,
         "model": model_contract,
         "training": _training_checkpoint_contract(config),
-        "evaluation": asdict(config.evaluation),
+        "evaluation": _evaluation_checkpoint_contract(config),
         "trading": _trading_checkpoint_contract(config),
         "walk_forward": walk_forward_contract,
     }
@@ -3122,7 +3135,7 @@ def _checkpoint_manifest(
         "data": data_contract,
         "model": schema_3_model_contract,
         "training": _training_checkpoint_contract_schema_3(config),
-        "evaluation": asdict(config.evaluation),
+        "evaluation": _evaluation_checkpoint_contract(config),
         "trading": _trading_checkpoint_contract_schema_3(config),
         "walk_forward": historical_walk_forward_contract,
     }

@@ -2551,6 +2551,7 @@ class TrainingConfig:
     # Backward-only one-lot utility for actions rejected by board-lot sizing.
     # Forward execution, validation and checkpoint selection stay exact.
     day_trade_sub_lot_recovery: bool = False
+    day_trade_dense_allocation_backward: bool = False
     # Match annual fresh-capital validation with independent calendar-year
     # training accounts. Never use this to reset a carrying/live account.
     day_trade_training_annual_episodes: bool = False
@@ -2847,6 +2848,9 @@ class EvaluationConfig:
     eval_log_utility_pre_log_power: float = 0.0
     eval_log_utility_periods_per_year: float = 252.0
     eval_log_utility_log_shift: float = 0.0
+    log_utility_risk_aversion: float = 0.0
+    log_utility_downside_aversion: float = 0.0
+    log_utility_benchmark_shortfall_aversion: float = 0.0
 
 
 @dataclass(slots=True)
@@ -5004,6 +5008,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "unlimited terminal day-trade liquidation requires the "
                 "scheduled 50%-minute execution policy"
             )
+    for name in ("log_utility_risk_aversion", "log_utility_downside_aversion",
+                 "log_utility_benchmark_shortfall_aversion"):
+        value = evaluation[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"evaluation.{name} must be nonnegative and finite")
+        if value and (training["loss_type"] != "log_utility"
+                      or trading["execution_mode"] != "tw_day_trade"
+                      or evaluation["gamma_turnover"] != 0):
+            raise ValueError("risk-sensitive log growth requires physical day-trade log_utility without extra turnover penalty")
+    if not isinstance(training["day_trade_dense_allocation_backward"], bool):
+        raise ValueError("day_trade_dense_allocation_backward must be boolean")
+    if training["day_trade_dense_allocation_backward"] and (
+            not training["day_trade_sub_lot_recovery"]
+            or training["model_name"] != "financial_transformer"
+            or phase_model_config["portfolio_output_mode"] != "score_entmax_scale_separated_cash"):
+        raise ValueError("dense allocation backward requires physical sub-lot recovery and the financial-transformer scale-separated allocator")
     if bool(training["day_trade_sub_lot_recovery"]):
         if (trading["execution_mode"] != "tw_day_trade"
                 or str(trading["tw_corporate_action_mode"]).lower() != "avoid"
@@ -5656,6 +5676,7 @@ def load_config(
                 "day_trade_optimizer_step_per_trajectory"
             ],
             day_trade_sub_lot_recovery=training_raw["day_trade_sub_lot_recovery"],
+            day_trade_dense_allocation_backward=training_raw["day_trade_dense_allocation_backward"],
             day_trade_training_annual_episodes=training_raw["day_trade_training_annual_episodes"],
             crypto_optimizer_step_per_trajectory=training_raw[
                 "crypto_optimizer_step_per_trajectory"

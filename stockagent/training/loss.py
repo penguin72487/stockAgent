@@ -1254,6 +1254,9 @@ def risk_aware_loss(
     gamma_turnover_budget: float = 0.0,
     objective: str = "sharpe",
     log_utility_periods_per_year: float = 252.0,
+    log_utility_risk_aversion: float = 0.0,
+    log_utility_downside_aversion: float = 0.0,
+    log_utility_benchmark_shortfall_aversion: float = 0.0,
     log_return_weights: Tensor | None = None,
     aux_outputs: dict[str, Tensor] | None = None,
     rank_ic_weight: float = 1.0,
@@ -2064,6 +2067,19 @@ def risk_aware_loss(
             )
             masked_returns = masked_returns + shadow * valid_f
         _loss_timer_stop("mask_apply", mask_start)
+
+        if (log_utility_risk_aversion or log_utility_downside_aversion
+                or log_utility_benchmark_shortfall_aversion):
+            from stockagent.training.log_growth_risk import risk_adjusted_log_growth
+            # Recovery above is exactly zero forward; risk preferences multiply
+            # its adjoint at the authoritative realised return, not a proxy PnL.
+            recovered = masked_returns
+            masked_returns = risk_adjusted_log_growth(
+                recovered, backtest.benchmark_returns.to(recovered) * valid_f,
+                risk_aversion=log_utility_risk_aversion,
+                downside_aversion=log_utility_downside_aversion,
+                benchmark_shortfall_aversion=log_utility_benchmark_shortfall_aversion,
+            ) * valid_f
 
         reduce_start = _loss_timer_start()
         mean_return = masked_returns.sum() / valid_count.clamp_min(1.0)

@@ -690,6 +690,7 @@ def build_model(
             head_layers=fin_cfg.head_layers,
             dropout=fin_cfg.dropout,
             default_temperature=fin_cfg.default_temperature,
+            entmax_dense_backward=config.training.day_trade_dense_allocation_backward,
             portfolio_mode=portfolio_mode,
             portfolio_activation=config.trading.portfolio_activation,
             portfolio_output_mode=fin_cfg.portfolio_output_mode,

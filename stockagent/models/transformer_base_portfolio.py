@@ -2202,6 +2202,7 @@ class TransformerBasePortfolioModel(nn.Module):
         head_layers: int = 1,
         dropout: float = 0.1,
         default_temperature: float = 1.0,
+        entmax_dense_backward: bool = False,
         portfolio_mode: str = "long_short",
         portfolio_activation: str = "identity",
         portfolio_output_mode: str = "activation_l1",
@@ -2223,6 +2224,7 @@ class TransformerBasePortfolioModel(nn.Module):
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
+        self.entmax_dense_backward = bool(entmax_dense_backward)
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.d_model = int(d_model)
@@ -4139,7 +4141,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
                 "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
                 "score_entmax_scale_separated_cash": (
-                    masked_score_entmax_scale_separated_cash_weights
+                    self._scale_separated_cash_weights
                 ),
             }[resolved_mode]
             cash_output = allocator(
@@ -4221,6 +4223,11 @@ class TransformerBasePortfolioModel(nn.Module):
             else:
                 reshaped[name] = value
         return reshaped
+
+    def _scale_separated_cash_weights(self, logits, mask, **kwargs):
+        return masked_score_entmax_scale_separated_cash_weights(
+            logits, mask, dense_backward=self.entmax_dense_backward and self.training, **kwargs
+        )
 
     def postprocess_action_logits(
         self,
@@ -4702,7 +4709,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
                     "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
                     "score_entmax_scale_separated_cash": (
-                        masked_score_entmax_scale_separated_cash_weights
+                        self._scale_separated_cash_weights
                     ),
                 }[self.portfolio_output_mode]
                 cash_output = allocator(
@@ -4846,7 +4853,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     "score_entmax_bounded_cash": masked_score_entmax_bounded_cash_weights,
                     "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
                     "score_entmax_scale_separated_cash": (
-                        masked_score_entmax_scale_separated_cash_weights
+                        self._scale_separated_cash_weights
                     ),
                 }[self.portfolio_output_mode]
                 cash_output = allocator(

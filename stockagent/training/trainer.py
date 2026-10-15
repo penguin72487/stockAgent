@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
+from stockagent.training.log_growth_risk import log_growth_risk_kwargs, risk_adjusted_log_growth
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 try:
@@ -4361,6 +4362,9 @@ def _loss_from_backtest_series(
     log_utility_pre_log_power: float = 0.0,
     log_utility_periods_per_year: float = 252.0,
     log_utility_log_shift: float = 0.0,
+    log_utility_risk_aversion: float = 0.0,
+    log_utility_downside_aversion: float = 0.0,
+    log_utility_benchmark_shortfall_aversion: float = 0.0,
 ) -> torch.Tensor:
     if sample_mask is None:
         valid_returns = strategy_returns
@@ -4378,7 +4382,12 @@ def _loss_from_backtest_series(
     objective_norm = objective.strip().lower()
     if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
         annual_utility = _annual_log_utility_eval_value(
-            valid_returns,
+            risk_adjusted_log_growth(
+                valid_returns, valid_benchmark,
+                risk_aversion=log_utility_risk_aversion,
+                downside_aversion=log_utility_downside_aversion,
+                benchmark_shortfall_aversion=log_utility_benchmark_shortfall_aversion,
+            ),
             pre_log_power=log_utility_pre_log_power,
             periods_per_year=log_utility_periods_per_year,
             log_shift=log_utility_log_shift,
@@ -4627,6 +4636,7 @@ def _loss_from_backtest_result(
         log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
         log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
         log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
+        **log_growth_risk_kwargs(config.evaluation),
     )
 
 
@@ -4826,6 +4836,7 @@ def _evaluated_backtest_loss(
         log_utility_periods_per_year=(
             config.evaluation.eval_log_utility_periods_per_year
         ),
+        **log_growth_risk_kwargs(config.evaluation),
     )
 
 
@@ -4853,6 +4864,9 @@ def _batched_loss_from_backtest_segments(
     log_utility_pre_log_power: float = 0.0,
     log_utility_periods_per_year: float = 252.0,
     log_utility_log_shift: float = 0.0,
+    log_utility_risk_aversion: float = 0.0,
+    log_utility_downside_aversion: float = 0.0,
+    log_utility_benchmark_shortfall_aversion: float = 0.0,
 ) -> torch.Tensor:
     """Compute one validation/test loss per fold without per-fold CPU round trips.
 
@@ -4892,6 +4906,9 @@ def _batched_loss_from_backtest_segments(
                 log_utility_pre_log_power=log_utility_pre_log_power,
                 log_utility_periods_per_year=log_utility_periods_per_year,
                 log_utility_log_shift=log_utility_log_shift,
+                log_utility_risk_aversion=log_utility_risk_aversion,
+                log_utility_downside_aversion=log_utility_downside_aversion,
+                log_utility_benchmark_shortfall_aversion=log_utility_benchmark_shortfall_aversion,
             )
             for idx in range(segment_count)
         ]
@@ -4920,6 +4937,14 @@ def _batched_loss_from_backtest_segments(
     annualizer = torch.sqrt(torch.as_tensor(252.0, device=device, dtype=calc_dtype))
 
     if objective_norm == "log_utility":
+        if (log_utility_risk_aversion or log_utility_downside_aversion
+                or log_utility_benchmark_shortfall_aversion):
+            b = benchmark_returns[gather_idx].to(dtype=calc_dtype) * valid_f
+            r = risk_adjusted_log_growth(
+                r, b, risk_aversion=log_utility_risk_aversion,
+                downside_aversion=log_utility_downside_aversion,
+                benchmark_shortfall_aversion=log_utility_benchmark_shortfall_aversion,
+            ) * valid_f
         manual_years = float(log_utility_pre_log_power)
         if manual_years > 0.0:
             years = torch.full_like(count, manual_years)
@@ -25277,6 +25302,7 @@ def _run_training_impl(
     loss_portfolio_activation = _training_loss_portfolio_activation(config)
     loss_min_trade_weight = _training_loss_min_trade_weight(config)
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
+    risk_loss_kwargs.update(log_growth_risk_kwargs(config.evaluation))
     risk_loss_kwargs["day_trade_sub_lot_recovery"] = bool(config.training.day_trade_sub_lot_recovery)
     risk_loss_kwargs["min_trade_weight"] = loss_min_trade_weight
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
@@ -27835,6 +27861,7 @@ def _run_training_impl(
                     log_utility_log_shift=(
                         config.evaluation.eval_log_utility_log_shift
                     ),
+                    **log_growth_risk_kwargs(config.evaluation),
                 )
                 epoch_zero_values = (
                     epoch_zero_losses.detach().float().cpu().reshape(-1).tolist()
@@ -29109,6 +29136,7 @@ def _run_training_impl(
                         log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
                         log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
                         log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
+                        **log_growth_risk_kwargs(config.evaluation),
                     )
                     val_loss_total = time.perf_counter() - val_loss_start
                 else:
@@ -29237,6 +29265,7 @@ def _run_training_impl(
                             log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
                             log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
                             log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
+                            **log_growth_risk_kwargs(config.evaluation),
                         )
                         test_loss_total = time.perf_counter() - test_loss_start
                     curve_test_total = time.perf_counter() - curve_test_start
