@@ -248,5 +248,50 @@ data_bybit_daily_synced
 data_crypto_historical_public/*
 data_crypto_historical_public/raw/wikimedia/Blockchain.json.gz
 data_bybit_prepacked_20260926/*
-json
-data_bybit
+/json
+/data_bybit
+
+# Git stores reproducible software, not node-local payloads or exported views.
+# Root anchoring preserves configs/data_sync, stockagent/data and test fixtures.
+/data_*/
+/artifacts_*/
+/reports/
+/.stignore
+/.stfolder
+.skill-sync-backups/
+
+# Private environment variants; the reviewed placeholder template stays public.
+.env.*
+!.env.example
+*.key
+
+# Generated training/data/database payloads, including accidental new locations.
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.parquet
+*.feather
+*.npy
+*.npz
+*.pkl
+*.joblib
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.zip
+
+# Small, reviewed fixtures are source inputs, not production datasets.
+!/test/fixtures/**/*.pt
+!/test/fixtures/**/*.parquet
+!/test/fixtures/**/*.npy
+!/test/fixtures/**/*.npz
+!/test/fixtures/**/*.zip
+
+# Editor/OS scratch, not the shared .vscode configuration.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
