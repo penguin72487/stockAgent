@@ -52,7 +52,7 @@ def _visible_text(node):
             _visible(value.parent)
 
 
-def _clocks(soup, scope, host):
+def _clocks(soup, scope, host, *, adapter_contract_version=1):
     publication = _one(soup, 'head > meta[name="pubdate"][content]', 'invalid_bulk_publication_clock')
     # The actual www page repeats itemprop=dateCreated/datePublished on this
     # same pubdate meta. HTML engines select different aliases; the unique
@@ -67,7 +67,9 @@ def _clocks(soup, scope, host):
                 _CLOCK.fullmatch(published) and _CLOCK.fullmatch(modified)):
             raise ValueError('source precision or offset not verified')
         pub, mod = datetime.fromisoformat(published), datetime.fromisoformat(modified)
-        if mod < pub:
+        if modified == '1970-01-01T08:00:00+08:00':
+            raise ValueError('observed source epoch placeholder, not revision evidence')
+        if adapter_contract_version == 1 and mod < pub:
             raise ValueError('revision precedes source release')
         if host == ETTODAY_HOSTS[0]:
             if 'c1' not in scope.parent.get('class', []):
@@ -97,6 +99,15 @@ def _clocks(soup, scope, host):
         {'kind': 'native_visible_release_minute', 'text': label.get_text(' ', strip=True)}]
     if native_datetime == '31':
         notices.append({'kind': 'source_invalid_datetime_attribute_preserved', 'text': '31'})
+    if adapter_contract_version == 2 and mod < pub:
+        # These are distinct source properties, not a universally ordered
+        # event sequence. Preserve both declarations after independent native
+        # and schema checks; do not infer why they differ or backdate public
+        # availability to an edit time. No historical PIT claim follows.
+        notices.append({'kind': 'source_modification_precedes_publication',
+            'declared_publication': published, 'declared_modification': modified,
+            'availability_backdated_to_modification': False,
+            'source_reason_inferred': False})
     return published, modified, notices
 
 
@@ -250,7 +261,9 @@ def _original_body(body):
     return cleaned, names, credit, captions
 
 
-def ettoday_visible_article(soup, *, page_url):
+def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1):
+    if type(adapter_contract_version) is not int or adapter_contract_version not in {1, 2}:
+        raise NewsError('article_identity_not_verified')
     identity = ettoday_request_identity(page_url)
     if identity is None:
         raise NewsError('article_identity_not_verified')
@@ -274,7 +287,7 @@ def ettoday_visible_article(soup, *, page_url):
     _visible_text(heading)
     _visible(body)
     cleaned, names, credit, captions = _original_body(body)
-    published, modified, notices = _clocks(soup, scope, host)
+    published, modified, notices = _clocks(soup, scope, host, adapter_contract_version=adapter_contract_version)
     notices += _schemas(soup, original, title, published, modified, names)
     notices.append({'kind': 'native_reporter_credit', 'text': credit})
     for node in scope.select(':scope > p.note'):

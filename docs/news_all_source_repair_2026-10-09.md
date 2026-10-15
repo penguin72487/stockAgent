@@ -1,5 +1,85 @@
 # 全來源新聞：下載器、CPU、故障範圍與完整性清冊
 
+## ETtoday 原生正文與獨立時間修復：2026-10-15 10:26，Asia/Taipei
+
+**已實作、載入並驗到正式正文；不是所有新聞／全歷史完成。**
+沿用 [既有新聞面板](https://penguin72487.dpdns.org/news/) 與唯一 canonical collector，
+沒有另開爬蟲、HTTP owner、資料庫或 GPU 工作。依工作偏好技能修共用入口，
+依資料品質流程分開核對文章身分、完整正文、署名、時鐘與落盤收據，沒有把成功率
+提升等同於放寬原件驗證。鉅亨仍第一優先，原背景順序與 CNA 暫緩均未改動。
+
+### 最少修改：來源 adapter 加共用恢復，不複製整條管線
+
+- 新增一個 ETtoday 純解析 adapter，接入共用 HTTP pool、REP、限速、排程、SQLite、
+  Parquet、原件與收據；只准已驗的 finance／www literal 文章命名空間。
+  其他 12 個已觀測 branded hosts 留為明確待驗版型，不猜 URL、不當作永久不存在。
+- 不再把 publisher `ETtoday新聞雲` 當成記者。保留原生多人署名順序，完整可見正文、
+  圖說、署名與著作權提示分開；不把摘要、推薦區、轉載或付費／會員內容充作正文。
+- 兩種實際 JSON 語法缺陷只做無損解析：description 內原始換行、唯一已觀測作者註解；
+  原始 HTTP bytes 不更動。finance 的 `datetime="31"` 保留為來源異常，發布時間另與
+  native pubdate、schema 及畫面可見分鐘交叉核對，不把 `31` 推成時鐘。
+- 發布與修改是不同來源屬性。Schema.org 分別定義
+  [首次發布](https://schema.org/datePublished) 與 [最後修改](https://schema.org/dateModified)；
+  本輪推論是「不能普遍要求修改一定晚於發布」，不是文件證明 ETtoday 的內部編稿原因。
+  原件確實出現修改早於發布，v2 分別核對並保留兩個原值、記錄順序異常，**不把
+  修改時間當成更早可用時間、不推測原因，也不宣稱歷史 PIT**。
+- clock-only 恢復共用 FTNN 已有的一次性方法。只有精確舊 capture、同一授權／來源範圍、
+  無正文／租約的時間失敗可以重排；原 attempts、due、error、觀測時間都保留。
+  durable marker 防止每次重啟再排。403／429、拒絕期限、權限與其他解析問題不清零。
+
+### 實測／正式驗收，與未完成邊界
+
+| 驗收邊界 | 已確認結果 |
+| --- | --- |
+| v1 原生接入完整新聞回歸 | 202 檔、11,169 passed；10,955 個既有 case ID 保留，新增 214 個原生案例 |
+| v2 時間／恢復相關語意回歸 | 13 檔、796 passed，34.81 秒；不是重新跑完整 11,169 suite |
+| v2 安裝後來源 scope | 338 passed，7.83 秒；與上一列重疊，不能相加為新案例數 |
+| 10:24:33 正式舊失敗恢復 | marker 涵蓋 2,364 筆，已有 23 筆正常提交正文；重排數不等於完成數 |
+| 10:25:52 本機／公網面板 API | 200／no-store／ABI2，均顯示 ETtoday 1,735 個正文 head／20,223 個已知 URL head |
+
+三份 private 原件在 v1／v2、兩個 HTML engine 的完整輸出相同，沒有升格成正式文章。
+正式抽驗 **4 個補回的 prepublication-modification 正文、4 個既有 ETtoday 正文、
+16 個跨來源保護 head**：原件、完整正文、作者、兩個來源時間、SHA、Parquet 與收據
+重播通過；其中四個新正文的兩種 HTML engine 輸出相同，來源時鐘沒有改寫。
+**1,528 個 preflight 成功 ETtoday head、67 個其他來源身分、21 份有限批次收據、
+31 個 provider 與 aggregate capacity 身分保持不變**；不重置已消耗診斷額度或限速學習。
+
+唯一 owner 正常收尾後重啟，載入 v2 的 owner 為 `84f91f7c717346459e2468eab55cc26a`、
+PID `1614903`，NRestarts=0。初始化 **102.72 秒**，其中 acceptance recovery **100.66 秒**；
+這是本次收據恢復的實測成本，與上一輪 178.48 秒不是受控效能比較，也不是零停機。
+初始化後確實正常抓到正文，不用 systemd active 或 HTTP200 代替下載完成。
+
+保留真正未通過的 native 身分／署名／時鐘與來源範圍結果；兩個 2012 issuer notices
+及 `1970` 修改 placeholder 不是已驗 own-reporter 歷史。個人／非商業聲明不是整站、
+第三方、重散布或訓練概括授權。其他 branded hosts、歷史版型與所有來源缺口仍需
+逐項驗證；不把「沒寫 adapter」或「這次回 404」當成已窮盡所有合法原始來源。
+本次只驗既有唯讀 API，沒有宣稱先前 **公網 Cloudflare 外部統計請求**的完整四寬度
+瀏覽器驗收已修復，該問題仍與 publisher／正文失敗分開記錄。
+
+### 全 936 個來源逐列保留，不反覆全庫重掃
+
+[完整工作清單 CSV](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/all_source_plan_after.csv)
+與 [分工／端點／下一步 JSON](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/all_source_plan_after.json)
+已用現行 v2 recipe／審閱與原工作順序重建。每個來源鍵都有資料量、來源角色、
+已宣告端點、解析方法、缺口與下一步；小來源走有限既有 URL 批次，不各開長駐服務。
+分類含既有 collector 20、既有有限批次 10、待審有限批次 666、待審 literal 原文連結 189、
+待審增量／歷史 34，以及其他需原站身分／授權 API／archive 的來源；**不是 936 家
+不同公司，也不是 666 個下載器已完成**。68 已註冊、868 未註冊鍵仍完整留在清冊。
+
+數量固定來自 **10:00:19** 一次性唯讀 inventory：**6,306,682 個已知 URL head、
+3,838,612 個正文 head**；重建 plan 使用較新的配置／審閱，不能混稱同一時間全新清點。
+該次全清點 **135.40 秒 wall／84.40 秒 CPU**，因此不為報表再重掃一次，面板持續
+讀 owner 的有界新快照。10:27:50 owner 的鉅亨 active missing 仍為 **190**（186 個有
+主文候選、4 個無已知主文）；此 live scope 不等於 inventory 的所有 missing URL。
+151 個 pending AMP 仍受已記錄 REP／期限限制；候選連結不是相同版本正文的證明。
+全來源完成時間仍未知，不以成功測試或目前速率捏造全歷史 ETA。
+
+證據：[v1 完整回歸](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/regression_after.json)、
+[v2 離線／796 測試與 capacity 證據](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/clock_v2_candidate.json)、
+[v2 正式收據／恢復驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/clock_v2_deployment_acceptance.json)、
+[v2 本機／公網進度](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/clock_v2_dashboard_acceptance.json)、
+[原始一次性清冊](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ettoday_20261015/inventory_after.json)。
+
 ## 共用時間狀態修復與全來源續排：2026-10-15 09:10，Asia/Taipei
 
 **本輪已修正並載入既有新聞面板；不是所有網站／全歷史完成。**

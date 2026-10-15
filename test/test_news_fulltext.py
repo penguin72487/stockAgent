@@ -529,7 +529,7 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         from downloader.news_fulltext_ettoday import ETTODAY_BODY_SELECTOR, ETTODAY_PATH_PATTERN
         assert ettoday.known_url_only and ettoday.acquisition_mode == 'continuous'
         assert ettoday.domains == ('ettoday.net',)
-        assert ettoday.embedded_article_layout == 'ettoday_visible_article_v1'
+        assert ettoday.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}
         assert ettoday.article_path_pattern == ETTODAY_PATH_PATTERN
         assert ettoday.authorization['kind'] == 'personal_research'
         assert ettoday.authorization['evidence_url'] == 'https://member.ettoday.net/clause_copyright.php7'

@@ -483,7 +483,7 @@ class PolicyRegistry:
                            and entry.get('article_path_pattern') == '^(?:/[a-z][a-z-]*/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$'
                            and entry.get('article_selectors') == [':scope > .tvbs-native-body']
                            and entry.get('exclude_selectors') == [])
-            ettoday_layout = (embedded == 'ettoday_visible_article_v1' and provider == 'ettoday'
+            ettoday_layout = (embedded in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'} and provider == 'ettoday'
                               and domains == ('ettoday.net',) and auth.get('kind') == 'personal_research'
                               and auth.get('evidence_url') == 'https://member.ettoday.net/clause_copyright.php7'
                               and known_url_only and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
@@ -645,7 +645,7 @@ class PolicyRegistry:
                 fingerprint_payload["embedded_article_adapter_contract_version"] = (
                     {"cmnews_visible_article_v1": 6, "einfo_next_post_v1": 2, "cnews_visible_article_v1": 4,
                      "ftv_visible_article_v1": 5, "nownews_visible_article_v1": 2,
-                     "ftnn_visible_article_v1": 2, "tvbs_visible_article_v2": 2,
+                     "ftnn_visible_article_v1": 2, "tvbs_visible_article_v2": 2, "ettoday_visible_article_v2": 2,
                      "tainan_visible_news_v1": 2, "voa_reviewed_private_article_v2": 3,
                      "taichung_visible_news_v1": 2}.get(embedded, 1))
             if tainan_layout:
@@ -696,6 +696,14 @@ class PolicyRegistry:
                 # all original source/auth/scope/HTTP fields remain binding.
                 capacity_payload = dict(fingerprint_payload)
                 capacity_payload['entry'] = {**capture_entry, 'embedded_article_layout': 'tvbs_visible_article_v1'}
+                capacity_payload['embedded_article_adapter_contract_version'] = 1
+                capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+            elif ettoday_layout and embedded == 'ettoday_visible_article_v2':
+                # Only the independently declared clock interpretation changes.
+                # Keep the entire previous source/auth/scope/HTTP identity;
+                # do not reset learned pacing, refusals or diagnostic budgets.
+                capacity_payload = dict(fingerprint_payload)
+                capacity_payload['entry'] = {**capture_entry, 'embedded_article_layout': 'ettoday_visible_article_v1'}
                 capacity_payload['embedded_article_adapter_contract_version'] = 1
                 capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
             bulk_fingerprint = ""
@@ -1162,9 +1170,10 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         from downloader.news_fulltext_tvbs import tvbs_visible_article
         article, article_scope = tvbs_visible_article(soup, page_url=page_url,
             adapter_contract_version=2 if source.embedded_article_layout.endswith('_v2') else 1)
-    elif source.embedded_article_layout == 'ettoday_visible_article_v1':
+    elif source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
         from downloader.news_fulltext_ettoday import ettoday_visible_article
-        article, article_scope = ettoday_visible_article(soup, page_url=page_url)
+        article, article_scope = ettoday_visible_article(soup, page_url=page_url,
+            adapter_contract_version=2 if source.embedded_article_layout.endswith('_v2') else 1)
     if source.required_license_url_prefix and not license_basis and not any(url.startswith(source.required_license_url_prefix) for url in licenses):
         raise NewsError("article_license_not_verified")
     canonical = _select_first(soup, 'link[rel="canonical"]')

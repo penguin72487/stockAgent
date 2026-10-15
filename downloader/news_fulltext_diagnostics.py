@@ -223,7 +223,7 @@ def retain_identity_metadata(queue, row, error, context):
         if provider == 'tvbs' and source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
             from downloader.news_fulltext_tvbs import tvbs_validation_metadata
             facts['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=context.response.url)
-        if provider == 'ettoday' and source.embedded_article_layout == 'ettoday_visible_article_v1':
+        if provider == 'ettoday' and source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
             from downloader.news_fulltext_ettoday import ettoday_validation_metadata
             facts['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=context.response.url)
         stamp = clock.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + uuid.uuid4().hex[:8]

@@ -134,6 +134,16 @@ def tvbs_native_v2_parser_repair(source, previous_capture):
         and previous_capture != source.data_fingerprint)
 
 
+def ettoday_clock_only_parser_repair(source, previous_capture):
+    """Only ETtoday's exact prior source/scope; no fresh retry permission."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v2'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.http_capacity_source_fingerprint)
+        and previous_capture == source.http_capacity_source_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
 def discovery_selection_sql(statement, readiness_rows):
     """Same full selection, with a bounded sparse/dense physical plan choice.
 
@@ -957,6 +967,7 @@ class NewsQueue:
                                          prior_parsers.get('source_parser_repair_fingerprint:cnyes'))
         self.recheck_ftnn_release_clocks(prior_sources.get('source_capture_fingerprint:ftnn'))
         self.recheck_tvbs_native_credits_and_clocks(prior_sources.get('source_capture_fingerprint:tvbs'))
+        self.recheck_ettoday_independent_release_revision_clocks(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_changed_feed_parser(prior_sources, prior_parsers)
         self.recheck_taiwanhot_native_views(prior_sources.get('source_capture_fingerprint:taiwanhot'),
                                           prior_parsers.get('source_parser_repair_fingerprint:taiwanhot'))
@@ -1002,6 +1013,7 @@ class NewsQueue:
                     if (parser_changed and source.provider != 'cnyes'
                             and not ftnn_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ftnn'))
                             and not tvbs_native_v2_parser_repair(source, prior_sources.get('source_capture_fingerprint:tvbs'))
+                            and not ettoday_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
                             and not (source.provider == 'taiwanhot'
                                      and source.embedded_article_layout == 'taiwanhot_visible_article_v3')):
                         # Retry parser failures only after a parser repair,
@@ -1150,18 +1162,38 @@ class NewsQueue:
         source = self.registry.sources.get('ftnn')
         if not ftnn_clock_only_parser_repair(source, previous_capture):
             return
-        marker = 'ftnn_native_release_revision_recheck_v1:' + source.data_fingerprint
+        self._recheck_native_release_revision_clocks(source, previous_capture,
+            'ftnn_native_release_revision_recheck_v1:',
+            lambda url: bool(re.fullmatch(r'https://www[.]ftnn[.]com[.]tw/news/[1-9][0-9]*', url)))
+
+    def recheck_ettoday_independent_release_revision_clocks(self, previous_capture):
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_clock_only_parser_repair(source, previous_capture):
+            return
+        from downloader.news_fulltext_ettoday import ettoday_request_identity
+        self._recheck_native_release_revision_clocks(source, previous_capture,
+            'ettoday_independent_release_revision_recheck_v2:',
+            lambda url: ettoday_request_identity(url, requested=True) is not None)
+
+    def _recheck_native_release_revision_clocks(self, source, previous_capture, marker_prefix, admitted_url):
+        """Same one-time clock repair for exact, unchanged approved scopes.
+
+        Keep each original attempts/due/error/clock, every body, refusal and
+        lease. A replayed marker does no work; only real normal HTTP acceptance
+        can turn a retry into a stored article. This grants no new raw budget.
+        """
+        marker = marker_prefix + source.data_fingerprint
         if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
             return
         with self.db:
             rows = [dict(row) for row in self.db.execute('SELECT id,url,attempts,due,last_checked_at_utc '
-                'FROM articles INDEXED BY dispatch WHERE provider=\'ftnn\' '
+                'FROM articles INDEXED BY dispatch WHERE provider=? '
                 "AND state='invalid_bulk_publication_clock' AND error_code='invalid_bulk_publication_clock' "
                 'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
-                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url')]
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url', (source.provider,))]
             repaired = []
             for row in rows:
-                if not re.fullmatch(r'https://www[.]ftnn[.]com[.]tw/news/[1-9][0-9]*', row['url']):
+                if not admitted_url(row['url']):
                     continue
                 count = self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount
                 if count != 1:
@@ -1174,7 +1206,7 @@ class NewsQueue:
                 'rows': repaired, 'attempts_due_error_and_observation_preserved': True,
                 'refusals_leases_stored_heads_finite_cohorts_or_unrelated_failures_changed': False,
                 'accepted_as_bodies': False}, sort_keys=True)))
-            self.metrics.count('ftnn', 'native_release_revision_clock_rechecks', len(repaired))
+            self.metrics.count(source.provider, 'native_release_revision_clock_rechecks', len(repaired))
 
     def recheck_tvbs_native_credits_and_clocks(self, previous_capture):
         """One normal retry of proved v1 parser defects, preserving evidence.

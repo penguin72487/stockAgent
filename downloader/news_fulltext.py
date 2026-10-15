@@ -185,7 +185,7 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         from downloader.news_fulltext_tvbs import tvbs_request_identity
         if tvbs_request_identity(request_url, requested=True) is None:
             raise NewsError('unsupported_article_path')
-    elif source.embedded_article_layout == 'ettoday_visible_article_v1':
+    elif source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
         from downloader.news_fulltext_ettoday import ettoday_request_identity
         if ettoday_request_identity(request_url, requested=True) is None:
             raise NewsError('unsupported_article_path')
@@ -199,10 +199,10 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     if response.status == 304:
         return None
     _require_article_response(response, source)
-    if source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2', 'ettoday_visible_article_v1'}:
+    if source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2', 'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
         # Transport may upgrade a literal HTTP link; it cannot replace its
         # article/category/host with another currently available report.
-        if source.embedded_article_layout == 'ettoday_visible_article_v1':
+        if source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
             from downloader.news_fulltext_ettoday import ettoday_request_identity as request_identity
         else:
             from downloader.news_fulltext_tvbs import tvbs_request_identity as request_identity
