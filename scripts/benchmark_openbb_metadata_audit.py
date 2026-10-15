@@ -117,7 +117,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--source', type=Path, default=ROOT / 'data_openBB')
-    parser.add_argument('--baseline-revision', default='ef3d4bb55ca8e35160ecbc150432a08f5afbc136')
+    parser.add_argument('--baseline-revision', default='aacc15783907ccb83093dbd8ae78f0745d927a8d')
     parser.add_argument('--prepare-only', action='store_true')
     parser.add_argument('--worker', choices=('baseline', 'candidate'))
     parser.add_argument('--output', type=Path)
