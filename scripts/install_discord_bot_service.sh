@@ -11,18 +11,26 @@ RETRY_TIMER_NAME="stockagent-discord-artifact-retry.timer"
 POSTCLOSE_CACHE_SERVICE_NAME="stockagent-discord-postclose-cache.service"
 HEAVY_DATA_SLICE_NAME="stockagent-heavy-data.slice"
 START_NOW=true
+RETRY_ONLY=false
 
-if [[ "${1:-}" == "--no-start" ]]; then
-  START_NOW=false
-elif [[ -n "${1:-}" ]]; then
-  echo "Usage: sudo bash scripts/install_discord_bot_service.sh [--no-start]" >&2
-  exit 2
-fi
+for option in "$@"; do
+  case "$option" in
+    --no-start) START_NOW=false ;;
+    --retry-only) RETRY_ONLY=true ;;
+    *) echo "Usage: sudo bash scripts/install_discord_bot_service.sh [--no-start] [--retry-only]" >&2; exit 2 ;;
+  esac
+done
 if (( EUID != 0 )); then
   echo "[discord-service] root privileges are required" >&2
   exit 2
 fi
-for unit_name in "$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME"; do
+unit_names=("$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME")
+if [[ "$RETRY_ONLY" == true ]]; then
+  # Scoped maintenance deployment must not rewrite/restart Gateway, market,
+  # full-history or source owners, nor hide a failed inotify path.
+  unit_names=("$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME")
+fi
+for unit_name in "${unit_names[@]}"; do
   if [[ ! -f "$REPO_ROOT/deploy/systemd/$unit_name.in" ]]; then
     echo "[discord-service] unit template is missing: $unit_name.in" >&2
     exit 2
@@ -51,32 +59,30 @@ escape_replacement() {
 
 rendered_dir="$(mktemp -d)"
 trap 'rm -rf -- "$rendered_dir"' EXIT
-for unit_name in "$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME"; do
+rendered_units=()
+for unit_name in "${unit_names[@]}"; do
   sed \
     -e "s|@REPO_ROOT@|$(escape_replacement "$REPO_ROOT")|g" \
     -e "s|@SERVICE_USER@|$(escape_replacement "$SERVICE_USER")|g" \
     -e "s|@SERVICE_GROUP@|$(escape_replacement "$SERVICE_GROUP")|g" \
     -e "s|@SERVICE_HOME@|$(escape_replacement "$SERVICE_HOME")|g" \
     "$REPO_ROOT/deploy/systemd/$unit_name.in" > "$rendered_dir/$unit_name"
+  rendered_units+=("$rendered_dir/$unit_name")
 done
 
-systemd-analyze verify \
-  "$rendered_dir/$SERVICE_NAME" \
-  "$rendered_dir/$MAINTENANCE_SERVICE_NAME" \
-  "$rendered_dir/$MAINTENANCE_TIMER_NAME" \
-  "$rendered_dir/$MAINTENANCE_PATH_NAME" \
-  "$rendered_dir/$RETRY_SERVICE_NAME" \
-  "$rendered_dir/$RETRY_TIMER_NAME" \
-  "$rendered_dir/$POSTCLOSE_CACHE_SERVICE_NAME" \
-  "$rendered_dir/$HEAVY_DATA_SLICE_NAME"
-install -m 0644 "$rendered_dir/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
-install -m 0644 "$rendered_dir/$MAINTENANCE_SERVICE_NAME" "/etc/systemd/system/$MAINTENANCE_SERVICE_NAME"
-install -m 0644 "$rendered_dir/$MAINTENANCE_TIMER_NAME" "/etc/systemd/system/$MAINTENANCE_TIMER_NAME"
-install -m 0644 "$rendered_dir/$MAINTENANCE_PATH_NAME" "/etc/systemd/system/$MAINTENANCE_PATH_NAME"
-install -m 0644 "$rendered_dir/$RETRY_SERVICE_NAME" "/etc/systemd/system/$RETRY_SERVICE_NAME"
-install -m 0644 "$rendered_dir/$RETRY_TIMER_NAME" "/etc/systemd/system/$RETRY_TIMER_NAME"
-install -m 0644 "$rendered_dir/$POSTCLOSE_CACHE_SERVICE_NAME" "/etc/systemd/system/$POSTCLOSE_CACHE_SERVICE_NAME"
-install -m 0644 "$rendered_dir/$HEAVY_DATA_SLICE_NAME" "/etc/systemd/system/$HEAVY_DATA_SLICE_NAME"
+systemd-analyze verify "${rendered_units[@]}"
+for unit_name in "${unit_names[@]}"; do
+  install -m 0644 "$rendered_dir/$unit_name" "/etc/systemd/system/$unit_name"
+done
+if [[ "$RETRY_ONLY" == true ]]; then
+  systemctl daemon-reload
+  systemctl enable "$RETRY_TIMER_NAME"
+  if [[ "$START_NOW" == true ]]; then
+    systemctl restart "$RETRY_TIMER_NAME"
+  fi
+  echo "[discord-service] scoped_retry_install=true gateway_restarted=false path_restarted=false"
+  exit 0
+fi
 chmod 0600 "$REPO_ROOT/services/discord_bot/.env"
 chmod 0755 \
   "$REPO_ROOT/scripts/run_discord_bot.sh" \

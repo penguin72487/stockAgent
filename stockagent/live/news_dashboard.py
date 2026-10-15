@@ -17,26 +17,14 @@ from urllib.parse import urlsplit
 from stockagent.data.news_source_catalog import (
     configuration_paths, load_news_configuration, load_source_review_ledger,
     planning_review_path, source_role, classify_news_outcomes,
-    NEWS_OUTCOME_CLASSIFICATION_VERSION,
+    NEWS_OUTCOME_CLASSIFICATION_VERSION, NEWS_OUTCOME_STATES,
 )
 
 
 MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_AGE_SECONDS = 180
 _ID = re.compile(r"^(?:[a-z][a-z0-9_]{0,63}|unregistered:[a-z0-9.-]{1,253})$")
-_STATES = frozenset({
-    "pending", "inflight", "complete", "retry", "retry_cooldown",
-    "awaiting_authorization", "waiting_cohort", "unsupported_article_path", "body_not_found",
-    "article_attribution_not_verified", "article_title_not_verified", "article_license_not_verified",
-    "article_identity_not_verified", "article_rights_not_verified", "article_rights_or_scope_excluded",
-    "robots_disallowed", "source_not_allowed", "authorization_expired",
-    "paywall", "not_found", "gone", "response_too_large",
-    "paywall_or_login", "access_challenge", "robots_access_challenge", "robots_not_plain_rules", "robots_redirect_refused",
-    "source_body_removed", "source_not_found", "source_body_image_only", "source_body_embedded_only", "source_article_empty_template",
-    "source_body_quote_only", "source_article_test_only",
-    "source_document_landing_page",
-    "pdf_image_only_or_body_not_found",
-})
+_STATES = NEWS_OUTCOME_STATES
 _READY_STATES = {"pending", "inflight", "retry", "retry_cooldown"}
 # Match the canonical owner's actual cycle/daemon/CLI states. A completed
 # cycle in a warm daemon is not a stopped download service. Conversely,

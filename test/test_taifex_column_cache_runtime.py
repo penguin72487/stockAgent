@@ -144,6 +144,113 @@ def test_allocator_acceptance_requires_complete_idle_warm_output_and_installed_v
         verifier.accepted_code(receipt)
 
 
+@pytest.fixture
+def source_proof_acceptance(tmp_path, monkeypatch):
+    root, fixture = tmp_path / "repo", tmp_path / "fixture"
+    source = root / "source"
+    source.mkdir(parents=True)
+    (fixture / "state").mkdir(parents=True)
+    frozen_source = fixture / "state/marks.jsonl"
+    frozen_source.write_bytes(b"source\n")
+    size = frozen_source.stat().st_size
+    names = ("helper.py", "projector.py", "selector.py",
+             "scripts/benchmark_taifex_source_proof_memo.py",
+             "scripts/benchmark_taifex_history_selection.py",
+             "scripts/benchmark_taifex_history_columns.py", "downloader/artifact_io.py",
+             "polars/__init__.py")
+    paths = [root / name for name in names] + [fixture.parent / "original_column_cache.py"]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# measured implementation\n")
+    monkeypatch.setattr(verifier, "ROOT", root)
+    monkeypatch.setattr(verifier, "SOURCE", source)
+    monkeypatch.setattr(verifier, "cache", SimpleNamespace(__file__=str(paths[0])))
+    keys = ("1h", "1d", "1w", "1mo", "1q", "1y", "all")
+    monkeypatch.setattr(verifier, "dashboard", SimpleNamespace(__file__=str(paths[1]),
+                                                              HISTORY_RANGE_SECONDS=dict.fromkeys(keys, 0)))
+    monkeypatch.setattr(verifier, "selection", SimpleNamespace(__file__=str(paths[2])))
+    monkeypatch.setattr(verifier, "pl", SimpleNamespace(__file__=str(paths[7])))
+    atomic_write_json(fixture / "fixture.json", {"source": str(source)})
+    atomic_write_json(fixture.parent / "original-code-proof.json", {"sha256": verifier.sha(paths[-1])})
+    expected = dict.fromkeys(keys, "a" * 64)
+    raw_path = fixture.parent / "raw.json"
+    atomic_write_json(raw_path, {"variant": "baseline", "range": "1d", "provider_calls": 0,
+                                "production_writes": False, "output_sha256": expected["1d"]})
+    order = ["baseline", "candidate", "candidate", "baseline"] * 2
+    trials = []
+    for index, variant in enumerate(order):
+        proofs = [{"path": str(frozen_source), "kind": "build", "bytes": size}]
+        if variant == "baseline":
+            proofs.append({"path": str(frozen_source), "kind": "verify", "bytes": size})
+        trials.append({"trial": index, "phase": "update", "variant": variant,
+            "threads": 4, "output_sha256": expected.copy(), "provider_calls": 0,
+            "model_forward_calls": 0, "production_writes": False,
+            "durable_complete_readback": True, "warm_exact_output_parity": True,
+            "proofs": proofs, "proof_bytes": sum(row["bytes"] for row in proofs),
+            "warm_proof_bytes": 0, "wall_seconds": 10. if variant == "baseline" else 9.,
+            "cpu_seconds": 20. if variant == "baseline" else 16., "rss_peak_bytes": 100.,
+            "warm_wall_seconds": 1., "warm_cpu_seconds": 1.,
+            "ranges": [{"range": key, "rows": 1, "json_bytes": 100} for key in keys]})
+    metrics = ("wall_seconds", "cpu_seconds", "rss_peak_bytes", "proof_bytes",
+               "warm_wall_seconds", "warm_cpu_seconds", "warm_proof_bytes")
+    medians = {variant: {metric: trials[index][metric] for metric in metrics}
+               for index, variant in enumerate(("baseline", "candidate"))}
+    value = {"contract": verifier.SOURCE_PROOF_CONTRACT, "fixture": str(fixture),
+        "trials": trials, "trial_order": order, "medians": medians, "balanced_abba": True,
+        "source_unchanged": True, "code_stable": True, "exact_output_parity": True,
+        "model_forward_calls": 0, "provider_calls": 0, "production_writes": False,
+        "code_sha256": {str(path): verifier.sha(path) for path in paths},
+        "independent_raw_1d": {"path": str(raw_path), "sha256": verifier.sha(raw_path),
+                               "output_sha256": expected["1d"]}}
+    receipt = root / "acceptance.json"
+    atomic_write_json(receipt, value)
+    return receipt, value, paths
+
+
+def test_source_proof_acceptance_binds_complete_trials_original_raw_code_and_gain(source_proof_acceptance):
+    receipt, value, paths = source_proof_acceptance
+    assert verifier.accepted_code(receipt) == value["code_sha256"]
+    paths[-1].write_text("# changed original control\n")
+    with pytest.raises(ValueError, match="accepted_measurement"):
+        verifier.accepted_code(receipt)
+
+
+@pytest.mark.parametrize("damage", ["missing_trial", "summary_only", "no_source_proof",
+    "missing_range", "wrong_threads", "warm_hash", "raw_mismatch", "provider_call",
+    "durable_failure", "reordered", "warm_regression"])
+def test_source_proof_acceptance_rejects_partial_or_unsupported_measurements(source_proof_acceptance, damage):
+    receipt, value, _ = source_proof_acceptance
+    candidate = value["trials"][1]
+    if damage == "missing_trial":
+        value["trials"].pop()
+    elif damage == "summary_only":
+        value["medians"]["candidate"]["cpu_seconds"] = 1.
+    elif damage == "no_source_proof":
+        candidate["proofs"].clear()
+    elif damage == "missing_range":
+        candidate["ranges"].pop()
+    elif damage == "wrong_threads":
+        candidate["threads"] = 16
+    elif damage == "warm_hash":
+        candidate["warm_proof_bytes"] = 1
+    elif damage == "raw_mismatch":
+        value["independent_raw_1d"]["output_sha256"] = "b" * 64
+    elif damage == "provider_call":
+        candidate["provider_calls"] = 1
+    elif damage == "durable_failure":
+        candidate["durable_complete_readback"] = False
+    elif damage == "reordered":
+        value["trials"][0], value["trials"][1] = value["trials"][1], value["trials"][0]
+    elif damage == "warm_regression":
+        for row in value["trials"]:
+            if row["variant"] == "candidate":
+                row["warm_cpu_seconds"] = 100.
+        value["medians"]["candidate"]["warm_cpu_seconds"] = 100.
+    atomic_write_json(receipt, value)
+    with pytest.raises(ValueError, match="accepted_measurement"):
+        verifier.accepted_code(receipt)
+
+
 @pytest.mark.parametrize("damage", ["missing_trial", "summary_only", "short_idle", "wrong_pool",
     "wrong_allocator", "warm_parity", "partial_curve", "idle_memory_gain", "whole_wall_regression", "warm_read_delay"])
 def test_allocator_rejects_partial_unproven_or_excessive_cost_measurements(allocator_acceptance, damage):
@@ -212,6 +319,63 @@ def test_runtime_requires_new_owner_real_column_refresh_and_untouched_trading_ow
     assert value["source_mutations"] is False and value["service_restart_requested"] is False
     assert value["provider_calls"] == value["gpu_calls"] == 0
     assert calls == ["readonly-api"]
+
+
+@pytest.mark.parametrize("damage", [None, "old_refresh", "newer_code"])
+def test_source_proof_runtime_requires_refresh_after_new_process_and_older_bound_code(
+    runtime, tmp_path, monkeypatch, damage
+):
+    baseline, _, _, column, _, _ = runtime
+    root = tmp_path / "repo"
+    code = root / "scripts/benchmark_taifex_source_proof_memo.py"
+    code.parent.mkdir(parents=True)
+    code.write_text("# bound code\n")
+    start = code.stat().st_mtime_ns + 1
+    column["receipt_mtime_ns"] = start + 1
+    hashes = {str(code): "fixed"}
+    value = verifier.metadata(baseline)
+    value.update(code_sha256=hashes, prewarm_polars_threads=4,
+                 prewarm_allocator_conf=verifier.ALLOCATOR_CONF)
+    atomic_write_json(baseline, value)
+    monkeypatch.setattr(verifier, "ROOT", root)
+    monkeypatch.setattr(verifier, "accepted_code", lambda _: hashes)
+    monkeypatch.setattr(verifier, "owner_polars_limit", lambda _: 4)
+    monkeypatch.setattr(verifier, "owner_allocator_override", lambda _: verifier.ALLOCATOR_CONF)
+    monkeypatch.setattr(verifier, "owner_start_wall_ns", lambda _: start)
+    if damage == "old_refresh":
+        column["receipt_mtime_ns"] = start - 1
+    elif damage == "newer_code":
+        start = code.stat().st_mtime_ns - 1
+    output = tmp_path / "readback.json"
+    args = ["--acceptance", "unused", "--baseline", str(baseline), "--output", str(output)]
+    if damage is None:
+        verifier.main(args)
+        assert verifier.metadata(output)["owner_start_wall_ns"] == start
+    else:
+        with pytest.raises(ValueError, match="actual_new_owner|newer_than_display"):
+            verifier.main(args)
+        assert verifier.metadata(output)["state"] == "failed_readback"
+
+
+@pytest.mark.parametrize("damage", [None, "changed_owner", "future_start", "no_start"])
+def test_owner_start_readback_fences_exact_systemd_generation(monkeypatch, damage):
+    owner = {"MainPID": "123", "InvocationID": "current"}
+    fields = {**owner, "ExecMainStartTimestampMonotonic": "500"}
+    if damage == "changed_owner":
+        fields["InvocationID"] = "other"
+    elif damage == "future_start":
+        fields["ExecMainStartTimestampMonotonic"] = "1500"
+    elif damage == "no_start":
+        fields["ExecMainStartTimestampMonotonic"] = "0"
+    monkeypatch.setattr(verifier.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(stdout="\n".join(f"{key}={value}" for key, value in fields.items())))
+    monkeypatch.setattr(verifier.time, "monotonic_ns", lambda: 1_000_000)
+    monkeypatch.setattr(verifier.time, "time_ns", lambda: 10_000_000)
+    if damage is None:
+        assert verifier.owner_start_wall_ns(owner) == 9_500_000
+    else:
+        with pytest.raises(ValueError, match="owner_changed|start_time"):
+            verifier.owner_start_wall_ns(owner)
 
 
 @pytest.mark.parametrize("pool", [4, 16, None])

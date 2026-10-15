@@ -2393,14 +2393,76 @@ def fetch_shared_day_trade_stock_snapshots(
 
 
 class SharedDayTradeQuoteBroker:
-    """One off-loop worker in the existing engine process; no extra login."""
+    """One off-loop worker in the existing engine process; no extra login.
 
-    def __init__(self, state_dir: str | Path):
+    The autonomous owner receives requests without waiting for the ledger's
+    readiness/benchmark/projection loop. Authorization still comes from that
+    loop's verified session, and expires at the Taipei date boundary.
+    """
+
+    def __init__(self, state_dir: str | Path, *, autonomous: bool = False,
+                 opening_deadline: datetime_time = datetime_time(9, 0, 15)):
         self.state_dir = Path(state_dir)
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tw-shared-quote")
         self._future: Future | None = None
+        self._autonomous = autonomous
+        self._opening_deadline = opening_deadline
+        self._stop = threading.Event()
+        self._session_date: str | None = None
+        self._results = deque()
+        self._results_lock = threading.Lock()
+        self._thread = None
+        if autonomous:
+            self._thread = threading.Thread(target=self._receive_loop,
+                                            name="tw-shared-quote-owner", daemon=True)
+            self._thread.start()
+
+    def authorize(self, session_date: str | None) -> None:
+        """No calendar inference here: the canonical engine supplies its proof."""
+        self._session_date = session_date
+
+    def _receive_loop(self) -> None:
+        requests_dir, _ = _day_trade_quote_broker_paths(self.state_dir)
+        last_scan = None
+        while not self._stop.is_set():
+            now = datetime.now(ZoneInfo("Asia/Taipei"))
+            clock = now.time()
+            protected = datetime_time(8, 59, 30) <= clock < self._opening_deadline
+            if self._session_date == now.date().isoformat():
+                try:
+                    stat = requests_dir.stat()
+                    revision = (stat.st_dev, stat.st_ino, stat.st_mtime_ns,
+                                stat.st_ctime_ns, protected, self._session_date)
+                    rows = []
+                    if revision != last_scan:
+                        rows = serve_shared_day_trade_quote_requests(
+                            state_dir=self.state_dir, max_requests=1,
+                            allowed_purposes={"opening_signal"} if protected else None,
+                        )
+                        # A served request unlinks its inbox file, making the
+                        # next revision different; queued requests then drain.
+                        last_scan = revision
+                except Exception as exc:
+                    rows = [{"error": type(exc).__name__, "purpose": "broker_worker"}]
+                    self._stop.wait(0.1)
+                with self._results_lock:
+                    # Snapshot bodies are already durable IPC responses, not
+                    # main-loop inputs. Retain all outcomes without retaining
+                    # a second full-market price array for every attempt.
+                    self._results.extend({k: v for k, v in row.items() if k != "snapshot"}
+                                         for row in rows)
+                if rows:
+                    continue
+            # This is only local inbox observation, never provider polling.
+            # No new API rate, login, or quote subscription is introduced.
+            self._stop.wait(0.005 if protected else 0.05)
 
     def poll(self, *, allowed_purposes: set[str] | None = None) -> list[dict[str, Any]]:
+        if self._autonomous:
+            with self._results_lock:
+                results = list(self._results)
+                self._results.clear()
+            return results
         results = []
         if self._future is not None:
             if not self._future.done():
@@ -2416,6 +2478,9 @@ class SharedDayTradeQuoteBroker:
         return results
 
     def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
         self._pool.shutdown(wait=True, cancel_futures=True)
 
 

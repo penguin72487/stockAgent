@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import UTC, datetime, time as wall_time, timedelta
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -14,7 +15,12 @@ import time
 from typing import Any, Callable, Iterable
 
 from downloader.artifact_io import atomic_write_json
-from downloader.finmind_scheduling import TAIPEI, Source, calendar_next_check
+from downloader.finmind_scheduling import (
+    TAIPEI, STOCK_OPENING_PROTECTION_END, Source, calendar_next_check,
+    stock_opening_protection_deadline,
+)
+
+LOADED_RUNTIME_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def optimize_queue(connection: sqlite3.Connection) -> None:
@@ -109,7 +115,7 @@ def next_cycle_delay(root: Path, now: datetime, maximum: float, *,
     local = now.astimezone(TAIPEI)
     clocks = {(source.release_hour, source.release_minute) for source in sources}
     clocks.update((hour, 0) for hour in snapshot_hours)
-    clocks.add((9, 10))  # End of the canonical opening-protection window.
+    clocks.add((STOCK_OPENING_PROTECTION_END.hour, STOCK_OPENING_PROTECTION_END.minute))
     for hour, minute in clocks:
         release = datetime.combine(local.date(), wall_time(hour, minute), TAIPEI)
         if release <= local:
@@ -152,9 +158,25 @@ def wait_for_next_cycle(root: Path, result: dict[str, Any], seconds: float, *,
             pass
     # Backoff deadlines for bans/rate errors must not be shortened by ordinary
     # publication clocks. The shared account limiter remains authoritative too.
-    delay = (seconds if seconds == 0 or result.get('state') in {'rate_limited', 'ip_banned', 'queue_busy'} else
-             next_cycle_delay(root, now, seconds, sources=sources, snapshot_hours=snapshot_hours))
+    opening_wait = seconds > 0 and result.get('state') == 'protected_opening'
+    if opening_wait:
+        # Due historical tasks/releases cannot dispatch inside this window.
+        # They must not repeatedly reopen/seed the large queue. Keep Free's
+        # independently due calendar refresh, and observe local emergency
+        # closures with the ordinary heartbeat below (no provider requests).
+        deadline = stock_opening_protection_deadline(now)
+        if deadline is not None and (root / 'calendar.json').is_file():
+            deadline = min(deadline, max(now + timedelta(seconds=1), calendar_next_check(root, now)))
+        delay = max(0.0, (deadline - now).total_seconds()) if deadline is not None else 0.0
+    else:
+        delay = (seconds if seconds == 0 or result.get('state') in {'rate_limited', 'ip_banned', 'queue_busy'} else
+                 next_cycle_delay(root, now, seconds, sources=sources, snapshot_hours=snapshot_hours))
     until = now + timedelta(seconds=delay)
+    if opening_wait:
+        print(json.dumps({'finmind_protected_idle': {
+            'contract_version': 1, 'loaded_runtime_sha256': LOADED_RUNTIME_SHA256,
+            'until_utc': until.isoformat(), 'calendar_recheck_seconds': 30,
+        }}), flush=True)
     stop = monotonic() + delay
     while (remaining := stop - monotonic()) > 0:
         atomic_write_json(root / 'worker_status.json', {
@@ -164,6 +186,8 @@ def wait_for_next_cycle(root: Path, result: dict[str, Any], seconds: float, *,
         })
         if wake_if is not None and wake_if():
             break
+        if opening_wait and stock_opening_protection_deadline(clock()) is None:
+            break  # A newly verified holiday/closure must not wait until 09:10.
         priority_wait = result.get('state') == 'incremental_reserve'
         if priority_wait and _backfill_ready(root, clock()):
             break

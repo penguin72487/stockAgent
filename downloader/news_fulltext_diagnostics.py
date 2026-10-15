@@ -57,6 +57,10 @@ DAILY_PROVIDER_ATTEMPTS = 2
 HOURLY_BUCKET_ATTEMPTS = 1
 HOURLY_EVIDENCE_PROVIDERS = frozenset({'cnyes', 'globalvoices', 'taiwanhot'})
 IDENTITY_METADATA_CONTRACT_VERSION = 1
+VALIDATION_METADATA_CODES = frozenset({
+    'invalid_bulk_publication_clock', 'article_attribution_not_verified',
+    'article_rights_or_scope_excluded',
+})
 
 
 def _public_taiwanhot_scope(context, source):
@@ -84,12 +88,16 @@ def _public_taiwanhot_scope(context, source):
 
 
 def retain_identity_metadata(queue, row, error, context):
-    """At most two metadata-only identity witnesses/provider/UTC day.
+    """Bounded metadata-only witnesses, never a raw body or new request.
 
-    This separate static error bucket never refills old body/raw budgets.
+    Keep the original two identity witnesses/provider/UTC day unchanged.
+    Three static validation outcomes have two witnesses each; they never
+    refill identity/body/raw budgets, including on restart/parser upgrades.
     Reserve before DOM/I/O; no worker write, request, raw body, body permission,
     retry change, acceptance or per-URL/parser reset. Failed writes stay charged.
     """
+    if error.code not in {'article_identity_not_verified', *VALIDATION_METADATA_CODES}:
+        return
     provider = row['provider']
     try:
         source = queue.registry.require(row['url'])
@@ -104,7 +112,9 @@ def retain_identity_metadata(queue, row, error, context):
         if clock.tzinfo is None:
             return
         day = clock.astimezone(timezone.utc).strftime('%Y%m%d')
-        key = f'failure_identity_metadata_attempts:v1:{provider}:{day}'
+        key = (f'failure_validation_metadata_attempts:v1:{provider}:{error.code}:{day}'
+               if error.code in VALIDATION_METADATA_CODES else
+               f'failure_identity_metadata_attempts:v1:{provider}:{day}')
         with queue.db:
             previous = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (key,)).fetchone()
             attempts = int(previous[0]) if previous else 0
@@ -142,6 +152,80 @@ def retain_identity_metadata(queue, row, error, context):
             facts['requested_admission_candidates'] = sorted(taiwanhot_request_ids(row['url']))
             facts['response_admission_candidates'] = sorted(taiwanhot_request_ids(context.response.url))
             facts['candidates_are_not_verified_article_ids'] = True
+        if provider == 'ftnn' and source.embedded_article_layout == 'ftnn_visible_article_v1':
+            # Body/parser failures must be diagnosable without another fetch
+            # or retaining an unproved raw body. Compare bounded source facts;
+            # no headline/byline, cookie, query, script or body text is exported.
+            from downloader.news_fulltext_policy import _objects
+            compact_hash = lambda value: (hashlib.sha256(re.sub(r'\s+', '', value).encode()).hexdigest()
+                                           if isinstance(value, str) else None)
+            schemas = []
+            crumbs = []
+            schema_error = False
+            scripts = soup.select('script[type="application/ld+json"]')
+            if len(scripts) <= 16:
+                try:
+                    for script in scripts:
+                        if len(script.get_text()) > 65536:
+                            raise ValueError('bounded metadata required')
+                        for obj in _objects(json.loads(script.get_text())):
+                            if obj.get('@type') == 'NewsArticle':
+                                schemas.append(obj)
+                            elif obj.get('@type') == 'BreadcrumbList':
+                                crumbs.append(obj)
+                except (ValueError, TypeError, RecursionError):
+                    schema_error = True
+            else:
+                schema_error = True
+            scoped_heads = soup.select('.news-page-all > .news-show > .news-page-top > .news-main-title > h1')
+            bylines = soup.select('.news-page-all > .news-show > .news-box > .news-body > p:first-child')
+            releases = soup.select('.news-page-all > .news-show > .news-page-top > .news-detail-text > .ndt-left > p')
+            news = schemas[0] if len(schemas) == 1 and not schema_error else {}
+            author = news.get('author')
+            author_name = author.get('name') if isinstance(author, dict) else None
+            credit = bylines[0].get_text(' ', strip=True) if len(bylines) == 1 else ''
+            release = releases[0].get_text(' ', strip=True) if len(releases) == 1 else ''
+            release_pattern = r'(?:發布時間|異動時間)：[0-9]{4}/[0-9]{1,2}/[0-9]{1,2} [0-9]{1,2}:[0-9]{1,2}'
+            clock_labels = []
+            for node in releases[:4]:
+                text = node.get_text(' ', strip=True)
+                safe = bool(re.fullmatch(release_pattern, text))
+                clock_labels.append({'kind': ('publication' if text.startswith('發布時間：') else 'modification')
+                    if safe else 'unknown', 'text': text if safe else None,
+                    'text_sha256': hashlib.sha256(text.encode()).hexdigest()})
+            safe_clock = lambda value: (value if isinstance(value, str) and re.fullmatch(
+                r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+08:00', value) else None)
+            last_crumb = (crumbs[0].get('itemListElement') if len(crumbs) == 1 else None)
+            last_crumb = last_crumb[-1] if isinstance(last_crumb, list) and last_crumb else None
+            last_item = last_crumb.get('item') if isinstance(last_crumb, dict) else None
+            ogtitles = soup.select('meta[property="og:title"][content]')
+            facts['ftnn_native_validation'] = {
+                'contract_version': 2, 'schema_error': schema_error,
+                'article_schema_count': len(schemas), 'breadcrumb_schema_count': len(crumbs),
+                'scoped_heading_count': len(scoped_heads),
+                'heading_compact_sha256': [compact_hash(n.get_text(' ', strip=True)) for n in scoped_heads[:16]],
+                'schema_headline_compact_sha256': compact_hash(news.get('headline')),
+                'breadcrumb_headline_compact_sha256': compact_hash(last_item.get('name')) if isinstance(last_item, dict) else None,
+                'og_title_compact_sha256': [compact_hash(n.get('content')) for n in ogtitles[:16]],
+                'schema_expected_og_title_compact_sha256': compact_hash(news['headline'] + ' | FTNN 新聞網')
+                    if isinstance(news.get('headline'), str) else None,
+                'byline_count': len(bylines), 'byline_compact_sha256': compact_hash(credit),
+                'declared_author_in_visible_byline': bool(isinstance(author_name, str)
+                    and author_name.strip() and re.sub(r'\s+', '', author_name) in re.sub(r'\s+', '', credit)),
+                'native_reporter_byline_shape': bool(re.fullmatch(r'(?:FTNN新聞網)?記者[^／\s]+／[^／\s]{1,16}報導', re.sub(r'\s+', '', credit))),
+                'release_node_count': len(releases),
+                'visible_release': release if re.fullmatch(r'發布時間：[0-9]{4}/[0-9]{1,2}/[0-9]{1,2} [0-9]{1,2}:[0-9]{1,2}', release) else None,
+                'native_clock_labels': clock_labels, 'clock_labels_truncated': len(releases) > 4,
+                'declared_publication': safe_clock(news.get('datePublished')),
+                'declared_modification': safe_clock(news.get('dateModified')),
+                'body_text_retained': False,
+            }
+        if provider == 'tvbs' and source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
+            from downloader.news_fulltext_tvbs import tvbs_validation_metadata
+            facts['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'ettoday' and source.embedded_article_layout == 'ettoday_visible_article_v1':
+            from downloader.news_fulltext_ettoday import ettoday_validation_metadata
+            facts['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=context.response.url)
         stamp = clock.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + uuid.uuid4().hex[:8]
         target = queue.root / 'identity_metadata' / day / provider / (stamp + '.json')
         value = {'contract_version': IDENTITY_METADATA_CONTRACT_VERSION, 'provider': provider,
@@ -619,7 +703,7 @@ def retain_index_failure_response(queue, task, error):
 def retain_failure_response(queue, row, error):
     """Best-effort diagnostics; the original failure is persisted first."""
     context = getattr(error, 'failure_response', None)
-    if error.code == 'article_identity_not_verified' and isinstance(context, FailureResponse):
+    if error.code in {'article_identity_not_verified', *VALIDATION_METADATA_CODES} and isinstance(context, FailureResponse):
         retain_identity_metadata(queue, row, error, context)
         return
     if error.code != 'body_not_found' or not isinstance(context, FailureResponse):

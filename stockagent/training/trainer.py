@@ -14160,6 +14160,7 @@ def _physical_source_cache_snapshot(runtime: _ExecutionRuntime) -> dict[str, Any
         scope="rank_local_shared_source_lifetime_before_fold_reporting",
         rank=int(os.environ.get("RANK", "0")),
         effective_universe_count=len(source.universe),
+        prepared_transport_cache=source.prepared_batch_cache_info(),
         **source.runtime_cache_info(),
     )
 
@@ -21362,6 +21363,7 @@ def _train_epoch_windowed_tensor(
                 split,
                 batch_order,
                 batch_size,
+                device=device,
             )
         )
     )
@@ -22373,6 +22375,7 @@ def _train_epoch_windowed_tensor_ddp(
                 list(range(num_batches)),
                 int(batch_size),
                 batch_spans=episode_spans,
+                device=device,
             )
         )
     )

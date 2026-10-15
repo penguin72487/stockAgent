@@ -104,8 +104,25 @@ def code_matches(accepted):
     hashes = accepted.get("code_sha256", {})
     required = {str(REPO / "downloader/download_finmind_complement.py"),
                 str(REPO / "downloader/finmind_queue_indexes.py")}
+    if "whole_publication_wall_improvement_observed" in accepted:
+        required.add(str(REPO / "downloader/finmind_status_aggregates.py"))
     return (required.issubset(hashes)
             and all(file_sha(Path(path)) == digest for path, digest in hashes.items()))
+
+
+def accepted_local_measurement(accepted):
+    """An exact full local publication quantum, not only a fast status query."""
+    if "whole_publication_wall_improvement_observed" not in accepted:
+        return accepted.get("status_wall_improvement_observed") is True
+    return bool(accepted.get("state") == "measurement_complete"
+                and accepted.get("whole_publication_wall_improvement_observed") is True
+                and accepted.get("all_task_values_equal") is True
+                and accepted.get("source_files_stable") is True
+                and accepted.get("resource_limits_stable") is True
+                and accepted.get("task_count", 0) > 0
+                and accepted.get("rows_published_per_trial", 0) > 0
+                and [row.get("label") for row in accepted.get("trials", [])]
+                    == ["baseline", "candidate", "candidate", "baseline"])
 
 
 def main(argv=None):
@@ -119,7 +136,7 @@ def main(argv=None):
         parser.error("new output required; bounded wait must be 0..600 seconds")
     accepted = metadata(args.acceptance)
     if (not accepted.get("exact_output_parity") or not accepted.get("code_stable")
-            or not accepted.get("status_wall_improvement_observed")
+            or not accepted_local_measurement(accepted)
             or Path(accepted["source_queue"]).resolve() != (ROOT / "queue.sqlite3").resolve()
             or not code_matches(accepted)):
         raise ValueError("current_code_not_bound_to_accepted_measurement")

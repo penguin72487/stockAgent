@@ -510,26 +510,30 @@ def tainan_visible_news(soup, *, page_url):
     }, scope
 
 
-def _kmdn_identity(url: str):
+def _kmdn_identity(url: str, *, allow_student_essay: bool = False):
     try:
         parts = urlsplit(normalize_url(url))
     except (NewsError, ValueError, TypeError):
         return None
-    match = re.fullmatch(r"/1117/1271/(1272|287081)/([1-9][0-9]*)/?", parts.path)
+    pattern = (r"/1117/1271/(1272|1277|287081)/([1-9][0-9]*)/?" if allow_student_essay else
+               r"/1117/1271/(1272|287081)/([1-9][0-9]*)/?")
+    match = re.fullmatch(pattern, parts.path)
     if parts.scheme != "https" or parts.netloc != "www.kmdn.gov.tw" or parts.query or not match:
         return None
     return match[1], match[2]
 
 
-def kmdn_visible_article(soup, *, page_url):
+def kmdn_visible_article(soup, *, page_url, allow_student_essay: bool = False):
     """Current heading/panel/share identity, never stale site-wide og:url.
 
     The four real originals declare a stale og:url (262893 or 261387). Each
     current function panel independently shares its actual article URL through
     Facebook and Twitter. Verify both local links without requesting either
     social network; keep stale source metadata in the exact raw response.
+    Only the reviewed v2 capture contract admits the native 1277 student
+    contribution namespace. V1 and unrelated paths retain their original scope.
     """
-    identity = _kmdn_identity(page_url)
+    identity = _kmdn_identity(page_url, allow_student_essay=allow_student_essay)
     scopes = soup.select("#center > .container")
     if identity is None or len(scopes) != 1:
         raise NewsError("article_identity_not_verified")
@@ -550,9 +554,11 @@ def kmdn_visible_article(soup, *, page_url):
             raise NewsError("article_identity_not_verified") from None
         pairs = parse_qsl(parts.query, keep_blank_values=True)
         if parts.hostname == "www.facebook.com" and parts.path == "/share.php":
-            shares["facebook"].extend(_kmdn_identity(value) for key, value in pairs if key == "u")
+            shares["facebook"].extend(_kmdn_identity(value, allow_student_essay=allow_student_essay)
+                                      for key, value in pairs if key == "u")
         elif parts.hostname == "twitter.com" and parts.path == "/share":
-            shares["twitter"].extend(_kmdn_identity(value) for key, value in pairs if key == "url")
+            shares["twitter"].extend(_kmdn_identity(value, allow_student_essay=allow_student_essay)
+                                     for key, value in pairs if key == "url")
     if any(values != [identity] for values in shares.values()):
         raise NewsError("article_identity_not_verified")
     bylines = []
@@ -577,3 +583,126 @@ def kmdn_visible_article(soup, *, page_url):
         "article_identity_basis": "current_function_panel_two_source_share_urls_and_visible_heading_v1; source_og_url_untrusted",
         "body_completeness": "verified_current_article_container",
     }, scope
+
+
+_COOLLOUD_COPYRIGHT = 'https://www.coolloud.org.tw/node/4524'
+_COOLLOUD_LICENSE = 'http://creativecommons.org/licenses/by-nc-sa/2.0/tw/deed.zh_TW'
+
+
+def coolloud_visible_original(soup, *, page_url):
+    """Native Drupal staff report, not external archives or open submissions.
+
+    The actual source's <h1><p> title is malformed HTML: lxml places its p
+    immediately after an empty h1. Admit only those two observed shapes,
+    bounded by the same native region and matching OG/document titles. The
+    linked site notice licenses publisher originals, not third-party works.
+    Calendar/event date, Facebook account and chief editor never replace the
+    source publication clock or staff reporter. No HTTP is performed here.
+    """
+    from urllib.parse import quote
+    from downloader.news_fulltext_public_originals import _one, _visible
+
+    try:
+        parts = urlsplit(page_url)
+        identity = re.fullmatch(r'/node/([1-9][0-9]*)', parts.path)
+    except (ValueError, TypeError):
+        identity = None
+    if (identity is None or parts.scheme != 'https' or parts.netloc != 'www.coolloud.org.tw'
+            or parts.query or parts.fragment):
+        raise NewsError('article_identity_not_verified')
+    page = _one(soup, '.main-container > .row > section.col-sm-12')
+    region = _one(page, ':scope > .region.region-content')
+    article = _one(region, ':scope > article.node')
+    if article.get('id') != 'node-' + identity[1]:
+        raise NewsError('article_identity_not_verified')
+    classes = set(article.get('class', []))
+    if ('node-post' not in classes or classes & {'node-news', 'node-outer'}
+            or article.select('.field-name-field-reminder')):
+        raise NewsError('article_rights_or_scope_excluded')
+    for selector, attribute in (('head link[rel~="canonical"]', 'href'),
+                                ('head link[rel~="shortlink"]', 'href'),
+                                ('head meta[property="og:url"]', 'content')):
+        if _one(soup, selector).get(attribute) != page_url:
+            raise NewsError('article_identity_not_verified')
+    heading = _one(page, ':scope > h1.page-header')
+    heading_text = heading.get_text(' ', strip=True)
+    if heading_text:
+        native_p = _one(heading, ':scope > p')
+        if len(heading.find_all(True, recursive=False)) != 1 or heading.find_next_sibling() is not region:
+            raise NewsError('article_identity_not_verified')
+    else:
+        native_p = heading.find_next_sibling()
+        if (heading.contents or native_p is None or native_p.name != 'p' or native_p.attrs
+                or native_p.find_next_sibling() is not region):
+            raise NewsError('article_identity_not_verified')
+    title = native_p.get_text(' ', strip=True)
+    if (not title or heading_text and heading_text != title
+            or _one(soup, 'head meta[property="og:title"]').get('content') != title
+            or _one(soup, 'head > title').get_text(' ', strip=True) != title + ' | 苦勞網'):
+        raise NewsError('article_identity_not_verified')
+    info = _one(article, ':scope > .group-info')
+    source = _one(info, '.field-name-field-source > .field-items > .field-item > a[href]')
+    credit = _one(article, ':scope > .group-author')
+    reporter = _one(credit, '.field-name-field-author > .field-items > .field-item > a[href]',
+                    'article_attribution_not_verified')
+    staff = _one(credit, '.field-name-field-writernote > .field-items > .field-item',
+                 'article_attribution_not_verified')
+    name = reporter.get_text(' ', strip=True)
+    if source.get_text(' ', strip=True) != '苦勞報導' or source.get('href') != '/story':
+        raise NewsError('article_rights_or_scope_excluded')
+    if (not name or reporter.get('href') != '/author/' + quote(name, safe='')
+            or staff.get_text(' ', strip=True) != '苦勞網記者'):
+        raise NewsError('article_attribution_not_verified')
+    editor = _one(article, ':scope > .field-name-field-chiefeditor', 'article_attribution_not_verified')
+    label = _one(editor, ':scope > .field-label', 'article_attribution_not_verified')
+    editor_name = _one(editor, ':scope > .field-items > .field-item > a[href]', 'article_attribution_not_verified')
+    chief = editor_name.get_text(' ', strip=True)
+    if (label.get_text(' ', strip=True) != '責任主編:' or not chief
+            or editor_name.get('href') != '/chiefeditor/' + quote(chief, safe='')):
+        raise NewsError('article_attribution_not_verified')
+    clocks = {}
+    for role in ('published', 'modified'):
+        raw = _one(soup, f'head meta[property="article:{role}_time"]',
+                   'invalid_bulk_publication_clock').get('content', '')
+        try:
+            if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}', raw):
+                raise ValueError('unreviewed precision')
+            clocks[role] = (raw, datetime.fromisoformat(raw))
+        except ValueError:
+            raise NewsError('invalid_bulk_publication_clock') from None
+    day = _one(info, '.field-name-field-actdate .date-display-single', 'invalid_bulk_publication_clock')
+    day_raw = day.get_text(' ', strip=True)
+    parsed_day = _release_day(day_raw, r'[0-9]{4}/[0-9]{2}/[0-9]{2}', '%Y/%m/%d')
+    if (parsed_day != clocks['published'][1].date() or clocks['modified'][1] < clocks['published'][1]
+            or _one(soup, 'head meta[property="og:updated_time"]', 'invalid_bulk_publication_clock').get('content')
+            != clocks['modified'][0]):
+        raise NewsError('invalid_bulk_publication_clock')
+    copyright_links = [n for n in soup.select('a[href="/node/4524"]') if n.get_text(' ', strip=True) == '版權宣告']
+    if len(copyright_links) != 1:
+        raise NewsError('article_license_not_verified')
+    body = _one(article, ':scope > .field-name-body > .field-items > .field-item')
+    for node in (page, region, article, heading, native_p, info, source, credit, reporter, staff,
+                 editor, label, editor_name, day, copyright_links[0], body):
+        _visible(node)
+    for root in (native_p, info, credit, editor, body):
+        for node in root.find_all(True):
+            if node.name not in {'img', 'figure', 'figcaption'} and not node.find_parent(['figure', 'figcaption']):
+                _visible(node)
+    if body.select('form, [data-paywall], .paywall, [rel~="license"]'):
+        raise NewsError('article_rights_or_scope_excluded')
+    return {
+        'headline': title, 'author': [{'@type': 'Person', 'name': name}],
+        'author_attribution_detail_json': json.dumps({'reporter_raw': name, 'reporter_profile_raw': reporter['href'],
+            'staff_role_raw': staff.get_text(' ', strip=True), 'chief_editor_raw': chief,
+            'chief_editor_profile_raw': editor_name['href'], 'chief_editor_role_raw': label.get_text(' ', strip=True),
+            'original_source_label_raw': source.get_text(' ', strip=True),
+            'calendar_field_actdate_raw': day_raw, 'calendar_field_used_as_publication': False,
+            'editor_or_facebook_account_used_as_reporter': False}, ensure_ascii=False),
+        'datePublished': clocks['published'][0], 'dateModified': clocks['modified'][0],
+        'published_time_basis': 'current_article_published_time_exact_seconds_offset; calendar_field_day_agrees_but_is_not_publication',
+        'article_identity_basis': 'native_node_ID_type_canonical_shortlink_og_visible_title_and_staff_source_v1',
+        'verified_article_notices_json': json.dumps([{'kind': 'publisher_original_copyright_notice',
+            'text': 'CC-BY-NC-SA-2.0-TW; applies to verified publisher original, not third-party archives or submissions',
+            'source_links': [_COOLLOUD_COPYRIGHT], 'license_url': _COOLLOUD_LICENSE, 'image_sources': []}], ensure_ascii=False),
+        'body_completeness': 'verified_current_native_publisher_original_prose; staff_editor_calendar_tags_and_media_excluded',
+    }, article, 'publisher_original_bound_to_linked_CC-BY-NC-SA-2.0-TW_notice_v1'

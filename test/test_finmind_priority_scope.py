@@ -2,7 +2,10 @@
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from downloader import download_finmind_complement as worker
+from downloader.finmind_queue_indexes import STATUS_INDEX
 
 
 NOW = datetime(2026, 10, 3, 17, tzinfo=UTC)
@@ -14,8 +17,11 @@ def _override(conn, keys):
     conn.executemany('INSERT INTO finmind_priority_tasks VALUES (?,?,?)', keys)
 
 
-def test_finished_overrides_seek_only_their_datasets_then_use_normal_order(tmp_path):
+@pytest.mark.parametrize("status_index", (False, True))
+def test_finished_overrides_seek_only_their_datasets_then_use_normal_order(tmp_path, status_index):
     with closing(worker._db(tmp_path / 'queue.sqlite3')) as conn, conn:
+        if not status_index:
+            conn.execute(f"DROP INDEX {STATUS_INDEX}")
         worker._add_tasks(conn, [('TaiwanFuturesKBar', 'TX', '2026-10-02', 'id_day', 8),
                                 ('TaiwanExchangeRate', 'USD', 'history', 'id_history', 1)])
         _override(conn, [('TaiwanFuturesKBar', 'TX', '2026-10-02')])
@@ -26,7 +32,11 @@ def test_finished_overrides_seek_only_their_datasets_then_use_normal_order(tmp_p
         conn.set_trace_callback(None)
         scoped = next(q for q in queries if 'WITH RECURSIVE override_datasets' in q)
         plan = conn.execute('EXPLAIN QUERY PLAN ' + scoped).fetchall()
-        assert any('idx_finmind_outstanding_dispatch' in row[-1] and 'dataset=?' in row[-1] for row in plan)
+        # The prior accepted covering status projection can also seek the exact
+        # dataset + outstanding-state prefixes. Require that bounded plan, not
+        # a specific index name that fails on the unchanged predecessor too.
+        assert any(any(index in row[-1] for index in ('idx_finmind_outstanding_dispatch', STATUS_INDEX))
+                   and 'dataset=?' in row[-1] and 'state=?' in row[-1] for row in plan)
 
 
 def test_multiple_override_datasets_keep_partition_and_identifier_order(tmp_path):

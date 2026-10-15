@@ -31,6 +31,7 @@ CODE_PATHS = (
     "scripts/compact_openbb_l1.py",
     "scripts/openbb_l1_view_schema.py",
     "scripts/openbb_l1_source_journal.py",
+    "scripts/openbb_l1_task_contract_index.py",
     "stockagent/data/columnar_lake.py",
     "stockagent/data/source_processing_runtime.py",
     "downloader/artifact_io.py",

@@ -59,6 +59,7 @@ from ohlcv_hot_tail import (  # noqa: E402
     plan_candle_reconcile_windows,
     read_logical_parquet,
     remove_hot_tail,
+    tail_newer_summary,
 )
 
 
@@ -490,21 +491,17 @@ def _load_logical_existing_info(path: Path) -> ExistingCandleInfo:
     if base.latest_ms is None:
         return tail
 
-    dates = _normalize_date_frame(
-        pl.from_arrow(pq.read_table(tail_path, columns=["date"], memory_map=True))
-    ).select(pl.col("date").str.to_datetime(strict=False).alias("__ts"))
-    base_latest = datetime.fromtimestamp(
-        base.latest_ms / 1000, tz=timezone.utc
-    ).replace(tzinfo=None)
-    newer = dates.filter(pl.col("__ts") > base_latest)
-    first_new = newer.select(pl.col("__ts").min()).item() if newer.height else None
+    newer_count, first_new = tail_newer_summary(
+        pl.from_arrow(pq.read_table(tail_path, columns=["date"], memory_map=True)),
+        base_latest_ms=base.latest_ms, normalize=_normalize_date_frame,
+    )
     contiguous = (
         first_new is None
         or int(first_new.replace(tzinfo=timezone.utc).timestamp() * 1000)
         <= base.latest_ms + CANDLE_INTERVAL_MS
     )
     return ExistingCandleInfo(
-        rows=base.rows + newer.height,
+        rows=base.rows + newer_count,
         latest_ms=max(
             value for value in (base.latest_ms, tail.latest_ms) if value is not None
         ),

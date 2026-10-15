@@ -157,6 +157,16 @@ _LIVE_PANEL_CACHE_MAX_ENTRIES = 3
 _LIVE_PANEL_CACHE: OrderedDict[str, PanelData] = OrderedDict()
 _LIVE_PANEL_SOURCE_KEY_CACHE: dict[str, str] = {}
 _LIVE_PANEL_CACHE_LOCK = threading.Lock()
+_LIVE_PANEL_CACHE_EPOCH = 0
+
+
+@dataclass
+class _LivePanelBuild:
+    future: Future = field(default_factory=Future)
+    progress: tuple[str, int, int] | None = None
+
+
+_LIVE_PANEL_BUILDS: dict[tuple[int, str], _LivePanelBuild] = {}
 _LIVE_CHECKPOINT_CACHE_MAX_ENTRIES = 8
 _LIVE_CHECKPOINT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _LIVE_CHECKPOINT_CACHE_LOCK = threading.Lock()
@@ -258,7 +268,9 @@ def _live_raw_tail_source_cache():
 
 
 def clear_live_panel_memory_cache() -> None:
+    global _LIVE_PANEL_CACHE_EPOCH
     with _LIVE_PANEL_CACHE_LOCK:
+        _LIVE_PANEL_CACHE_EPOCH += 1
         _LIVE_PANEL_CACHE.clear()
         _LIVE_PANEL_SOURCE_KEY_CACHE.clear()
         _LIVE_FACTORIZED_PANEL_CACHE.clear()
@@ -592,6 +604,76 @@ def _remember_live_panel(key: str, panel: PanelData) -> None:
             _LIVE_PANEL_CACHE.popitem(last=False)
 
 
+def _shared_live_panel_build(key, builder, progress_callback=None):
+    """One immutable panel per source/feature revision, not one per requester.
+
+    Joiners relay only actual builder milestones, never a periodic heartbeat.
+    Failures fan out unchanged and are retryable on the next call. Eviction
+    fences an old build from repopulating caches or attracting new callers.
+    The caller still owns the canonical source read lease for the entire read.
+    """
+    def report(event):
+        if progress_callback is not None:
+            try:
+                progress_callback(*event)
+            except Exception:
+                pass  # Observation cannot change a correct panel/result.
+
+    with _LIVE_PANEL_CACHE_LOCK:
+        cached = _LIVE_PANEL_CACHE.get(key)
+        if cached is not None:
+            _LIVE_PANEL_CACHE.move_to_end(key)
+        flight_key = (_LIVE_PANEL_CACHE_EPOCH, key)
+        flight = _LIVE_PANEL_BUILDS.get(flight_key)
+        owner = flight is None
+        if cached is None and owner:
+            flight = _LivePanelBuild()
+            _LIVE_PANEL_BUILDS[flight_key] = flight
+    if cached is not None:
+        report(("memory_cache", 1, 1))
+        return cached, True, "memory"
+    if not owner:
+        last_progress = None
+        while True:
+            with _LIVE_PANEL_CACHE_LOCK:
+                event = flight.progress
+            if event is not None and event != last_progress:
+                report(event)
+                last_progress = event
+            if flight.future.done():
+                panel, hit, tier = flight.future.result()
+                return panel, hit, f"shared-{tier}"
+            try:
+                flight.future.result(timeout=0.05)
+            except TimeoutError:
+                if flight.future.done():
+                    flight.future.result()  # Preserve a real builder TimeoutError.
+
+    def progress(phase, done, total):
+        event = (str(phase), int(done), int(total))
+        with _LIVE_PANEL_CACHE_LOCK:
+            flight.progress = event
+        report(event)
+
+    try:
+        result = builder(progress)
+        with _LIVE_PANEL_CACHE_LOCK:
+            if flight_key[0] == _LIVE_PANEL_CACHE_EPOCH:
+                _LIVE_PANEL_CACHE[key] = result[0]
+                _LIVE_PANEL_CACHE.move_to_end(key)
+                while len(_LIVE_PANEL_CACHE) > _LIVE_PANEL_CACHE_MAX_ENTRIES:
+                    _LIVE_PANEL_CACHE.popitem(last=False)
+        flight.future.set_result(result)
+        return result
+    except BaseException as exc:
+        flight.future.set_exception(exc)
+        raise
+    finally:
+        with _LIVE_PANEL_CACHE_LOCK:
+            if _LIVE_PANEL_BUILDS.get(flight_key) is flight:
+                _LIVE_PANEL_BUILDS.pop(flight_key, None)
+
+
 def _cached_normalized_model_window(
     panel: PanelData,
     *,
@@ -867,100 +949,18 @@ def _build_panel_from_stable_source(
             live_tail_rows=live_tail_rows,
             panel_kwargs=panel_kwargs,
         )
-        cached = _cached_live_panel(cache_key)
-        if cached is not None:
-            print(
-                f"[panel] live memory cache hit dates={cached.num_dates} "
-                f"symbols={cached.num_symbols}"
-            )
-            return (
-                slice_panel_start(cached, config.data.panel_start_date),
-                True,
-                "memory",
-            )
-        disk_backend_key = _live_panel_disk_backend_key(
-            config,
-            live_tail_rows=live_tail_rows,
-            panel_kwargs=panel_kwargs,
+        panel, hit, tier = _shared_live_panel_build(
+            cache_key,
+            lambda progress: _load_live_tail_panel(
+                config, live_tail_rows=live_tail_rows, panel_kwargs=panel_kwargs,
+                cache_key=cache_key, progress_callback=progress,
+            ),
+            progress_callback,
         )
-        disk_cache_root = _live_panel_disk_cache_root()
-        if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
-            try:
-                cached = load_panel_cache_v2_exact(
-                    disk_cache_root,
-                    source_hash=cache_key,
-                    backend_key=disk_backend_key,
-                    source_paths=[],
-                )
-            except Exception as exc:
-                print(
-                    "[panel] live disk cache read failed; rebuilding "
-                    f"error={type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-                cached = None
-            if cached is not None:
-                print(
-                    f"[panel] live disk cache hit dates={cached.num_dates} "
-                    f"symbols={cached.num_symbols} root={disk_cache_root}",
-                    flush=True,
-                )
-                _remember_live_panel(cache_key, cached)
-                return (
-                    slice_panel_start(cached, config.data.panel_start_date),
-                    True,
-                    "disk",
-                )
-        panel = build_tail_panel(
-            config.data.parquet_root,
-            tail_rows=live_tail_rows,
-            raw_tail_reader=_live_raw_tail_source_cache().read,
-            benchmark_name=config.data.benchmark_name,
-            usd_only_trading_pairs=config.data.usd_only_trading_pairs,
-            tradable_mode=config.data.tradable_mode,
-            trading_volume_policy=config.data.trading_volume_policy,
-            security_filter=config.data.security_filter,
-            strict_no_fallback=config.training.strict_no_fallback,
-            panel_load_workers=int(panel_kwargs["panel_load_workers"]),
-            **external_kwargs,
-            feature_include=config.data.feature_include,
-            feature_exclude=config.data.feature_exclude,
-            feature_zero_fill=config.data.feature_zero_fill,
-            feature_availability_indicators=config.data.feature_availability_indicators,
-            feature_shift_next_session=config.data.feature_shift_next_session,
-            # Persist the reusable unsliced tail. Apply each strategy's exact
-            # boundary after memory/disk/build retrieval.
-            panel_start_date=None,
-            progress_callback=progress_callback,
-        )
-        if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
-            try:
-                save_panel_cache_v2(
-                    disk_cache_root,
-                    panel,
-                    source_hash=cache_key,
-                    backend_key=disk_backend_key,
-                    version=PANEL_CACHE_VERSION,
-                )
-                print(
-                    f"[panel] live disk cache committed dates={panel.num_dates} "
-                    f"symbols={panel.num_symbols} root={disk_cache_root}",
-                    flush=True,
-                )
-            except Exception as exc:
-                # A cache optimization must never turn a correct in-memory
-                # signal into an outage. The next run can retry the atomic
-                # cache publication.
-                print(
-                    "[panel] live disk cache write failed; continuing with "
-                    f"rebuilt panel error={type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-        _remember_live_panel(cache_key, panel)
         return (
             slice_panel_start(panel, config.data.panel_start_date),
-            False,
-            "rebuilt",
+            hit,
+            tier,
         )
     return (
         build_panel(
@@ -970,6 +970,61 @@ def _build_panel_from_stable_source(
         False,
         "rebuilt-full",
     )
+
+
+def _load_live_tail_panel(config, *, live_tail_rows, panel_kwargs, cache_key,
+                          progress_callback):
+    """The shared owner's exact, unsliced disk/build path."""
+    disk_backend_key = _live_panel_disk_backend_key(
+        config, live_tail_rows=live_tail_rows, panel_kwargs=panel_kwargs,
+    )
+    disk_cache_root = _live_panel_disk_cache_root()
+    progress_callback("disk_cache_lookup", 0, 1)
+    if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
+        try:
+            cached = load_panel_cache_v2_exact(
+                disk_cache_root, source_hash=cache_key,
+                backend_key=disk_backend_key, source_paths=[],
+            )
+        except Exception as exc:
+            print(f"[panel] live disk cache read failed; rebuilding error={type(exc).__name__}: {exc}", flush=True)
+            cached = None
+        if cached is not None:
+            progress_callback("disk_cache", 1, 1)
+            print(f"[panel] live disk cache hit dates={cached.num_dates} symbols={cached.num_symbols} root={disk_cache_root}", flush=True)
+            return cached, True, "disk"
+    progress_callback("panel_source_read", 0, 1)
+    panel = build_tail_panel(
+        config.data.parquet_root, tail_rows=live_tail_rows,
+        raw_tail_reader=_live_raw_tail_source_cache().read,
+        benchmark_name=config.data.benchmark_name,
+        usd_only_trading_pairs=config.data.usd_only_trading_pairs,
+        tradable_mode=config.data.tradable_mode,
+        trading_volume_policy=config.data.trading_volume_policy,
+        security_filter=config.data.security_filter,
+        strict_no_fallback=config.training.strict_no_fallback,
+        panel_load_workers=int(panel_kwargs["panel_load_workers"]),
+        **external_panel_data_kwargs(config.data),
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
+        feature_availability_indicators=config.data.feature_availability_indicators,
+        feature_shift_next_session=config.data.feature_shift_next_session,
+        # Each caller applies its own start boundary after retrieval.
+        panel_start_date=None, progress_callback=progress_callback,
+    )
+    progress_callback("panel_built", 1, 1)
+    if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
+        try:
+            save_panel_cache_v2(
+                disk_cache_root, panel, source_hash=cache_key,
+                backend_key=disk_backend_key, version=PANEL_CACHE_VERSION,
+            )
+            print(f"[panel] live disk cache committed dates={panel.num_dates} symbols={panel.num_symbols} root={disk_cache_root}", flush=True)
+        except Exception as exc:
+            print(f"[panel] live disk cache write failed; continuing with rebuilt panel error={type(exc).__name__}: {exc}", flush=True)
+    progress_callback("panel_cache_committed", 1, 1)
+    return panel, False, "rebuilt"
 
 
 def _discover_latest_fold(output_dir: str | Path) -> int:
@@ -3286,7 +3341,8 @@ def prefetch_live_signal_prices(
     prices_csv: str | Path | None = None, yahoo_chunk_size: int = 80,
     day_trade_model_observation: str = "session_open",
     tw_latest_quote_cache_seconds: float = 0.0,
-    tw_latest_quote_force_refresh: bool = False, **_unused: Any,
+    tw_latest_quote_force_refresh: bool = False,
+    progress_callback: ProgressCallback | None = None, **_unused: Any,
 ) -> PrefetchedLiveQuote:
     """Fetch independent I/O before acquiring the serialized model runtime.
 
@@ -3296,6 +3352,11 @@ def prefetch_live_signal_prices(
     identical quote requests share one in-flight result, never a completed TTL.
     """
     started, started_utc = time.perf_counter(), datetime.now(timezone.utc)
+    def report(phase, done=1, total=1):
+        _emit_progress(progress_callback, label="opening_input", step=done,
+                       total=total, message=phase)
+
+    report("config_load", 0)
     config = load_config(config_path)
     require_live_feature_source(config.data)
     execution_mode = _require_supported_live_execution(config.trading.execution_mode)
@@ -3303,14 +3364,18 @@ def prefetch_live_signal_prices(
         raise ValueError("quote prefetch is restricted to TW day-trade opening/quote inputs")
     root = Path(output_dir if output_dir is not None else config.runner.output_dir)
     resolved_fold, checkpoint = _resolve_checkpoint(root, fold_id, checkpoint_path)
+    report("checkpoint_load", 0)
     payload, checkpoint_key, _hit = _cached_checkpoint(checkpoint)
-    panel, _hit, _tier = _build_panel(config, live_tail=True)
+    report("panel_fingerprint", 0)
+    panel, _hit, _tier = _build_panel(config, live_tail=True, progress_callback=report)
+    report("panel_alignment", 0)
     panel, _hit = _cached_aligned_panel(
         panel, checkpoint_key=checkpoint_key, checkpoint_payload=payload,
         state_dict=payload["model_state_dict"],
         fold_dir=root / f"fold_{resolved_fold:02d}", context="quote prefetch",
     )
     index, _notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
+    report("quote_request_prepare", 0)
     request = _live_quote_request(
         config=config, panel=panel, panel_idx=index, execution_mode=execution_mode,
         observation=day_trade_model_observation, price_source=price_source,
@@ -3326,11 +3391,14 @@ def prefetch_live_signal_prices(
             future = Future()
             _LIVE_QUOTE_INFLIGHT[key] = future
     if not owner:
+        report("quote_join_wait", 0)
         return future.result()
     try:
+        report("quote_transport", 0)
         quote_started, requested = time.perf_counter(), datetime.now(timezone.utc)
         snapshot = _price_snapshot(**request)
         quote_finished, received = time.perf_counter(), datetime.now(timezone.utc)
+        report("quote_validation", 0)
         _reject_unready_opening_prefetch(
             request, snapshot, workflow_started_utc=started_utc,
             requested_at_utc=requested, received_at_utc=received,

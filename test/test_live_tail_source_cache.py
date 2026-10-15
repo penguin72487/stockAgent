@@ -1,4 +1,7 @@
 from dataclasses import fields
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 import numpy as np
 import polars as pl
@@ -136,3 +139,58 @@ def test_unknown_loader_type_is_not_a_success_receipt(tmp_path):
     with pytest.raises(TypeError):
         cache.read(path, tail_rows=48)
     assert cache.stats()["entries"] == 0
+
+
+def test_concurrent_feature_policies_share_one_physical_decode(tmp_path):
+    path = source(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def load(path, rows):
+        calls.append(1)
+        started.set()
+        assert release.wait(3)
+        return read_logical_parquet(path, tail_rows=rows).to_arrow()
+
+    cache = LiveTailSourceCache(loader=load)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        jobs = [pool.submit(cache.read, path, tail_rows=48) for _ in range(3)]
+        assert started.wait(3)
+        deadline = time.monotonic() + 3
+        while cache.stats()["joined_reads"] < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert cache.stats()["joined_reads"] == 2
+        release.set()
+        tables = [job.result(3) for job in jobs]
+    assert calls == [1]
+    assert all(table is tables[0] for table in tables)
+    assert not cache._inflight
+
+
+def test_concurrent_decode_failure_releases_waiters_and_retries(tmp_path):
+    path = source(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    error = OSError("source failure")
+
+    def fail(*_):
+        started.set()
+        assert release.wait(3)
+        raise error
+
+    cache = LiveTailSourceCache(loader=fail)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(cache.read, path, tail_rows=48) for _ in range(2)]
+        assert started.wait(3)
+        deadline = time.monotonic() + 3
+        while cache.stats()["joined_reads"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert cache.stats()["joined_reads"] == 1
+        release.set()
+        for job in jobs:
+            with pytest.raises(OSError) as caught:
+                job.result(3)
+            assert caught.value is error
+    assert not cache._inflight
+    assert cache.stats()["entries"] == 0
+    cache._loader = lambda path, rows: read_logical_parquet(path, tail_rows=rows).to_arrow()
+    assert cache.read(path, tail_rows=48).num_rows == 48

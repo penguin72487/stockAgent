@@ -85,7 +85,10 @@ def encode_record_cache(
             reason = type(exc).__name__
         else:
             if observation is not None:
-                observation.update(backend="msgspec_validated_metadata", fallback_reason=None)
+                observation.update(
+                    backend="msgspec_validated_metadata", fallback_reason=None,
+                    temporary_struct_gc_tracking=_RecordCache.__struct_config__.gc,
+                )
             return encoded
     if observation is not None:
         observation.update(backend="stdlib", fallback_reason=reason)

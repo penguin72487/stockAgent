@@ -120,6 +120,9 @@ def test_only_html_abi_changes_not_bulk_index_or_authorization(cnyes_config, tmp
             # capture with the independently versioned source-test outcome.
             assert payload.pop('verified_source_test_article_outcome_contract_version') == 1
             assert payload.pop('visible_headline_body_ownership_contract_version') == 1
+            assert payload.pop('verified_office_comment_empty_outcome_contract_version') == 1
+            assert payload.pop('verified_untitled_no_events_bulletin_contract_version') == 1
+            assert payload.pop('verified_source_signature_image_outcome_contract_version') == 1
             return original_sha(json.dumps(payload, sort_keys=True).encode())
         return original_sha(value)
 

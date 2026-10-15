@@ -299,6 +299,23 @@ def test_parallel_input_watchdog_tracks_oldest_and_clears_cancelled_tasks(monkey
     asyncio.run(exercise())
 
 
+def test_input_watchdog_uses_real_progress_not_builder_start_or_poll(monkeypatch):
+    building = {"market": "building", "started_monotonic": 1., "hot": True,
+                "last_progress_monotonic": 190.}
+    hung = {"market": "hung", "started_monotonic": 150., "hot": True}
+    monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {"building": building, "hung": hung})
+    monkeypatch.setattr(discord_bot, "_opening_source_operation", lambda *_args, **_kw: None)
+    assert discord_bot._oldest_opening_input_stage(now_monotonic=220.) is hung
+    monkeypatch.setattr(discord_bot.time, "monotonic", lambda: 221.)
+    discord_bot._record_opening_input_progress(building, {"message": "load", "step": 250, "total": 2760})
+    assert building["last_progress_monotonic"] == 221.
+    monkeypatch.setattr(discord_bot.time, "monotonic", lambda: 500.)
+    discord_bot._record_opening_input_progress(building, {"message": "load", "step": 250, "total": 2760})
+    assert building["last_progress_monotonic"] == 221.  # No timer-only liveness.
+    discord_bot._record_opening_input_progress(building, {"message": "load", "step": 500, "total": 2760})
+    assert building["last_progress_monotonic"] == 500.
+
+
 def test_persistent_input_poll_retries_fast_mode_without_waiting_or_restarting_slow_job(monkeypatch):
     monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {})
     monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {})
@@ -457,6 +474,39 @@ def test_scheduled_source_failure_is_a_value_and_does_not_run_model(monkeypatch)
     assert timing["signal_stage"] == "quote_prefetch_outside_model_lock"
     assert timing["parallel_quote_prefetch_ms"] >= 0
     assert "never-persist-this" not in str(timing)
+    assert set(timing["input_preparation_stages_ms"]) == {"realtime_freshness"}
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_input_stage_timings_persist_real_work_even_on_failure(monkeypatch, fails):
+    cfg = SimpleNamespace(market="measured", day_trade_simulation_enabled=True,
+                          timezone="Asia/Taipei", open_time="09:00")
+
+    async def prepare(_cfg):
+        return ("tw", "verified", False), None, 1.0
+
+    def prefetch(**kwargs):
+        report = kwargs["progress_callback"]
+        report({"message": "panel_fingerprint", "step": 0, "total": 1})
+        report({"message": "load", "step": 250, "total": 2760})
+        report({"message": "load", "step": 500, "total": 2760})
+        report({"message": "quote_transport", "step": 0, "total": 1})
+        if fails:
+            raise ConnectionError("do not persist secret")
+        return SimpleNamespace(snapshot=SimpleNamespace(transport_timing={}))
+
+    monkeypatch.setattr(discord_bot, "_prepare_scheduled_signal", prepare)
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **kwargs: kwargs)
+    monkeypatch.setattr(discord_bot, "prefetch_live_signal_prices", prefetch)
+    prepared, error, _ms, quote, timing = asyncio.run(discord_bot._prepare_scheduled_inputs(cfg))
+    spans = timing["input_preparation_stages_ms"]
+    assert set(spans) == {"realtime_freshness", "panel_fingerprint", "load", "quote_transport"}
+    assert all(ms >= 0 for ms in spans.values())
+    assert bool(error) == fails and (quote is None) == fails
+    assert "secret" not in str(timing)
+    record = discord_bot._opening_signal_latency_record(cfg=cfg, session_date="2026-10-15",
+        schedule_key="test:2026-10-15", timing=timing, result=None, error=error)
+    assert record["input_preparation_stages_ms"] == spans
 
 
 def test_scheduled_prefetched_quote_is_revalidated_by_canonical_model_owner(monkeypatch):

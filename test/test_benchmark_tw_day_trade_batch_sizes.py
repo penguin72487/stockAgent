@@ -272,6 +272,27 @@ def test_score_curve_rejects_invalid_training(mutate, reason: str) -> None:
     assert any(reason in item for item in score["reasons"])
 
 
+@pytest.mark.parametrize("missing", [None, "forward_replays", "backward_replays", "accepted_blocks", "certificate_fallbacks"])
+def test_requested_ledger_graph_requires_actual_training_execution(missing) -> None:
+    row = _epoch(3, wall=4.0, train=3.0)
+    prefix = "train_loss_day_trade_carry_explicit_graph_"
+    for counter in ("forward_replays", "backward_replays", "accepted_blocks"):
+        row[prefix + counter] = 8
+    row[prefix + "certificate_fallbacks"] = 0
+    if missing == "certificate_fallbacks":
+        row[prefix + missing] = 1
+    elif missing is not None:
+        row.pop(prefix + missing)
+    score = benchmark._score_curve(
+        [row], skip_epochs=2, minimum_steady_epochs=1, train_rows=289,
+        global_batch_size=128, memory=_memory(), max_peak_fraction=0.9,
+        min_headroom_gib=3.0, require_explicit_carry_graph=True,
+    )
+    assert score["ok"] is (missing is None)
+    if missing is not None:
+        assert any("ledger graph" in reason for reason in score["reasons"])
+
+
 def test_naive_score_allows_canonical_eager_eval_but_rejects_runtime_fallback() -> None:
     rows = [
         _epoch(3, wall=4.0, train=3.0),

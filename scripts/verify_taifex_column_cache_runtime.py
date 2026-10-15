@@ -36,6 +36,76 @@ SOURCE = ROOT / "artifacts/live/shioaji_taifex_volatility_simulation"
 LAUNCHER = ROOT / "scripts/run_shioaji_taifex_dashboard.sh"
 ALLOCATOR_CONTRACT = "taifex_complete_curve_allocator_idle_comparison_v1"
 ALLOCATOR_CONF = "muzzy_decay_ms:1000"
+SOURCE_PROOF_CONTRACT = "taifex_complete_curve_source_proof_memo_comparison_v1"
+
+
+def source_proof_acceptance(value, required):
+    """Require complete balanced trials and raw readback, not a summary claim."""
+    fixture = Path(value["fixture"]).resolve()
+    required.update(str(ROOT / f"scripts/{name}.py") for name in (
+        "benchmark_taifex_source_proof_memo", "benchmark_taifex_history_selection",
+        "benchmark_taifex_history_columns"))
+    required.update((str(ROOT / "downloader/artifact_io.py"),
+                     str(fixture.parent / "original_column_cache.py"),
+                     str(Path(pl.__file__).resolve())))
+    order = ["baseline", "candidate", "candidate", "baseline"] * 2
+    trials = value.get("trials", [])
+    if len(trials) != len(order) or [row.get("variant") for row in trials] != order:
+        return False, str(fixture)
+    metrics = ("wall_seconds", "cpu_seconds", "rss_peak_bytes", "proof_bytes",
+               "warm_wall_seconds", "warm_cpu_seconds", "warm_proof_bytes")
+    measured = {variant: {metric: statistics.median(row[metric] for row in trials
+        if row.get("variant") == variant) for metric in metrics}
+        for variant in ("baseline", "candidate")}
+    # Include the subsequent same-process warm request sequence as well. A
+    # cheaper prefix proof must not conceal an overall workflow regression.
+    totals = {variant: {metric: statistics.median(row[metric] + row["warm_" + metric]
+        for row in trials if row.get("variant") == variant)
+        for metric in ("wall_seconds", "cpu_seconds")}
+        for variant in ("baseline", "candidate")}
+    expected = trials[0]["output_sha256"]
+    raw = value["independent_raw_1d"]
+    raw_readback = metadata(raw["path"])
+    original = metadata(fixture.parent / "original-code-proof.json")
+    source = fixture / "state/marks.jsonl"
+    source_size = source.stat().st_size
+
+    def complete_trial(row, variant):
+        proofs = [proof for proof in row["proofs"] if proof["path"] == str(source)]
+        return (row.get("phase") == "update" and row.get("variant") == variant
+                and row.get("threads") == 4 and row.get("output_sha256") == expected
+                and row.get("provider_calls") == 0 and row.get("model_forward_calls") == 0
+                and row.get("production_writes") is False
+                and row.get("durable_complete_readback") is True
+                and row.get("warm_exact_output_parity") is True
+                and row["warm_proof_bytes"] == 0
+                and row["proof_bytes"] == sum(proof["bytes"] for proof in row["proofs"])
+                and {item["range"] for item in row["ranges"]} == set(dashboard.HISTORY_RANGE_SECONDS)
+                and len(row["ranges"]) == len(dashboard.HISTORY_RANGE_SECONDS)
+                and all(item["rows"] > 0 and item["json_bytes"] > 0 for item in row["ranges"])
+                and [(proof["kind"], proof["bytes"]) for proof in proofs]
+                    == ([("build", source_size), ("verify", source_size)] if variant == "baseline"
+                        else [("build", source_size)]))
+
+    improvement = (
+        value.get("source_unchanged") is True and value.get("balanced_abba") is True
+        and value.get("trial_order") == order and value.get("model_forward_calls") == 0
+        and measured == value.get("medians")
+        and set(expected) == set(dashboard.HISTORY_RANGE_SECONDS)
+        and sha(raw["path"]) == raw["sha256"]
+        and raw_readback.get("variant") == "baseline" and raw_readback.get("range") == "1d"
+        and raw_readback.get("provider_calls") == 0 and raw_readback.get("production_writes") is False
+        and raw_readback["output_sha256"] == raw["output_sha256"] == expected["1d"]
+        and original["sha256"] == sha(fixture.parent / "original_column_cache.py")
+        and all(row.get("trial") == index and complete_trial(row, variant)
+                for index, (row, variant) in enumerate(zip(trials, order, strict=True)))
+        and measured["candidate"]["cpu_seconds"] < .95 * measured["baseline"]["cpu_seconds"]
+        and measured["candidate"]["wall_seconds"] <= 1.05 * measured["baseline"]["wall_seconds"]
+        and measured["candidate"]["proof_bytes"] < measured["baseline"]["proof_bytes"]
+        and totals["candidate"]["wall_seconds"] <= 1.05 * totals["baseline"]["wall_seconds"]
+        and totals["candidate"]["cpu_seconds"] <= totals["baseline"]["cpu_seconds"]
+    )
+    return improvement, str(fixture)
 
 
 def metadata(path):
@@ -133,6 +203,8 @@ def accepted_code(path):
             and medians["decay"]["warm_read_wall_seconds"] <= medians["baseline"]["warm_read_wall_seconds"] + .1
         )
         fixture_path = value["fixture"]
+    elif value.get("contract") == SOURCE_PROOF_CONTRACT:
+        improvement, fixture_path = source_proof_acceptance(value, required)
     else:
         raise ValueError("current_code_not_bound_to_accepted_measurement")
     if (not value.get("exact_output_parity") or not value.get("code_stable") or not improvement
@@ -149,6 +221,21 @@ def identity(unit):
     result = subprocess.run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "InvocationID", "-p", "MainPID"],
                             check=True, text=True, capture_output=True, timeout=5)
     return dict(row.split("=", 1) for row in result.stdout.splitlines() if "=" in row)
+
+
+def owner_start_wall_ns(owner):
+    """Bind freshness to the actual new systemd process, not an older writer."""
+    run = subprocess.run(["systemctl", "show", UNIT, "-p", "MainPID", "-p", "InvocationID",
+                          "-p", "ExecMainStartTimestampMonotonic"],
+                         check=True, text=True, capture_output=True, timeout=5)
+    fields = dict(row.split("=", 1) for row in run.stdout.splitlines() if "=" in row)
+    if any(fields.get(key) != owner[key] for key in ("MainPID", "InvocationID")):
+        raise ValueError("owner_changed_during_start_time_readback")
+    start = int(fields["ExecMainStartTimestampMonotonic"]) * 1000
+    monotonic = time.monotonic_ns()
+    if not 0 < start <= monotonic:
+        raise ValueError("invalid_display_owner_start_time")
+    return time.time_ns() - monotonic + start
 
 
 def owner_environment(owner):
@@ -295,7 +382,8 @@ def main(argv=None):
               "service_restart_requested": False, "column_env_enabled": enabled}
     try:
         if args.baseline is None:
-            if str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes:
+            if (str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
+                    or str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes):
                 result.update(prewarm_polars_threads=pl.thread_pool_size(),
                               prewarm_allocator_conf=os.environ.get("_RJEM_MALLOC_CONF", ""))
                 if (result["prewarm_polars_threads"] != 4
@@ -314,7 +402,8 @@ def main(argv=None):
                     or baseline["cache_root"] != str(root) or baseline["protected"] != protected
                     or owner["InvocationID"] == baseline["owner"]["InvocationID"]):
                 raise ValueError("runtime_not_bound_to_prewarm_and_protected_owners")
-            allocator = str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
+            allocator = (str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
+                         or str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes)
             if allocator or str(ROOT / "scripts/benchmark_taifex_curve_threads.py") in hashes:
                 result["owner_polars_max_threads"] = owner_polars_limit(owner)
                 if result["owner_polars_max_threads"] != 4:
@@ -332,6 +421,15 @@ def main(argv=None):
                 row["receipt_mtime_ns"] > baseline["columns"][index]["receipt_mtime_ns"]
                 for index, row in enumerate(result["columns"])):
             raise ValueError("new_owner_has_not_proved_a_column_refresh_yet")
+        if args.baseline and str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes:
+            # An old owner can refresh between prewarm and restart. Such a
+            # receipt is not proof that the new process has rebuilt a source.
+            start_ns = owner_start_wall_ns(owner)
+            result["owner_start_wall_ns"] = start_ns
+            if not any(row["receipt_mtime_ns"] > start_ns for row in result["columns"]):
+                raise ValueError("no_column_refresh_after_actual_new_owner_start")
+            if any(Path(path).stat().st_mtime_ns > start_ns for path in hashes):
+                raise ValueError("benchmark_code_newer_than_display_owner")
         if identity(UNIT) != owner or {unit: identity(unit) for unit in PROTECTED} != protected:
             raise ValueError("owner_changed_during_readback")
         accepted_code(args.acceptance)

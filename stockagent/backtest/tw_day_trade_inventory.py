@@ -1929,7 +1929,8 @@ def rebalance_inventory_at_open(
         gross_rate = gross_rate - rebate
     valid = _finite_nonnegative(gross_rate, "gross funding fee") & valid
     gross_cost = (wanted.abs() * safe_price * (1 + gross_rate)).sum()
-    tolerance = torch.maximum(budget.new_tensor(1e-9), budget.abs() * 1e-12)
+    # Scalar bounds stay device operations in eager CUDA graph capture too.
+    tolerance = (budget.abs() * 1e-12).clamp_min(1e-9)
     scale = torch.where(
         gross_cost <= budget + tolerance,
         torch.ones_like(budget),

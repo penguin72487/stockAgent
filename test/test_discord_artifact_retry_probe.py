@@ -488,16 +488,15 @@ def test_retry_unit_is_lightweight_and_uses_original_worker():
         root / "deploy/systemd/stockagent-discord-artifact-retry.timer.in"
     ).read_text()
     installer = (root / "scripts/install_discord_bot_service.sh").read_text()
-    assert "--request-due-retry" in service
-    assert (
-        f"--minimum-runway-minutes {runner.ARTIFACT_RETRY_RUNWAY_MINUTES} "
-        "--protected-until 13:40"
-    ) in service
+    assert "--request-due-work" in service
+    # Runway is checked separately inside each dispatch; a 2h ExecCondition
+    # here would incorrectly silence the bounded latest-close owner.
+    assert "ExecCondition=" not in service
+    assert runner.ARTIFACT_RETRY_RUNWAY_MINUTES == 123
     assert "ProtectSystem=strict" in service
     assert "RestrictAddressFamilies=AF_UNIX" in service
     assert "StateDirectory=stockagent-discord-artifact-retry" in service
-    assert "00..06:*:00 Asia/Taipei" in timer
-    assert "13..23:*:00 Asia/Taipei" in timer
+    assert "OnCalendar=*-*-* *:*:00 Asia/Taipei" in timer
     assert "Persistent=true" in timer
     assert "RETRY_SERVICE_NAME" in installer and "RETRY_TIMER_NAME" in installer
 

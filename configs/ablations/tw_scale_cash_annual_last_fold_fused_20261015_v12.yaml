@@ -1,0 +1,5 @@
+# Preserve all 35 cases, OFAT settings, failure policy and last-fold selection.
+# Compiled whole-session arithmetic has an explicit optimizer fingerprint.
+base_spec: tw_scale_cash_annual_last_fold_ledger_20261015_v11.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_last_fold_fused_20261015_v12
+optimization_recipe: configs/benchmarks/gpu_ledger_fused_best_20261015.yaml

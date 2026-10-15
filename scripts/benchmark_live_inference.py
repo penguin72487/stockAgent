@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json
 from stockagent.data.factorized_panel import file_sha256
 from stockagent.live import signal_engine
+from stockagent.live import completed_inference_cache as forward_cache
 from stockagent.live.market_config import load_market_config
 from stockagent.config import load_config
 import torch
@@ -56,6 +57,166 @@ def forward_tensor_inventory(value, path: str = "output") -> list[dict]:
     return []
 
 
+class _ForwardIdentityCaptured(Exception):
+    """Stop the offline observer before reading/writing a forward payload."""
+
+    def __init__(self, identity: dict):
+        self.identity = json.loads(json.dumps(identity, sort_keys=True, allow_nan=False))
+
+
+def capture_forward_identity(kwargs: dict) -> dict:
+    """Observe the canonical CPU input boundary, not a forward acceptance.
+
+    Do not reimplement window/mask selection, read an old tensor as a new
+    generation, create a cache lease or publish a signal. Canonical preparation
+    may use its existing CPU panel caches; all model, CUDA and HTTP work fails
+    closed. The source reader lease and final identity fence remain in place.
+    """
+    if not kwargs.get("use_completed_session_cache"):
+        raise ValueError("identity observation requires the completed-session cache path")
+    if kwargs.get("write", True) or kwargs.get("publish_latest", True):
+        raise ValueError("identity observation forbids signal publication")
+    if kwargs.get("ensure_previous_signal", True):
+        raise ValueError("identity observation forbids historical signal generation")
+    if kwargs.get("price_source") != "panel":
+        raise ValueError("identity observation requires offline panel prices")
+    if torch.cuda.is_initialized():
+        raise RuntimeError("identity observation requires a fresh CUDA-cold process")
+
+    source_generations = []
+    original_forward = signal_engine._live_forward_outputs
+
+    def record_source(**forward_kwargs):
+        source_generations.append(forward_kwargs["source_fingerprint"])
+        return original_forward(**forward_kwargs)
+
+    def capture(root, identity, compute, *, validate_before_commit=None):
+        if validate_before_commit is None:
+            raise RuntimeError("canonical forward identity fence is missing")
+        validate_before_commit()
+        raise _ForwardIdentityCaptured(identity)
+
+    def forbid_work(*a, **kw):
+        raise AssertionError("identity observation attempted model, CUDA or HTTP work")
+
+    with ExitStack() as stack:
+        import requests
+        stack.enter_context(patch.object(forward_cache, "cached_forward", capture))
+        stack.enter_context(patch.object(signal_engine, "_live_forward_outputs", record_source))
+        for name in ("resolve_device", "_cached_live_model", "call_model"):
+            stack.enter_context(patch.object(signal_engine, name, forbid_work))
+        for name in ("is_available", "init", "synchronize", "empty_cache"):
+            stack.enter_context(patch.object(torch.cuda, name, forbid_work))
+        stack.enter_context(patch.object(requests.sessions.Session, "request", forbid_work))
+        started = time.perf_counter()
+        try:
+            signal_engine.generate_live_signal(**kwargs)
+        except _ForwardIdentityCaptured as observed:
+            if len(source_generations) != 1 or not source_generations[0]:
+                raise RuntimeError("identity observation did not retain the canonical source fence")
+            if torch.cuda.is_initialized():
+                raise RuntimeError("identity observation initialized CUDA")
+            return {
+                "contract": "completed_forward_identity_observer_v1",
+                "scope": "canonical_input_identity_not_forward_or_artifact_acceptance",
+                "key": forward_cache.identity_digest(observed.identity),
+                "identity": observed.identity,
+                "source_generation": source_generations[0],
+                "elapsed_ms": (time.perf_counter() - started) * 1000,
+                "model_calls": 0, "network_requests": 0, "cuda_initialized": False,
+                "signal_publication": False, "forward_cache_reads": 0,
+                "forward_cache_writes": 0,
+            }
+    raise RuntimeError("identity observation never reached the canonical forward boundary")
+
+
+def require_equal_forward_outputs(control, candidate, path: str = "output") -> None:
+    """Exact full-tree oracle, including dtype, NaN bits, signs and auxiliaries."""
+    if isinstance(control, torch.Tensor) and isinstance(candidate, torch.Tensor):
+        if control.shape != candidate.shape or control.dtype != candidate.dtype:
+            raise RuntimeError(f"{path}: tensor shape/dtype differs from forward control")
+        a = control.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        b = candidate.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        if not torch.equal(a, b):
+            raise RuntimeError(f"{path}: full tensor bytes differ from forward control")
+    elif type(control) is not type(candidate):
+        raise RuntimeError(f"{path}: output type differs from forward control")
+    elif isinstance(control, dict):
+        if control.keys() != candidate.keys():
+            raise RuntimeError(f"{path}: auxiliary keys differ from forward control")
+        for key in control:
+            require_equal_forward_outputs(control[key], candidate[key], f"{path}.{key}")
+    elif isinstance(control, (tuple, list)):
+        if len(control) != len(candidate):
+            raise RuntimeError(f"{path}: output length differs from forward control")
+        for index, (a, b) in enumerate(zip(control, candidate)):
+            require_equal_forward_outputs(a, b, f"{path}[{index}]")
+    elif control != candidate:
+        raise RuntimeError(f"{path}: output value differs from forward control")
+
+
+def forward_control_wrapper(control_path: Path, evidence: list):
+    """Qualify one new-code candidate against a verified old-generation tensor.
+
+    Only the code component may differ. The old payload remains labelled by
+    its original identity. Never install the candidate into the control root
+    or substitute the old tensor for a new model forward.
+    """
+    with control_path.open("rb") as handle:
+        raw = handle.read(1024**2 + 1)
+    if len(raw) > 1024**2:
+        raise ValueError("forward control metadata exceeds bounded size")
+    control = json.loads(raw)
+    control_key = control["key"]
+    if (control.get("contract") != forward_cache.CONTRACT
+            or forward_cache.identity_digest(control["identity"]) != control_key
+            or control_path.name != f"{control_key}.receipt.json"):
+        raise ValueError("forward control contract/key/identity mismatch")
+    original = forward_cache.cached_forward
+    value = None
+
+    def compare(root, identity, compute, *, validate_before_commit=None):
+        nonlocal value
+        if Path(root).resolve() == control_path.parent.resolve():
+            raise ValueError("new-code candidate must use a private forward cache root")
+        identity = json.loads(json.dumps(identity, sort_keys=True, allow_nan=False))
+        differences = sorted(key for key in identity.keys() | control["identity"].keys()
+                             if identity.get(key) != control["identity"].get(key))
+        changed_inputs = sorted(set(differences) - {"code"})
+        if changed_inputs:
+            raise RuntimeError("forward control has different canonical inputs: " + ", ".join(changed_inputs))
+        if validate_before_commit is None:
+            raise RuntimeError("forward control requires canonical identity validation")
+        validate_before_commit()
+        if value is None:
+            value = forward_cache._read(
+                control_path.parent / f"{control_key}.forward", control_key, control["identity"])
+            if value is forward_cache._CACHE_MISS:
+                raise RuntimeError("verified old-generation forward control is unavailable")
+            with control_path.open("rb") as handle:
+                if handle.read(1024**2 + 1) != raw:
+                    raise RuntimeError("forward control receipt changed during verification")
+        model_calls = 0
+
+        def verified_compute():
+            nonlocal model_calls
+            model_calls += 1
+            computed = compute()
+            require_equal_forward_outputs(value, computed)
+            return computed
+
+        candidate, receipt = original(root, identity, verified_compute,
+                                      validate_before_commit=validate_before_commit)
+        require_equal_forward_outputs(value, candidate)
+        evidence.append({"control_receipt": str(control_path), "control_key": control_key,
+                         "control_receipt_sha256": hashlib.sha256(raw).hexdigest(),
+                         "control_payload_sha256": control["payload_sha256"],
+                         "candidate_key": receipt["key"], "different_components": differences,
+                         "whole_output_bitwise_equal": True, "model_calls": model_calls})
+        return candidate, receipt
+    return compare
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--market-config", type=Path, required=True)
@@ -74,6 +235,10 @@ def main() -> None:
     parser.add_argument("--release-after-first", action="store_true")
     parser.add_argument("--forward-inventory", action="store_true",
                         help="Record full output shapes and logical cache size, never tensor values")
+    parser.add_argument("--capture-forward-identity", action="store_true",
+                        help="Observe exact canonical CPU input identity; forbid model/CUDA/HTTP")
+    parser.add_argument("--forward-control", type=Path,
+                        help="Verify every tensor against an existing receipt; only code may differ")
     args = parser.parse_args()
     if args.repeats < 1 or (args.cpu_threads is not None and args.cpu_threads < 1):
         parser.error("repeats and cpu-threads must be positive")
@@ -81,6 +246,14 @@ def main() -> None:
         parser.error("offline completed cache benchmark requires --cache-root")
     if (args.cache_hit_only or args.release_after_first) and not args.completed_session_cache:
         parser.error("cache-hit-only/release-after-first require --completed-session-cache")
+    if args.capture_forward_identity:
+        if not args.completed_session_cache:
+            parser.error("capture-forward-identity requires --completed-session-cache")
+        if (args.cache_hit_only or args.release_after_first or args.compare_to or args.forward_control
+                or args.profile or args.forward_inventory):
+            parser.error("identity observation is not a forward benchmark or output comparison")
+    if args.forward_control and not args.completed_session_cache:
+        parser.error("forward-control requires --completed-session-cache")
     cfg = load_market_config(args.market_config)
     config_path = args.config or cfg.config_path
     config = load_config(config_path)
@@ -96,12 +269,26 @@ def main() -> None:
         price_source="panel", use_completed_session_cache=args.completed_session_cache)
     kwargs["config_path"] = config_path
     started_at = datetime.now(timezone.utc).isoformat()
+    if args.capture_forward_identity:
+        payload = capture_forward_identity(kwargs)
+        payload.update(market=cfg.market, config_path=str(config_path),
+                       panel_date=args.panel_date, started_at_utc=started_at,
+                       finished_at_utc=datetime.now(timezone.utc).isoformat(),
+                       host=platform.node())
+        atomic_write_json(args.output, payload)
+        print(json.dumps({key: value for key, value in payload.items() if key != "identity"}),
+              flush=True)
+        return
     samples = []
     forward_inventory = []
+    forward_controls = []
     profiler = cProfile.Profile() if args.profile else None
     expected = (json.loads(args.compare_to.read_text())["output_sha256"]
                 if args.compare_to else None)
     with ExitStack() as stack:
+        if args.forward_control:
+            stack.enter_context(patch.object(forward_cache, "cached_forward",
+                forward_control_wrapper(args.forward_control, forward_controls)))
         if args.cache_hit_only:
             if torch.cuda.is_initialized():
                 raise RuntimeError("cache-hit-only must start without initialized CUDA")
@@ -226,6 +413,8 @@ def main() -> None:
         "samples": samples}
     if args.forward_inventory:
         payload["forward_tensor_inventory"] = forward_inventory
+    if args.forward_control:
+        payload["full_forward_controls"] = forward_controls
     atomic_write_json(args.output, payload)
 
 

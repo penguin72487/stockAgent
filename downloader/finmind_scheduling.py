@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from contextlib import closing
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time as wall_time, timedelta
 from pathlib import Path
 import json
 import sqlite3
@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 from stockagent.live.market_status import tw_stock_day_decision
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+STOCK_OPENING_PROTECTION_START = wall_time(8, 20)
+STOCK_OPENING_PROTECTION_END = wall_time(9, 10)
 RELEASE_CLOCK_VERSION = 4  # Periodic settlement publication is Mon-Fri, not 24/7.
 # Primary tutorial pages, checked 2026-09-30. These are expected release
 # boundaries, not actual publication evidence; the observation ledger owns it.
@@ -243,16 +245,28 @@ PRODUCT_HISTORY_STARTS = {
 }
 
 
-def protected_stock_opening(now: datetime, *, day_decision=tw_stock_day_decision) -> bool:
-    """Protect real/unknown stock openings without idling on a verified holiday."""
+def stock_opening_protection_deadline(now: datetime, *, day_decision=tw_stock_day_decision) -> datetime | None:
+    """The existing cash-opening gate's exact end, or no current protection.
+
+    A deadline lets drained owners keep their cheap heartbeat instead of
+    rebuilding millions of tasks every ten minutes when dispatch is forbidden.
+    Callers must still recheck the local calendar while waiting.
+    """
     local = now.astimezone(TAIPEI)
-    if not ((local.hour == 8 and local.minute >= 20) or (local.hour == 9 and local.minute < 10)):
-        return False
+    if not STOCK_OPENING_PROTECTION_START <= local.time() < STOCK_OPENING_PROTECTION_END:
+        return None
     decision = day_decision(local.date(), parquet_root=Path(__file__).resolve().parents[1] / "data_tw_public",
                             observed=now)
     if decision.status == "closed":
-        return False
-    return decision.is_session or local.weekday() < 5
+        return None
+    if decision.is_session or local.weekday() < 5:
+        return datetime.combine(local.date(), STOCK_OPENING_PROTECTION_END, TAIPEI).astimezone(UTC)
+    return None
+
+
+def protected_stock_opening(now: datetime, *, day_decision=tw_stock_day_decision) -> bool:
+    """Protect real/unknown stock openings without idling on a verified holiday."""
+    return stock_opening_protection_deadline(now, day_decision=day_decision) is not None
 
 
 def latest_released_stock_session(now: datetime, *, public_root: Path,

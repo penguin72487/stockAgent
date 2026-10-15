@@ -10,8 +10,9 @@ to expose the two physical files as one timestamp-deduplicated logical table.
 Periodic non-tail reconciliation compacts the tail back into the base.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import polars as pl
 import pyarrow as pa
@@ -19,6 +20,43 @@ import pyarrow.parquet as pq
 
 
 HOT_TAIL_DIRNAME = "_hot_tail"
+
+
+def tail_newer_summary(
+    frame: pl.DataFrame,
+    *,
+    base_latest_ms: int,
+    normalize: Callable[[pl.DataFrame], pl.DataFrame],
+) -> tuple[int, datetime | None]:
+    """Count/min actual tail dates without a canonical string round trip.
+
+    Only non-null, exact second-resolution writer strings take the native
+    path. Everything else retains the caller's complete legacy normalization
+    (including its invalid-date handling and exceptions). This computes the
+    same overlap facts, not a footer-only or inferred-contiguity certificate.
+    No input frame, source file, timestamp or provider policy is modified.
+    """
+    dates = None
+    if not frame.is_empty() and frame.schema.get("date") == pl.String:
+        values = frame.get_column("date")
+        if values.null_count() == 0 and bool((values.str.len_bytes() == 19).all()):
+            try:
+                parsed = values.str.to_datetime(
+                    format="%Y-%m-%d %H:%M:%S", time_unit="us",
+                    strict=False, exact=True,
+                )
+            except pl.exceptions.PolarsError:
+                parsed = None
+            if parsed is not None and parsed.null_count() == 0:
+                dates = parsed
+    if dates is None:
+        # Keep the same post-normalization parse as all three CEX callers.
+        dates = normalize(frame).select(
+            pl.col("date").str.to_datetime(strict=False).alias("__ts")
+        ).get_column("__ts")
+    cutoff = datetime.fromtimestamp(base_latest_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+    newer = dates.filter(dates > cutoff)
+    return len(newer), newer.min() if len(newer) else None
 
 
 def hot_tail_path(base_path: Path) -> Path:

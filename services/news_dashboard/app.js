@@ -23,6 +23,7 @@ const stateLabels = Object.freeze({
   waiting_cohort: "新文章待納入，非抓取失敗",
   article_attribution_not_verified: "作者未驗證", article_title_not_verified: "標題未驗證", article_license_not_verified: "授權標記未驗證", robots_disallowed: "robots 限制",
   article_identity_not_verified: "文章身分待驗證", article_rights_not_verified: "原創／來源署名待驗證", article_rights_or_scope_excluded: "原創／作者權利未確認或超出範圍",
+  invalid_bulk_publication_clock: "發布／異動時間未驗證",
   paywall_or_login: "付費／登入內容", access_challenge: "來源存取驗證", robots_access_challenge: "robots 存取驗證挑戰", robots_not_plain_rules: "robots 回應身分／規則待驗證", robots_redirect_refused: "robots 轉址待修",
   source_body_removed: "來源已主動撤下正文", source_not_found: "來源網址已不存在", source_body_image_only: "來源正文僅圖片，未做 OCR", source_body_embedded_only: "來源正文僅外部嵌入，未取得文字", source_article_empty_template: "來源目前回空白文章模板，未取得正文", pdf_image_only_or_body_not_found: "影像 PDF 待文字辨識",
   source_body_quote_only: "原站只提供行情片段，未取得新聞正文",
@@ -48,7 +49,7 @@ const reviewLabels = Object.freeze({permission_required: "需取得來源同意"
   authorized_api_configuration_required: "授權 API 待設定", review_unverified: "審閱時間待驗證"});
 const outcomeLabels = Object.freeze({complete_state: "正文完成狀態", queued_or_retry: "可排程／重試",
   registration_required: "尚未接線", scope_or_access_waiting: "範圍／存取待核實", waiting_cohort: "新增待納入批次",
-  repair_required: "解析／端點待修", nontext_representation: "圖片／嵌入／PDF 待文字驗證",
+  repair_required: "解析／時間／端點待修", nontext_representation: "圖片／嵌入／PDF 待文字驗證",
   nonarticle_response: "行情／測試／文件索引", source_currently_empty: "目前空模板",
   origin_absent: "原站撤下／不存在", unknown_outcome: "其他待查"});
 const state = {latest: null, filter: "all", query: "", sort: "state", page: 0, inFlight: false, retry: null, retryDelay: 3000, cnyesListOpen: false};

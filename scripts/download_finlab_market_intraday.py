@@ -329,23 +329,49 @@ def _open_index(path: Path) -> sqlite3.Connection:
         parquet_bytes INTEGER NOT NULL DEFAULT 0, checked_at_utc TEXT NOT NULL,
         PRIMARY KEY(kind, symbol, trade_date))""")
     db.execute("CREATE INDEX IF NOT EXISTS partitions_retry ON partitions(status, checked_at_utc)")
-    # One effective minute per stock/day: accepted direct data wins, then an
-    # accepted local derivation. A failed direct probe must not hide good data.
-    # This small indexed view avoids both double counting and a market/date
-    # Cartesian product; raw receipts and both source objects stay intact.
-    db.execute("""CREATE TEMP VIEW effective_partitions AS
-        SELECT kind,symbol,trade_date,status,rows,parquet_bytes,checked_at_utc,
-               'finlab_api' AS source_kind FROM partitions WHERE kind='tw_tick'
-        UNION ALL
-        SELECT 'tw_minute',symbol,trade_date,status,rows,parquet_bytes,checked_at_utc,
-               CASE WHEN kind='tw_minute' THEN 'finlab_api' ELSE 'derived_from_tw_tick' END
-        FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY symbol,trade_date ORDER BY
-          CASE WHEN status IN ('downloaded_unverified_for_pit','derived_unverified_for_pit',
-             'derived_no_regular_trades','verified_closed_date','verified_no_trade') THEN 0 ELSE 1 END,
-          CASE WHEN kind='tw_minute' THEN 0 ELSE 1 END) AS preference
-          FROM partitions WHERE kind IN ('tw_minute','tw_minute_derived'))
-        WHERE preference=1""")
+    _create_effective_partitions_view(db)
     return db
+
+
+def _create_effective_partitions_view(db: sqlite3.Connection) -> None:
+    """Select the same effective source without ranking the entire minute index.
+
+    Accepted direct data wins; a failed direct probe loses only to an accepted
+    local derivation. With two failures direct still wins. Missing direct data
+    never hides a derived row, including its errors. The existing primary key
+    bounds every partner probe. No persistent index, materialized cache, source
+    mutation or refresh delay is introduced; reads see the current transaction.
+    """
+    accepted = ("('downloaded_unverified_for_pit','derived_unverified_for_pit',"
+                "'derived_no_regular_trades','verified_closed_date','verified_no_trade')")
+    db.execute(f"""CREATE TEMP VIEW effective_partitions AS
+      SELECT kind,symbol,trade_date,status,rows,parquet_bytes,checked_at_utc,
+             'finlab_api' AS source_kind FROM partitions WHERE kind='tw_tick'
+      UNION ALL
+      SELECT kind,symbol,trade_date,status,rows,parquet_bytes,checked_at_utc,
+             'finlab_api' AS source_kind FROM partitions AS direct
+      WHERE kind='tw_minute' AND (status IN {accepted} OR NOT EXISTS (
+        SELECT 1 FROM partitions AS derived
+        WHERE derived.kind='tw_minute_derived' AND derived.symbol=direct.symbol
+          AND derived.trade_date=direct.trade_date AND derived.status IN {accepted}))
+      UNION ALL
+      SELECT 'tw_minute',symbol,trade_date,status,rows,parquet_bytes,checked_at_utc,
+             'derived_from_tw_tick' AS source_kind FROM partitions AS derived
+      WHERE kind='tw_minute_derived' AND NOT EXISTS (
+        SELECT 1 FROM partitions AS direct
+        WHERE direct.kind='tw_minute' AND direct.symbol=derived.symbol
+          AND direct.trade_date=derived.trade_date
+          AND (direct.status IN {accepted} OR derived.status NOT IN {accepted}))""")
+
+
+def _effective_partitions_view_identity(db: sqlite3.Connection) -> dict:
+    """Observe the actually opened owner connection, not a code-file guess."""
+    row = db.execute("SELECT sql FROM sqlite_temp_master "
+                     "WHERE type='view' AND name='effective_partitions'").fetchone()
+    if row is None or not isinstance(row[0], str):
+        raise ValueError("effective partition view is missing")
+    return {"contract": "finlab_effective_partition_view_observation_v1",
+            "sql_sha256": hashlib.sha256(row[0].encode("utf-8")).hexdigest()}
 
 
 def _record(db: sqlite3.Connection, kind: str, symbol: str, day: date,
@@ -574,6 +600,95 @@ def _coverage_phases(db: sqlite3.Connection, universe: list[dict], days: list[da
     return result
 
 
+def _minute_priority(db: sqlite3.Connection, universe: list[dict], days: list[date],
+                     *, first_observed: str | None, phases: list[dict],
+                     source_root: Path | None, quota_policy: QuotaPolicy | None) -> dict:
+    """Shared minute-before-tick decision; never changes publication/retry clocks.
+
+    The full dashboard already owns its minute phases. Admission supplies the
+    same phases without building tick statistics and thousands of display rows.
+    No cached decision survives a transaction or the existing admission boundary.
+    """
+    minute_pending = sum(row["untested_candidate_partitions"] + row["other_failed_partitions"]
+                         for row in phases if row["id"] != "older_discovery")
+    observed = datetime.now(UTC)
+    blocked_failures = 0
+    failure_wakes = []
+    if first_observed and source_root is not None:
+        known = {item["symbol"]: item for item in universe}
+        session_set = set(days)
+        for symbol, text, status in db.execute("SELECT symbol,trade_date,status FROM effective_partitions "
+                "WHERE kind='tw_minute' AND trade_date>=? AND status NOT IN "
+                "('downloaded_unverified_for_pit','derived_unverified_for_pit','derived_no_regular_trades',"
+                "'verified_closed_date','verified_no_trade','partition_not_ready')", (first_observed,)):
+            day = date.fromisoformat(text)
+            item = known.get(symbol)
+            if item is None or day not in session_set or not _eligible(item, day):
+                continue
+            path = _partition_paths(source_root, f"tw_minute:{symbol}", day)[1]
+            if not _checked_this_cycle(path, "attempted_at_utc", observed):
+                continue
+            blocked_failures += 1
+            attempt = read_json(path)
+            wake = quota_cycle_start(observed) + timedelta(days=1)
+            if not attempt.get("retry_exhausted"):
+                try:
+                    explicit = datetime.fromisoformat(attempt["retry_at_utc"])
+                    if explicit.tzinfo is not None and observed < explicit:
+                        wake = min(wake, explicit)
+                except (ValueError, KeyError, TypeError):
+                    pass
+            failure_wakes.append(wake)
+    publication_policy = quota_policy or load_policy()
+    publication_delay = publication_recheck_delay(now=observed, policy=publication_policy)
+    minute_due = db.execute("SELECT COUNT(*) FROM effective_partitions WHERE kind='tw_minute' "
+        "AND status='partition_not_ready' AND trade_date>=? AND checked_at_utc<?",
+        ((days[-1]-timedelta(days=30)).isoformat(),
+         (observed-publication_delay).isoformat())).fetchone()[0]
+    next_check = db.execute("SELECT MIN(checked_at_utc) FROM effective_partitions WHERE kind='tw_minute' "
+        "AND status='partition_not_ready' AND trade_date>=?",
+        ((days[-1]-timedelta(days=30)).isoformat(),)).fetchone()[0]
+    next_check_at = min(datetime.fromisoformat(next_check)+publication_delay,
+                        quota_cycle_start(observed)+timedelta(days=1)) if next_check else quota_cycle_start(observed)+timedelta(days=1)
+    drain_at = quota_cycle_start(observed)+timedelta(days=1, minutes=-publication_policy.drain_before_reset_minutes)
+    if next_check and publication_policy.drain_before_reset_minutes and observed < drain_at:
+        next_check_at = min(next_check_at, drain_at)
+    next_check_at = min([next_check_at, *failure_wakes])
+    actionable_pending = max(0, minute_pending - blocked_failures)
+    return {"pending_known_window_partitions": minute_pending,
+        "actionable_known_window_partitions": actionable_pending,
+        "blocked_known_window_partitions": blocked_failures,
+        "due_publication_rechecks": minute_due,
+        "publication_recheck_seconds": publication_delay.total_seconds(),
+        "tick_residual_allowed": actionable_pending == 0 and minute_due == 0,
+        "next_source_check_at_utc": next_check_at.isoformat() if actionable_pending == 0 and minute_due == 0 else None,
+        "basis": "available minute history first; unpublished and older unverified supply stay incomplete",
+        "older_discovery_is_bounded": True}
+
+
+def _minute_admission(db: sqlite3.Connection, universe: list[dict], days: list[date],
+                      *, source_root: Path | None, quota_policy: QuotaPolicy | None) -> dict:
+    """Compute only the live minute-priority inputs, not a complete inventory.
+
+    Match dashboard bounds exactly: known symbols and the selected date horizon,
+    accepted data only, prefer minute history then tick history. Lifecycle/session
+    eligibility remains in _coverage_phases, just as in the full inventory.
+    """
+    known = {item["symbol"] for item in universe}
+    first_by_kind = {}
+    for kind, symbol, first in db.execute(
+            "SELECT kind,symbol,MIN(trade_date) FROM effective_partitions "
+            "WHERE status IN ('downloaded_unverified_for_pit','derived_unverified_for_pit') "
+            "AND trade_date BETWEEN ? AND ? GROUP BY kind,symbol",
+            (days[0].isoformat(), days[-1].isoformat())):
+        if symbol in known:
+            first_by_kind[kind] = min(first_by_kind.get(kind, first), first)
+    first = first_by_kind.get("tw_minute") or first_by_kind.get("tw_tick")
+    phases = _coverage_phases(db, universe, days, first_observed=first, kind="tw_minute")
+    return _minute_priority(db, universe, days, first_observed=first, phases=phases,
+                            source_root=source_root, quota_policy=quota_policy)
+
+
 def _summarize(db: sqlite3.Connection, universe: list[dict], days: list[date],
                *, started: datetime, attempts: int, successes: int,
                state: str, daily_price_coverage: dict | None = None,
@@ -671,66 +786,14 @@ def _summarize(db: sqlite3.Connection, universe: list[dict], days: list[date],
             by_kind[kind]["source_kind"] = "derived_from_tw_tick"
     minute_first = by_kind["tw_minute"]["first_data_date"] or by_kind["tw_tick"]["first_data_date"]
     minute_phases = _coverage_phases(db, universe, days, first_observed=minute_first, kind="tw_minute")
-    minute_pending = sum(row["untested_candidate_partitions"] + row["other_failed_partitions"]
-                         for row in minute_phases if row["id"] != "older_discovery")
-    observed = datetime.now(UTC)
-    blocked_failures = 0
-    failure_wakes = []
-    if minute_first and source_root is not None:
-        known = {item["symbol"]: item for item in universe}
-        session_set = set(days)
-        for symbol, text, status in db.execute("SELECT symbol,trade_date,status FROM effective_partitions "
-                "WHERE kind='tw_minute' AND trade_date>=? AND status NOT IN "
-                "('downloaded_unverified_for_pit','derived_unverified_for_pit','derived_no_regular_trades',"
-                "'verified_closed_date','verified_no_trade','partition_not_ready')", (minute_first,)):
-            day = date.fromisoformat(text)
-            item = known.get(symbol)
-            if item is None or day not in session_set or not _eligible(item, day):
-                continue
-            path = _partition_paths(source_root, f"tw_minute:{symbol}", day)[1]
-            if not _checked_this_cycle(path, "attempted_at_utc", observed):
-                continue
-            blocked_failures += 1
-            attempt = read_json(path)
-            wake = quota_cycle_start(observed) + timedelta(days=1)
-            if not attempt.get("retry_exhausted"):
-                try:
-                    explicit = datetime.fromisoformat(attempt["retry_at_utc"])
-                    if explicit.tzinfo is not None and observed < explicit:
-                        wake = min(wake, explicit)
-                except (ValueError, KeyError, TypeError):
-                    pass
-            failure_wakes.append(wake)
-    publication_policy = quota_policy or load_policy()
-    publication_delay = publication_recheck_delay(now=observed, policy=publication_policy)
-    minute_due = db.execute("SELECT COUNT(*) FROM effective_partitions WHERE kind='tw_minute' "
-        "AND status='partition_not_ready' AND trade_date>=? AND checked_at_utc<?",
-        ((days[-1]-timedelta(days=30)).isoformat(),
-         (observed-publication_delay).isoformat())).fetchone()[0]
-    next_check = db.execute("SELECT MIN(checked_at_utc) FROM effective_partitions WHERE kind='tw_minute' "
-        "AND status='partition_not_ready' AND trade_date>=?",
-        ((days[-1]-timedelta(days=30)).isoformat(),)).fetchone()[0]
-    next_check_at = min(datetime.fromisoformat(next_check)+publication_delay,
-                        quota_cycle_start(observed)+timedelta(days=1)) if next_check else quota_cycle_start(observed)+timedelta(days=1)
-    drain_at = quota_cycle_start(observed)+timedelta(days=1, minutes=-publication_policy.drain_before_reset_minutes)
-    if next_check and publication_policy.drain_before_reset_minutes and observed < drain_at:
-        next_check_at = min(next_check_at, drain_at)
-    next_check_at = min([next_check_at, *failure_wakes])
-    actionable_pending = max(0, minute_pending - blocked_failures)
+    minute_priority = _minute_priority(db, universe, days, first_observed=minute_first,
+        phases=minute_phases, source_root=source_root, quota_policy=quota_policy)
     return {
         "schema_version": 4, "observed_at_utc": datetime.now(UTC).isoformat(),
         "progress_contract_version": 1,
         "acquisition_mode": "minute_first_tick_residual",
         "acquisition_policy_version": ACQUISITION_POLICY_VERSION, "active_kind": active_kind,
-        "minute_priority": {"pending_known_window_partitions": minute_pending,
-            "actionable_known_window_partitions": actionable_pending,
-            "blocked_known_window_partitions": blocked_failures,
-            "due_publication_rechecks": minute_due,
-            "publication_recheck_seconds": publication_delay.total_seconds(),
-            "tick_residual_allowed": actionable_pending == 0 and minute_due == 0,
-            "next_source_check_at_utc": next_check_at.isoformat() if actionable_pending == 0 and minute_due == 0 else None,
-            "basis": "available minute history first; unpublished and older unverified supply stay incomplete",
-            "older_discovery_is_bounded": True},
+        "minute_priority": minute_priority,
         "legacy_direct_minute_partitions": db.execute(
             "SELECT COUNT(*) FROM partitions WHERE kind='tw_minute' AND status IN "
             "('downloaded_unverified_for_pit','verified_closed_date','verified_no_trade')"
@@ -816,6 +879,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     if not days or not universe:
         raise ValueError("no verified stock universe or observed session days")
     index = _open_index(root / "intraday/market_index.sqlite3")
+    index_view_identity = _effective_partitions_view_identity(index)
     cursor_path = root / ("intraday/minute_cursor.json" if kind == "tw_minute" else "intraday/market_cursor.json")
     try:
         cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
@@ -880,6 +944,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     scanned = 0
     general_admission: dict = {}
     general_recheck_at = datetime.min.replace(tzinfo=UTC)
+    minute_admission_checks = 0
+    minute_admission_observation = None
     started_clock = time.monotonic()
     deadline = started_clock + max_run_seconds if max_run_seconds is not None else None
     active_key = active_day = None
@@ -965,6 +1031,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             "scanned_candidates": scanned, "cached_skips": cached_skips,
             "quota_checks": quota_checks, "quota_cache_hits": quota_cache_hits,
             "processing_engine": engine,
+            "partition_index_view": index_view_identity,
+            "minute_priority_admission": minute_admission_observation,
             "data_processing_engine": "polars_arrow_v1", "processing_threads": quota_policy.processing_threads,
             "pipeline_workers": workers, "range_calendar_days": range_calendar_days,
             "download_threads": download_threads, "queue_depth": queue_depth, "authorization_slots": authorization_slots,
@@ -1000,6 +1068,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     def may_acquire() -> bool:
         nonlocal general_admission, general_recheck_at, state, quota_checks, quota_cache_hits, policy_state
         nonlocal previous_quota, quota_pending_successes, account_delta_bytes, quota_sample_successes
+        nonlocal minute_admission_checks, minute_admission_observation
         # Leave a complete SDK request's timeout runway before the outer shell
         # watchdog. Stop normally so source/index/frontiers stay recoverable.
         if deadline is not None and time.monotonic() + 180 >= deadline:
@@ -1025,10 +1094,16 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 state = "opening_window_yield"
                 return False
         if source_kind == "tw_tick" and enforce_minute_priority and boundary >= general_recheck_at:
-            admission = _summarize(index, universe, days, started=started,
-                                  attempts=attempts, successes=successes, state=state, source_root=root,
-                                  quota_policy=quota_policy)
-            if not admission["minute_priority"]["tick_residual_allowed"]:
+            admission_clock = time.monotonic()
+            admission = _minute_admission(index, universe, days, source_root=root,
+                                          quota_policy=quota_policy)
+            minute_admission_checks += 1
+            minute_admission_observation = {"contract_version": 1,
+                "engine": "minute_priority_only_v1", "checks": minute_admission_checks,
+                "checked_at_utc": datetime.now(UTC).isoformat(),
+                "wall_seconds": time.monotonic() - admission_clock,
+                "complete_inventory_generated": False, "decision": admission}
+            if not admission["tick_residual_allowed"]:
                 state = "waiting_required_minutes"
                 return False
         # No other regular writer can change receipts under the account lock.

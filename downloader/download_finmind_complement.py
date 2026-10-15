@@ -26,6 +26,7 @@ import sys
 import time
 from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retryable_queue_error, optimize_queue
 from downloader.finmind_queue_indexes import dispatch_indexes, ensure_status_index
+from downloader.finmind_status_aggregates import StatusConnection, task_status_aggregates
 from typing import Any
 
 import pyarrow as pa
@@ -135,7 +136,7 @@ def _iso(value: datetime) -> str:
 
 def _db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10)
+    connection = sqlite3.connect(path, timeout=10, factory=StatusConnection)
     try:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")
@@ -1814,10 +1815,7 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
                   "last_data_date": None, "last_attempt_at_utc": None}
         for dataset in ALL_DATASETS
     }
-    for row in connection.execute(
-        "SELECT dataset,state,COUNT(*),SUM(rows),SUM(bytes),MIN(first_data_date),"
-        "MAX(last_data_date),MAX(last_attempt_at_utc) FROM tasks GROUP BY dataset,state"
-    ):
+    for row in task_status_aggregates(connection, report_first_use=True):
         dataset, task_state, count, rows, size, first, last_date, attempted = row
         if task_state in {"deprecated_query_shape", "outside_documented_range", "identifier_alias", "non_session", "not_observation_date", "object_tier_paused"}:
             if task_state == 'deprecated_query_shape':

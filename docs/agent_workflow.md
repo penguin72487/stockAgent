@@ -39,6 +39,14 @@ stockagent-agent status --architecture --output artifacts/operations/agent-workf
 Git remote refs、遠端節點、載入的服務程式版本、來源 freshness／完整性仍需對應驗收。
 快照檔案的 mtime 只表示檔案年齡；`active` 只表示程序活動。
 
+跨主機回傳的 run 收據可與本機紀錄並存；`status` 會保留為
+`foreign_unverified`，列出宣告的 host／checkout／結果與未驗證外地紀錄
+數量，不查它的 PID／log 在本機是否存在，不冒充遠端即時觀察。
+這些紀錄不阻塞無關本機 task 的 launcher；同 task／同名的未驗證紀錄
+仍不能授權重試或完成。定點 `run-status`／`_execute`／`run-reconcile`
+與收據寫入仍要求當前 host 和 checkout 完全一致。原收據不改寫，
+格式損壞的本機紀錄也不因這個分類被略過。
+
 ## 接手、執行與交付
 
 實作／維運的多步任務先查相關現況並建立紀錄。小型文字修改可直接完成，

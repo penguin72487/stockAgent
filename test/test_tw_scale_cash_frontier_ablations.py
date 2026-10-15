@@ -122,6 +122,71 @@ def test_resident_list_does_not_start_training(monkeypatch, capsys):
     launch.assert_not_called()
 
 
+def test_ledger_catalog_keeps_dimensions_and_original_35_cases(tmp_path, dated_manifest):
+    spec, rows = queue._experiment_rows(entry.LEDGER_SPEC)
+    old_spec, old_rows = queue._experiment_rows(entry.RESIDENT_SPEC)
+    assert rows == old_rows and len(rows) == 35
+    for value in (spec,old_spec):
+        value['matrix']['base_overrides'].setdefault('data',{})['factorized_feature_manifest']=str(dated_manifest)
+    runs=queue._build_configs(entry.LEDGER_SPEC,spec,rows,tmp_path/'ledger')
+    controls=queue._build_configs(entry.RESIDENT_SPEC,old_spec,old_rows,tmp_path/'resident')
+    for run,control in zip(runs,controls,strict=True):
+        a,b=load_config(run['config_path']),load_config(control['config_path'])
+        for section in ('data','walk_forward','trading','training','evaluation'):
+            assert asdict(getattr(a,section))==asdict(getattr(b,section))
+    assert spec['output_root'].endswith('_v12')
+    recipe=yaml.safe_load((entry.ROOT/spec['optimization_recipe']).read_text())['full_fold_candidates'][0]
+    runtime=recipe['runtime_overrides']
+    assert runtime['STOCKAGENT_DAY_TRADE_GRAPH_FUSED_STEP']==1
+    assert runtime['STOCKAGENT_DAY_TRADE_DEVICE_PREFETCH']==1
+    assert runtime['STOCKAGENT_DAY_TRADE_DEVICE_PREFETCH_ROWS']==32
+    assert spec['runtime']['capacity_retry']==old_spec['runtime']['capacity_retry']
+    launch=Mock(side_effect=AssertionError('listing must not train'))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(entry.subprocess,'run',launch)
+        assert entry.main(['--ledger-graph','--list'])==0
+    launch.assert_not_called()
+
+
+def test_ledger_binding_rejects_missing_financial_or_source_adjoint_evidence(tmp_path,monkeypatch):
+    path=tmp_path/'mechanism.json'
+    proof=dict(contract='ledger_graph_mechanism_validation_v1',source_sha256='ledger',
+        strict_cuda_returncode=0,mechanism_tests_returncode=0,
+        canonical_financial_forward_and_adjoint_pass=True,failed_certificate_replays_canonical=True,
+        checkpoint_resume_contract_pass=True,prepared_transport_bitwise_pass=True,
+        normalized_csr_disk_cache_adjoint_pass=True,
+        explicit_graph_contract=dict(version='canonical_terminal_flat_buffered_bounded_adjoint_v2',adjoint='saved'))
+    path.write_text(json.dumps(proof))
+    binding=dict(source_sha256='ledger',mechanism_validation_receipt=str(path),
+                 mechanism_validation_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    measured=Mock(return_value=(binding,tmp_path/'code'))
+    monkeypatch.setattr(entry,'_structural_source',measured)
+    assert entry._ledger_source({'source_sha256':'resident'},tmp_path/'binding.json')[0]==binding
+    assert measured.call_args.kwargs==dict(binding_contract='tw_ablation_ledger_graph_source_v1',
+                                          parent_key='parent_resident_source_sha256')
+    proof['explicit_graph_contract']['step']='canonical_whole_session_compiled_v1'
+    path.write_text(json.dumps(proof))
+    binding['mechanism_validation_sha256']=hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError,match='financial/source/adjoint'):
+        entry._ledger_source({'source_sha256':'resident'},tmp_path/'binding.json')
+    binding['explicit_graph_contract']=dict(proof['explicit_graph_contract'])
+    with pytest.raises(ValueError,match='financial/source/adjoint'):
+        entry._ledger_source({'source_sha256':'resident'},tmp_path/'binding.json')
+    proof['bounded_device_prefetch_bitwise_stream_pass']=True
+    path.write_text(json.dumps(proof))
+    binding['mechanism_validation_sha256']=hashlib.sha256(path.read_bytes()).hexdigest()
+    assert entry._ledger_source({'source_sha256':'resident'},tmp_path/'binding.json')[0]==binding
+    binding['explicit_graph_contract']={**binding['explicit_graph_contract'],'step':'unverified'}
+    with pytest.raises(ValueError,match='unsupported compiled step'):
+        entry._ledger_source({'source_sha256':'resident'},tmp_path/'binding.json')
+    binding['explicit_graph_contract']=dict(proof['explicit_graph_contract'])
+    proof['prepared_transport_bitwise_pass']=False
+    path.write_text(json.dumps(proof))
+    binding['mechanism_validation_sha256']=hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError,match='financial/source/adjoint'):
+        entry._ledger_source({'source_sha256':'resident'},tmp_path/'binding.json')
+
+
 def test_resident_binding_requires_mechanism_and_unchanged_financial_owners(tmp_path, monkeypatch):
     path = tmp_path/'mechanism.json'
     proof = {'source_sha256':'resident','strict_cuda_returncode':0,

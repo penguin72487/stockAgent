@@ -37,7 +37,10 @@ def test_native_metadata_is_lossless_and_does_not_mutate_source(tmp_path):
     expected = json.loads(_stdlib(payload))
     observation = {}
     observed = codec.encode_record_cache(payload, observation=observation)
-    assert observation == {"backend": "msgspec_validated_metadata", "fallback_reason": None}
+    assert observation == {
+        "backend": "msgspec_validated_metadata", "fallback_reason": None,
+        "temporary_struct_gc_tracking": codec._RecordCache.__struct_config__.gc,
+    }
     assert json.loads(observed) == expected
     assert list(json.loads(observed)) == list(payload)
     assert codec.encode_record_cache(json.loads(original)) != b""

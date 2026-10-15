@@ -445,6 +445,9 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
             snapshot["training"]["physical_fifo_prepare_contract"] = "tensor_gregorian_bucketed_inventory_funding_preparation_v3"
         if str(os.environ.get("STOCKAGENT_DAY_TRADE_FINALIZE_COMPILE", "0")).lower() not in {"0", "false", "off", "no"}:
             snapshot["training"]["physical_fifo_finalize_contract"] = "fused_close_nav_absorbing_default_atomic_commit_fp64_v1"
+        if str(os.environ.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0")).lower() not in {"0", "false", "off", "no"}:
+            from stockagent.backtest.tw_day_trade_graph import explicit_carry_graph_contract
+            snapshot["training"]["physical_fifo_explicit_graph_contract"] = explicit_carry_graph_contract()
     if not getattr(config.data, "factorized_feature_manifest", ""):
         snapshot["data"].pop("factorized_feature_manifest", None)
     elif config.training.enable_torch_compile:
@@ -996,6 +999,11 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         contract["integer_gradient_contract_version"] = int(
             TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION
         )
+    if (execution_mode == "tw_day_trade" and
+        str(os.environ.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0")).lower()
+            not in {"0", "false", "off", "no"}):
+        from stockagent.backtest.tw_day_trade_graph import explicit_carry_graph_contract
+        contract["physical_fifo_explicit_graph_contract"] = explicit_carry_graph_contract()
     if (
         execution_mode in TW_CARRYING_EXECUTION_MODES
         or execution_mode == "tw_day_trade"

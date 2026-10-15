@@ -583,6 +583,69 @@ def test_broker_worker_does_not_block_engine_poll(owner, monkeypatch, tmp_path):
         broker.close()
 
 
+def test_autonomous_broker_serves_while_engine_is_busy_and_requires_session(owner, monkeypatch, tmp_path):
+    inbox = quotes.day_trade_quote_broker_request_dir(tmp_path)
+    path = inbox / "pending.json"
+    path.write_text("{}")
+    served = threading.Event()
+
+    def serve(**kwargs):
+        path.unlink(missing_ok=True)
+        served.set()
+        return [{"available_count": 1, "snapshot": {"large": "body"}}]
+
+    monkeypatch.setattr(quotes, "serve_shared_day_trade_quote_requests", serve)
+    broker = quotes.SharedDayTradeQuoteBroker(tmp_path, autonomous=True)
+    try:
+        assert not served.wait(0.08)  # No verified session means no quote I/O.
+        broker.authorize("1900-01-01")
+        assert not served.wait(0.08)  # Yesterday cannot authorize a new session.
+        broker.authorize(acquisition.datetime.now(TAIPEI).date().isoformat())
+        assert served.wait(2)  # No engine poll is needed to dispatch the request.
+        deadline = time.monotonic() + 2
+        results = []
+        while not results and time.monotonic() < deadline:
+            results = broker.poll()
+            time.sleep(0.001)
+        assert results == [{"available_count": 1}]
+    finally:
+        broker.close()
+
+
+def test_autonomous_broker_protects_opening_purpose_and_releases_deferred_inbox(owner, monkeypatch, tmp_path):
+    inbox = quotes.day_trade_quote_broker_request_dir(tmp_path)
+    path = inbox / "pending.json"
+    path.write_text("{}")
+    clock = [datetime(2026, 10, 15, 9, 0, tzinfo=TAIPEI)]
+
+    class Clock:
+        @staticmethod
+        def now(_zone):
+            return clock[0]
+
+    monkeypatch.setattr(quotes, "datetime", Clock)
+    protected, ordinary = threading.Event(), threading.Event()
+
+    def serve(**kwargs):
+        if kwargs["allowed_purposes"] == {"opening_signal"}:
+            protected.set()
+            return []  # Interactive inbox remains unchanged during hot gate.
+        path.unlink()
+        ordinary.set()
+        return [{"available_count": 1}]
+
+    monkeypatch.setattr(quotes, "serve_shared_day_trade_quote_requests", serve)
+    broker = quotes.SharedDayTradeQuoteBroker(tmp_path, autonomous=True)
+    try:
+        broker.authorize("2026-10-15")
+        assert protected.wait(2)
+        assert not ordinary.is_set()
+        clock[0] = clock[0].replace(second=15)
+        assert ordinary.wait(2)  # Policy change must invalidate the inbox scan.
+    finally:
+        broker.close()
+
+
 @pytest.mark.parametrize("session", ["2026-10-08", "2026-02-28", "2024-02-29", "invalid", "20261008"])
 def test_vectorized_clock_matches_original_scalar_contract(session):
     center = datetime.fromisoformat("2026-10-08T00:00:00+08:00")

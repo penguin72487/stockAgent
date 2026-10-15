@@ -1985,7 +1985,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     specs: list[ModeSpec] = []
     live_configs: dict[str, LiveMarketConfig] = {}
-    quote_broker = SharedDayTradeQuoteBroker(engine.state_dir)
+    quote_broker = SharedDayTradeQuoteBroker(
+        engine.state_dir, autonomous=True, opening_deadline=MISSED_OPENING_COMMIT_DEADLINE,
+    )
     last_reload = 0.0
     last_readiness = 0.0
     last_liveness = 0.0
@@ -2041,6 +2043,7 @@ def main(argv: list[str] | None = None) -> int:
                 live_configs,
                 observed=observed,
             )
+            quote_broker.authorize(observed.date().isoformat() if session_open else None)
             current_coverage = (
                 _current_eligibility_coverage(
                     specs,
@@ -2139,6 +2142,7 @@ def main(argv: list[str] | None = None) -> int:
             live_configs,
             observed=observed,
         )
+        quote_broker.authorize(observed.date().isoformat() if session_open else None)
         session_gate_elapsed_ms = (
             time_module.perf_counter() - session_gate_started
         ) * 1000.0

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
+import os
 
 import numpy as np
 import torch
@@ -85,6 +87,15 @@ class FactorizedSparseRowStore:
         self.entries = OrderedDict()
         self.bytes = 0
         self.hits = self.misses = self.host_payload_bytes = 0
+        self.disk = None
+        if disk_root := os.environ.get("STOCKAGENT_SPARSE_ROW_DISK_CACHE_DIR", ""):
+            from stockagent.data.factorized_sparse_cache import NormalizedCSRDiskCache
+            self.disk = NormalizedCSRDiskCache(disk_root, dict(
+                row_contract=SPARSE_ROW_CONTRACT, source=self.source_identity,
+                shape=list(source.shape), layernorm=self.layernorm, eps=self.eps,
+                sanitize=bool(self.sanitize), normalize=bool(self.normalize),
+                scale_sha256=hashlib.sha256(self.scale.tobytes()).hexdigest(),
+                active_sha256=hashlib.sha256(self.active.tobytes()).hexdigest()))
         # The resident representation replaces expanded host cache entries.
         # This releases runtime arrays, never source files or their receipts.
         source._cache.cache.clear()
@@ -126,6 +137,12 @@ class FactorizedSparseRowStore:
              else source.shape[0]) - start)
         stop = start + count
         symbols, features = source.shape[1:]
+        cache_block = dict(id=int(block_id), start=start, stop=stop,
+                           shape=[count*symbols, features])
+        cached = self.disk.load(cache_block) if self.disk is not None else None
+        if cached is not None:
+            return self._upload(start, stop, symbols, features, cached["crow"],
+                cached["columns"], cached["values"], cached["zero_value"], origin="verified_disk")
         row_parts, column_parts, value_parts = [], [], []
 
         def add(raw, logical_columns, stock_positions):
@@ -222,6 +239,13 @@ class FactorizedSparseRowStore:
             inverse = 1. / np.sqrt(variance + self.eps)
             prepared = (raw64 * inverse[rows]).astype(np.float32)
             zero_value = np.zeros(shape[0], dtype=np.float32)
+        if self.disk is not None:
+            self.disk.save(cache_block, dict(crow=crow, columns=columns,
+                                           values=prepared, zero_value=zero_value))
+        return self._upload(start, stop, symbols, features, crow, columns, prepared, zero_value,
+                            origin="source_build")
+
+    def _upload(self, start, stop, symbols, features, crow, columns, prepared, zero_value, *, origin):
         required = crow.nbytes + columns.nbytes + prepared.nbytes + zero_value.nbytes
         if required > self.budget_bytes:
             raise MemoryError("one immutable sparse date block exceeds the GPU cache budget")
@@ -233,6 +257,8 @@ class FactorizedSparseRowStore:
             # Evaluation may be the first consumer of a physical date block.
             # Resident constants must remain usable by a later training adjoint.
             with torch.inference_mode(False), torch.no_grad():
+                if not array.flags.writeable:
+                    array = np.array(array, copy=True)
                 host = torch.from_numpy(array)
                 if self.device.type == "cuda":
                     host = host.pin_memory()
@@ -243,8 +269,8 @@ class FactorizedSparseRowStore:
             upload(zero_value))
         self.bytes += entry.nbytes
         self.host_payload_bytes += required
-        print(f"[sparse-source] block={block_id} dates={start}:{stop} nnz={len(prepared)} "
-              f"logical_cells={shape[0]*features} resident_bytes={self.bytes} "
+        print(f"[sparse-source] dates={start}:{stop} nnz={len(prepared)} origin={origin} "
+              f"logical_cells={(stop-start)*symbols*features} resident_bytes={self.bytes} "
               f"contract={SPARSE_ROW_CONTRACT}", flush=True)
         return entry
 

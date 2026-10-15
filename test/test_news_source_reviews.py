@@ -289,3 +289,19 @@ def test_money_link_public_footer_review_keeps_news_and_financial_products_separ
     config = load_news_configuration(Path('configs/news_fulltext.json'))
     source = next(row for row in config['providers'] if row['id'] == 'money_link')
     assert source['enabled'] is False and source['authorization']['kind'] == 'awaiting_authorization'
+
+
+@pytest.mark.parametrize('provider,evidence', [
+    ('unregistered:hd.stheadline.com', 'https://www.stheadline.com/terms/'),
+    ('unregistered:sunmedia.tw', 'https://sunmedia.tw/copyright'),
+    ('unregistered:www.peoplenews.tw', 'https://www.peoplenews.tw/%E7%89%88%E6%AC%8A%E8%81%B2%E6%98%8E'),
+])
+def test_new_restrictive_reviews_preserve_known_urls_without_granting_capture(provider, evidence):
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews[provider]
+    assert review['capture_decision'] == 'permission_required'
+    assert evidence in review['evidence_urls']
+    assert review['reviewed_at_utc'].startswith('2026-10-14T')
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    assert not any(source['id'] == provider and source.get('enabled') for source in config['providers'])
+    assert config['remote_training_export'] is False

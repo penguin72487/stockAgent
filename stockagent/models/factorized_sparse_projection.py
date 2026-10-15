@@ -55,6 +55,9 @@ def project_factorized_sparse_rows(model, slab):
     stats["sparse_resident_bytes"] = store.bytes
     stats["sparse_cache_hits"] = store.hits
     stats["sparse_cache_misses"] = store.misses
+    if store.disk is not None:
+        for key, value in store.disk.stats.items():
+            stats[f"sparse_disk_{key}"] = value
     stats["sparse_cold_allocator_releases"] = store.__dict__.get("cold_allocator_releases", 0)
     return result
 

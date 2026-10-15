@@ -184,7 +184,7 @@ def test_candidate_has_exactly_two_reviewed_mode_changes_and_priority_source_unc
         if entry['id'] == 'peopo':
             entry['require_configured_container'] = True
     after = PolicyRegistry(cfg, base=repo)
-    assert len(before.sources) == len(after.sources) == 66
+    assert before.sources.keys() == after.sources.keys()
     for provider in before.sources:
         if provider in PROVIDERS:
             assert after.sources[provider].known_url_only

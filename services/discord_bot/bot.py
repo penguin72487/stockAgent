@@ -394,6 +394,7 @@ def _opening_signal_latency_record(
         "stages": stages,
         "price_receipt_timing": receipt or None,
         "quote_transport": quote_transport,
+        "input_preparation_stages_ms": timing.get("input_preparation_stages_ms"),
         "ensure_previous_signal": timing.get("ensure_previous_signal"),
         "previous_signal_backfill_limit": timing.get(
             "previous_signal_backfill_limit"
@@ -3409,11 +3410,19 @@ def _oldest_opening_input_stage(*, now_monotonic: float | None = None) -> dict[s
         # A legitimate long source owner must not hide an unrelated stalled
         # quote job behind it. Inspect all overdue input jobs, not only oldest.
         stalled = [row for row in stages
-                   if now_monotonic - row["started_monotonic"] > _opening_attempt_timeout_seconds(hot=row["hot"])
+                   if now_monotonic - row.get("last_progress_monotonic", row["started_monotonic"]) > _opening_attempt_timeout_seconds(hot=row["hot"])
                    and _opening_source_operation(now_monotonic, input_stage=row) is None]
         if stalled:
             stages = stalled
-    return min(stages, key=lambda row: row["started_monotonic"]) if stages else None
+    return min(stages, key=lambda row: row.get("last_progress_monotonic", row["started_monotonic"])) if stages else None
+
+
+def _record_opening_input_progress(stage, event):
+    """Observe real input milestones; a waiting poll cannot renew this clock."""
+    identity = (str(event.get("message") or ""), event.get("step"), event.get("total"))
+    if identity != stage.get("progress_identity"):
+        stage.update(progress_identity=identity, last_progress=identity[0],
+                     last_progress_monotonic=time.monotonic())
 
 
 def _opening_source_operation(now_monotonic: float, *, input_stage=None) -> dict[str, Any] | None:
@@ -6094,6 +6103,13 @@ def _write_discord_service_status() -> dict[str, Any]:
             "scheduler_interval_seconds": 0.1,
             "input_poll_timeout_seconds": 0.05,
             "inflight_mode_count": sum(not row["task"].done() for row in bot._scheduled_input_jobs.values()),
+            "progress_contract": "real_input_milestones_not_poll_heartbeat_v1",
+            "input_stages": {
+                market: {"phase": row.get("phase"), "last_progress": row.get("last_progress"),
+                         "elapsed_ms": round((time.monotonic() - row["started_monotonic"]) * 1000, 3),
+                         "idle_ms": round((time.monotonic() - row.get("last_progress_monotonic", row["started_monotonic"])) * 1000, 3)}
+                for market, row in bot._opening_input_stages.items()
+            },
             "scheduled_delivery_pending": bool(bot._scheduled_delivery_task is not None
                                                and not bot._scheduled_delivery_task.done()),
         },
@@ -11696,7 +11712,7 @@ async def service_heartbeat() -> None:
     if attempt_started is not None:
         now_monotonic = time.monotonic()
         elapsed = max(0.0, now_monotonic - attempt_started)
-        last_progress = (attempt_started if input_stage else
+        last_progress = (input_stage.get("last_progress_monotonic", attempt_started) if input_stage else
                          bot._opening_attempt_last_progress_monotonic or attempt_started)
         idle_elapsed = max(0.0, now_monotonic - last_progress)
         timeout_seconds = _opening_attempt_timeout_seconds(
@@ -11732,7 +11748,8 @@ async def service_heartbeat() -> None:
             )
         elif idle_elapsed > timeout_seconds:
             market = input_stage["market"] if input_stage else bot._opening_attempt_market or "unknown"
-            progress = "parallel_readonly_inputs" if input_stage else bot._opening_attempt_progress_message or "none"
+            progress = (input_stage.get("last_progress", "parallel_readonly_inputs") if input_stage
+                        else bot._opening_attempt_progress_message or "none")
             print(
                 f"[scheduled-watchdog] market={market} elapsed={elapsed:.3f}s "
                 f"idle={idle_elapsed:.3f}s last_progress={progress!r} "
@@ -11835,6 +11852,24 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
     a ready mode, and the model owner still revalidates the complete quote key
     and age after acquiring its existing serialized runtime lock.
     """
+    stage = bot._opening_input_stages.get(cfg.market)
+    input_stages = {}
+    input_clock = time.perf_counter()
+    input_phase = None
+
+    def progress(event):
+        nonlocal input_clock, input_phase
+        phase = str(event.get("message") or "")
+        if phase != input_phase:
+            observed = time.perf_counter()
+            if input_phase is not None:
+                input_stages[input_phase] = input_stages.get(input_phase, 0.0) + (observed - input_clock) * 1000.0
+            input_clock, input_phase = observed, phase
+        # A completed old config/session job cannot keep its replacement alive.
+        if stage is not None and bot._opening_input_stages.get(cfg.market) is stage:
+            _record_opening_input_progress(stage, event)
+
+    progress({"message": "realtime_freshness", "step": 0, "total": 1})
     prepared, error, prepare_ms = await _prepare_scheduled_signal(cfg)
     timing: dict[str, Any] = {}
     prefetched = None
@@ -11847,6 +11882,7 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
                 market=cfg.market, scheduled=True,
                 price_source=price_source, prepared_status=status,
             )
+            kwargs["progress_callback"] = progress
             prefetched = await asyncio.to_thread(prefetch_live_signal_prices, **kwargs)
             timing["prefetch_quote_transport"] = dict(
                 getattr(prefetched.snapshot, "transport_timing", None) or {}
@@ -11862,6 +11898,8 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
             timing["parallel_quote_prefetch_ms"] = round(
                 (time.perf_counter() - started) * 1000.0, 3
             )
+    progress({"message": "input_finished", "step": 1, "total": 1})
+    timing["input_preparation_stages_ms"] = {phase: round(ms, 3) for phase, ms in input_stages.items()}
     return prepared, error, prepare_ms, prefetched, timing
 
 

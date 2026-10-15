@@ -60,6 +60,20 @@ Use the section for the service being changed. Operational acceptance requires f
   official-close signal or a matching deployment's complete existing cache;
   this does not establish formal-history or broker-fill acceptance. See
   [2026-10-08 source-coherence repair](../tw_corporate_action_generation_repair_2026-10-08.md).
+- The postclose path notification is a latency hint, not the only recovery
+  mechanism: the canonical receipt-only retry controller also checks completed
+  cache dependencies without importing Torch. Latest-close and full-history
+  owners retain separate runtime/runway budgets; do not place the two-hour
+  history restriction around their shared controller. Probe a source lock with
+  a shared lease so a legitimate reader is not mistaken for an exclusive
+  producer; job locks still suppress duplicate workers. Only complete canonical
+  summary/weights readback across a stable generation acknowledges a wakeup.
+  A dispatch, deferred exit, partial artifact or metadata-only plan is not data
+  acceptance. Unchanged plans avoid repeated YAML/Arrow/model imports while
+  preserving per-file and membership invalidation; actual signal consumers
+  retain their full validation. Scoped maintenance installation must not restart
+  Gateway, source, quote or execution owners. Measurements and native evidence
+  are in [the running-service report](../running_service_optimization_2026-10-13.md).
 - Set the outer systemd watchdog above measured legitimate event-loop stalls.
   Keep the tighter opening path protected by its progress-aware hot/cold
   watchdog so relaxing the outer process watchdog does not relax 09:00 recovery.

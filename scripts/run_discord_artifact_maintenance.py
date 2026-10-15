@@ -414,6 +414,71 @@ def request_due_retry() -> int:
     return 0
 
 
+def request_due_postclose_cache() -> int:
+    """Fallback when inotify is exhausted; this controller never imports Torch."""
+    from scripts import discord_postclose_wakeup as wakeup
+    from scripts.check_outside_tw_opening_resource_window import evaluate
+
+    started = time.perf_counter()
+    window = evaluate(datetime.now(timezone.utc), minimum_runway_minutes=wakeup.RUNWAY_MINUTES,
+                      protected_until=wall_time(13, 40))
+    if not window["allowed"]:
+        _emit(status="postclose_wakeup_idle", reason="protected_market_runway",
+              requested=False, model_runtime_imported="torch" in sys.modules)
+        return 0
+    status_path = wakeup.absolute(ROOT, os.environ.get("STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH") or
+                                  "artifacts/discord_bot/artifact_backfill_status.json")
+    source_lock = wakeup.absolute(ROOT, os.environ.get("STOCKAGENT_TW_PUBLIC_REFRESH_LOCK") or
+                                  "/srv/stockagent-live/.locks/tw-public-refresh.lock")
+    locks = (status_path.with_name("postclose_signal_cache.worker.lock"),
+             status_path.with_name(status_path.name + ".worker.lock"))
+    if (any(wakeup.lock_held(path) for path in locks)
+            or wakeup.lock_held(source_lock, producer_only=True)):
+        _emit(status="postclose_wakeup_idle", reason="canonical_owner_or_source_lock_held",
+              requested=False, model_runtime_imported="torch" in sys.modules)
+        return 0
+    accepted = wakeup.read_json(wakeup.accepted_path(ROOT))
+    dispatch_path = _retry_dispatch_state_path().with_name("postclose_dispatch_latest.json")
+    previous = _read_retry_json(dispatch_path)
+    snapshot = wakeup.observe(ROOT, previous=[accepted, previous])
+    fingerprint = snapshot.get("fingerprint")
+    reason = snapshot["reason"]
+    if (fingerprint and accepted.get("contract") == wakeup.CONTRACT
+            and accepted.get("status") == "canonical_artifacts_reusable"
+            and accepted.get("fingerprint") == fingerprint and wakeup.artifacts_unchanged(accepted)):
+        reason = "unchanged_verified_wakeup_generation"
+        fingerprint = None
+    now = datetime.now(timezone.utc)
+    if fingerprint and previous.get("fingerprint") == fingerprint:
+        accepted_at = datetime.fromisoformat(previous["dispatch_accepted_at"])
+        if accepted_at.tzinfo is None:
+            raise ValueError("postclose dispatch time must be timezone-aware")
+        if 0 <= (now - accepted_at).total_seconds() < UNCHANGED_RETRY_WAKEUP_SECONDS:
+            reason, fingerprint = "unchanged_postclose_wakeup_coalesced", None
+    if not fingerprint:
+        _emit(status="postclose_wakeup_idle", reason=reason, requested=False,
+              member_count=snapshot["member_count"], probe_seconds=time.perf_counter() - started,
+              model_runtime_imported="torch" in sys.modules)
+        return 0
+    subprocess.run(["systemctl", "start", "--no-block", wakeup.OWNER_UNIT], check=True, timeout=10)
+    from downloader.artifact_io import atomic_write_json
+
+    # Dispatch acceptance is deliberately separate from worker/data acceptance.
+    atomic_write_json(dispatch_path, {**snapshot, "dispatch_accepted_at": now.isoformat(),
+                                     "owner_unit": wakeup.OWNER_UNIT})
+    _emit(status="postclose_wakeup_requested", requested=True,
+          **{key: value for key, value in snapshot.items() if key != "observation_plan"},
+          probe_seconds=time.perf_counter() - started, model_runtime_imported="torch" in sys.modules)
+    return 0
+
+
+def request_due_work() -> int:
+    # The bounded latest-close worker and two-hour history owner have different
+    # runway budgets. Never let history's restriction silence the cheap bridge.
+    request_due_postclose_cache()
+    return request_due_retry()
+
+
 def _emit(**payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
@@ -460,6 +525,9 @@ def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> b
 
 
 def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int]:
+    from scripts import discord_postclose_wakeup as wakeup
+
+    wakeup_before = wakeup.observe(ROOT)
     discord_bot = _load_discord_bot()
     attempted = 0
     failures = 0
@@ -498,6 +566,10 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
                 panel_date=result.summary.get("panel_date"),
                 output_dir=str(result.output_dir),
             )
+    if attempted and not failures:
+        acknowledged = wakeup.acknowledge(ROOT, wakeup_before, discord_bot)
+        _emit(status="postclose_wakeup_readback", acknowledged=acknowledged,
+              advisory_only=True)
     return attempted, failures
 
 
@@ -774,12 +846,15 @@ def main() -> None:
     retry_mode = parser.add_mutually_exclusive_group()
     retry_mode.add_argument("--retry-check-only", action="store_true")
     retry_mode.add_argument("--request-due-retry", action="store_true")
+    retry_mode.add_argument("--request-due-work", action="store_true")
     args = parser.parse_args()
-    if args.signal_cache_only and (args.retry_check_only or args.request_due_retry):
+    if args.signal_cache_only and (args.retry_check_only or args.request_due_retry or args.request_due_work):
         parser.error("retry probe modes cannot generate signal caches")
-    if args.retry_check_only or args.request_due_retry:
+    if args.retry_check_only or args.request_due_retry or args.request_due_work:
         try:
-            if args.request_due_retry:
+            if args.request_due_work:
+                return_code = request_due_work()
+            elif args.request_due_retry:
                 return_code = request_due_retry()
             else:
                 probe = retry_probe()

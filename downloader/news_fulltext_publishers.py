@@ -190,7 +190,7 @@ def _cnyes_flight_frames(fragments):
     return models, texts
 
 
-def _cnyes_current_article_data(soup, news_id, *, verify_video=False, verify_author=False):
+def _cnyes_current_article_data(soup, news_id, *, verify_video=False, verify_author=False, verify_signature=False):
     """Read corroborating declarations only; never use them to supply a body."""
     from downloader.news_fulltext_policy import _objects
     fragments = []
@@ -237,6 +237,8 @@ def _cnyes_current_article_data(soup, news_id, *, verify_video=False, verify_aut
         fields += ('video',)
     if verify_author:
         fields += ('author',)
+    if verify_signature:
+        fields += ('signature',)
     data = candidates[0]
     if any(any(type(other.get(k)) is not type(data.get(k)) or other.get(k) != data.get(k)
                for k in fields) for other in candidates[1:]):
@@ -2826,7 +2828,8 @@ def cnyes_verified_image_only_body(soup, source, article, *, page_url, identity=
             return False  # Ordinary empty templates need no Flight/current reparse.
         parent = container.find_parent('article')
         reveal = identity.revealed_wrapper if identity else _cnyes_completed_stream_wrapper(soup, parent)
-        data = _cnyes_current_article_data(soup, int(match[1]), verify_video=True, verify_author=True)
+        data = _cnyes_current_article_data(soup, int(match[1]), verify_video=True, verify_author=True,
+                                           verify_signature=True)
         clock = datetime.fromisoformat(article.get('datePublished', '').replace('Z', '+00:00'))
         times = parent.select(':scope > p > time[datetime]')
         bylines = parent.select(':scope > p > .signature')
@@ -2841,7 +2844,11 @@ def cnyes_verified_image_only_body(soup, source, article, *, page_url, identity=
                 or len(names) != 1 or not isinstance(names[0], str) or not names[0].strip()
                 or names[0] != data.get('author') or len(bylines) != 1 or not bylines[0].get_text(strip=True)
                 or (names[0] not in bylines[0].get_text(' ', strip=True)
-                    and bylines[0].get_text(' ', strip=True) not in {'鉅亨網新聞中心', '鉅亨台北資料中心'}) or data.get('video', '') != ''
+                    and bylines[0].get_text(' ', strip=True) not in {'鉅亨網新聞中心', '鉅亨台北資料中心'}
+                    and not (parts.netloc == 'news.cnyes.com' and not parts.query
+                             and data.get('signature') == bylines[0].get_text(' ', strip=True)
+                             and re.fullmatch(r'鉅亨網記者[^\s]{2,8} [^\s]{1,16}', data['signature'])))
+                or data.get('video', '') != ''
                 or not isinstance(data.get('content'), str)):
             return False
         for node in (header, container, times[0], bylines[0]):
@@ -2916,7 +2923,8 @@ def _cnyes_same_empty_native_view(container, full_content, source, reveal):
 def cnyes_verified_empty_body(soup, source, article, *, page_url):
     """Distinguish observed empty public templates from extraction failures.
 
-    This is failure-outcome contract v8, not a new accepted-body contract.
+    This is failure-outcome contract v8 plus Office-comment outcome v1,
+    not a new accepted-body contract.
     A metadata shell, hidden body, video or guessed URL is never a full article.
     Require matching public identity and an aware declared publication clock,
     an actually empty visible container and the same current free declaration.
@@ -2963,6 +2971,17 @@ def cnyes_verified_empty_body(soup, source, article, *, page_url):
                            '<p>\xa0</p>\n<div>\n<p>\xa0</p>\n</div>')
                            if declared_body == '' else
                            isinstance(content, str) and html.unescape(content) in ('null', '<p>null</p>'))
+        if (not content_matches and declared_body == '' and not container.contents
+                and isinstance(content, str) and html.unescape(content) in (
+                    '<!--StartFragment -->', '<!--[if gte mso 9]>      <![endif]-->')):
+            # Six retained public originals contain only these exact, empty
+            # Office markers. The renderer emits no children at all. Never
+            # strip arbitrary comments/conditional content to invent absence;
+            # the whole native container must be empty and visibly completed.
+            reveal = _cnyes_completed_stream_wrapper(soup, container.find_parent('article'))
+            _cnyes_visible_after_completed_stream(container, reveal)
+            _cnyes_visible_after_completed_stream(header, reveal)
+            content_matches = True
         if not content_matches and declared_body == '':
             reveal = _cnyes_completed_stream_wrapper(soup, container.find_parent('article'))
             content_matches = _cnyes_same_empty_native_view(container, content, source, reveal)
@@ -3314,6 +3333,32 @@ def cnyes_verified_short_body(soup, source, article, body, *, page_url, restore_
                                                restore_source_spacing=restore_source_spacing)
 
 
+def cnyes_verified_untitled_no_events_bulletin(soup, source, article, body, *, page_url):
+    """Keep a source-empty title and an explicit, whole no-events bulletin.
+
+    The two historical originals contain the same dated-table header, rule
+    and literal no-events statement. This is a real sparse observation, not
+    missing source data or an inferred title/date. Unknown empty-title prose
+    retains its old rejection. Require the visible/current/schema whole-body
+    proof and retain the observed whitespace/line boundaries, not a summary.
+    """
+    if (source.provider != 'cnyes' or article.get('headline') != ''
+            or not isinstance(body, str) or not 0 < len(body) < 100
+            or re.sub(r'\s+', '', body) != '日期公司名稱代碼理由承銷價備註' + '-' * 70 + '今日無資料'):
+        return None
+    verified = _cnyes_verified_visible_current_body(soup, source, article, body, page_url=page_url,
+                                                    allow_empty_title=True)
+    scope = _cnyes_visible_article_scope(soup)
+    if verified is None or scope is None:
+        return None
+    from downloader.news_fulltext_policy import _plain_text_node
+    container = scope[1]
+    if container.find(['img', 'video', 'audio', 'iframe', 'object', 'embed', 'figure', 'script']):
+        return None
+    excluded = (*source.exclude_selectors, '[id^="div-gpt-ad-cnyes_news_article_"]')
+    return _plain_text_node(container, excluded, parser=source.html_parser)
+
+
 def cnyes_verified_test_article(soup, source, article, body, *, page_url):
     """Observed test-account signatures are nonbody outcomes, not news success.
 
@@ -3413,7 +3458,8 @@ def cnyes_verified_test_article(soup, source, article, body, *, page_url):
     return declared == visible
 
 
-def _cnyes_verified_visible_current_body(soup, source, article, body, *, page_url, restore_source_spacing=False):
+def _cnyes_verified_visible_current_body(soup, source, article, body, *, page_url, restore_source_spacing=False,
+                                       allow_empty_title=False):
     """Whole declared, visible and current body proof; not a length heuristic.
 
     Actual Cnyes flash reports have 35--78 characters. A length threshold is
@@ -3448,7 +3494,7 @@ def _cnyes_verified_visible_current_body(soup, source, article, body, *, page_ur
     if visible_scope is None:
         return None
     header, container = visible_scope
-    if (not isinstance(headline, str) or not headline.strip()
+    if (not isinstance(headline, str) or not headline.strip() and not allow_empty_title
             or compact(header.get_text(' ', strip=True)) != compact(headline)):
         return None
     # Figure captions, ads, navigation and related-story text do not count.

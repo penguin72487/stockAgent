@@ -115,7 +115,12 @@ def _env_truthy(name: str, default: str = "1") -> bool:
 
 
 def get_day_trade_carry_compile_stats() -> dict[str, int]:
-    return {key: int(value) for key, value in _CARRY_COMPILE_STATS.items()}
+    result = {key: int(value) for key, value in _CARRY_COMPILE_STATS.items()}
+    if _env_truthy("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0"):
+        from stockagent.backtest.tw_day_trade_graph import get_explicit_carry_graph_stats
+        result.update({f"explicit_graph_{key}": int(value)
+                       for key, value in get_explicit_carry_graph_stats().items()})
+    return result
 
 
 def reset_day_trade_carry_compile_stats(*, clear_cache: bool = False) -> None:
@@ -429,8 +434,12 @@ def _restore_session_calendar(
     )
 
 
-def _session_day_tensor(template: Tensor, *, day: int) -> Tensor:
+def _session_day_tensor(template: Tensor, *, day: int | Tensor) -> Tensor:
     """Cache immutable CUDA ordinals; return separately owned state scalars."""
+    if isinstance(day, Tensor):
+        # Explicit block graphs carry dates as data at stable addresses. Source
+        # and calendar admission happen at the public boundary before capture.
+        return day
     if template.device.type != "cuda" or not _env_truthy("STOCKAGENT_DAY_TRADE_CALENDAR_CACHE", "0"):
         return template.new_tensor(day)
     key = (template.device, template.dtype, int(day))
@@ -1848,10 +1857,14 @@ def _prepare_session_funding_core(state, session, *, weights, can_enter, initial
 
 def _prepare_session_funding(state, session, *, weights, can_enter, initial_capital):
     inventory = state.inventory
-    if inventory.cohorts.device.type != "cuda" or not _env_truthy("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "0"):
+    if (torch.compiler.is_compiling() or inventory.cohorts.device.type != "cuda"
+            or not _env_truthy("STOCKAGENT_DAY_TRADE_PREPARE_COMPILE", "0")):
         return _prepare_session_funding_core(state, session, weights=weights,
             can_enter=can_enter, initial_capital=initial_capital)
-    if not isinstance(session.day, int) or isinstance(session.day, bool) or not 0 < session.day <= 3652059:
+    if not isinstance(session.day, Tensor) and (
+        not isinstance(session.day, int) or isinstance(session.day, bool)
+        or not 0 < session.day <= 3652059
+    ):
         raise ValueError("event requires a Gregorian day ordinal")
     day = _session_day_tensor(inventory.observed_day, day=session.day)
     tensor_session = replace(session, day=day)
@@ -1947,7 +1960,7 @@ def _finalize_carry_session(state, session, path_inventory, converted, inventory
     args = (state.alive, session.marks, session.terminal_liquidation_price, path_inventory,
             converted, inventory, working, trade_alive, valid, marks, notional)
     kwargs = dict(initial_capital=initial_capital, event_compression=event_compression)
-    if (marks.device.type != "cuda"
+    if (torch.compiler.is_compiling() or marks.device.type != "cuda"
             or not _env_truthy("STOCKAGENT_DAY_TRADE_FINALIZE_COMPILE", "0")):
         return _finalize_carry_session_core(*args, **kwargs)
     tensors = [state.alive, session.marks, trade_alive, valid, marks, notional]
@@ -2134,6 +2147,8 @@ def execute_carry_session(
             # hence the replay inputs and every differentiable result match.
             first_pass_solvent = (
                 not torch.compiler.is_compiling()
+                and (marks.device.type != "cuda"
+                     or not torch.cuda.is_current_stream_capturing())
                 and bool((marks > 0).all().detach())
             )
             if not first_pass_solvent:
@@ -2547,6 +2562,17 @@ def run_day_trade_carry_sessions(
         rebate_rate=rebate_rate, initial_capital=initial_capital,
         initial_state=initial_state, event_compression=event_compression,
         require_minute_nav_grad=require_minute_nav_grad)
+    if (weights.device.type == "cuda"
+        and _env_truthy("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0")
+        and _allow_flat_terminal
+        and (not require_minute_nav_grad or not torch.is_grad_enabled())
+        and weights.ndim == 2 and bool(sessions)
+        and all(s.terminal_liquidation_price is not None and s.entry_path is None
+                and not s.uses_sparse_events for s in sessions)):
+        from stockagent.backtest.tw_day_trade_graph import run_flat_graph_sessions
+        graphed = run_flat_graph_sessions(weights, sessions, **common)
+        if graphed is not None:
+            return graphed
     block_rows = _carry_checkpoint_block_rows(weights)
     flat_candidate = (_allow_flat_terminal and _env_truthy("STOCKAGENT_DAY_TRADE_CARRY_FLAT_TERMINAL", "0")
         and torch.is_grad_enabled() and weights.requires_grad and weights.ndim == 2

@@ -59,6 +59,7 @@ from ohlcv_hot_tail import (
     hot_tail_path,
     read_logical_parquet,
     remove_hot_tail,
+    tail_newer_summary,
 )
 
 
@@ -631,14 +632,10 @@ def _load_logical_existing_candle_info(path: Path) -> ExistingCandleInfo:
     if base.latest_ms is None:
         return tail
 
-    dates = _normalize_date_frame(_read_date_column(tail_path)).select(
-        pl.col("date").str.to_datetime(strict=False).alias("__ts")
+    newer_count, first_new = tail_newer_summary(
+        _read_date_column(tail_path), base_latest_ms=base.latest_ms,
+        normalize=_normalize_date_frame,
     )
-    base_latest = datetime.fromtimestamp(base.latest_ms / 1000, tz=timezone.utc).replace(
-        tzinfo=None
-    )
-    newer = dates.filter(pl.col("__ts") > base_latest)
-    first_new = newer.select(pl.col("__ts").min()).item() if newer.height else None
     contiguous = first_new is None or int(
         first_new.replace(tzinfo=timezone.utc).timestamp() * 1000
     ) <= base.latest_ms + CANDLE_INTERVAL_MS
@@ -649,7 +646,7 @@ def _load_logical_existing_candle_info(path: Path) -> ExistingCandleInfo:
         value for value in (base.latest_ms, tail.latest_ms) if value is not None
     ]
     return ExistingCandleInfo(
-        rows=base.rows + newer.height,
+        rows=base.rows + newer_count,
         latest_ms=max(latest_values) if latest_values else None,
         interval_ok=bool(base.interval_ok and tail.interval_ok and contiguous),
         earliest_ms=min(earliest_values) if earliest_values else None,

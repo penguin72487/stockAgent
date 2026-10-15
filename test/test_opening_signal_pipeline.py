@@ -138,7 +138,7 @@ def test_scheduler_prepares_together_publishes_before_reports_and_isolates_failu
     monkeypatch.setattr(discord_bot, "datetime", Clock)
     monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: list(configs))
     monkeypatch.setattr(discord_bot, "_resolve_market", configs.__getitem__)
-    monkeypatch.setattr(discord_bot, "_preopen_market_symbol_count", lambda cfg: 10)
+    monkeypatch.setattr(discord_bot, "_preopen_market_symbol_count", lambda cfg, **_kwargs: 10)
     monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *a: (True, "test"))
     monkeypatch.setattr(discord_bot, "_scheduled_signal_key", lambda cfg, now: f"{now.date()}:{cfg.market}")
     monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *a: "retry")

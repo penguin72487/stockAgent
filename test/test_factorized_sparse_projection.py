@@ -167,3 +167,60 @@ def test_evaluation_built_cache_supports_later_training(tmp_path):
     (result*torch.randn_like(result)).sum().backward()
     assert torch.isfinite(candle.joint_projection.proj.weight.grad).all()
 
+
+@pytest.mark.parametrize('norm',['layernorm','rmsnorm'])
+@pytest.mark.parametrize('device',['cpu','cuda'])
+def test_verified_disk_rows_reuse_source_and_all_parameter_adjoint(tmp_path,monkeypatch,norm,device):
+    if device=='cuda' and not torch.cuda.is_available():pytest.skip('requires CUDA')
+    for name in ('first','second'):(tmp_path/name).mkdir()
+    monkeypatch.setenv('STOCKAGENT_SPARSE_ROW_DISK_CACHE_DIR',str(tmp_path/'csr-cache'))
+    source=source_fixture(tmp_path/'first')
+    torch.manual_seed(41)
+    candle=CandleEncoder(num_features=28,d_model=8,dropout=0.,norm_type=norm,
+        ffn_type='gelu',sanitize_inputs=True,projection_fp32=True,
+        causal_feature_rms_normalization=True)
+    candle.set_causal_feature_rms_normalizer(torch.arange(28).float()/10+1,torch.arange(28)!=13)
+    candle=candle.to(device)
+    second_candle=deepcopy(candle)
+    first=SimpleNamespace(candle_encoder=candle,factorized_sparse_cache_bytes=1024**2)
+    a=project_factorized_sparse_rows(first,FactorizedPanelSlab(source,np.arange(9),device=device))
+    assert first._factorized_sparse_row_store.disk.stats['writes']==2
+    again=source_fixture(tmp_path/'second')
+    assert again.content_fingerprint==source.content_fingerprint
+    monkeypatch.setattr(again._cache,'get',lambda _:pytest.fail('disk hit must avoid payload decompression'))
+    second=SimpleNamespace(candle_encoder=second_candle,factorized_sparse_cache_bytes=1024**2)
+    b=project_factorized_sparse_rows(second,FactorizedPanelSlab(again,np.arange(9),device=device))
+    assert second._factorized_sparse_row_store.disk.stats['hits']==2
+    torch.testing.assert_close(a,b,rtol=0,atol=0)
+    coeff=torch.randn_like(a)
+    (a*coeff).sum().backward();(b*coeff).sum().backward()
+    for (name,p),(_,q) in zip(candle.named_parameters(),second_candle.named_parameters(),strict=True):
+        assert (p.grad is None)==(q.grad is None),name
+        if p.grad is not None:torch.testing.assert_close(p.grad,q.grad,rtol=0,atol=0)
+
+
+def test_disk_rows_reject_damage_and_isolate_fold_normalization(tmp_path,monkeypatch):
+    from stockagent.data.factorized_sparse_rows import FactorizedSparseRowStore
+    (tmp_path/'source').mkdir()
+    source=source_fixture(tmp_path/'source')
+    monkeypatch.setenv('STOCKAGENT_SPARSE_ROW_DISK_CACHE_DIR',str(tmp_path/'csr-cache'))
+    candle=CandleEncoder(num_features=28,d_model=8,dropout=0.,norm_type='layernorm',
+        ffn_type='gelu',sanitize_inputs=True,projection_fp32=True,
+        causal_feature_rms_normalization=True)
+    store=FactorizedSparseRowStore(source,candle,'cpu',budget_bytes=1024**2)
+    before=store._build(0)
+    original=before.values.clone()
+    path=next(store.disk.root.glob('block_00000/generation-*/values.npy'))
+    damaged=bytearray(path.read_bytes());damaged[-1]^=1;path.write_bytes(damaged)
+    rebuild=FactorizedSparseRowStore(source,candle,'cpu',budget_bytes=1024**2)
+    after=rebuild._build(0)
+    assert rebuild.disk.stats['rejected']==1 and rebuild.disk.stats['writes']==1
+    assert list(rebuild.disk.root.glob('block_00000/rejected-*.json'))
+    torch.testing.assert_close(after.values,original,rtol=0,atol=0)
+    changed=deepcopy(candle)
+    changed.causal_feature_rms_scale.add_(.1)
+    other=FactorizedSparseRowStore(source,changed,'cpu',budget_bytes=1024**2)
+    assert other.disk.root!=store.disk.root
+    alternate=FactorizedSparseRowStore(source.subset_symbols(np.array([1,0])),candle,'cpu',budget_bytes=1024**2)
+    assert alternate.disk.root!=store.disk.root
+

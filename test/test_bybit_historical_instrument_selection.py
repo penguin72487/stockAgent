@@ -163,7 +163,14 @@ def _materialize_inputs(tmp_path, monkeypatch, *, include_coverage):
 def test_materializer_routes_selected_historical_symbol_to_supplied_coverage(tmp_path, monkeypatch):
     funding_dir, output_dir, row = _materialize_inputs(tmp_path, monkeypatch, include_coverage=True)
     observed = []
-    monkeypatch.setattr(daily, "_daily_bars", lambda *a, **kw: (pl.DataFrame(), 0, 0))
+
+    def bars(*args, audit, **kwargs):
+        # The real builder also supplies its exact exclusion/clock certificate.
+        # This routing-only mock must implement that existing return contract.
+        audit.update(execution_excluded_dates=[], canonical_string_dates=True)
+        return pl.DataFrame(), 0, 0
+
+    monkeypatch.setattr(daily, "_daily_bars", bars)
 
     def attach(frame, path, coverage, **kwargs):
         observed.append((path, coverage, kwargs))

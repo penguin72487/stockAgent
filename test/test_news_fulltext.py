@@ -494,11 +494,66 @@ def test_run_cycle_accepts_body_and_not_a_404(config, tmp_path):
 
 def test_default_configuration_separates_personal_capture_from_licenses():
     config, registry, repo = load_config(Path("configs/news_fulltext.json"))
-    assert {p.provider for p in registry.sources.values() if p.allowed} == {
+    expected = {
         "globalvoices", "fed_board", "cnyes", "cmoney", "cmnews", "einfo", "moneyweekly",
         "ftvnews", "nownews", "genetinfo", "pansci", "cmmedia", "abmedia", "peopo", "cnews", "tainan_gov", "kmdn", "macau_gov",
-        "voa_chinese", "voa_cantonese", "tfc_taiwan", "nccu", "taichung_gov", "changhua_gov", "taiwanhot"}
-    assert registry.sources['abmedia'].acquisition_mode == 'finite'
+        "voa_chinese", "voa_cantonese", "tfc_taiwan", "nccu", "taichung_gov", "changhua_gov", "taiwanhot", "coolloud", "eventsinfocus"}
+    # Closed installed set; FTNN may cross the tested configuration cutover
+    # only under the reviewed native/private recipe, not arbitrary enablement.
+    ftnn = registry.sources['ftnn']
+    if ftnn.allowed:
+        assert ftnn.known_url_only and ftnn.acquisition_mode == 'continuous'
+        assert ftnn.domains == ('ftnn.com.tw',)
+        assert ftnn.embedded_article_layout == 'ftnn_visible_article_v1'
+        assert ftnn.authorization['kind'] == 'personal_research'
+        assert ftnn.authorization['evidence_url'] == 'https://www.ftnn.com.tw/copyright'
+        assert ftnn.selectors == (':scope > .news-body',)
+        assert not ftnn.feeds and not ftnn.sitemaps
+        expected.add('ftnn')
+    # TVBS joins only through its tested three-layout/private native contract.
+    tvbs = registry.sources['tvbs']
+    if tvbs.allowed:
+        assert tvbs.known_url_only and tvbs.acquisition_mode == 'continuous'
+        assert tvbs.domains == ('news.tvbs.com.tw', 'cars.tvbs.com.tw', 'supertaste.tvbs.com.tw')
+        assert tvbs.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}
+        assert tvbs.article_path_pattern == '^(?:/[a-z][a-z-]*/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$'
+        assert tvbs.authorization['kind'] == 'personal_research'
+        assert tvbs.authorization['evidence_url'] == 'https://www.tvbs.com.tw/policies/copyright'
+        assert tvbs.selectors == (':scope > .tvbs-native-body',)
+        assert tvbs.require_configured_container and tvbs.require_author_attribution
+        assert not tvbs.feeds and not tvbs.sitemaps and not tvbs.wordpress_apis and not tvbs.fulltext_feeds
+        expected.add('tvbs')
+    # ETtoday joins only through the tested native, literal known-URL contract.
+    ettoday = registry.sources['ettoday']
+    if ettoday.allowed:
+        from downloader.news_fulltext_ettoday import ETTODAY_BODY_SELECTOR, ETTODAY_PATH_PATTERN
+        assert ettoday.known_url_only and ettoday.acquisition_mode == 'continuous'
+        assert ettoday.domains == ('ettoday.net',)
+        assert ettoday.embedded_article_layout == 'ettoday_visible_article_v1'
+        assert ettoday.article_path_pattern == ETTODAY_PATH_PATTERN
+        assert ettoday.authorization['kind'] == 'personal_research'
+        assert ettoday.authorization['evidence_url'] == 'https://member.ettoday.net/clause_copyright.php7'
+        assert ettoday.selectors == (ETTODAY_BODY_SELECTOR,)
+        assert ettoday.require_configured_container and ettoday.require_author_attribution
+        assert not ettoday.feeds and not ettoday.sitemaps and not ettoday.wordpress_apis and not ettoday.fulltext_feeds
+        expected.add('ettoday')
+    assert {p.provider for p in registry.sources.values() if p.allowed} == expected
+    events = registry.sources['eventsinfocus']
+    assert events.acquisition_mode == 'finite'
+    assert events.embedded_article_layout == 'eventsinfocus_visible_news_v1'
+    assert events.authorization['kind'] == 'personal_research'
+    assert not events.feeds and not events.sitemaps
+    coolloud = registry.sources['coolloud']
+    assert coolloud.acquisition_mode == ('continuous' if coolloud.known_url_only else 'finite')
+    if coolloud.known_url_only:
+        entry = next(p for p in config['providers'] if p['id'] == 'coolloud')
+        assert entry['private_known_url_scope'] == 'publisher_original_open_license_v1'
+    assert coolloud.authorization['kind'] == 'open_license'
+    assert coolloud.authorization['license'] == 'CC-BY-NC-SA-2.0-TW'
+    assert coolloud.embedded_article_layout == 'coolloud_visible_original_v1'
+    assert coolloud.interval_seconds == 10
+    abmedia = registry.sources['abmedia']
+    assert abmedia.acquisition_mode == ('continuous' if abmedia.known_url_only else 'finite')
     peopo = registry.sources['peopo']
     assert peopo.acquisition_mode == ('continuous' if peopo.known_url_only else 'finite')
     assert peopo.authorization['kind'] == 'open_license'
@@ -506,7 +561,9 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     assert not registry.sources['pts'].allowed
     assert registry.sources["cnyes"].authorization["kind"] == "personal_research"
     assert registry.sources["cmoney"].authorization.get("license") is None
-    assert registry.sources["tainan_gov"].acquisition_mode == registry.sources["kmdn"].acquisition_mode == "finite"
+    assert registry.sources["tainan_gov"].acquisition_mode == "finite"
+    kmdn = registry.sources["kmdn"]
+    assert kmdn.acquisition_mode == ("continuous" if kmdn.known_url_only else "finite")
     assert registry.sources["tainan_gov"].authorization["kind"] == "open_license"
     assert registry.sources["macau_gov"].acquisition_mode == "finite"
     assert registry.sources["macau_gov"].authorization["kind"] == "open_license"
@@ -531,7 +588,8 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     assert registry.sources["voa_cantonese"].allow_reviewed_supplements
     assert registry.sources["kmdn"].authorization["kind"] == "personal_research"
     assert registry.sources["kmdn"].authorization.get("license") is None
-    assert registry.sources['cnews'].acquisition_mode == 'finite'
+    cnews = registry.sources['cnews']
+    assert cnews.acquisition_mode == ('continuous' if cnews.known_url_only else 'finite')
     cmmedia = registry.sources['cmmedia']
     assert cmmedia.acquisition_mode == ('continuous' if cmmedia.known_url_only else 'finite')
     assert registry.sources["cnews"].authorization["kind"] == registry.sources["cmmedia"].authorization["kind"] == "personal_research"

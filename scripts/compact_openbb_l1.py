@@ -51,6 +51,13 @@ from scripts.openbb_l1_source_journal import (
     finish_source_audit,
     prepare_source_audit,
 )
+from scripts.openbb_l1_task_contract_index import (
+    LOOKUP_POLICY,
+    bind_task_contract_index,
+    verified_task_contract_index,
+)
+from scripts.openbb_l1_status_counts import member_endpoint_counts
+from scripts.openbb_l1_footer_io import FooterOpener
 from scripts.openbb_l1_view_schema import (
     PhysicalSchemaIdentityCache,
     SCHEMA_IDENTITY_REVISION,
@@ -737,6 +744,7 @@ def _mark_stale_segments(
     timing: dict[str, float] | None = None,
     view_proofs: dict[str, ViewSourceProof] | None = None,
     metadata_audit: dict[str, object] | None = None,
+    task_lookup_audit: dict[str, object] | None = None,
 ) -> tuple[set[str], int]:
     stage_started = time.monotonic()
     # Source members store absolute paths while the archive normally records
@@ -759,18 +767,56 @@ def _mark_stale_segments(
         timing["stale_existing_status_query"] = round(
             time.monotonic() - stage_started, 3
         )
+    lookup_started = time.monotonic()
+    task_index = verified_task_contract_index(connection)
+    if task_lookup_audit is not None:
+        task_lookup_audit.update(
+            policy=LOOKUP_POLICY,
+            index=task_index,
+            state="validated_covering_index" if task_index else "canonical_fallback",
+            index_removed_during_lookup=False,
+        )
+    if timing is not None:
+        timing["stale_source_lookup_validation"] = round(
+            time.monotonic() - lookup_started, 3
+        )
+
+    def source_rows(
+        clause: str, parameters: Sequence[object], *, member_first: bool,
+    ) -> list[sqlite3.Row]:
+        nonlocal task_index
+        canonical_sql = _stale_source_contract_sql(clause, member_first=member_first)
+        try:
+            return connection.execute(
+                bind_task_contract_index(canonical_sql, task_index), parameters,
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # INDEXED BY is a requirement, not a planner hint. A concurrent
+            # schema owner may remove it after validation; retry only this
+            # exact, independently confirmed absence. Other SQL failures must
+            # remain visible, and the read-only retry changes no predicates.
+            if (task_index is None
+                    or str(exc) != f"no such index: {task_index}"
+                    or verified_task_contract_index(connection) is not None):
+                raise
+            task_index = None
+            if task_lookup_audit is not None:
+                task_lookup_audit.update(
+                    index=None, state="canonical_fallback",
+                    index_removed_during_lookup=True,
+                )
+            return connection.execute(canonical_sql, parameters).fetchall()
+
     source_query_started = time.monotonic()
     rows: list[sqlite3.Row] = []
     if changed_task_ids is None:
         # The full comparison remains the bootstrap, daily and fail-closed
         # fallback path. No journal state can waive this source contract.
-        rows = connection.execute(
-            _stale_source_contract_sql(
-                filter_clause,
-                member_first=STALE_SOURCE_SCAN_ORDER == "member_first",
-            ),
+        rows = source_rows(
+            filter_clause,
             (source_prefix, *filter_parameters, source_prefix),
-        ).fetchall()
+            member_first=STALE_SOURCE_SCAN_ORDER == "member_first",
+        )
     else:
         # The journal supplies exact mutated task IDs. Bounded IN batches use
         # the member task primary key; new un-compacted tasks simply match no
@@ -781,10 +827,11 @@ def _mark_stale_segments(
                 filter_clause + " AND m.task_id IN ("
                 + ",".join("?" for _ in batch) + ")"
             )
-            rows.extend(connection.execute(
-                _stale_source_contract_sql(narrowed, member_first=True),
+            rows.extend(source_rows(
+                narrowed,
                 (source_prefix, *filter_parameters, *batch, source_prefix),
-            ).fetchall())
+                member_first=True,
+            ))
     if timing is not None:
         timing["stale_source_join_query"] = round(
             time.monotonic() - source_query_started, 3
@@ -801,6 +848,7 @@ def _mark_stale_segments(
     # Arrow schema and both signatures. No file validity crosses invocations.
     physical_cache = PhysicalSchemaIdentityCache() if view_proofs is not None else None
     footer_open_attempts = 0
+    footer_opener = FooterOpener()
     for row in connection.execute(
         f"""
         SELECT segment_id, endpoint, output_path, output_rows, output_bytes,
@@ -823,7 +871,7 @@ def _mark_stale_segments(
             )
             before = _view_file_signature(path) if collect_proof else None
             footer_open_attempts += 1
-            parquet_file = pq.ParquetFile(str(path))
+            parquet_file = footer_opener(str(path))
             if before is not None:
                 # The proof validates rows, bytes and the manifest Arrow hash
                 # from this same open footer. Do not serialize its Arrow schema
@@ -869,6 +917,7 @@ def _mark_stale_segments(
         metadata_audit.update(
             policy=DERIVATIVE_METADATA_AUDIT_POLICY,
             footer_open_attempts=footer_open_attempts,
+            footer_io=footer_opener.snapshot(),
             physical_cache=None if physical_cache is None else physical_cache.snapshot(),
         )
     if timing is not None:
@@ -1863,18 +1912,14 @@ def _write_status(
     # transaction, and the compact receipt checks source file/row totals.
     # Avoid grouping millions of members again just to render status. A cheap
     # endpoint-wise member cardinality check still fails closed on missing,
-    # extra, or endpoint-misassigned memberships. The existing endpoint index
-    # makes this a covering scan without loading member source-row payloads.
+    # extra, or endpoint-misassigned memberships. Exact endpoint index seeks
+    # count every member without per-row GROUP BY machinery. Unknown/filtered
+    # layouts retain the original covering scan and its error semantics.
     member_filter, member_parameters = _filter_sql(filters, alias="m")
-    member_counts = {
-        str(row["endpoint"]): int(row["source_files"])
-        for row in connection.execute(
-            f"SELECT m.endpoint, COUNT(*) AS source_files "
-            f"FROM {MEMBER_TABLE} AS m WHERE 1=1{member_filter} "
-            "GROUP BY m.endpoint",
-            member_parameters,
-        )
-    }
+    member_count_audit: dict[str, object] = {}
+    member_counts = member_endpoint_counts(
+        connection, member_filter, member_parameters, audit=member_count_audit,
+    )
     timings["status_member_count"] = round(time.monotonic() - status_started, 3)
     status_started = time.monotonic()
     segments = _grouped_counts(
@@ -2028,6 +2073,7 @@ def _write_status(
         "derivative_metadata_audit": dict(derivative_metadata_audit or {}),
         "deferred_query_views": dict(sorted(deferred_query_views.items())),
         "stage_seconds": timings,
+        "member_count_audit": member_count_audit,
         "view_endpoint_seconds": dict(sorted((view_endpoint_seconds or {}).items())),
         "view_endpoint_actions": dict(sorted((view_endpoint_actions or {}).items())),
         "query_view_policy": {
@@ -2370,6 +2416,8 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
             stage_started = time.monotonic()
             derivative_metadata_audit: dict[str, object] = {}
             attempt.payload["derivative_metadata_audit"] = derivative_metadata_audit
+            task_lookup_audit: dict[str, object] = {}
+            attempt.payload["source_task_lookup"] = task_lookup_audit
             stale_endpoints, stale_segments = _mark_stale_segments(
                 manifest,
                 args.endpoint,
@@ -2381,6 +2429,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 timing=stage_seconds,
                 view_proofs=view_proofs,
                 metadata_audit=derivative_metadata_audit,
+                task_lookup_audit=task_lookup_audit,
             )
             stage_seconds["stale_contract_audit"] = round(time.monotonic() - stage_started, 3)
             attempt.payload["stale_segments"] = stale_segments
@@ -2616,6 +2665,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                     "pending_files", "pending_rows", "compacted_files", "compacted_rows",
                     "success_files", "success_rows", "active_segments", "endpoints",
                     "source_bytes", "output_bytes", "query_view_policy",
+                    "member_count_audit",
                 ) if key in status},
             )
             # Preserve the monitor's fixed SEC projection without an unbounded

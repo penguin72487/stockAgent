@@ -32,6 +32,14 @@ from stockagent.live.data_monitor_record_codec import encode_record_cache
 INVENTORY_VERSION = 10
 DATASET_MEMBERSHIP_VERSION = 1
 FAST_INDEX_VERSION = 4
+
+# Native JSON produces ordinary dicts. Avoid the Python ABC instance-check on
+# that common path, retaining exactly the original Mapping fallback otherwise.
+# An annotation still uses Mapping; this tuple is runtime validation only.
+_RUNTIME_MAPPING_TYPES = (dict, Mapping)
+# The live reader still accepts only lists for footer vectors. The private
+# rejected representation benchmark can patch this guard in its own process.
+_COUNT_VECTOR_TYPE = list
 FAST_INDEX_PREFLIGHT_HINTS = 512
 DEFAULT_REFRESH_FILES = 4_096
 DEFAULT_IDENTITY_REFRESH_FILES = 1_024
@@ -103,7 +111,7 @@ class _SourceObservation:
         else:
             identity = _file_identity(source_stat)
             digest.update(b"I" + struct.pack("<QQQQQ", *identity))
-            if not isinstance(entry, Mapping) or entry.get("file_identity") != identity:
+            if not isinstance(entry, _RUNTIME_MAPPING_TYPES) or entry.get("file_identity") != identity:
                 self.matches_cache = False
 
     def root(self) -> str:
@@ -255,7 +263,7 @@ def _selection_fingerprint(
                     return None
             else:
                 entry = cache.get(str(path))
-                identity = entry.get("file_identity") if isinstance(entry, Mapping) else None
+                identity = entry.get("file_identity") if isinstance(entry, _RUNTIME_MAPPING_TYPES) else None
                 if not isinstance(identity, list) or len(identity) != 5:
                     return None
             try:
@@ -299,7 +307,7 @@ def _bound_dataset_memberships(payload: Mapping[str, Any]) -> Mapping[str, str] 
     version = payload.get("dataset_membership_version")
     if (
         type(version) is not int or version != DATASET_MEMBERSHIP_VERSION
-        or not isinstance(members, Mapping)
+        or not isinstance(members, _RUNTIME_MAPPING_TYPES)
         or any(not isinstance(key, str) or not isinstance(value, str)
                or re.fullmatch(r"[0-9a-f]{32}", value) is None
                for key, value in members.items())
@@ -330,11 +338,11 @@ def inventory_dataset_delta(
         files, schemas, datasets = (payload.get(name) for name in ("files", "schemas", "datasets"))
         if (
             members is None
-            or not isinstance(files, Mapping) or not isinstance(schemas, Mapping)
-            or not isinstance(datasets, Mapping)
+            or not isinstance(files, _RUNTIME_MAPPING_TYPES) or not isinstance(schemas, _RUNTIME_MAPPING_TYPES)
+            or not isinstance(datasets, _RUNTIME_MAPPING_TYPES)
             or any(not isinstance(key, str) for key in files)
-            or any(not isinstance(value, Mapping) for value in files.values())
-            or any(not isinstance(datasets.get(key), Mapping) for key in members)
+            or any(not isinstance(value, _RUNTIME_MAPPING_TYPES) for value in files.values())
+            or any(not isinstance(datasets.get(key), _RUNTIME_MAPPING_TYPES) for key in members)
         ):
             return None
         states.append((members, files, schemas, datasets))
@@ -356,7 +364,7 @@ def inventory_dataset_delta(
             changed_paths.add(key)
         for entry in (old, new):
             info = entry.get("stats")
-            if isinstance(info, Mapping):
+            if isinstance(info, _RUNTIME_MAPPING_TYPES):
                 schema_id = info.get("schema_id")
                 if not isinstance(schema_id, str):
                     return None
@@ -406,11 +414,11 @@ def _read_quick_index(
     cache_decode_ms = round((time.perf_counter() - stage_started) * 1_000, 3)
     if (
         _cache_signature(index_path, trusted_index=True) != index_signature
-        or not isinstance(payload, Mapping)
+        or not isinstance(payload, _RUNTIME_MAPPING_TYPES)
         or payload.get("version") != FAST_INDEX_VERSION
         or payload.get("inventory_version") != INVENTORY_VERSION
         or payload.get("cache_signature") != cache_signature
-        or not isinstance(payload.get("datasets"), Mapping)
+        or not isinstance(payload.get("datasets"), _RUNTIME_MAPPING_TYPES)
         or type(payload.get("cached_files")) is not int
         or payload.get("identity_unbound_files") != 0
         or not isinstance(payload.get("feature_revision"), str)
@@ -589,10 +597,10 @@ def _entry_matches_stat(entry: Mapping[str, Any], stat: os.stat_result) -> bool:
 
 
 def _identity_unbound_count(entries: Any) -> int:
-    if not isinstance(entries, Mapping):
+    if not isinstance(entries, _RUNTIME_MAPPING_TYPES):
         return 0
     return sum(
-        not isinstance(entry, Mapping) or "file_identity" not in entry
+        not isinstance(entry, _RUNTIME_MAPPING_TYPES) or "file_identity" not in entry
         for entry in entries.values()
     )
 
@@ -689,7 +697,7 @@ def _selected_files(root: Path) -> dict[str, list[Path]]:
     names = {
         str(row.get("name"))
         for row in manifest
-        if isinstance(row, Mapping) and _SAFE_NAME.fullmatch(str(row.get("name") or ""))
+        if isinstance(row, _RUNTIME_MAPPING_TYPES) and _SAFE_NAME.fullmatch(str(row.get("name") or ""))
     } if isinstance(manifest, list) else set()
     names.update(("dgbas_release_vintages", "cbc_fx_reserve_release_vintages",
                   "cbc_money_release_vintages", "gcis_open_data_catalog",
@@ -764,7 +772,7 @@ def _aggregate(paths: list[Path], cache: Mapping[str, Any], *,
     time_columns: set[str] = set()
     for path in paths:
         entry = cache.get(str(path))
-        if not isinstance(entry, Mapping):
+        if not isinstance(entry, _RUNTIME_MAPPING_TYPES):
             if observation is not None:
                 observation.observe(dataset, path, None, entry=None)
             continue
@@ -781,7 +789,7 @@ def _aggregate(paths: list[Path], cache: Mapping[str, Any], *,
         if entry.get("error") == "invalid_parquet":
             invalid += 1
             continue
-        if not isinstance(entry.get("stats"), Mapping):
+        if not isinstance(entry.get("stats"), _RUNTIME_MAPPING_TYPES):
             continue
         info = entry["stats"]
         if not isinstance(info.get("count"), int):
@@ -870,13 +878,13 @@ def _build_record_inventory_unlocked(
         snapshot.previous_cache_signature = previous_cache_signature
         snapshot.cache_signature = previous_cache_signature
         snapshot.changed_dataset_ids = None
-    if not refresh and isinstance(payload, Mapping) and payload.get("version") == INVENTORY_VERSION:
+    if not refresh and isinstance(payload, _RUNTIME_MAPPING_TYPES) and payload.get("version") == INVENTORY_VERSION:
         datasets = payload.get("datasets")
         files = payload.get("files")
         if (
-            isinstance(datasets, Mapping)
-            and isinstance(files, Mapping)
-            and isinstance(payload.get("schemas"), Mapping)
+            isinstance(datasets, _RUNTIME_MAPPING_TYPES)
+            and isinstance(files, _RUNTIME_MAPPING_TYPES)
+            and isinstance(payload.get("schemas"), _RUNTIME_MAPPING_TYPES)
         ):
             return {
                 "datasets": dict(datasets),
@@ -895,14 +903,14 @@ def _build_record_inventory_unlocked(
         dict(payload.get("files", {}))
         # Retain identical footer semantics from the short-lived outer-v11
         # migration; restoring reader-compatible v10 must not drop observations.
-        if isinstance(payload, Mapping) and payload.get("version") in {7, 11, INVENTORY_VERSION}
-        and isinstance(payload.get("files"), Mapping)
+        if isinstance(payload, _RUNTIME_MAPPING_TYPES) and payload.get("version") in {7, 11, INVENTORY_VERSION}
+        and isinstance(payload.get("files"), _RUNTIME_MAPPING_TYPES)
         else {}
     )
     schemas: dict[str, Any] = (
         dict(payload.get("schemas", {}))
-        if isinstance(payload, Mapping) and payload.get("version") in {11, INVENTORY_VERSION}
-        and isinstance(payload.get("schemas"), Mapping) else {}
+        if isinstance(payload, _RUNTIME_MAPPING_TYPES) and payload.get("version") in {11, INVENTORY_VERSION}
+        and isinstance(payload.get("schemas"), _RUNTIME_MAPPING_TYPES) else {}
     )
     stage_start = time.perf_counter()
     selected = preselected if preselected is not None else _selected_files(root)
@@ -918,11 +926,11 @@ def _build_record_inventory_unlocked(
     identity_rechecked = 0
     unavailable_during_refresh = False
     all_entries_unchanged = True
-    previous_files = payload.get("files", {}) if isinstance(payload, Mapping) else {}
+    previous_files = payload.get("files", {}) if isinstance(payload, _RUNTIME_MAPPING_TYPES) else {}
     feature_inputs_changed = (
-        not isinstance(payload, Mapping)
+        not isinstance(payload, _RUNTIME_MAPPING_TYPES)
         or payload.get("version") != INVENTORY_VERSION
-        or not isinstance(previous_files, Mapping)
+        or not isinstance(previous_files, _RUNTIME_MAPPING_TYPES)
         or previous_files.keys() != all_paths.keys()
         or payload.get("selection_membership") != membership_fingerprint
     )
@@ -936,16 +944,16 @@ def _build_record_inventory_unlocked(
                 continue
             entry = cache.get(key)
             entry_current = (
-                isinstance(entry, Mapping)
+                isinstance(entry, _RUNTIME_MAPPING_TYPES)
                 and _entry_matches_stat(entry, stat)
-                and (isinstance(entry.get("stats"), Mapping) or entry.get("error") == "invalid_parquet")
+                and (isinstance(entry.get("stats"), _RUNTIME_MAPPING_TYPES) or entry.get("error") == "invalid_parquet")
                 and (entry.get("error") == "invalid_parquet" or (
                         entry["stats"].get("schema_id") in schemas
-                        and isinstance(entry["stats"].get("non_null"), list)
+                        and isinstance(entry["stats"].get("non_null"), _COUNT_VECTOR_TYPE)
                 ))
                 and not (
                     "/data_tw_microstructure/hft_dataset/" in key
-                    and isinstance(entry.get("stats"), Mapping)
+                    and isinstance(entry.get("stats"), _RUNTIME_MAPPING_TYPES)
                     and entry["stats"].get("time_column") != "snapshot_ts_ns"
                 )
             )
@@ -988,7 +996,7 @@ def _build_record_inventory_unlocked(
             else:
                 updated = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                            "file_identity": _file_identity(stat), "error": "invalid_parquet"}
-            if not isinstance(entry, Mapping) or (
+            if not isinstance(entry, _RUNTIME_MAPPING_TYPES) or (
                 entry.get("stats"), entry.get("error")
             ) != (updated.get("stats"), updated.get("error")):
                 feature_inputs_changed = True
@@ -1005,9 +1013,9 @@ def _build_record_inventory_unlocked(
             and all_entries_unchanged
             and not unavailable_during_refresh
             and cache.keys() == all_paths.keys()
-            and isinstance(payload, Mapping)
+            and isinstance(payload, _RUNTIME_MAPPING_TYPES)
             and payload.get("version") == INVENTORY_VERSION
-            and isinstance(payload.get("datasets"), Mapping)
+            and isinstance(payload.get("datasets"), _RUNTIME_MAPPING_TYPES)
             and isinstance(payload.get("feature_revision"), str)
             and len(payload["feature_revision"]) == 32
             and payload.get("selection_membership") == membership_fingerprint
@@ -1040,7 +1048,7 @@ def _build_record_inventory_unlocked(
         cache = {key: value for key, value in cache.items() if key in all_paths}
         referenced_schemas = {
             value["stats"]["schema_id"] for value in cache.values()
-            if isinstance(value, Mapping) and isinstance(value.get("stats"), Mapping)
+            if isinstance(value, _RUNTIME_MAPPING_TYPES) and isinstance(value.get("stats"), _RUNTIME_MAPPING_TYPES)
             and value["stats"].get("schema_id") in schemas
         }
         schemas = {key: value for key, value in schemas.items() if key in referenced_schemas}
@@ -1052,7 +1060,7 @@ def _build_record_inventory_unlocked(
         observation.start(name)
         output[name] = _aggregate(paths, cache, observation=observation, dataset=name)
     source_observation_root = observation.root()
-    if not recently_refreshed and isinstance(payload, Mapping):
+    if not recently_refreshed and isinstance(payload, _RUNTIME_MAPPING_TYPES):
         previous_recent = payload.get("recently_refreshed_files")
         if isinstance(previous_recent, list):
             recently_refreshed = [key for key in previous_recent if isinstance(key, str) and key in cache]
@@ -1078,9 +1086,9 @@ def _build_record_inventory_unlocked(
             "不重複加總。不同表的列數不是唯一市場事件，亦非 PIT 可用性。"
             + (f" {missing_families} 項預期主表尚無實存檔案。" if missing_families else "")
         )
-    if not isinstance(payload, Mapping) or output != payload.get("datasets"):
+    if not isinstance(payload, _RUNTIME_MAPPING_TYPES) or output != payload.get("datasets"):
         feature_inputs_changed = True
-    if not isinstance(payload, Mapping) or source_observation_root != payload.get("source_observation_root"):
+    if not isinstance(payload, _RUNTIME_MAPPING_TYPES) or source_observation_root != payload.get("source_observation_root"):
         feature_inputs_changed = True
     current_payload = {
         "version": INVENTORY_VERSION, "files": cache, "schemas": schemas,
@@ -1093,10 +1101,10 @@ def _build_record_inventory_unlocked(
     }
     delta = (
         inventory_dataset_delta(payload, current_payload, selected, memberships=dataset_memberships)
-        if isinstance(payload, Mapping) else None
+        if isinstance(payload, _RUNTIME_MAPPING_TYPES) else None
     )
     changed_dataset_ids = sorted(delta) if delta is not None else None
-    previous_revision = payload.get("feature_revision") if isinstance(payload, Mapping) else None
+    previous_revision = payload.get("feature_revision") if isinstance(payload, _RUNTIME_MAPPING_TYPES) else None
     feature_revision = (
         previous_revision
         if not feature_inputs_changed and isinstance(previous_revision, str)
@@ -1160,6 +1168,12 @@ def _build_record_inventory_unlocked(
     }
 
 
+def _runtime_validation_observation(result: dict[str, Any]) -> dict[str, Any]:
+    """Report actual guards in this process; not a cache freshness verdict."""
+    result["mapping_validation_types"] = [value.__name__ for value in _RUNTIME_MAPPING_TYPES]
+    return result
+
+
 def build_record_inventory(
     repo_root: Path, *, refresh: bool = False, max_refresh_files: int = DEFAULT_REFRESH_FILES,
     snapshot: InventorySnapshot | None = None,
@@ -1167,7 +1181,8 @@ def build_record_inventory(
     """Read the inventory, serializing refreshes across snapshot processes."""
 
     if not refresh:
-        return _build_record_inventory_unlocked(repo_root, refresh=False, snapshot=snapshot)
+        return _runtime_validation_observation(
+            _build_record_inventory_unlocked(repo_root, refresh=False, snapshot=snapshot))
     lock_path = Path(repo_root) / "artifacts/live/data_monitor/record_inventory_cache.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:
@@ -1186,7 +1201,7 @@ def build_record_inventory(
             preflight_observation["wall_ms"] = round((time.perf_counter() - probe_started) * 1_000, 3)
             if quick is not None:
                 quick["preflight_observation"] = preflight_observation
-                return quick
+                return _runtime_validation_observation(quick)
             result = _build_record_inventory_unlocked(
                 repo_root, refresh=True, max_refresh_files=max_refresh_files,
                 snapshot=snapshot, fast_index_miss=True,
@@ -1194,7 +1209,7 @@ def build_record_inventory(
                 quick_index_probe_ms=preflight_observation["wall_ms"],
             )
             result["preflight_observation"] = preflight_observation
-            return result
+            return _runtime_validation_observation(result)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -1303,12 +1318,12 @@ class FeatureInventoryScan:
                 snapshot.previous_cache_signature = None
                 snapshot.cache_signature = None
                 snapshot.changed_dataset_ids = None
-        if not isinstance(payload, Mapping) or payload.get("version") != INVENTORY_VERSION:
+        if not isinstance(payload, _RUNTIME_MAPPING_TYPES) or payload.get("version") != INVENTORY_VERSION:
             raise ValueError("waiting_inventory")
         self.cache = payload.get("files", {})
         self.schemas = payload.get("schemas", {})
         self.datasets = payload.get("datasets", {})
-        if not isinstance(self.cache, Mapping) or not isinstance(self.schemas, Mapping):
+        if not isinstance(self.cache, _RUNTIME_MAPPING_TYPES) or not isinstance(self.schemas, _RUNTIME_MAPPING_TYPES):
             raise ValueError("invalid_inventory")
         self.selected = (snapshot.selected if snapshot is not None and snapshot.selected is not None
                          else _selected_files(root))
@@ -1332,7 +1347,7 @@ class FeatureInventoryScan:
             valid_files = 0
             for path in paths:
                 entry = self.cache.get(str(path))
-                if not isinstance(entry, Mapping):
+                if not isinstance(entry, _RUNTIME_MAPPING_TYPES):
                     self.observation.observe(dataset, path, None, entry=None)
                     continue
                 try:
@@ -1344,20 +1359,20 @@ class FeatureInventoryScan:
                 if not _entry_matches_stat(entry, source_stat):
                     continue
                 info = entry.get("stats")
-                if not isinstance(info, Mapping):
+                if not isinstance(info, _RUNTIME_MAPPING_TYPES):
                     continue
                 fields = self.schemas.get(info.get("schema_id"))
                 non_null = info.get("non_null")
-                if not isinstance(fields, list) or not isinstance(non_null, list) or len(fields) != len(non_null):
+                if not isinstance(fields, list) or not isinstance(non_null, _COUNT_VECTOR_TYPE) or len(fields) != len(non_null):
                     continue
                 valid_files += 1
                 self.files_with_schema += 1
                 by_schema.setdefault(info["schema_id"], []).append(info)
             self.timing_ms["verify_file_signatures"] += (time.perf_counter() - started) * 1_000
-            dataset_info = self.datasets.get(dataset, {}) if isinstance(self.datasets, Mapping) else {}
+            dataset_info = self.datasets.get(dataset, {}) if isinstance(self.datasets, _RUNTIME_MAPPING_TYPES) else {}
             yield FeatureDataset(
                 dataset, len(paths), valid_files, self.observation.dataset_root(dataset),
-                by_schema, self.schemas, dataset_info if isinstance(dataset_info, Mapping) else {},
+                by_schema, self.schemas, dataset_info if isinstance(dataset_info, _RUNTIME_MAPPING_TYPES) else {},
             )
         self.finished = True
 

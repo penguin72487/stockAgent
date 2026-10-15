@@ -1,5 +1,1035 @@
 # 全來源新聞：下載器、CPU、故障範圍與完整性清冊
 
+## 共用時間狀態修復與全來源續排：2026-10-15 09:10，Asia/Taipei
+
+**本輪已修正並載入既有新聞面板；不是所有網站／全歷史完成。**
+下載器原本正確保留 `invalid_bulk_publication_clock`，但公網狀態 allowlist 與分類表
+漏列，11 個既有時間錯誤被顯示成「其他」。現在採共用、有限且一致的狀態字典，
+投影 ABI 升至 **2**，顯示「發布／異動時間未驗證」並歸入「解析／時間／端點待修」。
+未知私有錯誤仍遮罩為「其他」；不接受任意前綴，也不改原始時間或把錯誤算成正文。
+依工作偏好技能修共用入口；依 build-dashboard 流程核對同一渲染世代的數字與實際畫面，
+直接沿用 [新聞面板](https://penguin72487.dpdns.org/news/)，沒有新增正式爬蟲、網站或 GPU 工作。
+
+### 修改、驗證與實際運行
+
+- 正式程式只改共用分類、唯讀投影與既有頁面標籤三個檔；移除面板的重複狀態清單，
+  之後共用分類新增已知結果時，不再漏列為 unknown。
+- **201 個新聞測試檔、10,955 passed**；原 **10,945 個 case ID**與原 200 個測試檔
+  SHA 均保留。增加九個時間投影／隱私／實際渲染案例及一個既有共享列舉案例，沒有
+  放寬原斷言。pytest 自報 **308.78 秒**，外層 test 子程序 **311.09 秒**，含 collection、
+  釘選及驗後檢查的完整工作包 **375.25 秒**；不是受控效能比較或來源速率上限。
+- 原 **11 個 clock head、attempts、due、原觀測時間、正文／Parquet 狀態**保持一致。
+  **68 個來源 capture／HTTP capacity 身分、16 個保護 head、21 份固定批次收據**保留；
+  主設定、來源 catalog 與工作順序未改，source refusal／Retry-After／診斷額度不清零。
+- 只重新載入唯讀 gateway，重啟命令 **09:01:35～09:01:51**，不宣稱零停機。
+  canonical 新聞 owner `10fcaebdc76945c9828b69866499a464`、PID `1281032` 未重啟，
+  鉅亨第一優先與原背景順序照常跑，CNA 仍暫緩。
+- **09:03:18 本機與公網 API 均 200／no-store／ABI2**，TVBS 均為 **1,477** 個
+  已存正文 head、**12** 個時間錯誤；新增的一個錯誤是 owner 後續正常觀測，不是更改
+  原十一筆。**09:03:41 公網桌面 1440、手機 390**實際呈現 1,481／1,677、12 個時間
+  錯誤，分類、正文分子／已知網址分母及同世代進度一致，無水平溢出；畫面已目視確認。
+- 本機 gateway 的既有完整瀏覽器驗收 **1440／768／390／320 四種寬度**通過，
+  全 **936 個來源、39 頁**、搜尋／排序／篩選、68 個流量列、17 個 stage、鉅亨清單
+  及 metadata-only 未知進度均可使用。審閱註記在 run 期間更新，各畫面以自身世代核對。
+  註記安裝後另有 **148 passed／7.97 秒**。
+- **公網完整四寬度驗收尚未通過**：較長公網流程偵測到
+  `static.cloudflareinsights.com` 外部統計程式請求；本機來源頁／資產沒有該引用。
+  不把這項公網路徑問題當成 publisher/body 錯誤，也不放寬「無外站請求」驗收。
+  較短的公網 clock 畫面驗收與本機完整驗收，不能替代這個未通過的公網完整邊界。
+  早期驗收助手的欄位、preflight 與預設 urllib client 問題保留原失敗日誌；改用既有、
+  誠實具名的 owned-dashboard 驗收路徑後 API 已通過，新聞 UA／存取規則沒有更改。
+
+### ETtoday／台視：實際來源證據，而非失敗重試猜測
+
+ETtoday 舊文件網址實際回 **301／302**；沿來源 Location、頁面明列的 copyright
+link 及實際 HTTPS upgrade 找到現行 [服務條款](https://member.ettoday.net/clause_member.php7)、
+[著作權聲明](https://member.ettoday.net/clause_copyright.php7) 與
+[關於我們](https://events.ettoday.net/about-ettoday/index.htm)。第 2 點有合理範圍的個人、
+非商業使用例外；這不是整站歷史、第三方轉載、重新散布或模型訓練的概括授權／法律判決。
+會員對自己上傳內容的授權，也不是每篇新聞的授權。
+
+沿用同一個未啟用來源的診斷 HTTP root、固定 UA、兩秒節奏及 REP／cooldown，共計
+**15 個 HTTP 請求：6 個規則文件／轉址、6 個 REP、3 個已知文章**；不重置證據或
+另開正式 owner。三個 literal finance／www 原頁均 200，`.story` 存在，但兩個無已驗
+作者，另一個 generic extractor 使用 publisher `ETtoday新聞雲` 且標記
+`article_container_unverified`。**0 個原始文章回應留存、0 個正文收據**；不能把
+網站可開或 publisher 名稱當成原創記者、完整正文與已下載。
+
+ETtoday 改列「私人公開候選」，保留 **17,273** 個已知 URL，下一步須驗原生記者署名、
+原創範圍、完整可見正文、精確 article identity／原時鐘及歷史版型，再啟用獨立審閱的
+known-URL recipe。台視補讀 [官方條款第 14 點](https://www.ttv.com.tw/group/15/policy.asp)
+後改列「需取得來源同意」；第 7 點的下載責任聲明不是全站批次授權。**10,858** 個
+已知 URL 仍保留，沒有文章 HTTP／raw/body request，也未斷言永久不存在或沒有授權 API。
+兩項皆只改 planning review，不改來源設定、身分、租約／重試期限或啟用正文下載。
+
+### 全來源清冊、剩餘工作與證據
+
+**09:06:13 固定唯讀清點：936 個來源鍵、6,306,326 個已知 URL head、3,838,154 個
+已存正文 head；68 註冊、29 啟用、868 未註冊鍵。**不是去重篇數或 936 家不同公司。
+本次一次性全清點 **32.30 秒 wall／32.16 秒 CPU**，不在面板每次輪詢重掃 SQLite
+或文章檔案；網頁沿用有界 owner 快照，讀頁不呼叫 publisher。
+
+完整 [936 列工作清單](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/all_source_plan_after.csv)
+與 [分工／端點／已知缺口 JSON](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/all_source_plan_after.json)
+已更新為 outcome ABI2；沒有篩掉小來源。仍有鉅亨 **190** 個 active missing URL head
+（186 有主文候選、4 無已知主文；候選不是版本正文相同的證明）、ETtoday native parser、
+台視來源範圍、其他來源署名／身分／時間／正文 representation，以及公網外部統計問題。
+不能以沒有 adapter、403、404 或現在沒有全文，直接宣告所有安全替代途徑已窮盡。
+全來源目標維持 **progress／active**，完成時間與全途徑不可取得比例仍未知。
+
+證據：[完整回歸](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/regression_after.json)、
+[本機／公網 API](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/deployment_acceptance.json)、
+[公網 clock 實際渲染](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/rendered_acceptance.json)、
+[本機完整畫面](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/native-dashboard-browser/acceptance.json)、
+[公網完整未通過記錄](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/shared-dashboard-browser/acceptance.json)、
+[來源審閱不更動下載器的驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_policy_primary_20261015/review_acceptance.json)、
+[階段總驗收及剩餘項目](../artifacts/data_quality/news_goal_stage01_20261009/clock_projection_scope_20261015/stage_acceptance.json)。
+
+## TVBS 四種版型、原生署名與時間修復：2026-10-15 08:33，Asia/Taipei
+
+**共用下載器已正式抓到 TVBS 正文；474 個舊失敗項目均已由正常排程重新觀測，
+386 個補回正文、88 個保留其他驗證／範圍問題。08:32:55 本機與公網面板均顯示
+TVBS 累積 1,365 個已存正文 URL head。不是所有網站或全歷史完成。**
+依工作偏好技能沿用 canonical owner、原件、版本與收據邊界，只補來源 adapter、
+共用解析／診斷及一次性恢復，不建立第二個正式下載器。鉅亨第一優先、原背景順序、
+CNA 暫緩均未改動；現有 [新聞面板](https://penguin72487.dpdns.org/news/) 直接讀同一份進度。
+
+### 最少修改：先確認原件，再修共用鏈路
+
+- 原有 CSS 在初始四份 HTTP200 原頁均找不到正文。新增一個純 TVBS adapter，涵蓋
+  news、cars、supertaste 與兩份精確 exhibition 分段文章；不是四個獨立 HTTP 管線。
+  共用連線池、robots、限速、排程、SQLite、Parquet、雜湊與收據不另複製。
+- **11 份實際原頁**以 `lxml`、`html.parser` 重播；完整輸出字典一致。分段文章已完成
+  原生章節、標題、記者及日期核對，不再是未實作版型；來源只寫 **2026.06.03** 時，
+  保留 date-only，不補午夜、時區或精確發布時刻。原版型正文、清單、風險提示與數值保留，
+  只移除有證據的推薦 UI，不抓付費／會員或明示外部轉載正文。
+- 已知 URL 保留原 HTTP／`from` 參數身分；只接受實際發生的同 host、同 path HTTPS
+  轉址。不猜 ID、替代網址、API 或其他站的同文，不以搜尋摘要／圖片／alt 冒充全文。
+  標題變體保留來源原值，不做模糊標題匹配或側欄補標題。
+- 實際故障原頁顯示「記者＋責任編輯」的有序雙署名及「編譯」角色。新版只接受原生
+  支持的記者／編輯／編譯、精確來源 Person 順序及一致的可見署名；未知「作者」角色、
+  外部供稿、倒序、衝突或多餘署名仍不通過。未把個人研究說法當成所有轉載稿的授權。
+- 實際來源 schema 的異動時間可在發布時間前 **恰好 1 秒**，但兩者落於同一個原生可見
+  分鐘。`tvbs_visible_article_v2` 只接受這個已驗證的 news-host 形狀，且 schema、meta、
+  可見時間須獨立吻合；**兩個原時間都保留並標記異常**，不改值、不容許任意逆序／跨分鐘。
+  現在觀測到的正文不是該歷史發布時刻就已觀測到的證據，不能據此製造歷史 PIT。
+
+### 一次性修復、實際回補與耐久驗收
+
+正式交接前基準是 **470** 個可修復舊失敗；舊 owner 正常 drain 期間又出現四個，
+持久修復收據最終為 **474**，沒有鎖死舊分母。只把精確舊 ABI、未租用、無正文／Parquet
+的原生時間／署名錯誤，以及已證實的單筆編譯範圍誤判重排一次。**原 attempts、due、錯誤
+及觀測時間保留**；原錯誤不直接改成 complete，重啟不重授此機會。
+
+| 474 個正式重驗項目的結果 | 數量 | 處置 |
+| --- | ---: | --- |
+| complete | 386 | 正常抓取、驗證、落盤後才算已取得 |
+| article_rights_or_scope_excluded | 59 | 原生署名／來源範圍仍不符合，保留證據 |
+| article_attribution_not_verified | 18 | 署名尚不能核對，不以側欄／推測補值 |
+| invalid_bulk_publication_clock | 11 | 不屬於已證實的時間形狀，不調整原時鐘 |
+
+474 個項目全部 attempts 增加且留下新的來源觀測；觀測跨度 **08:30:25.948～08:31:39.964**。
+這是批次新觀測跨度，不含啟動、派發等待、全部落盤與驗收，不冒稱完整管線或理論速度上限。
+三個代表 URL `3272175`、`3271666`、`4033506` 的新版正文／時鐘／雙署名已實際通過，
+不是只用 fixture 推論可抓。合計 **28 份**舊／新正文以 canonical 稽核器 **16＋12** 有界分批，
+重驗原件、正文 SHA、Parquet、來源時鐘、署名、收據與兩種 parser。
+
+**953 個原有 TVBS 正文 head、16 個跨來源保護 head、967 個不相關 FTNN 失敗 head、
+21 份固定批次收據**不變。只有 TVBS capture ABI 改版；其他 67 來源身分、全部來源／全域
+HTTP capacity 身分與既有速率學習保留，403／429／robots／Retry-After 及診斷配額未清零。
+
+### 診斷、測試、交接與網頁
+
+- 為確定根因，只對 **9 個實際失敗、到期、無正文、未租用 URL** 做 metadata 診斷。
+  原服務正常停止後，使用同 canonical HTTP root、排他鎖、固定 UA、robots 與持久限速；
+  九次回應均 200，至少約 2 秒間隔，無原始正文留存／queue head 修改／容量學習重設。
+  producer 停止至診斷完成 **26.76 秒**，另有正常重啟初始化；不稱零停機。
+  新 hash-only 原生診斷直接使用已收到的 DOM，受原每來源／固定錯誤／UTC 日配額控制。
+  當日舊額度已用完時不補回，所以這九份受控診斷與後續正式診斷須分別看待。
+- **200 個新聞測試檔、10,945 passed**；原 **10,853 個 case ID**保留，只精確擴充本輪
+  自有 TVBS 版本斷言，其餘斷言未減少。pytest **348.96 秒**，含 collection／釘選／驗後
+  檢查的完整工作包 **412.74 秒**。另有 60 個新版聚焦案例及三種 canonical worker→accept→
+  關閉重開→獨立稽核流程通過；安裝後六個已存在測試檔 **424 passed／34.61 秒**。
+  早期 fixture、候選驗收欄位及測試路徑錯誤保留失敗日誌，由後續完整驗證取代，不算來源故障。
+- 新版只把 TVBS catalog parser 版本由 v1 改為 v2；其他解析後設定未改。
+  原 owner **08:29:05 正常 drain／exit75**，**08:29:16 自動重啟**，未為新版手動 restart。
+  新程序完整初始化 **64.61 秒／CPU 23.53 秒**，收據恢復 **63.45 秒／CPU 23.06 秒**。
+  這是本次實測，不是受控啟動速度比較；主機既有 cgroup inotify ENOSPC 警告仍未處理。
+- **08:32:55 本機、公網進度 API 均 200／no-store，各 2,519,446 bytes，TVBS 1,365**。
+  正文數字來自已落盤 head，不是 HTTP200、已派發或 parse fixture 數。
+  唯讀／一致快照／不匯出正文與金鑰／頁面不呼叫 publisher 皆通過；本輪為 API 與資料驗收，
+  沒有新增瀏覽器視覺驗收。11 個來源時鐘驗證錯誤在公網仍歸「其他」，逐 URL 細項見私有清單。
+
+### 全來源清單與尚未完成
+
+**08:32:51 全來源清點：936 個來源鍵、6,306,072 個已知 URL head、3,837,781 個已存正文
+head；68 個已註冊來源，29 個啟用，其中 19 個沿用持續下載、10 個固定小批次。**
+這個 grain 是 provider／hostname／URL，不是去重新聞篇數，也不是所有 936 家網站都已實作。
+新的 [完整工作表](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/all_source_plan_after_v2.csv)
+將所有鍵分配到既有下載器、有限批次、待審來源 adapter、原始 publisher 解析、授權 API、
+支援匯出或關站歷史來源查核；共用工具能處理的，不再建重複管線。
+
+仍有 **868 個未註冊來源鍵**待審；不是只因少量網址或單次失敗便判定永久放棄。
+本輪 TVBS 全部 head 還有身分、未知署名、範圍、時鐘、短正文及 TTALK 路徑等問題；
+TTALK 曾見 404 header 但傳輸未完整，不能宣稱永久不存在。復原清單剩餘的 88 個及其他
+未通過 head 保留逐 URL 原因，不無限重試、不假稱已抓齊。
+鉅亨仍有 **190 個活躍缺文 head**，186 有主站候選提示、4 沒有已知主站正文；
+提示不等於同文證明，仍維持第一優先與來源重試期限。全歷史完成時間目前沒有足夠依據，
+不拿已抓到的比例或 TVBS 短批次速率硬推所有來源 ETA。
+
+TVBS 條款查核為 [官方版權說明](https://www.tvbs.com.tw/policies/copyright)、
+[使用協定](https://www.tvbs.com.tw/policies/terms)，只作已審私人資訊取得範圍的依據，
+不宣稱批次歷史、第三方轉載、訓練／跨主機／再發布的一般授權。初始兩秒節流、既有
+自適應排程或離線 parse benchmark 都不是官方速率上限；未找到可證明的多篇正文 API。
+
+證據：[更新後分階段計畫](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/repair_plan.json)、
+[九份正式 metadata 診斷](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/validation_probe.json)、
+[11 份原件輸出／容量身分保護](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/validation_candidate_v2.json)、
+[10,945 項回歸](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/validation_regression_after.json)、
+[28 份耐久原件／正文／收據驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/validation_deployment_acceptance.json)、
+[474 項逐筆結果與剩餘失敗清單](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/validation_final_outcomes.json)、
+[本機／公網面板回讀](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/validation_dashboard_acceptance.json)、
+[全來源／端點清點](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_tvbs_20261015/inventory_after_v2.json)。
+
+## FTNN 發布／異動雙時鐘修復：2026-10-15 06:54，Asia/Taipei
+
+**共用修正已正式生效；321 個舊時間錯誤項目均已重新取得來源回應，
+319 筆正文補回、2 筆仍未通過其他檢查。06:53 回讀 FTNN 累積 5,928 筆正文，
+本機與公網唯讀進度 API 均反映此數字。不是所有來源或全歷史完成。**
+
+### 根因與最小共用修正
+
+實際故障 metadata 指出 `news/259535` 原生有兩個時間節點；官方原頁分別標示
+「發布時間」與「異動時間」，不是互相衝突的兩個發布時間。舊解析器只允許一個節點，
+因此把正常修訂文章誤判為 `invalid_bulk_publication_clock`。沿用工作偏好技能的
+canonical owner／原件／收據與版本邊界，只改四個共用模組，不新增獨立 HTTP 管線：
+
+- `news_fulltext_ftnn.py`：一個發布標記加至多一個異動標記，分別核對來源 schema
+  `datePublished`／`dateModified`；保留原秒數、原生顯示分鐘與兩個標記，不用抓取時間
+  補發布時間。重複、隱藏、未知或不一致的時間仍失敗，原單標記輸出不變。
+- `news_fulltext_policy.py`：FTNN 解析 ABI 升版；只在 HTTP 身分計算中正規化這個
+  adapter 版本，確保先前整份來源／範圍／權限仍完全相符。其他 67 來源身分不變，
+  全體與每來源 HTTP capacity 身分及已學到的 FTNN 速率均保留。
+- `news_fulltext_queue.py`：只對精確舊契約、未租用、沒有正文／Parquet 的舊時間錯誤，
+  寫入**一次性且可持久恢復**的 retry 清單；原 attempts、due、錯誤與觀測時間不清除。
+  健康正文、403／429／robots／權限及不相關解析錯誤不重排，重啟不會再次補回此機會。
+- `news_fulltext_diagnostics.py`：在既有每來源／固定錯誤／UTC 日配額內保留有界時間標記
+  證據；不多打 publisher、不保存正文或重設診斷預算。
+
+### 實際回補、耐久驗證與網頁
+
+- 交接前基準有 318 個時間錯誤；舊 owner 正常運作期間又觀測到 3 個，最終正式清單
+  是 **321**，不是鎖死舊分母。321 個項目全部由 attempts 1 → 2，正常排程重驗一次；
+  本次觀測時間跨度 **06:51:25.911～06:52:33.575**。這是批次觀測完成跨度，
+  不含啟動、等待派發與落盤驗收，不能冒稱完整管線時間或理論速率上限。
+- **319 個 complete**；`news/520952` 仍為 `article_identity_not_verified`，
+  `news/556383` 為 `article_rights_or_scope_excluded`。兩筆保留來源結果、未偽造正文，
+  也不據此宣稱網站永久不存在或已證明是來源壞資料。
+- `news/259535` 正式新原件／正文／收據及 `lxml`、`html.parser` 重播均通過：
+  來源發布 **2024-07-02 08:51:00+08:00**、異動 **09:16:06+08:00**，本次觀測
+  **2026-10-15 06:52:31.600771+08:00**。沒有把目前回讀當成 2024 歷史可得證據。
+- 合計 **24 份**既有健康與本次新正文，以 canonical 稽核器 **16＋8** 有界分批，
+  重驗原件／正文 SHA、Parquet、來源時鐘、署名及收據；舊健康 head、
+  **940 個不相關失敗 head、21 份固定批次收據**與診斷預算皆保留。
+- **06:53:38 本機、公網進度 API 均 200／no-store，各 2,518,572 bytes，FTNN 5,928**。
+  新 owner、程序時鐘與 heartbeat 通過；瀏覽不呼叫 publisher，也不匯出正文或金鑰。
+  本次是資料／API 驗收，不宣稱新增瀏覽器視覺驗收。
+
+### 回歸、交接與剩餘邊界
+
+**196 個新聞測試檔、10,642 passed**，原有 **10,600 個 case ID、測試檔 SHA 及斷言全保留**，
+新增 42 個案例；另有 220 個聚焦案例通過。pytest **332.89 秒**，完整 regression workflow
+從程序開始至結束 **410.41 秒**，包含 collection／釘選／測試／驗後檢查；不以其中的
+336.16 秒子區段冒稱整體耗時。早期唯讀基準腳本欄位錯誤已更正並保留失敗紀錄。
+
+只改 catalog JSON 空白觸發原維護點，解析後設定內容不變；舊 owner **06:49:32 正常
+drain／exit75**，**06:49:42 自動重啟**，未手動 restart。新程序完整初始化
+**93.78 秒／CPU 34.85 秒**，其中既有收據恢復 **92.67 秒／CPU 34.32 秒**；未跳過驗證，
+這不是受控啟動加速實驗。既有 cgroup inotify ENOSPC 警告仍在，未變更全主機監看配額。
+
+鉅亨仍有 **193 個活躍缺文 URL head**，其中 186 只有主站候選提示，7 沒有已知主站正文；
+提示不等於同文證明，拒絕與來源重試期限不清零。原 936 來源鍵清冊中的 869 個待審鍵
+仍不能稱為已完成下載器。維持鉅亨優先、既有背景順序與 CNA 暫緩。
+等待期間另查 [TVBS 官方版權](https://www.tvbs.com.tw/policies/copyright)與
+[使用協定](https://www.tvbs.com.tw/policies/terms)，可繼續限縮私人研究原文範圍的原生驗證；
+[鏡週刊授權說明](https://www.mirrormedia.mg/story/webauthorize)則仍需釐清適用授權，
+風傳媒的有界搜尋未找到適合的官方條款頁。三者均未因此啟動新抓取或被判為永久缺文。
+
+證據：[分階段修復計畫](../artifacts/data_quality/news_goal_stage01_20261009/ftnn_release_clock_20261015/repair_plan.json)、
+[候選與健康正文保護](../artifacts/data_quality/news_goal_stage01_20261009/ftnn_release_clock_20261015/candidate.json)、
+[10,642 案例回歸](../artifacts/data_quality/news_goal_stage01_20261009/ftnn_release_clock_20261015/regression_after.json)、
+[321 項正式回補與原件／收據驗收](../artifacts/data_quality/news_goal_stage01_20261009/ftnn_release_clock_20261015/deployment_acceptance.json)、
+[本機／公網進度驗收](../artifacts/data_quality/news_goal_stage01_20261009/ftnn_release_clock_20261015/dashboard_acceptance.json)、
+[下一批官方來源查核](../artifacts/data_quality/news_goal_stage01_20261009/ftnn_release_clock_20261015/next_source_review.json)。
+
+## 鉅亨稀疏公告與故障證據修復：2026-10-15 06:27，Asia/Taipei
+
+**共用修正已載入唯一正式服務；06:26:56 回讀 FTNN 累積 5,572 筆正文，
+24 份正文／原件／收據抽驗及本機、公網進度 API 通過。不是所有網站或全歷史完成。**
+依工作偏好技能沿用 canonical owner、原件與版本契約，只修改四個共用模組，
+不另寫重複 HTTP 管線、不重抓健康文章。鉅亨優先、既有背景順序與 CNA 暫緩不變。
+
+### 從實際原件區分「資料稀疏」與「沒有全文」
+
+五份既存鉅亨失敗原件均核對原收據與 SHA，再以 `lxml`、`html.parser` 重播：
+
+| 文章 ID | 修正後結果 | 可宣稱與不可宣稱 |
+| --- | --- | --- |
+| 1507405、335893 | 完整的「今日無資料」公告，各 116 字元 | 原生可見容器、current、schema、數字 ID 與發布時間相符；保留空標題與實際換行，不用側欄／OG 補標題。 |
+| 308913 | `source_body_image_only` | 宣告作者與可見署名分別核對來源原宣告及完整圖片結構；不改寫來源姓名，不用 OCR／alt／摘要冒充本文。 |
+| 635635 | `source_article_empty_template` | 既有空模板辨識仍正確；沒有新增正文。 |
+| 4999053 | 仍為 `body_not_found` | 原件只見單字 `b`；不能據此宣稱是完整新聞、測試稿或永久不存在，仍待來源證據。 |
+
+兩篇公告另走**隔離 SQLite／Parquet 落盤、關閉重開、正文及原件雜湊與收據重播**，
+均通過；2013／2015 的來源發布時間、2026-10-12 的原觀測時間維持原值。
+這不是正式新增下載，也沒有把舊回應冒稱為今天觀測；正式 head 仍依原重試期限處理。
+空標題例外只涵蓋完整、明確的無事件公告，不放寬未知短文、登入或付費內容。
+
+### 故障不再只剩一個錯誤代碼
+
+- 共用 worker 將**已收到的回應**交給原 owner；不為診斷多呼叫 publisher。
+  `invalid_bulk_publication_clock`、`article_attribution_not_verified`、
+  `article_rights_or_scope_excluded` 分別有每來源／固定錯誤／UTC 日最多兩份 metadata
+  證據；先扣配額再解析或寫入，寫入失敗仍計次，重啟／解析器更新不補回額度。
+  原身分與 raw 證據預算不變，沒有逐 URL 重設或把失敗變成已取得。
+- FTNN metadata 可比較來源發布／修訂時鐘、發布分鐘、標題雜湊與署名形狀；不保存正文、
+  標題或署名原文，也不授予抓取、發布或訓練匯出權限。新程序本次未遇到新的這三類
+  FTNN 錯誤，**現場新增診斷樣本為 0**；功能驗證目前來自隔離測試，不能稱為現場根治。
+- 無法確認、來源暫時錯誤、權限待確認、純圖片、空模板與已取得分開保留。
+  不把 403／429／robots origin 失敗改寫為不存在，不繞過限制或重設拒絕期限。
+
+### 測試、正常交接與正式驗收
+
+- **195 個新聞測試檔、10,600 passed；pytest 312.47 秒，完整工作包 315.15 秒。**
+  原有 **10,544 個 case ID 與原斷言全保留**，新增 56 個案例；另有 254 個聚焦案例通過。
+  一個舊身分測試的歷史 SHA 重建補上兩行新 HTML 契約欄位移除斷言，精確移除這兩行後，
+  檔案 SHA 與原測試相同；不是降低限流或身分驗證條件。
+  早期 fixture 錯誤、原件發現的 OG 標題問題、舊歷史 SHA 測試失敗與主動取消輪均留證，
+  不當成成功。首輪正式抽驗腳本超過單次 16 URL 上限亦留證；改為 16＋8 分批，
+  沒有放寬原稽核器或少驗樣本，後續 24 份抽驗才是成功證據。
+- 僅以 catalog 的一行 JSON 空白觸發既有設定維護點；解析後設定內容不變。
+  原程序 **06:23:31 正常 drain／exit75**，新程序 **06:23:41 自動接手**，未手動 restart。
+  核對新 owner、PID 時鐘、新鮮 heartbeat 與全部設定的 capture fingerprint。
+  只有鉅亨 HTML 修復身分改版，**其他 67 來源身分與鉅亨 HTTP capacity、bulk、index、
+  authorization 身分不變**；未重設流量學習或跨來源校驗預算。
+- **21 份固定批次收據、9 份健康來源 head、7 份既存 FTNN head 不變**；
+  再抽驗新 owner 正常排程下載的 FTNN、Global Voices 各 4 份，合計 24 份的原件／
+  正文 SHA／Parquet／署名／來源時鐘／收據及目前解析器重播通過。原診斷焦點 manifest、
+  回應／bytes 上限與已消耗配額均保留；HTML 修復沒有重新排入不相干的 bulk API 工作。
+- **06:26:26 本機、公網唯讀 API 均 200／no-store，各 2,518,456 bytes、回應 SHA 相同**，
+  當時 FTNN 顯示 5,571，後續正式回讀為 5,572；這是正常增加，不要求不同時間快照數字相等。
+  網頁瀏覽不呼叫 publisher、不匯出正文或金鑰；本輪為 API／資料驗收，未新增瀏覽器視覺驗收。
+
+### 尚未完成與效能邊界
+
+- 正式驗收快照中 FTNN 沒有 pending／inflight／retry；但仍有身分、署名、發布時鐘、
+  範圍與缺文未通過的項目，不能宣稱全站或所有可修復歷史完成。
+- 鉅亨仍有 **193 個活躍缺文 URL head**：186 只有已存主站候選提示，7 沒有已知主站正文。
+  提示不是逐篇同文證明。151 個 AMP pending 仍受原 robots-origin 暫時錯誤處理，
+  不換 host 繞過；五個檢查 head 的原期限均保留，其中一筆在舊 owner 正常重試後延後，
+  不是改版造成的提前或清零。兩篇修好的公告尚未當成正式抓取完成。
+- 沿用原 [936 來源鍵工作表](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/plan.csv)
+  與 [113 個端點能力清單](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/registered_endpoints.endpoints.csv)。
+  其 869 個待審查鍵是原清冊快照，不是 869 個網站確定不能抓；本輪不冒稱完成這些下載器。
+- 新程序完整初始化 **91.33 秒／CPU 31.76 秒**，收據恢復 **90.44 秒／CPU 31.29 秒**。
+  未跳過檢查；這不是受控速度比較或來源吞吐上限。主機仍有 cgroup inotify ENOSPC
+  警告，未動其他工作的監看配額；正常啟動與下載通過不表示該主機警告已修復。
+
+證據：[分階段修復計畫](../artifacts/data_quality/news_goal_stage01_20261009/source_failure_repair_20261015/repair_plan.json)、
+[五份實際原件與身分保護](../artifacts/data_quality/news_goal_stage01_20261009/source_failure_repair_20261015/candidate_v2.json)、
+[10,600 案例與精確舊測試修訂](../artifacts/data_quality/news_goal_stage01_20261009/source_failure_repair_20261015/regression_final_after.json)、
+[兩篇隔離落盤／關閉重開](../artifacts/data_quality/news_goal_stage01_20261009/source_failure_repair_20261015/isolated_durable_v2_acceptance.json)、
+[正式 24 份正文／收據回讀](../artifacts/data_quality/news_goal_stage01_20261009/source_failure_repair_20261015/deployment_acceptance.json)、
+[本機與公網進度資料驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_failure_repair_20261015/dashboard_acceptance.json)。
+
+## FTNN 原生正文修復、共用排程與回讀：2026-10-15 05:52，Asia/Taipei
+
+**FTNN 已接回共用下載器；05:51:42 的正式驗收快照已有 22 筆完整正文 URL head，
+本機與公網面板同步顯示 22。不是全站歷史完成，也不是其餘來源都已完成。**
+依工作偏好技能沿用同一個 owner、原件／收據與版本契約，只補來源級解析及設定；
+鉅亨優先、既有八家背景順序、CNA 暫緩及所有來源原有拒絕／重試期限均未改動。
+
+### 本次真正修好的部分
+
+- FTNN 舊 `.news-content`／`itemprop=articleBody` 選擇器在三份真實原件都找不到正文。
+  新增純解析器 `ftnn_visible_article_v1`，沿用既有 HTTP、限流、SQLite、Parquet、
+  斷點、收據及進度頁，不新增下載服務或第二個 writer。
+- 使用同篇 canonical／OG／breadcrumb／schema／可見標題及原生記者署名、發布分鐘交叉驗證；
+  兩種 HTML 引擎重播三份完整報導，保留原始數值與投資風險提示，圖片說明另存，
+  摘要、廣告與延伸閱讀不混入正文。來源宣告的秒數、可見分鐘、修訂與捕獲時間仍分開，
+  沒有捏造歷史發布觀測。範圍依[原站個人／非商業下載條款](https://www.ftnn.com.tw/copyright)
+  及已審查原作限定，不推論全站、第三方再利用或訓練匯出授權。
+- **193 個新聞測試檔、10,544 passed，pytest 284.62 秒，完整工作包 287.03 秒**。
+  原有 **10,483 個 case ID** 全保留，新增 61 個 FTNN 案例；只修正一個既有測試函式中
+  漏掉已上線焦點事件的固定名單，並加驗 FTNN 啟用後的封閉來源集合。函式外所有舊測試
+  bytes 不變，沒有刪斷言。安裝正式設定後再驗 **124 passed**。
+  首輪完整回歸的 10,542 passed／1 failed、早期新測試呼叫介面錯誤及主動取消的第二輪
+  均保留；取消輪不算通過，後續成功回歸與啟用分支才是驗證證據。
+
+### 正式執行、資料與網頁驗收
+
+- 僅更新 FTNN 來源配方；原程序於 **05:48:08 正常 drain／exit75**，新程序
+  **05:48:18 自動接手**，未手動 restart。設定變更依原三分鐘維護點檢查，不是即時熱換。
+- 正式回讀確認 **其他 67 個來源身分、21 份固定批次收據與 9 份健康正文 head** 不變，
+  原診斷 manifest、回應／bytes 上限與已消耗配額不重設；另抽驗 7 份新 FTNN 正文，
+  共 **16 份原件／本文 SHA／Parquet／署名／來源時鐘／收據與目前解析器重播**通過。
+- 05:51:42 正式快照中，FTNN 已完成 22 筆；來源實際請求為 **38 次文章＋1 次 robots**，
+  全為 200、共 1,487,963 decoded bytes。最小起始間隔至少 2 秒；三篇前置診斷另有
+  3 次文章＋1 次 robots，沒有藏進正式完成量。這是當時觀測，不是穩定吞吐上限。
+- 本機與公網唯讀 API 均 **200／no-store**，**2,518,452 bytes 回應 SHA 相同**，
+  來源狀態、已下載量及條件式 ETA 沿既有網頁更新；瀏覽網頁不呼叫 publisher，
+  也不匯出正文／金鑰。本輪為資料與 API 驗收，未重跑瀏覽器視覺驗收。
+
+### 尚未完成與效率邊界
+
+- FTNN 同一快照尚有 6,583 pending、8 inflight、8 筆範圍排除、1 筆身分驗證未過、
+  1 筆發布時鐘驗證未過。這些都不算已下載，也未證明是來源錯誤、第三方轉載或永久無法
+  修復；須續查實際原件。原清冊 6,623 是已知 URL 工作量，不是可取得原創篇數或全站歷史。
+- 鉅亨活躍缺文 URL 由本輪 197 降到 **193**，其中 186 只有主站候選提示、7 沒有已知主站正文；
+  下降包含空白模板的正確分類，不能稱為補出四篇全文。AMP 的實際 robots-origin 502 與
+  300 秒冷卻照原期限處理。五份既存失敗原件另以兩種引擎回讀：一份目前解析器可辨認空白
+  模板，另外四份仍不通過；沒有用舊回應改當下 head、冒稱今天觀測或增加 publisher 呼叫。
+- 依同一份 **03:40:48 原清冊**重產 **936 個來源鍵**工作表，仍有 **869 個鍵未完成審查**。
+  新增 FTNN、TradingView 及三立審查記錄；TradingView 依[官方第 3 節](https://www.tradingview.com/policies/)
+  列待權限，三立仍為查核未完，不把文件讀取失敗寫成文章 403 或不存在。
+  另更新 **113 個註冊端點／namespace 能力**。工作表的數量與啟用旗標保留原快照語意，
+  即時作業量以面板／正式回讀為準；來源鍵、主機、URL、文章與 metadata 關聯不可混算。
+- 實測固定 2,048 份收據的 AB／BA 局部讀取：serial 平均 wall **0.652 秒／CPU 0.205 秒**，
+  二讀者預讀 wall **0.523 秒／CPU 0.530 秒**。雖 wall 快約 1.25 倍，CPU 卻為 **2.59 倍**，
+  因此未採用，不能當整個啟動、真正冷啟或來源下載上限的成績。
+  本次真實啟動 `owner_initialization` 為 **109.98 秒／CPU 37.61 秒**，其中收據恢復
+  **106.83 秒／CPU 35.80 秒**，成本仍在；沒有略過驗證製造加速。inotify ENOSPC
+  警告仍存在，主機監看配額根因未證實，未更動其他工作的配額。
+
+證據：[原件與三篇整體重播](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/offline_candidate.json)、
+[10,544 案例與精確舊測試修改](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/regression_final_after.json)、
+[正式 16 份原件／正文／收據回讀](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/deployment_acceptance.json)、
+[本機與公網進度驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/dashboard_acceptance.json)、
+[鉅亨索引與原期限](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/priority_readiness.json)、
+[五份失敗原件重播](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/priority_original_replay.json)、
+[936 列工作表](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/plan.csv)、
+[113 個端點能力](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/registered_endpoints.endpoints.csv)、
+[未採用的預讀實測](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_ftnn_20261015/receipt_read_ahead.json)。
+
+## 共用下載器、精確範圍與正式回讀：2026-10-15 05:14，Asia/Taipei
+
+**焦點事件已知的 1 篇原文已正式下載、完整驗證，網頁同步顯示 1／1；不是全站歷史完成。**
+沿用工作偏好技能要求的 canonical owner／收據與版本邊界：只補來源原生版型與宣告式設定，
+沒有新增下載服務、第二個 writer、全站掃描或為健康來源重設流量／失敗期限。
+鉅亨優先、其餘來源獨立並行及 CNA 暫緩的既有工作順序不變。
+
+### 本次實作與驗收
+
+- 新增 `eventsinfocus_visible_news_v1`，只處理本機已知的 `news/7145971`。
+  同篇 canonical、OG、Drupal ID／about、可見標題與原署名必須相符；抽取完整原生
+  正文及另列的註解，不抓摘要、側欄募款名單、外部圖片或影片。不是複製一套 HTTP／排程。
+- 實際保留原件在兩種 HTML 引擎下都得到相同的 **1,038 字元、2,940 UTF-8 bytes**
+  本文與註解；署名保留為王子豪。`2020-10-07` 保留為可見日期，來源機器時間
+  `2020-10-07T12:00:00Z` 另外保存，沒有把它冒稱為當年確實觀測到的精確發布秒數。
+  私人閱讀捕獲範圍不等於 CC、全站批次、再散布或訓練匯出授權。
+- **192 個新聞測試檔、10,483 passed，342.48 秒**；原 10,436 個 case ID 與既有
+  斷言均保留，新增 44 個原生版型與 3 個審查案例。安裝實際設定後另跑 **204 passed**。
+  這些是新聞範圍測試，不是整個專案的測試總數。
+- 設定由原程序正常 drain／exit75；新程序於 **05:10:03** 自動接手，沒有手動
+  restart 或第二個 HTTP owner。05:13:09 的獨立驗收核對新 owner、程序時鐘、
+  新鮮 heartbeat、SQLite、Parquet、原件重播及收據；原有 **67 個來源身分、20 份
+  固定批次收據與 8 份健康正文 head／原件／署名／時鐘**均保留。
+- 正式新來源只有 **1 次文章請求＋1 次 robots 請求**，均回 200，共 66,717 decoded
+  bytes；先前另有一次有留證據的相同規模診斷，不把診斷算成正式完成或隱藏其請求。
+  正式最小起始間隔 10.00045 秒、文章 transport 約 0.108 秒、解析約 0.149 秒。
+  10 秒是本次設定，不是已證明的官方上限或吞吐極限；沒有為單篇原文做頻率壓測。
+- **05:13:15 本機與公網唯讀 API 均 200、no-store，2,517,657 bytes 回應 SHA 相同**；
+  新來源的 1／1 與三個新增限制審查都正確顯示。瀏覽網頁不呼叫 publisher，也不傳正文／
+  金鑰到瀏覽器。本輪為資料與 API 驗收，未額外重跑瀏覽器視覺驗收。
+
+### 不同問題不共用「失敗重試」或「完成」
+
+| 問題 | 本輪處理與實際邊界 |
+| --- | --- |
+| 原生版型缺解析 | 接入共用下載器，抓取後比對原件、本文、註解、署名、日期與收據；焦點事件 1 篇已完成。 |
+| 鉅亨可驗證的空白模板 | 沿用前節的逐字空標記修正；新回應才更新當前 head，不用舊原件製造正文或重設期限。 |
+| AMP origin 暫時錯誤 | 保留實際 robots 讀取的 `http_502` 與 300 秒 origin 冷卻；健康來源繼續，不跨 host 繞過。 |
+| 來源限制尚未滿足 | 保留網址與原因，標為 `permission_required`，不冒稱文章不存在、已完成或永遠不可恢復。 |
+
+05:13 的鉅亨仍有 **197 個活躍缺文 URL head**：186 個只有已存主站候選提示、
+11 個沒有已知主站正文。提示不代表逐篇同文證明，也不是 197 篇獨立新聞。
+05:05 的索引核對顯示 151 個 pending 全屬 AMP，due 已到但受該 origin 的 robots
+失敗冷卻影響；主站的 11 個當時都還沒到重試時間。14 次是 owner 的**派工**，
+不是 14 次成功的文章 HTTP。來源空白計數後來增加至 4,619，不能算新增正文。
+
+新增三個審查記錄：`hd.stheadline.com` 的 444 個、`sunmedia.tw` 的 236 個及
+`www.peoplenews.tw` 的 191 個原清冊 URL，均保留並列為權限工作，沒有請求其文章、
+猜測 API 或啟用抓取；詳見[審查清冊](../configs/news/source_reviews_20261009.json)及
+[星島條款](https://www.stheadline.com/terms/)、[太陽網著作權宣告](https://sunmedia.tw/copyright)、
+[民報著作權宣告](https://www.peoplenews.tw/%E7%89%88%E6%AC%8A%E8%81%B2%E6%98%8E)。
+
+同一份 **03:40:48 的 936 列來源鍵清冊**已依新審查重產工作表，沒有重掃 630 萬筆
+frontier；那些數量仍是原快照，不是本輪即時全庫統計，也不是 936 家獨立新聞媒體。
+其中 **872 個鍵尚未完成來源審查**，因此不能宣稱「全部網站都已做好／可抓」。
+另列出目前註冊的 **112 個端點／namespace 能力**，這只是能力清單，不是全部可訪問
+或全歷史完成證明。Global Voices 的正常下載亦持續，05:13:09 的驗收有 59,136 個已存正文 URL head。
+
+系統交接時另出現 cgroup inotify watch 的 ENOSPC 警告；磁碟仍約有 51 GB，未調整
+其他工作使用的監看配額。新程序初始化實測 wall **93.69 秒／CPU 34.11 秒**；其中
+`acceptance_recovery` 為 **91.06 秒／CPU 33.32 秒**，約占初始化 wall 97%，目前仍按
+原契約讀取全部 commit JSON 收據。這個啟動成本已定位，尚未修改；不能靠跳過收據
+檢查製造加速。監看配額警告的主機根因則尚未確定。後續 heartbeat、正式捕獲與
+面板驗收正常，但不能宣稱上述兩項已根治，或把它們混成 publisher 502／抓文 CPU。
+
+證據：[實際原件／完整註解／67 來源身分不變](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/offline_production_candidate.json)、
+[10,483 案例與原案例保護](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/regression_after.json)、
+[正式原件／收據與 9 份正文回讀](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/deployment_acceptance.json)、
+[本機與公網面板驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/dashboard_acceptance.json)、
+[鉅亨派工及計數一致性](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/cnyes_dispatch.json)、
+[缺文原始到期時間](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/cnyes_deadlines.json)、
+[936 列工作表](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/plan.csv)、
+[112 個註冊端點能力](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_followup_20261015/registered_endpoints.endpoints.csv)。
+
+## 鉅亨空回應根因與新增來源查核：2026-10-15 04:43，Asia/Taipei
+
+**空回應根因修正已通過新聞回歸並載入正式服務；本機與公網面板 API 驗收通過，並非所有網站完成。**
+本輪依工作偏好技能採共用下載器、保留原件／失敗收據及版本邊界，不另開平行 writer。
+鉅亨仍優先，既有八家背景順序不變，CNA 依原指示暫緩。
+
+### 問題不是「再重試一次」
+
+13 個沒有已知主站正文的活躍鉅亨 URL 中，找回 6 份可保留的私人失敗原件。
+兩種 HTML 引擎都確認其 current 與可見正文長度為 0：
+
+| 原件 ID | 來源實際內容 | 修正後的分類 |
+| --- | --- | --- |
+| `1214456`、`1214458`、`1217561`、`1217577`、`1310371` | 只有空的 Office `StartFragment` 註解；原生正文節點沒有 children | `source_article_empty_template`，來源目前空白 |
+| `635635` | 只有沒有內容的 Office 條件註解；原生正文節點沒有 children | 同上，不是已下載全文 |
+
+舊分類為 `body_not_found`，會進入無限可恢復的缺文重試。現在只辨認兩個**逐字相同**
+的已觀察空標記，並仍要求完整原生空容器可見、同篇 canonical／URL／標題、免費旗標、
+來源發布時鐘及無影片。任意註解、隱藏文字、圖片、iframe、未知條件內容及非空節點
+都不能套用這個例外。沒有移除字元、拼出文章或把空回應列為正文完成。
+
+新增獨立的 Office-comment outcome v1；原 empty outcome v8 不改寫。
+只變更鉅亨 HTML／parser-repair 身分，其他 66 個來源、授權、批次 API、metadata index
+及 HTTP 限速／拒絕身分完全不變。6 份失敗原件重播和另 8 份健康正文的完整原件、
+SHA、署名及時鐘回讀均通過。保存原件不是當下來源狀態：正式服務仍須在原期限
+收到新回應才變更當前 head，不直接用舊診斷原件回填，也不重設 retry／AMP 冷卻。
+
+第一次完整回歸為 10,435 passed／1 failed；唯一失敗是歷史 HTTP 指紋測試重建舊契約時
+未移除新加入的 outcome 欄位。已補正重播舊版本的測試，仍保留原指紋相等斷言、
+全部原 10,381 個 case ID 及原失敗 log；新增 55 個案例後，**191 個新聞測試檔、
+10,436 passed，318.81 秒**。這是新聞相關回歸，不是整個專案的測試總數。
+
+### 正式載入與獨立驗收
+
+- 04:35:30 僅通知原設定 revision，設定內容 SHA 不變；舊服務正常 drain／exit75，
+  新 owner 於 04:38:32 自動接手。未另啟 writer，未手動重啟其他來源或健康服務。
+- 04:42:46 核對新 owner、程序啟動時鐘、新鮮 heartbeat、SQLite owner 與全部
+  67 個來源 capture 身分；另驗 8 份舊正文的 raw／Parquet／SHA／署名／來源時鐘，
+  原正文 head、路徑及捕獲時間不變。8 份是保護樣本，不是全庫完整性或新下載量。
+- 6 個離線空白樣本中，`1214458` 已在正常來源排程的新回應下成為
+  `source_article_empty_template`；其餘 5 筆仍保留原 retry／冷卻時間，沒有用舊原件
+  直接改當前 head。AMP 的 502 與其獨立 origin 冷卻也維持。
+- 驗收快照仍有 **198 個活躍缺文 URL head**：186 個只具有已存主站候選提示、
+  12 個無已知主站正文。提示不等於逐篇同文驗證，不能扣掉當作 12 篇全部剩餘量。
+- 首次 urllib 公網驗證回 403，保留原失敗 log，原因尚未確定。後續沿用既有
+  固定身分的 owned-dashboard curl 驗證，不重試、不輪換身分，分別讀回本機與
+  公網 API，兩者均 200、`no-store`，且 2,516,633 bytes 回應 SHA 相同。
+  正文不匯出、page view 不呼叫 publisher、936 個來源分類與新增審查狀態均通過。
+  這是 API／資料驗收，本輪未額外重跑瀏覽器視覺驗收。
+
+### 全來源工作表與實測邊界
+
+- 依同一份 03:40:48 清冊重產全部 **936 列**工作表，不再重掃 630 萬筆 frontier。
+  表內數量仍明示原快照時間，不冒稱本輪即時全庫統計或全來源均已審查。
+- **Global Voices**：RSS 已留下英文 1,128／中文 624 頁的身分證據；下一頁分別為
+  無效 XML／404，原到期時間保留。已知 HTML 正文仍正常抓取；WordPress 的
+  `rest_cannot_access` 作者嵌入拒絕不能用改 selector 或再加 `_embed` 假裝修好。
+  主要等待是來源要求的 10 秒節流，不是解析 CPU；本輪未提高這個下限。
+- **BigGo**：一個本機已知 UUID 原件經 canonical REP／HTTP 回 200。
+  摘要 225 字元、正文區 647 字元，兩者不能互代；保留精確的 UTC 發布／修改宣告。
+  可見作者欄空白，schema 只宣告組織作者，不是已核實的記者。814 個已知 URL 也包含
+  報價及法說路徑，不能當成 814 篇已驗全文。本次只留 metadata／結構及 SHA，未留正文
+  或 raw，未啟用正式來源；原文來源與捕獲範圍仍待核對，不宣稱網站無法取得。
+- **YesMedia**：[官方宣告](https://www.yesmedia.com.tw/copyright/)要求作者事先書面授權，
+  並區分投稿、合作媒體與自動匯入內容。給站方／合作平台的授權不能推論為本站下載器
+  的授權；586 個既有網址保留，清冊改為 `permission_required`。研究工具讀聲明頁的
+  403 不是 canonical 文章 HTTP 證據。本次沒有請求文章或保存正文。
+
+證據：[6 份原件與兩引擎失敗重播](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/cnyes_focus_replay.json)、
+[逐字空標記與原生空樹](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/cnyes_empty_forests_v2.json)、
+[候選修正／8 份健康正文／66 個其他來源不變](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/offline_candidate.json)、
+[10,436 案例與原案例身分驗證](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/regression_after.json)、
+[正常 revision 載入收據](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/reload_trigger.json)、
+[正式 owner／正文／面板驗收](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/deployment_acceptance.json)、
+[本機與公網獨立傳輸驗證](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/dashboard_transport_v2.json)、
+[BigGo metadata-only 原件診斷](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/biggo_metadata.json)、
+[全 936 列工作表](../artifacts/data_quality/news_goal_stage01_20261009/source_scope_batch_20261015/plan.csv)。
+
+## 已知網址增量、全來源清冊與正式驗收：2026-10-15 04:01，Asia/Taipei
+
+**已修正苦勞網新網址永遠停在舊固定批次外的問題；不是全部新聞網站已完成。**
+04:01:39 的獨立原件／SQLite／Parquet／收據／正文 SHA 與
+[正式唯讀新聞面板](https://penguin72487.dpdns.org/news/)回讀均通過。
+苦勞目前 **11 個已知 URL head、1 份正文、9 個目前原作範圍排除、1 個身分未核對**；
+原來待查的 3 個網址均已依正常來源排程處理。本次沒有新增合格正文，不能把
+範圍排除或身分失敗灌進正文進度，也不能宣稱全站歷史完成。
+
+### 最少變動的根因修正
+
+- 擴充既有 `PolicyRegistry`，新增版本化 `publisher_original_open_license_v1` 已知網址範圍。
+  它只適用已驗證的苦勞原作／站方記者／原生版型／既有授權宣告組合，不是任意
+  網站的自動授權，也不是第三方文章逐篇 CC 授權。
+- `finite → continuous` 只讓後續本機實際觀察到的字面網址進入同一下載器。
+  原始 8 筆 cohort 仍是不可變的歷史證據，不再當作永久擋住新網址的篩選器。
+  沒有 ID 猜測、全站 discovery、重複服務、第二個 writer 或已完成正文重掃。
+- 正文解析／原署名／原始來源時鐘完全不變。既存原件在兩個 HTML 引擎下逐欄相同；
+  其餘 66 個來源身分、20 份舊 cohort 的 header／membership／receipt SHA，
+  以及 285 份舊正文均保留。舊捕獲契約不被回寫成新契約。
+- 來源 Crawl-delay 10 秒、單來源 slot、已耗診斷預算與尚未到期的拒絕截止時間
+  仍有效。鉅亨優先與其餘來源獨立平行排程不變，沒有以提高頻率掩蓋來源拒絕。
+- 設定於原程序 03:57:30 正常 drain 後 exit75，新程序 03:57:41 自動接手，
+  03:59:17 已回報新 `continuous` 範圍並實際處理新網址；沒有手動重啟健康 owner。
+
+| 本次新增待查網址 | 實際結果 | 不可混淆的邊界 |
+| --- | --- | --- |
+| `https://www.coolloud.org.tw/node/61644` | 1 次處理，原作範圍排除 | 不是已取得正文，也不是已證明文章消失 |
+| `https://www.coolloud.org.tw/node/97779` | 1 次處理，原作範圍排除 | 原先就有的獨立本機網址；不是從 HTTP 猜寫而來 |
+| `http://www.coolloud.org.tw/node/97779` | 200，文章身分尚未核對 | 回應仍是 HTTP，canonical／OG 宣告 HTTPS；沒有觀察到重新導向 |
+
+最後一筆的 metadata-only 收據已保存：目前原作 adapter 要求 HTTPS 回應，
+所以在原生正文判讀前拒絕此 HTTP 身分。保留傳輸網址、宣告身分及兩筆獨立 URL
+的實際狀態；沒有借用 HTTPS 結果當成 HTTP 的正文等價證明，沒有重設重試預算。
+診斷的空 h1／全頁 selector 數量也不當成「來源沒有正文」的證據。
+
+### 全來源清點與後續實作順序
+
+03:40:48 的單一唯讀快照完整列出 **936 個來源鍵、67 個已註冊 recipe、26 個啟用、
+869 個未註冊鍵**；6,305,128 個已知 URL head、3,828,671 個正文 URL head。
+04:01 的正式面板回讀則為 6,305,131／3,828,784；兩者時間不同，不混用分母。
+來源鍵不是出版社數，URL head 也不是去重故事數；190 個鍵目前只有 metadata。
+資料日期清楚保留為 metadata 日期，不拿來冒充原始發布時鐘。
+
+全域 inventory 這次僅跑一次：wall 56.196 秒／CPU 34.038 秒，沒有 publisher HTTP。
+後續頁面用唯讀快照投影，不在每次刷新重新掃整個 630 萬筆 frontier。
+全 936 列的清冊、端點、錯誤與分階段方案均已輸出；CNA 仍依指示暫不處理，
+既有背景來源順序不被新候選取代。以下只列**尚未註冊的單站原文候選**，按已知網址數
+排序，並不是來源授權或預測價值的保證：
+
+| 來源鍵 | 已知網址 | 先做的工作 |
+| --- | ---: | --- |
+| `turnnewsapp.com` | 2,528 | 官方自動存取／原文範圍審查，才接同一 collector |
+| `finance.biggo.com.tw` | 814 | 核對真正原始媒體，避免把聚合摘要當全文 |
+| `news.wearn.com` | 694 | 既有 review 要求來源許可，不能改成一般開放正文 |
+| `www.yesmedia.com.tw` | 586 | 原件版型、署名、發布時鐘與存取規則審查 |
+| `www.investor.com.tw` | 551 | 補齊尚未完成的原文／存取範圍審查 |
+| `www.wantgoo.com` | 455 | 既有 review 要求來源許可，不能繼承其他站的許可 |
+| `hd.stheadline.com` | 444 | 原文／時鐘／來源規則審查，再共用接線 |
+
+翻爆的初始 metadata 診斷缺少自動存取審查，**在本機守門就停止，Publisher HTTP 為 0**。
+已獨立核對並保留失敗 log；這不是網站 403／404、來源永久不可得或可以直接放棄的證據。
+不強行打開 `allowed`；所有已知網址與待辦仍保留。
+
+### 驗證、鉅亨剩餘邊界與 ETA
+
+新聞完整回歸 **10,381 passed／190 files，325.57 秒**，保留原 10,339 個案例；
+新增 42 案例包含範圍不變、來源拒絕、實際增量、已存正文不重抓及重啟恢復。
+正式設定另有 **296 passed，12.84 秒**；正式設定逐欄等於已測試候選。
+驗收時正常 metadata 又多一個網址，已將驗收改為核對實際 guard 的全部待查集合，
+而非把舊數量 2 寫死；沒有少驗任何新增網址。原失敗收據與修正關係全部保留。
+
+鉅亨另用既有私人失敗原件做零 HTTP 離線重播：`165936` 的 13,997 字元 HTML
+仍沒有可用純文字正文；`4999053` 的原生可見／current／schema 文字均只有 1 字元。
+兩種解析器都維持 `body_not_found`，原始 SHA／原生身分／來源時間保留；
+這是本次保存回應沒有可用文字，不代表所有歷史／媒體或未來來源都永久不可得。
+AMP origin 的暫時錯誤仍由原共享冷卻處理，沒有走替代身分／路線或 reset。
+
+本次另觀察到 systemd 新增 cgroup inotify watch 的主機資源警告；磁碟尚有約 74G，
+不能把該警告直接當成硬碟已滿或來源存取拒絕。本次未調高核心上限、清理資料或
+重啟其他服務；新程序後續實際排程、耐久原件與獨立面板驗收已通過，主機監看
+資源歸因仍待另行核對，不宣稱警告已根治。
+
+目前仍有未接線、原文範圍、來源拒絕與內容缺失等不同邊界，**不提供虛構的全域
+抓完日期，不用測試數、已分類數或服務 active 取代正文完成率**。
+目標維持 `active / progress / all_history_complete=false`；不是縮小到本批就結案。
+
+本批證據：
+
+- [全來源清冊](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/inventory.csv)／[端點](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/inventory.endpoints.csv)／[全 936 列分階段方案](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/plan.csv)
+- [原件兩解析器完全一致與 66 個來源身分不變](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/offline.json)
+- [10,381 項完整回歸與 code／test SHA](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/regression_after.json)／[正式設定 296 項回歸](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/deployed_focused.json)
+- [正式下載／原件／收據／新增網址／公開面板回讀](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/after.json)
+- [HTTP／HTTPS 身分邊界與原始 metadata 證據](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/identity_followup.json)／[鉅亨既有失敗原件 v3 重播](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/saved_failed_replay_v3.json)
+- [翻爆本機審查守門，未送出來源 HTTP](../artifacts/data_quality/news_goal_stage01_20261009/licensed_known_growth_20261015/next_source_admission_review.json)
+
+## 苦勞網原生下載器與正式進度：2026-10-15 03:34，Asia/Taipei
+
+**已新增正式下載器並取得 1 篇完整正文；原來 8 個已知網址完成分類，並非全站完成。**
+03:12:44 的原件／SQLite／Parquet／正文 SHA／署名／來源時鐘驗證及
+[正式唯讀新聞面板](https://penguin72487.dpdns.org/news/)獨立回讀均通過。
+該次本機增量匯入另發現 1 個網址；**03:34:57 再次獨立回讀時，已增為
+10 個已知網址、1 份正文、7 個範圍排除、2 個新增待查**。
+新網址保留在佇列，不刪除、不冒充完成，也不無證據加入舊固定範圍。
+
+| 本批來源類型 | 原有網址 | 正文入庫 | 處理結果 |
+| --- | ---: | ---: | --- |
+| 自製 `node-post`／苦勞報導 | 1 | 1 | 本篇身分、記者、完整來源時間與正文均通過 |
+| 外部來源 `node-news` | 6 | 0 | 3 篇工商時報、1 篇鉅亨、1 篇證交所、1 篇蘋果日報；不繼承網站授權 |
+| 外部投稿 `node-outer` | 1 | 0 | 台灣電信工會投稿；不是站方記者作品 |
+| 後來本機觀察到的新網址（包含 `node/61644`） | 2 | 0 | `waiting_cohort`；0 次抓取，來源／可用範圍待查 |
+
+### 根因與集中修正
+
+- 舊候選 CSS 指向實際不存在的 `#content`，不是文章消失或 HTTP 拒絕。
+  新 `coolloud_visible_original_v1` 擴充既有 pure native adapter，沿用唯一正式
+  HTTP owner、queue、限流、退避與耐久寫入；沒有另建下載器或 SQLite writer。
+- 實際原文的 `<h1><p>` 是不合法 HTML，lxml 會把段落放到空的 h1 後面。
+  僅接收兩種已觀測、同一 native region 內的形狀，並核對 canonical、shortlink、
+  og URL／title、文件標題與 node ID；不把側欄、摘要或全頁文字當正文。
+- 只接受原生 `node-post`、`苦勞報導` 與站方記者 credit 的本篇正文。
+  張智琦是記者，王顥中是責任主編；網站 Facebook 帳號不改成作者。
+  tag、calendar、編輯／作者介紹及影像不混入正文；沒有要求媒體網址。
+- 本篇確有 `article:published_time=2019-09-16T16:30:42+08:00` 和
+  `modified_time=2019-09-16T16:51:05+08:00`，均原樣保留。
+  `field-actdate=2019/09/16` 僅作獨立來源欄位，沒有推估午夜、時區或發布秒數。
+  當前取得的文章不是經驗證的 2019 年原始 vintage，`historical_point_in_time=false`。
+- [站方實際版權宣告](https://www.coolloud.org.tw/node/4524)連到
+  [CC BY-NC-SA 2.0 Taiwan](http://creativecommons.org/licenses/by-nc-sa/2.0/tw/deed.zh_TW)。
+  本篇保留署名、非商業／相同方式分享限制及宣告來源；標示為已驗證站方原作，
+  不是第三方文章逐篇授權。宣告的實際主站讀取為 200；web reader 的 502 不等於來源失效。
+  原始 HTML 私人保留，不開啟 public body、媒體下載或自動訓練匯出。
+
+### 實際請求、恢復與驗收
+
+正式 owner 完成本批 **8 次文章請求＋1 次 robots，9 次均為 200**；
+只有 1 篇合乎原作範圍而入庫，正文 **1,194 字元**，捕獲於 03:09:36.336883。
+原有 284 份 ABMedia／KMDN 正文以及 19 份舊 cohort header、membership、receipt SHA
+維持不變；新增苦勞固定範圍仍只有原 8 個網址。所有舊來源身分、退避截止時間和
+已耗診斷預算保留，鉅亨的優先排程不變。
+
+來源 robots 的 **Crawl-delay 10 秒** 維持有效；1 個 source slot，沒有升速。
+本批 pacing 累積等待 76.010 秒、傳輸 2.548 秒；8 次解析 CPU 合計 0.125 秒，
+不是 CPU 解析瓶頸。這些是本批分段實測，不是全流程總時間或來源數字最高速。
+新的正式程序於 03:07:46 自動接手；舊程序完成設定 drain 後 exit75，沒有手動重啟。
+
+70 個新案例涵蓋兩種 HTML 引擎、原作／外部來源、標題／署名／時鐘／存取拒絕，
+以及完整請求→寫入→收據→重啟不重抓。原有案例全保留；部署前回歸 10,339 項通過。
+部署後另發現舊測試固定綁「66 個來源」及允許名單；已改為核對來源 ID 集合及
+每個未修改來源的完整政策，並同步新來源的明確授權斷言，沒有放寬採集驗證。
+正式設定的完整回歸也於 **03:29:41** 通過：**10,339 passed／189 files，295.81 秒**；
+原 10,339 個測試 node ID、其餘測試 AST 及 43 份新聞程式碼 SHA 均通過保留核對。
+測試／審查別名方向的原失敗與 log 均保留；審查別名正確連回原始 review entry，
+測試 node ID 的身分雜湊排除每次不同的 pytest collection duration。
+
+截至本批回讀仍是 **936 個來源鍵、67 個已註冊 recipe、869 個未註冊鍵**，
+6,305,044 個已知 URL head／3,828,506 個已存正文 URL head；不是去重新聞篇數。
+鉅亨仍有 AMP 網域暫時來源錯誤等未解項目；CNA 仍依要求暫不處理。
+全目標保持 `active / progress / all_history_complete=false`，不拿這批成功縮小目標。
+
+本批證據：
+
+- [原生頁面、時鐘與私人 raw SHA](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/native.json)
+- [兩解析器一致與 284 舊正文回讀](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/offline.json)
+- [部署前 10,339 項測試](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/regression_after.json)
+- [正式設定 10,339 項完整回歸與保留契約](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/deployed_regression_after.json)
+- [正式正文／cohort／新增網址／公開面板回讀](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/after.json)
+- [審查別名驗證與原錯誤說明](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/review_alias.json)
+- [03:34 最新程序／正文／公開面板獨立回讀](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_original_native_20261015/document_acceptance.json)
+
+## 鏈新聞／金門日報缺口與苦勞網來源查核：2026-10-15 02:30，Asia/Taipei
+
+**本批 18 個卡在舊固定範圍的 URL 已全部取得正文；原有 266 份正文保留。**
+02:30:33 的原件／SQLite／Parquet／正文 SHA／署名／來源時鐘重驗，以及
+[正式唯讀新聞面板](https://penguin72487.dpdns.org/news/)獨立讀回均通過。
+這是既知 URL 的覆蓋，不是兩個網站所有歷史、去重故事數或全部新聞來源完成。
+
+| 來源 | 原有正文 | 本批新增正文 | 已知 URL／已存正文 | 本批待抓 |
+| --- | ---: | ---: | ---: | ---: |
+| 鏈新聞 ABMedia | 262 | 15 | 277／277 | 0 |
+| 金門日報 KMDN | 4 | 3 | 7／7 | 0 |
+
+### 根因與集中修正
+
+當次正式佇列只有這兩家仍有 `waiting_cohort`，合計 18 個。它們是後來正常匯入的
+本機網址，被舊不可變 cohort 排除，不是網站缺正文。兩家沿用共用
+`known_url_only`、queue、獨占 HTTP owner、來源限流、退避與耐久寫入，沒有新增
+第二下載器或 SQLite writer；原 19 份 cohort header、membership 與 receipt SHA
+保持不變，後續本機正常觀察到的 URL 可以增量取得。
+
+- ABMedia 只改本機已知 URL 排程與審查文字；原 parser-repair 與 HTTP capacity
+  身分不變，不重抓舊正文、重排舊拒絕或補回已花掉的診斷配額。
+- KMDN 另有一個實際可讀的 `1277` 學生投稿 URL。新增 **native v2** 僅接收
+  `1272／1277／287081`，仍核對當篇可見標題與兩個 function-panel 分享 URL；
+  不要求社群網站，也不採用站方陳舊 `og:url`。v1 保留原範圍／相容性。
+  原作者與日期保留；僅有日期的來源不製造開盤前時間或聲稱歷史發布時刻已證明。
+- [金門日報官方著作權宣告](https://www.kmdn.gov.tw/1119/1121/1367/)第 4(2) 項
+  明列個人／家庭非營利用途重製；第 5 項的權利資訊仍保留。這不是 RSS 閱讀條款、
+  公有領域、整站再發布或自動訓練授權。鏈新聞亦保留原著作權與個別署名。
+- 所有 feed／sitemap／index／API discovery 均不開啟，不猜 ID；KMDN 原 homepage
+  discovery job 保留為證據但不排程，也不把已完成正文加入定期全量重掃。
+  同 parser 的排程遷移／重啟，以及明確的 v1→v2 parser 遷移分別驗證，不混為一談。
+
+### 真實部署與效能邊界
+
+完整新聞回歸 **10,269 passed／188 files，303.21 秒**，保留原 10,191 個 nodeid；
+新增 78 個自包含範圍／拒絕／恢復／原生身分／逐篇完整鏈路案例。原有測試僅有
+兩個 production admission 斷言調整，其他原測試檔 SHA 不變。部署後直接載入
+正式設定的 **361 項集中測試，14.30 秒**也通過，不額外重跑整湖下載。
+首輪新 fixture 把 parser 升版誤當成「同 parser 排程修改」的失敗留在私人證據；
+分開兩個契約後通過，未放寬 attribution、拒絕或 production parser-repair 機制。
+
+只切換一次已測 catalog。原 owner 在 **02:26:45** 正常排空並以 exit 75 交接，
+新程序 **PID 241150、02:26:56 起、owner `cc120ae78539419493b48368a4685b79`**
+已核對 loaded policy、SQLite owner、實際 process clock 與新 heartbeat。
+不把 systemd 把 exit 75 標為 `TEMPFAIL` 誤當抓取失敗或再人工重啟。
+
+新 owner 的兩家 HTTP 合計 **20 次**：18 次 article 200，2 次 robots 304；
+18 個 durable new URL heads，沒有重抓原 266 個正文。18 份的新捕獲時計落在
+**02:28:20.909943–02:28:49.144140**。28.23 秒只是第一至最後捕獲的跨度，
+不是準備／測試／排空／初始化／耐久／面板讀回的全鏈耗時，也不是官方速度上限。
+兩家的來源流量與平行設定沒有改動；正式面板唯讀、no-store，不呼叫出版商或輸出正文。
+
+本輪全域 `stockagent-agent status/run` 因另一 ledger 任務的非 canonical schema
+receipt 無法讀取；未修改或隱藏那份無關收據。沿用原新聞 task、canonical runtime
+與直接前景驗證的完整 log／exit code／SHA 留證，沒有另起任務或冒稱 launcher 已成功。
+
+### 苦勞網：可訪問、原創、轉載與時鐘分開查核
+
+在主服務持續運行時，針對尚未啟用的 disjoint host 使用原私人診斷 root／鎖／REP：
+8 個 literal URL 全部 HTTP 200，耗時 **70.827 秒**、228,977 response bytes。
+遵守實際 `Crawl-delay: 10`，沒有升速、猜 ID、跟隨來源連結、保存新聞正文／raw、
+建立新聞 head 或更動原佇列。六個 `node-news`、一個 `node-post` 與一個 `node-outer`
+不是同一種來源授權／署名模型：
+
+| 分類 | URL node ID | 原生來源證據／後續動作 |
+| --- | --- | --- |
+| 苦勞自製報導 | 93414 | `苦勞報導`、原作者張智琦、獨立責任主編王顥中；優先實作當篇 body／identity／作者／時計驗證。`field-actdate=2019/09/16` 暫只記為原日期欄，未升格為已證明發布時間。 |
+| 媒體轉載 | 36836、42220、43247、40528、64178 | 原生來源分別為工商時報三篇、鉅亨一篇、蘋果日報一篇；先對照既有原來源資料／可核對的來源鏈，不繼承苦勞授權或猜原文 URL。 |
+| 官方來源轉載 | 54683 | 原生來源證券交易所；另核對官方原件與已取得資料，不直接當成苦勞自製。 |
+| 外部工會投稿 | 95945 | `node-outer`／台灣電信工會，保留來源與投稿性質；不是苦勞記者署名或已取得投稿者授權。 |
+
+八頁皆指出真正的[版權宣告 `/node/4524`](https://www.coolloud.org.tw/node/4524)。
+該原域 notice 經 canonical HTTP 獨立讀取得到 200，明列
+**CC-BY-NC-SA 2.0 Taiwan** 與實際 license URL，解決先前未找到授權聲明的問題。
+web reader timeout 不代表原域不可讀，文章沒有 CC hyperlink 也不證明全站無授權；
+但站方聲明不能自行轉移外媒或外部投稿的權利。這次只是版權／分類／日期欄位證據，
+不是已接受苦勞新聞正文或可直接遠端訓練；正式 recipe 尚未啟用。
+
+### 剩餘工作與證據
+
+鉅亨主站持續運行。151 個 `pending` URL 全在 AMP origin，當次該 origin 的 robots
+重試仍 502；隔離其政策查詢失敗，不停掉主站或其他 provider，也不清掉原 due／refusal。
+已知 primary body candidate 不是 AMP 內容等價證明，不複製既存正文來冒充那 151 個 head。
+本批單次公網讀回仍是 **936 來源鍵、66 recipes、870 未登錄、6,305,027 已知 URL
+heads、3,828,257 已存正文 URL heads**；不是去重文章或「所有網站完成」。
+`all_history_complete=false`，原 unlimited goal/task 保持 active，CNA 依要求暫緩。
+
+完整私人證據：
+
+- [修改前範圍與原有測試基線](../artifacts/data_quality/news_goal_stage01_20261009/abmedia_kmdn_known_scope_20261015/before.json)
+- [266 份原件離線重驗、兩 parser／版本相容](../artifacts/data_quality/news_goal_stage01_20261009/abmedia_kmdn_known_scope_20261015/offline.json)
+- [10,269 項完整回歸、code／test／log SHA](../artifacts/data_quality/news_goal_stage01_20261009/abmedia_kmdn_known_scope_20261015/regression_after.json)
+- [新 owner／284 份 current heads／19 cohort／公網讀回](../artifacts/data_quality/news_goal_stage01_20261009/abmedia_kmdn_known_scope_20261015/after.json)
+- [部署後 361 項集中測試](../artifacts/data_quality/news_goal_stage01_20261009/abmedia_kmdn_known_scope_20261015/live_focused.json)
+- [苦勞 8 URL 原生 metadata，不含正文](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_native_attribution_20261015/metadata.json)
+- [真實版權宣告的原域讀取證據](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_native_attribution_20261015/copyright.json)
+
+## 匯流既知網址增量接線與逐篇驗證：2026-10-15 01:53，Asia/Taipei
+
+**已補回 73 份匯流正文，原有 65 份保留；目前為 138／145 個已知 URL，約 95.17%。**
+這批原先卡住的 75 個 URL 已全數處理：73 個取得正文、2 個未通過既有原創／權利
+範圍檢查。01:53:05 的[正式唯讀新聞面板](https://penguin72487.dpdns.org/news/)
+已核對 `continuous`、138／145、`attention`，不把待抓佇列清空當成全部全文完成。
+工程收據另保留 queue 01:52:43、SQLite 01:52:51 的各自觀測時鐘。
+
+### 共用責任與最小修正
+
+根因不是來源限速或正文 CSS 壞掉：CNEWS 的原生 layout admission 硬綁 `finite`，
+75 個後來正常匯入的本機 URL 因舊固定批次而永遠留在 `waiting_cohort`。
+只在既有 policy 加入已驗證的私人 `known_url_only` 分支，更新匯流單一 recipe 與
+審查紀錄；沿用原 queue、獨占 HTTP owner、限流、退避、耐久寫入、恢復及網頁投影。
+
+- 捕獲／排程指紋更新；正文 parser-repair 與 HTTP capacity 身分不變。
+  不以審核文字／排程修改重抓舊拒絕、改原 due／attempt／lease 或灌入新診斷配額。
+- 僅接收正常本機 metadata 的已知 URL。所有 feed、sitemap、index、API discovery
+  均拒絕，不猜新聞 ID，不重掃已完成正文，沒有新增平行寫入／來源身分。
+- 保留原 70-URL 固定批次及全部 19 個原 cohort header、membership SHA、receipt SHA；
+  原 65 個正文 heads、捕獲日期、作者、數值與原件均未改寫。
+- 舊署名 JSON 有不同欄位版本。驗證分開比較歷史已存欄位與 current old/new mode，
+  不把後來新增的署名依據寫回舊檔；普通 metadata 的最後看見時間／標題刷新也不冒充
+  正文、作者、發布時計或收據變動。
+- [官方版權聲明](https://cnews.com.tw/%E7%89%88%E6%AC%8A%E8%81%B2%E6%98%8E/)
+  的書面許可、轉載與單篇署名條款仍分開處理；私人用途不是整站再利用／訓練授權。
+  付費／登入、轉載與未知原創署名仍排除，沒有解除來源拒絕、robots 或 TLS 檢查。
+
+### 當前 URL 與處置清點
+
+| 互斥處置 | 全部已知 URL | 本次原等待 75 個 URL |
+| --- | ---: | ---: |
+| 真正已存正文 | 138 | 73 |
+| 未通過原創／權利範圍 | 3 | 2 |
+| 既有來源不存在觀測 | 1 | 0 |
+| 不在已核對文章命名空間 | 3 | 0 |
+| 合計 | 145 | 75 |
+
+剩餘 7 個不是正文，也不把它們視為永久無法取得的證明。當前合格待抓為 0，
+既有 ETA 的 0 秒僅指合格佇列，不是整個網站或這 145 個 URL 全文完工。
+將來正常本機 metadata 的新網址會自動入列；更大的站史 discovery、第三方許可或
+不在命名空間的網址，仍需要各自的來源證據。這些是 URL heads，不是去重故事篇數。
+
+### 正式鏈路與驗證證據
+
+01:43:23 更新 catalog；原 owner 按 180 秒 maintenance 正常排空，01:46:05
+留下 exit 75／`configuration_reload_requested`，01:46:16 由原 systemd 的 10 秒
+重啟政策接手。新 owner／PID、載入 policy、queue 設定、程序時計與新心跳均一致，
+沒有強制中斷鉅亨、清除退避或為了 warming 反覆重啟。
+
+- 完整新聞回歸 **10,191 passed／187 files／272.54 秒**，保留原 10,141 個 nodeids；
+  新增 47 個匯流 scope 案例與 3 個診斷 CLI 案例。部署後 **315** 項聚焦回歸也通過，
+  是完整回歸的子集，不重複加總。只更新兩處明確增量 admission 的既有預期。
+- 8 份舊實際原件通過兩種 HTML parser；**全部目前 138 個匯流正文 heads** 均經
+  canonical verifier 逐篇重播、作者／原始發布時間／正文 SHA／Parquet／耐久批次收據
+  核對。新 73 個符合新 capture contract，舊 65 個保留各自原 contract，不倒填歷史。
+  這是匯流目前全部已存 heads，不是整個新聞 lake integrity 驗收。
+- 本 owner 匯流 HTTP 計數 **78 次請求／78 回應／73 個耐久新增 URL heads**；
+  計數含原生傳輸／協商，不能把回應數當正文數。原 pacing 保留，沒有把 client floor
+  或這個有限批次說成官方／理論速度上限。
+- Owned 公網 API 200／no-store／snapshot consistent／read-only；1 次畫面資料讀回沒有
+  publisher call、正文、金鑰或訓練匯出，審查日期和 138／145 分母均已同步。
+- 原 verifier 的歷史 JSON schema、metadata 刷新與 tuple／JSON list 比較問題，以及
+  兩個新測試 fixture 預期錯誤，保留失敗 run／log；後續成功收據已明確 supersede。
+  沒有修改新聞原件、刪除既有案例或重設來源失敗來通過。
+
+同一 owner 的鉅亨仍有 **126 HTTP／42 個既有 URL 的耐久版本／0 個新 URL head**；
+優先權及來源指紋保留，不能把這 42 版本說成新增 42 篇。全部清冊仍為 **936 個來源鍵／
+66 個 recipe／870 個未登錄鍵**，公網觀測 **6,305,018 已知 URL／3,828,024 已存正文 URL**。
+全來源目標仍 active、`all_history_complete=false`；CNA 依要求暫緩。
+下一批依已知缺口先核對鏈新聞 15、金門日報 3 個舊批次之外的增量範圍，苦勞網仍需
+署名／時鐘／權利接線；未核對來源不假稱 downloader 已完成。
+
+證據：[修改前基準](../artifacts/data_quality/news_goal_stage01_20261009/cnews_known_scope_20261015/before.json)、
+[原件雙 parser 與候選](../artifacts/data_quality/news_goal_stage01_20261009/cnews_known_scope_20261015/offline.json)、
+[完整回歸](../artifacts/data_quality/news_goal_stage01_20261009/cnews_known_scope_20261015/regression_after.json)、
+[部署守護核對](../artifacts/data_quality/news_goal_stage01_20261009/cnews_known_scope_20261015/guard.json)、
+[正式產出](../artifacts/data_quality/news_goal_stage01_20261009/cnews_known_scope_20261015/after.json)、
+[全部 138 heads 與公網讀回](../artifacts/data_quality/news_goal_stage01_20261009/cnews_known_scope_20261015/handoff.json)。
+下方舊觀測維持各自日期，不與本次新增量混算。
+
+## 新來源原生存取與診斷入口恢復：2026-10-15 01:13，Asia/Taipei
+
+**苦勞網不是「網站無法訪問」：原生 robots、首頁與兩個已知文章均實際 HTTP 200。**
+這輪仍未接受或保存該站全文；8 個原 URL／佇列狀態完整保留，文章署名、時鐘、
+原創／轉載與可用範圍仍待核對。01:13:24 的[唯讀新聞面板](https://penguin72487.dpdns.org/news/)
+已讀到新的審查日期，維持 `review_incomplete`、未啟用／0 正文；沒有把存取成功
+誤顯示為資料完成，也沒有公開內文或私人診斷。
+
+- 沿用既有 `scripts.probe_news_sources.py`／NewsHTTP、REP、pacer、source circuit
+  和獨占診斷鎖；新域名經實際 guard 確認不與任何已啟用 provider overlap。
+  不停止鉅亨或另開同來源額度／writer，不改正式 catalog／capture／parser。
+- 只送 **4 個來源請求**：robots 2,259 bytes、首頁 47,982 bytes、既知原址
+  `95945` 32,826 bytes、`36836` 27,484 bytes；合計 110,551 bytes，全部 200。
+  真實 wildcard REP 宣告 **`Crawl-delay: 10`**，三頁實際使用 10 秒間隔；
+  不以 5 秒設定取代來源規則，不做壓力測試或宣稱官方最高吞吐量。
+- Native node 分別是 `node-95945`／`node-outer`、`node-36836`／`node-news`，
+  body-container text 計數為 2,265／763。暫定 `#content` CSS 匹配 0 是 candidate
+  版型未驗證，不是來源空正文。三頁未觀察到 CC hyperlink，也不能推出沒有
+  其他授權。未借用全站 CC 或原始財經媒體權利，沒有保留 raw／接受正文。
+- 首個直接 `.py` 啟動在 import `downloader` 時失敗，**來源 HTTP 為 0**，不是
+  來源拒絕。模組入口完成有界診斷後，只在原腳本加入當前 checkout 路徑 bootstrap；
+  一般直接啟動、移除 PYTHONPATH 與 repo 外 `-I` 啟動、原 `-m` 均有 CLI 驗證。
+  原 failed run／log 保留，另由後續驗收 supersede；不清錯誤、額度或拒絕期限。
+- **321 項相關測試／13.37 秒**通過，包括 3 個新 CLI 案例及既有獨占 owner、
+  到期失敗選取、取消／拒絕與原件診斷範圍。較早完整 **10,141 項**的 production
+  code／185 個測試檔 SHA 仍逐項吻合；本輪沒有重跑或宣稱新增完整 10,144 項回歸。
+- 正式 owner／DB／載入來源指紋／程序／心跳一致且沒有為本次重啟。當時鉅亨
+  本 owner 已實際落盤 185 個正文版本、9 個新 URL head；公網鉅亨累計正文 URL
+  為 **3,681,610**。版本、URL head 與獨立故事分開，不拿這些累積數宣稱速度。
+
+全來源公網快照仍是 **936 來源鍵／66 recipe、6,304,842 個已知 URL head、
+3,827,641 個已存正文 URL head**；不等於獨立網站／故事數或全歷史完成。
+另已核對 CNEWS 匯流的 **145 已知 URL／65 正文／75 waiting_cohort**：這 75
+是舊 finite scope 的等待，不是當次新 HTTP／來源限速；其餘 5 是 3 個路徑待查、
+1 個來源不存在與 1 個權利／範圍排除。下一步優先核對並延伸已知原創範圍，
+沿用已驗證 native parser 與精確 scope migration，保留原 frozen 收據；這段尚未
+實作／重抓，不把計畫算完成。CNA 照要求暫緩，全來源 goal 保持 active。
+
+證據：[8 個原 URL 與不重疊基準](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_native_scope_20261015/before.json)、
+[4 個真實 REP／原生頁觀察](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_native_scope_20261015/native_metadata_probe.json)、
+[唯讀原佇列／設定保留](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_native_scope_20261015/after.json)、
+[CLI／321 測試／正式 owner 與公網讀回](../artifacts/data_quality/news_goal_stage01_20261009/coolloud_native_scope_20261015/handoff.json)。
+
+## 原生短網址、失敗診斷與完整短文：2026-10-15 00:39，Asia/Taipei
+
+**原始五個工程案例已有兩個真正補入正文；另三個仍如實保留失敗，不算完成。**
+00:39:38 的公網獨立讀回為台灣好新聞 **3,007／3,023 個已知 URL 已存正文**，
+另有 13 個連線／重試及 3 個身分待查；三類合計等於分母。數字是 URL head，
+不是去重篇數、全站清冊或完整歷史完成率。[正式新聞進度](https://penguin72487.dpdns.org/news/)
+已連動，唯讀／no-store，頁面不呼叫出版商或輸出原文。
+
+最小整合修改集中在既有五個模組：原生網址／metadata adapter、policy、fetch、
+queue 與限量診斷；catalog 只更新 TaiwanHot 的版型、路徑與既有短文 opt-in。
+沒有新增 HTTP client、SQLite writer、下載管線、來源端點或改流量／平行參數。
+Anue 保持最高優先，其他可取得來源由同一正式服務繼續獨立排程。
+
+| 原始文章 ID／網址形態 | 真實根因或目前證據 | 當次結果 |
+| --- | --- | --- |
+| `1027295`，無 slug 的 `/news/ID` | 原 admission 錯排為不支援；原網址正常回應有可核對的 native OG、正文、署名及分鐘發布時間。 | 已正式存正文、獨立原件／收據讀回。 |
+| `1073952`，2024-07-10 營收短文 | 完整配置容器只有 **82 字**、三個 paragraph／兩張圖；兩 parser 得到相同原文 SHA。原 100 字 heuristic 不能證明正文缺失。 | 已由新 owner 真正重抓入庫；保留原數字、署名及 **2024-07-10 17:30**，實際擷取時間為 **2026-10-15 00:33:14**，不回填診斷擷取時間。 |
+| `1108345` | 來源普通跳轉至首頁；265,111 bytes 回應沒有當篇 OG、文章標題或正文容器。 | 不接受首頁文字；仍需查核可證實的既有同篇來源，不宣稱永久不存在。 |
+| `1129990` | 實際 HTTP 200 僅 40 bytes，沒有 canonical、OG、當篇標題或配置正文。 | HTTP 成功不等於文章；保留身分失敗與限量 metadata，不猜替代 URL。 |
+| `978889`，舊 `focus/category/article` 路徑 | 新路由能被排程，但正常回應仍未通過當篇身分。當天固定兩份身分診斷已被前兩個案例用完，未冒充第三份觀察。 | 保留失敗；尚未取得可判定源頭的原件，不能宣稱 CSS 已修好或文章永久不可取得。 |
+
+`taiwanhot_visible_article_v3` 支援原本本機已知的無 slug 原生 URI、舊 focus
+順序及普通來源跳轉。focus 兩個數字都是 **admission candidate，不是已證實
+文章 ID**；不按數字大小或位置猜。source OG／H2 作為當篇錨點，新接納的舊
+slot 還須匹配原網址的 literal title。query、主機與原始請求不改寫，付費、權利、
+隱藏欄位、錯誤 OG／canonical、真實署名與發布精度檢查保留。
+
+短文沿用既有 `allow_short_configured_body`、plaintext walker、hash 與入庫管線；
+只對已證明的 TaiwanHot 原生版型 opt-in。短文仍須有完整唯一容器、已驗證
+native metadata，以及貢獻於最終正文的實際葉 paragraph；只有小標、圖說、
+alt、空白或不足的 Latin 字串不會補成正文。葉段落 subtree 不重疊，避免對
+不合法巢狀 p 重複掃整棵樹；正常長文不增加這一段工作。沒有把原文改寫或
+把圖片轉成 OCR 文字，也不宣稱完成了整鏈路速度極限量測。
+
+身分失敗現在把 **原請求已收到的回應**交回唯一 owner；每 provider／UTC 日
+最多兩份 metadata-only JSON。先持久保留 attempt 再解析／寫入，失敗寫入仍
+計入；原文、title 文字、cookie／金鑰不存，query／fragment 遮蔽，只留受限的
+declaration、雜湊與容器數。當篇 native author／minute clock／公開 scope 可
+獨立證實時，既有私人 raw 診斷才可保留已收到的 HTML；每天兩份原預算耗盡
+後，TaiwanHot 可用既有固定每 UTC 小時一份的 supplemental raw 機制。
+這不是正文接受、額外 HTTP、權利豁免、瀏覽器全文或訓練／遠端匯出。
+午夜是本地日期更換，不會提早重設 UTC 診斷額度；改 parser／重啟亦不重設。
+
+兩次來源發布都使用 pinned capture／parser 遷移：第一批精確重排五個未存
+正文且無 lease 的舊失敗；第二批只重排已證實的缺短文。attempts、due、舊錯誤、
+觀察時間、lease、既存 head 和拒絕期限保留，正常 claim 才增加真實嘗試。
+額外排除會覆寫此 cohort 的通用 body／short-body reset；其他來源不被重排。
+第一批 **3,607 個**、第二批 **3,617 個**既存 TaiwanHot／CMMedia／PeoPo head
+的 SHA、Parquet 與擷取時間逐列不變，19 份原 cohort 收據不變；新正文與控制
+樣本另獨立讀回。00:02 驗收時尚未到期的 CMoney／PeoPo 期限保留、新 owner
+該來源零 HTTP；00:36 第二批驗收時原期限已到期，沒有拿這次讀回冒稱期限前
+零請求。原診斷／已花完的 metadata budget 保留，這不是全湖逐筆 integrity。
+
+完整新聞回歸 **10,141 passed／185 files，376.37 秒**，保留上一批 10,120
+nodeid／測試檔 SHA，新增 21 個自包含短文案例；另有 287 項聚焦及部署後
+214 項通過。上一批 10,120 項也完整通過，保留原 10,063 nodeid／斷言；只有
+一個 hourly-provider fixture 加入新診斷來源，其他原測試檔 SHA 不變。
+原失敗 runs 留存：包含 generic reconcile 重設舊 lease/head 的缺陷、fixture
+少來源、純 extraction 與 HTTP record 欄位層級混淆，以及小標影響短文判斷；
+修復後由完整回歸及實際提交讀回處置，沒有刪案例／放寬權利或時鐘斷言。
+
+服務於 **23:59:24 → 23:59:34** 及 **00:31:41 → 00:31:51** 自動 drain／exit 75
+重載，warming 舊心跳都未算成功。最後新 owner、程序、DB 身分及心跳一致。
+公網完整 JSON 對帳為 **936 個來源鍵、66 個 recipe、6,304,827 個已知 URL、
+3,827,456 個已存正文 URL**，來源鍵不等於獨立網站；870 未登錄鍵、其他來源
+缺口及這三個工程案例仍未完成。CNA 繼續按要求暫緩；不偽造全來源 ETA，
+`all_history_complete=false`，也不把私人讀取當轉載／訓練／匯出授權。
+
+證據：[路由／限量診斷與第一個新正文](../artifacts/data_quality/news_goal_stage01_20261009/taiwanhot_route_metadata_20261014/after.json)、
+[原件短文診斷](../artifacts/data_quality/news_goal_stage01_20261009/taiwanhot_route_metadata_20261014/source_diagnosis.json)、
+[10,141 項回歸與碼／測試 pin](../artifacts/data_quality/news_goal_stage01_20261009/taiwanhot_complete_short_prose_20261015/regression_after.json)、
+[82 字原件雙 parser 與控制讀回](../artifacts/data_quality/news_goal_stage01_20261009/taiwanhot_complete_short_prose_20261015/offline.json)、
+[實際短文提交／舊 head／預算](../artifacts/data_quality/news_goal_stage01_20261009/taiwanhot_complete_short_prose_20261015/after.json)、
+[00:39 公網與全來源對帳](../artifacts/data_quality/news_goal_stage01_20261009/taiwanhot_complete_short_prose_20261015/handoff.json)。
+
 ## 原生網址與單主機故障修復：2026-10-14 23:03，Asia/Taipei
 
 **原先鎖定的 18 個工程失敗 URL 已全部真正補入正文，獨立原件／收據讀回通過。**

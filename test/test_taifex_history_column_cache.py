@@ -1,10 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from datetime import datetime, timezone
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
 
 import polars as pl
 import pytest
@@ -16,6 +16,7 @@ from test_taifex_volatility_dashboard import _fixture
 
 @pytest.fixture
 def source(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache, "_VERIFIED_PAYLOADS", OrderedDict())
     root = tmp_path / "cache"
     root.mkdir()
     monkeypatch.setenv(cache.CACHE_ENV, str(root))
@@ -199,3 +200,96 @@ def test_invalid_source_keeps_raw_parser_failure_instead_of_empty_success(source
     path.write_bytes(b'{"ts":4,"value":"not-a-number"}\n')
     with pytest.raises(pl.exceptions.PolarsError):
         read(source)
+
+
+def _count_proof_reads(monkeypatch):
+    """Count successful complete source/payload proofs, not parser reads."""
+    calls = []
+    prefix, source_digests = cache._prefix_digest, cache._source_digests
+
+    def record_prefix(fd, size):
+        value = prefix(fd, size)
+        calls.append((os.readlink(f"/proc/self/fd/{fd}"), "verify", size))
+        return value
+
+    def record_source(fd, size, previous):
+        value = source_digests(fd, size, previous)
+        calls.append((os.readlink(f"/proc/self/fd/{fd}"), "build", size))
+        return value
+
+    monkeypatch.setattr(cache, "_prefix_digest", record_prefix)
+    monkeypatch.setattr(cache, "_source_digests", record_source)
+    return calls
+
+
+@pytest.mark.parametrize("update", ["cold", "append", "metadata"])
+def test_completed_source_proof_is_reused_without_skipping_new_payload_proof(source, monkeypatch, update):
+    path, schema, _ = source
+    if update != "cold":
+        read(source)
+        if update == "append":
+            with path.open("ab") as stream:
+                stream.write(b'{"ts":4,"value":4.0}\n')
+        else:
+            before = path.stat()
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+    calls = _count_proof_reads(monkeypatch)
+    expected = pl.read_ndjson(path, schema=schema)
+    assert_exact(read(source), expected)
+    first_count = len(calls)
+    for _ in range(3):
+        assert_exact(read(source), expected)
+    source_calls = [row for row in calls if row[0] == str(path)]
+    assert source_calls == [(str(path), "build", path.stat().st_size)]
+    # A new payload still receives an independent SHA proof after publication.
+    if update != "metadata":
+        assert any(row[0].endswith(".parquet") for row in calls[first_count:])
+
+
+def test_restart_loses_memory_proofs_and_verifies_disk_receipt(source, monkeypatch):
+    path, schema, _ = source
+    read(source)
+    monkeypatch.setattr(cache, "_VERIFIED_PAYLOADS", OrderedDict())
+    calls = _count_proof_reads(monkeypatch)
+    assert_exact(read(source), pl.read_ndjson(path, schema=schema))
+    assert [row for row in calls if row[0] == str(path)] == [
+        (str(path), "verify", path.stat().st_size)]
+    assert any(row[0].endswith(".parquet") for row in calls)
+
+
+def test_inode_replacement_cannot_use_seeded_source_proof(source, monkeypatch):
+    path, schema, _ = source
+    read(source)
+    old = path.stat()
+    replacement = path.with_suffix(".replacement")
+    replacement.write_bytes(path.read_bytes().replace(b'"ts": 1', b'"ts": 8'))
+    os.utime(replacement, ns=(old.st_atime_ns, old.st_mtime_ns))
+    replacement.replace(path)
+    calls = _count_proof_reads(monkeypatch)
+    assert_exact(read(source), pl.read_ndjson(path, schema=schema))
+    assert path.stat().st_ino != old.st_ino
+    assert any(row[0] == str(path) and row[1] == "build" for row in calls)
+
+
+def test_failed_publication_does_not_seed_a_source_receipt(source, monkeypatch):
+    path, _, root = source
+
+    def fail(*args, **kwargs):
+        raise OSError("injected receipt publication failure")
+
+    monkeypatch.setattr(cache, "_publish_receipt", fail)
+    assert read(source).height == 3  # Canonical raw fallback, not empty success.
+    assert not list(root.rglob("*.json"))
+    assert not any(key[0] == str(path) for key in cache._VERIFIED_PAYLOADS)
+
+
+def test_proof_memo_is_bounded_lru_and_retains_false_results(monkeypatch):
+    monkeypatch.setattr(cache, "_VERIFIED_PAYLOADS", OrderedDict())
+    generation = (1, 2, 3, 4, 5)
+    for index in range(cache._VERIFIED_PAYLOAD_LIMIT):
+        cache._remember_verified_payload(str(index), generation, "a" * 64, False)
+    assert cache._verified_payload("0", generation, "a" * 64) is False
+    cache._remember_verified_payload("new", generation, "a" * 64)
+    assert len(cache._VERIFIED_PAYLOADS) == cache._VERIFIED_PAYLOAD_LIMIT
+    assert ("0", generation, "a" * 64) in cache._VERIFIED_PAYLOADS
+    assert ("1", generation, "a" * 64) not in cache._VERIFIED_PAYLOADS

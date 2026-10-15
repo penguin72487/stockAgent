@@ -265,6 +265,7 @@ def _score_curve(
     strict_compiled_backtest: bool = True,
     world_size: int = 1,
     annual_ownership: dict[str, Any] | None = None,
+    require_explicit_carry_graph: bool = False,
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -306,6 +307,14 @@ def _score_curve(
         for key in failure_keys:
             if int(row.get(key, 0) or 0) != 0:
                 reasons.append(f"epoch {epoch} has {key}={row.get(key)!r}")
+        if require_explicit_carry_graph:
+            for counter in ("forward_replays", "backward_replays", "accepted_blocks"):
+                key = f"train_loss_day_trade_carry_explicit_graph_{counter}"
+                if int(row.get(key, 0) or 0) <= 0:
+                    reasons.append(f"epoch {epoch} requested ledger graph but has no {counter}")
+            key = "train_loss_day_trade_carry_explicit_graph_certificate_fallbacks"
+            if int(row.get(key, 0) or 0):
+                reasons.append(f"epoch {epoch} has ledger graph certificate fallback")
 
     for key in ("futures_cuda_graph_constructors", "futures_cuda_graph_evictions"):
         observed = [int(row[key]) for row in steady if key in row]
@@ -832,6 +841,9 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 ),
                 world_size=args.world_size,
                 annual_ownership=annual_ownership,
+                require_explicit_carry_graph=(
+                    env.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0") == "1"
+                ),
             )
             result.update(score)
             result["epoch_curve"] = str(curve_path)

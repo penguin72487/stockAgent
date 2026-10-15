@@ -308,18 +308,15 @@ def _asset_log_returns_to_simple_torch(
 def _portfolio_simple_returns_to_log_torch(
     simple_returns: torch.Tensor,
 ) -> torch.Tensor:
-    floor = torch.as_tensor(
-        _MIN_PORTFOLIO_SIMPLE_RETURN,
-        device=simple_returns.device,
-        dtype=simple_returns.dtype,
-    )
     clean = torch.nan_to_num(
         simple_returns,
         nan=0.0,
         posinf=torch.finfo(simple_returns.dtype).max,
         neginf=_MIN_PORTFOLIO_SIMPLE_RETURN,
     )
-    return torch.log1p(clean.clamp_min(floor))
+    # A scalar clamp is capture-safe; constructing a CUDA tensor from a Python
+    # number performs an unpinned host copy inside every daily ledger call.
+    return torch.log1p(clean.clamp_min(_MIN_PORTFOLIO_SIMPLE_RETURN))
 
 
 def _drift_weights_after_return_numpy(

@@ -8,9 +8,9 @@ rounded, aggregated or quantized here. Query/range/accounting remain callers'.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 import fcntl
-from functools import lru_cache
 import hashlib
 import io
 import json
@@ -19,6 +19,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+from threading import Lock
 from typing import Any, Iterator
 
 import polars as pl
@@ -32,6 +33,9 @@ MIN_SOURCE_BYTES = 8 * 1024**2
 MAX_DELTA_BYTES = 64 * 1024**2
 _BLOCK_BYTES = 1024**2
 MAX_GENERATION_ATTEMPTS = 3
+_VERIFIED_PAYLOAD_LIMIT = 16
+_VERIFIED_PAYLOADS: OrderedDict[tuple[str, tuple[int, ...], str], bool] = OrderedDict()
+_VERIFIED_PAYLOAD_LOCK = Lock()
 
 
 class _SourceGenerationChanged(OSError):
@@ -80,16 +84,39 @@ def _source_digests(descriptor: int, size: int, previous_size: int) -> tuple[str
     return previous, digest.hexdigest()
 
 
-@lru_cache(maxsize=16)
+def _remember_verified_payload(path: str, generation: tuple[int, ...], expected: str,
+                               verified: bool = True) -> None:
+    """Reuse an in-process proof, never a receipt alone or an assumed append.
+
+    The key includes device, inode, size, mtime AND ctime plus the expected
+    SHA256. Only a completed digest fenced by matching descriptor/path
+    generations may seed a true value. Restart loses all proofs; disk receipts
+    still require independent source and payload verification.
+    """
+    key = path, generation, expected
+    with _VERIFIED_PAYLOAD_LOCK:
+        _VERIFIED_PAYLOADS[key] = verified
+        _VERIFIED_PAYLOADS.move_to_end(key)
+        while len(_VERIFIED_PAYLOADS) > _VERIFIED_PAYLOAD_LIMIT:
+            _VERIFIED_PAYLOADS.popitem(last=False)
+
+
 def _verified_payload(path: str, generation: tuple[int, ...], expected: str) -> bool:
+    key = path, generation, expected
+    with _VERIFIED_PAYLOAD_LOCK:
+        if key in _VERIFIED_PAYLOADS:
+            _VERIFIED_PAYLOADS.move_to_end(key)
+            return _VERIFIED_PAYLOADS[key]
     descriptor = _open_regular(Path(path))
     try:
-        return (_generation(os.fstat(descriptor)) == generation
-                and _prefix_digest(descriptor, generation[2]) == expected
-                and _generation(os.fstat(descriptor)) == generation
-                and _generation(Path(path).stat()) == generation)
+        verified = (_generation(os.fstat(descriptor)) == generation
+                    and _prefix_digest(descriptor, generation[2]) == expected
+                    and _generation(os.fstat(descriptor)) == generation
+                    and _generation(Path(path).stat()) == generation)
     finally:
         os.close(descriptor)
+    _remember_verified_payload(path, generation, expected, verified)
+    return verified
 
 
 def _receipt(path: Path, schema: dict[str, Any]) -> dict:
@@ -154,6 +181,7 @@ def _prepare(source: Path, payload: Path, receipt: Path,
             raise _SourceGenerationChanged("history source changed during prefix proof")
         if incremental and previous_size == size:
             _publish_receipt(receipt, {**old, "source_generation": list(generation)})
+            _remember_verified_payload(str(source), generation, source_sha)
             return _open_regular(payload)
 
         old_fd = _open_regular(payload) if incremental else None
@@ -193,6 +221,11 @@ def _prepare(source: Path, payload: Path, receipt: Path,
             "source_generation": list(generation), "source_sha256": source_sha,
             "payload_sha256": payload_sha, "rows": rows, "polars": pl.__version__,
             "columns": [[name, str(dtype)] for name, dtype in schema.items()]})
+        # _source_digests already proved this entire source and both generation
+        # fences passed. Do not rehash it on the next same-generation query.
+        # The newly published payload is NOT seeded: its next reader still
+        # independently verifies the renamed inode against the receipt SHA.
+        _remember_verified_payload(str(source), generation, source_sha)
         return _open_regular(payload)
     finally:
         os.close(source_fd)

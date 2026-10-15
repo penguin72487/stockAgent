@@ -2,6 +2,105 @@
 
 目前目標仍在進行；已驗收的結果與尚待正式載入的部分分開列出：
 
+- **10/15 09:17 FinMind 保護期後恢復下載已完成獨立回讀。** 同一正式
+  Complement owner 在 09:10:00.013602 更新 running 心跳，09:11:04.656011
+  觀察到第一筆 complete（結束保護後 64.656 秒，包含初始化與來源延遲）。
+  抽查三份新收據／Parquet，共 10,260 列，身分、筆數與完整 SHA 通過；
+  舊收據及來源也保留。900 秒跨界觀察不是純 idle／API 吞吐比較，更不是
+  全部歷史完成。47 項有重疊的等待／回讀／工程 fixture 測試通過。
+- **10/15 08:51 FinMind 開盤保護等待的重複初始化已原生驗收。** 原本每
+  600 秒仍重做 queue／seed／修正／狀態初始化，沒有取得新資料；改成等到
+  原日曆准許的 09:10，每 30 秒只更新心跳並檢查日曆。原生 690 秒觀察
+  跨過舊重建邊界，僅用 0.053314 秒 CPU、狀態循環未換代；原 180 秒
+  窗口含一次初始化用了 18.756198 秒 CPU。這是不同長度的保護等待取樣，
+  不當作 API／全機降幅。1,121 項共享回歸、62 項有重疊的工程驗收測試
+  與完整 SQL 回讀通過；目前僅 Complement owner 已獨立驗收，09:10
+  恢復另由上述跨界觀察及來源回讀證明，不宣稱 Free／Sponsor 或所有服務已採用。
+- **10/15 08:29 FinMind 分組失效快取已正式驗收。** 完整 3,572,121 筆
+  queue、每輪 16 次發布／24,248 原始列，固定資源 A/B/B/A：平均 wall
+  6.502→3.612 秒（少 44.4%）、CPU 3.040→1.199 秒（少 60.5%）；完整
+  tasks、status、收據及 Parquet 相同。1,099 項共享回歸通過；原 owner
+  在無在途工作的開盤保護等待期載入，獨立完整 SQL 回讀與原生狀態全部
+  欄位相同，五個其他保護 owner 未變。這是本機發布／狀態流程，不是整個
+  API 下載 1.80 倍。首次冷啟動仍有約 77 秒初始化；後續保護期重複初始化
+  已另行量測與修正，沒有宣稱首次啟動成本消失。
+- **10/15 07:59 五模式盤後快取續接已驗收。** 修正 path 失效後沒有短版
+  備援喚醒的根因；同一 controller 分開短版／完整歷史預算。新來源世代由
+  原 owner 完成，獨立 consumer 五模式全數只讀 cache、零 model／provider／
+  CUDA；最後兩輪真實 timer 不再啟動 worker，六個保護 owner 未變。
+  完整 idle-probe CPU 平均 1.127→0.086 秒、post-exec 峰值 163.78→23.78 MiB，
+  283 項回歸通過；52／52 當下可讀 managed Linux processes 無 GPU handles。
+  這是本機盤後備援的有界驗收，不是全部服務／Windows 顯存已最佳化。
+- **10/15 07:32 全資料清冊的 dict 快徑已原生驗收。** 最終完整 68,043
+  路徑／89,097 特徵、每輪 204,129 次 frozen-source checks，八輪鏡像比較
+  CPU 平均 9.031→8.446 秒（少約 6.5%），完整 cache／feature bytes 相同；
+  368 項相關回歸通過。正式 native guards、世代收據及全部來源身分已獨立
+  讀回；不是全機／完整 CLI 加速或 RAM 降幅。另兩個 GC／deferred 候選
+  完整流程反而增加 CPU，因此未部署。
+- **來源換代不沿用舊 cache。** 07:32 的五模式來源失效已在 07:59 依新
+  世代恢復；舊拒絕診斷與收據保留，未放寬 source／model／config gate。
+  原事件 path 的 `failed/resources` 仍如實呈現，已有不用 inotify 的 timer
+  備援。VS Code 舊 watcher 仍待使用者 `Developer: Reload Window`，未為此
+  終止 IDE、提高 kernel limit 或重啟交易。Windows 整卡顯存仍未完整歸因。
+- **10/15 OpenBB 全量 footer 讀取減少不必要的建構成本。** 完整 185,963
+  真實 footers／50,722 view proofs，暖機分開、八輪鏡像比較：metadata-only
+  平均 wall 139.898→120.816 秒、CPU 81.125→70.160 秒（少 13.5%）。
+  所有完整輸出 SHA 相同，430 項相關回歸通過；06:48 新正式 owner 的全來源
+  集合／每檔世代／完整 native AST／JSON-Parquet 獨立讀回已接受，六個
+  交易／行情保護 owner 與 native 資源 limits 未變。
+  不採用兩個 worker，因 CPU 平均反而多 48.1%；未縮減檔案驗證或來源範圍。
+  06:47 五模式收盤快取 5／5 accepted、模型前推／provider／CUDA 為零，
+  68／68 可讀 managed Linux 程序沒有 GPU device handles。這不是全機
+  CPU／Windows 整卡顯存歸零的證明。
+- **10/15 OpenBB 完整狀態發布已減少 SQL 分組成本。** 完整 7,327,309
+  source files／334,949,985 rows、67 endpoints 的暖快取 A/B/B/A＋B/A/A/B：
+  wall 平均 2.299→1.946 秒，CPU 少 12.9%，八輪完整 JSON／Parquet
+  發布與讀回相同。最終 380 項相關回歸通過，06:03 正式原生採用與原 SQL
+  全量讀回已獨立接受；六個保護 owner 未變。
+  冷暖未分開的首次 64% 降幅不當正式收益；這不是完整 compaction 加速。
+  五個收盤模式仍零重算／CUDA、64／64 managed Linux 程序無 GPU handles。
+- **10/15 三來源 hot-tail 清冊的重複日期轉換已修正。** 全部 1,976 個已存
+  商品、前後完整清冊 durable 發布 A/B/B/A：123.227→24.922 秒、4.945×，
+  CPU 約少 79.1%；四輪完整輸出 SHA 相同。三個既有 collector 已接線，
+  非標準格式維持原驗證／異常語意；05:29 獨立 native probe 已觀測三個
+  正式 owner 實際執行新版入口，沒有重啟下載。最終 389 項相關測試通過；
+  05:32 五模式收盤快取仍零前推、54／54 managed Linux processes 無 GPU
+  裝置句柄。這不是完整 API 下載 4.945 倍或 Windows 整卡顯存歸零。
+- **10/15 04:41 FinLab 分鐘優先准入已原生驗收。** 完整 280,704 分區、
+  2,461 股票／5,711 sessions 的控制循環 A/B/B/A：30.603→16.734 秒，
+  CPU 約少 46.4%，完整清冊、准入結果、候選及 durable readback 全相同。
+  新 owner 實際執行六次 minute-only 檢查，約 1.136 秒；三來源驗證通過、
+  六個保護 owner 未變，沒有重啟下載。這不是全 API 下載 1.83 倍。
+- **10/15 04:49 發現仍未解決的主要閒置負擔：VS Code fileWatcher。**
+  同一原生程序占 12.89 GiB RSS、約 0.997 CPU core，監看 4,187,900 項，
+  單一程序已占 UID watch limit 99.85%。工作區排除規則已修正；舊程序
+  尚未釋放，需要 `Developer: Reload Window` 後回測，未終止編輯器或
+  增加 kernel limit。registered intraday 的 main exit＝0／來源更新成功，
+  卻同時有 inotify ENOSPC 與 stop timeout；不能把這個服務狀態問題當成
+  所有來源下載失敗，也尚未證明釋放 watchers 就完全解決 timeout。
+- **10/15 04:28 Bybit 固定原 release 完整恢復完成。** 同一原始還原 owner
+  成功處理 4,677 檔／22,357,148,836 bytes，切換到 mutable workspace，
+  cold 原件未改。原 pipeline 接續 888 symbols 的 1m tail 更新，報告全部
+  updated；04:57 固定 scope、原件／新 tail readback 與當時 native owner
+  獨立驗收接受。服務停止生命週期仍有上述資源問題，未聲稱全歷史／全部
+  symbol 都沒有缺口，也未聲稱 stop timeout 已解決。
+- **10/15 04:08 FinLab 完整分區清冊已自然載入索引查詢修正。** 同一固定
+  280,391 筆真實索引、完整 2,461 股票／5,711 交易日、64 次持久寫入及
+  逐筆讀回，A/B/B/A 的流程中位數 10.293→3.807 秒，CPU 約少 64.8%；
+  全部有效分區、完整摘要與候選結果相同。434 項相關回歸通過，新 owner
+  的實際 TEMP view 指紋獨立回讀吻合，原排程持續抓取，未重啟服務。
+  這不是全下載／全機 2.70 倍；五個收盤模式再次 CPU cache 命中、零 GPU
+  前推。Bybit 固定原 release 的同一完整還原仍在執行，未宣稱已完成。
+- **10/15 03:39 新程式世代的盤後快取已重新正式驗收。** 五模式完整輸入
+  僅 code 換代；每個新模型隔離前推一次，全部 tensor／auxiliary 位元相等。
+  經 canonical durable cache 安裝、正式 cache-only owner 及獨立 CUDA-cold
+  回讀，5／5 可用。只重載合格閒置的 Discord consumer；新 owner 的 code
+  准入、完整數值、Gateway／commands／engine ACK 均接受，無 GPU handles、
+  新暖機或 fatal。03:41 的 67／67 managed Linux processes 均可讀且無 GPU
+  handles；不是 Windows／整卡零顯存或遊戲 FPS 保證。穩定 20 秒取樣的
+  Discord 為 0.0141 CPU core、516.04 MiB anonymous RAM；不是全機 A/B 降幅。
+  本輪 182 項共享回歸通過。Bybit 已確認是失效的 immutable-cache symlink，
+  正在以固定原 release 完整校驗／還原到 mutable workspace；未宣稱已追新。
 - **盤後 GPU 閒置已正式採用。** 19:55 僅重載合格閒置的 Discord owner，
   19:56 獨立原生驗收：五模式完整輸出、目前正式鍵、engine ACK 全部一致，
   新 owner 沒有 GPU handles／暖機／模型重算。另取樣 61／61 本機 managed
@@ -18,6 +117,22 @@
   23:52 的最新取樣為 73／73 managed Linux processes 可讀、GPU handles
   為零；Discord CPU 約 0.0135 core、匿名記憶體約 503 MiB。Windows
   顯存／遊戲 FPS 仍未全部歸因。
+  **10/15 01:03 再次獨立回讀五模式當前收盤快取全部通過**：直接呼叫
+  canonical consumer，禁止模型／網路／CUDA 操作；五個正式鍵與 10/14
+  13:30 收盤相符，模型前推、provider 呼叫與 CUDA 初始化均為零。
+  00:59 取樣的 56／56 可見 managed Linux processes 無 GPU 裝置句柄；
+  不以程序數變動推論服務停止，也不充作全卡／Windows 顯存證明。
+  **10/15 01:56 當時的狀態已不同**：62／62 可讀 managed 程序仍無 GPU
+  handles，但五模式 canonical consumer 全因來源／程式世代變更拒用，
+  零模型／provider／CUDA 操作。三份 factorized 資料／模型程式已在其他
+  工作中改變；01:03 的成功不延伸為這一世代成功。本輪未重啟 GPU owner、
+  未改寫其程式、未以舊快取冒充目前結果；後續須重新驗收正常更新流程。
+- **10/15 01:51 唯讀 TAIFEX 面板已採用同 generation 的完整驗證證明重用。**
+  固定 5.15 GB 有效真實來源、八輪七區間增量刷新／durable readback，
+  第一階段 wall 少 11.5%、CPU 少 6.5%，SHA 驗證量少 44.3%；加入暖讀
+  後的完整兩階段中位數 wall 少 7.1%、CPU 少 1.2%。七區間全輸出一致，
+  一日原始解析器獨立對照一致；不是全機降幅。新 owner 七區間時鐘與
+  重載後增量收據全部通過，行情／模擬交易 owner 未變；161 回歸通過。
 - 閒置訊號／收盤排程的四輪原始 caller 對照已接受：每 30 秒 CPU 平均
   1.654→0.0348 秒（少 97.9%），各 task 300→6 次喚醒；截止前 30 秒、
   未完成鍵及交易確認仍維持 100 ms。這是兩個閒置 callback 的量測，不是
@@ -79,8 +194,11 @@
   **10/15 00:13 完整四輪 SQL 對照已完成。** 固定完整清冊下，SQL 平均
   2,306.950→193.496 秒，CPU 458.981→61.316 秒；含完整 SHA 等工程
   驗證的 worker 平均 2,390.953→263.078 秒。輸出與來源身分一致；不是
-  全 compaction 倍率。新索引增加 3.54 GiB，完整私人寫入成本正在量測，
-  正式庫仍未安裝。
+  全 compaction 倍率。新索引增加 3.54 GiB；10/15 00:53 完整私人
+  寫入四輪已完成，固定 1,024 筆原生操作 wall 平均增加 0.229 秒、
+  CPU 增加 0.148 秒。驗證索引的 canonical lookup 已接入並通過 607
+  項回歸，**正式庫仍未安裝實體索引**；缺失時沿用原查詢，不宣稱
+  正式服務已獲得該完整 SQL 加速倍率。
 - 完整歷史工作另有「圖表是同一 inode 卻重複複製」及「30 分鐘逾時後從頭
   重建 1,613 個分鐘 session」兩個原因。圖表修復通過 131 項生命週期測試；
   V8 完整歷史預算改為 3,600 秒，120／600 秒啟用／收盤期限不變。
@@ -2565,6 +2683,1529 @@ Python3.12.15／SQLite3.54.0；本輪未替換任何服務環境。
 - [418 項 focused／完整私人流程回歸](../artifacts/operations/agent-workflow/runs/openbb-full-size-writer-complete-20261014T161230-4129a8ea/run.log)
 - [完整私人 writer copy exact run](../artifacts/operations/agent-workflow/runs/openbb-full-size-native-writer-p-20261014T161351-61d5c836/run.json)
 - [原生寫入測試入口](../scripts/benchmark_openbb_l1_source_write_cost.py)、[語意與安全負向測試](../test/test_openbb_l1_source_write_cost.py)
+
+### 10/15 00:53–01:09：原生寫入四輪、查詢接線與當前快取驗收
+
+`openbb-full-size-native-writer-a-20261014T163456-a140e297` 已 terminal
+succeeded／exit 0。四個 fresh worker 使用前述完整私人 DB 與相同
+1,024 筆工作量；全 task 欄位 SHA、3,072 筆 journal entry／multiset
+SHA、6,144 次直接＋trigger changes、獨立 connection 回讀與來源
+完整 SHA 全部相同。固定原生 claim→mark-executing→四個 256 筆
+completion batch→WAL checkpoint 都計入，沒有省略 durable commit。
+
+原版／covering 的 persistence wall 均值 1.015442／1.244171 秒
+（+22.525%），CPU 0.550526／0.698902 秒（+26.952%）。完整工程
+worker wall 均值 338.223／218.124 秒，包括全檔 SHA 和驗證，受
+OS cache／共享主機 I/O 明顯影響，**不解讀成下載或原生寫入加速**。
+這個有界成本與每日完整 source audit 的讀取收益、479.748 秒建索引
+及 3.54 GiB 磁碟成本一起評估；不能把 1,024 筆 replay 外推成
+全部 1,329 萬 tasks 的正式 API 吞吐。
+
+新增共用 `openbb_l1_task_contract_index.py`，先以實際
+`main.index_list`／`index_xinfo` 驗證固定名稱、完整七欄順序、
+非 unique／非 partial／非 expression、ascending BINARY layout；
+缺失或不相容就保持原 SQL。canonical `_mark_stale_segments` 的
+全量與 journal 有界分批共用同一 lookup，沒有改 CASE／NULL／
+DISTINCT／排序／路徑 fallback，也沒有改 source contract fingerprint。
+實體 schema 改動仍觸發既有 full audit，無變更的 journal 仍檢查每個
+derivative footer。新 helper 也納入往後 benchmark 的 code closure。
+
+[SQLite 官方 `INDEXED BY`](https://www.sqlite.org/lang_indexedby.html)
+說明這是強制要求而非 hint；接線只在實體 layout 已驗證時固定已量測
+的查詢，並在索引於驗證後移除時，僅針對獨立確認的 exact missing-index
+error 重試原讀取。其他 SQL／資料錯誤保留，不吞掉、不改標成成功。
+每次 attempt 記錄 `source_task_lookup` 與 validation 時間；本次沒有
+自動 CREATE INDEX、ANALYZE 正式庫或改 source journal watermark 規則。
+更新 statistics 後由 planner 自選的完整對照尚未測量，不宣稱全域最優。
+
+首輪 canonical 接線 174 passed；包含原生 downloader、compactor、
+來源 journal、完整私人 writer、footer／view／metadata／attempt 的
+較廣回歸 607 passed in 66.22s。兩組重疊，不能加總成不同測試數。
+兩個新增檔案 formatting 後另外 40 passed in 2.90s；F／E9 lint 和
+`git diff --check` 通過，未跑 repository 全測試。
+
+01:03 的獨立 verifier 使用正式 consumer 回讀所有五個 enabled 台股
+模式，全部 reusable，對應同一 10/14 13:30 completed close；模型
+前推／provider calls=0、CUDA initialized=false。這是當前 artifact
+重用的診斷驗收，不是新的獨立 GPU 數值 oracle、全歷史或券商成交。
+00:59 GPU 裝置取樣觀察 56／56 程序可讀、owners／handles=0。
+
+下載本身仍有獨立問題。原生 archive 10/14 20:33 結束 exit 2；
+其 audit `checked_at=2026-10-14T07:26:07.614353+00:00` 是稽核
+起算時間，不是完成時間。7,327,309 份成功檔／334,949,985 rows 的
+缺檔／不可讀／列數／metadata mismatch 都是 0，但掃過 7,474,495
+份檔案中有 611 份沒有目前成功 owner；另有 146,575 份已註冊的
+inactive-success 歷史。ownership 建索引 3,147.392 秒、scan 1,094.903
+秒，也是後續熱點；不能直接把 failed service 重啟當成修復。
+
+只對三份舊共識 source 做獨立 task／SHA／所有欄位讀回：task ID／
+canonical path 一致，內容有 target／price／analyst 數值，非 encoded
+empty wrapper。擷取在 7/18，現在 task 是 inactive pending，8/20
+記錄 yfinance empty；因此 current success ownership 拒絕它們。
+保留原值、原擷取時間與 bytes，不把三份樣本推論成全部 611 正確、
+不強制 pending→success、不 backdate／移動／刪除原始資料。
+
+01:08:36 原生 compaction timer 自然啟動，01:11:31 exit 0；精確
+invocation `63c870cfb7c444119d2b839dedf859b5` 的獨立回讀已接受。
+全次 attempt 173.433756 秒、footer scan 132.628 秒／185,963 份；
+journal 無變更、source lookup 缺實體索引正確走 canonical fallback，
+7,327,309 sources／334,949,985 rows 的 attempt 與 publication 一致，
+pending／new／stale／failed 全為 0。這不處置 archive 的 611 份 ownership
+缺口，也不是 covering index 加速的正式驗收。
+
+01:09 起始 receipt 的 `phase=lock` 只在 start／finish 時持久化，**不能
+當成程序仍在等鎖**；它不是目前執行 stack。後來已由 terminal receipt
+核對完整 stage timings，不把該過時 phase 誤判為卡住。
+磁碟安全可用約 96.1 GiB，低於既有 archive 100 GiB floor；本次不降低
+floor 或啟動下載來製造活動狀態。實體索引採用及 ownership 修復仍待
+獨立驗收。21.086 秒的全 loaded-unit counter 取樣另保留；原始
+`list-unit-files` 含 transient 與 template，不直接用其 86 列代替服務
+數量，四個 legacy-return instances 仍保留在完整明細，未縮小原目標。
+
+01:18 的 canonical 全服務 observer 另完成 20 秒完整取樣，分類仍為
+87 個 installed＋1 個 engineering transient，67 timers／3 paths。
+當時 installed 持續服務的 CPU 熱點是 TAIFEX dashboard 約 0.333 core、
+FinMind complement 約 0.296 core；storage lifecycle 約 0.237 core。
+GC／backup 同時有 activating 工作，不能把活動批次算成靜止 baseline。
+TAIFEX dashboard 匿名記憶體約 125 MiB，另有約 3.91 GiB cgroup file
+cache，後者不是同量不可回收的 Python heap 或 GPU 顯存。
+
+該 observer 保留原生 compaction 的 443 次 memory.high event；max／
+OOM／OOM-kill／swap 都為 0。不隱藏 soft-limit 壓力、不調高 cap 來
+美化時間。後續沿真正耗時的 footer／I/O 與常駐 dashboard 完整請求
+路徑實測；TAIFEX 夜盤仍開市，不能因台股收盤就停止有效資料串流。
+
+證據：
+
+- [完整原生 persistence 四輪結果](../artifacts/benchmarks/running_services_20261013/openbb_full_size_native_writer_index_20261015/abba-receipt.json)
+- [607 項接線／原生共享回歸](../artifacts/operations/agent-workflow/runs/openbb-native-lookup-full-regres-20261014T170105-f8b3e343/run.log)
+- [五模式當前收盤快取完整診斷](../artifacts/operations/running-services-optimization-20261013/completed-cache-current-readback-after-lookup-20261015.json)
+- [最新 managed GPU 裝置取樣](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-lookup-code-integration-20261015.json)
+- [正式 compactor fallback／完整 footer／publication 回讀](../artifacts/operations/running-services-optimization-20261013/native-openbb-lookup-fallback-20261015.json)
+- [全 loaded-unit 配對 counter 與分類限制](../artifacts/operations/running-services-optimization-20261013/service-census-after-native-lookup-20261015.json)
+- [87 installed 的 canonical 全服務清冊與壓力讀回](../artifacts/operations/running-services-optimization-20261013/all-native-services-canonical-census-20261015.json)
+- [三份保留原檔 task／SHA 讀回](../artifacts/operations/running-services-optimization-20261013/openbb-orphan-source-readback-20261015.json)、[所有欄位分類](../artifacts/operations/running-services-optimization-20261013/openbb-orphan-content-classification-20261015.json)
+- [共用 lookup 驗證](../scripts/openbb_l1_task_contract_index.py)、[原生接線／fallback 測試](../test/test_openbb_l1_task_contract_index.py)
+
+### 10/15 01:25–02:03：TAIFEX 重複來源驗證移除及原生採用
+
+30 秒、49 Hz 的原生 `py-spy` 只作熱點診斷，取到 active Python 約
+1.33 秒，不能拿這個樣本稱整段 CPU 百分比。`taifex-history-1d` 路徑
+涉及欄式資料轉換、JSON 輸出與完整 SHA；主 marks 當時約 4.18 GB。
+實體資料夾另有舊 replay，canonical `_history_backfill_receipts` 按既有
+契約選出目前 v3；本次固定的是其全部有效來源約 5.15 GB，而不是刪除
+或忽略任何本來有效的來源。舊 replay 與原始檔全部保留。
+
+原欄式快取已在 `_source_digests` 完整讀取來源，並以 descriptor／path
+的 device、inode、size、mtime、ctime 作兩次 generation fence；建立／
+發佈後，下一查詢卻又對同一來源完整 SHA。改為有界 16 entries、帶鎖
+LRU，只將已完成且通過 fence 的 source proof 記入本程序。expected SHA
+也是 key；重啟丟失所有 memory proofs，來源改寫／換 inode／metadata
+換代依然驗證全部前綴。**新 payload 不預先 seed**，下一 reader 仍獨立
+驗證其 SHA。沒有假設永遠 append-only、mtime 相同就可信，也沒有取消
+schema、收據、並行 lease 或壞資料 fallback。
+
+工程來源副本與原版 module SHA 在編輯前保留；八次交錯順序為
+`baseline, candidate, candidate, baseline` 重複兩次，各 fresh worker
+使用獨立 initial cache。只在私人副本一次 append 已捕獲的真實 260,856
+bytes，沒有捏造 ticks／quotes。每輪第一階段包含全部七種完整曲線、
+durable JSON 寫入及讀回；第二階段同程序再讀七區間，不能略掉後續成本。
+
+| 中位數，完整固定有效來源 | 原版 | 修正 | 實測差異 |
+| --- | ---: | ---: | ---: |
+| 增量後七區間＋durable readback wall | 14.4976 s | 12.8237 s | -11.5% |
+| 同階段 CPU | 21.4020 s | 20.0163 s | -6.5% |
+| SHA helper 完成的驗證 bytes | 9,429,984,329 | 5,252,215,986 | -44.3% |
+| 兩階段合併 wall，逐 trial 相加再取 median | 19.9593 s | 18.5443 s | -7.1% |
+| 兩階段合併 CPU，逐 trial 相加再取 median | 31.6131 s | 31.2243 s | -1.2% |
+
+peak RSS 1,064,007,680→1,059,790,848 bytes，差異不到 0.5%，不稱明顯
+記憶體收益。暖讀各自 SHA proof bytes 為零；暖讀時間有約 4.7% 波動，
+不把其單獨宣稱加速。八輪七區間完整 JSON SHA 一致，一日完整曲線另與
+原始 NDJSON parser 相同，當時 raw control 6.71 秒。本機同時仍有下載／
+夜盤／儲存工作，wall 中位數不是獨佔硬體上限或統計顯著性證明。
+
+第一個測量 launcher 因使用 `atomic_write_json` 不支援的 `mode` 失敗；
+修正入口、補八項 worker／路徑／讀回 smoke，保留失敗檔及原始 run，
+從新 `comparison-v2` cache 目錄完成正式八輪。不將失敗改寫成成功。
+獨立准入重算 trial medians、驗證原版 module／原始對照 SHA、完整七範圍、
+16 proof 上限及 warm 成本；30 項 smoke、153 相關回歸後採用，最後版本
+161 passed，包括實際 owner birth／較新程式／舊 owner 收據拒絕測試。
+這些測試有重疊，不相加稱 344 個不同測試；未跑全 repository suite。
+
+01:50 獨立預暖完成，01:51:35 **只重載唯讀 dashboard**，新 invocation
+`1343a444b1ae4f519fdb0d21e7b6d2f8`、PID 138733。01:53 的 runtime
+驗收全部七區間 strict data clock 通過，coverage end 為 01:52:43。
+主 projected cache 2,068,041 rows／31,797,445 bytes，v3 397,785 rows／
+4,418,206 bytes；主收據確實晚於新 process start，而不只是晚於 prewarm。
+新 owner 啟動晚於全部已驗收 code files；兩個原行情／模擬交易 owner
+InvocationID 不變，無 broker／provider／CUDA／source／ledger 操作。
+
+01:55 canonical 20.98 秒取樣仍是 **87 installed＋1 engineering transient**、
+67 timers／3 paths。TAIFEX 面板當時 CPU 約 0.170 core、anon 130 MiB、
+file cache 73 MiB；與 01:18 約 0.333 core／3.91 GiB file cache 的捕獲
+階段不同，尤其重啟會改變 page-cache 的 cgroup 歸屬，**不作正式降幅**。
+FinMind complement 當時約 0.854 core 是下一持續熱點。compactor 的
+新 invocation `b7ce592d7b4142a5bf1b97395ec7c137` 記錄 1,045 memory.high
+events，max／OOM／OOM-kill／swap 為零；soft-limit 壓力仍是待最佳化項目。
+
+01:56 62／62 managed Linux processes 無 GPU device handles；Windows／
+整卡／遊戲 FPS 不在此證明範圍。同次五模式 completed-session consumer
+**0／5 拒用**，`completed_source_generation_changed`，配置一致但目前
+implementation SHA 已變：`factorized_sparse_cache.py`、
+`factorized_sparse_rows.py`、`factorized_sparse_projection.py`。這些是
+同 workspace 其他工作，未由本輪修改；相關收盤 owner 上一次成功為
+23:45，不把舊 generation 重貼成目前成功，也不強迫重算 GPU／重啟
+Gateway／覆蓋 checkpoint。當前目標繼續處理 generation 正常刷新與
+87-service 下一熱點；歷史 2,906 列 gap、OpenBB physical index／ownership／
+容量及次日開盤端到端驗收仍分開保留，不標記全部最佳化完成。
+
+證據：
+
+- [原生短 stack 診斷](../artifacts/operations/running-services-optimization-20261013/taifex-dashboard-native-profile-20261015.json)
+- [原版 module 證明](../artifacts/benchmarks/running_services_20261013/taifex_proof_memo_20261015/original-code-proof.json)、[完整八輪七範圍／增量／暖讀](../artifacts/benchmarks/running_services_20261013/taifex_proof_memo_20261015/comparison-v2.json)
+- [最後 161 項共享回歸](../artifacts/operations/agent-workflow/runs/taifex-proof-memo-final-regressi-20261014T175440-03f0db7d/run.log)
+- [原生獨立預暖](../artifacts/operations/running-services-optimization-20261013/taifex-proof-memo-native-prewarm-20261015.json)、[重載後 owner／全區間／新收據驗收](../artifacts/operations/running-services-optimization-20261013/taifex-proof-memo-native-acceptance-20261015.json)
+- [全 installed 服務及壓力取樣](../artifacts/operations/running-services-optimization-20261013/all-services-after-proof-memo-census-20261015.json)、[GPU 裝置取樣](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-proof-memo-20261015.json)
+- [當前五模式 cache 拒用的完整原因](../artifacts/operations/running-services-optimization-20261013/current-close-cache-after-proof-memo-20261015.json)
+
+## 10 月 15 日 02:08–02:52：workflow 身分邊界修復與 FinMind 原生控制路徑
+
+### 已採用：外地收據不再阻塞無關本機執行
+
+02:08 原生 profiler 的 canonical launcher 被兩份 Vast 回傳的 run 收據阻擋：
+`Workflow.runs()` 對每份紀錄套用本機 host／checkout 驗證，將外地成功宣告
+誤當作不相容的本機紀錄，連無關 task 的 status／新 run 都無法使用。
+保留原收據、原版 workflow 程式及 SHA；沒有刪除紀錄、查外地 PID、偽造
+遠端存活，也沒有把遠端宣告的 exit 0 當成本機成功。
+
+修正 listing 的所有權分類：完整 schema／host／checkout 的外地收據只列
+`foreign_unverified`，allowlist 顯示其宣告結果與來源。定點 read／execute／
+reconcile／寫入仍要求本機身分；同 task／同名未驗證紀錄仍不授權重試或
+完成；格式錯誤仍拒絕，不藉此跳過壞紀錄。50 項 workflow 回歸通過。
+
+02:30 獨立原生 launcher 已實際執行本機驗收：6,382 本機／2 外地未驗證
+收據可並存；定點外地讀取仍拒絕，原 profile 收據 SHA 與修正前完全相同。
+後續 profiler、完整快照 benchmark、回歸及 service census 都從這個已恢復
+的 canonical launcher 留下實際 exit 收據，不把 queued 當成功。
+
+### FinMind：先量測，未達完整收益的候選不部署
+
+實際 owner 維持 invocation `165a95f3e8514ad491fdb7cb28f61654`，MainPID
+1,920,404，Python PID 1,920,445。30 秒／49 Hz py-spy 有 1,840 samples、
+零 errors。主執行緒 `_status` 約 6.92／20.39 weighted sample-seconds，
+約 34%；`incremental_reservation` 約 2.43。這是 stack weight，不是全機
+CPU 百分比、完整下載速率或所有 worker 的可相加 wall time。
+
+唯讀同一 SQLite snapshot 有 3,482,652 tasks；3,421,449（98.24%）具有
+非預設 rows／bytes／日期／attempt 資訊。故不實作「全量計數＋部分統計」
+拆掃描：幾乎全部紀錄仍在部分索引內，另加計數與維護不構成明確省工。
+
+追新預留查詢只涉及 complement 的 21,068 筆 priority-0 非 derived 工作，
+sponsor 約 64–65 筆。先在隔離真實 online-backup 上測 partial covering
+index，保持原查詢、cohort／canary、calendar、due-hour、alias、priority
+與逐項原始資料語意。SQLite 的部分索引須符合查詢 predicate；
+`INDEXED BY` 是必要索引約束而非一般 hint，故固定索引亦只當隔離原型
+比較，未強迫正式 reader 採用。
+[SQLite partial index 文件](https://www.sqlite.org/partialindex.html)、
+[SQLite INDEXED BY 文件](https://www.sqlite.org/lang_indexedby.html)。
+
+初次 12 輪 ABBA 的 reservation 中位數 16.61→7.48 ms；不能據此把完整
+流程／API 吞吐宣告成倍速。同一保留的雙 queue 輸入又完成 18 次平衡三路
+比較，包含完整 native reservation、metadata 讀取、完整 `_status`／selector／
+frontiers／retry summary、JSON fsync，以及每輪各 64 筆 history／release
+task 的 canonical claim／release、每組 128 次 durable transactions。
+所有輸出 SHA 一致，所有 selected task values 恢復，來源佇列未寫入。
+
+| 固定輸入三路中位數 | 原路徑 | 新索引／自動規劃 | 固定索引原型 |
+| --- | ---: | ---: | ---: |
+| 完整 reservation wall | 24.31 ms | 11.63 ms | 17.17 ms |
+| 完整 reservation CPU | 23.46 ms | 11.51 ms | 15.97 ms |
+| reservation＋完整 status wall | 1.877 s | 1.952 s | 1.954 s |
+| reservation＋完整 status CPU | 1.842 s | 1.897 s | 1.915 s |
+
+完整控制路徑波動很大，未證明可靠的整體加速；release 組 64 筆寫入的
+wall 中位數亦為 1.073→1.228 秒，CPU 則 0.0532→0.0455 秒，不把這些
+混合差異都歸因索引。部分索引另外佔 complement 約 1.62 MiB／sponsor
+20 KiB；建置掃描約需 5.5–6.5 秒。**決定不部署此候選**，維持正式
+下載器、配額、交易日與排程。實驗程式收斂到獨立 benchmark helper；
+三個生產檔案逐一 SHA 回讀都與保留原版一致，正式雙 queue 均沒有候選
+index，原服務 invocation／PID 未變。沒有以縮減歷史／跳過驗證換快。
+
+較廣回歸先發現一個只接受 `idx_finmind_outstanding_dispatch` 名稱的舊
+assertion。用保留原版 `_db`／`_next_task` 與候選獨立比較，兩者都走相同
+`idx_finmind_status_covering(dataset=?,state=?)` seek、選同一資料集；不是
+本次造成的退化。測試改為要求指定 dataset **且** outstanding state 的
+有界 seek，並分別覆蓋有／無 status covering index，不接受全表掃描。
+原失敗 run 保留，沒有刪掉測試或略過這個條件。
+
+最後正式程式已復原、原型已隔離的版本：**1,074 passed／81.84 秒**，涵蓋
+60 個 FinMind 測試檔、workflow、runtime、drained idle reload；包含既有
+及新原型／prepared-fixture／clock／cohort／legacy／source-preservation
+測試。48 項前期小集合是重疊驗證，不相加當成不同測試數；沒有跑整個
+repository suite。
+
+### 最新 GPU／收盤 cache 邊界
+
+02:49:57 的 **68／68** 可見 managed Linux processes 完整可讀、GPU owner／
+device handles 均為零；probe 沒有 CUDA 初始化。這不是全 Windows／
+整卡 VRAM／遊戲 FPS 歸因，也不代表所有服務已最佳化完成。
+
+02:51:25 五模式 canonical completed-session consumer 仍 **0／5**：
+`completed_source_generation_changed`，resolved config 相同，但 implementation
+已換代。沒有模型前推、provider 呼叫或 CUDA 初始化；保留既有 cache／
+checkpoint，不硬套舊 generation。後續仍須檢查正常 source-events／
+postclose owner 如何安全完成新世代，不能把 01:03 的成功充作當前成功。
+02:51:46 canonical 21.12 秒新普查為 89 services／67 timers／3 paths，含
+本輪 engineering transient；service-count 變化不是已完成最佳化的證據。
+
+證據：
+
+- [workflow 外地身分／原收據 SHA／原生 launcher 獨立驗收](../artifacts/operations/running-services-optimization-20261013/workflow-owner-native-boundary-20261015.json)
+- [50 項 workflow 回歸](../artifacts/operations/agent-workflow/runs/workflow-foreign-owner-boundary--20261014T181408-693abac1/run.log)
+- [原生 FinMind stack profile](../artifacts/operations/running-services-optimization-20261013/finmind-native-cpu-profile-20261015.json)、[唯讀完整 tasks census](../artifacts/operations/running-services-optimization-20261013/finmind-status-materialized-stats-census-20261015.json)
+- [第一輪完整控制／寫入／planner 比較](../artifacts/benchmarks/running_services_20261013/finmind_release_reserve_20261015.3tw97C/comparison.json)、[固定索引第二輪](../artifacts/benchmarks/running_services_20261013/finmind_release_reserve_20261015.3tw97C/comparison-v2.json)、[相同保留輸入三路比較與拒用決策](../artifacts/benchmarks/running_services_20261013/finmind_release_reserve_20261015.3tw97C/comparison-three-plans.json)
+- [正式源碼原 SHA／native invocation／雙 queue 無候選 index](../artifacts/operations/running-services-optimization-20261013/finmind-native-candidate-not-deployed-20261015.json)
+- [最後 1,074 項共享回歸](../artifacts/operations/agent-workflow/runs/finmind-reserve-final-isolated-r-20261014T184923-3762253f/run.log)
+- [最新 GPU 零 handle 取樣](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-finmind-screen-20261015.json)、[當前五模式 cache 拒用診斷](../artifacts/operations/running-services-optimization-20261013/current-close-cache-after-finmind-screen-20261015.json)、[完整 service resource 普查](../artifacts/operations/running-services-optimization-20261013/all-services-after-finmind-screen-20261015.json)
+
+重現原型用 `run_fintech_python -m scripts.benchmark_finmind_reservation --help`，
+指定新 fixture／output；可用 `--prepared-from` 綁定原收據、保留原輸入，
+用 `--compare-automatic` 做平衡三路比較。這些是本機控制路徑原型，沒有
+正式 API 限額／吞吐／下載完成／GPU 數值結果的接受權。
+
+## 10/15 03:15–03:42：新世代快取的完整數值准入與 Bybit writer 根目錄修復
+
+### 先區分過期快取、程式准入與 GPU 真正工作
+
+02:51 的 0／5 是正確拒用，不是可移除的檢查：既有 Gateway 已載入的
+Python modules 與三份後續修改的 factorized data／model 程式不同。
+source-event path 監測來源與 eligibility，不會因工作樹 Python 改動就
+自動宣告新模型相容。未放寬 `loaded_implementation_identity()`、未縮減
+code member 集合、未把舊 receipt 改寫成新版本，也未動其他工作的程式。
+
+在既有 `benchmark_live_inference.py` 加入兩個明確分離的工程入口：
+
+- `--capture-forward-identity` 沿 canonical preparation／mask／window／來源
+  lease 與最後 identity fence，到真正 forward boundary 就停止。拒絕 model、
+  CUDA、HTTP、發布及歷史訊號生成；forward cache 既不讀也不寫。既有 CPU
+  panel caches 可正常使用。契約 `completed_forward_identity_observer_v1`
+  明確不是數值／artifact 准入。
+- `--forward-control` 只接受完整 input identity 除 code 外一致的既有對照。
+  舊 payload 依原身分完整 SHA／safe CPU readback，候選用私有 cache 正常
+  執行新模型；比較全部 output tree、shape、dtype、auxiliary、NaN bits 與
+  signed zero。不同輸入在 GPU 前即拒絕，不截 top-N、不量化、不省欄位。
+  舊 tensor 不是新模型 forward 的替代品；比對失敗不提交候選 payload。
+
+五模式 CPU input observation 為 1.44–2.79 秒，**全部只有 code 改變**：
+config／checkpoint、完整視窗與 mask、symbols／features、CPU threads、
+AMP／TF32／runtime 均一致。含 14,726 features 的 factorized 模式亦沿
+原 transport，未建立縮小資料集或另設模型。strict CUDA preflight 成功後，
+五模式各正常前推 **一次**，第二輪 cache hit；所有完整輸出位元相等，
+每個模型釋放後 allocated／reserved 均為零，工程 GPU 程序已自行結束。
+
+`install_completed_inference_cache.py` 是**手動明確的已驗證 cache 安裝**，
+不是新增推論服務。它要求 real-new-forward＋warm-hit＋完整 bitwise oracle
+與 GPU release 收據，在 source shared lease 下重新取得 canonical CPU
+identity，再次比對舊對照並以 `cached_forward` 的原 kernel lease／SHA／
+durable commit 安裝新 generation。沒有模型、CUDA、provider、原始資料
+修改或 signal publication。舊 keys／payload／控制記錄都保留。
+
+### 正式 owner 與獨立回讀
+
+03:35:15–03:35:36，canonical `stockagent-discord-postclose-cache.service`
+InvocationID `1795feb8df9443dfaa3a453f482fc855` 終止成功：attempted=5、
+failures=0，來源 warming 與 formal history 不在 cache-only 工作範圍。
+原服務自報 21.036 秒 wall、24.570 CPU 秒、約 1.2G memory peak；這是
+有工作批次，不能當作日常 idle。五正式 forward keys 均接回 current code。
+
+各 fresh CUDA-cold 程序的完整 output digest 與獨立 GPU 控制一致，兩次
+讀取皆 disk hit／GPU calls=0，CUDA 未初始化：
+
+| 模式 | fresh process 完整訊號 | warm 完整訊號 | GPU 前推 |
+| --- | ---: | ---: | ---: |
+| 100m | 2.279 秒 | 0.384 秒 | 0 |
+| factorized scale-separated cash | 1.913 秒 | 0.718 秒 | 0 |
+| multi-basis | 1.928 秒 | 0.395 秒 | 0 |
+| multi-basis 22 | 1.431 秒 | 0.438 秒 | 0 |
+| V8 annual log cash | 4.593 秒 | 0.913 秒 | 0 |
+
+包含完整 preparation、auxiliary 與金融格式化，未控制 OS page cache；
+不是 09:00 latency、券商成交、完整 fold 或 GPU kernel 的單獨時間。
+最新 canonical consumer 另 **5／5 accepted**，沒有 CUDA／provider／模型。
+
+只在既有 idle admission 和 source lease 下再次確認原 owner、六個 protected
+owners、程式、五摘要／keys 與準備窗口不變，才重載 Discord 一次。
+新 InvocationID `c8d04971f9bc4fe88e78aa6538e98021`、wrapper 457438、Python
+457512。獨立 numerical control 與 code-admission control 都接受：Gateway／
+commands sync、五模式 engine ACK zero lag、summary SHA／keys／protected
+owners 不變，runtime code SHA 正確，無 GPU handles、warm-ready、watchdog
+或 fatal。行情、模擬成交、FinMind、TAIFEX／public dashboard owners 均未動。
+下一個自然暖機／09:00 開盤仍需獨立驗收。
+
+03:41:43 **67／67** managed Linux processes 可讀，GPU owners／handles=0，
+probe 不初始化 CUDA。03:42:12 的 21 秒全服務取樣涵蓋 89 services（含工程
+transients）、67 timers、3 paths；Discord 是 **0.01407 CPU core**、
+541,106,176 bytes anonymous、20,164,608 bytes file cache、零 high／OOM
+事件。03:38 的 0.161 core 包含剛重載，不冒充 steady idle 或全機 A/B。
+FinLab／FinMind／backup／storage 仍有真實批次；也不把單卡瞬間約
+3993 MiB／12% GPU 利用率全歸於 StockAgent，Windows 及遊戲 FPS 未驗收。
+
+### Bybit：不能把未掛載／已回收誤作空歷史
+
+原 registered-intraday Bybit 子步驟在 `output_dir.mkdir()` 失敗，因
+`data_bybit` 指向已不存在的 immutable materialization；formal owner namespace
+的 status 證實 **cold-only**，不是只在 IDE namespace 看不到。
+冷庫 latest 有 4,677 files／22.375 GB logical，但不能擅自把它替換成原
+writer generation。原 broken link 固定 release
+`bybit-20260926T051004983477667Z-l0-penguin-857d2f9a99f1b88f`
+仍有全部 objects／manifest，SHA
+`7af635eb057024bd9e26ed0b0c621c0c124c89c93af7469d1c48e090ab272df6`，
+4,677 files／22,357,148,836 bytes。僅 manifest／objects presence 當時
+不等於完整冷恢復；没有mkdir空樹、刪除 link 或寫進 immutable hot cache。
+
+`restore_missing_crypto_workspace.py` dry-run 預設，只允許既有三個 CEX；
+本次 explicit apply 僅 Bybit。固定 release＋manifest SHA＋broken link stat
+身分、32 GiB 剩餘空間、相同 `bybit_source_publish.lock`、真實 mutable root、
+canonical **durable** 全檔 fetch／hash／metadata verification 都保留。
+全驗後使用既有 no-replace rename 到 `/srv/stockagent-live/data_bybit`，
+再原子換 link；未經本次收據的既有 destination 一律不覆蓋。若剛安裝
+workspace 就中斷，仍須全驗後才可續接；失敗 scratch／冷庫／原始證據不刪。
+這不是每日 downloader 的自動 cold-to-hot hook，之後 writer 不再依賴會過期
+的 immutable materialization。還原只證明原 snapshot baseline，追新／歷史
+缺口仍須由原 canonical downloader 的新收據另行證明。
+
+03:40 仍是同一 recovery PID 439596、start_ticks 11121648；native stack
+顯示正在 `verify_packed_snapshot → sha256_file` 冷庫 I/O，不因觀察時間到期
+重啟／複製另一個 owner。**此時尚未換 link，尚未恢復 Bybit 追新**。
+重新使用 system PATH 的 canonical `py-spy` 後實際 dump 成功；先前錯把
+Rust profiler 查到 Python env/bin 的失敗收據保留，不當成來源卡死。
+03:47 的同 PID／start_ticks 10 秒唯讀取樣，rchar／read_bytes 均前進
+176,513,308 bytes，沒有寫入／重啟；約 16.83 MiB/s 是當下冷庫讀取樣本，
+不是完整還原吞吐或全局 ETA。後續要保留同 owner 完成，不能重抓另一份。
+
+### 本輪驗證與證據
+
+最後 11 個 shared 測試檔 **182 passed／14.00 秒**，涵蓋完整 tensor oracle、
+純 CPU observation、qualifier、cache integrity、來源 lease、cache-only owner、
+native idle／loaded-code admission、materialized-cache 與 writer recovery。
+前期 54／62／75、7 項是重疊集合，不相加；首次 wider invocation 指到不存在
+的 `test_data_cache_cli.py`，exit 4／零測試，已用實際存在集合重跑並保留失敗。
+Ruff、git diff --check 通過；沒有聲稱 repository 全測試或全服務最優。
+
+證據：
+
+- [五模式 complete CPU identity 與 code-only 差異](../artifacts/operations/running-services-optimization-20261013/forward-input-generation-comparison-20261015.json)
+- [strict CUDA preflight](../artifacts/operations/agent-workflow/runs/current-close-code-strict-cuda-p-20261014T192625-ccbb1197/run.json)、[五模式一次新 forward／完整舊 oracle](../artifacts/operations/agent-workflow/runs/current-code-full-forward-old-or-20261014T192735-8dc35a6e/run.json)
+- [新 generation canonical cache 安裝](../artifacts/operations/agent-workflow/runs/qualified-new-code-five-cache-in-20261014T193326-ec64860f/run.json)、[fresh CUDA-cold 完整重讀](../artifacts/operations/agent-workflow/runs/fresh-cuda-cold-five-current-cac-20261014T193516-42d9e075/run.json)
+- [5／5 current canonical consumer](../artifacts/operations/running-services-optimization-20261013/postclose-current-five-reuse-20261015.json)、[合格單 owner 動作](../artifacts/operations/running-services-optimization-20261013/discord-qualified-current-code-reload-20261015.json)
+- [新 native numerical control](../artifacts/operations/running-services-optimization-20261013/discord-new-native-numerical-adoption-20261015.json)、[獨立 loaded-code 准入](../artifacts/operations/running-services-optimization-20261013/discord-new-native-code-admission-20261015.json)
+- [67／67 managed GPU 零 handles](../artifacts/operations/running-services-optimization-20261013/managed-gpu-stable-after-code-adoption-20261015.json)、[穩定全服務取樣](../artifacts/operations/running-services-optimization-20261013/all-services-stable-after-code-adoption-20261015.json)
+- [Bybit 原 link／固定 release 身分](../artifacts/operations/running-services-optimization-20261013/bybit-cold-source-identity-20261015.json)、[無寫入 dry run](../artifacts/operations/running-services-optimization-20261013/bybit-mutable-recovery-plan-20261015.json)、[仍在執行的 recovery](../artifacts/operations/agent-workflow/runs/bybit-fixed-cold-to-mutable-reco-20261014T193247-75a17f03/run.json)、[同 owner 原生 stack](../artifacts/operations/agent-workflow/runs/bybit-full-reconstruction-native-20261014T194008-2e590b7c/run.log)、[10 秒原生 I/O 前進](../artifacts/operations/running-services-optimization-20261013/bybit-recovery-live-io-progress-20261015.json)
+- [182 項 shared 回歸](../artifacts/operations/agent-workflow/runs/close-cache-and-recovery-shared--20261014T193451-e74f8fe4/run.log)
+
+技術選擇沿既有 `torch.inference_mode` 與 restricted `torch.load(...,
+map_location="cpu", weights_only=True)`，先減掉沒有需要的 forward，再討論
+kernel／compile。官方亦說明 inference mode 移除 view/version tracking 開銷，
+CPU map 可避免反序列化 GPU tensor 的顯存上衝；不拿文件代替這次本機完整
+實測，也沒有為「最新」直接升級共享 PyTorch 或改精度／checkpoint：
+[inference-mode 官方說明](https://docs.pytorch.org/docs/2.14/generated/torch.autograd.grad_mode.inference_mode.html)、
+[CPU／restricted load 官方說明](https://docs.pytorch.org/docs/2.14/generated/torch.load.html)。
+
+## 10/15 03:55–04:09：FinLab 完整進度清冊的主鍵選擇與原生載入
+
+本輪沿用既有 owner、配額、交易日／發布時程、分鐘優先／tick residual、
+raw Arrow／Polars、完整 source receipt 與單位契約。沒有增加 provider
+呼叫、改造 SDK、放寬 reserve、截斷年份／股票或降低進度更新頻率。
+工程偏好及儲存維運流程要求先量整段工作，固定完整索引、保留每次失敗及
+來源，確認真正部署，不將已在工作的 CPU 當成閒置浪費。
+
+### 原生瓶頸及方案
+
+03:56:45 自然啟動的 FinLab Invocation
+`41aadf4b19164b138b14f295a1504be0`，tick Python PID 507612／start ticks
+11269829，在完整程式身分前後相同下做 20 秒、29 Hz 非阻塞取樣：467 samples、
+6 errors 均保留，約 91.65% 活躍 sample weight 含 `_summarize`。這是
+Python 活躍樣本歸因，不是整機／Windows CPU 百分比。完整本機摘要的額外
+cProfile 對照有 18 次 SQLite execute，累計約 6.019 秒；不是憑名稱猜瓶頸。
+
+`effective_partitions` 原先對 direct／derived 分鐘全體做 `ROW_NUMBER`
+排序，再由每個完整統計／候選查詢消費。改為同一 TEMP view 的主鍵 partner
+probe，對每檔／日只判斷是否有勝出的另一來源：
+
+- direct 成功時優先；direct 失敗只會輸給成功的 derived。
+- 兩邊失敗仍保留 direct；沒有 direct 時保留 derived（含其失敗）。
+- tick 仍獨立；原 rows／bytes／狀態／source origin／檢查時間完全保留。
+
+既有 `(kind,symbol,trade_date)` 主鍵已足夠，不新增持久索引／快取、沒有
+schema migration 或延遲失效；原 transaction 下立即看到修復／新增資料。
+選擇依[SQLite 官方索引／query planner 說明](https://www.sqlite.org/optoverview.html)
+及[官方 EXPLAIN QUERY PLAN](https://www.sqlite.org/eqp.html)實測；不為
+「最前沿」無依據替換共享環境或放鬆財務／來源語意。
+
+### 固定完整資料比較
+
+`benchmark_finlab_effective_partitions.py` 使用 readonly native SQLite online
+backup，再在私人副本執行 canonical `_record`、`_summarize`、完整股票／日曆
+及 bounded hole planner、完整 JSON 發布。原版 SQL 作保留控制，新版直接呼叫
+正式 helper，不用另一份 benchmark-only candidate。來源／正式 schema
+未寫；provider/network 在工程程序中禁止。
+
+最終固定 snapshot SHA
+`d4a64712dc4d4da57f9b0c425bd829d3705d67335e76780c0e9aae2ec33f126d`：
+280,391 原 partition、280,294 effective rows、2,461 股票、5,711 session，
+2003-08-01 至 2026-10-14。完整輸入 context／原版／候選 SQL／每 case DB、
+完整輸出與 cProfile 都保留。64 次 `_record` 仍逐次 commit／即時讀回，
+沒有省略持久寫入來提高查詢分數。
+
+| 固定完整本機流程 | 原版中位數 | 主鍵選擇中位數 | 本次變化 |
+| --- | ---: | ---: | ---: |
+| 索引寫入／讀回＋完整清冊／候選／JSON 發布 wall | 10.293 s | 3.807 s | −63.0%（2.70×） |
+| 相同流程 process CPU | 9.563 s | 3.365 s | −64.8% |
+
+全股票／calendar／FinLab daily footer 的固定輸入 preparation 另量 3.296 秒，
+不是省略它；cProfile 和全部 effective rows 的排序 SHA 是計時外獨立驗證。
+同一 case relation 的每一欄、完整摘要、候選順序及 64 份讀回結果一致。
+OS page cache 未清除，host 仍有真實下載／冷庫工作；不同輪固定 cohort 不
+混算。這是完整本機索引／清冊工作量收益，**不是端到端 API throughput、
+配額上限或全機最優證明**。首次 prototype 280,307-row A/B 亦全量相符，
+但不把其 2.06× 與最終同輪 2.70× 平均成一個不存在的實測。
+
+### 不重啟的正式 adoption
+
+舊 tick owner 04:05:09 以 exit 0 自然完成，未送 signal。相同已部署 timer
+04:06:10 啟新 Invocation `c206f7f9f61e4958aae83e4821560365`、MainPID
+528986；新 tick Python 530318／11324794（同 boot）自然載入新程式。
+`active_run.json` 新增 versioned `partition_index_view` observation，只記錄
+實際已開 TEMP view 的 SQL SHA，不靠磁碟程式檔名稱推定 loaded code。
+
+獨立 verifier 比對完整 benchmark 的 code SHA、native cgroup／cmdline／cwd／
+canonical Python／PID generation、新鮮 progress，實際 SQL 指紋為
+`7e33888a9c178b16e85e1a7cb8f54903ebcbfda59abfad03bec078b48a17f7ad`。
+前後同 owner，attempt 30→31，已成功 11；新近 `5438／5434／5432`
+2026-08-26 分鐘來源的 source receipt、完整 file SHA、rows、bytes 和原
+validator 全部通過。三分區證明是有界獨立 readback，不等於全歷史完整。
+
+434 項相關回歸涵蓋 121 組 direct／derived presence/status、即時修復、實際
+view identity、分鐘/tick priority、Arrow、quota、pipeline/recovery、dashboard
+與 ETA。先前 124／433 是重疊集合不相加。初次 pytest 因 iterator parametrize
+的新 deprecation 被正式 warning gate 拒絕，改成 tuple 而非關閉 warning。
+一輪 canonical comparison 正確因工程 code observer 變更被 generation guard
+拒收，保留失敗，固定最終版本重跑成功；不把該輪時間當正式採用證據。
+
+04:05 全部 68／68 observed managed Linux processes 沒有 GPU handles／owner，
+probe 未初始化 CUDA；04:08 再回讀五個正式收盤模式，5／5 current canonical
+cache 命中，model forward／provider／trading writes＝0、CUDA 未初始化。
+不推論 Windows VRAM／遊戲 FPS 或下一次盤前 readiness。
+
+04:09 新一輪完整清點含 89 services（也含工程 transient）、67 timers、3 paths。
+該 20 秒樣本 Discord 約 0.0149 core／520 MiB anonymous RAM，FinLab 0.471
+core、FinMind complement 0.314 core；兩個 downloader 正在抓取，這不是
+matched-source 全下載 A/B，也不把 89 個觀測項當成 89 個已最佳化服務。
+
+Bybit 還原仍由原 439596／11121648 owner 處理全部固定 source；04:05 已觀察
+實際讀取 31,365,085,367 bytes、寫入 4,097,265,664 bytes，進入有資料寫出的
+完整重建，尚未有 final recovery receipt。這些 I/O counters 不能換算成原值
+完成百分比、ETA 或最新歷史完整。未切換 symlink、未重啟、未清 partial／cold。
+04:11 同 PID generation 的獨立 5 秒重觀測，讀／寫各前進約 56.1 MB；
+有確實 I/O 前進，不由 lock file 或 elapsed time 猜測卡死／完成。
+
+證據：
+
+- [完整 prototype control](../artifacts/benchmarks/running_services_20261013/finlab_effective_relation_20261015/comparison.json)、[固定最終 canonical A/B/B/A](../artifacts/benchmarks/running_services_20261013/finlab_canonical_effective_relation_final_20261015/comparison.json)
+- [正式 PID 非阻塞 profile](../artifacts/operations/agent-workflow/runs/finlab-native-active-python-prof-20261014T200113-a19428c2/run.log)、[保留 467 samples](../artifacts/operations/running-services-optimization-20261013/finlab-native-tick-speedscope-20261015.json)
+- [generation guard 拒收的工程輪](../artifacts/operations/agent-workflow/runs/finlab-canonical-full-index-abba-20261014T200321-057bb339/run.log)、[434 項完整相關回歸](../artifacts/operations/agent-workflow/runs/finlab-view-observer-regression-20261014T200436-99e80d4c/run.log)
+- [新 native connection／同 owner／來源 readback 驗收](../artifacts/operations/running-services-optimization-20261013/finlab-native-keyed-view-adoption-20261015.json)
+- [68／68 managed GPU-cold](../artifacts/operations/running-services-optimization-20261013/managed-gpu-finlab-view-stage-20261015.json)、[五模式收盤 CPU cache 再驗](../artifacts/operations/running-services-optimization-20261013/postclose-five-after-finlab-view-20261015.json)
+- [04:09 完整服務資源觀測](../artifacts/operations/running-services-optimization-20261013/all-services-finlab-native-view-20261015.json)、[Bybit 同 owner 持續重建的 I/O 證據](../artifacts/operations/running-services-optimization-20261013/bybit-reconstruction-stage-progress-20261015.json)
+
+## 10/15 04:14–04:49：FinLab 准入不重建清冊、Bybit 恢復與 IDE watch 壓力
+
+### FinLab：保留資料與排程，只取消不會使用的清冊計算
+
+前一輪原生 profile 已指出 `_summarize` 占 active Python samples 的約
+91.65%。其中 tick 的 minute-first admission 每到既有一分鐘／重置檢查點，
+只是要判斷分鐘缺口是否允許抓 tick，卻重建完整 tick 統計、來源分類、
+4,922 個顯示列及所有 coverage phases，再丟棄除 minute priority 外的結果。
+
+本輪抽出共享 `_minute_priority`，完整網頁清冊仍由 `_summarize` 原 cadence
+更新、欄位不刪減；准入用 `_minute_admission` 僅計算相同的 minute inputs。
+不保存跨 transaction 的舊決定，不改發布、retry、quota reset/drain、開盤
+runway、交易日、上市／退市、分鐘先於 tick 的規則，也不更動 provider call
+cadence／worker／資料範圍。first-date 保留 known-symbol、selected-horizon、
+accepted observation 的原定義，minute 優先、沒有 minute 才用 tick 起點，
+不能用未過濾的全資料 MIN 偷換分母。
+
+保留原 `9d4ff9...` 完整模組 oracle，SQLite online backup 固定全部 280,704
+raw partitions、2,461 股票與 5,711 sessions（2003-08-01～2026-10-14）；
+failure attempt receipts 也先固定，兩組不讀不同時點的 native receipts。
+每輪保留 32 次 canonical durable upsert／effective readback、八次准入、
+前後兩份完整清冊發布與全部 known-gap candidates。只有未發布、未使用的
+中間完整清冊省掉，不用小資料 microbenchmark 代替完整控制循環。
+
+| 同一完整控制循環，中位數 | 原路徑 | 修正路徑 |
+| --- | ---: | ---: |
+| Wall time | 30.603 秒 | 16.734 秒 |
+| CPU time | 30.082 秒 | 16.126 秒 |
+| 有效分區 | 280,607 | 280,607 |
+| 完整輸出 SHA | `6b327394...348a` | 相同 |
+
+ABBA 接受：1.82875×、wall 少約 45.3%、CPU 少約 46.4%。完整準備另計
+5.558 秒；host 非獨占、OS page cache 未清。這是指定完整 index/control
+workflow 的實測，不是整批 SDK／API 吞吐、全機降幅或全域最佳解。
+
+原 563695 owner 跑完 256 attempts 自然離開；原 timer 啟動新 invocation
+`ef9de857...8b1a`，新 tick owner 603516／11496712 的進度收據確實含六次
+已執行准入、實測 1.136 秒及完整決定，不是只用磁碟 code label 證明採用。
+04:41 獨立同 PID-generation／cgroup／canonical Python／cwd／code guard
+回讀，attempt 129→130、success 83→84；三個最近來源的 receipt、全檔 SHA、
+rows、bytes、source validator 全通過。六個交易／quote／FinMind／dashboard
+保護 owner 與基準相同。是已採用的有界工程修正，不是全來源歷史完整。
+
+483 個相關測試包含新增 49 個准入、來源狀態、minute/tick bounds、未知
+symbol、非 session、退市、即時 transaction、08:00 retry reset、stale/future
+runtime clocks 與 fresh-output guard。初次新測試把 reset 前一分鐘當成同一
+週期、使用錯誤 coverage 欄名，修正 fixture/assertion 後通過；沒有放寬規則。
+434／471／483 是重疊集合，不能相加。
+
+### Bybit：完整恢復和增量更新分開證明
+
+原 `bybit-fixed-cold-to-mutable-reco-20261014T193247-75a17f03`／439596 owner
+於 04:28:46 成功完成。固定原 20260926T051004... release、manifest
+`7af635eb...df6`、4,677 files／22.36 GB，complete canonical verification
+後 durable 安裝到 `/srv/stockagent-live/data_bybit`，再原子更新 repo link。
+沒有改用新 head、修改 cold、清 partial、啟動另一個 restore 或建立空來源。
+
+正式 registered pipeline 隨即回到 source 1m hot-tail 增量。04:39:44～04:41:13
+的目前報告：888 symbols、888 updated、793,581,794 logical rows；保留原
+source＋hot-tail canonical reader，不重寫多年 base 來追加一分鐘。
+這是 downloader 的 current run report，不是全歷史品質或供應商分母證明。
+
+新增獨立 native probe 檢查固定 manifest/inventory、所有 original paths、
+三個原件 SHA 及三組真實新 tail／canonical logical reader／OHLCV／closed
+minute timestamps，不重新 materialize cold 或阻擋 live writer。17 個來源
+恢復／reader guards 通過，包括零量合法、null/NaN/負量、未收盤／重複時間
+與 generation change 拒收。工程第一輪在組裝結果時誤用不存在的
+`ResolvedSnapshot.snapshot_id`，已改成 canonical manifest ID 並加完整
+result regression；後續 live-only probe 正確拒收已退出的 native unit。
+不把 watcher／unit 已退出的拒收當來源資料錯誤；加入 provenance/value 與
+native-owner/lifecycle 的分階段結果，`--require-live-owner` 仍可要求完整
+live 准入，native 未觀測時只回報 source readback、不能宣稱 lifecycle ready。
+這些分界補兩個 regression，最後 68 項 focused tests 通過（49 FinLab＋19
+Bybit／恢復）；與前述 500 項共享集合重疊，不相加。
+
+04:57 新一輪獨立 stage probe 實際接受：固定原 manifest/inventory hash、
+4,677 檔／6 dirs／22.36 GB original path scope、三個原件 SHA，以及三組
+新 tail 與 canonical logical reader。新 tail 分別 35,664／35,662／35,662
+rows，三者 latest data＝2026-10-14 20:54 UTC；closed minute、唯一時間、
+有限值、OHLCV 邏輯與兩個物理檔 generation 前後皆相同，當時原生 source
+owner 與 unit 也一致。Probe calls／source writes＝0。
+這不是重新驗所有 evolving mutable file contents 或全部 cold objects，也
+不是全部 symbols latest／全歷史無缺口／服務正常 stop 的證明；相關 claim
+在正式收據明確 false。先前失敗工程收據保留。
+
+正式 main 已 exit＝0、888 更新完成，但 unit 於 stop 階段 timeout。
+journal 同時有 memory/control inotify watch ENOSPC；先處理 host 資源，
+不能為得到綠燈重啟、拉高 stop timeout、跳過來源驗證或偽造 running。
+
+### IDE／host：不讓資料湖變成數百萬 IDE 監看事件
+
+04:45 實際辨識 4078945 為 VS Code `--type=fileWatcher`，不是模型或
+StockAgent downloader；其 inotify fd28 有 **4,187,900** watches，PID1 有
+166。kernel max_user_watches＝4,194,304（另外 instances＝1,024、queued
+events＝32,768）。這不是磁碟沒空間；worktree 當時尚有約 50 GiB free。
+
+採用符合實際安裝 VS Code 1.141.2 schema 的 workspace 設定，保留 editor
+80-tab／dirty exclusion、原 search.exclude，補跨 request-root 的 data_*／
+artifacts glob、明確 local absolute 規則及 JS/TS 的資料輸出排除。只排除
+原始資料與 runtime artifacts 的遞迴 IDE watch；程式、configs、docs、test
+仍維持監看，沒有刪檔、停 service、改 source API 或改 kernel 限制。
+Microsoft 的[監看架構](https://github.com/microsoft/vscode/wiki/File-Watcher-Internals)
+說明 extension request 與 workspace watch 的不同；官方
+[relative-root issue](https://github.com/microsoft/vscode/issues/311908) 亦有相似
+排除未生效回報，但不把別人的 issue 當成本機已證明的同一 bug。
+
+04:49 原 PID 的完整 streamed fdinfo／10 秒 CPU 再樣本：依然 4,187,900
+watches、13,836,959,744 bytes RSS（12.887 GiB）、0.99670 core，單一程序
+就占 UID limit 99.8473%。配置寫入不等於 native 生效；需要 user 儲存
+編輯後 `Developer: Reload Window`，再驗新 owner/watch/RAM/CPU 和服務
+stop outcome。已提出非阻塞詢問；尚未強制關閉 IDE、未聲稱已省掉 13 GiB。
+inotify ENOSPC 與 service stop timeout 的因果仍須釋放後對照。
+
+04:27 五模式 completed-close readback 再接受，model forward／provider／
+trading writes＝0、CUDA 未初始化；65／65 observed managed Linux processes
+無 GPU handles。04:49 全清點 89 services／67 timers／3 paths，Discord 約
+0.0128 core、520 MiB anon，FinMind 約 0.268 core。兩個 sampled batch 換代
+的 CPU 欄為 null，不能填零、不能拿來算改善比例。未測 Windows VRAM、
+遊戲 FPS 或下一次開盤 readiness。
+
+05:01 最終同 generation 再回讀，五個 requested modes 全部接受；model
+forward／provider calls／trading writes＝0、probe 未初始化 CUDA。另一個
+native probe 觀測 68／68 managed Linux processes，GPU owner／device
+handles＝0、觀測期間 service generation 未變。這是當次有界 Linux
+readback，不是整機原子 snapshot、Windows VRAM 歸因或全服務最佳化完成。
+
+這輪沿用工程偏好保留完整來源／輸出／語意，並依儲存維運技能只將已完整
+驗證的固定來源安裝到 mutable workspace；沒有把 cold 或歷史 receipts 當成
+可重寫暫存。目標仍 active，下一優先是 watcher 生效與 canonical source
+服務正常完成／重試；其他服務仍依完整工作量瓶頸清冊逐一處理。
+
+證據：
+
+- [完整控制循環 A/B/B/A](../artifacts/benchmarks/running_services_20261013/finlab_minute_admission_20261015.WddHfnc6/trial/comparison.json)、[固定完整來源及 attempts](../artifacts/benchmarks/running_services_20261013/finlab_minute_admission_20261015.WddHfnc6/trial/fixed-input-context.json)
+- [483 項相關回歸](../artifacts/operations/agent-workflow/runs/finlab-minute-gate-final-regress-20261014T203126-66c06b16/run.log)、[FinLab 原生 shortcut／同 owner／來源 readback](../artifacts/operations/running-services-optimization-20261013/finlab-native-minute-priority-20261015.json)
+- [Bybit 完整原來源恢復](../artifacts/operations/running-services-optimization-20261013/bybit-mutable-recovery-applied-20261015.json)、[保留第一次工程結果組裝失敗](../artifacts/operations/agent-workflow/runs/bybit-recovery-independent-live-20261014T203436-dccb8ebf/run.log)、[保留 native 已退出的拒收](../artifacts/operations/agent-workflow/runs/bybit-live-recovery-proof-final-20261014T204114-e2608c0e/run.log)
+- [Bybit 固定 scope／原件／增量值與 native owner 分階段驗收](../artifacts/operations/running-services-optimization-20261013/bybit-restoration-source-readback-20261015.json)、[500 項正式共享回歸](../artifacts/operations/agent-workflow/runs/finlab-bybit-final-shared-tests-20261014T205111-39f5cc85/run.log)
+- [原生 watcher 壓力與 settings identity](../artifacts/operations/running-services-optimization-20261013/vscode-watch-pressure-after-settings-20261015.json)、[04:49 完整服務資源清點](../artifacts/operations/running-services-optimization-20261013/all-services-after-minute-gate-20261015.json)
+- [收盤五模式 cache-only 回讀](../artifacts/operations/running-services-optimization-20261013/postclose-five-after-minute-gate-20261015.json)、[65／65 managed GPU-cold](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-minute-gate-20261015.json)
+- [05:01 最終五模式同 generation CPU-cache 驗收](../artifacts/operations/running-services-optimization-20261013/postclose-five-final-minute-gate-20261015.json)、[68／68 managed Linux GPU-cold 再驗](../artifacts/operations/running-services-optimization-20261013/managed-gpu-final-minute-gate-20261015.json)
+
+## 10/15 05:05–05:33：全來源 hot-tail 清冊消除日期字串往返及原生驗收
+
+05:05 原 canonical 20 秒級普查保留 89 services／67 timers／3 paths。
+registered intraday 正在真實更新，取樣 CPU 約 5.4377 cores、匿名記憶體
+約 1,328 MiB；FinMind 約 0.235 core、Discord 約 0.0192 core。CPU PSI some
+avg10＝47.91，host 非獨占。不能把資料處理成本或其他工程測試當成盤後
+模型空轉，也不能從一次 batch 取樣推估全天耗用。
+
+一輪 20 秒原生 Bybit profiler 在程序自然完成後未通過同 owner gate；183
+samples／3 errors 只當定位線索，不當正式效能／部署證明。後續八秒 profile
+在原 native owner 上正常結束，108 samples／零 errors、同 PID generation
+與 unit；沒有重開 source。兩次保留原紀錄。
+
+三來源的 `_load_logical_existing*` 都對 tail 日期做
+parse→strftime→sort→parse，再只取比 base latest 新的筆數與最早時間。
+這些 overlap facts 不需要格式化或排序。新增共用 `tail_newer_summary`：
+只有非 NULL、長度 19、完整匹配原生 writer 秒級格式且全部成功解析的字串
+才走單次 Polars 原生解析；未知格式、NULL、時區、次秒、其他 dtype 仍
+呼叫各 provider 的原 normalization／post-parse。重複時間仍重複計數，
+base cutoff 不四捨五入，不用 footer 推算新筆數、不新增「歷史完整」證明。
+價格／成交量／單位、provider 範圍、配額、請求、retry、交易日與收盤 gate
+皆未改。參數與格式依 [Polars 官方文件](https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.str.to_datetime.html)
+核對；使用現行 Polars 1.38.1／PyArrow 25.0.0，沒有盲目升級相依套件。
+
+先保存原三 collector 和原 hot-tail 模組，未接線原型在記憶體只替换相同
+日期 overlap block，其餘完整 function 保留；canonical production 在完整
+benchmark 接受後才接回共享入口。
+
+固定完整 stored universes：Bybit 896／OKX 505／Binance 575，共 1,976
+base paths，包含 retained historical symbols，沒有縮成目前 provider 名單。
+多年 base 合计約 176 GB，只保持唯讀參照及完整 dev/inode/size/mtime/ctime
+前後 guard；全部可變 tail 固定到私人快照，共 1,678,109,330 bytes。
+copy 前後 generation 不同便拒收；不 hard-link mutable source、不修改 cold、
+不為 benchmark 鎖住 native writer。這不是全 host 的原子快照或全部歷史
+values SHA 重驗。快照準備 5.496 秒另計，32 GiB 磁碟 reserve 保留。
+
+每輪完整讀回全部 information tuples（rows、首末時間、interval、error），
+保留初始／最終完整清冊與 JSON durable 發布。A/B/B/A 的四個輸出 SHA 都是
+`f723b78c85571c1b3f3c258e25f83eb87cdab7643308f072e0793c5c4c192d5d`，
+全部 base generations 與 pinned tail SHA 前後相同，native API／source writes＝0。
+
+| 完整三來源 information/control workflow 中位數 | 原路徑 | 新路徑 |
+| --- | ---: | ---: |
+| Wall time | 123.227 秒 | 24.922 秒 |
+| CPU time | 122.207 秒 | 25.579 秒 |
+| 完整 stored symbol 範圍 | 1,976 | 相同 |
+| 完整輸出 SHA | `f723b78c...92d5d` | 相同 |
+
+Wall 少 79.78%、CPU 少 79.07%、吞吐 4.94456×。reference wall 範圍
+104.68–141.78 秒，candidate 22.32–27.52 秒；host 工作並行、OS cache 未清，
+不能把數字稱為全球最優、完整 HTTP／merge／訓練加速或 native 全機降幅。
+
+89 個新語意測試含原生／fallback、時區／次秒、NULL／錯誤／重複時間、
+完整 physical loader／相同異常及來源 bytes 不變。先前較廣集合的 routing-only
+mock 未提供已存在的 `execution_excluded_dates`／`canonical_string_dates`
+audit 欄位，原結果為 KeyError；只補 mock 契約，不放寬 materializer，
+修正後 296 項共享測試通過，production 接線後 358 項相關回歸通過。
+最終版本再以 389 項共享回歸驗證，28.79 秒全部通過，包含 daily materialize
+與 perp scope。上述集合重疊，不相加。另九項 observer guards 驗證：同名 frame 不代表
+正確來源、不同 date projection 拒收、未觀測／owner 换代不能升格成功、
+三個實際 native frame 與 fresh evidence gate；不是全 repository suite。
+
+新 verifier 比對 preserved 完整函式／原 physical loader／normalizer AST
+與已接受原型，只觀察原 timer 的 fresh canonical Python/cwd/cgroup/boot/PID
+generation；五秒低頻並行 profiles 要有實際 `tail_newer_summary` frames、
+前後同 owner／code／六個保護 owner。沒有三個有效 owner 時保留
+`awaiting_native_helper_execution`，最多等 180 秒；不把短批次已完成當資料
+錯誤、不重啟下載。正式 source value readback／all-history／服務 stop outcome
+仍是不同界線，後两項不因本輪 benchmark 變成完成。
+
+05:29:14 正式 registered timer 的三個 fresh native collector 已獨立驗收。
+當時 unit InvocationID 為 `f8c01491cb0848aa97b4c9f7074ffa84`，三個 Python
+程序皆在 producer code 的 05:20:10 世代之後啟動；五秒 profile 的實際
+helper samples 為 OKX 53、Binance 50、Bybit 104，profiler exit 皆為零。
+前後 boot／PID／start ticks、collector code 及六個保護 owner 不變，完整
+live function／physical loader／normalizer AST 與 accepted prototype 相符。
+工程未呼叫 provider、改寫 source 或重啟下載；此證明是入口實際採用，
+不是全部 source values 無缺口，也不是 unit 停止生命週期驗收。
+
+05:32:38 另外重新從 canonical consumer 回讀五個當前收盤模式，5／5
+接受，model forward＝0、provider calls＝0、trading writes＝false、CUDA
+initialized＝false。05:32:32 的 managed Linux GPU audit 可讀 54／54
+程序，GPU owners／device handles＝0，probe 未初始化 CUDA 或改變服務。
+Windows 所有顯存配置仍未歸因，不能把這次 Linux 接受證明說成遊戲 FPS
+或整卡顯存保證。快取仍以實際輸入／模型／程式世代作失效判斷，不因
+「收盤只算一次」忽略後續真正發布的新資料。
+
+05:28 VS Code 舊 4078945 仍在，RSS 約 12.89 GiB；registered main 正常完成
+但 stop 仍 timeout。尚待 user `Developer: Reload Window` 後重驗資源與
+生命週期因果。全服務目標 active，不把這個待決事項擴成其他工作的 blocker。
+工程偏好維持原始值／時鐘／整段輸出，儲存維運技能限制私人快照與唯讀
+base 參照，未回收／改寫 source、cold 或 prior receipts。
+
+05:38:04 再完成原 canonical 普查，仍為 89 services／67 timers／3 paths，
+resource window 21.333 秒。當時前三項 CPU 為 legacy partitions return
+0.660 core、OpenBB L1 compaction 0.624 core、TX history backfill 0.562 core；
+FinMind 0.312、FinLab 0.085 core。CPU PSI some avg10＝1.74、memory＝0.26、
+I/O＝12.30。這些工作狀態與 05:05 不同，不能把 PSI 下降當本輪全機 A/B
+改善；其來源處理、hash／publication 與 idle 成本須再各自定位。舊 VS Code
+watcher 的 RSS 仍約 12.89 GiB，registered main＝0／stop-sigterm 仍待
+生命週期讀回；沒有關閉服務或用提高 inotify limit 掩蓋監看數量問題。
+
+證據：
+
+- [05:05 完整服務清點](../artifacts/operations/running-services-optimization-20261013/all-services-next-bottleneck-20261015.json)
+- [完整 A/B/B/A 與輸出一致性](../artifacts/benchmarks/running_services_20261013/cex_timestamp_overlap_20261015.vmdjKiUu/trial/comparison.json)、[固定全部 source/tail inputs](../artifacts/benchmarks/running_services_20261013/cex_timestamp_overlap_20261015.vmdjKiUu/trial/fixed-inputs.json)
+- [保留自然完成而同 owner gate 拒收的 profile](../artifacts/operations/agent-workflow/runs/bybit-active-next-hot-profile-20261014T210654-f220dca7/run.log)、[八秒同 owner 原生 profile](../artifacts/operations/agent-workflow/runs/bybit-pre-overlap-bounded-profil-20261014T211840-1e2282d6/run.log)
+- [296 項較廣語意回歸](../artifacts/operations/agent-workflow/runs/cex-tail-overlap-semantic-regres-20261014T211537-4a5f6bd1/run.log)、[接線後 358 項相關回歸](../artifacts/operations/agent-workflow/runs/cex-tail-overlap-final-verified--20261014T212412-8af14af0/run.log)
+- [三個 native collector 實際採用](../artifacts/operations/running-services-optimization-20261013/cex-tail-overlap-native-generation-20261015.json)、[最終 389 項共享回歸](../artifacts/operations/agent-workflow/runs/cex-tail-overlap-complete-regres-20261014T213228-f90a7146/run.log)
+- [05:32 五模式當前收盤快取](../artifacts/operations/running-services-optimization-20261013/postclose-after-cex-native-20261015.json)、[05:32 managed Linux GPU 句柄清點](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-cex-native-20261015.json)
+- [05:38 全部服務下一輪資源基線](../artifacts/operations/running-services-optimization-20261013/all-services-after-cex-native-20261015.json)
+
+## 10/15 05:40–06:04：OpenBB 全量成員統計、完整狀態發布與原生採用
+
+上一輪屬 progress：三個 CEX 真正 native 入口與最終 389 回歸已接受。
+這一輪先從 05:38 全服務基線接續。legacy partitions return 的同一個原生
+批次已正常結束，沒有重啟回傳或冷操作。OpenBB 原 05:36:49 owner
+`d606eee187b641a69b086bfe5ec26ae1` 則完整完成 178.99193 秒：
+new／stale／failed／pending 為零、185,963 derivative footers 真正開啟；
+124.162 秒 metadata／source audit、29.353 秒 unassigned selector、
+13.397 秒 status member count、14.954 秒 status publication。晚間已採用的
+reflection cache 繼續有效，並不是讀相同頁面就可取消檔案驗證。
+
+逐 endpoint 的 member cardinality 必須持續核對：缺少、額外、錯置成員
+都要在替換 status 前拒收。本輪改成單一 recursive statement，利用既有
+endpoint index 尋找下一個完整 endpoint，再原生 COUNT 每一個成員；
+仍數齊全部 7,327,309 records，只移除每列 GROUP BY 的分組機器操作，
+沒有拿 segments 的 SUM 當成 members 的校驗，也沒有新增 DB index、
+快取 member 有效性、改來源／rows／units 或增加 provider calls。
+MIN/range seek 的依據見 [SQLite 官方最佳化](https://www.sqlite.org/optoverview.html#the_min_max_optimization)；
+實際 query plan 與收益另外以目前 SQLite、同一真實索引測試，不以文件
+保證 wall time。NULL-capable／未知 type、COLLATE、partial／錯誤／不存在
+index 或 endpoint filters 仍走原 SQL，缺表與未知 DB error 不偽裝成空值。
+
+測試中的 guard 涵蓋 empty、2,100 endpoints（沒有硬編小名單）、Unicode、
+NUL、BLOB、case、重複、filters／SQL 特殊字元、NULL／NOCASE／partial
+index fallback、read-only bytes 與 caller transaction 不變。所有成員
+異常的既有 publication-before-replace checks 仍在共享回歸中執行。
+
+先保存完整原 compactor，使用既有 23,536,005,120-byte 唯讀 private
+archive，不另複製／回收原件；32 GiB 安全 reserve、native 同 2816 MiB
+MemoryHigh／3 GiB MemoryMax、兩個 source threads 保留。私人 manifest
+全檔 SHA／signature、完整 implementation closure 前後固定，沒有 production
+SQL write、API、模型或排程修改。完整 status function 原型只換 member
+query，另外加版本化 observational `member_count_audit`；原所有業務欄位、
+membership reject、full JSON／Parquet durable publication／逐筆回讀都保留。
+它不是 footer/source-contract/value audit 或整段 compaction 的對照。
+
+首次完整 A/B/B/A 所有輸出 SHA 相同，但 reference 第一輪 segment query
+12.639 秒、後輪 0.157 秒；平均 64.07% wall 少幅混入 OS cache 變化，
+**拒絕以此作正式可歸因收益**。另保留單 SQL screen，亦沒有將 23.324 秒
+冷讀與 0.540 秒暖讀稱成 43 倍。其結果只用於定位與完整同值驗證。
+
+後續分開完整暖機 15.194 秒，再以 A/B/B/A＋B/A/A/B 八輪量測整個 status
+發布／全 Parquet 與 JSON 讀回。完整 output SHA 同為
+`9ebb1cf364b2be69325a125327cc402e021573303301bfd41757c9f851e1fb2a`；
+Parquet bytes、全部 endpoint／source／compacted counts 與已有業務欄位一致。
+實際 attempt clocks／private roots 與新的 policy 欄位屬 observational，
+不把它們當數據內容相等或反填原始發布時間。
+
+| 完整 status publication/readback 平均 | 原始分組 | endpoint seeks |
+| --- | ---: | ---: |
+| wall 秒 | 2.298846 | 1.945628 |
+| CPU 秒 | 2.226446 | 1.938485 |
+| 全 source files | 7,327,309 | 相同 |
+| 全 source rows | 334,949,985 | 相同 |
+| endpoints／active segments | 67／185,963 | 相同 |
+
+wall 少 15.365%、CPU 少 12.934%。host 非獨占、OS cache 未刻意清空；
+第一個暖 A 仍 3.128 秒，而後半 B/A/A/B 的均值 wall 約少 10.7%。
+這是保留全部 scope 的較小實測收益，不能稱整機、全下載／全整理的倍率，
+更不能說完整 179 秒工作已降到 2 秒。CPU／RAM/GPU 的原本負擔另驗。
+
+05:55 接回原 `_write_status`，完整函式 AST 等於已接受原型；source
+selection 及 `_mark_stale_segments` 的完整函式未變。24 項新 guards 與
+362 項共享回歸通過、Ruff／diff check 接受；另 18 項 observer guards
+拒絕 running／舊／失敗 owner、incomplete publication、只貼 policy label、
+部分或錯置 endpoint counts、落後 row totals。測試集合有重疊，不相加
+成不同 tests，亦不宣稱 repository 全測試完成。最終相同集合加入 observer
+guards 後為 380 passed／45.40 秒。
+
+儲存維運技能促使本次先保存確實 terminal 的原 native attempt/publication
+與 private fixed archive，工程偏好促使在冷暖混合收益之外完成平衡全流程。
+05:58 確認既有 unit 已 inactive／MainPID＝0 後，只提前啟動同一正式服務
+一次，InvocationID `2785d4184bbe47058a7a250aaba00383`。沒有重啟正在跑的
+owner、另開 compactor、提高 native limits、刪除 L0/cold 或改動 broker。
+06:00 仍為相同實際 native owner；06:01:40 真正成功結束，完整 180.829558
+秒、footer audit 142.998 秒、unassigned 13.093 秒、status 13.223 秒，其中
+member count 11.314 秒。與原 178.992 秒的整段相近；host／I/O 狀態不同，
+這不是整段加速證明。沒有改排程定義；這次提前執行會按既有 OnUnitInactive
+規則自然移動下一次觸發時間。
+
+06:03:40 獨立 observer 接受新 terminal Invocation、目前完整 status AST
+與已測原型一致，以及未變的 source selector／footer function。重新用原
+GROUP BY SQL 直接數齊全部 members，所有 67 endpoint counts 與新 policy
+執行證據、JSON／Parquet／attempt source counts 全相符，7,327,309 files／
+334,949,985 rows／185,963 active segments 保留。probe 未寫 source DB、
+呼叫 provider、初始化模型或變更服務；不是全歷史 values／bitrot 稽核。
+六個事前保存的保護 owner 在讀回時仍相同，不能把 policy label 取代獨立
+資料／完整函式／正式工作接續證據。
+
+06:03:50 另回讀全部五個當前收盤模式，5／5 accepted，model forward＝0、
+provider calls＝0、trading writes＝false、CUDA initialized＝false。
+06:03:41 的 Linux GPU audit 64／64 managed processes 都可讀，owners／
+device handles＝0；Windows 所有配置／整卡／遊戲 FPS 仍未完全歸因。
+舊 VS Code 4078945 的 RSS 約 12.88 GiB，未重新載入、未再掃四百多萬個
+watches 來製造額外負擔；尚待使用者 reload 後驗釋放與 stop timeout 的
+因果。下一輪主要仍定位 footer metadata／source selector 的完整成本，
+全服務目標保持 active。
+
+證據：
+
+- [原 native 全 attempt 與 publication](../artifacts/operations/running-services-optimization-20261013/openbb-before-status-counts-native-20261015.json)
+- [保留單 SQL screen](../artifacts/benchmarks/running_services_20261013/openbb-member-count-index-screen-20261015.json)、[混合冷暖完整對照，未作正式倍率](../artifacts/benchmarks/running_services_20261013/openbb_complete_status_counts_20261015/comparison.json)
+- [暖機分開的八輪完整比較](../artifacts/benchmarks/running_services_20261013/openbb_warm_balanced_status_counts_20261015/comparison.json)、[完整 immutable code/source capture](../artifacts/benchmarks/running_services_20261013/openbb_warm_balanced_status_counts_20261015/fixture.json)
+- [362 項共享回歸](../artifacts/operations/agent-workflow/runs/openbb-status-counts-shared-regr-20261014T215523-37b12edc/run.log)、[只啟動一次既有 inactive service 的交接](../artifacts/operations/running-services-optimization-20261013/openbb-status-counts-native-handoff-20261015.json)
+- [最終 380 項共享回歸](../artifacts/operations/agent-workflow/runs/openbb-status-counts-final-share-20261014T215959-f92ab159/run.log)、[原生完整採用及原 SQL 全量核對](../artifacts/operations/running-services-optimization-20261013/openbb-native-status-counts-accepted-20261015.json)
+- [六個保護 owner 獨立讀回](../artifacts/operations/running-services-optimization-20261013/openbb-status-counts-protected-readback-20261015.json)、[五模式當前收盤快取](../artifacts/operations/running-services-optimization-20261013/postclose-after-openbb-status-counts-20261015.json)、[Linux GPU 句柄清點](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-openbb-status-counts-20261015.json)
+
+## 10/15 06:04 起：OpenBB 全量 footer I/O、平行成本與盤後快取再驗
+
+上一輪是實際 progress：原生完整狀態發布與原 SQL 全量獨立讀回已通過。
+本輪保留既有全量 metadata／physical reflection cache 的所有 source SQL、
+row count、Arrow schema、physical descriptor、完整 metadata、每檔 signature
+與 stale-state 處理。減少的只是 constructor 為「讀取 payload 欄位」建立、
+此 metadata-only caller 根本不用的 nested-column prefix index，以及逐檔
+filesystem inference。不是快取某檔「已有效」或跳過當前 footer。
+
+`FooterOpener` 一個 attempt 共用 LocalFileSystem；metadata-only 子類禁止
+所有 payload read 方法。私有 hook 僅在目前實測 PyArrow 25.0.0 與兩個
+constructor/hook 原碼 SHA 完全相符時啟用，未知版本／修改版用公開 reader。
+URI／permission／bad footer 的非資源例外回原 reader，MemoryError 不重試，
+不把 memory pressure 當 stale source。未知 shape／路徑仍維持原錯誤語意。
+公開能力界線見 [ParquetFile 文件](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetFile.html)
+與 [LocalFileSystem 文件](https://arrow.apache.org/docs/python/generated/pyarrow.fs.LocalFileSystem.html)；
+私有 hook 的收益不是文件保證，而是本機完整測試與原碼 gate 的結果。
+
+另實作但未正式部署的 bounded prefetch：最多 2 workers／4 pending readers，
+按原 SQLite source 順序交回 caller；SQL、proof/cache、state apply 不跨 worker，
+錯誤／取消會 close 所有自己的 reader 並 join 自己的 pool。pending 是數量上界，
+不是 decoded memory bytes 上界。Python 3.12 的 eager map 不能拿來宣稱有界，
+依 [futures 官方文件](https://docs.python.org/3.12/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor)
+與實際錯誤注入驗證。平行不是目的，增加 CPU 卻未改善均值就不採用。
+
+完整 scope 為全部 185,963 successful derivative segments、50,722 SEC view
+source proofs。沿用唯讀 private archive，只複製約 111 MiB 的 segment table，
+不另複製 23.536 GB archive 或 L0 原件；至少 30 GiB reserve。所有 11 個
+執行 code closure 原碼、manifest 全檔 SHA、每檔 source signatures 前後固定，
+每輪 fresh process，native 同 MemoryHigh 2816 MiB／MemoryMax 3 GiB、
+Nice＝15、CPU／IOWeight＝10、threads＝2，沒有 GPU／provider calls。
+
+暖機 116.956 秒／CPU 64.839 秒單獨列出，不算收益；之後鏡像八輪：
+
+| 次序／完整 audit variant | wall 秒 | CPU 秒 |
+| --- | ---: | ---: |
+| 1 adopted | 135.099 | 75.570 |
+| 2 local filesystem | 134.016 | 73.264 |
+| 3 metadata-only | 113.567 | 62.803 |
+| 4 bounded prefetch | 106.991 | 120.093 |
+| 5 bounded prefetch | 139.652 | 120.256 |
+| 6 metadata-only | 128.064 | 77.518 |
+| 7 local filesystem | 102.099 | 77.480 |
+| 8 adopted | 144.698 | 86.679 |
+
+八輪完整結果 SHA 都是
+`0dd42c46b760617764c5c9711b75e0762529074dfa9aca5e6fe38b3c42770619`。
+adopted 平均 wall／CPU＝139.898／81.125 秒；metadata-only＝120.816／70.160，
+少 13.641%／13.516%；local-only＝118.057／75.372，CPU 只少 7.091%。
+以降低常態 CPU 成本為本輪首要目標，選 metadata-only 而不是單純最短 wall。
+prefetch 平均 123.322／120.175，CPU 比 adopted 多 48.136%，也比 serial
+metadata-only 慢；拒絕部署。metadata-only RSS 約多 0.3%，不稱 RAM 改善。
+這是完整 footer phase，不含 source-member/journal audit、views 或整段 compaction；
+不是所有 payload values／bitrot 稽核、API 下載效率或全機加速證明。
+
+host 非獨占、未清 OS page cache；06:30 daily job 與自然 06:32 compactor
+仍照常執行，因此保留逐輪波動，不以單次 106 秒宣稱穩定效能。06:32 的
+舊 reader 正常 owner `644006b340c64336a8c1ce84aae673d5` 完整 171.153342 秒，
+footer 118.686 秒，尚不是新 reader 的正式採用證據。
+
+完整 controls 結束後只補了未採用 prefetch 的 close-error teardown，及不被
+native 匯入的 benchmark factory instrumentation。全部 frozen 11-code closure
+仍保存／逐檔 SHA 驗證；實測 serial helper 的完整 AST 沒改。獨立 observer
+只允許 native import 與 footer factory／observational counter 三處變化，其他
+完整 native module AST、selector、source SQL／units／state semantics 必須相同。
+共用回歸涵蓋 plain／nested／int96／timezone／geo／field IDs／UUID／empty、
+版本／原碼 fallback、壞檔／missing／directory、MemoryError、bounded queue、
+close 失敗不遺漏 reader／pool、完整 source proofs 與既有 compaction lifecycle。
+最終 18 個相關 modules 合計 **430 passed／53.36 秒**，Ruff／修改範圍 diff
+check 通過。focused sets 有重疊、不相加、不宣稱 repository 全 suite 完成。
+
+依儲存維運技能先保存舊 native attempt/publication、六個保護 owner 與資源
+limits，再於 06:46 僅啟動同一個 inactive unit 一次，新 InvocationID
+`00a9af62170c430a9805a89d225136d2`；沒有重啟 active owner／另開 writer，
+沒有冷庫／L0 刪除、交易／配額或 timer 定義修改。06:48 新 owner 正常結束，
+完整 120.913518 秒、footer 95.111 秒、unassigned 9.590 秒、views 10.591 秒、
+status 4.155168 秒。這是本次正式工作觀察值，與舊整段 171.153342 秒的差異
+包含 host／I/O／其他 phase 波動，不稱其降幅為單一 reader 的因果收益。
+
+06:48:52 原 canonical observer 獨立接受 terminal Invocation、全部 185,963
+來源集合六欄位 digest、每檔 file signature、原碼／runtime closure、完整
+native module AST 與 JSON／全 Parquet readback：7,327,309 source files、
+334,949,985 rows、67 endpoints 都相符，new／stale／failed／pending 為零。
+實際 metadata-only opens＝185,963、canonical retries＝0；physical reflection
+cache 為 50,710 hits／12 misses、12 entries／66,789 retained serialized bytes，
+仍低於 64 entries／2 MiB budget，沒有 validity cache、bypass 或 eviction。
+六個保護交易／行情 owner 與 native limits 完全相同；新 observed policy label
+不是單獨的採用證明。observer 沒有 source／service／trading write、provider
+call、GPU 或模型匯入，不把來源統計／schema parity 說成 payload value 稽核。
+沒有改 timer 定義；本次提前啟動依原 OnUnitInactive 規則自然移動下次觸發。
+
+06:47 的 canonical completed-session consumer 再次 5／5 accepted，
+model forward＝0、provider calls＝0、trading writes＝false、CUDA 未初始化；
+同世代收盤只讀 CPU cache。新來源／模型／程式世代仍必須拒用舊鍵，不把
+「一次 cache」解釋成凍結之後的真實更新。68／68 managed Linux processes
+可讀且 GPU owners／device handles＝0，這是 sampled handles，不是全卡 VRAM。
+
+06:36 Windows 兩次唯讀 WDDM 各有 48 process-adapter rows，全部名稱可讀，
+沒有標記 StockAgent reference；Sunshine／DWM／MAA／Code 等 counters 可見。
+整卡另取樣約 3,812 MiB、4% utilization，不能將 counters 相加或把 DWM
+共享 surfaces 當其私人顯存，更不能單憑名稱消除 WSL／Linux attribution 邊界。
+參見 [Microsoft WDDM 計數說明](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/)
+與 [counter accuracy 限制](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/gpu-process-memory-counters-report-wrong-value)。
+未停止任何 Windows 應用；沒有全 Windows 歸因或遊戲 FPS 改善證明。
+
+06:31 全服務基線為 89 services／67 timers／3 paths；daily job 約 4.39 cores、
+7.86 GB anonymous RAM；public status snapshot 仍每約 30 秒使用 14–15 CPU
+秒，下一輪優先處理完整 inventory decode／encode／dirty-source rebuild。
+06:50 正式採用後再完整清點為 88 services／67 timers／3 paths，數量包括
+當時 transient probe owners，不能以一個 unit 的差異推論停止正式服務。
+此時 daily 約 2.08 cores／0.575 GB anonymous RAM，是同一次工作的不同
+phase，不稱其與 06:31 差異為本輪最佳化效果。snapshot 仍約 0.916 GB
+anonymous RAM、Discord 約 0.548 GB；整卡 3,810 MiB／5% utilization。
+六個 localhost projection GET 都能讀到有效回應，但 day-trade／data-monitor
+仍回報 degraded，不能把 HTTP 200 延伸成所有資料完整或 live readiness。
+VS Code 原 12.88 GiB watcher 程序仍待使用者 Reload Window，沒有再次全掃
+百萬 watches、增加 kernel limit 或終止編輯器；stop timeout 仍未證明修復。
+全服務最佳化目標保持 active。
+
+證據：
+
+- [完整 source/code capture](../artifacts/benchmarks/running_services_20261013/openbb_complete_footer_io_20261015/fixture.json)、[暖機分開與八輪 full-scope comparison](../artifacts/benchmarks/running_services_20261013/openbb_complete_footer_io_20261015/comparison.json)
+- [最終 430 項共用語意回歸](../artifacts/operations/agent-workflow/runs/openbb-footer-final-shared-regre-20261014T224313-cf65af74/run.log)、[同一 inactive native unit 交接及舊完整收據](../artifacts/operations/running-services-optimization-20261013/openbb-footer-io-native-handoff-20261015.json)
+- [完整原生採用與全來源集合／signature／JSON-Parquet 獨立驗收](../artifacts/operations/running-services-optimization-20261013/openbb-native-footer-io-accepted-20261015.json)、[六個保護 owner 與原資源限制讀回](../artifacts/operations/running-services-optimization-20261013/openbb-footer-protected-readback-20261015.json)
+- [目前五模式盤後 CPU cache](../artifacts/operations/running-services-optimization-20261013/postclose-during-openbb-footer-native-20261015.json)、[68 程序 Linux GPU handles](../artifacts/operations/running-services-optimization-20261013/managed-gpu-during-openbb-footer-native-20261015.json)
+- [全服務實際資源基線](../artifacts/operations/running-services-optimization-20261013/all-services-during-footer-comparison-20261015.json)、[Windows WDDM／整卡的分離觀察](../artifacts/operations/running-services-optimization-20261013/windows-gpu-during-footer-comparison-20261015.json)
+- [06:50 正式採用後全部服務／資源／六個公開讀取再量測](../artifacts/operations/running-services-optimization-20261013/all-services-after-openbb-footer-native-20261015.json)
+
+## 10/15 07:03：全資料清冊 GC 方案實測拒絕，不關閉全域 GC
+
+正式 snapshot clean hit 仍完整驗證 68,042 個來源路徑；乾淨一輪約 4.83 秒，
+但來源變動時 record cache 的 131 MB JSON 解碼、統計陣列、彙整與持久寫入
+可讓單輪升到約 19 秒 CPU／1.46 GB peak。兩種 phase 不能相減宣稱改善。
+完整 cProfile 診斷涵蓋 decode、逐檔驗證、aggregation、atomic cache/index
+writes；其中 fixture capture／輸出一致性計算另外標明，不當正式單輪吞吐。
+
+先沿原 writer、strict metadata schema、未知型別 stdlib fallback，僅改四個
+暫存 validation Struct 的 GC tracking 做私有試驗；沒有 `gc.disable()` 或
+跳過欄位。ABBA＋ABBA 八輪都驗證全部 68,042 個真實來源的 frozen identity，
+cache bytes 與完整值輸出全部相同；50 項相關語意測試通過。然而 tracked
+中位 wall／CPU＝4.968／4.776 秒，untracked＝5.334／5.244 秒；CPU 多
+9.787%，沒有穩定收益，**拒絕正式採用**。正式 Struct 仍維持 GC tracking，
+既有全域 GC 不變；`verified` 只證明輸出／覆蓋一致，不代表效能接受。
+
+下一個候選改測大量 `non_null` 陣列的延後展開：先完整驗證每個整數／null，
+再保留緊湊表示；所有原始 JSON keys、缺省／顯式 null、任意精度整數、
+未知欄位與 legacy fallback 都須保持。只有特徵計算實際需要時才展開，
+以完整 record＋feature 計算及 JSON 量測，不以單獨 decoder 微測試選型。
+在完整 CPU 中位成本至少少 5%、完整 cache／feature bytes 全相同前，不接入
+正式 reader／writer；不以全域 GC、漏驗證或減少欄位換效能。
+
+證據：
+
+- [完整 record profiling](../artifacts/benchmarks/running_services_20261013/data-monitor-full-record-before-20261015.json)
+- [GC 八輪同輸入及原碼／實際 layout 核對](../artifacts/benchmarks/running_services_20261013/data-monitor-record-struct-gc-abba-20261015.json)
+- [82 項延後統計與 legacy／GC 語意測試](../artifacts/operations/agent-workflow/runs/data-monitor-deferred-semantic-v-20261014T231336-ae77ec57/run.log)
+
+## 10/15 07:16：延後統計展開亦拒絕，完整下游不能省略
+
+相同 68,042 個來源／89,097 個特徵，131,345,213 bytes canonical seed，
+全部 source identities frozen、source count 不縮減。延後展開候選以原碼
+schema 推導嚴格 proof，不新增第二份手維護 schema；完整 int/null 驗證後才
+存 canonical raw fragment，未知／legacy 仍回原讀寫。不使用 float 儲存統計。
+feature zip 每個 member 只展開一次，沒有每欄重解碼或全域永久 retaining。
+
+82 項相關測試通過；完整八輪的 cache bytes、全部 feature JSON bytes、
+任意精度數值與所有來源驗證相同。但完整 record＋feature JSON 流程：
+eager 中位 wall／CPU＝7.882／7.867 秒，deferred＝8.670／8.642 秒，
+CPU 約多 9.9%，未達先定的改善門檻，**拒絕正式 reader／writer 採用**。
+candidate encoder 雖較快，decode 多輪 raw mapping／逐欄轉換及 feature 再
+展開抵消收益；不能只報單獨 encode 的好看數字。private benchmark 整個
+process peak 同時含 fixture、前後拷貝與 parity，不能拿來稱每 variant RAM。
+
+正式 JSON v10、native reader／writer、GC 與來源更新維持。候選只留下可
+重現的私有試驗與精確型別 guard，不產生 deferred cache 或替代服務。
+下一個更小的候選針對 profile 的 326 萬次 Mapping ABC instance check：
+目前 cache 的普通 dict 先用 C-level dict 檢查，其他 Mapping 仍完整走原
+ABC fallback，不刪除 validation。以完整同輸入 record＋feature 發布量測，
+不以 `isinstance` 微測試宣稱整個服務收益。
+
+證據：[完整八輪 record＋feature 結果及代碼指紋](../artifacts/benchmarks/running_services_20261013/data-monitor-deferred-full-abba-20261015.json)。
+
+## 10/15 07:32：dict 快徑的完整計算實測與原生世代讀回
+
+完整 profile 有約 326 萬次 Mapping ABC instance check。JSON cache 本來
+就是 ordinary dict，先做 native dict 檢查，其他 UserDict／MappingProxy／
+Mapping implementations 仍走原 ABC fallback。只改 runtime guard tuple，
+不替換 annotation 的 Mapping、不省略任何 schema／source identity 驗證，
+不改數值、缺值、JSON v10、membership v1、欄位或來源範圍。
+`isinstance` tuple 與 Mapping 的公開語意見
+[Python builtin 文件](https://docs.python.org/3.12/library/functions.html#isinstance)、
+[Mapping ABC 文件](https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping)；
+效能取自本機完整流程，而非文件推論。
+
+第一輪全 namespace 鏡像測得較大收益，但 decode／encode 各階段也隨主機
+負載顯著波動，不能全部歸因於型別快徑。把正式碼改成清楚的 runtime tuple
+並移除 live module 對已拒絕 deferred prototype 的 import 後，再以最終碼
+做第二輪 ABBA＋BAAB。deferred prototype 移至 scripts 的 benchmark-only
+module；正式 `_COUNT_VECTOR_TYPE` 仍只有 list，沒有留下可被 JSON 啟用的
+另一套儲存格式／環境開關。
+
+最終固定 seed 131,288,104 bytes、68,043 unique source paths、89,097
+features；每輪完整 204,129 個 stat/absence observations，逐檔五部分身分
+仍重驗。包含完整 record decode／aggregation／cache/index atomic write，
+完整 feature scan／整數還原／JSON；不含 imports、directory discovery、
+live/cold I/O、footer refresh、全 provider label projection、網路或瀏覽器。
+沒有 OS cache 清空或暫停其他工作；原 input／code SHA 前後相同。
+
+| 順序 | 完整 variant | wall 秒 | CPU 秒 |
+| --- | --- | ---: | ---: |
+| 1 | 原 ABC | 6.244 | 6.212 |
+| 2 | dict first | 7.468 | 7.466 |
+| 3 | dict first | 8.214 | 8.192 |
+| 4 | 原 ABC | 7.252 | 7.219 |
+| 5 | dict first | 7.282 | 7.271 |
+| 6 | 原 ABC | 11.532 | 11.019 |
+| 7 | 原 ABC | 12.027 | 11.675 |
+| 8 | dict first | 12.031 | 10.854 |
+
+完整 cache bytes、feature JSON bytes 與數值輸出八輪全部相同。
+CPU **平均 9.031292→8.445763 秒，少 6.483%**；wall 平均
+9.263430→8.748691 秒，少 5.557%。CPU 中位數少 14.145%，但每輪有
+波動且頭一個 ABBA block 沒有變快；主摘要採較保守的完整平均，不把
+首輪的大幅下降或中位數當固定 SLA／因果純效應。這是減少確知重複檢查
+並通過輸出驗收的 bounded optimization，不是全域最佳解證明。
+
+368 項最新共享回歸通過（10.12 秒），包括 exact integers／non-finite
+fallback、schema drift、partial／unavailable、membership reassignment、
+全量與 shard publisher、原子回讀、source races、Mapping implementations、
+annotation compatibility 及原生 event binding。先前 360／119 tests 有
+重疊，不相加成新的不同測試數。Ruff 與 `git diff --check` 通過。
+
+正式 oneshot 不重啟即自然載入。獨立 probe 沿 canonical generation reader
+核對完整 feature bytes／receipt／revision，重新列出全部 membership，
+再掃每個實際來源 identity，並綁定真正 journal invocation
+`5b2e1a58a8c848c5ac82fde26577c2ca` 的 runtime guards／source root／revision。
+完成後 cache／feature source root 相符，89,097 個公開特徵已讀回；native
+該 clean frame 為 wall 5.608／CPU 5.237 秒、whole snapshot reuse。
+這不是與另一 phase 的 before/after latency 對照，不能稱正式單輪少 6.5%。
+source scan 68,043 中 68,024 有可用 schema，其餘 19 仍是 partial；沒有
+因效能修正改成 complete／零值，也不宣稱所有歷史／訓練資料完整。
+
+第一次獨立 readback 正確拒絕更新中 cache／feature 不同世代；沒有暫停
+來源、拿舊 generation 冒充最新或略過 fence，等 canonical coherent frame
+後再通過。原失敗收據保留，以後續成功驗收 supersede。
+
+07:32 再清點 89 services／67 timers／3 paths（含 transient probes），
+六個 localhost 回應有效，但 day-trade／data-monitor 仍 degraded。
+Discord 約 0.01364 CPU core／416.33 MiB anonymous RAM；不是本輪 A/B
+RAM 降幅。整卡仍約 3,786 MiB／5% usage，Windows 配額尚未完整歸因。
+盤後 probe 的來源邊界另外如下：
+
+- 07:27 最先在 100m 拒絕 `completed_source_generation_changed`。
+- 07:29 官方 source producer 持有更新鎖，五模式均 defer；零 model／CUDA。
+- 07:32 鎖已釋放，五模式仍是 source generation 改變；config／implementation
+  比對全部相符，沒有偽裝成模型／設定升版。是否 pure-forward input key
+  仍相同，尚待 canonical cache owner 驗證，不能推論數值一定改了。
+- 這些是 **正確拒絕的驗收，不是恢復完成**。獨立 jq 分類 run 成功綁定
+  原始診斷；三筆舊 failed receipts 保留並記為 expected-rejection，沒有
+  清除來源缺口、放行舊 cache 或把各模式改成 ready。
+- 45／45 當下可讀 managed Linux processes 無 GPU handles；不代表 Windows
+  整卡為零。artifact event path 仍 failed/resources，既有 retry 排程有開盤
+  保護窗口，沒有為了亮綠燈強制重啟或改排程。VS Code 原 PID 4078945
+  現有 RSS 13,435,568 KiB（12.81 GiB），待使用者 Reload Window；未再次
+  全掃 418 萬 watches 或增加 kernel limit。此分支及新世代 cache 續接保持待辦。
+
+證據：
+
+- [第一輪鏡像全流程](../artifacts/benchmarks/running_services_20261013/data-monitor-mapping-full-mirror-20261015.json)、[最終八輪原始結果](../artifacts/benchmarks/running_services_20261013/data-monitor-mapping-final-mirror-v2-20261015.json)
+- [正式 guard／全世代／完整來源身分獨立驗收](../artifacts/operations/running-services-optimization-20261013/data-monitor-mapping-native-accepted-v2-20261015.json)、[368 項共享回歸](../artifacts/operations/agent-workflow/runs/data-monitor-final-complete-regr-20261014T233432-780cf5a3/run.log)
+- [GC／deferred 正式拒絕決策](../artifacts/operations/running-services-optimization-20261013/data-monitor-gc-deferred-rejections-20261015.json)、[benchmark-only 原型](../scripts/data_monitor_deferred_counts_prototype.py)
+- [更新鎖的五模式拒絕診斷](../artifacts/operations/running-services-optimization-20261013/postclose-mapping-source-diagnostic-20261015.json)、[鎖釋放後的來源換代診斷](../artifacts/operations/running-services-optimization-20261013/postclose-mapping-after-source-guard-20261015.json)
+- [45 程序零 Linux GPU handles](../artifacts/operations/running-services-optimization-20261013/managed-gpu-after-source-guard-20261015.json)、[全部本機服務／排程／公開讀取／資源基線](../artifacts/operations/running-services-optimization-20261013/all-services-after-data-monitor-mapping-20261015.json)
+
+## 10/15 07:51 起：短版盤後快取備援、世代未變不載入資料處理依賴
+
+### 根因與責任分離
+
+07:40 實際 path 為 `failed/resources`（inotify 資源），最後短版 cache
+完成於 05:22。舊 retry timer 排除 07–12 時，且 service 的 ExecCondition
+對所有工作套用完整歷史 owner 的 123 分鐘 runway；實際 06:17 起便不允許
+啟動。新來源世代的 summary 正確拒用，真正缺少的是短版 owner 的續接。
+
+依 [systemd 官方 path 定義](https://github.com/systemd/systemd/blob/main/man/systemd.path.xml)，
+path 使用 inotify，不能將其當成永不漏失的唯一喚醒來源。保留原 path 及其失敗
+狀態，不提高 kernel limit、不終止 IDE；以原有 retry controller／timer 備援，
+不是新增第二個模型／下載／交易管線。
+
+新的 `--request-due-work` 在同一個 CPU-only controller 內分別處理：
+
+- 短版 `stockagent-discord-postclose-cache.service`：10 分鐘 start、90 秒 stop
+  加排隊餘裕，使用 13 分鐘 runway；週中 08:07–13:40 不啟動。其 unit 自身也
+  有相同 ExecCondition，path 事件不能繞過。只有完成收盤的 cache，不載入正式歷史。
+- 完整歷史 `stockagent-discord-artifact-maintenance.service`：原本 123 分鐘
+  runway、retry/backoff/source warming 責任保持不變；沒有為提早 cache 放寬兩小時工作。
+- timer 每分鐘檢查，但不 import Torch、pandas、呼叫 provider 或執行模型；
+  真正 kernel owner/source lock 存在時不重送。相同已請求世代五分鐘 coalesce，
+  中斷後可重試，來源／設定變動可提早喚醒。
+- `systemctl start` 成功只有 dispatch receipt；必須由 canonical worker 讀回
+  所有目標 summary／weights，逐一通過既有 close、freshness、deployment、source
+  reuse gates，並確認前後依賴世代穩定，才寫入 worker acknowledgment。
+  deferred、缺資料、舊 summary、preview、部分失敗都不會變成完成。
+- acknowledge 只是避免重複喚醒的私有證據；每次真正讀訊號仍用原始完整來源／
+  hash／generation gates。檔案 stat 絕不取代金融資料的驗收。
+
+### 常態成本實測與拒絕不實 RAM 數字
+
+首次實測完整 observation 約 1 秒、會載入約 160 MiB 的設定／資料依賴。
+因此 worker 保存可失效的依賴觀察計畫：每一檔原地寫入仍 stat，目錄世代
+涵蓋新增／刪除檔案，繼承 YAML 由 canonical `load_config(source_signatures=...)`
+取得依賴；code、checkpoint、source、factorized manifest／members、選定 market
+環境及產物身分均保留。未變世代不解 YAML、不載入 NumPy／Arrow／Torch。
+這是 advisory wakeup plan，不是另一套金融／factorized source validator。
+
+最終同來源 **3,127 metadata members、五個模式**，最後 shared-reader 修正版本
+的完整 fresh-process A/B/B/A（v3；不挑前輪較大降幅）：
+
+| 整段觀察程序 | 每次完整重解 | 未變世代計畫 | 差異 |
+| --- | ---: | ---: | ---: |
+| 完整 process wall 平均 | 1.3527 s | 0.1552 s | 少 88.5% |
+| process CPU 平均 | 1.1273 s | 0.0864 s | 少 92.3% |
+| post-exec `/proc/self/status` VmHWM 平均 | 163.78 MiB | 23.78 MiB | 少 85.5% |
+
+四輪完整 decision／plan 完全相同，code 與所有來源世代前後一致；無 provider、
+dispatch、模型或 source writes。共享主機、OS cache 未清；這不是完整推論加速、
+正式 controller SLA 或全機 RAM 降幅。v1 benchmark 的 `ru_maxrss` 繼承 fork
+前父程序高水位，使兩組都顯示約 163 MiB；不採用它作記憶體收益，v2 改讀
+post-exec VmHWM，保留兩份原收據。
+
+### 定點部署與目前驗收邊界
+
+原安裝器新增 `--retry-only`，僅更新 retry service／timer 與短版 cache service。
+先保存原三份 unit，strict CUDA preflight 通過後部署；不改寫／重啟 Gateway、
+全歷史、來源、行情或交易服務。07:51 原短版 owner 已由新的正式 controller
+喚醒，逐模式重建新世代；不是手動起另一個推論程序。
+
+最後 **283 項相關回歸通過**（16.66 秒），含 source writer race、真實 flock、
+backoff、clock rollback、新股／原地修正／繼承 YAML／code 新增失效、無 runtime
+import 快徑、partial／preview 不認證、原生 owner／unit／timer／artifact 拒絕條件。
+先前 v1 的 18 項失敗是 fixture 缺少 canonical base config 的 `frequency`，
+修正 fixture 後通過；正式來源與配置未改。測試不相加稱更多獨立案例。
+
+07:51:04–07:53:20 的正式 owner 終端成功，五模式全部完成並 acknowledgment。
+該次 unit CPU 224.188 秒、wall 約 136.044 秒、unit MemoryPeak 6.43 GiB；
+這是一次新來源世代的完整工作，不是常態 RAM、CPU 或先後 A/B 加速。
+07:54 獨立 canonical consumer 在禁止 generate/model、CUDA、provider 的條件下
+通過五模式全數 cache reuse。07:54／07:55／07:56 的真實 timer 各次都只讀
+metadata，`requested=false`、`model_runtime_imported=false`，沒有再次啟動 worker。
+管理讀回第一次因互動 shell 未載入 native `.env` 的 market scope，正確拒絕
+同世代宣告；第二次用與正式 wrapper 相同 env 讀回通過，未放寬 fingerprint。
+
+最後另外修正 lock probe：source 用共享鎖試探，只 defer 真正 exclusive producer；
+job worker 仍用 exclusive 試探。合法長讀取不是更新中，不能因此餓死 cache。
+追加對應測試及最後程式世代原生讀回；控制程式世代變動只喚醒原 worker 再驗證，
+不能使數值未變的模型重算。
+
+07:57 的最後控制程式版本由原 owner 以 **8.507 秒 wall／8.462 秒 CPU**
+完成再驗證，沒有新模型進度／前推。07:58／07:59 兩個不同的正式 timer
+InvocationID 都回報同世代 idle（probe 各 0.0711／0.0612 秒），worker
+InvocationID／CPU 終端計數保持不變，完整 artifact 及 source/code/config
+世代再次讀回相同。最終封存為 `accepted_bounded_postclose_wakeup`，五模式
+canonical CPU reuse、六個保護程序未變與 52／52 managed Linux GPU-handle
+零持有的當下樣本分別驗證；不是僅憑 service active／exit 0 宣稱成功。
+
+07:58 全服務新基線為 88 service definitions／67 timers／3 paths，
+20.945 秒採樣中未觸發新的 resource-pressure finding；六個 localhost GET
+有效，但 day-trade／data-monitor 仍 degraded，OpenBB stopped，未改成綠燈。
+Discord 約 0.01464 core／414.33 MiB anonymous RAM；短版 worker 已退出。
+較高 CPU 是 news 0.510 core、FinMind 0.402 core、backup 0.254 core 等當時
+工作，尚需分清有效吞吐與空轉再做下一批改善，不能因有工作就停服務。
+
+07:54 工作結束後的 49／49 Linux managed processes 沒有 GPU handles，仍只是
+採樣；重建期間允許真正新 input key 的一次推論，不將它冒稱永遠沒有 GPU 工作。
+IDE watcher 的 Reload 及其他服務的完整 profiling 仍在目標內。
+07:53 margin-actions owner 已 inactive，是有終端的 07:30
+排程工作；先前一核 CPU 樣本不能稱它常駐空轉，不為此停用必要操作。
+
+證據：
+
+- [完整 ABBA v3](../artifacts/benchmarks/running_services_20261013/postclose-cpu-wakeup-abba-v3-20261015.json)、[283 項最後回歸](../artifacts/operations/agent-workflow/runs/postclose-wakeup-shared-reader-r-20261014T235606-5ec1525a/run.log)
+- [原生部署前與保護 owner 基線](../artifacts/operations/running-services-optimization-20261013/postclose-wakeup-native-before-20261015.json)、[定點安裝收據](../artifacts/operations/agent-workflow/runs/postclose-wakeup-scoped-install-20261014T235028-a36a5c05/run.log)
+- [五模式禁止模型／CUDA 的獨立 reuse](../artifacts/operations/running-services-optimization-20261013/postclose-wakeup-canonical-reuse-20261015.json)、[原生 env 管理讀回](../artifacts/operations/running-services-optimization-20261013/postclose-wakeup-native-env-after-v2-20261015.json)
+- [最後世代原生讀回](../artifacts/operations/running-services-optimization-20261013/postclose-wakeup-native-final-v3-20261015.json)、[最後五模式獨立 reuse](../artifacts/operations/running-services-optimization-20261013/postclose-wakeup-canonical-reuse-v3-20261015.json)、[兩輪實際 timer／穩定 worker 封存驗收](../artifacts/operations/running-services-optimization-20261013/postclose-wakeup-acceptance-v3-20261015.json)
+- [全服務目前資源／排程／GET 基線](../artifacts/operations/running-services-optimization-20261013/all-services-after-postclose-wakeup-20261015.json)
+- [CPU-only 喚醒](../scripts/discord_postclose_wakeup.py)、[單一 controller 與原 worker](../scripts/run_discord_artifact_maintenance.py)、[獨立只讀 native verifier](../scripts/verify_discord_artifact_wakeup_runtime.py)
+
+## 10/15 08:03–08:29：FinMind 精確分組失效、完整發布實測與原生採用
+
+### 根因、方法與語意
+
+先核對真正的 Python child，不把 shell 當成取樣目標。原 owner 的 35 秒
+nonblocking py-spy 記錄有 381 個 stack weights、7 次取樣錯誤；它是有偏的
+stack 分布，不是精確 CPU 佔比。排程選擇、發布、資料指紋、基線讀取、預留
+配額與完整狀態都有成本；當中完整狀態占樣本 10.76%。同窗口共享 account
+有 59 次 request starts，不等於成功下載或由單一 owner 發出的 59 次。
+
+此次只改善 `_status` 每次重讀全部 tasks 的分組成本，不換來源、排程、配額、
+API 範圍、原始數值、校驗或 durable publication。新增
+`downloader/finmind_status_aggregates.py`，接入原 `_db`／`_status`：
+
+- connection-local TEMP triggers 僅記錄哪些 `(dataset,state)` 已變；實際數值
+  仍用原 SQL 的 COUNT／SUM／MIN／MAX 計算，保留 NULL、整數與 extrema。
+- INSERT、DELETE、identity／REPLACE 可能刪除別組，因此失效整份 memo；
+  一般結果更新只重算改變的群組。沒有變更就不重掃。
+- 外部 writer commit 以 `PRAGMA data_version` 失效；schema／TEMP trigger
+  世代改變重新安裝。未提交交易、普通／唯讀 connection 回到完整 SQL，
+  rollback 只會多失效，不快取未提交的數值。
+- 不新增永久 trigger、main-schema、排程 owner 或磁碟來源副本，不改來源收據。
+
+TEMP 觀察與外部 commit 的設計依據見
+[SQLite TEMP triggers](https://www.sqlite.org/lang_createtrigger.html) 與
+[data_version](https://www.sqlite.org/pragma.html#pragma_data_version)。
+
+### 完整本機工作量，而非只計一條 SQL
+
+固定當時全部 3,572,121 筆真實 tasks 與 16 個 UK 歷史 bodies；每輪共 24,248
+原始列。保留 claim/release、原始校驗、Parquet／Zstd、內容定址與 SHA、舊收據
+保存、指紋／更新觀測、結果落盤、完整 status JSON 與 fsync。最後全部 task
+values 逐列串流比較；四輪完整 status、receipt、Parquet hash 均相等。
+
+| 同輸入 A/B/B/A 平均 | 原版完整 SQL | 精確分組失效 | 降幅 |
+| --- | ---: | ---: | ---: |
+| wall 秒 | 6.502149 | 3.612283 | 44.44% |
+| CPU 秒 | 3.039796 | 1.199340 | 60.54% |
+
+最後四輪固定 nice 15、MemoryHigh 4 GiB／MemoryMax 6 GiB，前後資源限制與
+code/source hashes 相同。這是本機發布 quantum，HTTP 是明確的固定離線輸入；
+不宣稱網路／全機 1.80 倍，也不拿共享 host 的 OS 暖快取差異當冷啟動收益。
+
+初輪 stepped backup 在持續寫入時重頭開始，僅終止自己的工程子程序，原生
+下載未停止；改以有界 read snapshot 固定來源。第二輪完整 parity 有效，但
+工程 cgroup MemoryHigh 在中途改變，**不採其效能數字**，第三輪才是上表。
+不刪除失敗報告、來源或私有比較 fixture。
+
+### 正式載入與獨立驗收
+
+最後完整 FinMind／runtime／workflow 回歸 **1,099 passed，75.48 秒**。
+先前同範圍兩個 browser 啟動逾時保留；未改 UI 或 timeout，獨立 3 個 browser
+案例與完整重跑均通過，僅記錄同時存在的 host I/O 壓力，不推斷唯一原因。
+新增的 clock-readback 與 group/reload focused scope 另 **33 passed，2.29 秒**，
+與 1,099 多數重疊，不相加成不同測試數。
+
+08:23 原 owner 已有 canonical protected-opening wait、兩種 claim table 均為
+零，才由既有 `reload_finmind_at_idle.py` 重載這一個 owner。原最後 Japan
+來源收據／Parquet SHA 與實際 fetch timestamp 未改，五個其他保護 owner
+invocation 未變；不重啟行情、交易、Gateway 或其他來源。
+
+08:29 透過普通唯讀 SQLite connection 執行原來的完整 `_status`，與原生 JSON
+**全部欄位一致**。原生 journal 顯示先 full 121 組、再 unchanged 0 組重算。
+最初驗收誤將 top-level／frontier 兩次獨立時鐘固定成同一值，相差 36 微秒；
+改為依原記錄分別重播，不排除任何資料或時鐘欄位；失敗收據原樣保存。
+當時 FinMind native PIDs 無 GPU device handles，觀察器未 import Torch、
+無 provider request／來源寫入／service control。
+
+正式啟動至完整 status 約 77 秒，stack 指向既有 supplemental seed／populate。
+暖發布的收益不能掩蓋這項冷啟動成本。08:25 的最新全服務 census：89 個
+service definitions、67 timers、3 paths（不是 89 個 active services）；
+21.335 秒窗口 FinMind 為零 CPU 是開盤保護等待，不能當成 .402 busy core
+降到零的效益。Discord 約 1.268 core 正在真正盤前 factorized preparation，
+不是證明盤後 cache 失效；不終止這種必要的開盤工作。六個只讀 HTTP 均 200，
+但部分資料面板仍 degraded／waiting，不宣稱全業務 ready。IDE watcher 的
+Reload Window 與 Windows 整卡顯存歸因仍未解決。
+
+證據：
+
+- [原生取樣摘要](../artifacts/operations/running-services-optimization-20261013/finmind-runtime-profile-summary-v2-20261015.json)
+- [固定資源完整發布比較](../artifacts/benchmarks/running_services_20261013/finmind-group-status-abba-v3-20261015.json)
+- [1,099 項完整回歸](../artifacts/operations/agent-workflow/runs/finmind-final-shared-regression-20261015T002117-e366b7ef/run.log)
+- [既有 owner 閒置重載](../artifacts/operations/running-services-optimization-20261013/finmind-group-cache-native-reload-20261015.json)、[獨立完整 SQL 驗收](../artifacts/operations/running-services-optimization-20261013/finmind-group-cache-native-acceptance-v3-20261015.json)
+- [最新全服務資源普查](../artifacts/operations/running-services-optimization-20261013/all-services-after-finmind-group-cache-20261015.json)
+
+## 10/15 08:31–08:51：保護等待只更新心跳，不重建下載 queue
+
+### 原生根因與修正邊界
+
+原本禁止一般資料抓取的開盤保護期間，600 秒等待結束後仍先跑 `_populate`、
+supplemental seed、worker corrections 與完整狀態，最後再判定不可抓取。
+180 秒原生觀察剛好跨過一次這種重建：用了 18.756198 秒 cgroup CPU，
+實際最後取得來源仍是原 Japan 歷史，來源收據／Parquet hash 均未變。
+180 秒 nonblocking profile 的 336 個 stack weights、8 次錯誤只用來定位
+熱點；inclusive frame 有重疊，不當作精確 CPU 百分比。
+
+沿原 `finmind_scheduling.py`／`finmind_runtime.py` 修正，不新增 queue 或 owner：
+
+- 原來已判定 `protected_opening` 才延伸等待到日曆的 09:10，保留 08:20
+  起點、休市、未知平日、特殊週末交易日的原語意。
+- 每 30 秒僅更新原心跳並檢查本機 canonical 日曆。若官方休市更新解除
+  保護，下一個心跳提早離開；不以 cache 固定失效的日曆結論。
+- Free 日曆自身的更新／重試邊界仍可提早喚醒；普通 release、task、
+  backoff 與 quota 的原排程不改。不為減少 CPU 跳過應執行的工作。
+- 新增一次性的 loaded-runtime SHA／等待截止 journal，區分磁碟程式變更
+  與真正已載入版本；狀態／心跳 ABI、資料範圍、配額及來源收據不變。
+
+### 測試、原生採用與長窗口驗收
+
+最終 FinMind／runtime／workflow scope **1,121 passed，67.73 秒**；工程
+sealer／observer／readback focused scope **62 passed，2.52 秒**，多數與
+前者重疊，不相加稱不同測試數。涵蓋精確窗口、特殊交易日、90 次模擬
+心跳、日曆提早解除、Free calendar refresh／retry 與拒絕錯誤 loaded SHA。
+
+08:38 僅重載自然排空的 Complement owner；新 invocation 的 runtime SHA
+與截止 09:10 均獨立讀回。完整 SQL 與原生 status 全部欄位一致，五個其他
+保護 owner 未變；原實際 fetch clock 與來源檔案 SHA 保留。新 owner 的
+首次初始化仍存在，這次沒有把它算成已消除。
+
+08:39–08:50 的 **690.001122 秒**原生窗口，cgroup CPU 合計 **0.053314 秒**。
+全部觀察仍是 protected-opening／無 active task，同一狀態循環，原生 owner、
+來源及實際取得時間未變。窗口跨過舊循環的 08:48:26 重建邊界，不只是
+在重掃前短暫看到 idle。08:51 的獨立 sealer 驗證目前 owner、loaded SHA、
+完整 SQL、原始回歸 run／log 與輸入證據 hash，接受有界保護等待修正。
+不同長度的含重建／無重建窗口不可當成固定工作量的全下載加速比例。
+
+**剩餘邊界：** Free／Sponsor 仍需各自正式載入及驗收；本次證據尚未證明
+未來 09:10 能重新開始抓取、全部歷史完整，或所有服務最佳化。
+08:42 的 20.808 秒全服務取樣中 FinMind Complement 約 0.000097 core，
+而 storage lifecycle 約 0.307 core、backup stream 0.151 core；其中存在實際
+清冊／同步工作，不把 busy／idle 混作效益。六個 GET 均可達，但部分面板
+仍 degraded／waiting。Windows 整卡顯存與 IDE watcher 重建仍待驗證。
+
+證據：
+
+- [原生保護期基線](../artifacts/operations/running-services-optimization-20261013/finmind-protected-native-baseline-20261015.json)、[690 秒原生觀察](../artifacts/operations/running-services-optimization-20261013/finmind-protected-native-reuse-20261015.json)
+- [定點閒置重載](../artifacts/operations/running-services-optimization-20261013/finmind-protected-idle-native-reload-20261015.json)、[完整 SQL 回讀](../artifacts/operations/running-services-optimization-20261013/finmind-protected-current-sql-acceptance-20261015.json)
+- [獨立長窗口驗收](../artifacts/operations/running-services-optimization-20261013/finmind-protected-idle-acceptance-20261015.json)
+- [1,121 項共享回歸](../artifacts/operations/agent-workflow/runs/finmind-protected-final-regressi-20261015T003626-62df26ad/run.log)、[62 項工程驗收回歸](../artifacts/operations/agent-workflow/runs/finmind-idle-seal-final-contract-20261015T004841-472c942a/run.log)
+- [全服務目前資源與狀態](../artifacts/operations/running-services-optimization-20261013/all-services-after-protected-wait-20261015.json)
+
+## 10/15 08:54–09:04：儲存清冊計畫、watcher 現況與開盤 GPU 邊界
+
+這一段先量測、建立隔離候選，**尚未修改或重啟正式儲存 owner**。
+依儲存維運 skill 使用 PID 1 namespace／原 private Mamba 控制角色；不刪除
+原始資料、暫存、收據或備份，也不變更保存期限、NAS ACK 或容量政策。
+
+### 儲存候選與完整流程判準
+
+`storage-lifecycle` 35 秒 profile：161 個 stack weights、21 個取樣錯誤；
+inclusive `stat` 118、來源 signature lambda 71、`capture_catalog` 88。
+另對真正 backup-stream Python child 做 35 秒 profile：177 weights、16 個
+錯誤，`capture_catalog` 175、`add_metadata` 117、`stat` 65、`lstat` 56。
+這些 frame 互相重疊，不可加總成 CPU 佔比。兩個服務正在做真正的清冊工作，
+不是無效輪詢；採樣期間未停止發布或其他背景工作。
+
+`register()` 原 signature 為同一檔案呼叫 **四次** `stat()`，分別取 inode、
+size、mtime_ns、ctime_ns。候選每個 pass／每個檔案取一次完整 stat_result，
+保持原 ordered tuple、policy bit 及 hash，不跨 pass 記憶，保留最後再驗、
+每小時完整重查與異常回復。完整 capture／SHA／DuckLake／NAS 皆不省略。
+
+隔離 script 只以 AST 精確替換這個 lambda，原 `register` 其餘程式不變。
+先做完整 idle-register replay：真實全 metadata path set、原 mount guards、
+真正 READ_ONLY DuckLake snapshot/count 查詢，以及私有 status／durable readback。
+「新鮮 reuse gate」是明確的工程 fixture，**不是目前來源等於已提交 catalog
+的證明**，不能當作 full-capture 或備份加速；正式來源及 PG 不寫入。
+暖機另列，A/B/B/A 比較，來源集合／指紋、owner、limits 改變便拒絕採用。
+完整 recapture／原生載入驗收仍是後續工作。
+
+原私有控制 runtime 的最後工程 scope **147 passed，15.11 秒**，涵蓋
+完整 idle 回讀、來源變更、read-only catalog 前進、每小時失效、缺失 release、
+恢復／持久化等案例。一般金融 runtime 曾因沒有 `temporalio` 跳過 workflow
+測試；改用本來鎖定的角色後四個 continuation cases 均執行，未安裝新套件
+或放寬 skip。這不是全 repository tests、native acceptance 或全服務最佳化。
+目前正式 worker-ready 的 loaded fingerprint 仍是原 `7fc809f0…`。
+
+### watcher 與開盤 GPU 不混作盤後 idle
+
+08:54 同一 VS Code watcher 實測仍有 **4,187,968 watches**、RSS
+**12,548,108,288 bytes（11.69 GiB）**，23.679 秒窗口約 **0.9992 CPU core**；
+占 UID watch limit **99.8489%**。現有排除設定尚未讓舊 owner 釋放，已非阻塞
+請使用者儲存並 `Developer: Reload Window`；沒有終止 IDE、提高 kernel limit，
+也沒有宣稱已回收 RAM 或解決所有 service stop timeout。
+
+09:01 Windows 兩次 WDDM 取樣各 51 個 process-adapter rows，皆可識別，
+整卡另測約 15,011–15,048 MiB／1–7% utilization。09:02 的 managed Linux
+FD 探針 51／51 可讀，只有正式 Discord owner 持有兩個 `/dev/dxg` handles。
+這是開盤模型保護窗口，不是原 07:59 盤後零 handles 的延伸，沒有為降低數字
+強制清除開盤模型。Windows `vmwp.exe` 與 Linux 服務的 PID／顯存並未完成
+逐一映射；Sunshine／DWM 等 counters 也不能相加成唯一配置。依
+[Microsoft WDDM 說明](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/)
+與[計數器準確度界線](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/gpu-process-memory-counters-report-wrong-value)，
+不把這次取樣當成 VRAM leak、整卡已全部歸因或遊戲 FPS 的驗收。
+
+證據：
+
+- [儲存候選與不變條件計畫](../artifacts/operations/running-services-optimization-20261013/storage-signature-optimization-plan-20261015.json)
+- [storage 原生 profile](../artifacts/operations/running-services-optimization-20261013/storage-lifecycle-profile-20261015.raw)、[backup-stream 原生 profile 摘要](../artifacts/operations/running-services-optimization-20261013/backup-stream-native-profile-summary-20261015.json)
+- [隔離完整 idle replay](../scripts/benchmark_lakehouse_source_signature.py)、[147 項控制角色回歸](../artifacts/operations/agent-workflow/runs/lakehouse-idle-reference-final-c-20261015T010435-2258736f/run.log)
+- [watcher 原生再量測](../artifacts/operations/running-services-optimization-20261013/workspace-watcher-current-pressure-20261015T0057.json)
+- [Windows 開盤 WDDM／整卡](../artifacts/operations/running-services-optimization-20261013/windows-gpu-opening-attribution-20261015.json)、[managed Linux 開盤 FD 清冊](../artifacts/operations/running-services-optimization-20261013/managed-gpu-opening-owner-observation-20261015.json)
+
+## 10/15 09:10–09:17：保護等待結束後的真實下載回讀
+
+900 秒唯讀窗口從 08:58:03 到 09:13:03，正式 Complement InvocationID
+`71fc9d09c4284f3398b3c58fcb871884` 未換代。running 心跳為
+09:10:00.013602；兩秒取樣第一次看見它在 09:10:01.734534。第一個觀察到
+的新 complete 為 09:11:04.656011，不能把心跳時間當作資料完成時間。
+
+以同一 queue 的主鍵直接查回前三個不同的成功項目，沒有掃描 357 萬任務
+或額外呼叫 provider：
+
+| 資料 | 商品 | 新收據 fetched（台北） | 原始列數 | 獨立回讀 |
+| --- | --- | --- | ---: | --- |
+| UKStockPrice | 0ID1.L | 09:11:03.788805 | 2,187 | receipt 身分、Parquet footer／size／完整 SHA 通過 |
+| UKStockPrice | 0IEE.L | 09:11:27.789130 | 1,211 | 同上 |
+| EuropeStockPrice | MLCFD.PA | 09:11:48.798104 | 6,862 | 同上 |
+
+舊 JapanStockPrice／2722.T 的 receipt bytes／Parquet SHA 在等待、恢復
+及獨立回讀後均未改變。驗收僅限 Complement 的這個跨界窗口；Free／Sponsor
+仍需各自的 loaded-code 採用，未宣稱全歷史完整或所有 queue 已完成。
+900 秒混合了等待與真正下載，89.705514 秒 CPU **不可**與純等待 690 秒
+取樣做吞吐／節省比例。沒有提前解除開盤保護，也沒有變更 provider 配額。
+
+新增 verifier 的 47 項相關測試通過（包含既有等待／封存／儲存 fixture，彼此
+重疊，不與 1,121 相加）；拒絕舊成功時間、只有心跳、owner／來源變動、
+超時喚醒、錯誤列數與 SHA。正式驗收只讀 queue、receipt 和原始檔，沒有
+請求 provider、重排 queue 或重啟服務。
+
+儲存的首次完整 idle replay 在 09:13 被拒絕：09:11 fixture 為 catalog
+snapshot 566／1,883 releases，09:12 正式 owner 已提交 567／1,884 releases，
+私有 replay 依原程式落回 full capture，工程入口正確拒絕代替正式 publisher。
+原失敗 log 保留；沒有修改 reuse 條件、停止 producer 或宣稱候選加速。
+09:15 另啟一次新 fixture 對照，目前正式儲存程式與 worker 尚未修改。
+
+證據：
+
+- [900 秒原生跨界觀察](../artifacts/operations/running-services-optimization-20261013/finmind-native-opening-resume-window-20261015.json)
+- [三份新來源的獨立驗收](../artifacts/operations/running-services-optimization-20261013/finmind-native-opening-resume-acceptance-20261015.json)、[回讀程式](../scripts/verify_finmind_opening_resume.py)
+- [47 項回歸](../artifacts/operations/agent-workflow/runs/finmind-opening-readback-contrac-20261015T011653-a0eafad7/run.log)
+- [首次儲存對照拒絕](../artifacts/operations/agent-workflow/runs/lakehouse-full-idle-signature-ab-20261015T011019-ce1aa0e5/run.log)
 
 ## 測試與重現
 

@@ -17,8 +17,12 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
+
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bs4 import BeautifulSoup
 from lxml import etree
@@ -54,6 +58,7 @@ def require_diagnostic_owner_scope(config, registry, canonical_config, canonical
 FAILURE_PROBE_CODES = (
     'body_not_found', 'article_attribution_not_verified',
     'article_title_not_verified', 'article_identity_not_verified',
+    'invalid_bulk_publication_clock', 'article_rights_or_scope_excluded',
 )
 
 
@@ -477,7 +482,7 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                                 _visible(node)
                         except NewsError:
                             item["reviewed_current_byline_scope"] = False
-                if source.provider in {"nownews", "ftvnews", "voa_chinese", "voa_cantonese"}:
+                if source.provider in {"nownews", "ftvnews", "voa_chinese", "voa_cantonese", "tvbs"}:
                     # Public credits/clocks only, including failed original-
                     # scope decisions. Never retain a third-party/paid body to
                     # diagnose an old newsroom label or subsite DOM layout.
@@ -485,7 +490,10 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                         "classes": n.get("class"), "content": n.get("content"),
                         "text": n.get_text(" ", strip=True)[:200]}
                         for n in soup.select('meta[itemprop="author"][content], .mainBlk .infoBlk .info > p, '
-                                             '.newsInfo, .news-status > li, .articleInfo, .news__author')[:10]]
+                                             '.newsInfo, .news-status > li, .articleInfo, .news__author' +
+                                             (', main > div > div > header li, main > article > div a[href^="/author/"], '
+                                              'article#article-content > header a[href^="/author/"]'
+                                              if source.provider == 'tvbs' else ''))[:10]]
                     item["publisher_declared_articles"] = []
                     for node in soup.find_all("script", type="application/ld+json"):
                         try:
@@ -496,6 +504,12 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                         except (ValueError, TypeError):
                             continue
                     item["publisher_declared_articles"] = item["publisher_declared_articles"][:8]
+                    if source.provider == 'tvbs':
+                        from downloader.news_fulltext_tvbs import tvbs_validation_metadata
+                        item['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=response.url)
+                    if source.provider == 'ettoday':
+                        from downloader.news_fulltext_ettoday import ettoday_validation_metadata
+                        item['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=response.url)
                     if source.provider in {"voa_chinese", "voa_cantonese"}:
                         declarations = item["publisher_declared_articles"]
                         declaration = declarations[0] if len(declarations) == 1 else {}
@@ -728,7 +742,7 @@ def main(argv=None):
     selection.add_argument('--current-failure-provider', help='Select current due missing-body failures after draining the canonical producer')
     parser.add_argument('--maximum-failure-probes', type=int, default=4)
     parser.add_argument('--failure-code', choices=FAILURE_PROBE_CODES, default='body_not_found',
-                        help='Explicit observed missing-article failure; title/attribution/identity diagnosis is metadata-only')
+                        help='Explicit observed missing-article failure; validation diagnosis is metadata-only')
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--retain-reviewed-response", action="store_true", help="Retain private public diagnostics, not accepted bodies or denied/member responses")
     parser.add_argument("--trace-access", action="store_true", help="Record private bounded redirect/header/robots structure through the same HTTP path")
@@ -738,7 +752,7 @@ def main(argv=None):
     if args.failure_code != 'body_not_found' and (
             not (args.current_failure_provider or args.require_current_missing_body_failure)
             or args.retain_reviewed_response):
-        parser.error('title/attribution/identity failure diagnosis requires current failed-head preflight and metadata-only output')
+        parser.error('validation failure diagnosis requires current failed-head preflight and metadata-only output')
     if len(args.probe) > 16:
         parser.error("at most sixteen explicitly selected probes")
     config, registry, repo = load_config(args.config)

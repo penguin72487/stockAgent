@@ -6070,7 +6070,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript
     assert "historyRows || data.benchmark_marks" not in javascript
-    assert 'href="styles.css?v=25"' in html
+    assert re.search(r'href="styles\.css\?v=[1-9][0-9]*"', html)
     assert 'class="compact-table event-table"' in html
     assert "分鐘來源未齊" in javascript
     assert "response.status === 429" not in javascript

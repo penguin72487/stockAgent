@@ -109,6 +109,31 @@ def parser_repair_changed(source, previous_capture, previous_identity):
     return True
 
 
+def ftnn_clock_only_parser_repair(source, previous_capture):
+    """Exact prior capture: same source/auth/scope with only adapter v1 -> v2.
+
+    Registry-normalized HTTP identity is the old complete capture payload,
+    not an arbitrary permission alias. Unknown versions or changed scopes do
+    not receive this special retry, nor skip ordinary future parser repairs.
+    """
+    return bool(source and source.allowed and source.provider == 'ftnn'
+        and source.embedded_article_layout == 'ftnn_visible_article_v1'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.http_capacity_source_fingerprint)
+        and previous_capture == source.http_capacity_source_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def tvbs_native_v2_parser_repair(source, previous_capture):
+    """Only the exact prior TVBS v1 capture, not changed rights/source scope."""
+    return bool(source and source.allowed and source.provider == 'tvbs'
+        and source.embedded_article_layout == 'tvbs_visible_article_v2'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.http_capacity_source_fingerprint)
+        and previous_capture == source.http_capacity_source_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
 def discovery_selection_sql(statement, readiness_rows):
     """Same full selection, with a bounded sparse/dense physical plan choice.
 
@@ -930,6 +955,8 @@ class NewsQueue:
         self.recheck_cnyes_native_v16_declarations(prior_sources.get('source_capture_fingerprint:cnyes'))
         self.recheck_changed_cnyes_parser(prior_sources.get('source_capture_fingerprint:cnyes'),
                                          prior_parsers.get('source_parser_repair_fingerprint:cnyes'))
+        self.recheck_ftnn_release_clocks(prior_sources.get('source_capture_fingerprint:ftnn'))
+        self.recheck_tvbs_native_credits_and_clocks(prior_sources.get('source_capture_fingerprint:tvbs'))
         self.recheck_changed_feed_parser(prior_sources, prior_parsers)
         self.recheck_taiwanhot_native_views(prior_sources.get('source_capture_fingerprint:taiwanhot'),
                                           prior_parsers.get('source_parser_repair_fingerprint:taiwanhot'))
@@ -973,6 +1000,8 @@ class NewsQueue:
                     self.db.execute("UPDATE articles SET state='pending',due=0,error_code=NULL "
                                     "WHERE host=? AND state='awaiting_authorization'", (host,))
                     if (parser_changed and source.provider != 'cnyes'
+                            and not ftnn_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ftnn'))
+                            and not tvbs_native_v2_parser_repair(source, prior_sources.get('source_capture_fingerprint:tvbs'))
                             and not (source.provider == 'taiwanhot'
                                      and source.embedded_article_layout == 'taiwanhot_visible_article_v3')):
                         # Retry parser failures only after a parser repair,
@@ -1108,6 +1137,83 @@ class NewsQueue:
         self.migrate_parser_repair_lanes()
         self.migrate_unknown_cnyes_body_rechecks()
         self.migrate_unknown_cnyes_identity_rechecks()
+
+    def recheck_ftnn_release_clocks(self, previous_capture):
+        """One retry of exact old native clock failures; never erase evidence.
+
+        Only unleased, genuinely missing terminal clock failures from the
+        unchanged prior source/scope enter the existing retry lane. Attempts,
+        due, validators, original errors/observation clocks and all healthy or
+        unrelated failures remain intact. The durable marker prevents loops
+        after restart, and an unresolved source mismatch becomes terminal again.
+        """
+        source = self.registry.sources.get('ftnn')
+        if not ftnn_clock_only_parser_repair(source, previous_capture):
+            return
+        marker = 'ftnn_native_release_revision_recheck_v1:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        with self.db:
+            rows = [dict(row) for row in self.db.execute('SELECT id,url,attempts,due,last_checked_at_utc '
+                'FROM articles INDEXED BY dispatch WHERE provider=\'ftnn\' '
+                "AND state='invalid_bulk_publication_clock' AND error_code='invalid_bulk_publication_clock' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url')]
+            repaired = []
+            for row in rows:
+                if not re.fullmatch(r'https://www[.]ftnn[.]com[.]tw/news/[1-9][0-9]*', row['url']):
+                    continue
+                count = self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount
+                if count != 1:
+                    raise ValueError('exact_native_clock_failure_changed_during_repair')
+                repaired.append({key: value for key, value in row.items() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'invalid_bulk_publication_clock', 'target_state': 'retry',
+                'rows': repaired, 'attempts_due_error_and_observation_preserved': True,
+                'refusals_leases_stored_heads_finite_cohorts_or_unrelated_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count('ftnn', 'native_release_revision_clock_rechecks', len(repaired))
+
+    def recheck_tvbs_native_credits_and_clocks(self, previous_capture):
+        """One normal retry of proved v1 parser defects, preserving evidence.
+
+        Unknown rights outcomes are not bulk-reopened: only the one original
+        whose native translator credit was actually inspected joins the
+        clock/attribution cohort. Bodies, leases, denies, future deadlines,
+        other failures and every original observation remain untouched.
+        """
+        source = self.registry.sources.get('tvbs')
+        if not tvbs_native_v2_parser_repair(source, previous_capture):
+            return
+        marker = 'tvbs_native_credit_clock_recheck_v2:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_tvbs import tvbs_request_identity
+        with self.db:
+            rows = [dict(row) for row in self.db.execute('SELECT id,url,state,attempts,due,last_checked_at_utc '
+                "FROM articles INDEXED BY dispatch WHERE provider='tvbs' AND state=error_code "
+                "AND (state IN ('invalid_bulk_publication_clock','article_attribution_not_verified') "
+                "OR state='article_rights_or_scope_excluded' AND url='https://news.tvbs.com.tw/money/4033506') "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url')]
+            repaired = []
+            for row in rows:
+                identity = tvbs_request_identity(row['url'], requested=True)
+                if identity is None or identity[0] != 'news.tvbs.com.tw' or identity[1].startswith('/exhibition/'):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('exact_tvbs_native_failure_changed_during_repair')
+                repaired.append({key: value for key, value in row.items() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 2, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'unknown_rights_refusals_leases_stored_heads_finite_cohorts_or_unrelated_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count('tvbs', 'native_credit_clock_rechecks_v2', len(repaired))
 
     def recheck_taiwanhot_native_views(self, previous_capture, previous_identity):
         """Pinned v1 URI admission defects, not body failures/source refusals.

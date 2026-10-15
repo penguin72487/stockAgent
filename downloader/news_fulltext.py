@@ -181,6 +181,14 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         if (not taiwanhot_request_ids(request_url) if route_views else
                 taiwanhot_article_id(request_url, requested=True, native_view=native_view) is None):
             raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
+        from downloader.news_fulltext_tvbs import tvbs_request_identity
+        if tvbs_request_identity(request_url, requested=True) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout == 'ettoday_visible_article_v1':
+        from downloader.news_fulltext_ettoday import ettoday_request_identity
+        if ettoday_request_identity(request_url, requested=True) is None:
+            raise NewsError('unsupported_article_path')
     if row.get("body_sha256"):
         if row.get("etag"):
             headers["If-None-Match"] = row["etag"]
@@ -191,6 +199,20 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     if response.status == 304:
         return None
     _require_article_response(response, source)
+    if source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2', 'ettoday_visible_article_v1'}:
+        # Transport may upgrade a literal HTTP link; it cannot replace its
+        # article/category/host with another currently available report.
+        if source.embedded_article_layout == 'ettoday_visible_article_v1':
+            from downloader.news_fulltext_ettoday import ettoday_request_identity as request_identity
+        else:
+            from downloader.news_fulltext_tvbs import tvbs_request_identity as request_identity
+        if request_identity(response.url) != request_identity(request_url, requested=True):
+            from downloader.news_fulltext_diagnostics import FailureResponse
+            error = NewsError('article_identity_not_verified')
+            error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
+            raise error
+        if response.url != request_url:
+            resolution_basis = f'verified_{source.provider}_same_host_path_source_redirect_v1; original_frontier_url_retained'
     if source.embedded_article_layout in {'taiwanhot_visible_article_v1', 'taiwanhot_visible_article_v2', 'taiwanhot_visible_article_v3'}:
         mismatch = (not taiwanhot_request_ids(response.url).intersection(taiwanhot_request_ids(request_url))
                     if route_views else taiwanhot_article_id(response.url, native_view=native_view)
@@ -252,8 +274,8 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
                 if metrics:
                     metrics.count(source.provider, "content_access_refusals")
                 raise NewsError("access_challenge", retry=True, delay=900) from None
-            if error.code in {'body_not_found', 'article_identity_not_verified'}:
-                from downloader.news_fulltext_diagnostics import FailureResponse
+            from downloader.news_fulltext_diagnostics import FailureResponse, VALIDATION_METADATA_CODES
+            if error.code in {'body_not_found', 'article_identity_not_verified', *VALIDATION_METADATA_CODES}:
                 # The worker transfers the already-fetched response only.
                 # Bounded storage and SQLite budget belong to the queue owner.
                 error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint,

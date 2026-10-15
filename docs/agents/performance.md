@@ -75,6 +75,66 @@ Mechanism/adjoint tests, retained numeric rejections, full artifact/financial-ow
 checks and CPU-readable off-node results are in
 [the resident rewrite report](../gpu_architecture_rewrite_2026-10-14.md).
 
+### Buffered ledger graphs: 2026-10-15 observation
+
+The same selected d32/lookback32 workload uses event-compressed accounting in
+training. Test that actual path before timing a full fold; an enabled flag with
+zero forward/backward replays is a rejected integration. The dedicated graph
+owner uses fixed buffers, date tensors and bounded saved-tape leases; restore
+each backward's external source, preserve pending forwards, and replay the
+canonical executor if the terminal-flat financial certificate fails. Explicit
+graphs require inner Inductor graph trees disabled. Inference-first construction
+must leave tensors usable by later training and mutation checks.
+
+Repeated source staging needs a separate immutable, byte-bounded prepared-batch
+cache. Pin under the owning device and complete asynchronous transport before
+claiming its time. Cache normalized CSR derivatives using source identity and
+the exact fold-fitted normalizer, verify typed arrays/hashes on reuse, and retain
+source receipts and damaged generations. Do not cache learned projections or
+optimizer-dependent outputs. Separate initial cache fill, fresh-process reuse,
+steady complete epochs and isolated accounting speed.
+
+Common-source A/B/B/A on the selected dual-RTX-5090 d32/lookback32 fold11,
+global128/local64 workload measured complete steady MAX-rank epochs
+18.456 -> 5.570 seconds (3.313x throughput), and fresh-process complete four-epoch
+folds 481.042 -> 171.358 seconds (2.807x). Both candidate trials reused a verified
+normalized-CSR disk cache; this is not a new-node first-fill measurement. All
+validation/test/curves/plots/checkpoints/final replay were retained. Peak GPU
+memory was 28194 MiB with at least 4.3096 GiB headroom. At that acceptance, source
+prototype v13 backed the independent ablation v11 root; `--ledger-graph` had
+35/35 remote dry-run/calendar gates passed and the formal queue was stopped.
+Reject incompatible optimizer resume rather than copying v10 checkpoints.
+
+A separate complete-train-epoch Nsight capture still shows host gaps, source
+transport and rank imbalance. GPU activity includes NCCL waiting and is not SM
+or Tensor Core occupancy; neither 100% useful utilization nor a global compute
+limit was established. Rejections, mechanism tests and admission evidence are in
+[the ledger report](../ledger_block_optimization_2026-10-15.md).
+
+### Whole-session fusion and bounded device prefetch: 2026-10-15 observation
+
+Compile the canonical funding, execution, closing, financial certificate and
+state update as one fixed session step inside the existing saved-adjoint graph.
+Retain native sensitive FP64 scan boundaries and canonical fallback. A graph
+program owns input schema rather than one source row view: a row view can pin an
+entire field-major device tape. Stage at most the next 32 source rows on a copy
+stream, record the allocation's consumer lifetime once per field, and expand
+the suffix on its consuming stream. CPU source caches must remain CUDA-free.
+The compiled step has its own checkpoint fingerprint; reject incompatible resume.
+
+Same-source v19 A/B/B/A versus the already buffered/cached implementation measured
+complete steady MAX-rank epochs 5.595056 -> 5.000720 seconds (1.118850x throughput).
+Complete four-epoch folds were 170.356601 -> 173.429279 seconds, 1.80% slower;
+the selection serves the formal many-epoch workload, not a cold short-run speedup.
+All validation, tests, plots, checkpoints and final replay remain. Peak memory
+was 30576 MiB with 1.983398 GiB minimum headroom on the named dual RTX5090 d32/L32
+global128/local64 workload; unmeasured variants retain their OOM capacity policy.
+391 CPU checks, 13 remote GPU checks, canonical real-action forward/VJP and all
+16 resume transitions passed; four folds/311 files/eight checkpoints were
+SHA-verified off-node and checkpoints CPU-loaded. The shell now selects the
+independent fused v12 root, bound to source prototype v19. Current formal launch
+proof and remaining recurrence/rank-tail boundaries are in the ledger report.
+
 ## Remote node selection
 
 The user's 2026-10-03 instruction requires every remote build to use that node's

@@ -131,6 +131,78 @@ def test_other_host_receipt_cannot_describe_local_processes(workflow):
         workflow.read(workflow.task_path("repair"))
 
 
+@pytest.mark.parametrize("foreign", ["host", "checkout"])
+def test_foreign_run_is_visible_but_never_observes_local_pid_or_log(workflow, monkeypatch, foreign):
+    run = prepare_run(workflow, monkeypatch, [sys.executable, "-c", "print('local')"])
+    remote = {**run, "run_id": "remote-run", "state": "running", "exit_code": 0,
+              "process": {"pid": os.getpid(), "start_ticks": "untrusted", "boot_id": "untrusted"},
+              "log": str(workflow.root / "must-not-read-foreign.log")}
+    if foreign == "host":
+        remote["host"] = "remote-node"
+    else:
+        remote["repo_root"] = str(workflow.root.parent / "other-checkout")
+    path = workflow.run_path("remote-run")
+    save(path, remote)
+    before = path.read_bytes()
+    # Local queued records do not probe process_identity. The foreign running
+    # record must not probe a matching local PID, despite declaring success.
+    monkeypatch.setattr(workflow_module, "process_identity", lambda _: pytest.fail("foreign PID was observed locally"))
+    rows = workflow.runs()
+    observed = next(row for row in rows if row["run_id"] == "remote-run")
+    assert observed["state"] == "foreign_unverified" and observed["reported_state"] == "running"
+    assert observed["exit_code"] is None and observed["reported_exit_code"] == 0
+    assert "process" not in observed and "log_size_bytes" not in observed
+    assert path.read_bytes() == before
+    with pytest.raises(ValueError, match="incompatible"):
+        workflow.read(path)
+
+
+def test_unrelated_foreign_run_does_not_block_local_launch_or_status(workflow, monkeypatch):
+    old = prepare_run(workflow, monkeypatch, [sys.executable, "-c", "print('local')"])
+    remote = {**old, "run_id": "remote-run", "task_id": "different-task", "host": "remote-node"}
+    save(workflow.run_path("remote-run"), remote)
+    new = workflow.launch("repair", [sys.executable, "-c", "print('next')"], "systemd", "different-name")
+    assert new["state"] == "queued"
+    value = workflow_module.status(workflow)
+    assert value["run_receipt_inventory"]["unverified_external_count"] == 1
+    assert value["run_receipt_inventory"]["local_scope_count"] == 2
+    assert any(row["state"] == "foreign_unverified" for row in value["runs"])
+
+
+def test_same_task_foreign_outcome_cannot_authorize_retry_or_completion(workflow, monkeypatch):
+    run = prepare_run(workflow, monkeypatch, [sys.executable, "-c", "print('local')"])
+    remote = {**run, "run_id": "remote-run", "name": "remote-only", "host": "remote-node",
+              "state": "succeeded", "exit_code": 0}
+    path = workflow.run_path("remote-run")
+    save(path, remote)
+    with pytest.raises(ValueError, match="outcome is unverified"):
+        workflow.launch("repair", [sys.executable, "-c", "print('no')"], "systemd", "remote-only")
+    evidence = workflow.root / "proof.json"
+    evidence.write_text('{"local":true}')
+    with pytest.raises(ValueError, match="must have succeeded"):
+        workflow.update_task("repair", state="complete", evidence=[evidence])
+    with pytest.raises(ValueError, match="incompatible"):
+        workflow.reconcile("remote-run", "cannot prove remote process from local PID", [evidence])
+
+
+@pytest.mark.parametrize("damage", ["bad-schema", "empty-host", "not-an-object", "invalid-json"])
+def test_malformed_local_inventory_still_fails_closed(workflow, damage):
+    path = workflow.run_path("broken-run")
+    value = {"schema_version": workflow_module.SCHEMA_VERSION,
+             "host": workflow_module.socket.gethostname(), "repo_root": str(workflow.root)}
+    if damage == "bad-schema":
+        value["schema_version"] = 999
+    elif damage == "empty-host":
+        value["host"] = ""
+    elif damage == "not-an-object":
+        value = []
+    save(path, value)
+    if damage == "invalid-json":
+        path.write_text("{truncated")
+    with pytest.raises(ValueError):
+        workflow.runs()
+
+
 def test_empty_or_changed_evidence_cannot_become_current_proof(tmp_path, monkeypatch):
     path = tmp_path / "receipt.json"
     path.write_text("")

@@ -44,6 +44,9 @@ STRUCTURAL_SOURCE = ROOT / ('artifacts/operations/training_launches/'
 RESIDENT_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_resident_20261014_v10.yaml'
 RESIDENT_SOURCE = ROOT / ('artifacts/operations/training_launches/'
                          'tw_scale_cash_annual_last_fold_resident_20261014_v10/resident-source-v1.json')
+LEDGER_SPEC = ROOT / 'configs/ablations/tw_scale_cash_annual_last_fold_fused_20261015_v12.yaml'
+LEDGER_SOURCE = ROOT / ('artifacts/operations/training_launches/'
+                       'tw_scale_cash_annual_last_fold_fused_20261015_v12/ledger-source-v1.json')
 
 
 def _structural_source(parent: dict, binding_path: Path, *,
@@ -108,6 +111,33 @@ def _resident_source(parent: dict, binding_path: Path) -> tuple[dict, Path]:
             or proof.get('all_parameter_adjoint_pass') is not True
             or proof.get('financial_owner_files_unchanged') is not True):
         raise ValueError('resident full-schema mechanism/adjoint validation is incomplete')
+    return source, code
+
+
+def _ledger_source(parent: dict, binding_path: Path) -> tuple[dict, Path]:
+    """Admit the measured graph owner and its source/financial VJP oracles."""
+    source, code = _structural_source(parent, binding_path,
+        binding_contract='tw_ablation_ledger_graph_source_v1',
+        parent_key='parent_resident_source_sha256')
+    path = Path(source['mechanism_validation_receipt'])
+    if hashlib.sha256(path.read_bytes()).hexdigest() != source['mechanism_validation_sha256']:
+        raise ValueError('ledger graph mechanism validation changed')
+    proof = json.loads(path.read_text())
+    required = ('canonical_financial_forward_and_adjoint_pass',
+                'failed_certificate_replays_canonical', 'checkpoint_resume_contract_pass',
+                'prepared_transport_bitwise_pass', 'normalized_csr_disk_cache_adjoint_pass')
+    buffered = dict(version='canonical_terminal_flat_buffered_bounded_adjoint_v2',adjoint='saved')
+    expected = source.get('explicit_graph_contract', buffered)
+    if expected not in (buffered, {**buffered, 'step':'canonical_whole_session_compiled_v1'}):
+        raise ValueError('ledger graph source declares an unsupported compiled step contract')
+    if (proof.get('contract') != 'ledger_graph_mechanism_validation_v1'
+            or proof.get('source_sha256') != source['source_sha256']
+            or proof.get('strict_cuda_returncode') != 0
+            or proof.get('mechanism_tests_returncode') != 0
+            or any(proof.get(key) is not True for key in required)
+            or ('step' in expected and proof.get('bounded_device_prefetch_bitwise_stream_pass') is not True)
+            or proof.get('explicit_graph_contract') != expected):
+        raise ValueError('ledger graph financial/source/adjoint validation is incomplete')
     return source, code
 
 
@@ -390,14 +420,16 @@ def main(argv: list[str] | None = None) -> int:
                         help='Same 35 cases with measured whole-account DDP in a fresh v9 root.')
     parser.add_argument('--resident-sparse', action='store_true',
                         help='Same 35 cases with a verified resident full-schema CSR stem in a fresh v10 root.')
+    parser.add_argument('--ledger-graph', action='store_true',
+                        help='Same 35 cases with verified fused ledger graphs and bounded device prefetch in a fresh v12 root.')
     args = parser.parse_args(argv)
     if args.plots_only and args.dry_run:
         parser.error('--plots-only and --dry-run are mutually exclusive')
     selected = _selection(args.only)
-    structural = args.structural or args.resident_sparse
+    structural = args.structural or args.resident_sparse or args.ledger_graph
     frontier = args.frontier or structural
     optimized = args.optimized or frontier
-    spec_path = (RESIDENT_SPEC if args.resident_sparse else STRUCTURAL_SPEC if args.structural else FRONTIER_SPEC if args.frontier else OPTIMIZED_SPEC if args.optimized
+    spec_path = (LEDGER_SPEC if args.ledger_graph else RESIDENT_SPEC if args.resident_sparse else STRUCTURAL_SPEC if args.structural else FRONTIER_SPEC if args.frontier else OPTIMIZED_SPEC if args.optimized
                  else REPAIR_SPEC if args.numerical_repair else SPEC)
     if selected is None:
         _, all_rows = _experiment_rows(spec_path)
@@ -437,8 +469,11 @@ def main(argv: list[str] | None = None) -> int:
     if structural:
         source, code = _structural_source(source, STRUCTURAL_SOURCE)
         report_source, report_code = source, code
-    if args.resident_sparse:
+    if args.resident_sparse or args.ledger_graph:
         source, code = _resident_source(source, RESIDENT_SOURCE)
+        report_source, report_code = source, code
+    if args.ledger_graph:
+        source, code = _ledger_source(source, LEDGER_SOURCE)
         report_source, report_code = source, code
     for required in ('scripts/run_ablation_experiments.py', 'scripts/check_environment.py', 'coda_runner.sh'):
         if not (code / required).is_file():
@@ -478,11 +513,18 @@ def main(argv: list[str] | None = None) -> int:
                         episode_parallel_abi='annual_whole_account_local_actions_weighted_gradient_mean_v2',
                         ownership_exceptions=spec['matrix'].get('experiment_overrides', {}),
                         performance_acceptance_sha256=source['performance_acceptance_sha256'])
-    if args.resident_sparse:
+    if args.resident_sparse or args.ledger_graph:
         contract.update(contract='annual_scale_cash_resident_last_fold_ofat_v7',
                         projection_contract='full_schema_csr_affine_stable_full_rows_gpu_resident_v2',
                         numerical_trajectory='full_schema_affine_reordered_fp32_with_bf16_partitions_v2',
                         mechanism_validation_sha256=source['mechanism_validation_sha256'])
+    if args.ledger_graph:
+        contract.update(contract='annual_scale_cash_ledger_graph_last_fold_ofat_v8',
+                        explicit_graph_contract=source.get('explicit_graph_contract',dict(
+                            version='canonical_terminal_flat_buffered_bounded_adjoint_v2',adjoint='saved')),
+                        numerical_trajectory=('canonical_fp64_whole_session_compiled_saved_adjoint_v1'
+                            if 'step' in source.get('explicit_graph_contract',{})
+                            else 'canonical_fp64_ledger_buffered_saved_adjoint_v2'))
     _bind_contract(output / 'ablation-contract.json', contract)
     runtime_root = ROOT / 'artifacts/operations/training_launches' / output.name
     _bind_contract(runtime_root / 'input-contract.json', contract)

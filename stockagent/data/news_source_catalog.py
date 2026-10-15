@@ -18,7 +18,7 @@ SOURCE_REVIEW_DECISIONS = frozenset({
 # or original publisher. In particular, 404, a denied endpoint and a missing
 # parser are three different things. Keep this contract shared by the planner
 # and the read-only page; it never changes an article state or retries.
-NEWS_OUTCOME_CLASSIFICATION_VERSION = 1
+NEWS_OUTCOME_CLASSIFICATION_VERSION = 2
 NEWS_OUTCOME_GROUPS = {
     "queued_or_retry": frozenset({"pending", "inflight", "retry", "retry_cooldown"}),
     "waiting_cohort": frozenset({"waiting_cohort"}),
@@ -32,6 +32,7 @@ NEWS_OUTCOME_GROUPS = {
         "unsupported_article_path", "body_not_found", "article_attribution_not_verified",
         "article_title_not_verified", "article_identity_not_verified", "response_too_large",
         "robots_not_plain_rules", "robots_redirect_refused",
+        "invalid_bulk_publication_clock",
     }),
     "nontext_representation": frozenset({
         "source_body_image_only", "source_body_embedded_only", "pdf_image_only_or_body_not_found",
@@ -45,6 +46,10 @@ NEWS_OUTCOME_GROUPS = {
 _NEWS_OUTCOME_GROUP_BY_STATE = {
     state: group for group, states in NEWS_OUTCOME_GROUPS.items() for state in states
 }
+# Public allowlisting and outcome grouping must use the same finite vocabulary.
+# Unknown/private error names still stay out of the public snapshot; adding a
+# known validation outcome must not silently turn it into an unknown error.
+NEWS_OUTCOME_STATES = frozenset({"complete"}).union(*NEWS_OUTCOME_GROUPS.values())
 
 
 def classify_news_outcomes(states: dict, *, registered: bool, body_enabled: bool) -> dict:

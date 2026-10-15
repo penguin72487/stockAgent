@@ -146,3 +146,23 @@ def test_aggregate_rejects_claimed_subset_as_full(fixture_root) -> None:
         atomic_write_json(path, row)
     with pytest.raises(ValueError, match="evidence does not match"):
         benchmark.aggregate(root, root / "refused.json", "schema_cache")
+
+
+@pytest.mark.parametrize("candidate", ["local", "metadata_only", "prefetch"])
+def test_new_io_variants_use_adopted_reference_and_complete_proofs(fixture_root, candidate):
+    root, source = fixture_root
+    benchmark.capture(root, source, 0)
+    before = benchmark.digest(source)
+    benchmark.worker(root, root / "adopted.json", "adopted")
+    benchmark.worker(root, root / "candidate.json", candidate)
+    reference = json.loads((root / "adopted.json").read_bytes())
+    result = json.loads((root / "candidate.json").read_bytes())
+    assert result["complete_audit_output_sha256"] == reference["complete_audit_output_sha256"]
+    assert result["footer_open_attempts"] == result["footer_io"]["actual_footer_opens"] == 3
+    assert result["view_proofs"] == 2
+    assert result["physical_cache"]["hits"] == reference["physical_cache"]["hits"] == 1
+    assert result["physical_cache"]["misses"] == reference["physical_cache"]["misses"] == 1
+    if candidate != "local":
+        assert result["footer_io"]["metadata_only_supported"] is True
+        assert result["footer_io"]["metadata_only_opens"] == 3
+    assert benchmark.digest(source) == before

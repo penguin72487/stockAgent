@@ -204,9 +204,10 @@ def test_physical_training_prefetches_each_chronological_batch(monkeypatch):
     calls = []
     original = trainer.prefetch_physical_carry_batches
 
-    def observed_prefetch(source, current_split, batch_order, batch_size):
+    def observed_prefetch(source, current_split, batch_order, batch_size, **kwargs):
         calls.append((list(batch_order), int(batch_size)))
-        yield from original(source, current_split, batch_order, batch_size)
+        assert kwargs['device'] == torch.device('cpu')
+        yield from original(source, current_split, batch_order, batch_size, **kwargs)
 
     monkeypatch.setattr(
         trainer, "prefetch_physical_carry_batches", observed_prefetch

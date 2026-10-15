@@ -188,14 +188,18 @@ def parser_repair_fingerprint(payload: dict[str, Any]) -> str:
 def _known_url_only_scope(entry, auth):
     """Local metadata growth only, not an authorization to discover a site.
 
-    This explicit scope reuses the existing personal-reading or article-level
-    license checks. Reject endpoint configuration, including dormant discovery
-    jobs, rather than silently expanding the scope on a later edit.
+    This explicit scope reuses the existing personal-reading, article-level
+    license, or reviewed native publisher-original checks. A linked site notice
+    is not a per-article license or permission for syndicated works. Reject
+    endpoint configuration, including dormant discovery jobs, rather than
+    silently expanding the scope on a later edit.
     """
     scope = entry.get('private_known_url_scope', '')
     if scope == '':
         return False
-    if not isinstance(scope, str) or scope not in {'personal_noncommercial_originals_v1', 'per_article_licensed_text_v1'}:
+    if not isinstance(scope, str) or scope not in {
+            'personal_noncommercial_originals_v1', 'per_article_licensed_text_v1',
+            'publisher_original_open_license_v1'}:
         raise ValueError('unreviewed known-URL-only scope')
     if entry.get('acquisition_mode') == 'finite':
         return False  # A retained annotation never extends an immutable cohort.
@@ -203,9 +207,17 @@ def _known_url_only_scope(entry, auth):
     licensed = (scope == 'per_article_licensed_text_v1' and auth.get('kind') == 'open_license'
                 and bool(entry.get('required_license_url_prefix')) and bool(entry.get('license_selectors'))
                 and entry.get('require_configured_container') is True)
+    publisher_original = (
+        scope == 'publisher_original_open_license_v1' and entry.get('id') == 'coolloud'
+        and entry.get('domains') == ['www.coolloud.org.tw']
+        and entry.get('embedded_article_layout') == 'coolloud_visible_original_v1'
+        and auth.get('kind') == 'open_license' and auth.get('license') == 'CC-BY-NC-SA-2.0-TW'
+        and auth.get('evidence_url') == 'https://www.coolloud.org.tw/node/4524'
+        and entry.get('require_configured_container') is True
+        and entry.get('article_selectors') == [':scope > .field-name-body > .field-items > .field-item'])
     if entry.get('require_author_attribution') is not True:
         raise ValueError('known-URL-only scope or reviewed author scope requires exact current-article attribution')
-    if (not (personal or licensed) or entry.get('acquisition_mode') != 'continuous'
+    if (not (personal or licensed or publisher_original) or entry.get('acquisition_mode') != 'continuous'
             or not entry.get('article_selectors') or not entry.get('article_path_pattern')):
         raise ValueError('unreviewed known-URL-only scope')
     if any(entry.get(field) for field in (
@@ -319,15 +331,31 @@ class PolicyRegistry:
                             and entry.get("acquisition_mode") == "finite"
                             and entry.get("require_configured_container") is True
                             and entry.get("require_author_attribution") is True)
-            kmdn_layout = (embedded == "kmdn_visible_article_v1" and provider == "kmdn"
+            kmdn_layout = (embedded in {"kmdn_visible_article_v1", "kmdn_visible_article_v2"} and provider == "kmdn"
                            and domains == ("www.kmdn.gov.tw",) and auth.get("kind") == "personal_research"
-                           and entry.get("acquisition_mode") == "finite"
+                           and (embedded == "kmdn_visible_article_v1"
+                                or auth.get("evidence_url") == "https://www.kmdn.gov.tw/1119/1121/1367/")
+                           and (entry.get("acquisition_mode") == "finite"
+                                or known_url_only and entry.get('private_known_url_scope')
+                                == 'personal_noncommercial_originals_v1')
                            and entry.get("require_configured_container") is True
                            and entry.get("require_author_attribution") is True)
+            coolloud_layout = (embedded == 'coolloud_visible_original_v1' and provider == 'coolloud'
+                               and domains == ('www.coolloud.org.tw',) and auth.get('kind') == 'open_license'
+                               and auth.get('license') == 'CC-BY-NC-SA-2.0-TW'
+                               and auth.get('evidence_url') == 'https://www.coolloud.org.tw/node/4524'
+                               and (entry.get('acquisition_mode') == 'finite'
+                                    or known_url_only and entry.get('private_known_url_scope')
+                                    == 'publisher_original_open_license_v1')
+                               and entry.get('require_configured_container') is True
+                               and entry.get('require_author_attribution') is True
+                               and entry.get('article_selectors') == [':scope > .field-name-body > .field-items > .field-item'])
             cnews_layout = (embedded == "cnews_visible_article_v1" and provider == "cnews"
                             and domains == ("cnews.com.tw",) and auth.get("kind") == "personal_research"
                             and auth.get("evidence_url") == "https://cnews.com.tw/%E7%89%88%E6%AC%8A%E8%81%B2%E6%98%8E/"
-                            and entry.get("acquisition_mode") == "finite"
+                            and (entry.get("acquisition_mode") == "finite"
+                                 or known_url_only and entry.get('private_known_url_scope')
+                                 == 'personal_noncommercial_originals_v1')
                             and entry.get("require_configured_container") is True
                             and entry.get("require_author_attribution") is True)
             cmmedia_layout = (embedded == "cmmedia_visible_article_v1" and provider == "cmmedia"
@@ -425,7 +453,48 @@ class PolicyRegistry:
                                and entry.get('require_configured_container') is True
                                and entry.get('require_author_attribution') is True
                                and entry.get('article_selectors') == [':scope > article.content'])
-            if embedded and not (einfo_layout or cmnews_layout or tainan_layout or macau_layout or kmdn_layout or cnews_layout or cmmedia_layout or nownews_layout or ftv_layout or taiwanhot_layout or voa_layout or tfc_layout or nccu_layout or taichung_layout or changhua_layout):
+            events_layout = (embedded == 'eventsinfocus_visible_news_v1' and provider == 'eventsinfocus'
+                             and domains == ('eventsinfocus.org',) and auth.get('kind') == 'personal_research'
+                             and auth.get('evidence_url') == 'https://eventsinfocus.org/pages/55'
+                             and entry.get('acquisition_mode') == 'finite'
+                             and entry.get('require_configured_container') is True
+                             and entry.get('require_author_attribution') is True
+                             and entry.get('article_path_pattern') == '^/news/7145971$')
+            if events_layout:
+                from downloader.news_fulltext_independent import EVENTS_BODY_SELECTOR
+                events_layout = (entry.get('article_selectors') == [EVENTS_BODY_SELECTOR]
+                                 and entry.get('exclude_selectors') == [])
+            ftnn_layout = (embedded == 'ftnn_visible_article_v1' and provider == 'ftnn'
+                           and domains == ('ftnn.com.tw',) and auth.get('kind') == 'personal_research'
+                           and auth.get('evidence_url') == 'https://www.ftnn.com.tw/copyright'
+                           and known_url_only and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
+                           and entry.get('require_configured_container') is True
+                           and entry.get('require_author_attribution') is True
+                           and entry.get('article_path_pattern') == '^/news/[1-9][0-9]*$'
+                           and entry.get('article_selectors') == [':scope > .news-body']
+                           and entry.get('exclude_selectors') == [])
+            tvbs_layout = (embedded in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'} and provider == 'tvbs'
+                           and domains == ('news.tvbs.com.tw', 'cars.tvbs.com.tw', 'supertaste.tvbs.com.tw')
+                           and auth.get('kind') == 'personal_research'
+                           and auth.get('evidence_url') == 'https://www.tvbs.com.tw/policies/copyright'
+                           and known_url_only and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
+                           and entry.get('require_configured_container') is True
+                           and entry.get('require_author_attribution') is True
+                           and entry.get('article_path_pattern') == '^(?:/[a-z][a-z-]*/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$'
+                           and entry.get('article_selectors') == [':scope > .tvbs-native-body']
+                           and entry.get('exclude_selectors') == [])
+            ettoday_layout = (embedded == 'ettoday_visible_article_v1' and provider == 'ettoday'
+                              and domains == ('ettoday.net',) and auth.get('kind') == 'personal_research'
+                              and auth.get('evidence_url') == 'https://member.ettoday.net/clause_copyright.php7'
+                              and known_url_only and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
+                              and entry.get('require_configured_container') is True
+                              and entry.get('require_author_attribution') is True
+                              and entry.get('exclude_selectors') == [])
+            if ettoday_layout:
+                from downloader.news_fulltext_ettoday import ETTODAY_BODY_SELECTOR, ETTODAY_PATH_PATTERN
+                ettoday_layout = (entry.get('article_selectors') == [ETTODAY_BODY_SELECTOR]
+                                  and entry.get('article_path_pattern') == ETTODAY_PATH_PATTERN)
+            if embedded and not (einfo_layout or cmnews_layout or tainan_layout or macau_layout or kmdn_layout or coolloud_layout or cnews_layout or cmmedia_layout or nownews_layout or ftv_layout or taiwanhot_layout or voa_layout or tfc_layout or nccu_layout or taichung_layout or changhua_layout or events_layout or ftnn_layout or tvbs_layout or ettoday_layout):
                 raise ValueError("unreviewed embedded article parser")
             acquisition_mode = entry.get("acquisition_mode", "continuous")
             if not isinstance(acquisition_mode, str) or acquisition_mode not in {"continuous", "finite"}:
@@ -560,9 +629,12 @@ class PolicyRegistry:
                 fingerprint_payload['verified_native_prose_spacing_contract_version'] = 1
                 fingerprint_payload['mobile_canonical_html_contract_version'] = 43
                 fingerprint_payload['verified_empty_html_outcome_contract_version'] = 8
+                fingerprint_payload['verified_office_comment_empty_outcome_contract_version'] = 1
                 fingerprint_payload['verified_native_quote_only_outcome_contract_version'] = 7
                 fingerprint_payload['verified_native_image_only_outcome_contract_version'] = 4
                 fingerprint_payload['verified_source_test_article_outcome_contract_version'] = 1
+                fingerprint_payload['verified_untitled_no_events_bulletin_contract_version'] = 1
+                fingerprint_payload['verified_source_signature_image_outcome_contract_version'] = 1
             if fulltext_feeds:
                 fingerprint_payload['fulltext_feed_rights_contract_version'] = 2
             if pdf_pattern:
@@ -573,6 +645,7 @@ class PolicyRegistry:
                 fingerprint_payload["embedded_article_adapter_contract_version"] = (
                     {"cmnews_visible_article_v1": 6, "einfo_next_post_v1": 2, "cnews_visible_article_v1": 4,
                      "ftv_visible_article_v1": 5, "nownews_visible_article_v1": 2,
+                     "ftnn_visible_article_v1": 2, "tvbs_visible_article_v2": 2,
                      "tainan_visible_news_v1": 2, "voa_reviewed_private_article_v2": 3,
                      "taichung_visible_news_v1": 2}.get(embedded, 1))
             if tainan_layout:
@@ -604,6 +677,26 @@ class PolicyRegistry:
                 capacity_payload.pop('verified_native_prose_spacing_contract_version')
                 capacity_payload.pop('verified_source_test_article_outcome_contract_version')
                 capacity_payload.pop('visible_headline_body_ownership_contract_version')
+                capacity_payload.pop('verified_office_comment_empty_outcome_contract_version')
+                capacity_payload.pop('verified_untitled_no_events_bulletin_contract_version')
+                capacity_payload.pop('verified_source_signature_image_outcome_contract_version')
+                capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+            elif ftnn_layout:
+                # The dual native release/revision proof is an HTML-only ABI.
+                # Normalize only that adapter version to retain the exact
+                # previous HTTP identity, including scope/auth/entry fields.
+                # Its old capture identity also pins the one-time repair of
+                # prior parser clock failures, never source refusals.
+                capacity_payload = dict(fingerprint_payload)
+                capacity_payload['embedded_article_adapter_contract_version'] = 1
+                capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+            elif tvbs_layout and embedded == 'tvbs_visible_article_v2':
+                # Native clock/credit interpretation alone changed. Normalize
+                # only this explicit adapter ABI to its exact prior capture;
+                # all original source/auth/scope/HTTP fields remain binding.
+                capacity_payload = dict(fingerprint_payload)
+                capacity_payload['entry'] = {**capture_entry, 'embedded_article_layout': 'tvbs_visible_article_v1'}
+                capacity_payload['embedded_article_adapter_contract_version'] = 1
                 capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
             bulk_fingerprint = ""
             if cnyes_apis:
@@ -612,9 +705,12 @@ class PolicyRegistry:
                 bulk_payload.pop('verified_native_prose_spacing_contract_version', None)
                 bulk_payload.pop('mobile_canonical_html_contract_version', None)
                 bulk_payload.pop('verified_empty_html_outcome_contract_version', None)
+                bulk_payload.pop('verified_office_comment_empty_outcome_contract_version', None)
                 bulk_payload.pop('verified_native_quote_only_outcome_contract_version', None)
                 bulk_payload.pop('verified_native_image_only_outcome_contract_version', None)
                 bulk_payload.pop('verified_source_test_article_outcome_contract_version', None)
+                bulk_payload.pop('verified_untitled_no_events_bulletin_contract_version', None)
+                bulk_payload.pop('verified_source_signature_image_outcome_contract_version', None)
                 bulk_payload.pop('visible_headline_body_ownership_contract_version', None)
                 bulk_fingerprint = hashlib.sha256(json.dumps(bulk_payload, sort_keys=True).encode()).hexdigest()
             feed_fingerprint = ''
@@ -1017,9 +1113,13 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
     elif source.embedded_article_layout == "macau_visible_news_v1":
         from downloader.news_fulltext_taiwan_pages import macau_visible_news
         article, article_scope = macau_visible_news(soup, page_url=page_url)
-    elif source.embedded_article_layout == "kmdn_visible_article_v1":
+    elif source.embedded_article_layout in {"kmdn_visible_article_v1", "kmdn_visible_article_v2"}:
         from downloader.news_fulltext_taiwan_pages import kmdn_visible_article
-        article, article_scope = kmdn_visible_article(soup, page_url=page_url)
+        article, article_scope = kmdn_visible_article(soup, page_url=page_url,
+            allow_student_essay=source.embedded_article_layout == "kmdn_visible_article_v2")
+    elif source.embedded_article_layout == 'coolloud_visible_original_v1':
+        from downloader.news_fulltext_taiwan_pages import coolloud_visible_original
+        article, article_scope, license_basis = coolloud_visible_original(soup, page_url=page_url)
     elif source.embedded_article_layout == "cnews_visible_article_v1":
         from downloader.news_fulltext_cnews_cmmedia import cnews_visible_article
         article, article_scope = cnews_visible_article(soup, page_url=page_url)
@@ -1052,6 +1152,19 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
     elif source.embedded_article_layout == 'changhua_visible_news_v1':
         from downloader.news_fulltext_taiwan_pages import changhua_visible_news
         article, article_scope = changhua_visible_news(soup, page_url=page_url)
+    elif source.embedded_article_layout == 'eventsinfocus_visible_news_v1':
+        from downloader.news_fulltext_independent import eventsinfocus_visible_news
+        article, article_scope = eventsinfocus_visible_news(soup, page_url=page_url)
+    elif source.embedded_article_layout == 'ftnn_visible_article_v1':
+        from downloader.news_fulltext_ftnn import ftnn_visible_article
+        article, article_scope = ftnn_visible_article(soup, page_url=page_url)
+    elif source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
+        from downloader.news_fulltext_tvbs import tvbs_visible_article
+        article, article_scope = tvbs_visible_article(soup, page_url=page_url,
+            adapter_contract_version=2 if source.embedded_article_layout.endswith('_v2') else 1)
+    elif source.embedded_article_layout == 'ettoday_visible_article_v1':
+        from downloader.news_fulltext_ettoday import ettoday_visible_article
+        article, article_scope = ettoday_visible_article(soup, page_url=page_url)
     if source.required_license_url_prefix and not license_basis and not any(url.startswith(source.required_license_url_prefix) for url in licenses):
         raise NewsError("article_license_not_verified")
     canonical = _select_first(soup, 'link[rel="canonical"]')
@@ -1295,21 +1408,30 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
                                           'whole_visible_container_matches_current_full_prose_spacing')
     if (source.provider == 'cnyes' and method == 'jsonld_article_body'
             and 0 < len(body) < 100 and not nontrivial_text_missing):
-        from downloader.news_fulltext_publishers import cnyes_verified_short_body
+        from downloader.news_fulltext_publishers import (
+            cnyes_verified_short_body, cnyes_verified_untitled_no_events_bulletin,
+        )
         verified_body = cnyes_verified_short_body(soup, source, article, body, page_url=expected_url)
+        if verified_body is None and article.get('headline') == '':
+            verified_body = cnyes_verified_untitled_no_events_bulletin(soup, source, article, body, page_url=expected_url)
+            verified_untitled_html_body = verified_body is not None
         if verified_body:
             short_configured_body = True
             if verified_body != body:
-                body, method = verified_body, 'cnyes_visible_short_table_v1'
+                body, method = verified_body, ('cnyes_visible_untitled_no_events_bulletin_v1'
+                                               if verified_untitled_html_body else 'cnyes_visible_short_table_v1')
             article['article_identity_basis'] = 'canonical_url_newsId_free_payment0; declared_clock_and_whole_visible_container_match_full_content'
             article['body_completeness'] = ('verified_publisher_short_body; '
                                           'whole_visible_container_and_table_cells_match_declared_full_content')
+            if verified_untitled_html_body:
+                article['body_completeness'] += '; source_visible_title_empty; source_explicit_no_events_bulletin_not_missing_data'
     body_too_short = len(body) < 100 and not short_configured_body
     if not body or body_too_short or nontrivial_text_missing:
         raise NewsError("body_not_found")
     h1 = _select_first(soup, source.title_selector) if source.title_selector else soup.find("h1")
-    title = str(article.get("headline") or (h1.get_text(" ", strip=True) if h1 else ""))
-    if not title:
+    title = ('' if source.provider == 'cnyes' and verified_untitled_html_body else
+             str(article.get("headline") or (h1.get_text(" ", strip=True) if h1 else "")))
+    if not title and not (source.provider == 'cnyes' and verified_untitled_html_body):
         title_meta = _select_first(soup, 'meta[property="og:title"]')
         title = str(title_meta.get("content", "")) if title_meta else ""
     if not title and method in _FED_RELEASE_LAYOUT_VERSIONS and soup.title:
