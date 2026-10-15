@@ -57,7 +57,10 @@ proof. Setup and measured engine trials are in
   two-GPU DistributedDataParallel with the resolved formal global batch and a
   complete fold lifecycle. Single-GPU runs may diagnose correctness only. Treat
   epoch 1 as compiler warm-up; compare steady epoch 3+ maximum-rank wall time,
-  and require exact artifact/metric parity before promoting an optimization.
+  and require the selected experiment's numerical/accounting and complete-artifact
+  acceptance. Semantic-preserving changes retain their equality oracle; explicitly
+  selected numerical/optimizer experiments follow
+  [the performance contract](performance.md#numerical-and-optimizer-experiments).
 - The 428-feature all-observed fold11 dataset with exact physical FIFO exceeded
   a 32 GiB card's workspace when its 14.72 GiB FP32 panel was kept on each
   GPU. The measured v4 experiment keeps train/eval panels in host memory;

@@ -1,0 +1,13 @@
+# Keep baseline -> Muon -> the remaining catalog, each case's last fold.
+# Incompatible source/reduction trajectory uses a fresh artifact root.
+base_spec: tw_scale_cash_annual_last_fold_structural_20261014_v9.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_last_fold_resident_20261014_v10
+matrix:
+  fixed_overrides:
+    training:
+      # Capacity exception: local64; all dates, dimensions and one update remain.
+      batch_size_train: 128
+      financial_transformer:
+        factorized_sparse_projection: true
+        factorized_sparse_cache_bytes: 21474836480
+optimization_recipe: configs/benchmarks/gpu_resident_best_20261014.yaml

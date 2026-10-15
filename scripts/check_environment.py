@@ -214,7 +214,9 @@ def main() -> int:
         failures.append(
             f"CONDA_PREFIX={conda_prefix!r} does not match Python prefix {str(python_prefix)!r}"
         )
-    if python_prefix.name != "fintech":
+    selected_prefix = os.environ.get("FINTECH_ENV_PATH")
+    explicitly_selected_prefix = bool(selected_prefix) and Path(selected_prefix).resolve() == python_prefix
+    if python_prefix.name != "fintech" and not explicitly_selected_prefix:
         warnings.append(
             f"selected Python prefix is named {python_prefix.name!r}, not the preferred 'fintech'"
         )

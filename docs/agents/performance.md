@@ -2,6 +2,139 @@
 
 Use for compile, cache, batch, throughput or hardware investigations. Measure the complete requested workflow. Timings and tuning values below are observations of the named shape, hardware and experiment; they are starting points, not requirements for unrelated configurations. For vastai1T TW day-trade acceptance use two-GPU DDP, the formal global batch, the complete fold lifecycle and steady epoch 3+ maximum-rank wall time as specified in runtime.md. Epoch 2 observations below are historical or diagnostic. No benchmark result authorizes changing accounting or silently skipping work.
 
+## Numerical and optimizer experiments
+
+For semantic-preserving work, use the selected account's equality/gradient oracle.
+An explicitly selected precision, batch, kernel or gradient experiment may instead
+change continuous outputs and optimizer trajectory. Declare its numerical tolerance,
+changed axes and reference; compare nonempty trades, finite gradients and the full
+requested workflow. Preserve source values/units/clocks, fee and settlement formulas,
+whole-lot legality, masks and absorbing ruin. At fixed source/actions, test the
+account's discrete fields and financial recurrence; a changed model trajectory is
+not expected to produce an identical historical trade list or checkpoint.
+
+Record matching version/fingerprints and a new artifact root for incompatible
+training changes; retain the old comparator/results and reject old optimizer resume.
+The user's 2026-10-06 and 2026-10-12 numerical permissions apply to their named
+performance experiments, not every historical replay. See
+[batch/precision evidence](../tw_daytrade_no_basis_batch_powers_2026-10-06.md)
+for a scoped example.
+Neither a finite scalar nor a small speed difference proves acceptance or a global
+optimum; repeat measurements only enough to resolve a material uncertainty.
+
+### Configured annual account ownership: 2026-10-14 observation
+
+For the measured Vastai1T dual-RTX-5090 annual-reset FinancialTransformer
+baseline (d32, lookback32, global256/local128, fold11), whole configured accounts
+can be owned independently by each rank. Within-account financial recurrence,
+FP64 closing, fees, FIFO, masks and absorbing default still follow the canonical
+bridge. Local actions remove per-batch action gathering and replicated accounting;
+date-weighted gradients are reduced once before the epoch update. Unequal NN
+call counts require avoiding DDP forward collectives and handling globally used,
+locally absent gradients without changing globally unused parameters.
+
+The accepted BPTT experiment truncates at local128 and configured account
+boundaries; bind `annual_whole_account_local_actions_weighted_gradient_mean_v2`
+and actual configured world size to the checkpoint contract. Reject incompatible
+optimizer resume. A single continuous account, including `annual_reset__off`,
+does not supply this independent axis. Validate all date coverage, unique account
+ownership, padding, gradient weights and update cadence using the canonical
+ownership receipt; do not waive an old batch-count failure without new evidence.
+
+Four complete A/B/B/A trials measured steady maximum-rank epoch means
+74.414 -> 51.610 seconds (30.6% less time, 1.4418x throughput) for annual ownership
+plus compiled closing. Complete four-epoch fold means were 490.318 -> 480.891
+seconds (1.9% less time); startup remains material. NVML average utilization did
+not increase, and is not the effective-work denominator. Standalone closing
+fusion failed host headroom admission; annual-only versus combined fusion has
+only single-screen evidence. Do not extrapolate these results to other hardware,
+shapes, strategy quality or a completed 1000-epoch run. Source, tests, exceptions
+and raw results are in [the measured structural report](../gpu_structural_optimization_2026-10-14.md).
+
+### Full-schema resident projection: 2026-10-14 observation
+
+On the same dual-RTX-5090 d32/lookback32 fold11 workload, a repeated CPU compact
+packet and wide H2D/checkpoint path dominated before Tensor Core math. Cache
+immutable physical date blocks as full-schema CSR, retain zero-column effects
+in stable LayerNorm/RMSNorm affine projection, and checkpoint narrow learned
+embeddings. Store the CSR dense operand contiguously as `[F, projected_width]`;
+the transposed view was a measured bottleneck. Fixed source statistics may be
+cached; learned weights and embeddings must be recomputed each update.
+
+Common-source A/B/B/A measured complete steady MAX-rank epochs
+53.372 -> 17.351 seconds (3.076x throughput), while cold four-epoch folds only
+improved 482.979 -> 456.163 seconds (5.55% less time). New cold CSR construction
+remains expensive. Original global256/local128 failed the 1.5GiB headroom gate;
+the admitted capacity exception is global128/local64, with every date, feature,
+dimension and one epoch update retained. This changes BPTT truncation and numeric
+trajectory: use the resident ABI/new root and reject v9 optimizer resume.
+Do not project baseline acceptance onto unmeasured d128/lookback256 variants.
+After staging is removed, financial recurrence/adjoint dominates; low NVML busy
+alone is not evidence that replacing attention kernels will multiply throughput.
+Mechanism/adjoint tests, retained numeric rejections, full artifact/financial-owner
+checks and CPU-readable off-node results are in
+[the resident rewrite report](../gpu_architecture_rewrite_2026-10-14.md).
+
+### Buffered ledger graphs: 2026-10-15 observation
+
+The same selected d32/lookback32 workload uses event-compressed accounting in
+training. Test that actual path before timing a full fold; an enabled flag with
+zero forward/backward replays is a rejected integration. The dedicated graph
+owner uses fixed buffers, date tensors and bounded saved-tape leases; restore
+each backward's external source, preserve pending forwards, and replay the
+canonical executor if the terminal-flat financial certificate fails. Explicit
+graphs require inner Inductor graph trees disabled. Inference-first construction
+must leave tensors usable by later training and mutation checks.
+
+Repeated source staging needs a separate immutable, byte-bounded prepared-batch
+cache. Pin under the owning device and complete asynchronous transport before
+claiming its time. Cache normalized CSR derivatives using source identity and
+the exact fold-fitted normalizer, verify typed arrays/hashes on reuse, and retain
+source receipts and damaged generations. Do not cache learned projections or
+optimizer-dependent outputs. Separate initial cache fill, fresh-process reuse,
+steady complete epochs and isolated accounting speed.
+
+Common-source A/B/B/A on the selected dual-RTX-5090 d32/lookback32 fold11,
+global128/local64 workload measured complete steady MAX-rank epochs
+18.456 -> 5.570 seconds (3.313x throughput), and fresh-process complete four-epoch
+folds 481.042 -> 171.358 seconds (2.807x). Both candidate trials reused a verified
+normalized-CSR disk cache; this is not a new-node first-fill measurement. All
+validation/test/curves/plots/checkpoints/final replay were retained. Peak GPU
+memory was 28194 MiB with at least 4.3096 GiB headroom. At that acceptance, source
+prototype v13 backed the independent ablation v11 root; `--ledger-graph` had
+35/35 remote dry-run/calendar gates passed and the formal queue was stopped.
+Reject incompatible optimizer resume rather than copying v10 checkpoints.
+
+A separate complete-train-epoch Nsight capture still shows host gaps, source
+transport and rank imbalance. GPU activity includes NCCL waiting and is not SM
+or Tensor Core occupancy; neither 100% useful utilization nor a global compute
+limit was established. Rejections, mechanism tests and admission evidence are in
+[the ledger report](../ledger_block_optimization_2026-10-15.md).
+
+### Whole-session fusion and bounded device prefetch: 2026-10-15 observation
+
+Compile the canonical funding, execution, closing, financial certificate and
+state update as one fixed session step inside the existing saved-adjoint graph.
+Retain native sensitive FP64 scan boundaries and canonical fallback. A graph
+program owns input schema rather than one source row view: a row view can pin an
+entire field-major device tape. Stage at most the next 32 source rows on a copy
+stream, record the allocation's consumer lifetime once per field, and expand
+the suffix on its consuming stream. CPU source caches must remain CUDA-free.
+The compiled step has its own checkpoint fingerprint; reject incompatible resume.
+
+Same-source v19 A/B/B/A versus the already buffered/cached implementation measured
+complete steady MAX-rank epochs 5.595056 -> 5.000720 seconds (1.118850x throughput).
+Complete four-epoch folds were 170.356601 -> 173.429279 seconds, 1.80% slower;
+the selection serves the formal many-epoch workload, not a cold short-run speedup.
+All validation, tests, plots, checkpoints and final replay remain. Peak memory
+was 30576 MiB with 1.983398 GiB minimum headroom on the named dual RTX5090 d32/L32
+global128/local64 workload; unmeasured variants retain their OOM capacity policy.
+391 CPU checks, 13 remote GPU checks, canonical real-action forward/VJP and all
+16 resume transitions passed; four folds/311 files/eight checkpoints were
+SHA-verified off-node and checkpoints CPU-loaded. The shell now selects the
+independent fused v12 root, bound to source prototype v19. Current formal launch
+proof and remaining recurrence/rank-tail boundaries are in the ledger report.
+
 ## Remote node selection
 
 The user's 2026-10-03 instruction requires every remote build to use that node's

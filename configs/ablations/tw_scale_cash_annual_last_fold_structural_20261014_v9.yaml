@@ -1,0 +1,21 @@
+# The existing baseline, seven optimizer recipes and 27 original OFAT cases.
+# Whole configured accounts are independent; dates within each remain ordered.
+base_spec: tw_scale_cash_annual_last_fold_frontier_20261014_v8.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_last_fold_structural_20261014_v9
+matrix:
+  base_overrides:
+    training:
+      day_trade_annual_episode_sharding: true
+      day_trade_annual_episode_world_size: 2
+      ddp_broadcast_buffers: false
+      ddp_trajectory_gradient_sync: trajectory
+  experiment_overrides:
+    annual_reset__off:
+      description: 取消年度重置；單一連續帳戶沿用 metadata 免傳的 replicated ledger。
+      overrides:
+        training:
+          day_trade_annual_episode_sharding: false
+          ddp_broadcast_buffers: true
+          ddp_trajectory_gradient_sync: batch
+          distributed_replicated_ledger_local_metadata: true
+optimization_recipe: configs/benchmarks/gpu_structural_best_20261014.yaml

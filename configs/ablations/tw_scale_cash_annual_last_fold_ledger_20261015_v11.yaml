@@ -1,0 +1,5 @@
+# Same baseline -> optimizers -> OFAT order and per-case final fold.
+# Graph/adjoint identity rejects incompatible v10 optimizer resume.
+base_spec: tw_scale_cash_annual_last_fold_resident_20261014_v10.yaml
+output_root: artifacts/markets/tw_scale_cash_annual_last_fold_ledger_20261015_v11
+optimization_recipe: configs/benchmarks/gpu_ledger_graph_best_20261015.yaml

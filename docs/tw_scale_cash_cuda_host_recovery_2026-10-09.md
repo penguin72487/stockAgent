@@ -2,6 +2,11 @@
 
 ## 1. 執行進度
 
+- **10/12 最新複測已通過**：同一 instance 的兩卡實際 CUDA 運算、NCCL／compiled FIFO 雙卡梯度測試，以及原 27 項消融 dry-run 均通過。未啟動正式長訓練；原兩份 checkpoint SHA 不變。[最新複測紀錄](vast_cuda_retest_2026-10-12.md)。下列故障與主機處理需求為 10/09–10/11 的歷史狀態，不是目前 CUDA 結論。
+- **10/11 使用者 Start 後複測仍失敗，已再次送出 Stop 並收到成功回覆**：同一
+  instance／machine、兩張卡仍要求 `Reboot`，UVM 仍為 EIO；沒有開始訓練。
+  隨後 SSH 關閉，actual Stopped 的外部 API 讀回仍未完成。
+  [本次複測與 Stop 證據](vast_cuda_retry_2026-10-11.md)。
 - **仍不能開始雙卡訓練**：2026-10-09 複測 instance `45963859`，兩張 RTX 5090 都回報 `GPU Recovery Action: Reboot`。使用者已重啟 instance；本次沒有再次啟停容器、重置 GPU、重裝驅動或搬遷資料。
 - 獨立於 PyTorch 的 CUDA Driver API `cuInit(0)` 回傳 `999 / CUDA_ERROR_UNKNOWN`，開啟 `/dev/nvidia-uvm`、`/dev/nvidia-uvm-tools` 都失敗，errno 為 `5 / EIO`。
 - 已修正並部署共用環境檢查與消融薄控制入口。失敗時保留完整 JSON 診斷，明確指出宿主機恢復需求；不再因查詢 GPU 名稱而拋 traceback，也不再額外拋 `CalledProcessError`。

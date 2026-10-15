@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 from dataclasses import dataclass
 import json
 import os
@@ -22,6 +23,107 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC = REPO_ROOT / "configs/ablations/transformer_base_portfolio.yaml"
 DEFAULT_RUNNER = REPO_ROOT / "coda_runner.sh"
 _SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _capacity_run(run: dict[str, Any], policy: dict[str, Any], *, oom_log: Path | None = None) -> dict[str, Any] | None:
+    """Bounded execution-capacity retries, each with a fresh optimizer root.
+
+    The curated experiment path points at the selected attempt, so canonical
+    plots/completion readers see the same result as the queue. Old attempts and
+    their logs/checkpoints remain intact. Only an observed CUDA OOM advances it.
+    """
+    from downloader.artifact_io import atomic_write_json
+    from stockagent.config import load_config
+
+    original = Path(run.get("capacity_original_config", run["config_path"]))
+    root = original.parent.parent
+    owner = root / "_capacity" / run["name"]
+    selection = owner / "selection.json"
+    original_sha = hashlib.sha256(original.read_bytes()).hexdigest()
+    history = json.loads(selection.read_text()) if selection.exists() else None
+    if history is not None and history["original_config_sha256"] != original_sha:
+        raise ValueError("capacity retry cannot resume a different experiment config")
+    if history is not None and oom_log is None:
+        attempt = history["attempts"][-1]
+        config_path = Path(attempt["config_path"])
+        if hashlib.sha256(config_path.read_bytes()).hexdigest() != attempt["config_sha256"]:
+            raise ValueError("capacity attempt config changed; incompatible resume")
+        load_config(config_path)
+        return {**run, "config_path": config_path, "output_dir": Path(attempt["output_dir"]),
+                "capacity_original_config": original, "capacity_attempt": attempt["index"]}
+    index = len(history["attempts"]) if history else 0
+    raw = _load_yaml(Path(run["config_path"]))
+    changes: dict[str, Any] = {}
+    if oom_log is not None:
+        if _failure_kind(1, oom_log.read_text()) != "cuda_oom":
+            raise ValueError("capacity parameters may change only after CUDA OOM")
+        if index > int(policy["max_retries"]):
+            return None
+        training = raw["training"]
+        previous = int(training["batch_size_train"])
+        minimum = int(policy["minimum_train_batch"])
+        if previous <= minimum:
+            return None
+        # All attempts retain dual-GPU divisibility, research dimensions,
+        # accounting, precision/backends and full-trajectory update cadence.
+        reduced = max(minimum, (previous // 4) * 2)
+        changes["training.batch_size_train"] = [previous, reduced]
+        training["batch_size_train"] = reduced
+        for key in ("batch_size_eval", "eval_auto_chunk_rows_cap"):
+            old = int(training[key])
+            training[key] = max(1, old // 2)
+            changes[f"training.{key}"] = [old, training[key]]
+        model = training["financial_transformer"]
+        stream = int(model.get("factorized_compact_stream_chunk_bytes", 0))
+        if stream:
+            model["factorized_compact_stream_chunk_bytes"] = max(128 * 1024**2, stream // 2)
+            changes["training.financial_transformer.factorized_compact_stream_chunk_bytes"] = [
+                stream, model["factorized_compact_stream_chunk_bytes"]]
+    attempt_root = owner / f"attempt-{index:02d}"
+    attempt_root.mkdir(parents=True, exist_ok=False)
+    output = attempt_root / "training"
+    output.mkdir()
+    raw["runner"]["output_dir"] = str(output)
+    config_path = attempt_root / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    load_config(config_path)
+    attempt = {"index": index, "config_path": str(config_path), "output_dir": str(output),
+               "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+               "capacity_changes": changes, "optimizer_resume_from_previous_attempt": False}
+    if oom_log is not None:
+        attempt.update(oom_log=str(oom_log), oom_log_sha256=hashlib.sha256(oom_log.read_bytes()).hexdigest())
+    if history is None:
+        history = {"contract": "ablation_oom_capacity_attempts_v1", "name": run["name"],
+                   "original_config_sha256": original_sha, "attempts": []}
+    history["attempts"].append(attempt)
+    atomic_write_json(selection, history)
+    public = root / run["name"]
+    if public.exists() and not public.is_symlink():
+        raise ValueError("capacity retry requires a fresh versioned experiment root")
+    temporary = owner / "selected.tmp"
+    temporary.symlink_to(output)
+    temporary.replace(public)
+    return {**run, "config_path": config_path, "output_dir": output,
+            "capacity_original_config": original, "capacity_attempt": index}
+
+
+def _steady_timing(output: Path) -> dict[str, Any]:
+    """Read actual complete epochs 3+; never substitute rank-local timing."""
+    import statistics
+    import math
+    samples = []
+    for path in output.glob("train_*/epoch_curve.jsonl"):
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+                epoch = int(row.get("epoch", 0))
+                wall = row.get("epoch_max_rank_s", row.get("epoch_wall_s_max_rank"))
+                if epoch >= 3 and wall is not None and math.isfinite(float(wall)) and float(wall) > 0:
+                    samples.append({"epoch": epoch, "epoch_max_rank_s": float(wall), "curve": str(path)})
+            except (ValueError, TypeError):
+                continue  # A concurrently appended final line can be incomplete.
+    return {"steady_min_epoch": 3, "steady_samples": samples,
+            "steady_epoch_max_rank_median_s": statistics.median(s["epoch_max_rank_s"] for s in samples) if samples else None}
 _CUDA_INFRASTRUCTURE_FAILURE_PATTERNS = (
     "cuda is not available in this environment",
     "cuda driver initialization failed",
@@ -563,6 +665,12 @@ def _experiment_rows(spec_path: Path, selected: set[str] | None = None) -> tuple
     dimensions = matrix.get("dimensions")
     if not isinstance(dimensions, list) or not dimensions:
         raise ValueError("ablation spec requires a non-empty matrix.dimensions list")
+    prepend_dimensions = matrix.get("prepend_dimensions", [])
+    if not isinstance(prepend_dimensions, list):
+        raise ValueError("matrix.prepend_dimensions must be a list")
+    # An inherited catalog can add experiments immediately after its baseline
+    # without copying or replacing the original research dimensions.
+    dimensions = [*prepend_dimensions, *dimensions]
 
     rows: list[dict[str, Any]] = []
     if bool(matrix.get("include_baseline", True)):
@@ -992,6 +1100,15 @@ def main() -> None:
     runtime = spec.get("runtime", {})
     if not isinstance(runtime, dict):
         raise ValueError("ablation spec runtime must be a mapping")
+    capacity_policy = runtime.get("capacity_retry", {})
+    if not isinstance(capacity_policy, dict):
+        raise ValueError("runtime.capacity_retry must be a mapping")
+    if capacity_policy:
+        if (set(capacity_policy) != {"max_retries", "minimum_train_batch"}
+                or not 0 <= int(capacity_policy["max_retries"]) <= 8
+                or int(capacity_policy["minimum_train_batch"]) < 2
+                or int(capacity_policy["minimum_train_batch"]) % 2):
+            raise ValueError("invalid bounded dual-GPU capacity policy")
     cpu_threads = args.cpu_threads if args.cpu_threads is not None else runtime.get("cpu_threads")
     compile_threads = (
         args.torch_compile_threads
@@ -1110,9 +1227,19 @@ def main() -> None:
             "output_dir": str(run["output_dir"]),
             "source_config_path": str(run["source_config_path"]),
             "config_path": str(run["config_path"]),
+            **_steady_timing(run["output_dir"]),
             **_collect_metrics(run["output_dir"]),
         }
         write_current_summary()
+        if capacity_policy:
+            from downloader.artifact_io import atomic_write_json
+            timing = _steady_timing(run['output_dir'])
+            atomic_write_json(output_root / f"{run['name']}-speed.json", {
+                'name': run['name'], 'start_fold': _run_start_fold(run, args.start_fold),
+                'config_path': str(run['config_path']), 'elapsed_s_including_failed_attempts': elapsed_s,
+                'complete_fold_lifecycle_verified': status in {'succeeded', 'complete'}
+                    and requested_after is not None and requested_after > 0 and complete_after == requested_after,
+                **timing})
         _print_progress(
             len(summary_by_order), total_runs, f"{run['name']}: {status}"
         )
@@ -1132,6 +1259,8 @@ def main() -> None:
 
     pending: list[dict[str, Any]] = []
     for run_index, run in enumerate(runs, start=1):
+        if capacity_policy and not args.dry_run:
+            run = _capacity_run(run, capacity_policy)
         command = [str(args.runner.resolve()), "-c", str(run["config_path"]), "--"]
         for flag, value in (
             ("--start-fold", _run_start_fold(run, args.start_fold)),
@@ -1201,6 +1330,8 @@ def main() -> None:
     first_failure: int | None = None
     cuda_health_blocked = False
     next_cuda_health_probe_at = 0.0
+    next_timing_read_at = 0.0
+    last_timing: dict[str, Any] = {}
     try:
         while pending or active:
             while pending and len(active) < parallel_jobs and first_failure is None:
@@ -1263,7 +1394,7 @@ def main() -> None:
                 stdout = None
                 worker_log: Path | None = None
                 log_start_offset = 0
-                if parallel_jobs > 1 or bool(args.auto_resume):
+                if parallel_jobs > 1 or bool(args.auto_resume) or capacity_policy:
                     worker_log = run["output_dir"] / "ablation_worker.log"
                     worker_log.parent.mkdir(parents=True, exist_ok=True)
                     try:
@@ -1334,6 +1465,19 @@ def main() -> None:
                 for pid, job in active.items()
                 if job.process.poll() is not None
             ]
+            if capacity_policy and time.monotonic() >= next_timing_read_at:
+                from downloader.artifact_io import atomic_write_json
+                for job in active.values():
+                    timing = _steady_timing(job.run["output_dir"])
+                    if timing["steady_samples"] and last_timing.get(job.run["name"]) != timing:
+                        last_timing[job.run["name"]] = timing
+                        atomic_write_json(output_root / f"{job.run['name']}-speed.json", {
+                            "name": job.run["name"], "start_fold": _run_start_fold(job.run, args.start_fold),
+                            "config_path": str(job.run["config_path"]),
+                            "complete_fold_lifecycle_verified": False, **timing})
+                        print(f"[{job.run['name']}] steady epoch3+ MAX rank median="
+                              f"{timing['steady_epoch_max_rank_median_s']:.3f}s", flush=True)
+                next_timing_read_at = time.monotonic() + 5.0
             if not finished:
                 if active:
                     time.sleep(0.25)
@@ -1363,6 +1507,18 @@ def main() -> None:
                         returncode,
                         _attempt_log_text(job),
                     )
+                    if failure_kind == "cuda_oom" and capacity_policy:
+                        resized = _capacity_run(job.run, capacity_policy, oom_log=job.log_path)
+                        if resized is not None:
+                            resized["capacity_elapsed_s"] = float(job.run.get("capacity_elapsed_s", 0)) + elapsed_s
+                            command = list(job.command)
+                            command[command.index("-c") + 1] = str(resized["config_path"])
+                            pending.insert(0, {"order": job.order, "run": resized, "command": command,
+                                "attempt": job.attempt + 1, "consecutive_no_progress_failures": 0,
+                                "ready_at": 0.0})
+                            print(f"[{job.run['name']}] observed CUDA OOM; capacity attempt="
+                                  f"{resized['capacity_attempt']} fresh optimizer, config={resized['config_path']}", flush=True)
+                            continue
                     progress_after = _run_progress_signature(job.run["output_dir"])
                     made_progress = progress_after > job.progress_before
                     infrastructure_wait = (
@@ -1458,7 +1614,7 @@ def main() -> None:
                     run=job.run,
                     status="succeeded" if returncode == 0 else "failed",
                     returncode=returncode,
-                    elapsed_s=elapsed_s,
+                    elapsed_s=elapsed_s + float(job.run.get("capacity_elapsed_s", 0)),
                     attempts=job.attempt,
                     failure_kind=failure_kind,
                     consecutive_no_progress_failures=no_progress_failures,

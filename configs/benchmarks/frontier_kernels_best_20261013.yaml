@@ -1,0 +1,25 @@
+# Validated candidate from the complete Vastai1T A/B/B/A engineering comparison.
+# Balanced epoch: 88.7055 -> 71.5578 s; complete four-epoch fold: 556.6674 -> 474.0681 s.
+# Four complete epochs; this does not select a formal research deployment.
+# Source SHA256: daff3a8e0777e43ed0b0c969ac3b509d1f9bfd96c317fe56a41b27510923192a
+# Tested private packages: QuACK 0.6.5, CuTe DSL 4.8.0, Torch 2.11.0+cu128.
+# GPU affinity below is specific to this two-RTX-5090 host.
+contract: frontier_complete_fold_recipes_v1
+full_fold_candidates:
+  - name: vastai1t_quack_numa_funding_v3
+    code_root: /root/stockAgent/artifacts/benchmarks/frontier_kernels_20261013/candidate-source-v65/build-source
+    kernel_environment: true
+    batch_size: 256
+    cpu_threads: 8
+    compile_threads: 16
+    epochs: 4
+    overrides:
+      training:
+        financial_transformer:
+          compiled_cross_attention_backend: manual
+          temporal_blocks_fp32: false
+          kernel_softmax_backend: quack
+    runtime_overrides:
+      STOCKAGENT_DDP_CPU_AFFINITY: '42-55,154-167;28-41,140-153'
+      STOCKAGENT_DAY_TRADE_PREPARE_COMPILE: 1
+      STOCKAGENT_DAY_TRADE_CALENDAR_CACHE: 1
