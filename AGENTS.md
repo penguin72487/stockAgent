@@ -15,6 +15,10 @@ Paths written as `stockagent/...`, `scripts/...`, `configs/...`, `test/...` or
 - Inspect Git state before editing. Preserve unrelated and overlapping dirty
   work. Use `apply_patch` for manual edits; use `rg` for discovery. Do not use
   destructive Git commands without explicit authorization.
+- Review new files for necessity before staging: keep reusable source, tests,
+  configs and concise evidence; exclude private state and generated payloads.
+  Use the [Git content contract](docs/agents/git.md) and staged audit before
+  committing. Git-history removal is separate from deleting local source data.
 - For multi-step implementation/operations, use the [agent workflow](docs/agents/runtime.md#agent-workflow)
   to inspect current state, retain the original task and record milestone evidence.
 - Source `scripts/runtime_env.sh` and use `run_fintech_python`; do not hard-code
@@ -68,6 +72,7 @@ unrelated production preflights.
 
 | Task | Contract |
 | --- | --- |
+| New files, Git ignores, generated content or history cleanup | [Git content](docs/agents/git.md) |
 | Environment, Windows supervisor, GPU setup, test commands | [Runtime](docs/agents/runtime.md) |
 | Data publication, Syncthing, hot/cold storage, migration or deletion | [Storage](docs/agents/storage.md) |
 | Discord, manual signals, TAIFEX capture/strategy service and health | [Services](docs/agents/services.md) |
