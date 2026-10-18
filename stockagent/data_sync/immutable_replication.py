@@ -5,11 +5,15 @@ transport. Shared with the fixed locally installed lab203 archive adapter.
 """
 from __future__ import annotations
 
+import ctypes
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
+import platform
 import re
 import shutil
 import stat
@@ -25,13 +29,57 @@ HASH = re.compile(r"[0-9a-f]{64}\Z")
 NATIVE_HASH_MIN_BYTES = 8 * 1024**2  # Penguin NTFS full-hash comparison, 2026-10-06.
 
 
+class _OpenHow(ctypes.Structure):
+    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64), ('resolve', ctypes.c_uint64)]
+
+
+def _native_openat2_syscall():
+    # Linux x86-64 and asm-generic tables define openat2=437. Unknown ABIs use
+    # the original ancestor checks, never a guessed syscall or weaker guard.
+    if (platform.system() != 'Linux' or platform.machine() not in {'x86_64', 'aarch64', 'riscv64'}
+            or not hasattr(os, 'O_PATH') or ctypes.sizeof(ctypes.c_void_p) != 8):
+        return None
+    call = ctypes.CDLL(None, use_errno=True).syscall
+    call.restype = ctypes.c_long
+    return call
+
+
+_OPENAT2 = _native_openat2_syscall()
+
+
+def _checked_no_symlink(path):
+    """One complete path check; not a lease for subsequent payload I/O.
+
+    Keep all full SHA/stat/set/READY checks. O_NOFOLLOW must NOT accompany
+    O_PATH: that combination can return a final symlink FD even with
+    RESOLVE_NO_SYMLINKS. Any other error retains the entire old guard,
+    including its missing-payload metadata semantics.
+    """
+    global _OPENAT2
+    call = _OPENAT2  # Another thread may disable future probes during this call.
+    if call is None:
+        return False
+    how = _OpenHow(os.O_PATH | os.O_CLOEXEC, 0, 0x04)
+    fd = call(ctypes.c_long(437), ctypes.c_int(-100), ctypes.c_char_p(os.fsencode(path)),
+              ctypes.byref(how), ctypes.c_size_t(ctypes.sizeof(how)))
+    if fd >= 0:
+        os.close(fd)
+        return True
+    error = ctypes.get_errno()
+    if error == errno.ELOOP:
+        raise ValueError('immutable member path is redirected')
+    if error in {errno.ENOSYS, errno.EINVAL, errno.EPERM}:
+        _OPENAT2 = None
+    return False
+
+
 def safe(root: Path, relative: str) -> Path:
     name = PurePosixPath(relative)
     if (not name.parts or name.is_absolute() or ".." in name.parts
             or any(c in relative for c in "\\\r\n\0") or name.as_posix() != relative):
         raise ValueError("unsafe immutable member path")
     path = root / relative
-    if any(p.is_symlink() for p in (path, *path.parents)):
+    if not _checked_no_symlink(path) and any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError("immutable member path is redirected")
     return path
 

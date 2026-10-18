@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,7 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cash_asset_l1_weights,
     masked_learned_cash_weights,
+    masked_decoupled_entmax_cash_weights,
     masked_cash_entmax15_weights,
     masked_score_entmax_log_cash_weights,
     masked_score_entmax_bounded_cash_weights,
@@ -1496,7 +1498,8 @@ class TemporalBasisFeatureEncoder(nn.Module):
         *,
         collect_aux: bool,
         source_is_prepared: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        materialize_aux: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
         if temporal_embeddings.ndim != 4:
             raise ValueError("temporal_embeddings must have shape [B,L,S,F]")
         if int(temporal_embeddings.size(1)) != self.lookback:
@@ -1521,9 +1524,12 @@ class TemporalBasisFeatureEncoder(nn.Module):
         # sources are prepared explicitly before rolling-window views.
         if not source_is_prepared and self.fuse_projection:
             temporal_embeddings = self.prepare_source(temporal_embeddings)
-        aux: dict[str, torch.Tensor] = {}
+        aux: dict[str, torch.Tensor | None] = {}
         input_features: torch.Tensor | None = None
-        if collect_aux or not self.fuse_projection:
+        # A fused projection never consumes the explicit coefficient/feature
+        # diagnostics. Keep the same projection and attention numeric route;
+        # a non-fused projection still needs its full numeric input below.
+        if (collect_aux and materialize_aux) or not self.fuse_projection:
             feature_parts = [z_base]
             for family in self.family_names:
                 basis = self._basis(family, temporal_embeddings)
@@ -1535,7 +1541,7 @@ class TemporalBasisFeatureEncoder(nn.Module):
                 feature_parts.append(
                     coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
                 )
-                if collect_aux:
+                if collect_aux and materialize_aux:
                     aux[f"temporal_basis_{family}_coefficients"] = coefficients
             input_features = torch.cat(feature_parts, dim=-1)
         if self.fuse_projection:
@@ -1547,7 +1553,7 @@ class TemporalBasisFeatureEncoder(nn.Module):
         augmented = augmented.masked_fill(
             ~mask_bool.unsqueeze(-1), 0.0
         )
-        if collect_aux:
+        if collect_aux and materialize_aux:
             assert input_features is not None
             aux["temporal_basis_input_features"] = input_features.masked_fill(
                 ~mask_bool.unsqueeze(-1), 0.0
@@ -1556,6 +1562,11 @@ class TemporalBasisFeatureEncoder(nn.Module):
                 ~mask_bool.unsqueeze(-1), 0.0
             )
             aux["temporal_basis_output"] = augmented
+        elif collect_aux:
+            aux = dict.fromkeys([
+                *(f"temporal_basis_{family}_coefficients" for family in self.family_names),
+                "temporal_basis_input_features", "temporal_basis_original_path", "temporal_basis_output",
+            ])
         return augmented, aux
 
 
@@ -2206,6 +2217,7 @@ class TransformerBasePortfolioModel(nn.Module):
         portfolio_mode: str = "long_short",
         portfolio_activation: str = "identity",
         portfolio_output_mode: str = "activation_l1",
+        portfolio_risk_calibration: str = "off",
         center_long_short_logits: bool = True,
         projection_l1_scale_by_active_count: bool = False,
         max_full_tokens: int = 4096,
@@ -2327,6 +2339,13 @@ class TransformerBasePortfolioModel(nn.Module):
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode, allow_short_only=True)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.portfolio_output_mode = normalize_portfolio_output_mode(portfolio_output_mode)
+        self.portfolio_risk_calibration = str(portfolio_risk_calibration).strip().lower()
+        if self.portfolio_risk_calibration not in {"off", "constant", "linear"}:
+            raise ValueError("portfolio_risk_calibration must be off, constant or linear")
+        if self.portfolio_risk_calibration != "off" and (
+                self.portfolio_output_mode != "score_entmax_scale_separated_cash"
+                or self.num_action_channels != 1):
+            raise ValueError("risk calibration requires single-action scale-separated cash")
         if self.portfolio_mode == "short_only" and (
             self.portfolio_output_mode not in {
                 "cash_entmax15", "score_entmax_cash", "score_entmax_cash_v2",
@@ -2339,6 +2358,9 @@ class TransformerBasePortfolioModel(nn.Module):
                 "score_entmax_global_cash", "score_entmax_bounded_cash",
                 "score_entmax_log_cash",
                 "score_entmax_scale_separated_cash",
+                "decoupled_entmax_cash",
+                "decoupled_entmax_cash_v2",
+                "score_entmax_scale_separated_cash_v2",
             }
             and self.num_action_channels != 1
         ):
@@ -2573,6 +2595,20 @@ class TransformerBasePortfolioModel(nn.Module):
         # parameter shapes so old strict checkpoints remain byte-for-byte
         # schema compatible.  Multi-action modes widen only the final head.
         self.score_head = make_score_head(self.num_action_channels)
+        self.direction_score_head = (
+            make_score_head(1)
+            if self.portfolio_output_mode in {"decoupled_entmax_cash", "decoupled_entmax_cash_v2"}
+            else None
+        )
+        # Zero delta preserves the exact old allocation before any update.
+        # A distinct head changes risk odds without changing relative stock legs.
+        self.risk_calibration_head = None
+        if self.portfolio_risk_calibration != "off":
+            width = 1 if self.portfolio_risk_calibration == "constant" else 3 * self.d_model
+            self.risk_calibration_head = nn.Linear(width, 1, bias=width != 1)
+            nn.init.zeros_(self.risk_calibration_head.weight)
+            if self.risk_calibration_head.bias is not None:
+                nn.init.zeros_(self.risk_calibration_head.bias)
         # Cash-aware modes treat cash as one additional model-scored asset. Its
         # token receives the current masked market context. Legacy cash_l1 then
         # reuses the stock score head; learned_cash uses the independent gate
@@ -2580,12 +2616,12 @@ class TransformerBasePortfolioModel(nn.Module):
         # historical checkpoint schema.
         self.cash_asset_token = (
             nn.Parameter(torch.randn(1, self.d_model) * 0.02)
-            if self.portfolio_output_mode in {"cash_l1", "learned_cash"}
+            if self.portfolio_output_mode in {"cash_l1", "learned_cash", "decoupled_entmax_cash", "decoupled_entmax_cash_v2"}
             else None
         )
         self.cash_asset_norm = (
             _make_norm(self.d_model, self.norm_type)
-            if self.portfolio_output_mode in {"cash_l1", "learned_cash"}
+            if self.portfolio_output_mode in {"cash_l1", "learned_cash", "decoupled_entmax_cash", "decoupled_entmax_cash_v2"}
             else None
         )
         # ``learned_cash`` must not inherit the arbitrary common bias/scale of
@@ -2594,7 +2630,7 @@ class TransformerBasePortfolioModel(nn.Module):
         # Historical cash_l1 keeps the shared score head for exact replay.
         self.learned_cash_score_head = (
             nn.Linear(self.d_model, 1)
-            if self.portfolio_output_mode == "learned_cash"
+            if self.portfolio_output_mode in {"learned_cash", "decoupled_entmax_cash", "decoupled_entmax_cash_v2"}
             else None
         )
         if self.learned_cash_score_head is not None:
@@ -3606,6 +3642,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
         source_is_prepared: bool = False,
+        materialize_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.temporal_basis_feature_encoder is None:
             return z_base, {}
@@ -3615,6 +3652,7 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
             collect_aux=collect_aux,
             source_is_prepared=source_is_prepared,
+            materialize_aux=materialize_aux,
         )
 
     def _temporal_basis_source(
@@ -3653,6 +3691,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
         temporal_basis_source: torch.Tensor | None = None,
+        materialize_basis_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         basis_source = self._temporal_basis_source(h, temporal_basis_source)
         bsz, steps, n_symbols, dim = h.shape
@@ -3675,6 +3714,7 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
             collect_aux=collect_aux,
             source_is_prepared=(self.temporal_basis_input == "raw_features"),
+            materialize_aux=materialize_basis_aux,
         )
         if collect_aux:
             aux.update(basis_aux)
@@ -3687,6 +3727,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
         temporal_basis_source: torch.Tensor | None = None,
+        materialize_basis_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
@@ -3702,6 +3743,7 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
             collect_aux=collect_aux,
             source_is_prepared=(self.temporal_basis_input == "raw_features"),
+            materialize_aux=materialize_basis_aux,
         )
         if collect_aux:
             aux.update(basis_aux)
@@ -3714,6 +3756,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
         temporal_basis_source: torch.Tensor | None = None,
+        materialize_basis_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
@@ -3728,6 +3771,7 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
             collect_aux=collect_aux,
             source_is_prepared=(self.temporal_basis_input == "raw_features"),
+            materialize_aux=materialize_basis_aux,
         )
         if collect_aux:
             aux.update(basis_aux)
@@ -3742,6 +3786,7 @@ class TransformerBasePortfolioModel(nn.Module):
         collect_aux: bool,
         use_market: bool = True,
         temporal_basis_source: torch.Tensor | None = None,
+        materialize_basis_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
@@ -3755,6 +3800,7 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
             collect_aux=collect_aux,
             source_is_prepared=(self.temporal_basis_input == "raw_features"),
+            materialize_aux=materialize_basis_aux,
         )
         z_stock, aux = self._forward_latent_or_market_from_stock_embeddings(
             z_base,
@@ -3873,6 +3919,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
         temporal_basis_source: torch.Tensor | None = None,
+        materialize_basis_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
@@ -3886,6 +3933,7 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
             collect_aux=collect_aux,
             source_is_prepared=(self.temporal_basis_input == "raw_features"),
+            materialize_aux=materialize_basis_aux,
         )
         z_stock, aux = self._forward_market_token_from_stock_embeddings(
             z_base,
@@ -3954,6 +4002,7 @@ class TransformerBasePortfolioModel(nn.Module):
         return_aux: bool | None = None,
         return_scores: bool = False,
         portfolio_context: dict[str, torch.Tensor] | None = None,
+        _risk_calibration_inputs_only: bool = False,
     ):
         self._require_compact_explainability_mode()
         safe_mask = _safe_attention_mask(mask_bool)
@@ -3994,6 +4043,7 @@ class TransformerBasePortfolioModel(nn.Module):
             return_aux=return_aux,
             return_scores=return_scores,
             portfolio_context=portfolio_context,
+            _risk_calibration_inputs_only=_risk_calibration_inputs_only,
         )
 
     def _forward_embedded(
@@ -4005,6 +4055,7 @@ class TransformerBasePortfolioModel(nn.Module):
         return_scores: bool = False,
         temporal_basis_source: torch.Tensor | None = None,
         portfolio_context: dict[str, torch.Tensor] | None = None,
+        materialize_basis_aux: bool = True,
     ):
         safe_mask = _safe_attention_mask(mask_bool)
         collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
@@ -4015,6 +4066,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 safe_mask,
                 collect_aux=collect_aux,
                 temporal_basis_source=temporal_basis_source,
+                materialize_basis_aux=materialize_basis_aux,
             )
         elif self.attention_mode == "axial":
             z_stock, aux = self._forward_axial(
@@ -4022,6 +4074,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 safe_mask,
                 collect_aux=collect_aux,
                 temporal_basis_source=temporal_basis_source,
+                materialize_basis_aux=materialize_basis_aux,
             )
         elif self.attention_mode == "latent":
             z_stock, aux = self._forward_latent_or_market(
@@ -4031,6 +4084,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 use_market=True,
                 collect_aux=collect_aux,
                 temporal_basis_source=temporal_basis_source,
+                materialize_basis_aux=materialize_basis_aux,
             )
         elif self.attention_mode == "latent_only":
             z_stock, aux = self._forward_latent_or_market(
@@ -4040,6 +4094,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 use_market=False,
                 collect_aux=collect_aux,
                 temporal_basis_source=temporal_basis_source,
+                materialize_basis_aux=materialize_basis_aux,
             )
         elif self.attention_mode == "market_token":
             z_stock, aux = self._forward_market_token_fast(
@@ -4047,6 +4102,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 safe_mask,
                 collect_aux=collect_aux,
                 temporal_basis_source=temporal_basis_source,
+                materialize_basis_aux=materialize_basis_aux,
             )
         else:
             z_stock, aux = self._forward_temporal_only(
@@ -4054,6 +4110,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 safe_mask,
                 collect_aux=collect_aux,
                 temporal_basis_source=temporal_basis_source,
+                materialize_basis_aux=materialize_basis_aux,
             )
 
         return self._portfolio_outputs_from_stock_embeddings(
@@ -4086,7 +4143,7 @@ class TransformerBasePortfolioModel(nn.Module):
             # This helper is the explicit logits -> executable-target boundary.
             # Callers that want raw logits do not call it.
             resolved_mode = "activation_l1"
-        if resolved_mode in {"cash_l1", "learned_cash"}:
+        if resolved_mode in {"cash_l1", "learned_cash", "decoupled_entmax_cash", "decoupled_entmax_cash_v2"}:
             raise ValueError(
                 f"{resolved_mode} requires the contextual cash token and is resolved "
                 "inside model forward; raw stock logits alone are insufficient"
@@ -4135,6 +4192,7 @@ class TransformerBasePortfolioModel(nn.Module):
             "score_entmax_global_cash", "score_entmax_bounded_cash",
             "score_entmax_log_cash",
             "score_entmax_scale_separated_cash",
+            "score_entmax_scale_separated_cash_v2",
         }:
             allocator = {
                 "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
@@ -4142,6 +4200,9 @@ class TransformerBasePortfolioModel(nn.Module):
                 "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
                 "score_entmax_scale_separated_cash": (
                     self._scale_separated_cash_weights
+                ),
+                "score_entmax_scale_separated_cash_v2": partial(
+                    self._scale_separated_cash_weights, implicit_backward=True
                 ),
             }[resolved_mode]
             cash_output = allocator(
@@ -4548,7 +4609,7 @@ class TransformerBasePortfolioModel(nn.Module):
         )
         cash_head = (
             self.learned_cash_score_head
-            if self.portfolio_output_mode == "learned_cash"
+            if self.portfolio_output_mode in {"learned_cash", "decoupled_entmax_cash", "decoupled_entmax_cash_v2"}
             else self.score_head
         )
         if cash_head is None:
@@ -4557,6 +4618,30 @@ class TransformerBasePortfolioModel(nn.Module):
         if tuple(cash_score.shape) != (int(z_stock.size(0)), 1):
             raise RuntimeError("cash-aware score head must emit one cash score")
         return _sanitize_scores_to_dtype(cash_score.squeeze(-1))
+
+    def _portfolio_risk_features(self, z_stock, mask_bool):
+        with torch.autocast(z_stock.device.type, enabled=False):
+            return (z_stock.new_ones((z_stock.size(0), 1), dtype=torch.float32)
+                if self.portfolio_risk_calibration == "constant" else
+                _masked_market_summary_parts(z_stock.float(), mask_bool).flatten(1))
+
+    def _calibrate_portfolio_risk(self, weights, z_stock, mask_bool):
+        return self._calibrate_portfolio_risk_from_features(
+            weights, self._portfolio_risk_features(z_stock, mask_bool), mask_bool)
+
+    def _calibrate_portfolio_risk_from_features(self, weights, features, mask_bool):
+        # FP32 odds arithmetic keeps a small learned correction observable
+        # under BF16 AMP. Existing exact execution/fees still receive weights.
+        with torch.autocast(weights.device.type, enabled=False):
+            delta = self.risk_calibration_head(features).clamp(-12.0, 12.0)
+            base_gross = weights.float().abs().sum(dim=1, keepdim=True)
+            gross = base_gross.clamp(0.0, 1.0)
+            # sigmoid(logit(gross)+delta), expressed as a scale on the old
+            # weights: exact identity at delta=0, stable at cash/full risk.
+            scale = (gross + (1.0 - gross) * torch.exp(-delta)).reciprocal()
+            calibrated = weights.float() * scale
+            calibrated = calibrated.masked_fill(~mask_bool, 0.0)
+        return calibrated, base_gross.squeeze(1), delta.squeeze(1)
 
     def _portfolio_outputs_from_stock_embeddings(
         self,
@@ -4568,6 +4653,7 @@ class TransformerBasePortfolioModel(nn.Module):
         return_aux: bool | None = None,
         return_scores: bool = False,
         portfolio_context: dict[str, torch.Tensor] | None = None,
+        _risk_calibration_inputs_only: bool = False,
     ):
         del portfolio_context
         if self.num_action_channels > 1:
@@ -4610,12 +4696,29 @@ class TransformerBasePortfolioModel(nn.Module):
         cash_aware_output = self.portfolio_output_mode in {
             "cash_l1",
             "learned_cash",
+            "decoupled_entmax_cash",
+            "decoupled_entmax_cash_v2",
         }
         if cash_aware_output:
             cash_score_logits = self._cash_asset_score_logit(z_stock, mask_bool)
             cash_target_logits = cash_score_logits / temp
 
-        if self.portfolio_mode in {"long_only", "short_only"}:
+        if self.portfolio_output_mode in {"decoupled_entmax_cash", "decoupled_entmax_cash_v2"}:
+            if self.direction_score_head is None or cash_target_logits is None:
+                raise AssertionError("decoupled output heads were not constructed")
+            centered_scores = scores
+            target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
+            direction_logits = _sanitize_scores_to_dtype(
+                self.direction_score_head(z_stock).squeeze(-1)
+            ) / temp
+            weights, output_aux = masked_decoupled_entmax_cash_weights(
+                target_logits, direction_logits, cash_target_logits, mask_bool,
+                long_only=self.portfolio_mode == "long_only",
+                normalize_direction=self.portfolio_output_mode == "decoupled_entmax_cash_v2",
+            )
+            output_aux.update(cash_score_logits=cash_score_logits,
+                              cash_target_logits=cash_target_logits)
+        elif self.portfolio_mode in {"long_only", "short_only"}:
             centered_scores = scores
             if PROFILE_RANGES_ENABLED:
                 with profile_range("model.portfolio.target_logits"):
@@ -4703,6 +4806,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 "score_entmax_global_cash", "score_entmax_bounded_cash",
                 "score_entmax_log_cash",
                 "score_entmax_scale_separated_cash",
+                "score_entmax_scale_separated_cash_v2",
             }:
                 allocator = {
                     "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
@@ -4710,6 +4814,9 @@ class TransformerBasePortfolioModel(nn.Module):
                     "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
                     "score_entmax_scale_separated_cash": (
                         self._scale_separated_cash_weights
+                    ),
+                    "score_entmax_scale_separated_cash_v2": partial(
+                        self._scale_separated_cash_weights, implicit_backward=True
                     ),
                 }[self.portfolio_output_mode]
                 cash_output = allocator(
@@ -4847,6 +4954,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 "score_entmax_global_cash", "score_entmax_bounded_cash",
                 "score_entmax_log_cash",
                 "score_entmax_scale_separated_cash",
+                "score_entmax_scale_separated_cash_v2",
             }:
                 allocator = {
                     "score_entmax_global_cash": masked_score_entmax_global_cash_weights,
@@ -4854,6 +4962,9 @@ class TransformerBasePortfolioModel(nn.Module):
                     "score_entmax_log_cash": masked_score_entmax_log_cash_weights,
                     "score_entmax_scale_separated_cash": (
                         self._scale_separated_cash_weights
+                    ),
+                    "score_entmax_scale_separated_cash_v2": partial(
+                        self._scale_separated_cash_weights, implicit_backward=True
                     ),
                 }[self.portfolio_output_mode]
                 cash_output = allocator(
@@ -4900,11 +5011,29 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             weights = weights.masked_fill(~mask_bool, 0.0)
 
+        if _risk_calibration_inputs_only:
+            if self.risk_calibration_head is None or return_aux is not False or return_scores:
+                raise ValueError("frozen risk inputs require a risk head and tensor-only output")
+            return weights, self._portfolio_risk_features(z_stock, mask_bool)
+
+        if self.risk_calibration_head is not None:
+            weights, base_gross, risk_delta = self._calibrate_portfolio_risk(
+                weights, z_stock, mask_bool)
+            calibrated_gross = weights.abs().sum(dim=1)
+            output_aux.update({
+                "risk_calibration_base_gross": base_gross,
+                "risk_calibration_log_odds_delta": risk_delta,
+                "risky_gross_weight": calibrated_gross,
+                "score_entmax_scale_separated_risk_fraction": calibrated_gross,
+                "score_entmax_scale_separated_cash_fraction": (1.0-calibrated_gross).clamp_min(0.0),
+                "implicit_cash_weight": (1.0-calibrated_gross).clamp_min(0.0),
+            })
+
         if cash_aware_output:
             cash_weight = output_aux["cash_weight"]
             if cash_score_logits is None:
                 raise AssertionError("cash-aware score logits were not prepared")
-            if self.portfolio_output_mode == "learned_cash":
+            if self.portfolio_output_mode in {"learned_cash", "decoupled_entmax_cash", "decoupled_entmax_cash_v2"}:
                 # The cash gate and final signed stock weights are the actual
                 # allocation coordinates; no projected pre-weight exists.
                 stock_allocation_scores = weights.float()

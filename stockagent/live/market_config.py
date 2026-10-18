@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import os
 from pathlib import Path
 from typing import Any
 import shlex
 
 import yaml
+
+
+def live_panel_disk_cache_root(*, repo_root: Path | None = None) -> Path:
+    """Resolve the shared panel location without loading models or data.
+
+    A relative environment override is intentionally relative to the process
+    working directory, matching the live writer's original path contract.
+    """
+    configured = str(os.getenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", "")).strip()
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else Path.cwd() / path
+    root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
+    return root / "artifacts" / "cache" / "live_signal_panels"
 
 
 @dataclass(slots=True)

@@ -14,7 +14,7 @@ from downloader.finmind_history_order import HISTORY_STAGES, STAGES, metadata
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base-url', default='https://penguin72487.ddnsgeek.com')
+    parser.add_argument('--base-url', default='https://www.penguin72487.dpdns.org')
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
     output = args.output_dir

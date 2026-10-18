@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     DEFAULT_COMPRESSION_LEVEL,
     DEFAULT_LOOSE_FILE_THRESHOLD_BYTES,
     DEFAULT_PACK_BUCKETS,
+    _load_inventory,
     audit_packed_store,
     fetch_packed_snapshot,
     fetch_packed_subtree,
@@ -130,6 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish.add_argument("--pack-buckets", type=int, default=DEFAULT_PACK_BUCKETS)
     publish.add_argument(
+        "--file-chunk-mib", type=int,
+        help="Opt in to v2 exact large-file chunks (1–64 MiB); deploy v2 readers before shared publication.",
+    )
+    publish.add_argument(
         "--compression-level", type=int, default=DEFAULT_COMPRESSION_LEVEL
     )
     publish.add_argument(
@@ -164,6 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_resolution_arguments(verify)
     verify.add_argument("--materialized", type=Path)
     verify.add_argument(
+        "--reconstruct-all-files", action="store_true",
+        help="Stream every original file and compare its full SHA/size without materializing another dataset.",
+    )
+    verify.add_argument("--result-receipt", type=Path, help="New path for successful fixed-release verification evidence.")
+    verify.add_argument("--progress-receipt", type=Path, help="New path for verification progress; never acceptance proof.")
+    verify.add_argument(
         "--profile", action="store_true",
         help="include this process's resolution-plus-verification time and read counters",
     )
@@ -172,6 +184,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_resolution_arguments(fetch)
     fetch.add_argument("--materialized-root")
     fetch.add_argument("--pin", type=Path)
+
+    source_view = subparsers.add_parser("fetch-source-view",
+        help="verify and assemble a fixed private compound source with its cross-root dependencies")
+    _add_resolution_arguments(source_view)
+    source_view.add_argument("--materialized-root", required=True)
 
     fetch_subtree = subparsers.add_parser(
         "fetch-subtree", help="atomically materialize one snapshot directory"
@@ -194,12 +211,32 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/var/lib/stockagent-packed-audit/receipts"),
     )
+    scratch_plan = subparsers.add_parser('metadata-scratch-plan', help='audit one failed disposable metadata index')
+    scratch_plan.add_argument('scratch', type=Path)
+    scratch_plan.add_argument('--failed-attempt', required=True, type=Path)
+    scratch_plan.add_argument('--output', required=True, type=Path)
+    scratch_apply = subparsers.add_parser('metadata-scratch-apply', help='retire exactly the audited disposable index')
+    scratch_apply.add_argument('plan', type=Path)
+    scratch_apply.add_argument('--receipt', required=True, type=Path)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == 'metadata-scratch-plan':
+            from stockagent.data_sync.packed_metadata import plan_failed_metadata_scratch
+            if args.output.exists() or args.output.is_symlink():
+                raise ValueError('preserve the original scratch plan')
+            result = plan_failed_metadata_scratch(args.scratch, args.failed_attempt)
+            atomic_write_json(args.output, result)
+            _print(result)
+            return 0
+        if args.command == 'metadata-scratch-apply':
+            from stockagent.data_sync.packed_metadata import retire_failed_metadata_scratch, _scratch_document
+            result = retire_failed_metadata_scratch(_scratch_document(args.plan)[0], args.receipt)
+            _print(result)
+            return 0
         if args.command == "init":
             root = _sync_root(args.sync_root)
             node_id = initialize_packed_layout(
@@ -224,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
                 metadata=_metadata(args.metadata),
                 excluded_subtrees=args.exclude_subtree,
                 maximum_file_bytes=args.maximum_file_bytes,
+                **({"file_chunk_bytes": args.file_chunk_mib * 1024 * 1024}
+                   if args.file_chunk_mib is not None else {}),
                 repo_root=REPO_ROOT,
             )
             archive = resolved.manifest["archive"]
@@ -266,11 +305,47 @@ def main(argv: list[str] | None = None) -> int:
             started = time.perf_counter()
             io_before = _process_read_counters() if args.profile else None
             root = _sync_root(args.sync_root)
+            for path in (args.result_receipt, args.progress_receipt):
+                if path is not None and (path.exists() or path.is_symlink()):
+                    raise SnapshotError("verification receipts must be new paths")
+            if (args.result_receipt is not None and args.progress_receipt is not None
+                    and args.result_receipt.resolve() == args.progress_receipt.resolve()):
+                raise SnapshotError("verification result and progress paths must differ")
+            resolved = _resolved(args)
+            reconstruct_paths = None
+            if args.reconstruct_all_files:
+                reconstruct_paths = [row["path"] for row in _load_inventory(root.resolve(), resolved.manifest)
+                                     if row["kind"] == "file"]
+            last_progress_at, last_stage = 0.0, None
+
+            def progress(payload: dict[str, Any]) -> None:
+                nonlocal last_progress_at, last_stage
+                now = time.perf_counter()
+                if (now - last_progress_at < 1 and payload["stage"] == last_stage
+                        and payload.get("completed_items") != payload.get("total_items")):
+                    return
+                last_progress_at, last_stage = now, payload["stage"]
+                atomic_write_json(args.progress_receipt, {
+                    **payload, "snapshot_id": resolved.manifest["snapshot_id"],
+                    "manifest_sha256": resolved.manifest_sha256,
+                    "elapsed_seconds": round(now - started, 3),
+                    "observed_at_utc": datetime.now(UTC).isoformat(),
+                    "acceptance_proof": False,
+                })
+
             verification = verify_packed_snapshot(
                 root,
-                _resolved(args),
+                resolved,
                 materialized_path=args.materialized,
+                **({"reconstruct_paths": reconstruct_paths} if args.reconstruct_all_files else {}),
+                **({"progress": progress} if args.progress_receipt is not None else {}),
             )
+            if args.reconstruct_all_files:
+                verification["full_original_file_reconstruction_verified"] = True
+                verification["source_files"] = len(reconstruct_paths)
+            if args.progress_receipt is not None:
+                progress({"stage": "finished", "completed_items": len(reconstruct_paths or ()),
+                          "total_items": len(reconstruct_paths or ())})
             if args.profile:
                 io_after = _process_read_counters()
                 verification["profile"] = {
@@ -285,7 +360,21 @@ def main(argv: list[str] | None = None) -> int:
                         if io_before is not None and io_after is not None else None
                     ),
                 }
+            if args.result_receipt is not None:
+                if args.result_receipt.exists() or args.result_receipt.is_symlink():
+                    raise SnapshotError("verification result receipt must remain a new path")
+                verification["verified_at_utc"] = datetime.now(UTC).isoformat()
+                verification["proof_scope"] = "selected_fixed_packed_release_not_NAS_or_full_history"
+                atomic_write_json(args.result_receipt, verification)
             _print(verification)
+            return 0
+        if args.command == "fetch-source-view":
+            from stockagent.data_sync.private_source_links import fetch_private_source_view
+            root = _sync_root(args.sync_root)
+            resolved = _resolved(args)
+            target = fetch_private_source_view(root, Path(args.materialized_root), resolved)
+            _print({"materialized_source_view": str(target), "snapshot_id": resolved.manifest["snapshot_id"],
+                    "manifest_sha256": resolved.manifest_sha256})
             return 0
         if args.command == "fetch":
             root = _sync_root(args.sync_root)

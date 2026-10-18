@@ -50,11 +50,15 @@ class SourceAccessBlocked(RuntimeError):
     """A source challenge is not a quota that should be retried blindly."""
 
 
+class SourceUpstreamUnavailable(SourceAccessBlocked):
+    """HTTP 200 proxy error: retry the same URL with a bounded backoff."""
+
+
 def _reject_source_error_page(body: bytes) -> None:
     # CBC's upstream proxy has returned this HTML error with HTTP 200. It is
     # neither a release nor evidence that the official listing has changed.
     if b"this web server can't be reached" in body.lower():
-        raise SourceAccessBlocked("official CBC host returned an upstream error page")
+        raise SourceUpstreamUnavailable("official CBC host returned an upstream error page")
 
 
 PERIOD_RE = re.compile(
@@ -289,7 +293,7 @@ def _fetch(url: str, limiter: SharedRateLimiter) -> bytes:
                     raise ValueError(f"empty CBC body: {url}")
                 _reject_source_error_page(body)
                 return body
-        except requests.RequestException:
+        except (requests.RequestException, SourceUpstreamUnavailable):
             if attempt == 4:
                 raise
             limiter.defer(retry_delay_seconds(attempt, base=1.0, cap=30.0))

@@ -305,12 +305,28 @@ def test_notice_diagnostic_distinguishes_disabled_root_from_no_direct_dialog():
 
 
 def test_explicit_probe_has_no_query_or_source_selection_calls():
-    probe = BRIDGE.split("if($requestDoc.action -eq 'probe_date_input')", 1)[1].split('[IO.File]::WriteAllText($Output', 1)[0]
+    probe = BRIDGE.split("if($requestDoc.action -eq 'probe_date_input')", 1)[1].split('[TejBridgeNative]::WriteArtifact($Output', 1)[0]
     for forbidden in ('Click-Button', 'Select-Combo', 'PostMessageW', '0xF5', 'Set-Checkbox'):
         assert forbidden not in probe
     for proof in ('original dates/schema', 'WriteDateText', 'query_axes_unchanged', 'field_selection_unchanged',
                   'intermediate_edit_observed', 'early_noop_path_used=$false'):
         assert proof in probe
+
+
+def test_critical_artifacts_use_atomic_bounded_local_publication_before_submission():
+    writer = BRIDGE.split('public static void WriteArtifact(', 1)[1].split(
+        'public static void WriteProgress(', 1)[0]
+    for proof in ('Guid.NewGuid()', 'FileMode.CreateNew', 'stream.Flush(true)',
+                  'MoveProgressFile(temporary,path,1u)', 'if(attempt>=2)throw;',
+                  'System.IO.File.Delete(temporary)'):
+        assert proof in writer
+    assert 'BeginPreview' not in writer and 'WriteAllText' not in writer
+    assert '[IO.File]::WriteAllText($Output' not in BRIDGE
+    assert "[IO.File]::WriteAllText(($Output+" not in BRIDGE
+    stage = BRIDGE.index("[TejBridgeNative]::WriteArtifact(($Output+'.stage.json')")
+    marker = BRIDGE.index('$querySubmissionPossible=$true', stage)
+    submit = BRIDGE.index('[TejBridgeNative]::BeginPreviewDefaultAction(', stage)
+    assert stage < marker < submit
 
 
 def test_input_contract_matches_python_and_actual_windows_bridge():

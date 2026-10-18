@@ -2,6 +2,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import sqlite3
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -88,3 +90,77 @@ def test_write_connection_is_closed_not_only_committed(tmp_path, monkeypatch):
     monkeypatch.setattr(free.sqlite3, 'connect', lambda *a, **kw: original(*a, **kw, factory=Connection))
     free._record_request_start(tmp_path, 'test')
     assert closed == [True]
+
+
+def test_sixteen_http_workers_queue_before_single_sqlite_write(tmp_path, monkeypatch):
+    original = free._write_request_start
+    active = peak = 0
+    barrier = threading.Barrier(16)
+
+    def write(*args, **kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            time.sleep(.002)  # Make a concurrent SQLite preflight observable.
+            return original(*args, **kwargs)
+        finally:
+            active -= 1
+
+    def record(index):
+        barrier.wait(timeout=5)
+        free._record_request_start(tmp_path, str(index))
+
+    monkeypatch.setattr(free, '_write_request_start', write)
+    with ThreadPoolExecutor(16) as pool:
+        list(pool.map(record, range(16)))
+    assert peak == 1 and active == 0
+    with closing(sqlite3.connect(tmp_path / 'request_traffic.sqlite3')) as conn:
+        assert conn.execute('SELECT count(DISTINCT dataset),count(*) FROM requests').fetchone() == (16, 16)
+
+
+def test_local_gate_timeout_never_opens_db_or_issues_http(tmp_path, monkeypatch):
+    monkeypatch.setattr(free, 'TRAFFIC_BUSY_TIMEOUT_SECONDS', .02)
+    session, limiter = Mock(), Mock()
+    connect = Mock(side_effect=AssertionError('not admitted to SQLite'))
+    monkeypatch.setattr(free.sqlite3, 'connect', connect)
+    with free._TRAFFIC_WRITE_LOCK, ThreadPoolExecutor(1) as pool:
+        result = pool.submit(free._request, session, limiter, 'test', start_date=None,
+                             token='private-test-token', traffic_root=tmp_path)
+        with pytest.raises(free.ProviderError) as failure:
+            result.result(timeout=2)
+    assert failure.value.code == 'local_traffic_busy'
+    connect.assert_not_called()
+    session.get.assert_not_called()
+    assert free._TRAFFIC_WRITE_LOCK.acquire(blocking=False)
+    free._TRAFFIC_WRITE_LOCK.release()
+
+
+def test_child_does_not_inherit_held_parent_traffic_gate(tmp_path):
+    import multiprocessing
+    if 'fork' not in multiprocessing.get_all_start_methods():
+        pytest.skip('requires fork')
+    child = multiprocessing.get_context('fork').Process(
+        target=free._record_request_start, args=(tmp_path, 'child'))
+    try:
+        with free._TRAFFIC_WRITE_LOCK:
+            child.start()
+            child.join(timeout=3)
+            assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=3)
+    with closing(sqlite3.connect(tmp_path / 'request_traffic.sqlite3')) as conn:
+        assert conn.execute('SELECT dataset FROM requests').fetchall() == [('child',)]
+
+
+def test_offline_ledger_abba_checks_complete_rows_and_durability():
+    from scripts.benchmark_finmind_request_traffic import benchmark
+    result = benchmark(workers=2, per_worker=2)
+    assert result['exact_output_parity'] and result['code_stable']
+    assert result['provider_calls'] == result['production_writes'] == 0
+    assert [row['mode'] for row in result['trials']] == ['baseline', 'candidate', 'candidate', 'baseline']
+    assert all(row['requests'] == 4 and row['complete_ledger_values_equal'] for row in result['trials'])
+    assert all(row['peak_local_sqlite_writers'] == 1
+               for row in result['trials'] if row['mode'] == 'candidate')

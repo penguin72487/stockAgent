@@ -71,6 +71,12 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
         return "score_entmax_log_cash"
     if normalized == "score_entmax_scale_separated_cash":
         return "score_entmax_scale_separated_cash"
+    if normalized == "decoupled_entmax_cash":
+        return "decoupled_entmax_cash"
+    if normalized == "decoupled_entmax_cash_v2":
+        return "decoupled_entmax_cash_v2"
+    if normalized == "score_entmax_scale_separated_cash_v2":
+        return "score_entmax_scale_separated_cash_v2"
     if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
         return "logits"
     if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
@@ -107,6 +113,9 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
         "'score_entmax_global_cash', 'score_entmax_bounded_cash', "
         "'score_entmax_log_cash', "
         "'score_entmax_scale_separated_cash', "
+        "'decoupled_entmax_cash', "
+        "'decoupled_entmax_cash_v2', "
+        "'score_entmax_scale_separated_cash_v2', "
         "or 'projection_l1'"
     )
 

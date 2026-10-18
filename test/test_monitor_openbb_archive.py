@@ -20,6 +20,171 @@ from scripts.monitor_openbb_archive import (
 )
 
 
+def test_file_audit_parallel_cli_is_explicit_bounded_and_optional() -> None:
+    assert monitor.parse_args([]).file_audit_workers == 8
+    assert monitor.parse_args([]).audit_files is False
+    assert monitor.parse_args(["--audit-files", "--file-audit-workers", "1"]).file_audit_workers == 1
+    for value in ("0", "33"):
+        with pytest.raises(SystemExit):
+            monitor.parse_args(["--file-audit-workers", value])
+
+
+def test_batch_ownership_paths_match_reference_and_do_not_cache_across_calls(
+    tmp_path: Path, monkeypatch
+) -> None:
+    directory = tmp_path / "ordinary" / "共享"
+    directory.mkdir(parents=True)
+    files = [directory / f"file-{i}.parquet" for i in range(600)]
+    for path in files:
+        path.touch()
+    relative = files[0].relative_to(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    paths = [*files, relative, directory / "missing", directory / "missing" / "child",
+             directory / ".." / "共享" / files[0].name, files[0] / "child",
+             Path("//") / str(files[0]).lstrip("/")]
+    expected = monitor._resolve_ownership_paths_reference(paths)
+    calls = []
+    real_resolve = Path.resolve
+
+    def counted_resolve(path, *args, **kwargs):
+        calls.append(path)
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counted_resolve)
+    assert monitor._resolve_ownership_paths(paths) == expected
+    assert len(calls) <= 5  # Ordinary files do not repeatedly traverse ancestors.
+    old = tmp_path / "old-directory"
+    directory.rename(old)
+    directory.symlink_to(old, target_is_directory=True)
+    assert monitor._resolve_ownership_paths(files) == [str(old / p.name) for p in files]
+
+
+def test_parallel_archive_reader_is_bounded_and_preserves_source_order(monkeypatch):
+    outstanding = 0
+    maximum = 0
+
+    class Future:
+        def __init__(self, row):
+            self.row = row
+
+        def result(self):
+            nonlocal outstanding
+            outstanding -= 1
+            return self.row
+
+    class Pool:
+        def __init__(self, **kwargs):
+            assert kwargs["max_workers"] == 3
+            assert kwargs["mp_context"].get_start_method() == "spawn"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            assert outstanding == 0
+
+        def submit(self, function, row, **kwargs):
+            nonlocal outstanding, maximum
+            assert function is monitor._audit_archive_batch
+            assert kwargs == {} and len(row) <= 64
+            outstanding += 1
+            maximum = max(maximum, outstanding)
+            return Future(row)
+
+    class Cursor:
+        def __init__(self):
+            self.position = 0
+
+        def fetchmany(self, size):
+            result = [{"index": i} for i in range(self.position, min(1000, self.position + size))]
+            self.position += len(result)
+            return result
+
+    monkeypatch.setattr(monitor, "ProcessPoolExecutor", Pool)
+    assert list(monitor._ordered_archive_results(Cursor(), 3)) == [{"index": i} for i in range(1000)]
+    assert maximum == 6
+
+
+def test_parallel_and_serial_file_audits_keep_identical_errors_and_sample_order(tmp_path):
+    path = tmp_path / "_state/openbb_archive.sqlite3"
+    manifest = Manifest(path)
+    try:
+        for i in range(70):
+            task = _task(tmp_path, f"bad-{i:03}")
+            output = Path(task.output_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(pa.table({"value": [i]}), output)
+            manifest.upsert_tasks([task])
+            manifest.claim([task])
+            manifest.complete(TaskResult(task, "success", "yfinance", 1, str(output), 1))
+    finally:
+        manifest.close()
+    connection = monitor._open_read_only(path)
+    try:
+        audits = [monitor._audit_success_files(connection, output_dir=tmp_path, plan_token="default",
+                                             show_progress=False, workers=workers) for workers in (1, 4)]
+    finally:
+        connection.close()
+    for workers, audit in zip((1, 4), audits, strict=True):
+        audit.pop("ownership_index_build_seconds")
+        audit.pop("ownership_scan_seconds")
+        contract = audit.pop("execution_contract")
+        assert contract == {
+            "version": 1, "workers": workers,
+            "backend": "serial" if workers == 1 else "spawned_processes",
+            "batch_files": 1 if workers == 1 else 64,
+            "maximum_inflight_batches": 1 if workers == 1 else 2 * workers,
+            "decode_scope": "footer_schema_and_complete_first_row_group_provenance_columns",
+        }
+    assert audits[0] == audits[1]
+    assert audits[0]["metadata_mismatch_files"] == 70
+    assert len(audits[0]["issue_samples"]) == 50
+    assert not audits[0]["passed"]
+
+
+def test_batch_ownership_paths_preserve_leaf_and_parent_symlink_semantics(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "file.parquet").touch()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    leaf = target / "link.parquet"
+    leaf.symlink_to("file.parquet")
+    dangling = target / "dangling.parquet"
+    dangling.symlink_to("not-created/child")
+    paths = [alias / "file.parquet", leaf, dangling, alias / ".." / "target/file.parquet"]
+    assert monitor._resolve_ownership_paths(paths) == monitor._resolve_ownership_paths_reference(paths)
+    loop = target / "loop.parquet"
+    loop.symlink_to("loop.parquet")
+    with pytest.raises((RuntimeError, OSError)):
+        monitor._resolve_ownership_paths([loop])
+
+
+def test_batch_ownership_paths_fail_closed_when_directory_changes_during_batch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    directory = tmp_path / "data"
+    directory.mkdir()
+    leaf = directory / "file.parquet"
+    leaf.touch()
+    real_lstat = Path.lstat
+    mutated = False
+
+    def swap_parent(path):
+        nonlocal mutated
+        value = real_lstat(path)
+        if path == leaf and not mutated:
+            mutated = True
+            directory.rename(tmp_path / "old")
+            directory.mkdir()
+            leaf.touch()
+        return value
+
+    monkeypatch.setattr(Path, "lstat", swap_parent)
+    with pytest.raises(RuntimeError, match="directory changed during batch"):
+        monitor._resolve_ownership_paths([leaf])
+
+
 def test_archive_metadata_batches_preserve_first_row_and_decode_tail(tmp_path: Path) -> None:
     path = tmp_path / 'provenance.parquet'
     table = pa.table({'_provider': ['official'] * 200001,
@@ -1444,7 +1609,7 @@ def test_monitor_surfaces_permanent_provider_outcomes(tmp_path: Path) -> None:
         manifest.close()
 
     status = collect_status(tmp_path, min_free_gib=0, show_progress=False)
-    assert status["schema_version"] == 15
+    assert status["schema_version"] == 16
     assert status["zero_accepted_categories"] == [
         {
             "category": "equity",

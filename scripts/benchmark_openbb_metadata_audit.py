@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 from downloader.artifact_io import atomic_write_json, sha256_file  # noqa: E402
 from scripts import monitor_openbb_archive as monitor  # noqa: E402
+from stockagent.data_sync.benchmark_fixtures import ImmutableFixtureInputs  # noqa: E402
 
 
 def identity(path: Path) -> tuple[int, ...]:
@@ -55,7 +56,7 @@ def prepare(source: Path, fixture: Path, baseline_revision: str) -> dict:
     state = fixture / '_state'
     state.mkdir(mode=0o700)
     files, sources, total_bytes = {}, [], 0
-    with sqlite3.connect(state / 'openbb_archive.sqlite3') as shadow:
+    with sqlite3.connect(state / 'openbb_archive.sqlite3') as shadow, ImmutableFixtureInputs(fixture) as inputs:
         shadow.execute(schema)
         for row in selected.values():
             path = Path(row['output_path'])
@@ -65,7 +66,7 @@ def prepare(source: Path, fixture: Path, baseline_revision: str) -> dict:
                 raise ValueError('sample byte budget exceeded')
             target = fixture / 'data' / f"{row['task_id']}.parquet"
             target.parent.mkdir(mode=0o700, exist_ok=True)
-            shutil.copyfile(path, target)
+            inputs.copy(path, str(target.relative_to(fixture)), expected_sha256=digest)
             if sha256_file(target) != digest or identity(path) != stamp:
                 raise ValueError('source changed during bounded copy')
             sources.append({'path': str(path), 'identity': stamp, 'sha256': digest,
@@ -75,11 +76,13 @@ def prepare(source: Path, fixture: Path, baseline_revision: str) -> dict:
             names = list(row)
             shadow.execute(f"INSERT INTO tasks ({','.join(names)}) VALUES ({','.join('?' for _ in names)})",
                            [row[name] for name in names])
+        storage = inputs.commit()
     files['reference.py'] = sha256_file(fixture / 'reference.py')
     files['_state/openbb_archive.sqlite3'] = sha256_file(state / 'openbb_archive.sqlite3')
     result = {'schema_version': 1, 'observed_at_utc': datetime.now(UTC).isoformat(), 'plan': plan,
               'candidate_count': len(candidates), 'sample_files': len(selected), 'sample_bytes': total_bytes,
-              'baseline_revision': baseline_revision, 'files': files, 'sources': sources}
+              'baseline_revision': baseline_revision, 'files': files, 'sources': sources,
+              'storage_build': {key: value for key, value in storage.items() if key != 'files'}}
     atomic_write_json(fixture / 'manifest.json', result)
     return result
 

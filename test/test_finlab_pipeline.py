@@ -39,12 +39,27 @@ def test_range_uses_one_official_call_and_canonical_per_day_receipts(tmp_path):
         assert receipt == outcome["receipt"] and receipt["rows"] == 1
 
 
-def test_missing_range_falls_back_without_marking_published_days_empty(tmp_path):
+def test_tick_has_one_canonical_payload_not_a_second_sdk_frame_cache(tmp_path):
+    day = date(2026, 6, 1)
+    source = frame('2330', [day]).assign(sequence=[1], price=[100.5])
+    with patch('finlab.data.get', return_value=source) as get:
+        single = fetch_partition(tmp_path / 'single', 'tw_tick:2330', day, now=datetime.now(UTC))
+        assert get.call_args.kwargs['save_to_storage'] is False
+    with patch('finlab.data.get', return_value=source) as get:
+        ranged = fetch_partitions(tmp_path / 'range', 'tw_tick:2330', [day], now=datetime.now(UTC))
+        assert get.call_args.kwargs['save_to_storage'] is False
+    assert single['sha256'] == ranged['outcomes'][0]['receipt']['sha256']
+    assert single['rows'] == 1
+
+
+@pytest.mark.parametrize("kind", ["tw_minute", "tw_tick"])
+def test_missing_range_falls_back_without_marking_published_days_empty(tmp_path, kind):
     days = [date(2026, 6, 1), date(2026, 6, 2)]
+    source = frame("2330", days[:1]).assign(sequence=[1])
     with patch("finlab.data.get", side_effect=[
-        DataError("not_ready: dates missing"), frame("2330", days[:1]), DataError("not_ready: missing"),
+        DataError("not_ready: dates missing"), source, DataError("not_ready: missing"),
     ]):
-        result = fetch_partitions(tmp_path, "tw_minute:2330", days, now=datetime.now(UTC))
+        result = fetch_partitions(tmp_path, f"{kind}:2330", days, now=datetime.now(UTC))
     assert result["sdk_calls"] == 3 and result["fallback_calls"] == 2
     assert "receipt" in result["outcomes"][0]
     assert result["outcomes"][1]["failure"] == "partition_not_ready"
@@ -84,12 +99,15 @@ def test_range_preserves_explicit_no_trade_evidence(tmp_path):
     assert result["outcomes"][1]["receipt"]["status"] == "verified_no_trade"
 
 
-def test_explicit_missing_dates_rescue_ready_windows_not_every_individual_day(tmp_path):
+@pytest.mark.parametrize("kind", ["tw_minute", "tw_tick"])
+def test_explicit_missing_dates_rescue_ready_windows_not_every_individual_day(tmp_path, kind):
     days = [date(2026, 6, 1) + timedelta(days=i) for i in range(5)]
     with patch("finlab.data.get", side_effect=[
-        DataError("not_ready: source missing ['2026-06-03']"), frame("2330", days[:2]), frame("2330", days[3:]),
+        DataError("not_ready: source missing ['2026-06-03']"),
+        frame("2330", days[:2]).assign(sequence=[1, 1]),
+        frame("2330", days[3:]).assign(sequence=[1, 1]),
     ]) as get:
-        result = fetch_partitions(tmp_path, "tw_minute:2330", days, now=datetime.now(UTC))
+        result = fetch_partitions(tmp_path, f"{kind}:2330", days, now=datetime.now(UTC))
     assert get.call_count == result["sdk_calls"] == 3 and result["fallback_calls"] == 2
     assert sum("receipt" in item for item in result["outcomes"]) == 4
     assert result["outcomes"][2]["failure"] == "partition_not_ready"
@@ -100,18 +118,20 @@ def test_missing_date_parser_never_guesses_from_unverified_details(detail):
     assert missing_window_dates(DataError("not_ready: " + detail), [date(2026, 6, 1)]) is None
 
 
-def test_range_values_and_per_day_contract_match_single_day_path(tmp_path):
+@pytest.mark.parametrize("kind", ["tw_minute", "tw_tick"])
+def test_range_values_and_per_day_contract_match_single_day_path(tmp_path, kind):
     days = [date(2026, 6, 1), date(2026, 6, 2)]
-    source = frame("2330", days)
-    source.attrs = {"dataset": "tw_minute:2330", "volume_unit": "provider_native",
+    key = f"{kind}:2330"
+    source = frame("2330", days).assign(sequence=[1, 1])
+    source.attrs = {"dataset": key, "volume_unit": "provider_native",
                     "closed_dates": ["2026-05-31"], "no_trade_dates": []}
     with patch("finlab.data.get", return_value=source):
-        ranged = fetch_partitions(tmp_path / "range", "tw_minute:2330", days, now=datetime.now(UTC))
+        ranged = fetch_partitions(tmp_path / "range", key, days, now=datetime.now(UTC))
     for day, outcome in zip(days, ranged["outcomes"]):
         part = source.loc[source["trade_date"] == str(day)].copy()
         part.attrs = {**source.attrs, "closed_dates": []}  # Actual single-date SDK metadata.
         with patch("finlab.data.get", return_value=part):
-            single = fetch_partition(tmp_path / "single", "tw_minute:2330", day, now=datetime.now(UTC))
+            single = fetch_partition(tmp_path / "single", key, day, now=datetime.now(UTC))
         receipt = outcome["receipt"]
         pd.testing.assert_frame_equal(pd.read_parquet(tmp_path / "range" / receipt["parquet_path"]),
                                       pd.read_parquet(tmp_path / "single" / single["parquet_path"]))
@@ -128,6 +148,20 @@ def test_window_planner_obeys_calendar_cap_cached_holes_and_stock_day_budget():
                                     limit=2, available=lambda day: True) == days[-2:]
     assert market.plan_minute_window(days[-1], days, lower_bound=days[0], calendar_days=31,
                                     limit=100, available=lambda day: day != days[-3]) == days[-2:]
+
+
+def test_oldest_first_window_fills_forward_within_known_history_calendar_and_budget():
+    days = [date(2026, 6, 1) + timedelta(days=i) for i in range(40)]
+    def plan(anchor, *, available=lambda day: True, limit=100, upper=days[-1]):
+        return market.plan_minute_window(anchor, days, lower_bound=days[0], calendar_days=7,
+                                          limit=limit, available=available, upper_bound=upper)
+    assert plan(days[0]) == days[:7]
+    assert plan(days[0], limit=3) == days[:3]
+    assert plan(days[0], available=lambda day: day != days[3]) == days[:3]
+    assert plan(days[0], upper=days[1]) == days[:2]
+    assert plan(days[3]) == days[:7]  # The combined span, not each side, is capped.
+    # Forward extension never jumps a cached hole on its left or right.
+    assert plan(days[3], available=lambda day: day != days[2]) == days[3:10]
 
 
 @pytest.fixture
@@ -172,6 +206,90 @@ def run(universe, *, workers=4, limit=8, fetch=fake_range, queue_depth=1, range_
         range_calendar_days=range_days, range_fetch=fetch, queue_depth=queue_depth, download_threads=1)
 
 
+@pytest.mark.parametrize('workers', [2, 4, 8])
+def test_tick_reuses_owner_pool_one_stock_day_and_parent_derivation(universe, monkeypatch, workers):
+    root, public, days = universe
+    monkeypatch.setattr(market, '_general_work_admission', lambda *a, **kw: {'supplemental_allowed': True})
+    calls = []
+    derived = []
+    owner = threading.get_ident()
+    native_derive = market.derive_partition
+
+    def derive(*args, **kwargs):
+        assert threading.get_ident() == owner
+        result = native_derive(*args, **kwargs)
+        derived.append(result)
+        return result
+
+    monkeypatch.setattr(market, 'derive_partition', derive)
+    def tick_fetch(root, key, target_days, *, now):
+        assert key.startswith('tw_tick:') and len(target_days) == 1
+        calls.append((key, target_days[0]))
+        time.sleep(0.01)
+        return {'outcomes': [{'trade_date': str(day), 'receipt': persist_partition_frame(root, key, day,
+            frame(key.split(':')[1], [day]).assign(sequence=[1], session=['regular']))} for day in target_days],
+            'sdk_calls': 1, 'fallback_calls': 0, 'source_seconds': 0.01, 'persist_seconds': 0.01}
+    result = market.sync_market(root, public, start=days[0], end=days[-1], limit=6, reserve_mb=50,
+        minimum_free_gb=0, now=datetime.now(UTC), kind='tw_tick', workers=workers,
+        queue_depth=2, range_fetch=tick_fetch)
+    assert result['successes_this_run'] == 6 and len(set(calls)) == 6
+    assert len(derived) == 6 and all(row['status'] == 'derived_unverified_for_pit' for row in derived)
+    metrics = json.loads((root / 'intraday/batch_metrics.json').read_bytes())['batches'][-1]
+    assert metrics['kind'] == 'tw_tick' and metrics['pipeline_workers'] == workers
+    assert metrics['peak_inflight_windows'] == min(workers, 6) and metrics['sdk_calls'] == 6
+    assert metrics['range_calendar_days'] == 1
+    assert metrics['quota_checks'] <= 6 and metrics['quota_cache_hits'] > 0
+
+
+def test_tick_known_history_shares_ranges_and_preserves_parent_owned_derivation(universe, monkeypatch):
+    root, public, days = universe
+    monkeypatch.setattr(market, '_general_work_admission', lambda *a, **kw: {'supplemental_allowed': True})
+    db = market._open_index(root / 'intraday/market_index.sqlite3')
+    for symbol in ('2330', '2317'):
+        for day in (days[0], days[-1]):
+            receipt = persist_partition_frame(root, f'tw_tick:{symbol}', day,
+                frame(symbol, [day]).assign(sequence=[1], session=['regular']))
+            market._record_source(db, root, 'tw_tick', symbol, day, receipt)
+    db.close()
+    calls, derived = [], []
+    owner = threading.get_ident()
+    native_derive = market.derive_partition
+
+    def derive(*args, **kwargs):
+        assert threading.get_ident() == owner
+        result = native_derive(*args, **kwargs)
+        derived.append(result)
+        return result
+
+    def fetch(root, key, target_days, *, now):
+        calls.append((key, target_days))
+        return {'outcomes': [{'trade_date': str(day), 'receipt': persist_partition_frame(root, key, day,
+            frame(key.split(':')[1], [day]).assign(sequence=[1], session=['regular']))} for day in target_days],
+            'sdk_calls': 1, 'fallback_calls': 0, 'source_seconds': 0.01, 'persist_seconds': 0.01}
+
+    monkeypatch.setattr(market, 'derive_partition', derive)
+    result = market.sync_market(root, public, start=days[0], end=days[-1], limit=6, reserve_mb=50,
+        minimum_free_gb=0, now=datetime.now(UTC), kind='tw_tick', workers=2,
+        range_calendar_days=7, queue_depth=2, range_fetch=fetch)
+    assert result['successes_this_run'] == 6
+    assert sorted(calls) == [('tw_tick:2317', days[1:-1]), ('tw_tick:2330', days[1:-1])]
+    newly_derived = [row for row in derived if row['trade_date'] in set(map(str, days[1:-1]))]
+    assert len(newly_derived) == 6
+    assert all(row['status'] == 'derived_unverified_for_pit' for row in newly_derived)
+    metrics = json.loads((root / 'intraday/batch_metrics.json').read_bytes())['batches'][-1]
+    assert metrics['sdk_calls'] == 2 and metrics['fallback_calls'] == 0
+    assert metrics['completed_attempts'] == metrics['new_receipted_partitions'] == 6
+    assert metrics['range_calendar_days'] == 7 and metrics['pipeline_workers'] == 2
+
+
+@pytest.mark.parametrize('settings', [{'workers': 9}, {'workers': 2, 'range_calendar_days': 32},
+                                     {'workers': 2, 'download_threads': 2}])
+def test_tick_parallelism_rejects_unbounded_workers_ranges_and_nested_threads(tmp_path, settings):
+    with pytest.raises(ValueError):
+        market.sync_market(tmp_path, tmp_path, start=date(2026, 6, 1), end=date(2026, 6, 2), limit=2,
+            reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), kind='tw_tick', **settings)
+
+
 def test_rolling_pool_refills_a_free_slot_before_slowest_stock_finishes(universe):
     events = []
     lock = threading.Lock()
@@ -196,6 +314,48 @@ def test_rolling_pool_refills_a_free_slot_before_slowest_stock_finishes(universe
     assert metrics["processing_engine"] == "rolling_range_process_pool"
     assert metrics["peak_inflight_windows"] == 2 and metrics["queue_depth"] == 4
     assert metrics["worker_slot_seconds"] > 0
+
+
+def test_completed_window_burst_refills_before_second_parent_publication(universe, monkeypatch):
+    calls = []
+    records = 0
+    native_record = market._record_source
+
+    class ReadyResult:
+        def __init__(self, result):
+            self.result = result
+        def ready(self):
+            return True
+        def get(self):
+            return self.result
+
+    class ReadyPool:
+        def apply_async(self, fn, args, kwargs):
+            result = fn(*args, **kwargs)
+            return ReadyResult(result)
+        def close(self):
+            pass
+        def join(self):
+            pass
+        def terminate(self):
+            pass
+
+    def fetch(root, key, days, **kwargs):
+        calls.extend((key, str(day)) for day in days)
+        return fake_range(root, key, days, **kwargs)
+
+    def record(index, root, kind, symbol, day, receipt):
+        nonlocal records
+        if (f'{kind}:{symbol}', str(day)) in calls:
+            records += 1
+            if records == 2:
+                assert len(calls) >= 3, 'free source slot waited behind second parent publication'
+        return native_record(index, root, kind, symbol, day, receipt)
+
+    monkeypatch.setattr(market, '_minute_pool', lambda *args, **kwargs: ReadyPool())
+    monkeypatch.setattr(market, '_record_source', record)
+    result = run(universe, workers=2, queue_depth=4, range_days=1, fetch=fetch)
+    assert result['successes_this_run'] == 8 and records == 8
 
 
 def test_rolling_preemption_preserves_unsent_frontier_and_reuses_completed_receipts(universe, monkeypatch):

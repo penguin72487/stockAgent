@@ -43,6 +43,10 @@ Use for split ownership, model horizons, benchmark returns and stitched reportin
   panel's adjusted-close forward label shifted one row: close[t-1] to close[t].
   Do not replace it with a cross-sectional mean of intraday returns or use the
   unshifted close[t] to close[t+1] label. The active public benchmark is 2330.
+  Label it explicitly as `2330 buy and hold (total return)`: continuous 1x
+  long exposure including overnight, gross of fees/tax, with corporate actions
+  included once in adjusted close. It is not a daily open/close round trip.
+  Reporting metadata changes do not change a pure log-utility optimizer's ABI.
 
 - When `walk_forward.require_future_test_year: false`, the final experimental fold
   deliberately reuses its validation window as its test window. Keep that overlap;

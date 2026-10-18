@@ -1,0 +1,19 @@
+[Unit]
+Description=Arm and audit every TW opening with immutable 11-second assessments
+
+[Timer]
+OnCalendar=*-*-* 08:55:00 Asia/Taipei
+OnCalendar=*-*-* 09:00:11 Asia/Taipei
+OnCalendar=*-*-* 09:00:31 Asia/Taipei
+OnCalendar=*-*-* 09:01:00 Asia/Taipei
+OnCalendar=*-*-* 10:31:00 Asia/Taipei
+OnCalendar=*-*-* 13:40:00 Asia/Taipei
+OnCalendar=*-*-* 15:10:00 Asia/Taipei
+Persistent=true
+AccuracySec=100ms
+RandomizedDelaySec=0
+Unit=stockagent-tw-opening-audit.service
+
+[Install]
+WantedBy=timers.target
+

@@ -27,6 +27,27 @@ DuckDB database 只保存 catalog/view，不保存唯一一份市場事實；Pol
 台股分鐘日分區本來已接近正確大小，所以保留每日 partition。Tick／五檔與大型
 交易所 archive 只應在交易日或年月 partition 關閉後壓實，不能改寫仍在串流的檔案。
 
+## 所有資料集的版本責任
+
+同一設定檔的 `source_versioning.roots` 已覆蓋全部 33 個 `data_*` 根目錄，
+不只上方六個欄式壓實案例。版本是完整邏輯清單，payload 共用未變 part／檔案／
+SHA-256 區塊；增量抓取不代表可以永久另存一份全量副本。
+既有 packed publisher 的 v2 可把改變的大檔拆成預設 8 MiB 的精確 byte chunks，
+沿用同一 CAS、鎖與還原入口；新聞另沿用其既有 native part copy-on-write。
+訓練查詢仍讀選定 manifest 的 Parquet，不直接對 blob pool 做 glob。
+
+原 Temporal storage worker 已登錄 50 個具體來源及 10 個完整根私有補集，
+共 60 個持久處理項，逐來源發布、固定版本完整還原、回收自有暫存；完成一輪後每日檢查。
+共享來源保留原 gates；`publish: false` 的私有 D 歷史放在明確忽略的
+`.local-state/private-history/`，不藉版本化新增共享或 NAS 匯出權限。
+使用 `run_fintech_python scripts/dataset_migration_status.py` 讀取處理／驗證日誌，
+不掃 payload；處理項有重疊，不能加總成全域 bytes 進度。
+
+共同層的支援不表示每個 native writer 已完成分區遷移，或每個遠端 consumer 都已部署。
+原值、來源觀測、修訂、收據與相容路徑先保留；後續分批遷移需要其 source／reader
+契約和精確復原證據。詳細結構、讀回／啟用命令及剩餘工作見
+[全資料集增量版本架構](dataset_incremental_storage.md)。
+
 ## OpenBB 增量 L1
 
 手動執行一個有界批次：

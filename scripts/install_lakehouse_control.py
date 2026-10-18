@@ -162,8 +162,8 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/stockagent/temporal
 CPUQuota=150%
-MemoryHigh=768M
-MemoryMax=1536M
+MemoryHigh=6G
+MemoryMax=8G
 TasksMax=256
 Environment=GOMAXPROCS=2
 [Install]

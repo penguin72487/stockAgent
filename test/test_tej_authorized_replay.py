@@ -1,6 +1,7 @@
 """Standing user authority is bounded and audited, not proof of non-submission."""
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ import pytest
 
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_desktop_attempts import (AUTHORIZED_REPLAY_CONTRACT, authorized_replay_policy,
-    authorized_replay_window, retry_unknown_download)
+    authorized_replay_window, retry_unknown_download, interrupted_stage_write_proof)
 from downloader.tej_history import configure_runtime_policy, connect, run_one
 from downloader.tej_scheduler import replay_authorized_unknown, WatchPolicy, watch_queue
 from test_tej_desktop_attempts import ReplayBridge, unknown as unknown, registry as registry
@@ -58,6 +59,93 @@ class FreshReplayBridge(ReplayBridge):
             if self.revoke:
                 configure_runtime_policy(root, {})
         return payload, output, seconds
+
+
+@pytest.fixture
+def interrupted_write(standing):
+    root, task, prepared, config = standing
+    stage = root/'raw'/(prepared.name+'.stage.json')
+    stage.write_bytes(b'')  # Reproduce only inside the isolated fixture.
+    legacy = "[IO.File]::WriteAllText(($Output+'.stage.json'),($stage|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))"
+    code = '\n'.join([legacy, '# Mark BEFORE submission.', '$querySubmissionPossible=$true',
+        '$flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds',
+        '$queryClock=[Diagnostics.Stopwatch]::StartNew()',
+        '[TejBridgeNative]::BeginPreviewDefaultAction($ExpectedWindow,$previewButton)'])
+    digest = hashlib.sha256(code.encode()).hexdigest()
+    release = root/'bridge_releases'/(digest+'.ps1')
+    release.parent.mkdir(exist_ok=True); release.write_text(code)
+    manifest = root/'launches'/(task['active_attempt_id']+'.bridge.json')
+    atomic_write_json(manifest, {'contract':'immutable_bridge_release_bound_to_prepared_request_v1',
+        'attempt_id':task['active_attempt_id'], 'request_path':str(prepared.relative_to(root)),
+        'request_sha256':hashlib.sha256(prepared.read_bytes()).hexdigest(),
+        'bridge_release_path':str(release.relative_to(root)), 'bridge_script_sha256':digest})
+    diagnostic = root/'diagnostics'/(task['active_attempt_id']+'.txt')
+    diagnostic.parent.mkdir(exist_ok=True)
+    diagnostic.write_text('Exception calling "WriteAllText" with "3" argument(s): "The operation was canceled."\n'
+        'at <ScriptBlock>, C:\\Users\\fixture\\AppData\\Local\\StockAgent\\TEJSmartWizard\\worker-'
+        + 'a'*32 + '\\bridge.ps1: line 1\nat <ScriptBlock>, <No file>: line 1\n')
+    atomic_write_json(root/'progress'/(prepared.name+'.progress.json'), {
+        'contract':'tej_native_readback_progress_v1', 'task_id':task['task_id'],
+        'attempt_id':task['active_attempt_id'], 'stage':'preparing_scope',
+        'observed_at_utc':(datetime.now(UTC)-timedelta(minutes=10,seconds=30)).isoformat()})
+    return root, task, prepared, config, stage, diagnostic, manifest, release
+
+
+def test_interrupted_stage_replay_retains_zero_byte_evidence_and_unknown(interrupted_write):
+    root, task, prepared, config, stage, diagnostic, manifest, release = interrupted_write
+    paths = [prepared, stage, diagnostic, manifest, release]
+    before = [p.read_bytes() for p in paths]
+    bridge = FreshReplayBridge('fields')
+    result = replay_authorized_unknown(root, bridge, config)
+    assert result['performed'] and result['state'] == 'completed_task'
+    assert bridge.calls == ['inspect_query_runtime', 'download']
+    assert [p.read_bytes() for p in paths] == before
+    audit = json.loads(next((root/'operator_replays').glob('*.json')).read_text())
+    proof = audit['interrupted_stage_write_replay_proof']
+    assert proof['original_stage_sha256'] == hashlib.sha256(b'').hexdigest()
+    assert audit['original_outcome'] == 'unknown_retained_not_claimed_unsent'
+    assert audit['possible_additional_provider_usage']
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT state FROM desktop_attempts WHERE attempt_id=?',
+                           (task['active_attempt_id'],)).fetchone()[0] == 'unknown_outcome'
+
+
+@pytest.mark.parametrize('case', ['partial_json', 'empty_object', 'diagnostic', 'callsite', 'manifest',
+    'release', 'missing_manifest', 'response', 'outcome', 'progress', 'unfinished'])
+def test_corruption_alone_never_grants_replay(interrupted_write, case):
+    root, task, prepared, config, stage, diagnostic, manifest, release = interrupted_write
+    if case == 'partial_json': stage.write_text('{')
+    elif case == 'empty_object': stage.write_text('{}')
+    elif case == 'diagnostic': diagnostic.write_text('operation canceled')
+    elif case == 'callsite': diagnostic.write_text(diagnostic.read_text().replace('line 1\n', 'line 2\n', 1))
+    elif case == 'manifest':
+        value = json.loads(manifest.read_text()); value['request_sha256'] = '0'*64
+        atomic_write_json(manifest, value)
+    elif case == 'release': release.write_text(release.read_text()+'\n# modified')
+    elif case == 'missing_manifest': manifest.unlink()
+    elif case == 'response': atomic_write_json(root/'raw'/prepared.name, {'response':'retained'})
+    elif case == 'outcome': atomic_write_json(stage.with_name(prepared.name+'.outcome.json'), {'proof':'retained'})
+    elif case == 'progress': atomic_write_json(root/'progress'/(prepared.name+'.progress.json'), {'progress':'retained'})
+    elif case == 'unfinished':
+        with closing(connect(root)) as con, con:
+            con.execute('UPDATE desktop_attempts SET finished_at_utc=NULL')
+    bridge = FreshReplayBridge()
+    result = replay_authorized_unknown(root, bridge, config)
+    assert result is None or not result['performed']
+    assert bridge.calls == []
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT count(*) FROM desktop_replays').fetchone()[0] == 0
+
+
+def test_interrupted_stage_is_not_a_new_default_retry_mode(interrupted_write):
+    root, task, prepared, _, *_ = interrupted_write
+    bridge = FreshReplayBridge()
+    with pytest.raises(ValueError):
+        retry_unknown_download(root, task['task_id'], bridge, prepared)
+    with pytest.raises(ValueError, match='mode'):
+        retry_unknown_download(root, task['task_id'], bridge, prepared,
+            allow_interrupted_stage_write=True, allow_unstaged_interop=True)
+    assert bridge.calls == []
 
 
 def test_standing_replay_retains_unknown_and_adopts_a_new_actual_result(standing):

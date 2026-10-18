@@ -1,11 +1,13 @@
 # TEJ 目錄、下載故障自動恢復與驗收
 
-2026-10-10 初稿，2026-10-13 更新，Asia/Taipei。10/10 凌晨修復的停滯不是程序停止，而是
+2026-10-10 初稿，2026-10-17 更新，Asia/Taipei。10/10 凌晨修復的停滯不是程序停止，而是
 目錄準備失敗後，介面檢查也逾時，被誤歸為未知資料查詢，使整個佇列永久等待。
 10/10 下午重新盤點時，再重現 SQLite 忙碌導致失敗分類回滾、工作永久留在 `running`
 的第二條路徑；已補上負證據本機對帳及原 worker 身分保留。
 10/13 再修復「失敗分類已提交、次要操作註記卻回滾」的停止路徑，並在送往
 桌面前拆分超出來源選取器容量的範圍，避免原封不動重試必定失敗的操作。
+10/17 修復 Windows 中斷寫入留下零位元組 stage、原結果解析與授權重排互相
+等待的停止路徑；關鍵證據改為完整暫存後發布，並保留跨程序負證據傳輸。
 修復沿用同一個下載器、SQLite 佇列、Windows 操作鎖、開機 owner 與唯讀網站。
 不清空佇列、不改來源值，也不把失敗、來源空回或重試列成歷史下載完成。
 
@@ -328,3 +330,181 @@ node --test test/test_tej_dashboard_requests.mjs
 若目前程式版本尚無非空新收據，可先以 `--values-reference-task TASK_ID`
 獨立驗證一筆既有非空收據；輸出明確標為 `retained_nonempty_value_reference`，
 不計入新下載量，再將此檔案作為上述原值驗收參照。
+
+## 10/17：中斷寫入造成永久等待
+
+此次服務仍為 `active`，但最後收據停在 10/15 **16:56:12**。
+`Contract Adjustment of Stock Futures` 工作 `4cedcef2b372d295b263c276`
+在下一次操作中，Windows `WriteAllText` 回報 `The operation was canceled.`。
+它已建立 `.stage.json`，內容卻為零位元組。原恢復流程看見檔案就解析，
+每次都失敗，未能接續既有的有界授權重排；重啟不會修復這份原始壞檔。
+
+新增 `exact_interrupted_stage_write_authorized_replay_v1` 只辨識此精確邊界：
+原 attempt 必須已結束且仍為 unknown、原 request／scope／程式 SHA 一致、
+stage 恰為零位元組、沒有 raw／outcome，原三行診斷的行號必須指向不可變
+程式內、唯一 Preview 動作前的舊 stage writer。若有進度，只接受同一 attempt
+及操作時間內的 `preparing_scope`。任意 JSON 毀損、較晚階段、缺少原程式、
+不同 scope 或已有結果均不適用。
+
+這不是把 unknown 改稱未送出。恢復仍使用原先使用者授權、最新 owned idle
+介面讀回及原滾動預算：每工作一小時最多 2 次、全域 6 次。核對介面前後均
+重驗原證據，先採納可恢復的原結果，不清零冷卻或增加來源配額。
+正式排程於 10/17 **22:52:49** 自行完成原工作；原 attempt 仍為
+`unknown_outcome`，另以新 attempt／授權稽核記錄重排，五份原故障證據 SHA
+全部不變。之前的 595 次證據檢查不是 595 次來源查詢。
+
+### 同類故障的預防與恢復
+
+| 邊界 | 本輪處理 | 驗證限制 |
+| --- | --- | --- |
+| 關鍵 stage／回應／outcome | 同目錄唯一暫存、完整 UTF-8 寫入與 flush 後，以 rename 發布；本機 I/O 最多 3 次、25／100 ms 退避 | 只重試本機發布，絕不因此再按 Preview；不保證所有檔案系統斷電耐久性 |
+| Windows 無法寫回 UNC | 已獲准程序以 stderr 傳回精確負證據，由 Linux 原子保存 | 須核對唯一訊息、attempt、scope、程式 SHA、時鐘與未跨 Preview；已有 stage／raw／outcome 不覆蓋 |
+| 原未明操作 | 保留原 request、stage、診斷、manifest、進度及 attempt | 缺少或不符證據仍保持 unknown；不以沒有檔案推定沒送出 |
+| 每筆程式部署 | 依不可變 script SHA 重用 Windows 本機程式檔，不再每筆建立 GUID 目錄、複製同一份程式 | 每筆仍核對 SHA、語法、permit、session，使用全新程序；不快取選取、COM、授權或來源值 |
+
+檔案發布使用同目錄 rename，因 WSL UNC 不支援此路徑的 `File.Replace`。
+`Flush(true)` 的行為及 rename 旗標分別參見
+[Microsoft FileStream.Flush](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flush)
+及 [MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)。
+真正採用的 NTFS／WSL UNC 行為另經下列 fixture 實測，不以文件代替驗證。
+
+### 本輪故障與原值驗證
+
+證據根目錄為
+[`tej_resilience_2026-10-17/`](../artifacts/data_quality/tej_resilience_2026-10-17/)。
+`native_io_v2/native_io_acceptance.json` 通過 11 項快取檢查及 9 個新程序樣本；
+每個子程序另在 NTFS 與 WSL UNC 驗證：檔案獨占鎖定時發布有限失敗、舊內容
+不截斷；解鎖後精確 UTF-8 替換，無本輪暫存殘留。這些測試沒有 TEJ 查詢。
+`windows_entry_cache_v2/entry_gate_acceptance.json` 的四個真實 Windows 案例
+確認：進入 bridge 前的語法錯誤可保存負證據，進入後的錯誤仍為 unknown；
+兩者均測試首次 staging 與快取命中，沒有呼叫 TEJ／Excel。
+
+22:56 最後核心版本部署後，
+[`production_acceptance.json`](../artifacts/data_quality/tej_resilience_2026-10-17/production_acceptance.json)
+於 **22:57:49** 核對八份此次部署後真正啟動、完成完整鏈路的新收據。
+原故障證據未變，網站為唯讀，排程持續執行且沒有全域暫停。
+這八份都是來源明確空回，新增 **0 列／0 個原始資料格**；不可當成非空 feature
+新增。`retained_value_audit_v2.json` 另以目前 capture／ingest SHA 核對既有
+5 列／55 個原始資料格，不能冒稱為本輪新下載。
+
+### 完整鏈路實測與仍存在的瓶頸
+
+[`performance_decision.json`](../artifacts/data_quality/tej_resilience_2026-10-17/performance_decision.json)
+比較同一份 bridge、相同來源範圍的「每筆複製程式」與「依 SHA 重用程式」。
+以 A/B/B/A 執行四條完整實驗鏈，每案例每方法兩次，包含 source admission、
+條件準備、查詢、全值讀回、驗證、Parquet／收據與獨立稽核。兩版各取得
+12,936 列，同範圍原值／鍵／schema 全部相等；正式既有收據不改寫。
+總共送出 12 次資料查詢、5 次目錄操作，不把操作數當成 TEJ 內部 HTTP 次數。
+
+| 相同範圍，每筆平均秒 | 每筆複製程式 | 依 SHA 重用程式 |
+| --- | ---: | ---: |
+| 股票期貨契約調整，9 個特徵 | 39.76 | 12.66 |
+| 相鄰 4 個特徵 | 7.26 | 5.17 |
+| 密集價格，4 家 × 1,615 日 × 28 個特徵，每次 6,460 列 | 57.01 | 54.79 |
+| 同價格表完整目錄 | 8.91 | 12.73 |
+
+完整取得時間合計 **225.89 → 170.68 秒**，本次觀察耗時少 **24.44%**、
+吞吐增加 **32.35%**。這不是穩定保證：第一次整鏈含稽核的 candidate 反而
+較慢，目錄平均亦較慢；原版另一輪快取命中仍有 **42.96 秒**的 compiler／
+reference 指紋計算等待，該異常完整保留，不歸因成程式複製快取的必然收益。
+沒有與回歸測試重疊計時，但其他既有主機工作仍在執行。
+完整樣本見
+[`full_chain_code_cache_abba/acceptance.json`](../artifacts/data_quality/tej_resilience_2026-10-17/full_chain_code_cache_abba/acceptance.json)。
+
+密集表目前完整讀回平均 **37.50／54.79 秒（68.4%）**，仍是主要瓶頸；本輪
+沒有更動該讀回方法或以抽樣替代全值。沿用先前已驗證的最多 4 個唯讀工作者，
+不把更多程序等同於來源隔離；先前 8 工作者沒有穩定收益的證據見
+[候選與限制](tej_chain_fast_paths_2026-10-05.md#候選實測與沒有採用的方法)。
+初始化檔案讀取的異常等待與其他完整匯出介面仍待進一步釐清，不能宣稱已達
+理論速度極限或所有可改善瓶頸皆已消除。持續工作仍記在
+`tej-resilience-throughput-20261017`，不以此次局部改善關閉原任務。
+
+測試完成後，只由原 benchmark 核對並清除自己持有的介面 gate，正式服務於
+**23:08:05** 恢復。Linux 服務持續為 `enabled`，沿用原 Windows boot／logon
+owner；本輪未實體重開機，也沒有更改自動登入、來源授權或配額。
+該階段 TEJ 回歸為 **1,829 passed**，另 **16 項前端測試通過**；最後版本見下一節。
+
+[`production_after_abba.json`](../artifacts/data_quality/tej_resilience_2026-10-17/production_after_abba.json)
+於 **23:11:48** 再驗證八份 23:08 恢復服務後才開始的新收據，全部明確來源空回，
+取得 0 列；原故障證據仍未變。當時 owner 正在 `recovering_metadata`，不是正在
+抓資料；23:12:02 已回到正式下載並完成第九筆。恢復期間另有四個表的精確公司
+標籤在當前選單找不到，保存未送出證據後逐表退避，沒有堵住其他表。仍待核對
+最新目錄與原標籤的差別，不猜測改名、不改原 scope，也不宣稱這些表已修復。
+
+`rendered_final/rendered_acceptance.json` 通過本機桌面／手機版實際渲染及六種
+獨立 polling 狀態，沒有 JavaScript 錯誤或 provider 請求；來源讀回 100% 不會
+冒充已入庫。公網 GET 於 23:12 跟隨 www 轉址至
+`https://penguin72487.dpdns.org/tej/` 回傳 200；這只是本機外連的可達證據，
+不是另一外地節點或冷開機驗收。沒有修改前端或既有使用者修改的測試 URL。
+
+### 最後部署與 API 空轉成本
+
+後續補上 JSON 型別守門：負證據、manifest 雖可解析，但若根節點為陣列、
+純量或 null，必須保留為未驗證／unknown，不能因未分類例外或 `.get` 失敗
+使恢復 owner 退出，也不能誤認為未送出。
+
+23:13 再遇到同一張 `Delisted Option Attribute(2018~2019)` 的目錄準備失敗，
+具體診斷為 `Catalog axis exceeds reviewed bound`：公司軸沒有通過既有
+`Items` 計數界線。該條件同時拒絕負值與超過 150,000 的計數，診斷未留下實際
+數字，不能斷言一定是公司過多。後續兩次唯讀檢查逾時，原負證據仍完整保留。
+這張表尚未修復，不提高上限或把不完整公司軸當成完整。
+獨立穩定介面核對通過後，原目錄恢復於 **23:23:43** 自行排回，沿用已累積的
+900 秒逐表退避，其他表繼續下載。
+
+此間發現明確的另一個工具問題：operator lifecycle 從 systemd 繼承 Session 0
+relay，`GetActiveObject` 無法看見 Session 1 的 Excel。已改為每階段核對原互動
+relay 的 boot／PID birth／socket，並在 Windows 端先檢查 SessionId，再做操作。
+實際重啟要求後被原生獨立 add-in 身分守門拒絕，沒有停止 TEJ／Excel；其後只做
+穩定介面讀回便恢復，不能稱為已成功驗證 add-in 重啟。
+
+原 30 秒唯讀期限包含初始化，而完整鏈路曾量得 42.96 秒 compiler/reference
+指紋等待；因此它可能在尚未檢查介面前就逾時，不足以推定 TEJ 掛死。四個純
+唯讀檢查改為有限 **120 秒**總期限；通知確認仍為 30 秒，下載／規劃仍為
+900 秒，heartbeat 不延長原期限。本次未證明上述兩次逾時各自卡在哪一個內部
+呼叫，不能把初始化異常當成已確認的唯一原因。
+
+最終核心於 **23:26:09** 安全重啟；
+[`production_release_v4.json`](../artifacts/data_quality/tej_resilience_2026-10-17/production_release_v4.json)
+於 **23:28:09** 驗證八份在此部署後才開始的新完整鏈路收據，原五份故障證據
+SHA 不變，正式排程正在執行、沒有全域暫停。這批均為明確來源空回，新增
+0 列；`retained_value_audit_v4.json` 另以最後 capture／ingest SHA 重驗既有
+5 列／55 個原始資料格，兩項證據不可混算。
+
+API 支線在列數配額已耗盡時，原來仍先執行全來源價值排序。現在先恢復已收到
+頁面的本機提交，再判斷配額、冷卻與驗證身分；能抓新頁面時才重算排序。
+[`api_quota_idle_measurement.json`](../artifacts/data_quality/tej_resilience_2026-10-17/api_quota_idle_measurement.json)
+記錄原正式 unit 的一組前後測：CPU **18.206 → 0.217 秒**，記憶體峰值
+**530,010,112 → 17,465,344 bytes**，牆鐘約 39 → 1 秒，新增 0 個來源呼叫、
+0 頁。這是等待配額的空轉成本，不是有效下載吞吐；有其他主機服務負載，
+也不把此單組測量當成普遍穩定倍數。
+
+本機保守預算為 12 calls／50,000 rows，仍有 488 calls、但剩餘 0 rows，
+因此必須等待列數配額；官方 usage 快照不是此次重新取樣。沒有為消耗 calls
+繞過每日列數上限、清零流量或改動既有 timer。回歸包含配額耗盡、冷卻、驗證
+失敗都不重算排序，但原接收頁面的本機恢復仍執行。
+
+最後全 TEJ 回歸為 **1,848 passed（71.39 秒）**，另 **16 項前端測試通過**。
+`windows_entry_release_v4/entry_gate_acceptance.json` 亦重新通過四個真實 Windows
+入口故障案例，新增 0 個 TEJ／Excel 操作。原有 30 秒期限斷言已依新的純唯讀
+120 秒契約更新；先前失敗收據保留，不把舊斷言失敗當成新版本已通過。
+
+部署後另一次真正故障復原也已觀察：`Delisted Option(from 2026)` 的
+`b78817b96b2a06f612f95583` 目錄於 **23:32:52** 失敗後，沒有人工改狀態，
+原排程於 **23:33:12** 自行核對介面、保存負證據並排回，仍維持第 119 次累積
+失敗及 900 秒退避，沒有重設計數或重複資料 Preview。此表本身尚未取得完整
+目錄；此次驗證的是全域不再因它永久停住。
+原稽核為
+[`metadata_retry-c6079a27804345479a933ee2fa691136.json`](../data_tej/diagnostics/b78817b96b2a06f612f95583-9ee47a6657b644489c1af8cb84d0a98a-metadata_retry-c6079a27804345479a933ee2fa691136.json)。
+**23:34:16** 正式排程已完成部署後第 22 筆工作，最後收據 23:34:13、無全域
+暫停。數百次相同目錄失敗的重試成本仍值得進一步處理，不能把自動恢復等同
+於來源目錄或整體吞吐已修到最優。
+
+### 舊隔離工作的品質邊界
+
+22 個舊隔離工作仍保留，不影響其他健康表。17 個目錄工作仍需各自的完整
+來源與容量證據；本輪未重送它們。另五個已完整捕捉的來源回應，共 1,417 列，
+有 175 列的原生期間超出原選取日期／月份，全部公司的代號都在原 scope 內。
+這是拒絕入庫的具體原因，不是欄位遺失；保留整份回應，沒有只截掉失敗列。
+`quarantined_key_audit.json` 保存逐表列數、鍵範例及原回應 SHA，檢查新增 0 次
+來源查詢、採納 0 列。尚未證明是來源錯誤或期間模型問題，不能直接放寬日期
+驗證、回填發布時間或宣稱不可修復。

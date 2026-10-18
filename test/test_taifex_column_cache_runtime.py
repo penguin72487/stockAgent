@@ -7,6 +7,113 @@ from downloader.artifact_io import atomic_write_json
 from scripts import verify_taifex_column_cache_runtime as verifier
 
 
+@pytest.fixture
+def base_delta_acceptance(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    source, fixture = root / "source", root / "fixture"
+    source.mkdir(parents=True)
+    fixture.mkdir()
+    paths = [root / name for name in ("cache.py", "dashboard.py", "selection.py", "segments.py",
+        "scripts/benchmark_taifex_history_segments.py", "scripts/benchmark_taifex_history_selection.py")]
+    for path in paths:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("# accepted source\n")
+    monkeypatch.setattr(verifier, "ROOT", root)
+    monkeypatch.setattr(verifier, "SOURCE", source)
+    monkeypatch.setattr(verifier, "cache", SimpleNamespace(__file__=str(paths[0])))
+    keys = ("1h", "1d", "1w", "1mo", "1q", "1y", "all")
+    monkeypatch.setattr(verifier, "dashboard", SimpleNamespace(__file__=str(paths[1]),
+        HISTORY_RANGE_SECONDS=dict.fromkeys(keys)))
+    monkeypatch.setattr(verifier, "selection", SimpleNamespace(__file__=str(paths[2])))
+    monkeypatch.setattr(verifier, "segments", SimpleNamespace(__file__=str(paths[3])))
+    atomic_write_json(fixture / "fixture.json", {"source": str(source)})
+    original = root / "original_column_cache.py"
+    original.write_text("# preserved original\n")
+    control = root / "control.json"
+    expected = dict.fromkeys(keys, "a" * 64)
+    atomic_write_json(control, {"fixture": str(fixture), "exact_output_parity": True,
+        "trials": [{"output_sha256": expected}]})
+    metrics = {"baseline": {"wall_seconds": 10, "cpu_seconds": 20, "rss_peak_bytes": 100000,
+                            "parquet_written_bytes": 30000000, "warm_wall_seconds": 1, "warm_cpu_seconds": 2},
+               "candidate": {"wall_seconds": 8, "cpu_seconds": 14, "rss_peak_bytes": 90000,
+                             "parquet_written_bytes": 16000, "warm_wall_seconds": 1, "warm_cpu_seconds": 2}}
+    rows = [{"variant": variant, **metrics[variant], "threads": 4,
+        "allocator_conf": "dirty_decay_ms:500," + verifier.ALLOCATOR_CONF,
+        "output_sha256": expected, "warm_exact_output_parity": True,
+        "warm_parquet_written_bytes": 0, "warm_sink_calls": 0,
+        "provider_calls": 0, "model_forward_calls": 0, "production_writes": False,
+        "ranges": [{"range": key, "rows": 69, "json_bytes": 1000} for key in keys]}
+        for variant in ["baseline", "candidate", "candidate", "baseline"] * 2]
+    value = {"contract": verifier.BASE_DELTA_CONTRACT, "fixture": str(fixture),
+        "independent_control": {"path": str(control), "sha256": verifier.sha(control)},
+        "seed": {"fixture": str(fixture), "source_sha256": {"source": "b" * 64},
+                 "original_code_sha256": verifier.sha(original)},
+        "source_sha256": {"source": "b" * 64}, "source_unchanged": True, "balanced_abba": True,
+        "model_forward_calls": 0, "provider_calls": 0, "production_writes": False,
+        "code_stable": True, "exact_output_parity": True,
+        "medians": metrics, "trials": rows, "code_sha256": {str(path): verifier.sha(path) for path in paths}}
+    acceptance = root / "measurement.json"
+    return acceptance, value
+
+
+def test_base_delta_requires_actual_balanced_full_workflow_and_current_code(base_delta_acceptance):
+    path, value = base_delta_acceptance
+    atomic_write_json(path, value)
+    assert verifier.accepted_code(path) == value["code_sha256"]
+    for field, damage in (("balanced_abba", False), ("source_unchanged", False),
+                          ("model_forward_calls", 1), ("trials", value["trials"][:-1])):
+        atomic_write_json(path, {**value, field: damage})
+        with pytest.raises(ValueError, match="accepted_measurement"):
+            verifier.accepted_code(path)
+
+
+@pytest.mark.parametrize("damage", ["warm_write", "source", "range", "summary", "order", "speed", "original"])
+def test_base_delta_rejects_incomplete_or_unbound_claims(base_delta_acceptance, damage):
+    path, base = base_delta_acceptance
+    import json
+
+    value = json.loads(json.dumps(base))
+    if damage == "warm_write":
+        value["trials"][1]["warm_parquet_written_bytes"] = 1
+    elif damage == "source":
+        value["source_sha256"] = {}
+    elif damage == "range":
+        value["trials"][1]["ranges"] = value["trials"][1]["ranges"][:-1]
+    elif damage == "summary":
+        value["medians"]["candidate"]["cpu_seconds"] = 1
+    elif damage == "order":
+        value["trials"][0], value["trials"][1] = value["trials"][1], value["trials"][0]
+    elif damage == "speed":
+        value["medians"]["candidate"]["wall_seconds"] = 100
+        for row in value["trials"]:
+            if row["variant"] == "candidate":
+                row["wall_seconds"] = 100
+    else:
+        (path.parent / "original_column_cache.py").write_text("# changed original\n")
+    atomic_write_json(path, value)
+    with pytest.raises(ValueError, match="accepted_measurement"):
+        verifier.accepted_code(path)
+
+
+def test_native_segment_observation_requires_real_pinned_inodes(tmp_path, monkeypatch):
+    import os
+
+    part = tmp_path / "part.parquet"
+    part.write_bytes(b"known engineering inode")
+    fd = os.open(part, os.O_RDONLY)
+    try:
+        info = os.fstat(fd)
+        columns = [{"payloads": [{"device": info.st_dev, "inode": info.st_ino}]}]
+        monkeypatch.setattr(verifier, "observe_apis", lambda: {"ranges": "seven"})
+        result = verifier.observe_segmented_apis({"MainPID": str(os.getpid())}, columns)
+        assert result["native_payload_inodes"] == [[info.st_dev, info.st_ino]]
+        assert result["native_new_source_update_observed"] is False
+    finally:
+        os.close(fd)
+    with pytest.raises(ValueError, match="no_verified_segment"):
+        verifier.observe_segmented_apis({"MainPID": str(os.getpid())}, [])
+
+
 def test_acceptance_binds_exact_full_output_current_code_and_real_owner_source(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     source = root / "source"

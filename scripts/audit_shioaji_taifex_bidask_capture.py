@@ -78,6 +78,75 @@ def strategy_hedge_tail_gap_seconds(
     return max(0.0, finished_at.timestamp() - last_receive_ns / 1e9)
 
 
+def capture_book_metrics(manifests: list[dict], books: pl.LazyFrame) -> dict:
+    """Reduce projected columns, never materialize the full multi-level books.
+
+    Exact nearest quantiles still need their complete one-column population;
+    streaming does not make that state free. Contract/worker maxima and counts
+    are small, and also preserve the original missing-code/hedge-tail checks.
+    """
+    needs_worker = any(
+        isinstance(manifest.get("strategy_simulation"), dict)
+        and manifest["strategy_simulation"].get("enabled")
+        for manifest in manifests
+    )
+    # Legacy data-only frames need no worker axis, just as in the eager audit.
+    group_keys = ["worker_index", "code"] if needs_worker else ["code"]
+    tails = books.group_by(group_keys).agg(
+        pl.col("receive_ts_ns").max(), pl.len().cast(pl.UInt64).alias("book_rows")
+    ).collect(engine="streaming")
+    expected_codes = sorted({
+        str(row["code"])
+        for manifest in manifests
+        for row in manifest.get("contract_metadata", [])
+        if isinstance(row, dict) and row.get("code")
+    })
+    observed_codes = {str(value) for value in tails["code"].unique()}
+    missing_codes = sorted(set(expected_codes).difference(observed_codes))
+    if missing_codes:
+        raise RuntimeError(f"captured books miss subscribed contracts: {missing_codes}")
+
+    valid = books.filter(
+        (~pl.col("simtrade").fill_null(False))
+        & (pl.col("bid_price_1") > 0.0)
+        & (pl.col("ask_price_1") >= pl.col("bid_price_1"))
+        & (pl.col("bid_volume_1") > 0)
+        & (pl.col("ask_volume_1") > 0)
+    )
+    transport_ms = (pl.col("receive_ts_ns") - pl.col("exchange_ts_ns")).cast(pl.Float64) / 1e6
+    stats = valid.select(
+        pl.len().alias("valid_book_rows"),
+        transport_ms.quantile(0.50, "nearest").alias("transport_delay_ms_p50"),
+        transport_ms.quantile(0.99, "nearest").alias("transport_delay_ms_p99"),
+        pl.col("receive_ts_ns").min().alias("receive_ts_min_ns"),
+        pl.col("receive_ts_ns").max().alias("receive_ts_max_ns"),
+    ).collect(engine="streaming").row(0, named=True)
+    valid_rows = int(stats["valid_book_rows"])
+    if not valid_rows:
+        raise RuntimeError("capture has no valid non-crossed best BidAsk")
+    strategy_hedge_tail_gaps = [
+        gap for manifest in manifests
+        if (gap := strategy_hedge_tail_gap_seconds(manifest, tails)) is not None
+    ]
+    if any(gap > BIDASK_STALE_TIMEOUT_SECONDS for gap in strategy_hedge_tail_gaps):
+        raise RuntimeError(
+            "strategy hedge BidAsk stream ended before capture close: "
+            f"tail_gaps_seconds={strategy_hedge_tail_gaps}"
+        )
+    total_rows = sum(tails["book_rows"])
+    return {
+        "contracts": len(expected_codes), "book_rows": total_rows,
+        "valid_book_rows": valid_rows, "valid_book_fraction": valid_rows / total_rows,
+        "transport_delay_ms_p50": float(stats["transport_delay_ms_p50"]),
+        "transport_delay_ms_p99": float(stats["transport_delay_ms_p99"]),
+        "receive_ts_min_ns": int(stats["receive_ts_min_ns"]),
+        "receive_ts_max_ns": int(stats["receive_ts_max_ns"]),
+        "strategy_hedge_tail_gap_seconds": (
+            max(strategy_hedge_tail_gaps) if strategy_hedge_tail_gaps else None
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trade-date", type=date.fromisoformat, required=True)
@@ -125,45 +194,7 @@ def main() -> int:
         trade_date=args.trade_date.isoformat(),
         manifests=manifests,
     )
-    books = pl.scan_parquet(paths).collect()
-    valid = books.filter(
-        (~pl.col("simtrade").fill_null(False))
-        & (pl.col("bid_price_1") > 0.0)
-        & (pl.col("ask_price_1") >= pl.col("bid_price_1"))
-        & (pl.col("bid_volume_1") > 0)
-        & (pl.col("ask_volume_1") > 0)
-    )
-    metadata = [
-        row
-        for manifest in manifests
-        for row in manifest.get("contract_metadata", [])
-    ]
-    expected_codes = sorted(
-        {
-            str(row["code"])
-            for row in metadata
-            if isinstance(row, dict) and row.get("code")
-        }
-    )
-    observed_codes = sorted(str(value) for value in books["code"].unique())
-    missing_codes = sorted(set(expected_codes).difference(observed_codes))
-    if missing_codes:
-        raise RuntimeError(f"captured books miss subscribed contracts: {missing_codes}")
-    if valid.is_empty():
-        raise RuntimeError("capture has no valid non-crossed best BidAsk")
-    strategy_hedge_tail_gaps = [
-        gap
-        for manifest in manifests
-        if (gap := strategy_hedge_tail_gap_seconds(manifest, books)) is not None
-    ]
-    if any(gap > BIDASK_STALE_TIMEOUT_SECONDS for gap in strategy_hedge_tail_gaps):
-        raise RuntimeError(
-            "strategy hedge BidAsk stream ended before capture close: "
-            f"tail_gaps_seconds={strategy_hedge_tail_gaps}"
-        )
-    transport_ms = (valid["receive_ts_ns"] - valid["exchange_ts_ns"]).cast(
-        pl.Float64
-    ) / 1e6
+    metrics = capture_book_metrics(manifests, pl.scan_parquet(paths))
     summary = {
         "schema_version": 1,
         "status": "ok",
@@ -174,18 +205,8 @@ def main() -> int:
             bool(manifest.get("simulation")) for manifest in manifests
         ),
         "workers": len(manifests),
-        "contracts": len(expected_codes),
-        "book_rows": books.height,
-        "valid_book_rows": valid.height,
-        "valid_book_fraction": valid.height / books.height,
-        "transport_delay_ms_p50": float(transport_ms.quantile(0.50, "nearest")),
-        "transport_delay_ms_p99": float(transport_ms.quantile(0.99, "nearest")),
-        "receive_ts_min_ns": int(valid["receive_ts_ns"].min()),
-        "receive_ts_max_ns": int(valid["receive_ts_ns"].max()),
+        **metrics,
         "dropped_events": sum(int(item["dropped_events"]) for item in manifests),
-        "strategy_hedge_tail_gap_seconds": (
-            max(strategy_hedge_tail_gaps) if strategy_hedge_tail_gaps else None
-        ),
         "queue_high_watermark": max(
             int(item["queue_high_watermark"]) for item in manifests
         ),
@@ -202,7 +223,7 @@ def main() -> int:
     print(
         f"[shioaji-taifex-audit] status=ok date={args.trade_date} "
         f"session={args.session or 'legacy'} "
-        f"books={books.height} valid={valid.height} contracts={len(expected_codes)} "
+        f"books={metrics['book_rows']} valid={metrics['valid_book_rows']} contracts={metrics['contracts']} "
         f"output={output}",
         flush=True,
     )

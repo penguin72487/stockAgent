@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import time
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,7 @@ QUOTA_POLICY_VERSION = 2
 WORKLOAD_CONTRACT_VERSION = 4
 INTRADAY_PROGRESS_VERSION = 1
 DISPATCH_INTERVAL_SECONDS = 60
+FINLAB_RESEARCH_STAGE_LOCK = ".locks/tw-public-research-finlab-2014-v4.lock"
 # These adapters currently sign and stream whole objects, not SDK deltas.
 WHOLE_TABLE_KEYS = frozenset({
     "broker_transactions", "after_market_fixed_price:市場別", "after_market_fixed_price:資料來源",
@@ -200,6 +202,58 @@ def proven_source_empty(key: str, attempt: dict) -> bool:
             and type(attempt.get("raw_non_null_values")) is int
             and attempt["raw_non_null_values"] == 0
             and bool(attempt.get("empty_evidence_path")))
+
+
+def read_verified_empty_evidence(key: str, output_root: Path, attempt: dict) -> dict | None:
+    """Verify the collector's bounded all-null source proof without importing its SDK.
+
+    A missing matrix is not a numeric zero. This returns the original producer
+    evidence only after its retained raw object passes a stable full SHA check.
+    """
+    if not proven_source_empty(key, attempt):
+        return None
+    try:
+        root = output_root.resolve()
+        rel = Path(str(attempt["empty_evidence_path"]))
+        proof = root / rel
+        if (rel.is_absolute() or ".." in rel.parts or rel.parts[:1] != ("empty_evidence",)
+                or proof.resolve(strict=True) != proof):
+            return None
+        proof_before = proof.stat()
+        if not stat.S_ISREG(proof_before.st_mode) or not 0 < proof_before.st_size <= 32768:
+            return None
+        with os.fdopen(os.open(proof, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            if not os.path.samestat(proof_before, os.fstat(stream.fileno())):
+                return None
+            report = json.loads(stream.read(32769))
+        if not isinstance(report, dict):
+            return None
+        raw_rel = Path(str(report.get("raw_path") or ""))
+        raw = root / raw_rel
+        expected = report.get("raw_sha256")
+        if (report.get("dataset") != key or report.get("status") != "source_all_null"
+                or report.get("usable_observations") is not False
+                or type(report.get("raw_non_null_values")) is not int or report["raw_non_null_values"] != 0
+                or raw_rel.is_absolute() or ".." in raw_rel.parts
+                or raw_rel.parts[:1] != ("empty_evidence",) or raw.resolve(strict=True) != raw
+                or not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None):
+            return None
+        before = raw.stat()
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 8 * 1024**2:
+            return None
+        with os.fdopen(os.open(raw, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            if not os.path.samestat(before, os.fstat(stream.fileno())):
+                return None
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        after = raw.stat()
+        proof_after = proof.stat()
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (actual == expected and all(getattr(before, f) == getattr(after, f) for f in fields)
+                and all(getattr(proof_before, f) == getattr(proof_after, f) for f in fields)):
+            return report
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
 
 
 def queue_stage(key: str, *, downloaded: bool, metadata: bool = False,

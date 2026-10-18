@@ -137,3 +137,58 @@ def test_dashboard_health_reports_warm_failure_without_private_error(tmp_path) -
     assert payload["session_index_warm_status"] == "failed"
     assert payload["session_index_warm_elapsed_ms"] == 123.457
     assert "/private/source/path" not in json.dumps(payload)
+
+
+def test_browser_mode_acceptance_checks_rendered_cards_not_only_status():
+    from scripts.verify_tw_dashboard_date_range import _check_mode_visibility
+
+    observed = {"markets": ["base", "factorized"],
+                "labels": ["Base", "Factorized"], "headings": ["Base", "Factorized"]}
+    _check_mode_visibility(observed, ["factorized", "base"])
+    _check_mode_visibility(observed, [])
+
+
+def test_browser_mode_acceptance_rejects_hidden_or_mislabelled_mode():
+    import pytest
+    from scripts.verify_tw_dashboard_date_range import _check_mode_visibility
+
+    for markets, labels, headings in [
+        (["base"], ["Base"], ["Base"]),
+        (["base", "base"], ["Base", "Base"], ["Base", "Base"]),
+        (["base", "factorized"], ["Base", "Factorized"], ["Base"]),
+        (["base", "factorized"], ["Base", "Factorized"], ["Base", "Wrong model"]),
+    ]:
+        with pytest.raises(ValueError):
+            _check_mode_visibility({"markets": markets, "labels": labels, "headings": headings},
+                                   ["base", "factorized"])
+
+
+def test_browser_counterfactual_disclosure_requires_rendered_provenance():
+    from scripts.verify_tw_dashboard_date_range import _check_counterfactual_disclosure
+
+    observed = {"rows": [{"session_date": "2026-01-02", "counterfactual_open_replay": True,
+                          "replay_signal_origin": "current_model_counterfactual"}],
+                "rendered_clocks": ["01-02 09:01:00 · 目前模型反事實回放（非當時訊號）"]}
+    _check_counterfactual_disclosure(observed, "2026-01-02")
+
+
+def test_browser_counterfactual_disclosure_rejects_missing_wrong_or_backdated_rows():
+    import pytest
+    from scripts.verify_tw_dashboard_date_range import _check_counterfactual_disclosure
+
+    row = {"session_date": "2026-01-02", "counterfactual_open_replay": True,
+           "replay_signal_origin": "current_model_counterfactual"}
+    label = "01-02 09:01:00 · 目前模型反事實回放（非當時訊號）"
+    defects = [
+        {"rows": [], "rendered_clocks": []},
+        {"rows": [row], "rendered_clocks": []},
+        {"rows": [{**row, "session_date": "2026-01-05"}], "rendered_clocks": [label]},
+        {"rows": [{**row, "counterfactual_open_replay": False}], "rendered_clocks": [label]},
+        {"rows": [{**row, "replay_signal_origin": "retained-original"}], "rendered_clocks": [label]},
+        {"rows": [{**row, "has_private_signal_id": True}], "rendered_clocks": [label]},
+        {"rows": [row], "rendered_clocks": ["01-02 09:01:00 · 開盤價重建；原始訊號 01-02 09:01:00"]},
+        {"rows": [row], "rendered_clocks": [label + "；原始訊號 01-02 09:01:00"]},
+    ]
+    for observed in defects:
+        with pytest.raises(ValueError):
+            _check_counterfactual_disclosure(observed, "2026-01-02")

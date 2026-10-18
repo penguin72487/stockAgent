@@ -88,6 +88,129 @@ def test_financial_transformer_forward_aux_and_mask() -> None:
     assert "stock_market_gate" in aux
 
 
+@pytest.mark.parametrize("basis_input", [None, "input_features", "raw_features", "embedded"])
+@pytest.mark.parametrize("empty_mask", [False, True])
+def test_completed_signal_can_omit_candle_values_without_changing_numeric_route(
+    basis_input, empty_mask, monkeypatch,
+) -> None:
+    from scripts.benchmark_live_inference import require_equal_forward_outputs
+    from stockagent.training.runtime import call_model
+
+    options = {} if basis_input is None else {
+        "temporal_basis_families": ("haar", "dct"),
+        "temporal_basis_components": 2,
+        "temporal_basis_input": basis_input,
+        "temporal_basis_algebraic_contraction": True,
+    }
+    model = _make_model(lookback=8, **options).eval()
+    x = torch.randn(1, 8, 7, 10, device=_device())
+    mask = torch.zeros(1, 7, dtype=torch.bool, device=_device()) if empty_mask else \
+        torch.tensor([[True, False, True, True, True, True, False]], device=_device())
+    before = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    with torch.inference_mode(), torch.autocast(_device().type, dtype=torch.bfloat16,
+                                               enabled=_device().type == "cuda"):
+        full = call_model(model, x, mask, return_aux=True)
+        if model.temporal_basis_input_feature_builder is not None:
+            def wrong_numeric_route(**kwargs):
+                raise AssertionError("omitting diagnostics switched the numeric contraction")
+            monkeypatch.setattr(model.temporal_basis_input_feature_builder,
+                                "_forward_algebraic_no_aux", wrong_numeric_route)
+        lean = call_model(model, x, mask, return_aux=True, materialize_candle_aux=False)
+        again = call_model(model, x, mask, return_aux=True)
+
+    require_equal_forward_outputs(full[:2], lean[:2])
+    require_equal_forward_outputs(full, again)
+    assert full[2].keys() == lean[2].keys()
+    omitted = {key for key, value in lean[2].items() if value is None}
+    expected = {"candle_tokens", "candle_token_weights", "candle_embedding"}
+    if basis_input is not None:
+        expected.update({"temporal_basis_haar_coefficients", "temporal_basis_dct_coefficients",
+                         "temporal_basis_input_features", "temporal_basis_original_path",
+                         "temporal_basis_output"})
+    assert omitted == expected
+    for key in full[2].keys() - omitted:
+        require_equal_forward_outputs(full[2][key], lean[2][key], key)
+    require_equal_forward_outputs(before, dict(model.state_dict()))
+
+
+def test_omitting_candle_diagnostics_is_inference_only() -> None:
+    model = _make_model()
+    x = torch.randn(1, 5, 7, 10, device=_device())
+    with torch.inference_mode(), pytest.raises(RuntimeError, match="eval and inference"):
+        model(x, return_aux=True, materialize_candle_aux=False)
+    model.eval()
+    with torch.no_grad(), pytest.raises(RuntimeError, match="eval and inference"):
+        model(x, return_aux=True, materialize_candle_aux=False)
+
+
+def test_metadata_only_basis_does_not_construct_wide_diagnostic_or_original_path(monkeypatch) -> None:
+    model = _make_model(
+        lookback=8,
+        temporal_basis_families=("haar", "dct"), temporal_basis_components=2,
+        temporal_basis_input="input_features", temporal_basis_algebraic_contraction=True,
+    ).eval()
+    builder, candle = model.temporal_basis_input_feature_builder, model.candle_encoder
+    x = torch.randn(1, 8, 7, 10, device=_device())
+    with torch.inference_mode():
+        full, aux = builder(x, candle, collect_aux=True)
+        def forbidden(*args, **kwargs):
+            raise AssertionError("unconsumed diagnostic work was executed")
+        monkeypatch.setattr(torch, "cat", forbidden)
+        monkeypatch.setattr(candle, "_forward_base_with_zero_extra", forbidden)
+        monkeypatch.setattr(builder, "_forward_algebraic_no_aux", forbidden)
+        lean, metadata = builder(x, candle, collect_aux=True, materialize_aux=False)
+    assert full.dtype == lean.dtype and full.shape == lean.shape
+    assert torch.equal(full.view(torch.uint8), lean.view(torch.uint8))
+    assert metadata.keys() == aux.keys() and all(value is None for value in metadata.values())
+
+
+@pytest.mark.parametrize("attention_mode", ["full", "axial", "latent", "latent_only", "market_token", "temporal_only"])
+def test_raw_basis_metadata_policy_reaches_every_attention_route(attention_mode):
+    from scripts.benchmark_live_inference import require_equal_metadata_only_candle_outputs
+    model = _make_model(
+        lookback=8, attention_mode=attention_mode,
+        temporal_basis_families=("haar", "dct"), temporal_basis_components=2,
+        temporal_basis_input="raw_features",
+    ).eval()
+    x = torch.randn(1, 8, 7, 10, device=_device())
+    mask = torch.tensor([[True, False, True, True, False, True, True]], device=_device())
+    with torch.inference_mode():
+        full = model(x, mask, return_aux=True)
+        lean = model(x, mask, return_aux=True, materialize_candle_aux=False)
+    require_equal_metadata_only_candle_outputs(full, lean, model.candle_diagnostic_aux_fields())
+
+
+def test_fused_raw_basis_skips_duplicate_coefficient_and_wide_concat_work(monkeypatch):
+    model = _make_model(
+        lookback=8, temporal_basis_families=("haar", "dct"), temporal_basis_components=2,
+        temporal_basis_input="raw_features",
+    ).eval()
+    encoder = model.temporal_basis_feature_encoder
+    assert encoder.fuse_projection
+    x = torch.randn(1, 8, 7, 10, device=_device())
+    z = torch.randn(1, 7, 24, device=_device())
+    mask = torch.ones(1, 7, dtype=torch.bool, device=_device())
+    with torch.inference_mode():
+        full, aux = encoder(x, z, mask, collect_aux=True)
+        einsum = torch.einsum
+        def numeric_contractions_only(equation, *args, **kwargs):
+            if equation == "kl,blsf->bksf":
+                raise AssertionError("duplicate diagnostic coefficient contraction executed")
+            return einsum(equation, *args, **kwargs)
+        cat = torch.cat
+        def no_concat(parts, dim=0, **kwargs):
+            if dim == -1 and parts[0].ndim == 3:
+                raise AssertionError("unused wide diagnostic was concatenated")
+            # The existing numeric fused kernel still needs its small basis
+            # bank/weight concatenations. Only the B,S,wide diagnostic is banned.
+            return cat(parts, dim=dim, **kwargs)
+        monkeypatch.setattr(torch, "einsum", numeric_contractions_only)
+        monkeypatch.setattr(torch, "cat", no_concat)
+        lean, metadata = encoder(x, z, mask, collect_aux=True, materialize_aux=False)
+    assert torch.equal(full.view(torch.uint8), lean.view(torch.uint8))
+    assert metadata.keys() == aux.keys() and all(value is None for value in metadata.values())
+
+
 @pytest.mark.parametrize(
     "output_mode", [
         "score_entmax_global_cash", "score_entmax_cash_v2",

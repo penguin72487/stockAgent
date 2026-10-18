@@ -12,8 +12,25 @@ from scripts.audit_tw_day_trade_margin_replay import (
     audit, _entry_source_path, _retained_entry_book_source_days,
     _verify_calendar_coverage, _claim_matches_source, _verified_action_sources,
     _with_verified_share_volume,
+    _selected_replay_source_bars,
 )
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+
+
+def test_audit_uses_pinned_symbol_session_source_not_overlapping_chunk():
+    frame = pl.DataFrame({
+        "symbol": ["2330"] * 3, "minute_key": ["2026-08-13T09:02"] * 2 + ["2026-08-14T09:02"],
+        "low": [100., 90., 101.], "high": [101., 91., 102.],
+        "volume_shares": [4000., 0., 6000.], "_source_path": ["/selected", "/unused", "/unused"],
+    })
+    pins = {("2026-08-13", "2330"): frozenset({"/selected"}),
+            ("2026-08-14", "2330"): frozenset({"/unused"})}
+    actual = _selected_replay_source_bars(frame, pins)
+    assert actual["low"].to_list() == [100., 101.]
+    assert actual["volume_shares"].to_list() == [4000., 6000.]
+    # Old receipts have no symbol pins: disagreements must remain visible.
+    assert _selected_replay_source_bars(frame, None).height == 3
+    assert _selected_replay_source_bars(frame, {}).height == 0
 
 
 @pytest.mark.parametrize("raw_volume", [1.0, 1_000.0])

@@ -258,6 +258,37 @@ exec_fintech_python() {
   exec "$selected_python" "$@"
 }
 
+ensure_enrolled_wsl_identity() {
+  # Opt-in for unattended native capacity/publication callers. Merely sourcing
+  # runtime_env never starts Windows or reads the private enrollment.
+  if [[ "$(uname -r)" != *microsoft* ]]; then
+    return 0
+  fi
+  if [[ -z "${WSL_DISTRO_NAME:-}" ]]; then
+    local runtime_distro
+    runtime_distro="$(run_fintech_python - "${1:?repository root is required}" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from stockagent.runtime_identity import enrolled_wsl_distribution
+print(enrolled_wsl_distribution(Path(sys.argv[1])))
+PY
+)" || return 1
+    [[ -n "$runtime_distro" ]] || return 1
+    export WSL_DISTRO_NAME="$runtime_distro"
+  fi
+  # Match the existing lakehouse owner: PID 1 does not inherit the login
+  # Windows PATH or bridge. Resolve the enrolled native reader, not a shell
+  # shim, without starting Windows or weakening the downstream mount guard.
+  if [[ -S /run/WSL/1_interop && ! -S "${WSL_INTEROP:-/missing}" ]]; then
+    export WSL_INTEROP=/run/WSL/1_interop
+  fi
+  local powershell_root=/mnt/c/Windows/System32/WindowsPowerShell/v1.0
+  if ! command -v powershell.exe >/dev/null 2>&1 && [[ -x "$powershell_root/powershell.exe" ]]; then
+    export PATH="${PATH:+$PATH:}$powershell_root"
+  fi
+}
+
 FINTECH_ENV_PATH="${FINTECH_ENV_PATH:-$(detect_fintech_env_path 2>/dev/null || true)}"
 FINTECH_MAMBA_BIN="${FINTECH_MAMBA_BIN:-$(detect_mamba_or_conda_bin 2>/dev/null || true)}"
 

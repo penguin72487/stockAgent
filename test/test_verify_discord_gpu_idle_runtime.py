@@ -6,6 +6,10 @@ import pytest
 from scripts import verify_discord_gpu_idle_runtime as verifier
 
 
+def bot():
+    return verifier.verification_cache().discord_bot
+
+
 def status():
     return {"interactive_signal_jobs": {"active_count": 0, "running_count": 0},
             "background_maintenance": {"running_count": 0, "status": "degraded"},
@@ -22,11 +26,11 @@ def engine():
 @pytest.mark.parametrize("kind", ["interactive", "maintenance", "warmup", "opening", "source", "prepare"])
 def test_idle_admission_rejects_actual_work_and_prepare_window(monkeypatch, kind):
     value = status()
-    monkeypatch.setattr(verifier.BOT, "_opening_critical_work_pending", lambda: kind == "opening")
-    monkeypatch.setattr(verifier.BOT, "_interactive_signal_work_pending", lambda: False)
-    monkeypatch.setattr(verifier.BOT, "_tw_public_refresh_in_progress", lambda: kind == "source")
-    monkeypatch.setattr(verifier.BOT, "_startup_inference_warmup_must_defer", lambda: kind != "prepare")
-    monkeypatch.setattr(verifier.BOT, "_offhours_gpu_cache_release_allowed", lambda: True)
+    monkeypatch.setattr(bot(), "_opening_critical_work_pending", lambda: kind == "opening")
+    monkeypatch.setattr(bot(), "_interactive_signal_work_pending", lambda: False)
+    monkeypatch.setattr(bot(), "_tw_public_refresh_in_progress", lambda: kind == "source")
+    monkeypatch.setattr(bot(), "_startup_inference_warmup_must_defer", lambda: kind != "prepare")
+    monkeypatch.setattr(bot(), "_offhours_gpu_cache_release_allowed", lambda: True)
     if kind == "interactive":
         value["interactive_signal_jobs"]["active_count"] = 1
     elif kind == "maintenance":
@@ -39,9 +43,9 @@ def test_idle_admission_rejects_actual_work_and_prepare_window(monkeypatch, kind
 
 def test_degraded_old_formal_history_does_not_block_idle_gateway_admission(monkeypatch):
     for name in ("_opening_critical_work_pending", "_interactive_signal_work_pending", "_tw_public_refresh_in_progress"):
-        monkeypatch.setattr(verifier.BOT, name, lambda: False)
-    monkeypatch.setattr(verifier.BOT, "_startup_inference_warmup_must_defer", lambda: True)
-    monkeypatch.setattr(verifier.BOT, "_offhours_gpu_cache_release_allowed", lambda: True)
+        monkeypatch.setattr(bot(), name, lambda: False)
+    monkeypatch.setattr(bot(), "_startup_inference_warmup_must_defer", lambda: True)
+    monkeypatch.setattr(bot(), "_offhours_gpu_cache_release_allowed", lambda: True)
     assert verifier.pending_work(status()) is None
 
 
@@ -78,8 +82,48 @@ def test_current_engine_ack_is_readonly_and_not_a_fill_claim(monkeypatch):
     ("commands failed\n", False), ("command sync failed\n", False),
 ])
 def test_commands_need_success_or_explicit_contractual_defer(monkeypatch, text, accepted):
-    monkeypatch.setattr(verifier.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=text))
+    monkeypatch.setattr(verifier, "identity", lambda _: {"InvocationID": "a"*32})
+    monkeypatch.setattr(verifier.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(
+        stdout=text, returncode=0, stderr=""))
     assert verifier.command_sync_since_restart()["commands_sync_or_deferred_observed"] is accepted
+
+
+def test_journal_filters_each_fact_in_one_fixed_invocation_before_tail(monkeypatch):
+    invocation = "b"*32
+    monkeypatch.setattr(verifier, "identity", lambda _: {"InvocationID": invocation})
+    calls = []
+    def query(argv, **kwargs):
+        calls.append(argv)
+        assert f"--invocation={invocation}" in argv and "--invocation=0" not in argv
+        assert argv[argv.index("-n")+1] == "1" and "--grep" in argv
+        pattern = argv[-1]
+        if pattern.startswith("^synced"):
+            return SimpleNamespace(stdout="synced 22 global app commands installs=guild,user\n", returncode=0, stderr="")
+        if pattern.startswith("action="):
+            return SimpleNamespace(stdout="Fatal Python error\n", returncode=0, stderr="")
+        return SimpleNamespace(stdout="", returncode=1, stderr="")
+    monkeypatch.setattr(verifier.subprocess, "run", query)
+    assert verifier.command_sync_since_restart() == {
+        "commands_sync_or_deferred_observed": True, "watchdog_or_fatal_observed": True,
+        "new_warm_ready_log_observed": False}
+    assert len(calls) == 3
+
+
+def test_journal_only_readback_does_not_load_artifact_or_inference_dependencies(monkeypatch):
+    monkeypatch.setattr(verifier, "verification_cache", lambda: pytest.fail("unrelated inference import"))
+    monkeypatch.setattr(verifier, "identity", lambda _: {"InvocationID": "a"*32})
+    monkeypatch.setattr(verifier.subprocess, "run", lambda *_a, **_kw: SimpleNamespace(
+        stdout="", returncode=1, stderr=""))
+    assert not any(verifier.command_sync_since_restart().values())
+
+
+@pytest.mark.parametrize("code,stderr", [(2, ""), (1, "Permission denied"), (0, "read error")])
+def test_unknown_journal_visibility_is_not_proven_absence(monkeypatch, code, stderr):
+    monkeypatch.setattr(verifier, "identity", lambda _: {"InvocationID": "a"*32})
+    monkeypatch.setattr(verifier.subprocess, "run", lambda *_a, **_kw: SimpleNamespace(
+        stdout="", returncode=code, stderr=stderr))
+    with pytest.raises(ValueError, match="journal_unavailable"):
+        verifier.command_sync_since_restart()
 
 
 @pytest.fixture
@@ -88,18 +132,19 @@ def runtime(monkeypatch):
     value["startup_inference_warmup"] = {"status": "deferred"}
     owner = {"InvocationID": "before", "MainPID": "12"}
     admission = {"contract": "live_implementation_process_admission_v1", "code_sha256": "current",
+                 "entrypoint_sha256": "current-entrypoint",
                  "requires_fresh_process_on_change": True}
     monkeypatch.setattr(verifier, "owner", lambda: deepcopy(owner))
     monkeypatch.setattr(verifier, "identity", lambda unit: {"InvocationID": unit})
     monkeypatch.setattr(verifier, "sha", lambda path: str(path))
     monkeypatch.setattr(verifier, "status_for_owner", lambda: (deepcopy(value), SimpleNamespace(name="12")))
     monkeypatch.setattr(verifier, "pending_work", lambda status: None)
-    monkeypatch.setattr(verifier.cache, "verify", lambda: {"markets": [
+    monkeypatch.setattr(verifier.verification_cache(), "verify", lambda: {"markets": [
         {"market": "cash", "cache_key": "same", "summary_path": "same.json"}]})
     monkeypatch.setattr(verifier, "engine_acknowledgements", lambda *args: [{"lag": 0}])
     monkeypatch.setattr(verifier, "gpu_handles", lambda process: [])
     monkeypatch.setattr(verifier, "gpu_snapshot", lambda: {"gpu": "not probed in unit tests"})
-    monkeypatch.setattr(verifier.BOT, "_scheduled_markets", lambda: [])
+    monkeypatch.setattr(bot(), "_scheduled_markets", lambda: [])
     monkeypatch.setattr(verifier, "current_code_admission", lambda: deepcopy(admission))
     monkeypatch.setattr(verifier, "command_sync_since_restart", lambda: {
         "commands_sync_or_deferred_observed": True, "watchdog_or_fatal_observed": False,
@@ -109,7 +154,7 @@ def runtime(monkeypatch):
 
 def test_code_adoption_is_distinct_from_gpu_numerical_acceptance(runtime, monkeypatch):
     value, owner, admission = runtime
-    monkeypatch.setattr(verifier.cache, "matched_benchmarks", lambda *args: pytest.fail("wrong scope"))
+    monkeypatch.setattr(verifier.verification_cache(), "matched_benchmarks", lambda *args: pytest.fail("wrong scope"))
     baseline = verifier.verify(None, None, code_admission_only=True)
     assert baseline["contract"] == "discord_native_loaded_code_admission_v1"
     assert baseline["full_numerical_oracle_proven"] is False
@@ -120,7 +165,10 @@ def test_code_adoption_is_distinct_from_gpu_numerical_acceptance(runtime, monkey
     assert result["signals"] == baseline["signals"]
 
 
-@pytest.mark.parametrize("admission", [None, {}, {"code_sha256": "old"}])
+@pytest.mark.parametrize("admission", [None, {}, {"code_sha256": "old"}, {
+    "contract": "live_implementation_process_admission_v1", "code_sha256": "current",
+    "entrypoint_sha256": "old-entrypoint", "requires_fresh_process_on_change": True,
+}])
 def test_native_changed_owner_needs_its_actual_current_code_admission(runtime, admission):
     value, owner, _expected = runtime
     baseline = verifier.verify(None, None, code_admission_only=True)
@@ -130,9 +178,18 @@ def test_native_changed_owner_needs_its_actual_current_code_admission(runtime, a
         verifier.verify(None, None, baseline, code_admission_only=True)
 
 
+def test_current_code_admission_includes_the_exact_bot_entrypoint(monkeypatch):
+    monkeypatch.setattr(verifier.verification_cache().forward_cache, "loaded_implementation_identity", lambda: [])
+    monkeypatch.setattr(verifier, "sha", lambda path: "entrypoint" if path ==
+                        verifier.ROOT / "services/discord_bot/bot.py" else pytest.fail("unrelated code"))
+    result = verifier.current_code_admission()
+    assert result["entrypoint_sha256"] == "entrypoint"
+    assert result["code_sha256"] == verifier.verification_cache().forward_cache.identity_digest({"code": []})
+
+
 def test_original_numerical_acceptance_still_requires_independent_benchmarks(runtime, monkeypatch):
     calls = []
-    monkeypatch.setattr(verifier.cache, "matched_benchmarks", lambda *args: calls.append(args) or ["proof"])
+    monkeypatch.setattr(verifier.verification_cache(), "matched_benchmarks", lambda *args: calls.append(args) or ["proof"])
     with pytest.raises(ValueError, match="separate modes"):
         verifier.verify(None, None)
     with pytest.raises(ValueError, match="separate modes"):

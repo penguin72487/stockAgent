@@ -1,8 +1,209 @@
 # 台股 09:00 開盤行情：來源、異常與主備方案
 
-查核日：2026-10-13，時間均為 Asia/Taipei。這是行情取得與公開展示規劃，不是投資建議或券商成交驗收。
+初版查核日：2026-10-13；來源清冊與三時段測速續查：2026-10-18。時間均為 Asia/Taipei。
+這是行情取得與公開展示規劃，不是投資建議或券商成交驗收。
 
-## 結論
+## 每日可交易清冊：來源與獨立更新（2026-10-18）
+
+本節的「可交易」是**指定日期、時點允許交易**，不是「今天已經有成交」。
+盤前不能拿今日成交量、provider 回價筆數或模型歷史 alive mask 當分母：
+當日有效掛牌與商品範圍，扣除已生效的終止上市櫃、停止／暫停交易，再套用該時點的復牌事件。
+當沖資格、可放空資格與券商可接受委託，仍是另外的交集，不能混成同一欄。
+
+| 官方來源 | 用途／限制 |
+| --- | --- |
+| [TWSE ISIN 上市](https://isin.twse.com.tw/isin/C_public.jsp?strMode=2)、[上櫃](https://isin.twse.com.tw/isin/C_public.jsp?strMode=4) | 代號、商品種類、掛牌日的免費基礎清冊；不能單獨證明目前仍交易，已確認保留已終止 ETF |
+| [證交所暫停／恢復交易](https://openapi.twse.com.tw/v1/exchangeReport/TWTAWU)、[停止買賣](https://www.twse.com.tw/rwd/zh/violation/stop?response=json)、[櫃買交易狀態](https://www.tpex.org.tw/openapi/v1/tpex_cmode)、[櫃買暫停／恢復歷史](https://www.tpex.org.tw/openapi/v1/tpex_spendi_history) | 按有效日期及時間排除／恢復；公司換股等停止交易仍由既有、收據驗證的生命週期公告參考檔補齊 |
+| [證交所 ETF 商品目錄](https://www.twse.com.tw/rwd/zh/ETF/list?response=json)、[櫃買 ETF 商品目錄](https://www.tpex.org.tw/www/zh-tw/ETF/list?type=domestic)與官方終止公告 | 上市目錄及上櫃七類聯集決定當前 ETF 成員；嚴格驗證來源，不以缺報價推論終止交易 |
+| [證交所全日成交](https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL)、[櫃買收盤行情](https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes) | 如需「今天確實成交過」的另一份清冊，再核對來源交易日及正成交量；不是盤前可交易主檔 |
+| [證交所證券主檔 BFI85U](https://eshop.twse.com.tw/zh/product/detail/000000006f6a5e34017033452c8d0070) | 付費結構化候選，官方列每交易日 22:00 提供次日參考；本輪未訂購，亦不能取代之後發布的臨時停復牌 |
+
+公開資訊觀測站的公司基本資料不是 ETF 全清冊；基金基本資料亦可能保留已終止商品，
+不宜直接拿來當當日可交易名單。Shioaji Contracts 是券商映射／交易條件的交叉核對，
+也不取代交易所生效公告。現有 `v3` 產品範圍是上市櫃普通股與 ETF，
+**不是全部有價證券**；創新板、TDR、特別股、ETN、權證、興櫃等不能不分種類直接塞進模型。
+
+### 已部署的每日更新
+
+- `scripts/refresh_tw_trading_universe.py --scheduled` 呼叫既有 canonical universe owner，
+  不另建券商連線、不依賴 Discord 或模型暖機。與既有公開資料抓取共用 provider-global cadence／backoff。
+- 獨立 `stockagent-tw-trading-universe.timer` 每天 07:30、08:00、08:15、08:30、08:45、08:55 檢查；
+  09:15 只補缺失的當日收據，不重發布既有開盤清冊。官方日曆決定休市，不硬寫週一至週五。
+- 開機 90 秒後亦檢查；08:57–09:10 保護開盤，不送清冊 HTTP。
+  單次 120 秒期限、暫時失敗 30 秒後重試、10 分鐘最多三次；有效的目錄衝突不盲目重試。
+- 原始 bytes、抓取時間與 SHA 保留；來源不完整不產生較小的假名單，已成功的來源可重用，
+  失敗來源再取。正式 membership policy 已納入完整商品目錄；來源差異與政策排除分別保留，
+  不修改既有歷史訊號或帳本，也不把已驗收的排除寫成「原始 ISIN 已無差異」。
+- 安裝沿用 `scripts/install_tw_public_publication_services.sh --universe-only`；
+  獨立排程安裝不連動重啟交易、行情或網站 owner。本次後續僅對 Discord 做合格的 code-only 換版，見下方驗收。
+
+狀態入口為 [每日更新收據](../artifacts/live/tw_trading_universe/daily_update_status.json)、
+[商品來源交叉驗證](../artifacts/live/tw_trading_universe/catalog_audit_status.json)。
+原先獨立排程驗收為五模組 **200 passed／11.43 秒**，保留於
+[排程安裝驗收](../artifacts/operations/tw_opening_latency_20261018/daily_universe_acceptance.json)。
+本次分母、重試、讀取相容性與服務換版整合回歸為九模組 **445 passed／17.58 秒**；不是全庫測試。
+09:50 的原生排程執行成功並回報 `closed`，因 10/18 為週日；下一次為 10/19 07:30，
+下一交易日的實際盤前驗收與開盤仍待發生。
+
+### 正式分母修復與原生讀回（2026-10-18）
+
+09:14 的即時目錄實測為 ISIN 上櫃 ETF 119 檔、七類商品聯集 118 檔，差異僅 `00838B`。
+已找到[櫃買原始公告](https://dsp.tpex.org.tw/web/announcement/announcement_detail.php?content_number=MTExMDAwMzYzMjE%3D&content_file=MTExMDAwMzYzMjEuaHRtbA%3D%3D)：
+證櫃債字第 11100036321 號，111/04/27 公告、**2022-05-31 起終止櫃檯買賣**，
+最後交易日為 2022-05-30。
+[原始 HTML／雜湊與解析收據](../artifacts/operations/tw_opening_latency_20261018/tpex_00838b_termination.json)
+保留此證據；不是由三家行情缺價推定終止交易。
+
+09:47 的正式現況清冊及運行中網站 API 均已讀回：**ISIN 2,312 → 有效掛牌 2,311 → 扣除停牌 11 → 可交易 2,300**，
+其中上市可交易 1,296、上櫃 1,004；排除名單僅 `00838B`。
+這是休市日的當前官方資料觀察，不是假造 10/18 有開盤，也不是下一交易日固定不變的數字。
+
+修復沿用 `tw_official_current_regular_stock_etf_universe_v3` 的相容讀取封套，
+新增獨立版本 `tw_official_active_stock_etf_membership_v1`，綁定原始來源與有效掛牌名單的雜湊。
+不是硬寫代號黑名單：上市目錄完整處理多幣別交易代號、尚未生效掛牌日與合法 NULL 指數欄；
+上櫃七類先完整驗收再取聯集。目錄新增、ISIN 尚未跟上的商品會保留待驗收並重抓清冊，
+不能遺漏該商品後宣稱完整；任何必要來源失敗均保留最後驗收版本與已成功來源。
+失敗嘗試亦會解除「直接回傳有效舊清冊」的早退，真正重試失敗項目。
+
+生命週期驗收未放寬日期條件：既有正式歷史參考檔仍只到 10/16，
+本次重用 canonical 官方收集器隔離取得 10/01–10/18 的當前換股停牌證據，
+兩市場 16 個事件與 33 份 raw receipts 通過既有驗證器；只供本次現況清冊的原始證據封存，
+不把隔離尾段改名為完整歷史、也未修改特徵來源或歷史帳本。
+正常交易日仍由既有 06:00 execution-actions 排程及歷史目錄合併供應，再由獨立清冊排程驗收。
+
+效能上將完整來源解析留在盤前寫入端。初始候選讀取端重解析 HTML 約 4,892 ms，
+已改為驗證全部原始資料 SHA 與政策綁定的名單投影，首次讀取實測 **52.53 ms**，
+既有五模式測速工具另測 **66.55 ms**；兩者都不是強制清除 OS 檔案快取的磁碟冷讀。
+五模式各 500 次完整模型遮罩的 p50 為 **0.162–0.172 ms**，請求識別 p50 為 **0.361–0.375 ms**。
+名單、數量及模型遮罩有獨立來源重算比對，未刪標的、未省略 raw SHA 驗證；09:00 讀取不新增清冊 HTTP。
+正式來源完整抓取與投影本次約 11.34 秒，仍屬盤前工作，不能冒充開盤至成交的總延遲。
+
+部署採既有 `plan → apply → verify` 的 Discord-only code admission；
+以換版前保留的實際讀取程式驗證其能讀取正式新收據，不為資料修正重啟交易引擎。
+六個受保護 owner、五模式**引擎已接受**訊號 ID、三份帳本前綴完整 SHA 均未變，兩筆真實未完成模擬委託保留。
+Discord 原生盤後工作可能發布新的研究 artifact 指標；這不等於改寫引擎已接受訊號或歷史成交。
+換版驗收是 Gateway／載入程式／引擎 ACK，不是 GPU 暖機或 09:00 成交 SLA。
+
+證據與可重測入口：
+
+- [完整修復與原生 API／owner／帳本驗收](../artifacts/operations/tw_opening_latency_20261018/universe_membership_repair/acceptance.json)
+- [原始來源、名單不變與讀取相容性／測速](../artifacts/operations/tw_opening_latency_20261018/universe_membership_repair/reader_projection_acceptance.json)
+- [五模式完整模型遮罩與請求識別測速](../artifacts/operations/tw_opening_latency_20261018/universe_membership_repair/five_mode_benchmark.json)
+- 既有 `scripts/benchmark_tw_trading_universe.py --signal-pointer <latest_signal.json> --rounds 500` 可重測；
+  每個模式各傳一次 `--signal-pointer`，讀取當日已驗收清冊，不抓行情、不推論或下單。
+
+尚未解除的邊界：網站仍忠實回報先前回放的開盤／09:01 缺價，Discord 盤後 Factorized artifact maintenance 仍 `degraded`。
+這些不是名單分母錯誤，不能以本次清冊修正宣稱已補價、已重建帳本、全部服務已健康或下次開盤必定一秒成交。
+
+## 最新權限讀回（2026-10-18）
+
+**目前可用的全市場組合仍是永豐共用連線、MIS、FinMind；新增確認 Fugle 單檔可用，
+但整批快照尚未獲准。** 不是四家均已支援全市場，也不是六條獨立行情：Fugle 的
+TSE／OTC／TIB 三個 route 是同一供應商。
+
+[本機權限收據](../artifacts/operations/tw_opening_latency_20261018/provider_access.json)
+記錄 08:55:59 的有限唯讀檢查：
+
+| 本機管道 | 可用性證據 | 對開盤目標的影響 |
+| --- | --- | --- |
+| 永豐共用 session | 已有原生 owner 與 10/16 全軸讀回；本輪沒有額外登入／定期 snapshot | 沿用既有推播、批次與執行路徑；200 訂閱不能直接當作全市場推播 |
+| MIS | 已有完整 29 請求原始回應與全軸測速 | 平行補缺；沒有全市場逐筆 SLA，不保證開盤端點不逾時 |
+| FinMind | 已有 sponsor 快照權限與全市場讀回 | 約 10 秒來源更新，增加 client 頻率不會變成逐筆 feed |
+| Fugle 單檔 | `2330` HTTP 200，21.50 ms；原始資料日期 10/16 | 證明該端點有權限；今天週日，不是 09:00 實測，也不能外推 2,301 檔耗時 |
+| Fugle 全市場快照 | TSE／OTC／TIB 均 HTTP 403；191.78／19.69／17.33 ms | 保留失敗與來源退避；不把存在 key 當成開發者／進階方案權限 |
+| 富邦、元大、玉山、台新、群益、凱基、國票、IBKR、企業 feed | 尚無本機帳號／容量驗收 | 候選，不冒稱已開通、已測速或已訂閱 |
+
+Fugle 官方定價已明列「**每個連線**最多 2,000 訂閱、最多兩條連線」，每檔股票×channel
+占一個訂閱；因此進階方案的文件容量可分片容納目前完整 scope 的單一 trades channel，
+但實際帳號方案、訂閱 ACK、重連與完整事件仍未驗收；不能把它當成已取得權限。
+同時全量 trades＋books 約需 4,602 槽，超過這個文件容量。
+[Fugle 定價](https://developer.fugle.tw/docs/pricing/)、
+[Snapshot 的開發者／進階資格與五秒更新](https://developer.fugle.tw/docs/data/http-api/snapshot/quotes/)。
+本輪沒有替使用者購買、升級或新增常駐訂閱。
+
+10/18 另重新讀回[官方資訊公司清冊](../artifacts/operations/tw_opening_latency_20261018/official_vendor_roster.json)：
+國內 23、國外 25、即時指數 9、延遲資訊 20 列。下方長名單與官方原始表是詢價與
+權限確認範圍，不把分組列數當成可直接使用的 API 數，也不宣稱已逐一登入實測。
+
+本輪本機處理、故障隔離、完整分母對照與換版結果見
+[10/18 實作驗收](tw_opening_latency_stages_2026-10-14.md#2026-10-18完整來源處理的增量投影與無等待批次合併)。
+開盤／盤中／盤後的原生測速排程仍沿用下節，週日沒有發生的 09:00 樣本保持未驗收。
+
+## 最新盤點與實測（2026-10-16）
+
+**現在有權限且已實際讀回的仍只有永豐共用連線、官方 MIS、FinMind 三路。**
+富果 REST adapter 已存在，但本機未設定 Fugle key；其他券商／企業 feed 尚未驗證帳號、
+授權容量與正式連線。文件可查到不等於這個帳號已可用，不新增登入、不購買、不送券商委託。
+下表與既有長名單涵蓋本輪能由官方文件查核的管道；未公開的機構合約不宣稱已窮盡。
+
+新增查核的候選：
+
+| 管道 | 正式開盤欄／介面與限制 | 本機狀態與判定 |
+| --- | --- | --- |
+| 玉山行情 API | REST `openPrice`／`openTime`、WebSocket；日內與快照各 600 次／分鐘，WebSocket 文件列 300 訂閱、2 連線 | 未開通驗證。基本與開發者權限的免費條件見官方 FAQ；不足以直接宣稱全市場推播。資料／技術同時報、群馥／Fugle，與富果、富邦不是完全獨立的主備。[行情](https://www.esunsec.com.tw/trading-platforms/api-trading/docs/market-data/http-api/intraday/quote/)、[限制](https://www.esunsec.com.tw/trading-platforms/api-trading/docs/market-data/rate-limit/)、[來源](https://www.esunsec.com.tw/trading-platforms/api-trading/docs/market-data/intro/)、[申請](https://www.esunsec.com.tw/trading-platforms/api-trading/docs/faq/intro/) |
+| 台新 Nova API | Python／Node.js，跨平台 REST、WebSocket `trades`／`books`／`aggregates` | 官方已有股票行情；未取得權限、完整開盤 schema、容量／費用及獨立故障域證據，不宣稱已接通或全市場合格。[官方平台](https://ml-fugle-api.tssco.com.tw/FugleSDK/landingpage/) |
+| 台新 MLAPI（原元富介面） | Python／C# 行情，`OpenPrice`、成交／五檔獨立時間、序號與試撮旗標；需完成線上行情驗證 | 未取得帳號與容量；文件列 TWSE／TAIFEX，TPEx 覆蓋須另確認。與 Nova 是同券商不同介面，不計為獨立供應商備援。[Python 行情手冊](https://mlapi.tssco.com.tw/web_api/service/document/python-quote) |
+| 國票 API | 官方手冊提供股票報價與五檔 callback，Windows 64-bit／.NET 元件 | 手冊版本為 2023，現行服務、開盤欄、全市場容量及費用待券商確認；本機未實測。[官方手冊](https://www.ibfs.com.tw/wealth-ap/download/API_trade/ibfs-API.pdf?ver=20230426) |
+| TWMD | 頁面標題稱接近即時，但 coverage 為 coming，注意事項又明列不提供即時報價／盤中分 K；回覆例也沒有正式開盤欄 | **規格互相衝突，排除於目前可用開盤來源**，不能只因 endpoint 名稱含 realtime 就加入模型。[供應商文件](https://twmarketdata.com/zh-TW/docs/api/market-prices/realtime-prices) |
+
+其他已查核的來源仍包括：富果 REST／WebSocket、富邦 Neo、元大 SPARK、群益 SKCOM、
+凱基、IBKR、TWSE／TPEx 授權 feed、國內資訊公司、LSEG、Bloomberg、ICE 等。
+本機分鐘 K、FinLab `tw_tick`／`tw_minute` 與 TEJ 日開盤欄屬於盤後／歷史證據，
+不能因為有 `open` 欄就當成 09:00 即時來源；MOPS 不是股價 feed。
+[FinLab 定義](https://finlab.finance/docs/reference/data/)、[TEJ API](https://api.tej.com.tw/document_rest.html)。
+
+已重新下載[10/16 官方簽約資訊公司清冊](../artifacts/operations/tw_opening_latency_20261016/official_vendor_roster.json)：
+國內 23、國外 25、即時指數 9、延遲資訊 20 列。這不是 77 個可買的低延遲 API，
+不把同公司跨組重複、展示商或延遲來源冒充獨立即時供應商。
+
+### 同一完整分母的盤後網路實測
+
+[18:15 三路實測](../artifacts/operations/tw_opening_latency_20261016/quote_phase_full_market_network.json)
+均從空的隔離 receipt 開始，請求同一官方 scope 2,301 檔，保留失敗與缺價：
+
+| 來源 | 首批有效開盤 ms | 來源工作完成 ms | 含來源保存 ms | 真實開盤／已證無首筆／未知 |
+| --- | ---: | ---: | ---: | --- |
+| MIS | 462.96 | 2,129.11 | 2,218.64 | 2,274／26／1 |
+| 永豐共用連線 | 502.42 | 2,674.60 | 2,976.43 | 2,274／0／27 |
+| FinMind | 1,169.34 | 1,283.94 | 1,622.53 | 2,274／0／27 |
+
+合併 90% quorum 約 1,447.44 ms；完整排空來源、保存與最後讀回約 3,185.32 ms。
+「來源工作完成」不是 100% 真正開盤價，也不是券商成交；不同來源沒有提供 no-first-print
+證據時不能借用別家的數字列為自身完整。這是盤後取得**當日開盤欄**的查詢成本，
+不是盤中最新成交／可執行五檔 freshness，也不能回推 09:00 第一輪供價。
+
+原生測速單元的[18:23 兩路讀回](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-16/postclose_182316141202.json)
+也成功執行：MIS 首批 141.46 ms／來源完成 1,226.62 ms；FinMind 765.65／873.77 ms；
+完整工作 1,367.39 ms。樣本條件不同，不能將兩次網路波動全算成程式加速或據此推導長期 P99。
+
+### 完整率分母與剩餘邊界
+
+本輪三路均缺的 `00838B`，ISIN 名冊仍列為上櫃；但已驗證官方七類 ETF 商品表的
+日期、schema、每表 totalCount 與實際列數，聯集 118 檔，ISIN ETF 為 119 檔，唯一差異
+正是此標的。[七類原始來源與雜湊](../artifacts/operations/tw_opening_latency_20261016/official_etf_scope_audit.json)。
+這證明現行 ISIN-only 分母存在商品目錄差異，**尚未將新的生命週期規則部署到交易 owner**；
+本輪沒有直接刪分母、回寫今日盤前名冊或重算原訊號，所以正式測速仍忠實保留 1 檔未知。
+需要後續在同版本、可安全換版的 canonical universe owner 整合 ETF 目錄與原始保存，
+不能用 provider 沒回價作為下市判定。完整 scope 修復與來源性能是不同驗收。
+
+### 已啟用的三時段測速
+
+- 開盤：原生流程被動記錄，observer 在 08:55、09:00:11、09:00:31、09:01 驗收；
+  不另登入或增加一輪開盤 API 競爭。沒有新 schema 的舊工作明確列為未測得，不寫 0 ms。
+- 盤中：交易日 10:30 做一次 MIS／FinMind 完整 scope 的空快取探測，10:31 被動彙整。
+- 盤後：交易日 13:40 做一次探測；observer 在 13:40、15:10 續收原生證據。
+  兩個 13:40 單元獨立，因此不能要求同秒 observer 立刻看見尚未結束的探測；探測自身即保存完整報告。
+- 每個實際 job 有獨立 ID、完整分母 SHA、首批、50／90／95／99／100% 正開盤與 resolved 里程碑，
+  排隊、HTTP／body／JSON、驗證合併、落盤、錯誤與逾時；按時段與來源彙整並保留失敗樣本。
+- 永豐不加入定期 snapshot 輪詢；沿用原生 owner 的被動記錄。probe 的 missed timer 不補跑成
+  假的歷史開盤測速；休市、日曆未驗收或 scope 不完整時留下 skip／waiting 收據。
+
+資料保存在 `artifacts/live/tw_opening_snapshots/*.acquisition.jsonl`、
+`artifacts/live/tw_day_trade_simulation/opening_audits/` 與 `artifacts/operations/tw_quote_phase_benchmarks/`。
+上述 timings 是 opening-input 取得與處理，不能當成市場撮合、可成交 book 或 broker fill 證明。
+下一個實際交易日的開盤與盤中樣本仍待發生；不宣稱已達一秒或外部 API 永遠零錯誤。
+
+## 10/13 原始結論與驗收
 
 14:33 續作已在四模式清倉後部署；Discord connected／core ready，訊號、委託與成交帳本 SHA 不變。
 現有三路仍是永豐共用串流優先、MIS／FinMind 並行補缺；**並未接通新的全市場串流，亦未達成一秒全量 SLA**。
@@ -60,7 +261,7 @@ ETF、特別股、創新板等須按實際官方 scope 對照；只選普通股�
 | 永豐 Shioaji | 即時訂閱上限 200；行情查詢共 50 次／10 秒；官方明確不允許以反覆 snapshots／ticks／kbars 輪詢替代即時行情 | 券商帳戶／API 權限；查詢流量依成交級距，推播不計流量 | 已有共用連線；適合實際交易標的，不足單獨推播 2,303 檔。不得靠多登入規避限制。[使用限制](https://sinotrade.github.io/zh/tutor/limit/) |
 | FinMind 股票快照 | 全市場一次請求；約 10 秒更新 | Sponsor NT$999／月；Sponsor Pro NT$3,330／月；免費／Backer 不含此股票即時權限 | 已有可用權限；補洞／稍晚交叉核對。提高請求額度不會把 10 秒更新變成逐筆推播。[資料說明](https://finmind.github.io/tutor/TaiwanMarket/RealTime/)、[價格與授權](https://finmind.github.io/Pricing/) |
 | 富果 REST Snapshot | 按市場整批；每五秒更新 | 開發者或進階方案 | 比逐檔請求省成本，但不足保證一秒目標；不是串流替代品。[Snapshot](https://developer.fugle.tw/docs/data/http-api/snapshot/quotes/) |
-| 富果 WebSocket | 免費 5 訂閱／1 連線；開發者 300／2 連線；進階文件列 2,000 訂閱／2 連線，並說每連線最多 2,000；股票×channel 占一訂閱 | 開發者 NT$1,499／月；進階 NT$2,999／月；企業方案另詢價 | 重要候選。**須確認 2 條連線的帳號合計上限**，不能直接宣稱有 4,000 或只有 2,000；依訂閱 ACK／readback 驗證是否容納完整 scope。[定價](https://developer.fugle.tw/docs/pricing/) |
+| 富果 WebSocket | 免費 5 訂閱／1 連線；開發者 300／2 連線；進階每連線最多 2,000、最多 2 連線；股票×channel 占一訂閱 | 開發者 NT$1,499／月；進階 NT$2,999／月；企業方案另詢價 | 10/18 重讀官方每連線定義，文件容量可覆蓋目前 scope 的單一 channel；實際帳號方案、全量 ACK 與開盤事件仍待驗收。本機 key 不等於已買此方案。[定價](https://developer.fugle.tw/docs/pricing/) |
 | 富邦 Neo | WebSocket 單連線 300、同時 7 條：最多 2,100 訂閱槽；REST 日內／快照 300 次／分鐘 | 需券商 API 開通；未確認獨立行情月費，不能宣稱免費 | 可作部分備援；預設額度不足 2,303 全量。Speed mode 是性能候選，需確認保留必需欄位後才測；未登入測試。[限制](https://www.fbs.com.tw/TradeAPI/docs/market-data/rate-limit/)、[模式](https://www.fbs.com.tw/TradeAPI/docs/market-data/websocket-api/upgrade-guide/) |
 | 元大 SPARK | 單連線 2,000、帳號合計 3,000，最多 10 連線；指定欄位訂閱按股票×欄位計數 | 需帳戶、API 申請與正式權限；官網無資金／交易量門檻，但不能因此推定所有費用為零 | **優先測試全市場候選**：兩條授權連線分片，若 `WatchlistAll` 每檔只占一額度，容量可涵蓋目前 scope。須實測正式開盤欄、delta 重組及 ACK。[限制](https://www.yuanta.com.tw/file-repository/content/sparkapi_docs/1.%E5%89%8D%E8%A8%80/3.%E4%BD%BF%E7%94%A8%E9%99%90%E5%88%B6%E8%AA%AA%E6%98%8E/index.html)、[平台](https://www.yuanta.com.tw/file-repository/content/API/page/index.html) |
 | 群益 SKCOM 等 | 官方提供行情／交易 API；SKCOM 涉及 Windows 元件 | 帳戶、API／行情權限；額度、費用待官方 SDK／帳號確認 | 候選但未取得全市場容量、來源時鐘及實測，不列作已達標來源。[官方下載](https://www.capitalfutures.com.tw/zh-tw/downloads) |

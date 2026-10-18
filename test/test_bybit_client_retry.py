@@ -73,8 +73,9 @@ def test_server_error_retry_budget_exhaustion_raises_final_error(monkeypatch, ma
         client.get(bybit.KLINE_ENDPOINT, {"symbol": "BTCUSD"})
     assert len(requests) == limiter.waits == max_retries + 1
     assert len(set(requests)) == 1
-    assert [attempt for attempt, _ in retries] == list(range(max_retries))
-    assert limiter.deferrals == [float(2**i) for i in range(max_retries)]
+    # The final exhausted worker still protects siblings with the cooldown.
+    assert [attempt for attempt, _ in retries] == list(range(max_retries + 1))
+    assert limiter.deferrals == [float(2**i) for i in range(max_retries + 1)]
 
 
 @pytest.mark.parametrize("code", [10001, 10029, -1])

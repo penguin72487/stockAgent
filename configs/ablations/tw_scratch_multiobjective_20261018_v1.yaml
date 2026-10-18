@@ -1,0 +1,23 @@
+# Continue the completed v9 study with four independent fresh-random policies.
+# The v2 gradient contract uses Sharpe / log return / Sortino / Calmar.
+# Completed v9 baseline remains the comparator; no weights or optimizer donated.
+base_spec: tw_scratch_strategy_20261017_v9.yaml
+output_root: artifacts/markets/tw_scratch_multiobjective_20261018_v1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: gradient
+      enabled: true
+      variants:
+        - name: pcgrad_return
+          overrides:
+            training: {loss_type: trajectory_pcgrad_return}
+        - name: mgda_return
+          overrides:
+            training: {loss_type: trajectory_mgda_return}
+        - name: pcgrad_parameter
+          overrides:
+            training: {loss_type: trajectory_pcgrad_parameter}
+        - name: mgda_parameter
+          overrides:
+            training: {loss_type: trajectory_mgda_parameter}

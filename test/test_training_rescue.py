@@ -241,6 +241,26 @@ def test_semantic_checkpoint_mismatch_rejected(formal):
         checkpoint_summary(p, spec)
 
 
+def test_compact_checkpoint_preserves_rescue_identity_and_rejects_corruption(formal):
+    from stockagent.training.checkpoint_transport import encode_checkpoint_manifest
+    spec, _, _, _, path, _ = formal
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    original = checkpoint_summary(path, spec)
+    spec["checkpoint_manifests"] = {
+        path.relative_to(Path(spec["output_root"])).as_posix():
+            digest(payload["experiment_manifest"]),
+    }
+    encoded = encode_checkpoint_manifest(payload)
+    torch.save(encoded, path)
+    restored = checkpoint_summary(path, spec)
+    assert restored["semantic_manifest_sha256"] == original["semantic_manifest_sha256"]
+    assert restored["epoch"] == 3 and restored["full_optimizer_state"]
+    encoded["experiment_manifest"]["payload"] += b" "
+    torch.save(encoded, path)
+    with pytest.raises(ValueError, match="SHA256"):
+        checkpoint_summary(path, spec)
+
+
 def test_config_drift_is_not_an_acknowledged_recovery_point(formal):
     spec = formal[0]
     config = Path(spec["config_file"])

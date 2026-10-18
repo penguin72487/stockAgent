@@ -13,6 +13,7 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+Environment="STOCKAGENT_PANEL_CHUNK_STORAGE=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_bot.sh"
 Restart=always
 RestartSec=1s

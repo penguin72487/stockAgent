@@ -592,7 +592,7 @@ def test_cpu_artifact_replay_restores_threads_after_source_failure(monkeypatch):
         assert torch.get_num_threads() == 1
         raise RuntimeError("source failure")
 
-    monkeypatch.setattr(PreparedDayTradeCarrySource, "batch", fail_source)
+    monkeypatch.setattr(PreparedDayTradeCarrySource, "prepare_batch", fail_source)
     previous = torch.get_num_threads()
     try:
         torch.set_num_threads(4)
@@ -608,7 +608,7 @@ def test_cpu_artifact_replay_restores_threads_after_source_failure(monkeypatch):
 
 def test_artifact_prefix_rejects_mismatched_requests_before_source_decode(monkeypatch):
     split, runtime, _ = fixture()
-    monkeypatch.setattr(PreparedDayTradeCarrySource, "batch",
+    monkeypatch.setattr(PreparedDayTradeCarrySource, "prepare_batch",
                         lambda *args, **kwargs: pytest.fail("invalid prefix must not decode source"))
     previous = torch.get_num_threads()
     with pytest.raises(ValueError, match="physical prefix requests differ"):
@@ -619,8 +619,20 @@ def test_artifact_prefix_rejects_mismatched_requests_before_source_decode(monkey
     assert torch.get_num_threads() == previous
 
 
-def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_account():
+@pytest.mark.parametrize('policy_field', [
+    None, 'force_exit_mask', 'unresolved_corporate_action_mask',
+    'force_short_cover_mask', 'can_short_open_open_mask',
+])
+def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_account(policy_field):
     split, runtime, _ = fixture()
+    if policy_field is not None:
+        value = torch.zeros_like(split.tradable_mask)
+        if policy_field == 'can_short_open_open_mask':
+            value.fill_(True)
+            value[1, 1] = False
+        else:
+            value[1, 1 if policy_field == 'force_short_cover_mask' else 0] = True
+        setattr(split, policy_field, value)
     model = Policy()
     options = dict(device=torch.device('cpu'), amp_dtype=None, non_blocking=False,
         long_only=False, buy_fee_rate=.001425, sell_fee_rate=.002925,
@@ -640,6 +652,23 @@ def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_accoun
     first = trainer._replay_physical_carry_split_prefix(
         full, split, 2, runtime=runtime, config=config
     )
+    dataset = SimpleNamespace(features_t=split.features, **{
+        name + '_t': getattr(split, name, None)
+        for name in (
+            'future_log_returns', 'tradable_mask', 'can_buy_mask', 'can_sell_mask',
+            'benchmark', 'can_short_open_mask', 'can_short_open_open_mask',
+            'force_short_cover_mask', 'force_exit_mask', 'session_advance_mask',
+            'day_trade_eligible_mask', 'day_trade_can_buy_open_mask',
+            'day_trade_can_sell_open_mask', 'unresolved_corporate_action_mask',
+        )
+    })
+    segment = trainer._replay_physical_carry_panel_segment(
+        full.requested_weights_history[:2], split.valid_indices[:2].numpy(),
+        dataset=dataset, runtime=runtime, config=config, initial_state=None,
+    )
+    for name in ('strategy_returns', 'turnovers', 'minute_nav', 'requested_weights_history'):
+        np.testing.assert_allclose(getattr(segment, name), getattr(first, name),
+                                   rtol=0, atol=1e-8)
     tail_split = replace(split, valid_indices=split.valid_indices[2:])
     tail_split._valid_indices_cpu = tail_split.valid_indices
     tail_requests = trainer._slice_backtest_rows(full, 2, len(split))
@@ -647,10 +676,18 @@ def test_artifact_prefix_replay_and_segment_concatenation_match_full_fifo_accoun
         tail_requests, tail_split, len(split) - 2, runtime=runtime,
         config=config, initial_state=first.day_trade_carry_state,
     )
+    panel_tail = trainer._replay_physical_carry_panel_segment(
+        full.requested_weights_history[2:], split.valid_indices[2:].numpy(),
+        dataset=dataset, runtime=runtime, config=config,
+        initial_state=segment.day_trade_carry_state,
+    )
     stitched = trainer._concatenate_physical_carry_segments([first, tail])
+    panel_stitched = trainer._concatenate_physical_carry_segments([segment, panel_tail])
     for name in ('strategy_returns', 'turnovers', 'weights_history',
                  'requested_weights_history', 'shares_history', 'minute_nav'):
         np.testing.assert_allclose(getattr(stitched, name), getattr(full, name),
+                                   rtol=0, atol=1e-8)
+        np.testing.assert_allclose(getattr(panel_stitched, name), getattr(full, name),
                                    rtol=0, atol=1e-8)
     torch.testing.assert_close(
         stitched.day_trade_carry_state.last_nav,

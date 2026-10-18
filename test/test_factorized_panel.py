@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,6 +13,59 @@ from stockagent.training.checkpoint_contract import _panel_array_content_fingerp
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.trainer import _fit_masked_training_feature_rms, _panel_training_transform_fingerprint
 from stockagent.training.windowed import dataset_to_windowed_tensors
+
+
+@pytest.mark.parametrize("factorized,compile_eval", [(True, True), (True, False), (False, True)])
+def test_formal_inference_compiles_math_not_factorized_host_io(monkeypatch, factorized, compile_eval):
+    from stockagent.training import trainer
+
+    class Model(torch.nn.Module):
+        @torch.compiler.disable
+        def forward_from_panel_slab(self, slab, mask, *, return_aux):
+            assert return_aux is False
+            self.seen_slab = slab
+            return mask.to(torch.float32)
+
+    model = Model()
+    panel = SimpleNamespace(features=SimpleNamespace(_stockagent_factorized_features=factorized))
+    config = SimpleNamespace(training=SimpleNamespace(enable_torch_compile=True,
+        compile_eval_model=compile_eval, strict_no_fallback=True,
+        factorized_encoder_checkpoint=True, vram_safety_margin_gb=1.5,
+        torch_compile_mode="default"))
+    calls = []
+    def compile_outer(module, **kwargs):
+        assert not factorized, "factorized host I/O cannot enter fullgraph"
+        calls.append(kwargs)
+        return module
+    monkeypatch.setattr(torch, "compile", compile_outer)
+    monkeypatch.setattr(trainer, "_can_enable_torch_compile", lambda device: (True, "test compiler"))
+    prepared = trainer._prepare_inference_panel_slab_model(model, panel, config,
+        torch.device("cpu"), fold_id=11)
+    slab = object()
+    mask = torch.tensor([[True, False, True]])
+    assert torch.equal(prepared(slab, mask), mask.float())
+    assert model.seen_slab is slab
+    if factorized:
+        assert not calls
+        assert model.factorized_input_compile is compile_eval
+        assert model.factorized_encoder_checkpoint is True
+        assert model.factorized_encoder_vram_safety_margin_bytes == int(1.5 * 1024**3)
+    else:
+        assert len(calls) == 1 and calls[0]["fullgraph"] is True and calls[0]["dynamic"] is False
+
+
+def test_factorized_formal_inference_does_not_hide_unavailable_requested_compiler(monkeypatch):
+    from stockagent.training import trainer
+    class Model(torch.nn.Module):
+        def forward_from_panel_slab(self, slab, mask, *, return_aux):
+            return mask.float()
+    config = SimpleNamespace(training=SimpleNamespace(enable_torch_compile=True,
+        compile_eval_model=True, strict_no_fallback=True))
+    monkeypatch.setattr(trainer, "_can_enable_torch_compile", lambda device: (False, "missing compiler"))
+    with pytest.raises(RuntimeError, match="factorized inference compile unavailable.*strict_no_fallback=true"):
+        trainer._prepare_inference_panel_slab_model(Model(),
+            SimpleNamespace(features=SimpleNamespace(_stockagent_factorized_features=True)),
+            config, torch.device("cpu"), fold_id=11)
 
 
 def test_partitioned_aot_backward_contract_is_scoped():
@@ -257,6 +311,85 @@ def test_live_date_projection_is_bitwise_equal_and_preserves_base_cache(tmp_path
     changed.write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="member"):
         attach_factorized_live_features(tail, path)
+
+
+def _formal_inference_fixture(tmp_path, monkeypatch, *, symbols=None):
+    import train
+    from stockagent.training.checkpoint_contract import subset_panel_symbols
+
+    panel, path, dense = example(tmp_path)
+    manifest = json.loads(path.read_text())
+    manifest["paper_inference"] = {"contract": "factorized_paper_projection_lag1_v1",
+        "status": "verified", "raw_source_publication": False}
+    path.write_text(json.dumps(manifest))
+    current = subset_panel_symbols(panel, symbols or ["3", "1", "2", "NEW"], allow_missing_masked=True)
+    config = SimpleNamespace(data=SimpleNamespace(parquet_root="unused",
+        factorized_feature_manifest=str(path), factorized_transfer_mode="dense_cpu",
+        factorized_host_cache_bytes=None), trading=SimpleNamespace(execution_mode="tw_day_trade"))
+    monkeypatch.setattr(train, "_build_panel_kwargs", lambda _: {})
+    return train, current, config, path, panel, dense
+
+
+def test_full_paper_inference_aligns_model_universe_not_live_membership(tmp_path, monkeypatch):
+    train, current, config, _path, original, dense = _formal_inference_fixture(tmp_path, monkeypatch)
+    before = current.features.copy()
+    attached = train._build_panel_rank_coordinated(lambda *_a, **_k: current,
+        config, "none", inference=True)
+    assert attached.symbols == original.symbols
+    np.testing.assert_array_equal(attached.dates, original.dates)
+    np.testing.assert_array_equal(attached.features[:].view(np.uint32), dense.view(np.uint32))
+    for name in ("returns_1d", "tradable_mask", "alive_mask", "close_prices", "can_buy_mask", "can_sell_mask"):
+        np.testing.assert_array_equal(getattr(attached, name), getattr(original, name))
+    np.testing.assert_array_equal(current.features, before)
+    assert current.symbols == ["3", "1", "2", "NEW"]
+
+
+def test_full_paper_inference_missing_trained_slot_stays_non_executable(tmp_path, monkeypatch):
+    train, current, config, _path, _original, _dense = _formal_inference_fixture(
+        tmp_path, monkeypatch, symbols=["3", "1"])
+    attached = train._build_panel_rank_coordinated(lambda *_a, **_k: current,
+        config, "none", inference=True)
+    assert attached.symbols == ["1", "2", "3"]
+    assert not attached.tradable_mask[:, 1].any()
+    assert not attached.alive_mask[:, 1].any()
+    assert not attached.can_buy_mask[:, 1].any()
+    assert not attached.can_sell_mask[:, 1].any()
+    assert np.isnan(attached.close_prices[:, 1]).all()
+
+
+@pytest.mark.parametrize("defect", ["bad_receipt", "raw_publication", "unverified", "short_calendar", "member_corrupt"])
+def test_full_paper_inference_alignment_retains_receipt_calendar_and_member_guards(
+    tmp_path, monkeypatch, defect,
+):
+    train, current, config, path, _original, _dense = _formal_inference_fixture(tmp_path, monkeypatch)
+    manifest = json.loads(path.read_text())
+    expected = "receipt"
+    if defect == "bad_receipt":
+        manifest["paper_inference"]["contract"] = "unknown"
+    elif defect == "raw_publication":
+        manifest["paper_inference"]["raw_source_publication"] = True
+    elif defect == "unverified":
+        manifest["paper_inference"]["status"] = "preparing"
+    elif defect == "short_calendar":
+        manifest["dates"] = manifest["dates"][1:]
+        expected = "complete executable calendar"
+    else:
+        (tmp_path / manifest["blocks"][0]["path"]).write_bytes(b"corrupt")
+        expected = "member"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=expected):
+        train._build_panel_rank_coordinated(lambda *_a, **_k: current, config, "none", inference=True)
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_training_and_non_paper_factorized_axes_remain_strict(tmp_path, monkeypatch, training):
+    train, current, config, path, _original, _dense = _formal_inference_fixture(tmp_path, monkeypatch)
+    if not training:
+        manifest = json.loads(path.read_text())
+        manifest.pop("paper_inference")
+        path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="universe/calendar"):
+        train._build_panel_rank_coordinated(lambda *_a, **_k: current, config, "none", inference=not training)
 
 
 def test_host_cache_budget_changes_io_only_not_source_or_fingerprint(tmp_path):

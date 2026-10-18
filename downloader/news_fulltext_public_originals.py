@@ -260,7 +260,82 @@ def taiwanhot_verified_short_prose(container, text, source):
     return False
 
 
-def _identity_and_schemas(soup, page_url, provider, headline, *, amp=False):
+def _ftv_paired_quote_title(soup, page_url, headline, declared, *, quote_edges=False):
+    """One observed unescaped label quote pair, not fuzzy matching.
+
+    FTV's current document title preserves the four ASCII apostrophes, its
+    schema omits them, and its malformed OG title ends at the opening pair.
+    Every other character and the independent full document title must agree.
+    This comparison never edits a retained title, value, body or source clock.
+    """
+    if urlsplit(page_url).hostname != 'www.ftvnews.com.tw':
+        raise NewsError('article_identity_not_verified')
+    match = re.fullmatch(r"([^']+)''([\u3400-\u9fff]{2,20})''([^']+)", headline)
+    version = 2
+    if match is None and quote_edges:
+        # Source-proved v3: a one-character CJK label or a pair at the
+        # beginning. A nonempty tail is still required. Missing OG is not an
+        # empty OG declaration, and no other character may disappear.
+        match = re.fullmatch(r"([^']*)''([\u3400-\u9fff]{1,20})''([^']+)", headline)
+        version = 3
+    if (match is None or _key(declared) != _key(''.join(match.groups()))):
+        raise NewsError('article_identity_not_verified')
+    document = _one(soup, 'head > title').get_text(' ', strip=True)
+    og = _one(soup, 'meta[property="og:title"][content]').get('content')
+    if (_key(document) != _key(headline + ' - 民視新聞網')
+            or _key(og) != _key(match[1])):
+        raise NewsError('article_identity_not_verified')
+    return {'kind': ('ftv_unescaped_paired_company_quotes' if version == 2
+                     else 'ftv_unescaped_paired_label_quotes'), 'contract_version': version,
+        'visible_headline_raw': headline, 'schema_headline_raw': declared,
+        'document_title_raw': document, 'og_title_raw': og,
+        'identity_comparison_only': True, 'original_values_modified': False}
+
+
+def _ftv_schema_json(text):
+    """Decode the observed literal value TAB without changing any JSON value.
+
+    The strict fast path is unchanged. Only v4 calls this fallback: a bounded
+    lexical pass proves every literal string control is a TAB, then the stdlib
+    decoder preserves it. Controls in keys, broken escapes, comments and other
+    invalid grammar still fail. Never strip controls or rewrite source bytes.
+    """
+    if len(text) > 262144:
+        raise ValueError('bounded FTV schema required')
+    try:
+        return json.loads(text), 0
+    except json.JSONDecodeError:
+        pass
+    quoted = escaped = False
+    tabs = 0
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+            elif ord(char) < 32:
+                if char != '\t':
+                    raise ValueError('unreviewed FTV string control')
+                tabs += 1
+        elif char == '"':
+            quoted = True
+    if not tabs:
+        raise ValueError('unreviewed FTV JSON syntax')
+
+    def keys_without_controls(pairs):
+        if any(any(ord(char) < 32 for char in key) for key, _ in pairs):
+            raise ValueError('FTV JSON key control')
+        return dict(pairs)
+
+    return json.loads(text, strict=False, object_pairs_hook=keys_without_controls), tabs
+
+
+def _identity_and_schemas(soup, page_url, provider, headline, *, amp=False,
+                          ftv_paired_quotes=False, ftv_quote_edges=False,
+                          ftv_literal_tabs=False, syntax_notices=None):
     identity = _id(page_url, provider)
     canonical = _one(soup, 'link[rel~="canonical"][href]')
     if identity is None or _id(canonical.get("href"), provider) != identity:
@@ -269,9 +344,14 @@ def _identity_and_schemas(soup, page_url, provider, headline, *, amp=False):
     if ((not amp or og) and (len(og) != 1 or _id(og[0].get("content"), provider) != identity)):
         raise NewsError("article_identity_not_verified")
     matches = []
-    for script in soup.find_all("script", type="application/ld+json"):
+    scripts = soup.find_all("script", type="application/ld+json")
+    if ftv_literal_tabs and (provider != 'ftvnews' or len(scripts) > 16):
+        raise NewsError('article_identity_not_verified')
+    for script in scripts:
         try:
-            candidates = _objects(json.loads(script.get_text()))
+            value, tabs = (_ftv_schema_json(script.get_text()) if ftv_literal_tabs
+                           else (json.loads(script.get_text()), 0))
+            candidates = _objects(value)
             for candidate in candidates:
                 types = candidate.get("@type", [])
                 types = [types] if isinstance(types, str) else types
@@ -285,10 +365,23 @@ def _identity_and_schemas(soup, page_url, provider, headline, *, amp=False):
                 if str(candidate.get("isAccessibleForFree", "true")).lower() == "false":
                     raise NewsError("paywall_or_login")
                 if _key(candidate.get("headline")) != _key(headline):
-                    raise NewsError("article_identity_not_verified")
+                    if provider != 'ftvnews' or not ftv_paired_quotes:
+                        raise NewsError("article_identity_not_verified")
+                    _ftv_paired_quote_title(soup, page_url, headline, candidate.get('headline'),
+                        quote_edges=ftv_quote_edges)
                 matches.append(candidate)
+                if tabs and syntax_notices is not None:
+                    syntax_notices.append({'kind': 'ftv_literal_json_value_tabs', 'contract_version': 4,
+                        'literal_tab_count': tabs, 'decoded_values_modified': False,
+                        'raw_evidence': 'shared_original_response_receipt'})
         except (json.JSONDecodeError, TypeError):
+            if ftv_literal_tabs:
+                raise NewsError('article_identity_not_verified') from None
             continue
+        except (ValueError, RecursionError):
+            if ftv_literal_tabs:
+                raise NewsError('article_identity_not_verified') from None
+            raise
     if not matches:
         raise NewsError("article_identity_not_verified")
     return matches
@@ -562,11 +655,19 @@ def voa_original_article(soup, source, *, page_url):
     }, scope
 
 
-def _ftv_newsroom_credit(body):
+def _ftv_parenthesized_credit(text):
+    return (len(text) <= 200 and text[:1] + text[-1:] in {'（）', '()'}
+        and re.fullmatch(r'民視新聞(?:網)?[ \t　]*[／/][ \t　]*[^()（）<>]{1,160}報導', text[1:-1]) is not None)
+
+
+def _ftv_newsroom_credit(body, *, standalone_credits=False, syntax_notices=None):
     """Credit lines are not whole paragraphs; preserve actual source breaks."""
-    credits = []
+    credits, legacy_credits, standalone = [], [], []
+    ignored_roles = ['figure', 'figcaption', 'nav', 'aside']
+    if standalone_credits:
+        ignored_roles += ['blockquote', 'footer', 'header', 'template', 'noscript']
     for node in body.find_all("p"):
-        if node.find("p") or node.find_parent(["figure", "figcaption", "nav", "aside"]):
+        if node.find("p") or node.find_parent(ignored_roles):
             continue
         # Actual originals put the credit and hundreds of body characters in
         # one <p>, separated by <br><br>. Flattening that whole paragraph loses
@@ -583,6 +684,24 @@ def _ftv_newsroom_credit(body):
             else:
                 parts.append(str(child))
         text = ''.join(parts).strip()
+        native_credit = None
+        if standalone_credits:
+            # The observed older source has a byline-only <p><br/>credit</p>
+            # or one horizontal space before '/'. Never search prose for a
+            # reporter or flatten a whole mixed body paragraph into a byline.
+            full_text = node.get_text(' ', strip=True) if not text else text
+            if (_ftv_parenthesized_credit(full_text)
+                    and node.get_text(' ', strip=True) == full_text
+                    and not node.find(['p', 'div', 'figure', 'figcaption', 'img', 'iframe', 'video', 'audio', 'ul', 'ol'])
+                    and not node.find_parent(['blockquote', 'footer', 'header', 'template', 'noscript'])):
+                native_credit = full_text
+            if (not text and len(full_text) <= 200
+                    and not node.find(['img', 'iframe', 'video', 'audio'])
+                    and not node.find_parent(['blockquote', 'footer', 'header', 'template', 'noscript'])
+                    and (full_text in {'（中央社）', '(中央社)'} or re.match(
+                        r'^(?:圖[、,，]?文|文|圖)[／/]\s*(?!民視)(\S+)|^(?:CNEWS|匯流新聞網|CTWANT|周刊王)', full_text))):
+                # A leading break cannot conceal a competing source credit.
+                text = full_text
         if len(text) > 200:
             continue
         # Actual older finance articles end with a standalone （中央社）.
@@ -617,10 +736,53 @@ def _ftv_newsroom_credit(body):
             for inline in inline_nodes:
                 _visible(inline)
             credits.append(text)
+            legacy_credits.append(text)
+        elif native_credit is not None:
+            _visible(node)
+            for inline in node.find_all():
+                _visible(inline)
+            leading_breaks = 0
+            for child in node.children:
+                if getattr(child, 'name', None) == 'br':
+                    leading_breaks += 1
+                elif getattr(child, 'name', None) or str(child).strip():
+                    break
+            credits.append(native_credit)
+            standalone.append({'contract_version': 7, 'visible_newsroom_credit_raw': native_credit,
+                'paragraph_leading_br_count': leading_breaks, 'paragraph_text_only_credit': True,
+                'basis': 'standalone_parenthesized_native_newsroom_credit', 'original_values_modified': False})
     credits = list(dict.fromkeys(credits))
     if len(credits) != 1:
         raise NewsError("article_attribution_not_verified")
+    if syntax_notices is not None and credits[0] not in legacy_credits:
+        syntax_notices.extend(standalone)
     return credits[0]
+
+
+_FTV_SUBSITE_V1_BASIS = 'actual_public_subsite_canonical_same_article_id_headline_and_own_newsroom_v1'
+_FTV_SUBSITE_V5_BASIS = 'actual_public_subsite_canonical_same_article_id_scoped_headline_and_own_newsroom_v5'
+
+
+def _ftv_subsite_headline(main, *, scoped=False):
+    headings = main.select('h1')
+    if len(headings) == 1:
+        return headings[0], None  # Preserve the complete v1-v4 single-header proof.
+    if not scoped:
+        raise NewsError('article_identity_not_verified')
+    article = _one(main, 'article')
+    content = _one(article, '#newscontent')
+    if content.name != 'div':
+        raise NewsError('article_identity_not_verified')
+    _visible(content)
+    body_headings = {id(node) for node in content.find_all('h1')}
+    candidates = [node for node in headings if id(node) not in body_headings]
+    if len(candidates) != 1 or not any(parent is article for parent in candidates[0].parents):
+        raise NewsError('article_identity_not_verified')
+    # All other H1s must actually belong to this unique native body. Never
+    # select the first match, borrow a related headline, or drop body headings.
+    return candidates[0], {'contract_version': 5, 'native_body_id': 'newscontent',
+        'total_h1_count': len(headings), 'body_h1_count': len(body_headings),
+        'basis': 'single_current_article_h1_outside_unique_native_newscontent'}
 
 
 def ftv_declared_public_canonical(payload, source, *, page_url):
@@ -633,12 +795,24 @@ def ftv_declared_public_canonical(payload, source, *, page_url):
     parts = urlsplit(page_url)
     if parts.netloc == "www.ftvnews.com.tw":
         return None
-    if (source.provider != "ftvnews" or source.embedded_article_layout != "ftv_visible_article_v1"
+    if (source.provider != "ftvnews" or source.embedded_article_layout not in {"ftv_visible_article_v1", "ftv_visible_article_v2", "ftv_visible_article_v3", "ftv_visible_article_v4", "ftv_visible_article_v5", "ftv_visible_article_v6", "ftv_visible_article_v7"}
             or _id(page_url, "ftvnews") is None):
         raise NewsError("article_identity_not_verified")
     soup = public_article_document(payload, source)
+    return _ftv_subsite_canonical_proof(soup, page_url=page_url,
+        scoped=source.embedded_article_layout in {'ftv_visible_article_v5', 'ftv_visible_article_v6', 'ftv_visible_article_v7'})
+
+
+def _ftv_subsite_canonical_proof(soup, *, page_url, scoped=False):
+    """Same native identity/byline/clock proof for capture and retained evidence.
+
+    HTTP access/authorization is decided by the normal public-response gate,
+    not by independently checking the retained receipt's DOM here.
+    """
+    if _id(page_url, 'ftvnews') is None or urlsplit(page_url).netloc == 'www.ftvnews.com.tw':
+        raise NewsError('article_identity_not_verified')
     main = _one(soup, "#__nuxt")
-    headline_node = _one(main, "h1")
+    headline_node, selection = _ftv_subsite_headline(main, scoped=scoped)
     _visible(headline_node)
     headline = headline_node.get_text(" ", strip=True)
     schemas = _identity_and_schemas(soup, page_url, "ftvnews", headline)
@@ -657,11 +831,14 @@ def ftv_declared_public_canonical(payload, source, *, page_url):
                      "invalid_bulk_publication_clock").get("content")
     if any(schema.get("datePublished") != raw_clock for schema in schemas):
         raise NewsError("invalid_bulk_publication_clock")
-    return {"declared_canonical_url": canonical, "subsite_url": page_url, "headline": headline,
+    proof = {"declared_canonical_url": canonical, "subsite_url": page_url, "headline": headline,
             "visible_newsroom_credit_raw": credit, "schema_authors_raw": authors,
             "subsite_published_at_raw": raw_clock,
             "clock_not_accepted_or_rewritten": True,
-            "basis": "actual_public_subsite_canonical_same_article_id_headline_and_own_newsroom_v1"}
+            "basis": _FTV_SUBSITE_V1_BASIS}
+    if selection:
+        proof.update(basis=_FTV_SUBSITE_V5_BASIS, headline_selection=selection)
+    return proof
 
 
 def verify_resolution_response(record):
@@ -683,16 +860,38 @@ def verify_resolution_response(record):
             or normalize_url(record["final_url"]) != normalize_url(evidence["declared_canonical_url"])
             or urlsplit(record["final_url"]).netloc != "www.ftvnews.com.tw"
             or evidence.get("basis") != record.get("url_resolution_basis")
-            or evidence.get("basis") != "actual_public_subsite_canonical_same_article_id_headline_and_own_newsroom_v1"
+            or evidence.get("basis") not in {_FTV_SUBSITE_V1_BASIS, _FTV_SUBSITE_V5_BASIS}
             or evidence.get("clock_not_accepted_or_rewritten") is not True
             or evidence.get("canonical_published_at_raw") != record.get("published_at_raw")
             or evidence.get("declared_clock_conflict") is not (evidence.get("subsite_published_at_raw") != record.get("published_at_raw"))
             or record.get("http_total_response_bytes") != len(raw) + record["http_response_bytes"]):
         raise ValueError("canonical_resolution_source_identity_or_byte_count_mismatch")
+    if evidence['basis'] == _FTV_SUBSITE_V5_BASIS:
+        from bs4 import BeautifulSoup
+        try:
+            observed = _ftv_subsite_canonical_proof(BeautifulSoup(raw, 'lxml'),
+                page_url=evidence['subsite_url'], scoped=True)
+        except (NewsError, ValueError, TypeError, RecursionError):
+            raise ValueError('canonical_resolution_native_header_not_verified') from None
+        actual = {key: evidence.get(key) for key in observed}
+        if (observed['basis'] != _FTV_SUBSITE_V5_BASIS
+                or json.dumps(actual, sort_keys=True) != json.dumps(observed, sort_keys=True)):
+            raise ValueError('canonical_resolution_native_header_evidence_mismatch')
     return len(raw)
 
 
-def ftv_visible_article(soup, *, page_url):
+def _ftv_reject_explicit_external_authors(names):
+    # A publisher suffix describes the hosting page, not original authorship.
+    # The actual canonical author can explicitly say 外稿｜引新聞 even when
+    # its subsite labels the prose 財經中心. Never let that generic newsroom
+    # line override declared syndicated provenance. Do not rewrite names or
+    # infer a different reporter from the source label.
+    if any(re.match(r'^(?:外稿|轉載)\s*[｜|／/：:]\s*\S', name) for name in names):
+        raise NewsError('article_rights_or_scope_excluded')
+
+
+def ftv_visible_article(soup, *, page_url, paired_quotes=False, quote_edges=False, literal_tabs=False,
+                        strict_author_provenance=False, standalone_credits=False):
     """Own-newsroom text only, not FTV-hosted CTWANT/CNEWS syndication."""
     scope = _one(soup, ".col-article")
     headline_node = _one(scope, ".scroll-header h1")
@@ -700,11 +899,30 @@ def ftv_visible_article(soup, *, page_url):
     for node in (headline_node, body):
         _visible(node)
     headline = headline_node.get_text(" ", strip=True)
-    schemas = _identity_and_schemas(soup, page_url, "ftvnews", headline)
-    credit = _ftv_newsroom_credit(body)
-    names = _schema_authors(schemas)
+    syntax_notices = []
+    schemas = _identity_and_schemas(soup, page_url, "ftvnews", headline,
+        ftv_paired_quotes=paired_quotes, ftv_quote_edges=quote_edges,
+        ftv_literal_tabs=literal_tabs, syntax_notices=syntax_notices)
+    title_notices = [_ftv_paired_quote_title(soup, page_url, headline, schema.get('headline'),
+        quote_edges=quote_edges)
+        for schema in schemas if _key(schema.get('headline')) != _key(headline)]
+    if strict_author_provenance:
+        names = _schema_authors(schemas)
+        _ftv_reject_explicit_external_authors(names)
+    credit_notices = []
+    credit = _ftv_newsroom_credit(body, standalone_credits=standalone_credits, syntax_notices=credit_notices)
+    if not strict_author_provenance:
+        names = _schema_authors(schemas)
     if any(not re.fullmatch(r".+ - 民視新聞網", name) for name in names):
         raise NewsError("article_rights_or_scope_excluded")
+    if credit_notices:
+        for name in names:
+            reporter = re.fullmatch(r'(.+?)(?:（[^（）]+）)? - 民視新聞網', name)
+            if not reporter or not re.search(r'[／/ \t　]' + re.escape(reporter[1]) + r'(?=[ \t　]|報導)', credit):
+                raise NewsError('article_attribution_not_verified')
+        for notice in credit_notices:
+            notice['schema_authors_raw'] = names
+            notice['declared_reporter_names_matched'] = True
     stamps = [n.get_text(" ", strip=True) for n in scope.select(":scope > ul.news-status > li")
               if n.get_text(" ", strip=True).startswith("發佈時間：")]
     if len(stamps) != 1:
@@ -721,7 +939,7 @@ def ftv_visible_article(soup, *, page_url):
                 and node.find("a", href=True)
                 and all(_id(urljoin(page_url, a["href"]), "ftvnews") for a in node.select("a[href]"))):
             node.decompose()
-    return {
+    article = {
         "headline": headline, "author": [{"name": name} for name in names],
         "datePublished": published, "dateModified": schemas[0].get("dateModified"),
         "published_time_basis": "matched_visible_minutes_and_declared_clock; source_seconds_and_offset_preserved",
@@ -730,4 +948,17 @@ def ftv_visible_article(soup, *, page_url):
         "author_attribution_detail_json": json.dumps({"visible_newsroom_credit_raw": credit,
             "schema_authors_raw": names, "byline_basis": "declared_current_article_author_and_visible_own_newsroom"},
             ensure_ascii=False, sort_keys=True),
-    }, scope
+    }
+    if title_notices:
+        article['verified_article_notices_json'] = json.dumps(title_notices, ensure_ascii=False, sort_keys=True)
+        version = max(notice['contract_version'] for notice in title_notices)
+        article['article_identity_basis'] = f'ftv_current_news_id_canonical_og_schema_visible_newsroom_and_paired_quotes_v{version}'
+    if syntax_notices:
+        article['verified_article_notices_json'] = json.dumps(title_notices + syntax_notices,
+            ensure_ascii=False, sort_keys=True)
+        article['article_identity_basis'] = 'ftv_current_news_id_canonical_og_schema_visible_newsroom_and_lossless_json_tabs_v4'
+    if credit_notices:
+        article['verified_article_notices_json'] = json.dumps(title_notices + syntax_notices + credit_notices,
+            ensure_ascii=False, sort_keys=True)
+        article['article_identity_basis'] = 'ftv_current_news_id_canonical_og_schema_and_standalone_visible_reporter_v7'
+    return article, scope

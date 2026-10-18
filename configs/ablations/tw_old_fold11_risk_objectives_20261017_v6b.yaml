@@ -1,0 +1,4 @@
+# Conditional continuation after the preserved pure-log v5c comparison.
+# Same six separate objectives, with the owned frozen-policy cache ABI.
+base_spec: tw_old_fold11_risk_objectives_20261017_v6.yaml
+output_root: artifacts/markets/tw_old_fold11_risk_objectives_20261017_v6b

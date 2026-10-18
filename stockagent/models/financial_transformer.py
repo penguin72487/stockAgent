@@ -504,11 +504,16 @@ class CandleEncoder(nn.Module):
         *,
         return_aux: bool = False,
         owned_inference: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        materialize_aux: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
         joint_features = self._base_joint_features(x, owned_inference=owned_inference)
         embedding = self._forward_base_with_zero_extra(joint_features)
         if not return_aux:
             return embedding, {}
+        if not materialize_aux:
+            return embedding, dict.fromkeys(
+                ("candle_tokens", "candle_token_weights", "candle_embedding")
+            )
         return embedding, {
             "candle_tokens": embedding.unsqueeze(-2),
             "candle_token_weights": embedding.new_ones(*embedding.shape[:-1], 1),
@@ -842,7 +847,16 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         candle_encoder: CandleEncoder,
         *,
         collect_aux: bool,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        materialize_aux: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
+        """Keep the numeric route independent of diagnostic materialization.
+
+        ``collect_aux`` also selects the established full-aux arithmetic route.
+        A completed signal may omit diagnostic values, but must not thereby
+        switch to the differently ordered algebraic no-aux contraction. None
+        explicitly records an unmaterialized diagnostic; default calls still
+        return every original tensor for training and explainability.
+        """
         if raw_window.ndim != 4:
             raise ValueError("raw_window must have shape [B,L,S,F]")
         if int(raw_window.size(1)) != self.lookback:
@@ -891,8 +905,9 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
             None,
         )
         squared_sum = base.float().square().sum(dim=-1)
-        aux: dict[str, torch.Tensor] = {}
-        aux_parts: list[torch.Tensor] = [base] if collect_aux else []
+        aux: dict[str, torch.Tensor | None] = {}
+        save_values = collect_aux and materialize_aux
+        aux_parts: list[torch.Tensor] = [base] if save_values else []
         offset = candle_encoder.base_joint_input_dim
 
         for family in self.family_names:
@@ -924,10 +939,11 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
                 coefficients,
             )
             if collect_aux:
-                aux[f"temporal_basis_{family}_coefficients"] = coefficients
-                aux_parts.append(
-                    coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
-                )
+                aux[f"temporal_basis_{family}_coefficients"] = coefficients if save_values else None
+                if save_values:
+                    aux_parts.append(
+                        coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
+                    )
             offset += width
 
         inverse_rms = torch.rsqrt(
@@ -941,13 +957,13 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         )
 
         if collect_aux:
-            input_features = torch.cat(aux_parts, dim=-1)
-            original = candle_encoder._forward_base_with_zero_extra(base)
+            input_features = torch.cat(aux_parts, dim=-1) if save_values else None
+            original = candle_encoder._forward_base_with_zero_extra(base) if save_values else None
             aux.update(
                 {
                     "temporal_basis_input_features": input_features,
                     "temporal_basis_original_path": original,
-                    "temporal_basis_output": embedding,
+                    "temporal_basis_output": embedding if save_values else None,
                 }
             )
         return embedding, aux
@@ -1115,6 +1131,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         factorized_sparse_cache_bytes: int = 8 * 1024**3,
         factorized_compact_stream_chunk_bytes: int = 0,
         factorized_input_compile: bool = True,
+        factorized_frozen_encoder_cache_bytes: int = 0,
         daily_context_num_features: int = 0,
         daily_context_categorical_feature_indices: Sequence[int] | None = None,
         daily_context_lookback: int = 1,
@@ -1124,6 +1141,9 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.factorized_input_compile=bool(factorized_input_compile)
+        self.factorized_frozen_encoder_cache_bytes = int(factorized_frozen_encoder_cache_bytes)
+        if self.factorized_frozen_encoder_cache_bytes < 0:
+            raise ValueError("frozen encoder cache requires nonnegative bytes")
         self.factorized_compact_projection=bool(factorized_compact_projection)
         self.factorized_sparse_projection=bool(factorized_sparse_projection)
         self.factorized_sparse_cache_bytes=int(factorized_sparse_cache_bytes)
@@ -1455,6 +1475,18 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
     def _input_basis_enabled(self) -> bool:
         return self.temporal_basis_input_feature_builder is not None
 
+    def candle_diagnostic_aux_fields(self) -> tuple[str, ...]:
+        """Inventory of candle and input-basis values the inference option omits."""
+        fields = ("candle_tokens", "candle_token_weights", "candle_embedding")
+        builder = self.temporal_basis_input_feature_builder
+        if builder is None:
+            builder = self.temporal_basis_feature_encoder
+        if builder is not None:
+            fields += tuple(f"temporal_basis_{family}_coefficients" for family in builder.family_names)
+            fields += ("temporal_basis_input_features", "temporal_basis_original_path",
+                       "temporal_basis_output")
+        return fields
+
     def temporal_basis_input_decomposition_for_explainability(
         self,
         x: torch.Tensor,
@@ -1485,7 +1517,8 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         x: torch.Tensor,
         *,
         return_token_aux: bool,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        materialize_aux: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
         """Encode a window with its causal coefficients as endpoint columns."""
 
         prepared = self.candle_encoder._window_scaled_features(x)
@@ -1494,6 +1527,10 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         if basis_encoder is None:
             if not return_token_aux:
                 return h, {}
+            if not materialize_aux:
+                return h, dict.fromkeys(
+                    ("candle_tokens", "candle_token_weights", "candle_embedding")
+                )
             return h, {
                 "candle_tokens": h.unsqueeze(-2),
                 "candle_token_weights": h.new_ones(*h.shape[:-1], 1),
@@ -1504,10 +1541,16 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             prepared,
             self.candle_encoder,
             collect_aux=return_token_aux,
+            materialize_aux=materialize_aux,
         )
         h = torch.cat((h[:, :-1], endpoint.unsqueeze(1)), dim=1)
         if not return_token_aux:
             return h, {}
+        if not materialize_aux:
+            return h, {
+                **dict.fromkeys(("candle_tokens", "candle_token_weights", "candle_embedding")),
+                **basis_aux,
+            }
         token_aux = {
             "candle_tokens": h.unsqueeze(-2),
             "candle_token_weights": h.new_ones(*h.shape[:-1], 1),
@@ -1763,7 +1806,12 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         symbol_indices: torch.Tensor | None = None,
         return_scores: bool = False,
         portfolio_context: dict[str, torch.Tensor] | None = None,
+        materialize_candle_aux: bool = True,
     ):
+        # Per-call, inference-only selection: never change a shared model flag,
+        # its state_dict, training gradients or the default explainability ABI.
+        if not materialize_candle_aux and (self.training or not torch.is_inference_mode_enabled()):
+            raise RuntimeError("omitting candle diagnostics requires eval and inference mode")
         self._check_shapes(x, mask, symbol_indices)
         if mask is None:
             mask_bool = torch.ones(x.size(0), x.size(2), dtype=torch.bool, device=x.device)
@@ -1775,6 +1823,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         h, token_aux = self._candle_project_window_features(
             x,
             return_token_aux=collect_token_aux,
+            materialize_aux=materialize_candle_aux,
         )
         h = self._add_window_positions(h, int(x.size(2)), symbol_indices)
         raw_basis_source = self._prepare_raw_temporal_basis_source(x)
@@ -1786,6 +1835,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             return_scores=return_scores,
             temporal_basis_source=raw_basis_source,
             portfolio_context=portfolio_context,
+            materialize_basis_aux=materialize_candle_aux,
         )
         return self._attach_candle_aux(output, token_aux, return_aux)
 

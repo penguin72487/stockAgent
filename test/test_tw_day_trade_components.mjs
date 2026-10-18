@@ -3,6 +3,23 @@ import {readFileSync} from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+test("counterfactual prefix clocks are not presented as original historical signals", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const context = vm.createContext({});
+  vm.runInContext(app.slice(app.indexOf("const shortTime ="), app.indexOf("const signalReasonLabel ="))
+    + ";globalThis.timing = replayTimingText;", context);
+  const at = "2026-01-02T09:01:00+08:00";
+  const replay = {signal_id: "tw_day_trade_100m-counterfactual-official-open-2026-01-02",
+    signal_at: at, source_signal_at: at, open_reconstructed_at: at};
+  assert.match(context.timing(replay), /目前模型反事實回放（非當時訊號）/);
+  assert.doesNotMatch(context.timing(replay), /原始訊號/);
+  assert.match(context.timing({...replay, signal_id: undefined,
+    replay_signal_origin: "current_model_counterfactual"}), /目前模型反事實回放（非當時訊號）/);
+  assert.doesNotMatch(context.timing({...replay, signal_id: "retained"}), /原始訊號/);
+  assert.match(context.timing({...replay, signal_id: "retained", source_signal_at: "2026-01-02T09:00:12+08:00"}),
+    /原始訊號 01-02 09:00:12/);
+});
+
 test("minute chart axis labels scale to phone width without removing source points", () => {
   const renderer = readFileSync(new URL("../services/tw_day_trade_dashboard/chart-renderer.js", import.meta.url), "utf8");
   const context = vm.createContext({});
@@ -55,6 +72,19 @@ function components(options = {}) {
   });
   return {view, presentation, modes, byId};
 }
+
+test("owner prices are labelled private observations without claiming public-feed permission", () => {
+  const {view} = components();
+  const data = {price_display_policy: {private_view: true, message: "本人私人檢視"}};
+  const row = {symbol: "2330", last_mark_price: 123.456789,
+    public_price_display: {withheld_fields: [], visible_fields: {
+      last_mark_price: {source: "本人私人檢視", publication_basis: "owner_private_view"},
+    }}};
+  assert.equal(view.priceNoticeText(data), "本人私人檢視");
+  const html = view.priceSources({data, positions: [row]}).sourcesHtml;
+  assert.match(html, /本人私人檢視/);
+  assert.doesNotMatch(html, /已驗證可公開行情/);
+});
 
 test("withheld public quotes remain pending without inventing zero notional or unfilled trades", () => {
   const {view} = components({formatOverrides: {money: (value) => value == null ? "—" : `NT$ ${value}`}});

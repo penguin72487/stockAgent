@@ -28,6 +28,7 @@ from stockagent.backtest.tw_day_trade_carry import (
     invalidate_day_trade_carry_compiled_caches,
 )
 from stockagent.backtest.tw_day_trade_inventory import _validate_checkpoint_identity
+from stockagent.backtest.tw_day_trade_graph import ledger_predicate, ledger_validation_is_deferred
 from stockagent.data.walkforward import period_labels_from_contract
 
 
@@ -294,6 +295,7 @@ class PreparedDayTradeCarryBatch:
     event_compression: bool = False
     packed_transport: bool = False
     transport_symbols: int = 0
+    sparse_transport_slots: int = 0
     _device_sessions: tuple[DayTradeCarrySession, ...] = field(default=(), repr=False, compare=False)
     _device_allocations: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
     _device_ready: object = field(default=None, repr=False, compare=False)
@@ -338,6 +340,7 @@ class PreparedDayTradeCarryBatch:
             raise ValueError("physical staged batch cannot mix dense and sparse sessions")
         packed: dict[str, torch.Tensor] = {}
         event_slots = 0
+        sparse_transport_slots = 0
         if all(sparse):
             raw_slots = os.environ.get(
                 "STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS", "262144"
@@ -362,6 +365,17 @@ class PreparedDayTradeCarryBatch:
                     f"required={required_slots} configured={event_slots}; increase "
                     "STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS to the next power of two"
                 )
+            if os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '0') == '1':
+                # Upload the bounded packet, rather than a global worst-case
+                # tail of inert events. Expand that tail on its consuming CUDA
+                # stream so every captured session still sees the fixed ABI.
+                packet_slots = 1 << max(0, required_slots - 1).bit_length()
+                if packet_slots < event_slots:
+                    if os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') != '1':
+                        sparse_transport_slots = event_slots
+                    event_slots = packet_slots
+            elif os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') == '1':
+                raise ValueError('sparse capacity buckets require compact sparse transport')
         for field in fields(DayTradeCarrySession):
             if field.name == "day":
                 continue
@@ -401,6 +415,8 @@ class PreparedDayTradeCarryBatch:
             int(count),
             sessions if preserve_cpu_sessions else (),
             bool(event_compression),
+            transport_symbols=int(sessions[0].official_open.numel()),
+            sparse_transport_slots=sparse_transport_slots,
         )
 
     @classmethod
@@ -510,6 +526,15 @@ class PreparedDayTradeCarryBatch:
             for name in transport_fields))
         moved = {name: _move_physical_transport(tensor, device) for name, tensor in self.tensors.items()
                  if not blocked or name not in transport_fields}
+        if self.sparse_transport_slots:
+            for name in ('exit_prices', 'exit_capacity', 'exit_symbol_indices', 'exit_sides'):
+                prefix = moved[name]
+                fill = (float('nan') if name == 'exit_prices' else
+                        self.transport_symbols - 1 if name == 'exit_symbol_indices' else 0)
+                padded = torch.full((self.count, self.sparse_transport_slots), fill,
+                                    device=device, dtype=prefix.dtype)
+                padded[:, :prefix.shape[1]].copy_(prefix)
+                moved[name] = padded
         if self.packed_transport:
             symbols = int(self.transport_symbols)
             exit_size = symbols * 270 * 2
@@ -532,8 +557,7 @@ class PreparedDayTradeCarryBatch:
                     del flat, values
                 moved["exit_prices"] = dense_prices[:, :exit_size].reshape(self.count, symbols, 270, 2)
                 moved["exit_capacity"] = dense_capacity[:, :exit_size].reshape(self.count, symbols, 270, 2)
-                return tuple(DayTradeCarrySession(day=day, **{name: value[i] for name, value in moved.items()})
-                             for i, day in enumerate(self.days))
+                return _sessions_from_field_batch(self.days, moved)
             flat = moved.pop("_transport_exit_flat").to(dtype=torch.int64)
             exit_values = moved.pop("_transport_exit_price")
             capacity_values = moved.pop("_transport_exit_capacity")
@@ -558,11 +582,7 @@ class PreparedDayTradeCarryBatch:
             moved["exit_capacity"] = dense_capacity[:, :exit_size].reshape(
                 rows, symbols, 270, 2
             )
-        result = []
-        for index, day in enumerate(self.days):
-            values = {name: tensor[index] for name, tensor in moved.items()}
-            result.append(DayTradeCarrySession(day=day, **values))
-        return tuple(result)
+        return _sessions_from_field_batch(self.days, moved)
 
     @torch.inference_mode(False)
     def prefetch_device(self, device: torch.device, stream) -> PreparedDayTradeCarryBatch:
@@ -593,6 +613,18 @@ class PreparedDayTradeCarryBatch:
                 allocations[id(value)] = value
         return replace(self, _device_sessions=sessions, _device_allocations=tuple(allocations.values()),
                        _device_ready=ready, _device=device)
+
+
+def _sessions_from_field_batch(days, tensors):
+    sessions = []
+    for index, day in enumerate(days):
+        session = DayTradeCarrySession(day=day, **{name: value[index] for name, value in tensors.items()})
+        # Private source-view provenance, excluded from the financial/session
+        # dataclass ABI and graph program schema. Owners never cache a model.
+        object.__setattr__(session, "_transport_fields", tensors)
+        object.__setattr__(session, "_transport_row", index)
+        sessions.append(session)
+    return tuple(sessions)
 
 
 def _move_physical_transport(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -961,8 +993,15 @@ class PreparedDayTradeCarrySource:
             and identity
             and self.packed_session_loader is not None
         )
-        cache_key = (tuple(rows), tuple(indices), bool(event_compression))
-        cache_enabled = packed_transport and self._prepared_batch_cache.budget() > 0
+        # A sparse fixed-slot batch must never alias a dense packed batch or
+        # a previous slot capacity. Both are immutable source representations;
+        # neither cache contains model outputs or recurrent account state.
+        layout = (('sparse', int(os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS', '262144')),
+                   os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '0') == '1',
+                   os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') == '1')
+                  if sparse_events else ('packed', None) if packed_transport else ('dense', None))
+        cache_key = (tuple(rows), tuple(indices), bool(event_compression), layout)
+        cache_enabled = identity and (packed_transport or sparse_events) and self._prepared_batch_cache.budget() > 0
         if cache_enabled:
             cached = self._prepared_batch_cache.get(cache_key)
             if cached is not None:
@@ -993,13 +1032,14 @@ class PreparedDayTradeCarrySource:
                 event_compression=event_compression,
             )
             return self._prepared_batch_cache.put(cache_key, prepared) if cache_enabled else prepared
-        return PreparedDayTradeCarryBatch.from_sessions(
+        prepared = PreparedDayTradeCarryBatch.from_sessions(
             sessions,  # type: ignore[arg-type]
             count,
             preserve_cpu_sessions=bool(self.sessions),
             event_compression=event_compression,
             sparse_events=sparse_events,
         )
+        return self._prepared_batch_cache.put(cache_key, prepared) if cache_enabled else prepared
 
 
 def prefetch_physical_carry_batches(
@@ -1073,9 +1113,10 @@ def prefetch_physical_carry_batches(
 
 
 def _require_flat_episode_boundary(state: DayTradeCarryState) -> None:
-    if (bool((state.inventory.shares != 0).any())
-            or bool((state.inventory.claims[..., 0] * (1 - state.inventory.claims[..., 2]) != 0).any())
-            or bool(state.inventory.failed != 0)):
+    valid = ((state.inventory.shares == 0).all()
+             & (state.inventory.claims[..., 0] * (1 - state.inventory.claims[..., 2]) == 0).all()
+             & (state.inventory.failed == 0))
+    if not ledger_predicate(valid, 'annual_boundary_flat_holdings_and_claims'):
         raise ValueError("annual training episode boundary cannot discard holdings, unpaid claims or invalid state")
 
 
@@ -1261,9 +1302,11 @@ def bind_physical_carry_loss(
                 "force_exit_mask", "unresolved_corporate_action_mask", "force_short_cover_mask",
                 "overnight_log_returns", "cash_dividend_yield", "cash_dividend_payment_delay_sessions",
                 "state_advance_mask", "volume_limit_weights", "short_capacity_weights", "sample_mask",
+                "log_return_weights", "day_trade_replay_log_returns",
             }
             total = weights.sum() * 0.0
             segment_previous = previous
+            captured_returns = []
             for offset, stop in zip(year_cuts[:-1], year_cuts[1:]):
                 if offset:
                     _require_flat_episode_boundary(segment_previous)
@@ -1280,10 +1323,14 @@ def bind_physical_carry_loss(
                 value = bound(weights[offset:stop], returns[offset:stop], mask[offset:stop], **supplied)
                 total = total + value * ((stop - offset) / count)
                 segment_previous = local_aux["_final_day_trade_carry_state"]
+                if "_daily_log_returns" in local_aux:
+                    captured_returns.append(local_aux["_daily_log_returns"])
                 kwargs["aux_outputs"].update(local_aux)
+            if captured_returns:
+                kwargs["aux_outputs"]["_daily_log_returns"] = torch.cat(captured_returns)
             return total
-        if not bool(torch.isfinite(weights[:count]).all()):
-            raise FloatingPointError("physical training model actions are nonfinite")
+        validation = [(torch.isfinite(weights[:count]).all(), FloatingPointError,
+                       "physical training model actions are nonfinite")]
         supplied = dict(kwargs)
         aux = supplied.get("aux_outputs")
         if not isinstance(aux, dict):
@@ -1324,13 +1371,22 @@ def bind_physical_carry_loss(
         supplied.pop("overnight_log_returns", None)
         for key in ("cash_dividend_yield", "cash_dividend_payment_delay_sessions"):
             value = supplied.pop(key, None)
-            if value is not None and not bool((value[:count] == 0).all()):
-                raise ValueError(
-                    f"physical avoid-mode source cannot consume exact field {key}"
-                )
+            if value is not None:
+                validation.append(((value[:count] == 0).all(), ValueError,
+                                   f"physical avoid-mode source cannot consume exact field {key}"))
         advance = supplied.pop("state_advance_mask", None)
-        if advance is not None and not bool(advance[:count].bool().all()):
-            raise ValueError("physical source cannot skip an owned exchange session")
+        if advance is not None:
+            validation.append((advance[:count].bool().all(), ValueError,
+                               "physical source cannot skip an owned exchange session"))
+        # Ordinary callers reject before executing. The annual pass gate may
+        # speculate, but must discard and replay any failed pass before update.
+        valid = torch.stack([predicate.to(weights.device) for predicate, _, _ in validation])
+        if ledger_validation_is_deferred():
+            ledger_predicate(valid.all(), 'physical_actions_and_source_obligations')
+        else:
+            for passed, (_, error, message) in zip(valid.detach().cpu().tolist(), validation):
+                if not passed:
+                    raise error(message)
         # Capacity is explicitly owned by the prepared 50%-minute session;
         # the daily-volume and short-availability proxies do not govern it.
         supplied.pop("volume_limit_weights", None)
@@ -1339,7 +1395,8 @@ def bind_physical_carry_loss(
         for key in ("benchmark_returns", "can_buy_mask", "can_sell_mask", "can_short_open_mask",
                     "can_short_open_open_mask", "day_trade_eligible_mask",
                     "day_trade_can_buy_open_mask", "day_trade_can_sell_open_mask",
-                    "session_month_ids", "commission_rebate_payment_eligible_mask"):
+                    "session_month_ids", "commission_rebate_payment_eligible_mask", "log_return_weights",
+                    "day_trade_replay_log_returns"):
             value = supplied.get(key)
             if isinstance(value, torch.Tensor):
                 supplied[key] = value[:count]
@@ -1362,6 +1419,8 @@ def bind_physical_carry_loss(
         def run_bound_loss() -> tuple[torch.Tensor, DayTradeCarryState]:
             physical_aux.clear()
             physical_aux["initial_day_trade_carry_state"] = previous
+            if aux.get("_capture_daily_log_returns", False):
+                physical_aux["_capture_daily_log_returns"] = True
             supplied["aux_outputs"] = physical_aux
             supplied["day_trade_carry_event_compression"] = compression_enabled
             try:
@@ -1381,6 +1440,8 @@ def bind_physical_carry_loss(
                 ).sessions(device)
                 physical_aux.clear()
                 physical_aux["initial_day_trade_carry_state"] = previous
+                if aux.get("_capture_daily_log_returns", False):
+                    physical_aux["_capture_daily_log_returns"] = True
                 supplied["aux_outputs"] = physical_aux
                 supplied["day_trade_carry_event_compression"] = False
                 current_result = loss_fn(
@@ -1400,10 +1461,8 @@ def bind_physical_carry_loss(
             raise RuntimeError("physical loss did not commit its final session state")
         # Never let the generic nonfinite-batch skip path discard a failed
         # chronological account and continue with the next day's policy.
-        local_failed = (
-            not bool(torch.isfinite(result).all())
-            or bool(final.inventory.failed != 0)
-        )
+        local_failed = not ledger_predicate(
+            torch.isfinite(result).all() & (final.inventory.failed == 0), 'physical_loss_and_committed_account')
         if local_failed:
             audit_valid, diagnosis = _diagnose_physical_trajectory_failure(
                 loss_fn,

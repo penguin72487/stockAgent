@@ -87,6 +87,16 @@ class FactorizedSparseRowStore:
         self.entries = OrderedDict()
         self.bytes = 0
         self.hits = self.misses = self.host_payload_bytes = 0
+        self.device_cache_policy = os.environ.get('STOCKAGENT_SPARSE_DEVICE_CACHE_POLICY', 'lru')
+        if self.device_cache_policy not in {'lru', 'lfu'}:
+            raise ValueError('sparse device cache policy must be lru or lfu')
+        self.access_counts = {}
+        self.device_evictions = self.device_evicted_bytes = 0
+        self.host_budget_bytes = int(os.environ.get('STOCKAGENT_SPARSE_HOST_CACHE_BYTES', '0'))
+        if self.host_budget_bytes < 0:
+            raise ValueError('sparse host cache budget must be nonnegative')
+        self.host_entries = OrderedDict()
+        self.host_bytes = self.host_hits = self.host_misses = self.host_capacity_skips = 0
         self.disk = None
         if disk_root := os.environ.get("STOCKAGENT_SPARSE_ROW_DISK_CACHE_DIR", ""):
             from stockagent.data.factorized_sparse_cache import NormalizedCSRDiskCache
@@ -139,10 +149,19 @@ class FactorizedSparseRowStore:
         symbols, features = source.shape[1:]
         cache_block = dict(id=int(block_id), start=start, stop=stop,
                            shape=[count*symbols, features])
+        host = self.host_entries.pop(block_id, None)
+        if host is not None:
+            self.host_entries[block_id] = host
+            self.host_hits += 1
+            return self._upload(start, stop, symbols, features, host['crow'], host['columns'],
+                                host['values'], host['zero_value'], origin='verified_host')
+        if self.host_budget_bytes:
+            self.host_misses += 1
         cached = self.disk.load(cache_block) if self.disk is not None else None
         if cached is not None:
-            return self._upload(start, stop, symbols, features, cached["crow"],
-                cached["columns"], cached["values"], cached["zero_value"], origin="verified_disk")
+            cached = self._remember_host(block_id, cached)
+            return self._upload(start, stop, symbols, features, cached['crow'],
+                cached['columns'], cached['values'], cached['zero_value'], origin='verified_disk')
         row_parts, column_parts, value_parts = [], [], []
 
         def add(raw, logical_columns, stock_positions):
@@ -242,29 +261,69 @@ class FactorizedSparseRowStore:
         if self.disk is not None:
             self.disk.save(cache_block, dict(crow=crow, columns=columns,
                                            values=prepared, zero_value=zero_value))
-        return self._upload(start, stop, symbols, features, crow, columns, prepared, zero_value,
+        stored = self._remember_host(block_id, dict(crow=crow, columns=columns,
+                                                   values=prepared, zero_value=zero_value))
+        return self._upload(start, stop, symbols, features, stored['crow'], stored['columns'],
+                            stored['values'], stored['zero_value'],
                             origin="source_build")
+
+    def _remember_host(self, block_id, arrays):
+        """Own already verified bytes across GPU eviction; never cache learned state."""
+        required = sum(array.nbytes for array in arrays.values())
+        if not self.host_budget_bytes or required > self.host_budget_bytes:
+            self.host_capacity_skips += bool(self.host_budget_bytes)
+            return arrays
+        while self.host_entries and self.host_bytes + required > self.host_budget_bytes:
+            _, old = self.host_entries.popitem(last=False)
+            self.host_bytes -= sum(value.nbytes for value in old.values())
+        owned = {}
+        with torch.inference_mode(False), torch.no_grad():
+            for name, array in arrays.items():
+                dtype = torch.int32 if name in {'crow', 'columns'} else torch.float32
+                value = torch.empty(array.shape, dtype=dtype, device='cpu',
+                                    pin_memory=self.device.type == 'cuda')
+                # Read-only mmap arrays are copied into independent storage only
+                # after their hashes/invariants passed; avoid a pageable copy and
+                # a new pin allocation on every GPU-cache miss.
+                np.copyto(value.numpy(), array, casting='no')
+                owned[name] = value
+        self.host_entries[block_id] = owned
+        self.host_bytes += required
+        return owned
 
     def _upload(self, start, stop, symbols, features, crow, columns, prepared, zero_value, *, origin):
         required = crow.nbytes + columns.nbytes + prepared.nbytes + zero_value.nbytes
         if required > self.budget_bytes:
             raise MemoryError("one immutable sparse date block exceeds the GPU cache budget")
         while self.entries and self.bytes + required > self.budget_bytes:
-            _, old = self.entries.popitem(last=False)
+            if self.device_cache_policy == 'lfu':
+                # Scan-like train/validation/test access can evict the whole
+                # cyclic working set under LRU. Protect repeatedly reused
+                # immutable rows; ties retain the existing oldest-first rule.
+                victim = min(self.entries, key=lambda key: self.access_counts.get(key, 0))
+                old = self.entries.pop(victim)
+            else:
+                _, old = self.entries.popitem(last=False)
             self.bytes -= old.nbytes
+            self.device_evictions += 1
+            self.device_evicted_bytes += old.nbytes
 
         def upload(array):
             # Evaluation may be the first consumer of a physical date block.
             # Resident constants must remain usable by a later training adjoint.
             with torch.inference_mode(False), torch.no_grad():
-                if not array.flags.writeable:
-                    array = np.array(array, copy=True)
-                host = torch.from_numpy(array)
-                if self.device.type == "cuda":
-                    host = host.pin_memory()
+                if torch.is_tensor(array):
+                    host = array
+                else:
+                    if not array.flags.writeable:
+                        array = np.array(array, copy=True)
+                    host = torch.from_numpy(array)
+                    if self.device.type == "cuda":
+                        host = host.pin_memory()
                 return host.to(self.device, non_blocking=self.device.type == "cuda")
 
-        entry = _SparseBlock(start, stop, symbols, features, crow,
+        host_crow = crow.numpy() if torch.is_tensor(crow) else crow
+        entry = _SparseBlock(start, stop, symbols, features, host_crow,
             upload(crow), upload(columns), upload(prepared),
             upload(zero_value))
         self.bytes += entry.nbytes
@@ -284,6 +343,7 @@ class FactorizedSparseRowStore:
         cuts = [0, *(np.flatnonzero((np.diff(rows) != 1) | (np.diff(blocks) != 0))+1), len(rows)]
         for a, b in zip(cuts[:-1], cuts[1:], strict=True):
             block_id = int(blocks[a])
+            self.access_counts[block_id] = self.access_counts.get(block_id, 0) + 1
             entry = self.entries.pop(block_id, None)
             if entry is None:
                 self.misses += 1

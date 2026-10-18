@@ -216,6 +216,72 @@ def masked_learned_cash_weights(
     )
 
 
+def masked_decoupled_entmax_cash_weights(
+    selection_logits: torch.Tensor,
+    direction_logits: torch.Tensor,
+    cash_logit: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    long_only: bool = False,
+    normalize_direction: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Independently learn stock selection, signed conviction and cash.
+
+    Selection is entmax-1.5 of cross-sectionally standardized rank scores.
+    Direction is tanh of a separate score (sigmoid for long-only). A contextual
+    cash gate supplies the maximum risky budget. The original mode lets
+    uncertain direction leave additional cash. The v2 mode normalizes the
+    signed selection before applying that gate, so only the cash head sets
+    gross exposure. An exactly empty direction still stays in cash. These are
+    distinct output ABIs, not changes to execution, fees or integer accounting.
+    """
+    if selection_logits.ndim != 2 or direction_logits.shape != selection_logits.shape:
+        raise ValueError("decoupled selection and direction must have matching [B,S] shapes")
+    if cash_logit.ndim == 1:
+        cash_logit = cash_logit.unsqueeze(1)
+    if cash_logit.shape != (selection_logits.size(0), 1):
+        raise ValueError("decoupled cash logit must have shape [B] or [B,1]")
+    mask_bool = (torch.ones_like(selection_logits, dtype=torch.bool) if mask is None
+                 else mask.to(device=selection_logits.device, dtype=torch.bool))
+    if mask_bool.shape != selection_logits.shape:
+        raise ValueError("decoupled mask must match selection logits")
+    selection = torch.nan_to_num(selection_logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    selection = selection.masked_fill(~mask_bool, 0.0)
+    count = mask_bool.sum(dim=1, keepdim=True).clamp_min(1).float()
+    # Max scaling avoids overflow in the variance. Clamp before sqrt so the
+    # constant-score and all-masked states have finite backward derivatives.
+    scaled = selection / selection.abs().amax(dim=1, keepdim=True).clamp_min(1.0)
+    centered = (scaled - scaled.sum(dim=1, keepdim=True) / count).masked_fill(~mask_bool, 0.0)
+    rms = (centered.square().sum(dim=1, keepdim=True) / count).clamp_min(
+        torch.finfo(torch.float32).eps ** 2).sqrt()
+    relative = _masked_entmax15(centered / rms, mask_bool, implicit_backward=True).float()
+    clean_direction = torch.nan_to_num(direction_logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    direction = (torch.sigmoid(clean_direction) if long_only else torch.tanh(clean_direction))
+    direction = direction.masked_fill(~mask_bool, 0.0)
+    clean_cash = torch.nan_to_num(cash_logit.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    budget = torch.sigmoid(-clean_cash)
+    signed_selection = relative * direction
+    if normalize_direction:
+        magnitude = signed_selection.abs().sum(dim=1, keepdim=True)
+        signed_selection = torch.where(
+            magnitude > PORTFOLIO_L1_EPS,
+            signed_selection / magnitude.clamp_min(PORTFOLIO_L1_EPS),
+            torch.zeros_like(signed_selection),
+        )
+    weights = (signed_selection * budget).masked_fill(~mask_bool, 0.0)
+    gross = weights.abs().sum(dim=1)
+    cash = (1.0 - gross).clamp(0.0, 1.0)
+    return weights, {
+        "decoupled_relative_allocation": relative,
+        "decoupled_direction": direction,
+        "decoupled_direction_logits": direction_logits,
+        "cash_weight": cash,
+        "cash_gate_risky_gross": budget.squeeze(1),
+        "risky_gross_weight": gross,
+        "implicit_cash_weight": cash,
+    }
+
+
 def _masked_distribution(
     logits: torch.Tensor,
     mask: torch.Tensor,
@@ -266,12 +332,38 @@ def _masked_sparsemax(
         return probs.to(dtype=logits.dtype)
 
 
+class _Entmax15Implicit(torch.autograd.Function):
+    """Keep the legacy forward but differentiate the simplex constraint.
+
+    Branches in threshold bisection do not supply the implicit derivative of
+    its root. At alpha=1.5 the exact VJP is s*(v-<s,v>/sum(s)), s=sqrt(p).
+    Saving only probabilities also removes all 32 search iterations from the
+    backward tape. Higher-order differentiation is not part of this ABI.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, mask, eps, n_iter):
+        probabilities = _masked_entmax15(logits, mask, eps=eps, n_iter=n_iter)
+        ctx.save_for_backward(probabilities)
+        return probabilities
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (probabilities,) = ctx.saved_tensors
+        root = probabilities.float().sqrt()
+        grad = grad_output.float()
+        correction = (root * grad).sum(dim=1, keepdim=True) / root.sum(
+            dim=1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+        return (root * (grad - correction)).to(dtype=probabilities.dtype), None, None, None
+
+
 def _masked_entmax15(
     logits: torch.Tensor,
     mask: torch.Tensor,
     *,
     eps: float = 1e-12,
     n_iter: int = 32,
+    implicit_backward: bool = False,
 ) -> torch.Tensor:
     """Masked alpha=1.5 entmax over dim=1.
 
@@ -279,6 +371,8 @@ def _masked_entmax15(
     each valid row sums to one.  The operation is differentiable almost
     everywhere, and exact zeros are the useful sparse case.
     """
+    if implicit_backward:
+        return _Entmax15Implicit.apply(logits, mask, eps, n_iter)
     with profile_range("portfolio.entmax15"):
         mask_bool = mask.bool()
         logits_f = torch.nan_to_num(logits.float(), nan=0.0)
@@ -709,6 +803,7 @@ def masked_score_entmax_scale_separated_cash_weights(
     short_mask: torch.Tensor | None = None,
     return_parts: bool = False,
     dense_backward: bool = False,
+    implicit_backward: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Choose sparse stock legs by score shape and cash by raw score strength.
 
@@ -754,7 +849,8 @@ def masked_score_entmax_scale_separated_cash_weights(
     shape_rms_scaled = shape_rms_sq_scaled.clamp_min(numerical_floor**2).sqrt()
     shape = scaled_evidence / shape_rms_scaled
     relative = _masked_entmax15(
-        shape - shape.max(dim=1, keepdim=True).values, mask_bool
+        shape - shape.max(dim=1, keepdim=True).values, mask_bool,
+        implicit_backward=implicit_backward,
     ).float()
 
     scaled_q = (relative * scaled_evidence).sum(dim=1, keepdim=True)
@@ -766,8 +862,14 @@ def masked_score_entmax_scale_separated_cash_weights(
         # Declared surrogate: executed actions remain exactly sparse. A dense
         # smooth allocator supplies discovery gradients before entmax support
         # selection. Physical sub-lot secants provide the missing payoff signal.
+        # RMS-normalized maxima can approach sqrt(S). A raw-shape softmax
+        # then saturates at the real 2,757-stock width, reducing discovery
+        # gradients below Adam's epsilon despite passing small-shape checks.
+        # log1p keeps the proxy's odds linear in evidence and gives every
+        # legal zero-score stock finite discovery credit. The hard entmax
+        # allocation and every executed action above remain unchanged.
         dense_relative = torch.softmax(
-            shape.masked_fill(~mask_bool, torch.finfo(shape.dtype).min), dim=1
+            shape.log1p().masked_fill(~mask_bool, torch.finfo(shape.dtype).min), dim=1
         ).masked_fill(~mask_bool, 0.0)
         dense_q = (dense_relative * scaled_evidence).sum(dim=1, keepdim=True)
         dense = dense_relative * (legal_scores / scale) / (scale.reciprocal() + dense_q)

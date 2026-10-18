@@ -286,7 +286,7 @@ def verify(url: str, output: Path) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="https://penguin72487.ddnsgeek.com/finlab/")
+    parser.add_argument("--url", default="https://www.penguin72487.dpdns.org/finlab/")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/data_quality/finlab_stage_eta_2026-10-01/public")
     args = parser.parse_args()
     print(json.dumps(verify(args.url, args.output), ensure_ascii=False))

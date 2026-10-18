@@ -25,8 +25,36 @@ if($Child) {
        [TejBridgeNative]::PreviewActionState() -ne 0 -or [TejBridgeNative]::LastSelectionMethod -cne 'none'){
         throw 'Loaded native semantics/static worker isolation differ'
     }
+    # Exercise the exact production writer on NTFS AND the WSL UNC output.
+    # Exclusively lock the final file to inject a publication failure without
+    # interacting with any TEJ window or sending a provider request.
+    $publication=[Collections.Generic.List[object]]::new()
+    foreach($target in @((Join-Path $CacheDirectory ('publication-'+[Guid]::NewGuid().ToString('N')+'.json')),
+                         ($Output+'.publication-'+[Guid]::NewGuid().ToString('N')+'.json'))) {
+        $original='{"state":"original","value":"台積電"}'
+        $next='{"state":"replacement","value":"台灣/α"}'
+        [TejBridgeNative]::WriteArtifact($target,$original)
+        $held=[IO.File]::Open($target,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        $refused=$false;$failureClock=[Diagnostics.Stopwatch]::StartNew()
+        try{[TejBridgeNative]::WriteArtifact($target,$next)}catch{$refused=$true}finally{$held.Dispose()}
+        $failureSeconds=$failureClock.Elapsed.TotalSeconds
+        if(-not $refused -or [IO.File]::ReadAllText($target) -cne $original -or $failureSeconds -gt 5){
+            throw 'Atomic publication did not preserve locked original with bounded failure'
+        }
+        $writeClock=[Diagnostics.Stopwatch]::StartNew()
+        [TejBridgeNative]::WriteArtifact($target,$next)
+        $writeSeconds=$writeClock.Elapsed.TotalSeconds
+        if([IO.File]::ReadAllText($target) -cne $next -or
+           @(Get-ChildItem -LiteralPath (Split-Path $target) -Filter ((Split-Path $target -Leaf)+'.*.tmp')).Count -ne 0){
+            throw 'Atomic UTF8 publication or own-temporary cleanup differs'
+        }
+        $publication.Add(@{filesystem=$(if($target.StartsWith('\\')){'wsl_unc'}else{'ntfs'});
+            locked_original_preserved=$true;bounded_failure_seconds=$failureSeconds;
+            successful_write_seconds=$writeSeconds;utf8_equal=$true;temporary_files_retained=0})
+    }
     [IO.File]::WriteAllText($ChildOutput,(@{cache=$cache;seconds=$seconds;native_semantics_equal=$true;
-        fresh_mutable_state=$true;provider_queries_sent=0}|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+        fresh_mutable_state=$true;artifact_publication=$publication.ToArray();
+        provider_queries_sent=0}|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
     exit
 }
 if(Test-Path -LiteralPath $Output){throw 'Do not overwrite native cache acceptance'}
@@ -46,6 +74,7 @@ function Run-Child([string]$Label,[string]$Bridge) {
     $samples.Add(@{name=$Label;state=$sample.cache.state;seconds=$sample.seconds;
         fingerprint=$sample.cache.fingerprint;dll_sha256=$sample.cache.dll_sha256;
         timings=$sample.cache.timings;
+        artifact_publication=$sample.artifact_publication;
         native_semantics_equal=$sample.native_semantics_equal;fresh_mutable_state=$sample.fresh_mutable_state})
     return $sample
 }

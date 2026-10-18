@@ -8,9 +8,6 @@ import hashlib
 import json
 from pathlib import Path
 
-from downloader.stock_volume_units import STOCK_MINUTE_READER_CONTRACT
-
-
 def _json_object(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -127,6 +124,11 @@ def may_reuse_materialization(
     """
     if not frontier_was_ready or source_rows_before < 0 or source_fingerprint_before == "-":
         return False
+    # Fingerprinting the raw terminal catalog is a standard-library control
+    # operation. Only materialization reuse needs this numerical reader's ABI;
+    # do not import Polars into the isolated storage role just to hash receipts.
+    from downloader.stock_volume_units import STOCK_MINUTE_READER_CONTRACT
+
     try:
         summary = _json_object(source_root / "download_summary.json")
         report_rows, _, source_rows_after = _source_report(

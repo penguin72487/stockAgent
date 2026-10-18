@@ -1,0 +1,19 @@
+# Preserve the five independent cases; add four explicitly multiobjective cases.
+base_spec: tw_single_metric_convergence_last_fold_20261015_v1.yaml
+output_root: artifacts/markets/tw_multiobjective_convergence_last_fold_20261016_v1
+postprocess_plots:
+  - {split: val, prefix: multiobjective_val, scope_label: last fold / declared validation criterion}
+  - {split: test, prefix: multiobjective_test_diagnostic, scope_label: last fold / retrospective diagnostic}
+matrix:
+  prepend_dimensions:
+    - name: gradient
+      enabled: true
+      variants:
+        - name: pcgrad_return
+          overrides: {training: {loss_type: trajectory_pcgrad_return}}
+        - name: mgda_return
+          overrides: {training: {loss_type: trajectory_mgda_return}}
+        - name: pcgrad_parameter
+          overrides: {training: {loss_type: trajectory_pcgrad_parameter}}
+        - name: mgda_parameter
+          overrides: {training: {loss_type: trajectory_mgda_parameter}}

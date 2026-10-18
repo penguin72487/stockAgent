@@ -39,6 +39,9 @@ def main():
     results = []
     for recipe in recipes:
         name = recipe["name"]
+        baseline = Path(recipe.get("baseline_config", args.baseline_config)).resolve()
+        if not baseline.is_file():
+            raise ValueError(f"recipe {name} baseline config is missing: {baseline}")
         overrides = args.output / f"{name}-overrides.yaml"
         overrides.write_text(yaml.safe_dump(recipe["overrides"], sort_keys=False))
         runtime = args.output / f"{name}-runtime.yaml"
@@ -49,7 +52,7 @@ def main():
         code = Path(recipe.get("code_root", ROOT)).resolve()
         command = [str(python), str(code / "scripts/run_frontier_training_trial.py"),
             "--code-root", str(code), "--source-receipt", str(code.parent / "release.json"),
-            "--baseline-config", str(args.baseline_config), "--output", str(args.output / name),
+            "--baseline-config", str(baseline), "--output", str(args.output / name),
             "--name", name, "--overrides", str(overrides), "--runtime-overrides", str(runtime),
             "--batch-size", str(recipe.get("batch_size", 256)),
             "--cpu-threads", str(recipe.get("cpu_threads", 8)),

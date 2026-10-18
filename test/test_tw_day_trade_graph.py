@@ -8,6 +8,29 @@ from stockagent.backtest.tw_day_trade_carry import (
 from stockagent.backtest.tw_day_trade_graph import _Program
 
 
+@pytest.mark.parametrize('layout', ['consecutive', 'strided', 'separate', 'reordered', 'repeated'])
+@pytest.mark.parametrize('tail', [0, 2])
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_session_field_transport_preserves_every_value_and_inactive_tail(layout, tail, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('requires CUDA')
+    from stockagent.backtest.tw_day_trade_graph import _copy_session_field_
+    original = torch.arange(5 * 3 * 7, dtype=torch.float64, device=device).reshape(5, 3, 7)
+    original[2, 1, 4] = float('nan')
+    source = original[:, :, :5] if layout == 'strided' else original
+    values = tuple(source[i] for i in range(3))
+    if layout == 'separate':
+        values = tuple(x.clone() for x in values)
+    elif layout == 'reordered':
+        values = (values[2], values[0], values[1])
+    elif layout == 'repeated':
+        values = (values[1],) * 3
+    actual = torch.empty((3 + tail, *source.shape[1:]), dtype=source.dtype, device=device)
+    _copy_session_field_(actual, values)
+    expected = torch.stack((*values, *((values[-1],) * tail)))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
 def _inputs(rows=3, device='cpu', tail=0):
     s=2;d=torch.device(device)
     v=lambda x: torch.full((s,),x,dtype=torch.float64,device=d)
@@ -81,13 +104,18 @@ def test_program_releases_input_source_storage_after_recording_schema():
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='requires CUDA graph runtime')
 @pytest.mark.parametrize('adjoint',['recompute','saved'])
 @pytest.mark.parametrize('compressed',[False,True])
-def test_graph_reuse_different_calendar_tail_and_pending_backward(monkeypatch,adjoint,compressed):
+@pytest.mark.parametrize('packed_source',[False,True])
+def test_graph_reuse_different_calendar_tail_and_pending_backward(monkeypatch,adjoint,compressed,packed_source):
     monkeypatch.setenv('STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH','1')
     monkeypatch.setenv('STOCKAGENT_DAY_TRADE_CUDAGRAPHS','0')
     monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_BLOCK_ROWS','4')
     monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_ADJOINT',adjoint)
     monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_TAPE_SLOTS','1')
     w,sessions,p,values,common=_inputs(device='cuda')
+    if packed_source:
+        from stockagent.training.day_trade_carry_bridge import _sessions_from_field_batch
+        tensors={name:torch.stack(tuple(getattr(s,name) for s in sessions)) for name in p.names}
+        sessions=_sessions_from_field_batch(tuple(s.day for s in sessions),tensors)
     common['event_compression']=compressed
     reference=run_day_trade_carry_sessions(w,sessions,**common,_allow_flat_terminal=False)
     actual=run_day_trade_carry_sessions(w,sessions,**common)
@@ -96,6 +124,14 @@ def test_graph_reuse_different_calendar_tail_and_pending_backward(monkeypatch,ad
     future=tuple(replace(s,day=s.day+20) for s in sessions[:2])
     second=run_day_trade_carry_sessions(w2[:2],future,**{**common,'can_enter':common['can_enter'][:2]})
     torch.testing.assert_close(actual.strategy_returns,reference.strategy_returns,rtol=1e-8,atol=1e-8)
+    from stockagent.backtest.tw_day_trade_graph import detached_carry_state
+    carried=detached_carry_state(actual.final_state)
+    assert carried.inventory.cohorts.shape[0] == carried.inventory.claims.shape[0] == 0
+    # Only the carried, detached copy is compacted; public history and its
+    # pending VJP remain intact through the following independent replay.
+    torch.testing.assert_close(actual.final_state.inventory.cohorts,
+                               reference.final_state.inventory.cohorts,rtol=1e-8,atol=1e-8)
+    torch.testing.assert_close(carried.last_nav,actual.final_state.last_nav,rtol=0,atol=0)
     grad_ref=torch.autograd.grad(reference.strategy_returns.sum(),w)[0]
     actual.strategy_returns.sum().backward(retain_graph=True)
     torch.testing.assert_close(w.grad,grad_ref,rtol=1e-5,atol=1e-8)
@@ -104,6 +140,65 @@ def test_graph_reuse_different_calendar_tail_and_pending_backward(monkeypatch,ad
     torch.testing.assert_close(w.grad,grad_ref,rtol=1e-5,atol=1e-8)
     second.strategy_returns.sum().backward()
     assert w2.grad[:2].abs().sum()>0 and torch.isfinite(w2.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA graph runtime')
+def test_graph_prefix_backend_change_cannot_replay_a_previous_captured_program(monkeypatch):
+    from stockagent.backtest.tw_day_trade_graph import get_explicit_carry_graph_stats
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_CUDAGRAPHS', '0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_BLOCK_ROWS', '2')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_ADJOINT', 'saved')
+    w, sessions, _, _, common = _inputs(rows=1, device='cuda')
+    oracle = run_day_trade_carry_sessions(w, sessions, **common, _allow_flat_terminal=False)
+    expected, = torch.autograd.grad(oracle.strategy_returns.sum(), w)
+    for backend in ['native', 'triton']:
+        monkeypatch.setenv('STOCKAGENT_DAY_TRADE_PREFIX_BACKEND', backend)
+        before = get_explicit_carry_graph_stats()['constructors']
+        result = run_day_trade_carry_sessions(w, sessions, **common)
+        assert get_explicit_carry_graph_stats()['constructors'] == before + 1
+        torch.testing.assert_close(result.strategy_returns, oracle.strategy_returns, rtol=1e-8, atol=1e-8)
+        actual, = torch.autograd.grad(result.strategy_returns.sum(), w)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-8)
+
+
+def test_certified_detach_preserves_mutated_rows_and_never_compacts_an_uncertified_state():
+    from stockagent.backtest.tw_day_trade_graph import detached_carry_state, _inventory_row_token
+    from stockagent.backtest.tw_day_trade_inventory import CohortField
+    state=DayTradeCarryState.empty(2,10_000_000,torch.device('cpu'))
+    state=replace(state,inventory=replace(state.inventory,
+        cohorts=torch.zeros((3,2,len(CohortField)),dtype=torch.float64),
+        claims=torch.zeros((3,2,3),dtype=torch.float64)))
+    assert detached_carry_state(state).inventory.cohorts.shape[0] == 3
+    object.__setattr__(state,'_graph_empty_inventory_rows',(_inventory_row_token(state),None))
+    detached=detached_carry_state(state)
+    assert detached.inventory.cohorts.shape[0] == detached.inventory.claims.shape[0] == 0
+    state.inventory.cohorts[0,0,CohortField.SHARES]=1000
+    fallback=detached_carry_state(state)
+    assert fallback.inventory.cohorts.shape[0] == 3
+    assert fallback.inventory.shares[0] == 1000
+    assert not fallback.inventory.cohorts.requires_grad
+    torch.testing.assert_close(fallback.last_nav,state.last_nav,rtol=0,atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='requires CUDA graph runtime')
+def test_deferred_graph_keeps_complete_account_and_vjp_before_the_update_gate(monkeypatch):
+    from stockagent.backtest.tw_day_trade_graph import DeferredLedgerValidation, detached_carry_state
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH','1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_CUDAGRAPHS','0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_BLOCK_ROWS','4')
+    w,sessions,_,_,common=_inputs(device='cuda')
+    reference=run_day_trade_carry_sessions(w,sessions,**common,_allow_flat_terminal=False)
+    with DeferredLedgerValidation(w.device) as gate:
+        actual=run_day_trade_carry_sessions(w,sessions,**common)
+        carried=detached_carry_state(actual.final_state)
+        assert carried.inventory.cohorts.shape[0] == 0
+        assert len(gate.predicates) >= 2
+        gate.finish()
+    torch.testing.assert_close(actual.strategy_returns,reference.strategy_returns,rtol=1e-8,atol=1e-8)
+    expected=torch.autograd.grad(reference.strategy_returns.sum(),w)[0]
+    observed=torch.autograd.grad(actual.strategy_returns.sum(),w)[0]
+    torch.testing.assert_close(observed,expected,rtol=1e-5,atol=1e-8)
 
 
 def test_graph_adjoint_checkpoint_identity_is_explicit_and_disabled_is_compatible(monkeypatch):
@@ -204,6 +299,152 @@ def test_prepared_source_cache_scope_bits_eviction_and_mutation(monkeypatch):
         batch=inference_source.prepare_batch(split,0,1,event_compression=True)
     assert not any(torch.is_inference(t) for t in batch.tensors.values())
     assert inference_source.prepare_batch(split,0,1,event_compression=True) is batch
+
+
+def test_sparse_prepared_source_cache_separates_layout_slots_and_rejects_mutation(monkeypatch):
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_PREPARED_CACHE_BYTES', str(1 << 20))
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_PREPARED_CACHE_PINNED', '0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS', '16')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0')
+    source, split, _ = _packed_source_fixture()
+    with torch.inference_mode():
+        sparse = source.prepare_batch(split, 0, 2, event_compression=True)
+    assert sparse.tensors['exit_prices'].shape == (2, 16)
+    assert not any(torch.is_inference(t) for t in sparse.tensors.values())
+    assert source.prepare_batch(split, 0, 2, event_compression=True) is sparse
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '0')
+    packed = source.prepare_batch(split, 0, 2, event_compression=True)
+    assert packed is not sparse and packed.packed_transport
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS', '32')
+    larger = source.prepare_batch(split, 0, 2, event_compression=True)
+    assert larger is not sparse and larger.tensors['exit_prices'].shape == (2, 32)
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '1')
+    compact = source.prepare_batch(split, 0, 2, event_compression=True)
+    assert compact is not larger and compact.sparse_transport_slots == 32
+    assert compact.tensors['exit_prices'].shape == (2, 4)
+    for expected, actual in zip(larger.sessions(torch.device('cpu')), compact.sessions(torch.device('cpu'))):
+        for field in fields(expected):
+            left, right = getattr(expected, field.name), getattr(actual, field.name)
+            if isinstance(left, torch.Tensor):
+                assert torch.equal(left.contiguous().view(torch.uint8), right.contiguous().view(torch.uint8))
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '1')
+    bucket = source.prepare_batch(split, 0, 2, event_compression=True)
+    assert bucket is not compact and bucket.sparse_transport_slots == 0
+    assert bucket.tensors['exit_prices'].shape == (2, 4)
+    assert bucket.sessions(torch.device('cpu'))[0].exit_prices.shape == (4,)
+    assert source.prepare_batch(split, 0, 2, event_compression=True) is bucket
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '0')
+    larger.tensors['exit_capacity'].add_(1)
+    with pytest.raises(RuntimeError, match='immutable prepared physical cache was mutated'):
+        source.prepare_batch(split, 0, 2, event_compression=True)
+
+
+def test_sparse_graph_schedule_versions_configuration_and_optimizer_contracts(monkeypatch):
+    from stockagent.config import load_config
+    from stockagent.backtest.tw_day_trade_inventory import INVENTORY_VOLUME_ADJOINT_ABI
+    from stockagent.training.checkpoint_contract import _configuration_fingerprint_snapshot, _training_checkpoint_contract
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0')
+    cfg = load_config('configs/deployments/tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml')
+    dense_config, dense_optimizer = _configuration_fingerprint_snapshot(cfg), _training_checkpoint_contract(cfg)
+    assert dense_config['training']['physical_fifo_volume_adjoint_contract'] == INVENTORY_VOLUME_ADJOINT_ABI
+    assert dense_optimizer['physical_fifo_volume_adjoint_contract'] == INVENTORY_VOLUME_ADJOINT_ABI
+    assert INVENTORY_VOLUME_ADJOINT_ABI == 'cumulative_closed_telescoping_volume_adjoint_v1'
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '1')
+    sparse_config, sparse_optimizer = _configuration_fingerprint_snapshot(cfg), _training_checkpoint_contract(cfg)
+    assert sparse_config != dense_config and sparse_optimizer != dense_optimizer
+    left = sparse_config['training']['physical_fifo_explicit_graph_contract']
+    right = sparse_optimizer['physical_fifo_explicit_graph_contract']
+    assert left == right
+    assert left['sparse_session_step'] == 'canonical_csr_liquidity_full_pending_adjoint_v1'
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '1')
+    packed_config, packed_optimizer = _configuration_fingerprint_snapshot(cfg), _training_checkpoint_contract(cfg)
+    assert packed_config != sparse_config and packed_optimizer != sparse_optimizer
+    assert packed_config['training']['physical_fifo_explicit_graph_contract'] == packed_optimizer['physical_fifo_explicit_graph_contract']
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '1')
+    bucket_config, bucket_optimizer = _configuration_fingerprint_snapshot(cfg), _training_checkpoint_contract(cfg)
+    assert bucket_config != packed_config and bucket_optimizer != packed_optimizer
+    assert bucket_config['training']['physical_fifo_explicit_graph_contract'] == bucket_optimizer['physical_fifo_explicit_graph_contract']
+    assert bucket_optimizer['physical_fifo_explicit_graph_contract']['sparse_session_transport'] == 'power_of_two_packet_device_capacity_buckets_v1'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires sparse CUDA ledger graphs')
+@pytest.mark.parametrize('adjoint', ['recompute', 'saved'])
+@pytest.mark.parametrize('copy_backend', ['native', 'triton'])
+@pytest.mark.parametrize('transport_mode', ['padded', 'compact', 'bucketed'])
+def test_sparse_graph_preserves_dense_financial_endpoint_and_pending_vjp(monkeypatch, adjoint, copy_backend, transport_mode):
+    from stockagent.backtest.tw_day_trade_carry import compact_day_trade_carry_session
+    from stockagent.backtest.tw_day_trade_graph import get_explicit_carry_graph_stats
+    from stockagent.training.day_trade_carry_bridge import PreparedDayTradeCarryBatch
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_CUDAGRAPHS', '0')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_FUSED_STEP', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_BLOCK_ROWS', '4')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_ADJOINT', adjoint)
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_TAPE_SLOTS', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_GRAPH_PACKED_COPY', copy_backend)
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_EVENT_SLOTS', '16')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '0' if transport_mode == 'padded' else '1')
+    monkeypatch.setenv('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '1' if transport_mode == 'bucketed' else '0')
+    w, dense, _, _, common = _inputs(device='cuda')
+    _, cpu, _, _, _ = _inputs()
+    staged = PreparedDayTradeCarryBatch.from_sessions(
+        tuple(compact_day_trade_carry_session(s) for s in cpu), len(cpu),
+        event_compression=True, sparse_events=True)
+    sparse = staged.sessions(torch.device('cuda'))
+    common['event_compression'] = True
+    reference = run_day_trade_carry_sessions(w, dense, **common, _allow_flat_terminal=False)
+    before = get_explicit_carry_graph_stats()
+    actual = run_day_trade_carry_sessions(w, sparse, **common)
+    w2 = w.detach().clone().requires_grad_()
+    future_cpu = tuple(replace(s, day=s.day + 20,
+        exit_prices=s.exit_prices.clone(), exit_capacity=s.exit_capacity.clone()) for s in cpu[:2])
+    for session in future_cpu:
+        session.exit_prices[:, 89, :] = session.exit_prices[:, 264, :]
+        session.exit_capacity[:, 89, :] = session.exit_capacity[:, 264, :]
+    future = PreparedDayTradeCarryBatch.from_sessions(future_cpu, 2,
+        event_compression=True, sparse_events=True).sessions(torch.device('cuda'))
+    if transport_mode == 'bucketed':
+        assert future[0].exit_prices.numel() > sparse[0].exit_prices.numel()
+    future_dense = tuple(replace(s, **{f.name: getattr(s, f.name).cuda()
+        for f in fields(s) if isinstance(getattr(s, f.name), torch.Tensor)}) for s in future_cpu)
+    reference2 = run_day_trade_carry_sessions(w2[:2], future_dense,
+        **{**common, 'can_enter': common['can_enter'][:2]}, _allow_flat_terminal=False)
+    second = run_day_trade_carry_sessions(w2[:2], future,
+        **{**common, 'can_enter': common['can_enter'][:2]})
+    for name in ['strategy_returns', 'turnovers', 'weights_history', 'shares_history', 'settlement_default']:
+        torch.testing.assert_close(getattr(actual, name), getattr(reference, name), rtol=1e-10, atol=1e-9)
+    torch.testing.assert_close(actual.minute_nav[:, -1], reference.minute_nav[:, -1], rtol=1e-12, atol=1e-7)
+    for field in fields(actual.final_state.inventory):
+        torch.testing.assert_close(getattr(actual.final_state.inventory, field.name),
+                                   getattr(reference.final_state.inventory, field.name), rtol=1e-12, atol=1e-7)
+    expected = torch.autograd.grad(reference.strategy_returns.sum(), w)[0]
+    actual.strategy_returns.sum().backward(retain_graph=True)
+    torch.testing.assert_close(w.grad, expected, rtol=1e-6, atol=1e-9)
+    w.grad.zero_()
+    actual.strategy_returns.sum().backward()
+    torch.testing.assert_close(w.grad, expected, rtol=1e-6, atol=1e-9)
+    second.strategy_returns.sum().backward()
+    expected2, = torch.autograd.grad(reference2.strategy_returns.sum(), w2)
+    torch.testing.assert_close(second.strategy_returns, reference2.strategy_returns, rtol=1e-10, atol=1e-9)
+    torch.testing.assert_close(w2.grad, expected2, rtol=1e-6, atol=1e-9)
+    assert torch.isfinite(w2.grad).all() and w2.grad[:2].abs().sum() > 0
+    after = get_explicit_carry_graph_stats()
+    assert after['forward_replays'] >= before['forward_replays'] + 2
+    assert after['backward_replays'] >= before['backward_replays'] + 3
+    assert after['sparse_forward_replays'] >= before['sparse_forward_replays'] + 2
+    assert after['sparse_backward_replays'] >= before['sparse_backward_replays'] + 3
+    if transport_mode == 'bucketed':
+        assert after['sparse_bucketed_forward_replays'] >= before['sparse_bucketed_forward_replays'] + 2
+    assert after['certificate_fallbacks'] == before['certificate_fallbacks']
+    if copy_backend == 'triton':
+        assert after['packed_field_copy_replays'] > before['packed_field_copy_replays']
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='requires pinned CUDA transport')

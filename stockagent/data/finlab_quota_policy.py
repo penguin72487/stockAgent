@@ -17,7 +17,7 @@ from stockagent.data.finlab_acquisition_contract import quota_cycle_start, utc_t
 
 
 CONTRACT_VERSION = 1
-ACQUISITION_POLICY_VERSION = 8
+ACQUISITION_POLICY_VERSION = 14
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs/finlab_quota_policy.json"
 
 
@@ -30,6 +30,7 @@ class QuotaPolicy:
     quota_sample_max_requests: int = 5
     quota_sample_near_floor_mb: float = 10.0
     minute_partitions_per_pass: int = 512
+    tick_partitions_per_pass: int = 256
     maximum_intraday_passes: int = 4
     catalog_refresh_minutes: int = 60
     minute_workers: int = 4
@@ -38,6 +39,11 @@ class QuotaPolicy:
     minute_download_threads: int = 1
     minute_queue_depth: int = 1
     minute_authorization_slots: int = 8
+    tick_workers: int = 1
+    tick_range_calendar_days: int = 1
+    tick_queue_depth: int = 1
+    tick_authorization_slots: int = 1
+    tick_http_keepalive: bool = True
     general_batch_size: int = 1
     pre_reset_publication_recheck_minutes: int = 10
     processing_threads: int = 1
@@ -74,11 +80,14 @@ def load_policy(path: Path = DEFAULT_CONFIG) -> QuotaPolicy:
             "drain_before_reset_minutes": (0, 180), "quota_sample_interval_seconds": (0, 60),
             "quota_sample_max_requests": (1, 32), "quota_sample_near_floor_mb": (0, 100),
             "minute_partitions_per_pass": (1, 2048), "maximum_intraday_passes": (1, 8),
+            "tick_partitions_per_pass": (1, 2048),
             "catalog_refresh_minutes": (1, 180),
             "minute_workers": (1, 32), "minute_range_calendar_days": (1, 31),
             "minute_download_threads": (1, 5),
             "minute_queue_depth": (1, 4),
             "minute_authorization_slots": (1, 32),
+            "tick_workers": (1, 8), "tick_range_calendar_days": (1, 31), "tick_queue_depth": (1, 4),
+            "tick_authorization_slots": (1, 8),
             "general_batch_size": (1, 16),
             "pre_reset_publication_recheck_minutes": (1, 120),
             "processing_threads": (1, 8),
@@ -139,8 +148,17 @@ class QuotaSampleWindow:
     The SDK still checks official quota on every source request. Near the local
     floor we sample before every request. A failed refresh is never stale-valid.
     """
-    def __init__(self, policy: QuotaPolicy):
+    def __init__(self, policy: QuotaPolicy, *, kind: str = "tw_minute"):
+        if kind not in {"tw_minute", "tw_tick"}:
+            raise ValueError("invalid FinLab quota sampling kind")
         self.policy = policy
+        # A Tick query is one stock-day, not a large multi-day window. Keep
+        # its local evidence much tighter than Minutes while avoiding a
+        # blocking user-info round trip before every tiny Tick partition.
+        # These are local safety bounds, not claimed provider API limits.
+        self.interval_seconds = min(5, policy.quota_sample_interval_seconds) if kind == "tw_tick" else policy.quota_sample_interval_seconds
+        self.maximum_requests = min(4, policy.quota_sample_max_requests) if kind == "tw_tick" else policy.quota_sample_max_requests
+        self.near_floor_mb = max(100, policy.quota_sample_near_floor_mb) if kind == "tw_tick" else policy.quota_sample_near_floor_mb
         self.sample: tuple[float, float] | None = None
         self.at_clock: float | None = None
         self.cycle: datetime | None = None
@@ -150,9 +168,9 @@ class QuotaSampleWindow:
     def needs_refresh(self, *, now: datetime, clock: float, reserve_mb: float) -> bool:
         return (self.sample is None or self.at_clock is None or self.cycle != quota_cycle_start(now)
                 or self.reserve_mb != reserve_mb or clock < self.at_clock
-                or clock - self.at_clock >= self.policy.quota_sample_interval_seconds
-                or self.requests >= self.policy.quota_sample_max_requests
-                or self.sample[0] <= reserve_mb + self.policy.quota_sample_near_floor_mb)
+                or clock - self.at_clock >= self.interval_seconds
+                or self.requests >= self.maximum_requests
+                or self.sample[0] <= reserve_mb + self.near_floor_mb)
 
     def observe(self, room: tuple[float, float] | None, *, now: datetime, clock: float,
                 reserve_mb: float) -> tuple[float, float] | None:

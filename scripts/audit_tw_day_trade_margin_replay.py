@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from scripts.rebuild_tw_day_trade_minute_curves import (
     _read_json, _read_jsonl, _sha256, _atomic_json, _is_entry_inventory_fill,
     validate_existing_strategy_marks,
+    _replay_minute_source_hashes, _replay_minute_symbol_sources,
 )
 from scripts.complete_tw_day_trade_paper_entry import CONTRACT as PAPER_COMPLETION_CONTRACT
 from stockagent.live.tw_day_trade_simulation import (
@@ -61,6 +62,24 @@ def _entry_source_path(source: str) -> Path:
             or not Path(name).is_absolute()):
         raise ValueError(f"unsupported historical entry source identity: {source}")
     return Path(name)
+
+
+def _selected_replay_source_bars(
+    frame: pl.DataFrame,
+    source_pins: dict[tuple[str, str], frozenset[str]] | None,
+) -> pl.DataFrame:
+    """Audit the exact symbol/session owner, not an unused overlapping chunk."""
+    if source_pins is not None:
+        selected = pl.DataFrame(
+            [(symbol, day, path) for (day, symbol), paths in source_pins.items()
+             for path in paths],
+            schema={"symbol": pl.String, "_session": pl.String, "_source_path": pl.String},
+            orient="row",
+        )
+        frame = (frame.with_columns(pl.col("minute_key").str.slice(0, 10).alias("_session"))
+                 .join(selected, on=["symbol", "_session", "_source_path"], how="semi")
+                 .drop("_session"))
+    return frame.drop("_source_path")
 
 
 def _retained_entry_book_source_days(
@@ -661,6 +680,10 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     if verify_sources and any(not row.get("prior_paper_fill_reused") for row in fills) and not source_days:
         errors.append("filled replay has no retained minute source receipts")
     if verify_sources and fills:
+        replay_source_hashes = _replay_minute_source_hashes(
+            state_dir, start=date.fromisoformat(dates[0]), end=date.fromisoformat(dates[-1]))
+        replay_symbol_sources = _replay_minute_symbol_sources(
+            state_dir, start=date.fromisoformat(dates[0]), end=date.fromisoformat(dates[-1]))
         needs = pl.DataFrame(
             [{"symbol": row["symbol"], "minute_key": row["recorded_at"][:16]}
              for row in fills if not row.get("prior_paper_fill_reused")],
@@ -669,6 +692,15 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
         source_bars = []
         for name, days in source_days.items():
             path = Path(name)
+            stat = path.stat()
+            signature = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            if minute_source_signatures.setdefault(str(path), signature) != signature:
+                raise RuntimeError(f"minute source changed during audit: {path}")
+            expected_hashes = {replay_source_hashes[(day.isoformat(), str(path))]
+                               for day in days if (day.isoformat(), str(path)) in replay_source_hashes}
+            if expected_hashes and expected_hashes != {_sha256(path)}:
+                errors.append(f"replay minute source hash mismatch: {path}")
+                continue
             if "minute_chunks" not in path.parts:
                 if "research_dataset" in path.parts and path.name == "data.parquet":
                     manifest_path = path.parent.parent / "manifest.json"
@@ -691,6 +723,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                                     pl.col("High").cast(pl.Float64).alias("high"),
                                     pl.col("Low").cast(pl.Float64).alias("low"),
                                     pl.col("volume_shares"))
+                            .with_columns(pl.lit(str(path)).alias("_source_path"))
                             .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
                         continue
                     except (OSError, ValueError, StopIteration, KeyError) as exc:
@@ -715,6 +748,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                 .select(pl.col("symbol"), pl.col("ts").dt.strftime("%Y-%m-%dT%H:%M").alias("minute_key"),
                         pl.col("High").cast(pl.Float64).alias("high"), pl.col("Low").cast(pl.Float64).alias("low"),
                         pl.col("volume_shares"))
+                .with_columns(pl.lit(str(path)).alias("_source_path"))
                 .join(needs.lazy(), on=["symbol", "minute_key"], how="semi").collect())
         if source_bars or retained_opening_bars:
             retained_by_key = {
@@ -725,7 +759,8 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
                 errors.append("retained opening evidence has duplicate symbol/minute")
             bars = {}
             if source_bars:
-                frame = pl.concat(source_bars).unique()
+                frame = _selected_replay_source_bars(
+                    pl.concat(source_bars), replay_symbol_sources).unique()
                 duplicate_keys = {
                     (row["symbol"], row["minute_key"])
                     for row in frame.filter(

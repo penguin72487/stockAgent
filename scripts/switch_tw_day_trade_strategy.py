@@ -8,6 +8,8 @@ receipt-backed 09:01..13:30 minute curves, and promotes by atomic directory
 exchange. An explicit --add-mode instead retains current account states and
 decision/execution bytes, validates one independent replay and appends it to an
 isolated union before the same promotion. It never submits a production order.
+An explicit --history-extension accepts an already rebuilt candidate, retains
+every existing signal decision, and permits only an earlier missing prefix.
 """
 
 from __future__ import annotations
@@ -54,9 +56,11 @@ from scripts.rebuild_tw_day_trade_open_price_replay import (  # noqa: E402
     _latest_valid_signal,
     _resolve_source_signal_pins,
     _sha256,
+    _source_ledger_signal_artifacts,
     _source_ledger_signal_ids,
 )
 from scripts.run_tw_day_trade_simulation import _mode_specs  # noqa: E402
+from scripts.reload_tw_day_trade_services_if_flat import fresh as _require_fresh_receipt  # noqa: E402
 from stockagent.config import load_config  # noqa: E402
 from stockagent.data.tw_price_rules import TW_ORDER_PRICE_CONTRACT_VERSION  # noqa: E402
 from stockagent.live.market_config import (  # noqa: E402
@@ -490,6 +494,15 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         market_config_path=market_config_path,
         checkpoint=checkpoint,
     )
+    if getattr(args, "history_extension", False):
+        if candidate_preflight or add_mode:
+            raise ValueError("history extension cannot add or replace a strategy")
+        require_live_feature_source(experiment.data)
+        return _build_history_extension_plan(
+            args, market_config=market_config, market_config_path=market_config_path,
+            experiment_path=experiment_path, requested_artifact=requested_artifact,
+            lifecycle=lifecycle, capital=capital,
+        )
     if candidate_preflight:
         return _candidate_preflight(
             args, market_config=market_config, market_config_path=market_config_path,
@@ -529,7 +542,8 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"replacement market is not active: {market_config.market}")
     flat = _flat_live_state(live_dir, set(active_markets))
     source_ids, source_provenance = _source_ledger_signal_ids(
-        live_dir, start_date=start, end_date=requested_end
+        live_dir, start_date=start, end_date=requested_end,
+        accepted_repair_manifests=tuple(getattr(args, "accepted_repair_manifest", ())),
     )
     expected_keys = {
         (day.isoformat(), market) for day in sessions for market in active_markets
@@ -616,6 +630,163 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "free_bytes": disk.free,
         },
     }
+
+
+def _history_source_streams(live: Path) -> dict[str, Any]:
+    """Bind decisions and execution streams, not changing status heartbeats."""
+    return {
+        name: {"bytes": (live / name).stat().st_size, "sha256": _sha256(live / name)}
+        for name in ("events.jsonl", "signals.jsonl", "orders.jsonl", "fills.jsonl",
+                     "execution_latency.jsonl") if (live / name).is_file()
+    }
+
+
+def _require_history_source_unchanged(live: Path, proof: Mapping[str, Any]) -> None:
+    if _history_source_streams(live) != proof:
+        raise RuntimeError("live decisions or execution changed after history-extension planning")
+
+
+def _prepared_history_evidence(candidate: Path, live: Path, *, sessions: Sequence[date],
+                               configs: Mapping[str, Any], manifests: Sequence[Path]) -> dict[str, Any]:
+    """An earlier counterfactual prefix may not replace any retained decision."""
+    candidate, live = candidate.resolve(strict=True), live.resolve(strict=True)
+    if (candidate == live or candidate in live.parents or live in candidate.parents
+            or candidate.stat().st_dev != live.stat().st_dev):
+        raise ValueError("prepared history requires a separate same-filesystem candidate")
+    receipt = _object(candidate / "rebuild_receipt.json")
+    if receipt.get("simulation_only") is not True or receipt.get("production_order_possible") is not False:
+        raise ValueError("prepared history must be simulation-only with production orders prohibited")
+    source = receipt.get("source_signal_ledger") or {}
+    if source.get("replacement_signal_markets") or source.get("replaced_pinned_signal_keys"):
+        raise ValueError("history extension cannot replace existing signal decisions")
+    if (Path(str(source.get("path") or "")).resolve() != live / "events.jsonl"
+            or source.get("sha256") != _sha256(live / "events.jsonl")):
+        raise ValueError("prepared history does not bind the current live decision journal")
+    original, _ = _source_ledger_signal_ids(
+        live, start_date=sessions[0], end_date=sessions[-1],
+        accepted_repair_manifests=tuple(manifests),
+    )
+    retained_artifacts = _source_ledger_signal_artifacts(
+        live, original, accepted_repair_manifests=tuple(manifests),
+    )
+    expected = {(day.isoformat(), market) for day in sessions for market in configs}
+    if not original or not set(original) <= expected:
+        raise ValueError("prepared history has no compatible retained decision scope")
+    missing = expected - set(original)
+    first_retained = min(day for day, _ in original)
+    if not missing or any(day >= first_retained for day, _ in missing):
+        raise ValueError("history extension permits only a missing earlier prefix")
+    prefix_root = Path(str(receipt.get("missing_signal_root") or "")).resolve(strict=True)
+    candidate_modes, live_modes = _object(candidate / "state.json").get("modes") or {}, _object(live / "state.json").get("modes") or {}
+    if set(candidate_modes) != set(configs) or set(live_modes) != set(configs):
+        raise ValueError("history extension cannot add or remove accounts")
+    for market, config in configs.items():
+        capital = float(config.current_capital or config.initial_capital or 0)
+        if capital <= 0 or any(float(modes[market].get("initial_capital_twd") or 0) != capital
+                               for modes in (candidate_modes, live_modes)):
+            raise ValueError(f"history extension changed initial capital: {market}")
+    seen: dict[tuple[str, str], str] = {}
+    artifact_proofs: list[dict[str, Any]] = []
+    for session in receipt.get("sessions") or ():
+        day = str(session.get("session_date") or "")
+        for row in session.get("modes") or ():
+            market, signal_id = str(row.get("market") or ""), str(row.get("signal_id") or "")
+            key = (day, market)
+            if key in seen or key not in expected or not signal_id:
+                raise ValueError(f"prepared history has an invalid or duplicate signal: {key}")
+            if key in original and signal_id != original[key]:
+                raise ValueError(f"prepared history changed a retained signal: {key}")
+            paths = {kind: Path(str(row.get(f"{kind}_path") or "")).resolve(strict=True)
+                     for kind in ("summary", "weights")}
+            for kind, path in paths.items():
+                if _sha256(path) != row.get(f"{kind}_sha256"):
+                    raise ValueError(f"prepared history signal artifact changed: {key}/{kind}")
+                if key in retained_artifacts and row.get(f"{kind}_sha256") != retained_artifacts[key][f"{kind}_sha256"]:
+                    raise ValueError(f"prepared history changed retained artifact bytes: {key}/{kind}")
+            summary = _object(paths["summary"])
+            if summary.get("signal_id") != signal_id:
+                raise ValueError(f"prepared history summary identity differs: {key}")
+            if key in missing:
+                config = configs[market]
+                if (not all(path.is_relative_to(prefix_root / market) for path in paths.values())
+                        or summary.get("counterfactual_signal_regeneration") is not True
+                        or summary.get("simulation_only") is not True
+                        or summary.get("production_order_possible") is not False
+                        or summary.get("checkpoint_fingerprint") != short_file_fingerprint(
+                            _resolved(Path(config.checkpoint_path)))
+                        or str(summary.get("replay_effective_signal_at") or "")[:10] != day):
+                    raise ValueError(f"missing-prefix signal is not the selected marked counterfactual: {key}")
+            seen[key] = signal_id
+            artifact_proofs.append({"session_date": day, "market": market, "signal_id": signal_id,
+                                    **{f"{kind}_{field}": str(paths[kind]) if field == "path"
+                                       else row[f"{kind}_sha256"]
+                                       for kind in paths for field in ("path", "sha256")}})
+    if set(seen) != expected:
+        raise ValueError("prepared history does not cover every official session and configured mode")
+    return {"candidate_dir": str(candidate), "rebuild_receipt_sha256": _sha256(candidate / "rebuild_receipt.json"),
+            "retained_decision_count": len(original), "retained_artifact_pin_count": len(retained_artifacts),
+            "counterfactual_prefix_count": len(missing),
+            "prefix_last_session": max(day for day, _ in missing),
+            "source_streams": _history_source_streams(live), "signal_artifacts": artifact_proofs}
+
+
+def _build_history_extension_plan(args, *, market_config, market_config_path,
+                                  experiment_path, requested_artifact, lifecycle, capital):
+    live = _resolved(args.live_dir)
+    specs, configs, markets = _active_specs(_resolved(args.markets_dir))
+    expected = set(markets)
+    if market_config.market not in expected:
+        raise ValueError("history verification target is not a configured mode")
+    flat = _flat_live_state(live, expected)
+    start = date.fromisoformat(args.start_date)
+    latest, calendar, digest = _latest_completed_session(tw_public_dir=_resolved(args.tw_public_dir), start_date=start)
+    end = latest if args.end_date == "latest" else date.fromisoformat(args.end_date)
+    sessions = [day for day in calendar if day <= end]
+    if not sessions or sessions[0] != start or sessions[-1] != end or end > latest:
+        raise ValueError("history extension requires the exact receipt-verified completed session range")
+    target = {"stable_market_id": market_config.market, "label": market_config.label,
+              "market_config_path": str(market_config_path), "experiment_config_path": str(experiment_path),
+              "checkpoint_path": str(_resolved(Path(market_config.checkpoint_path))),
+              "checkpoint_fingerprint": short_file_fingerprint(_resolved(Path(market_config.checkpoint_path))),
+              "live_signal_output_dir": str(_resolved(resolved_live_output_dir(market_config))),
+              "fold_id": market_config.fold_id, "initial_capital_twd": capital,
+              "lifecycle": lifecycle, "requested_artifact": requested_artifact}
+    history = {"start_date": str(start), "end_date": str(end), "latest_completed_session": str(latest),
+               "session_count": len(sessions), "points_per_session_mode": 270,
+               "expected_strategy_minute_rows": len(sessions) * len(expected) * 270,
+               "official_calendar_sha256": digest}
+    status_path = _resolved(args.operations_root) / market_config.market / "status.json"
+    if args.action == "verify" or (live / "promotion_receipt.json").is_file() and status_path.is_file():
+        previous = _object(status_path) if status_path.is_file() else {}
+        prior = previous.get("plan") or {}
+        promotion = _object(live / "promotion_receipt.json") if (live / "promotion_receipt.json").is_file() else {}
+        prepared = prior.get("prepared_history") or {}
+        matches = (prior.get("operation") == "extend_history" and prior.get("replacement") == target
+                   and prior.get("history") == history and set(prior.get("active_markets") or ()) == expected
+                   and (promotion.get("acceptance") or {}).get("rebuild_receipt_sha256") == prepared.get("rebuild_receipt_sha256")
+                   and prepared.get("rebuild_receipt_sha256") == _sha256(live / "rebuild_receipt.json"))
+        if matches:
+            _require_history_source_unchanged(Path(str(promotion["rollback_directory"])), prepared["source_streams"])
+            for proof in prepared["signal_artifacts"]:
+                for kind in ("summary", "weights"):
+                    if _sha256(Path(proof[f"{kind}_path"])) != proof[f"{kind}_sha256"]:
+                        raise RuntimeError("promoted history signal artifacts changed")
+            return {**prior, "status": "already_current", "current_deployment": {
+                "matches": True, "reasons": [], "promotion_receipt": str(live / "promotion_receipt.json"),
+                "rollback_directory": promotion.get("rollback_directory")}}
+        if args.action == "verify":
+            raise RuntimeError("current history is not the exact accepted history-extension operation")
+    if args.prepared_candidate is None:
+        raise ValueError("history extension plan/apply requires --prepared-candidate")
+    proof = _prepared_history_evidence(_resolved(args.prepared_candidate), live, sessions=sessions,
+                                      configs={spec.market: configs[spec.market] for spec in specs},
+                                      manifests=tuple(args.accepted_repair_manifest))
+    return {"schema_version": 1, "operation": "extend_history", "plan_complete": True,
+            "status": "ready_to_apply", "simulation_only": True, "production_order_possible": False,
+            "replacement": target, "history": history, "active_markets": markets,
+            "live_state": flat, "prepared_history": proof, "source_ledger_repairs": [],
+            "current_deployment": {"matches": False, "reasons": ["history_extension_not_promoted"]},
+            "disk": {"filesystem": str(live.parent), "free_bytes": shutil.disk_usage(live.parent).free}}
 
 
 def _build_addition_plan(args, config, config_path, experiment_path, experiment,
@@ -749,6 +920,7 @@ def _wait_engine_sync(
     while wall_time.monotonic() < deadline:
         try:
             sync = _object(live_dir / "service_sync.json")
+            _require_fresh_receipt(sync, "heartbeat_at" if "heartbeat_at" in sync else "published_at", datetime.now(TAIPEI))
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             wall_time.sleep(1.0)
             continue
@@ -776,6 +948,7 @@ def _wait_discord_ready(
     while wall_time.monotonic() < deadline:
         try:
             status = _object(status_path)
+            _require_fresh_receipt(status, "updated_at", datetime.now(TAIPEI))
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             wall_time.sleep(1.0)
             continue
@@ -1128,6 +1301,54 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             maintenance.close()
 
 
+def _prepare_replacement_candidate(args, plan, *, candidate, live_dir, sessions, run_dir, stages):
+    if plan.get("operation") == "extend_history":
+        proof = plan["prepared_history"]
+        if _sha256(candidate / "rebuild_receipt.json") != proof["rebuild_receipt_sha256"]:
+            raise RuntimeError("prepared history changed after planning")
+        _require_history_source_unchanged(live_dir, proof["source_streams"])
+        accepted = {"retained_decision_count": proof["retained_decision_count"],
+                    "counterfactual_prefix_count": proof["counterfactual_prefix_count"],
+                    "replacement_signal_markets": []}
+        stages.append({"stage": "retain_decisions_and_accept_prepared_history", **accepted})
+        return accepted, []
+    python, replacement = sys.executable, plan["replacement"]
+    start, end = str(plan["history"]["start_date"]), str(plan["history"]["end_date"])
+    market = str(replacement["stable_market_id"])
+    for index, repair in enumerate(plan["source_ledger_repairs"]):
+        repair_dates = [date.fromisoformat(str(value)) for value in repair["session_dates"]]
+        stages.append(_run(f"repair_signal_backfill_{index:02d}", [python,
+            str(REPO_ROOT / "scripts/backfill_tw_day_trade_open_signals.py"),
+            "--market-config", str(repair["market_config_path"]),
+            "--start-date", min(repair_dates).isoformat(), "--end-date", max(repair_dates).isoformat()],
+            run_dir=run_dir))
+    repairs = _verify_repaired_signals(plan["source_ledger_repairs"], _resolved(args.markets_dir))
+    stages.append({"stage": "verify_repaired_signals", "repairs": repairs})
+    stages.append(_run("signal_backfill", [python,
+        str(REPO_ROOT / "scripts/backfill_tw_day_trade_open_signals.py"),
+        "--market-config", str(replacement["market_config_path"]),
+        "--start-date", start, "--end-date", end], run_dir=run_dir))
+    signals = _verify_generated_signals(plan, sessions, _resolved(args.markets_dir))
+    stages.append({"stage": "verify_generated_signals", **signals})
+    command = [python, str(REPO_ROOT / "scripts/rebuild_tw_day_trade_open_price_replay.py"),
+               "--markets-dir", str(_resolved(args.markets_dir)), "--state-dir", str(candidate),
+               "--start-date", start, "--end-date", end,
+               "--benchmark-state-source", str(live_dir / "state.json"),
+               "--source-ledger-dir", str(live_dir), "--replace-signal-market", market,
+               "--reuse-retained-signal-open", "--replay-intraday-kbars"]
+    for repair in plan["source_ledger_repairs"]:
+        command.extend(("--allow-unpinned-market", str(repair["market"])))
+    for manifest in getattr(args, "accepted_repair_manifest", ()):
+        command.extend(("--accepted-repair-manifest", str(_resolved(manifest))))
+    stages.append(_run("replay", command, run_dir=run_dir))
+    stages.append(_run("minute_curves", [python,
+        str(REPO_ROOT / "scripts/rebuild_tw_day_trade_minute_curves.py"),
+        "--state-dir", str(candidate), "--start-date", start, "--end-date", end,
+        "--output-dir", str(run_dir / "minute_curves"), "--simulation", "--fetch-missing-kbars",
+        "--repair-unverified-strategy-marks", "--revalue-opening-marks", "--publish"], run_dir=run_dir))
+    return signals, repairs
+
+
 def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     if getattr(args, "candidate_preflight", False) or plan.get("plan_complete") is False:
         raise RuntimeError("a read-only candidate preflight cannot be applied")
@@ -1149,9 +1370,9 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     run_id = datetime.now(TAIPEI).strftime("%Y%m%dT%H%M%S%z")
     run_dir = operations_root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    candidate = Path(
-        tempfile.mkdtemp(prefix=f"{market}.replacement.", dir=live_dir.parent)
-    )
+    candidate = (Path(plan["prepared_history"]["candidate_dir"])
+                 if plan.get("operation") == "extend_history" else Path(
+                     tempfile.mkdtemp(prefix=f"{market}.replacement.", dir=live_dir.parent)))
     stages: list[dict[str, Any]] = []
     running = {
         "schema_version": 1,
@@ -1166,102 +1387,11 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     python = sys.executable
     active_markets = [str(value) for value in plan["active_markets"]]
     expected_markets = set(active_markets)
+    promoted = False
     try:
-        for index, repair in enumerate(plan["source_ledger_repairs"]):
-            repair_dates = [
-                date.fromisoformat(str(value)) for value in repair["session_dates"]
-            ]
-            stages.append(
-                _run(
-                    f"repair_signal_backfill_{index:02d}",
-                    [
-                        python,
-                        str(
-                            REPO_ROOT / "scripts/backfill_tw_day_trade_open_signals.py"
-                        ),
-                        "--market-config",
-                        str(repair["market_config_path"]),
-                        "--start-date",
-                        min(repair_dates).isoformat(),
-                        "--end-date",
-                        max(repair_dates).isoformat(),
-                    ],
-                    run_dir=run_dir,
-                )
-            )
-        repair_acceptance = _verify_repaired_signals(
-            plan["source_ledger_repairs"], _resolved(args.markets_dir)
-        )
-        stages.append(
-            {"stage": "verify_repaired_signals", "repairs": repair_acceptance}
-        )
-        stages.append(
-            _run(
-                "signal_backfill",
-                [
-                    python,
-                    str(REPO_ROOT / "scripts/backfill_tw_day_trade_open_signals.py"),
-                    "--market-config",
-                    str(replacement["market_config_path"]),
-                    "--start-date",
-                    start.isoformat(),
-                    "--end-date",
-                    end.isoformat(),
-                ],
-                run_dir=run_dir,
-            )
-        )
-        signal_acceptance = _verify_generated_signals(
-            plan, sessions, _resolved(args.markets_dir)
-        )
-        stages.append({"stage": "verify_generated_signals", **signal_acceptance})
-
-        replay_command = [
-            python,
-            str(REPO_ROOT / "scripts/rebuild_tw_day_trade_open_price_replay.py"),
-            "--markets-dir",
-            str(_resolved(args.markets_dir)),
-            "--state-dir",
-            str(candidate),
-            "--start-date",
-            start.isoformat(),
-            "--end-date",
-            end.isoformat(),
-            "--benchmark-state-source",
-            str(live_dir / "state.json"),
-            "--source-ledger-dir",
-            str(live_dir),
-            "--replace-signal-market",
-            market,
-            "--reuse-retained-signal-open",
-            "--replay-intraday-kbars",
-        ]
-        for repair in plan["source_ledger_repairs"]:
-            replay_command.extend(("--allow-unpinned-market", str(repair["market"])))
-        stages.append(_run("replay", replay_command, run_dir=run_dir))
-        minute_output = run_dir / "minute_curves"
-        stages.append(
-            _run(
-                "minute_curves",
-                [
-                    python,
-                    str(REPO_ROOT / "scripts/rebuild_tw_day_trade_minute_curves.py"),
-                    "--state-dir",
-                    str(candidate),
-                    "--start-date",
-                    start.isoformat(),
-                    "--end-date",
-                    end.isoformat(),
-                    "--output-dir",
-                    str(minute_output),
-                    "--simulation",
-                    "--fetch-missing-kbars",
-                    "--repair-unverified-strategy-marks",
-                    "--revalue-opening-marks",
-                    "--publish",
-                ],
-                run_dir=run_dir,
-            )
+        signal_acceptance, repair_acceptance = _prepare_replacement_candidate(
+            args, plan, candidate=candidate, live_dir=live_dir, sessions=sessions,
+            run_dir=run_dir, stages=stages,
         )
         promote_command = [
             python,
@@ -1289,11 +1419,17 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
                 nonlocal stopped
                 maintenance.enter_context(control_lease(owner=f"replace-mode:{market}:{run_dir.name}", timeout_seconds=90))
                 _flat_live_state(live_dir, expected_markets)
+                if plan.get("operation") == "extend_history":
+                    _require_history_source_unchanged(live_dir, plan["prepared_history"]["source_streams"])
                 subprocess.run(["systemctl", "stop", SIMULATION_SERVICE], check=True)
                 stopped = True
                 _flat_live_state(live_dir, expected_markets)
+                if plan.get("operation") == "extend_history":
+                    _require_history_source_unchanged(live_dir, plan["prepared_history"]["source_streams"])
             stages.append(_promote_with_cutover(promote_command, before_exchange=cutover,
                                                 stage="promote", run_dir=run_dir))
+            promoted = True
+            _atomic_json(status_path, {**running, "promotion_completed": True})
         finally:
             try:
                 if (
@@ -1344,6 +1480,7 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
         complete = {
             **running,
             "status": "complete_with_data_gaps" if runtime_issues else "complete",
+            "promotion_completed": True,
             "completed_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
             "stages": stages,
             "signal_acceptance": signal_acceptance,
@@ -1365,6 +1502,7 @@ def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
         failed = {
             **running,
             "status": "failed_retryable",
+            "promotion_completed": promoted,
             "failed_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
             "error_type": type(exc).__name__,
             "error": str(exc),
@@ -1450,6 +1588,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-config", type=Path, default=DEFAULT_MARKET_CONFIG)
     parser.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat())
     parser.add_argument("--end-date", default="latest")
+    parser.add_argument("--accepted-repair-manifest", action="append", type=Path, default=[],
+                        help="Receipt-backed original/repair signal lineage, validated before planning and replay.")
+    parser.add_argument("--history-extension", action="store_true",
+                        help="Extend the earlier missing history only; retain all existing signal decisions and strategy identities.")
+    parser.add_argument("--prepared-candidate", type=Path,
+                        help="Fully rebuilt and minute-validated isolated history candidate; requires --history-extension.")
     parser.add_argument("--add-mode", action="store_true", help="Add an independent paper mode; retain all current accounts and execution bytes.")
     parser.add_argument("--staged-signal-root", type=Path, help="Reuse an isolated signal root only after full checkpoint/session validation; addition only.")
     parser.add_argument("--resume-addition-candidate", type=Path,
@@ -1474,18 +1618,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _recover_promoted_addition(args, plan, previous_operation):
+def _recover_promoted_consumers(args, plan, previous_operation):
     """Finish consumers after an accepted exchange; never replay/promote twice."""
     from stockagent.live.day_trade_maintenance import control_lease
     target, history = plan["replacement"], plan["history"]
     market, expected = target["stable_market_id"], set(plan["active_markets"])
-    if (plan.get("operation") != "add_independent_mode"
+    if (plan.get("operation") not in {"add_independent_mode", "extend_history"}
             or previous_operation.get("status") != "failed_retryable"
             or previous_operation.get("promotion_completed") is not True
             or not plan["current_deployment"]["matches"]
             or previous_operation.get("plan", {}).get("replacement") != target
             or previous_operation.get("plan", {}).get("history") != history):
-        raise ValueError("consumer recovery requires the exact already-promoted failed addition")
+        raise ValueError("consumer recovery requires the exact already-promoted failed operation")
     live = _resolved(args.live_dir)
     run = Path(previous_operation["run_dir"])
     with control_lease(owner=f"deployed-consumer-recovery:{market}", timeout_seconds=90):
@@ -1520,6 +1664,11 @@ def _recover_promoted_addition(args, plan, previous_operation):
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.prepared_candidate and not args.history_extension:
+        raise ValueError("--prepared-candidate requires --history-extension")
+    if args.history_extension and (args.add_mode or args.candidate_preflight or args.staged_signal_root
+                                   or args.resume_addition_candidate or args.rebuild_resumed_addition):
+        raise ValueError("history extension cannot be combined with strategy addition/replacement inputs")
     if args.staged_signal_root and not args.add_mode:
         raise ValueError("--staged-signal-root requires --add-mode")
     if args.resume_addition_candidate and (not args.add_mode or args.action not in {"plan", "apply"}):
@@ -1554,8 +1703,8 @@ def main() -> None:
     if plan["status"] == "already_current":
         status_path = _resolved(args.operations_root) / plan["replacement"]["stable_market_id"] / "status.json"
         prior = _object(status_path) if status_path.is_file() else {}
-        if args.add_mode and prior.get("status") == "failed_retryable" and prior.get("promotion_completed") is True:
-            print(json.dumps(_recover_promoted_addition(args, plan, prior), ensure_ascii=False, indent=2, sort_keys=True))
+        if (args.add_mode or args.history_extension) and prior.get("status") == "failed_retryable" and prior.get("promotion_completed") is True:
+            print(json.dumps(_recover_promoted_consumers(args, plan, prior), ensure_ascii=False, indent=2, sort_keys=True))
             return
         print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
         return

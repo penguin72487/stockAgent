@@ -165,7 +165,8 @@ def fetch_partition(root: Path, key: str, day: date, *, now: datetime,
     from finlab import data
 
     frame = data.get(key, start=day.isoformat(), end=day.isoformat(),
-                     force_download=force_download, progress="silent")
+                     force_download=force_download, progress="silent",
+                     **({"save_to_storage": False} if key.startswith("tw_tick:") else {}))
     return persist_partition_frame(root, key, day, frame, reference_root=reference_root)
 
 
@@ -318,7 +319,8 @@ def fetch_partitions(root: Path, key: str, days: list[date], *, now: datetime,
         started = time.monotonic()
         try:
             frame = data.get(key, start=min(days).isoformat(), end=max(days).isoformat(),
-                             force_download=False, progress="silent")
+                             force_download=False, progress="silent",
+                             **({"save_to_storage": False} if key.startswith("tw_tick:") else {}))
         finally:
             source_seconds += time.monotonic() - started
         started = time.monotonic()

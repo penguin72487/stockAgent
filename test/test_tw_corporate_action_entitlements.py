@@ -4,6 +4,11 @@ from argparse import Namespace
 from datetime import date
 import hashlib
 import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import polars as pl
 import pytest
@@ -30,6 +35,161 @@ from downloader.download_tw_corporate_action_entitlements import (
     _collapse_etf_event_rows,
     _recover_retained_bulk_rows,
 )
+
+
+def test_bulk_loaded_code_fingerprint_matches_source_pyc_and_other_filenames():
+    module = entitlement_downloader
+    source = Path(module.__file__).read_bytes()
+    expected = module._LOADED_MODULE_SHA256
+    for filename in (module.__file__, "other-location.py"):
+        assert module._loaded_code_identity(compile(source, filename, "exec", dont_inherit=True)) == expected
+    changed = source.replace(b"PARSER_CONTRACT_VERSION = 4", b"PARSER_CONTRACT_VERSION = 999")
+    assert changed != source
+    assert module._loaded_code_identity(compile(changed, "other.py", "exec", dont_inherit=True)) != expected
+    program = "from downloader import download_tw_corporate_action_entitlements as m; print(m._LOADED_MODULE_SHA256)"
+    # Two independent real pyc imports, not another call on one code object.
+    for _ in range(2):
+        observed = subprocess.check_output([sys.executable, "-c", program], text=True, timeout=20).strip()
+        assert observed == expected
+
+
+def test_bulk_parse_cache_preserves_scalar_bits_dates_order_and_fresh_rows(tmp_path, monkeypatch):
+    module = entitlement_downloader
+    rows = [
+        {"date": date(2024, 7, 3), "symbol": "2330", "amount": -0.0,
+         "unknown": None, "complete": False, "sequence": 0},
+        {"date": date(2024, 6, 3), "symbol": "0001", "amount": 0.1,
+         "unknown": None, "complete": True, "sequence": 2},
+    ]
+    calls = []
+    monkeypatch.setattr(module, "parse_mops_bulk_dividends",
+                        lambda *_a, **_k: calls.append(1) or [row.copy() for row in rows])
+    kwargs = dict(key=BulkDividendKey("twse", 113), cache_root=tmp_path)
+    assert module._parse_mops_bulk_dividends_cached(b"same source", **kwargs) == rows
+    cached = module._parse_mops_bulk_dividends_cached(b"same source", **kwargs)
+    assert cached == rows and calls == [1]
+    assert type(cached[0]["date"]) is date
+    assert math.copysign(1, cached[0]["amount"]) == -1
+    assert cached[1]["amount"].hex() == rows[1]["amount"].hex()
+    cached[0]["symbol"] = "poison"
+    assert module._parse_mops_bulk_dividends_cached(b"same source", **kwargs) == rows
+
+
+@pytest.mark.parametrize("change", ["body", "market", "year", "code", "dependency"])
+def test_bulk_parse_cache_invalidates_actual_input_and_loaded_implementation(tmp_path, monkeypatch, change):
+    module = entitlement_downloader
+    calls = []
+    monkeypatch.setattr(module, "parse_mops_bulk_dividends", lambda *_a, **_k: calls.append(1) or [])
+    kwargs = dict(key=BulkDividendKey("twse", 113), cache_root=tmp_path)
+    assert module._parse_mops_bulk_dividends_cached(b"one", **kwargs) == []
+    body = b"two" if change == "body" else b"one"
+    if change == "market":
+        kwargs["key"] = BulkDividendKey("tpex", 113)
+    if change == "year":
+        kwargs["key"] = BulkDividendKey("twse", 114)
+    if change == "code":
+        monkeypatch.setattr(module, "_LOADED_MODULE_SHA256", "new loaded implementation")
+    if change == "dependency":
+        monkeypatch.setattr(module.bs4, "__version__", "new parser dependency")
+    assert module._parse_mops_bulk_dividends_cached(body, **kwargs) == []
+    assert calls == [1, 1]
+
+
+@pytest.mark.parametrize("damage", ["payload", "receipt", "schema", "rows", "identity",
+                                   "parquet", "missing", "symlink", "fifo", "oversized"])
+def test_bulk_parse_cache_corruption_is_a_parse_not_a_false_empty_hit(tmp_path, monkeypatch, damage):
+    module = entitlement_downloader
+    calls = []
+    row = {"date": date(2024, 7, 3), "symbol": "2330"}
+    monkeypatch.setattr(module, "parse_mops_bulk_dividends", lambda *_a, **_k: calls.append(1) or [row])
+    kwargs = dict(key=BulkDividendKey("twse", 113), cache_root=tmp_path)
+    assert module._parse_mops_bulk_dividends_cached(b"source", **kwargs) == [row]
+    payload = next(tmp_path.glob("*.parquet"))
+    receipt = next(tmp_path.glob("*.json"))
+    if damage == "payload":
+        payload.write_bytes(b"partial")
+    elif damage == "receipt":
+        receipt.write_bytes(b"[]")
+    elif damage in {"schema", "rows", "identity", "parquet"}:
+        info = json.loads(receipt.read_bytes())
+        if damage == "schema":
+            info["schema"] = []
+        elif damage == "rows":
+            info["rows"] = 999
+        elif damage == "identity":
+            info["identity"]["loaded_module_sha256"] = "old code"
+        else:
+            payload.write_bytes(b"not a parquet file")
+            info["bytes"] = payload.stat().st_size
+            info["sha256"] = hashlib.sha256(payload.read_bytes()).hexdigest()
+        receipt.write_text(json.dumps(info))
+    elif damage == "oversized":
+        monkeypatch.setattr(module, "_BULK_PARSE_CACHE_MAX_BYTES", 1)
+    else:
+        original = payload.read_bytes()
+        payload.unlink()
+        if damage == "symlink":
+            target = tmp_path / "unchanged.target"
+            target.write_bytes(original)
+            payload.symlink_to(target)
+        elif damage == "fifo":
+            os.mkfifo(payload)
+    assert module._parse_mops_bulk_dividends_cached(b"source", **kwargs) == [row]
+    assert calls == [1, 1]
+    if damage == "symlink":
+        assert target.read_bytes() == original
+
+
+def test_bulk_parse_cache_failure_and_unwritable_cache_do_not_change_source_result(tmp_path, monkeypatch):
+    module = entitlement_downloader
+    kwargs = dict(key=BulkDividendKey("twse", 113), cache_root=tmp_path)
+    for content in (b"\xff", b"Overrun - Too many query requests", b"<html>unknown</html>"):
+        with pytest.raises(ValueError):
+            module._parse_mops_bulk_dividends_cached(content, **kwargs)
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.setattr(module, "atomic_write_bytes", lambda *_a, **_k: (_ for _ in ()).throw(PermissionError()))
+    assert module._parse_mops_bulk_dividends_cached("<html>查無資料</html>".encode(), **kwargs) == []
+
+
+def test_bulk_parse_cache_receipt_replacement_during_read_forces_reparse(tmp_path, monkeypatch):
+    module = entitlement_downloader
+    calls = []
+    monkeypatch.setattr(module, "parse_mops_bulk_dividends", lambda *_a, **_k: calls.append(1) or [])
+    kwargs = dict(key=BulkDividendKey("twse", 113), cache_root=tmp_path)
+    module._parse_mops_bulk_dividends_cached(b"source", **kwargs)
+    original = module._read_regular_cache_bytes
+    reads = []
+    def replaced(path, **options):
+        content = original(path, **options)
+        if path.suffix == ".json":
+            reads.append(1)
+            if len(reads) == 2:
+                return b"replacement"
+        return content
+    monkeypatch.setattr(module, "_read_regular_cache_bytes", replaced)
+    assert module._parse_mops_bulk_dividends_cached(b"source", **kwargs) == []
+    assert calls == [1, 1]
+
+
+def test_bulk_fetch_keeps_original_request_receipt_when_parse_cache_hits(tmp_path, monkeypatch):
+    module = entitlement_downloader
+    requests, parses = [], []
+    monkeypatch.setattr(module, "_cached_or_post", lambda *_a, **_k: requests.append(1) or b"body")
+    monkeypatch.setattr(module, "parse_mops_bulk_dividends", lambda *_a, **_k: parses.append(1) or [])
+    raw = tmp_path / "raw/tw_corporate_action_entitlements"
+    args = Namespace(mode="daily", end_date="2026-10-15", timeout=1, retries=0)
+    for _ in range(2):
+        assert module._fetch_bulk_dividends(raw, BulkDividendKey("twse", 113), args) == []
+    assert requests == [1, 1] and parses == [1]
+
+
+def test_bulk_parse_benchmark_rejects_changes_to_other_existing_functions():
+    from scripts.benchmark_corporate_action_bulk_cache import validate_source_pair
+    reference = "def parse_mops_bulk_dividends():\n return 1\ndef _fetch_bulk_dividends():\n return 1\n"
+    candidate = reference.replace("def _fetch_bulk_dividends():\n return 1", "def _fetch_bulk_dividends():\n return 2")
+    validate_source_pair(reference, candidate)
+    with pytest.raises(ValueError, match="unrelated parser/workflow change"):
+        validate_source_pair(reference, candidate.replace("return 1", "return 3"))
 
 
 def test_stock_delivery_progress_reports_elapsed_rate_and_eta(capsys) -> None:

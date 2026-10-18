@@ -42,6 +42,10 @@ CNYES_MOBILE_CANONICAL_V7_CAPTURE_FINGERPRINT = '7fd7e72cab5f57dae18dc2e67bb1a62
 # 4955510 empty-signature repair. Only its terminal parser failures are due.
 CNYES_MOBILE_CANONICAL_V15_CAPTURE_FINGERPRINT = 'ac0ca35513f4d69bf658f6c127833b8274e2bc634f4875695981ef6ac556c824'
 CNYES_MOBILE_CANONICAL_V16_CAPTURE_FINGERPRINT = 'ee5e2a8af38ee38fd93dfe2eb99e064252ea1677fab395b693b97d7969289777'
+# Retained desktop 165936 has this entire decoded CSS comment, no rendered
+# children, and an empty NewsArticle declaration. Pin its whole value rather
+# than stripping arbitrary comments, hidden prose or unknown Office markup.
+_CNYES_EMPTY_STYLE_COMMENT = (12866, 'ff6ff7680b73b558829e927516186534d5c588d3daa5fbda80f0889c5dc07922')
 
 
 def cnyes_visible_headline_matches(visible, declared):
@@ -2923,7 +2927,7 @@ def _cnyes_same_empty_native_view(container, full_content, source, reveal):
 def cnyes_verified_empty_body(soup, source, article, *, page_url):
     """Distinguish observed empty public templates from extraction failures.
 
-    This is failure-outcome contract v8 plus Office-comment outcome v1,
+    This is failure-outcome contract v8 plus Office/degenerate outcomes v1,
     not a new accepted-body contract.
     A metadata shell, hidden body, video or guessed URL is never a full article.
     Require matching public identity and an aware declared publication clock,
@@ -2946,11 +2950,10 @@ def cnyes_verified_empty_body(soup, source, article, *, page_url):
         clock = datetime.fromisoformat(article.get('datePublished', '').replace('Z', '+00:00'))
         declared_body = article.get('articleBody', '')
         visible_body = container.get_text(' ', strip=True)
-        # Native company-announcement pages can render the literal string
-        # "null" in JSON-LD, the visible <p>, and the current free API record.
-        # That is a source placeholder, not four characters of article text.
-        # None, whitespace, case variants or mixed real text stay parser gaps.
-        if declared_body not in ('', 'null') or visible_body != declared_body:
+        # Exact native placeholders must agree in all three representations.
+        # None, whitespace, case variants and mixed real text stay parser gaps;
+        # no generic short-body acceptance or empty-comment cleanup is added.
+        if declared_body not in ('', 'null', 'b', '-') or visible_body != declared_body:
             return False
         if (parts.hostname not in {'news.cnyes.com', 'm.cnyes.com'} or not match or len(canonical) != 1
                 or normalize_url(canonical[0].get('href', '')) != expected
@@ -2961,21 +2964,43 @@ def cnyes_verified_empty_body(soup, source, article, *, page_url):
             return False
         data = _cnyes_current_article_data(soup, int(match[1]), verify_video=True)
         content = data.get('content') if data else None
+        decoded = html.unescape(content) if isinstance(content, str) else None
         # Response 784083 declares an encoded, exactly empty div; 958337 has
         # one BR inside that div, with no schema/visible text. Do not generalize
         # these exact source declarations to arbitrary textless HTML:
         # scripts, hidden text, comments, attributes and media stay unresolved.
-        content_matches = (isinstance(content, str) and html.unescape(content) in (
+        content_matches = (decoded in (
                            '', '<div></div>', '<div><br></div>', '<p></p>',
                            '<p>&nbsp;</p>\n<div>\n<p>&nbsp;</p>\n</div>',
                            '<p>\xa0</p>\n<div>\n<p>\xa0</p>\n</div>')
                            if declared_body == '' else
-                           isinstance(content, str) and html.unescape(content) in ('null', '<p>null</p>'))
+                           declared_body == 'null' and decoded in ('null', '<p>null</p>'))
+        if declared_body in ('b', '-') and decoded == f'<p>{declared_body}</p>':
+            from bs4 import NavigableString, Tag
+
+            # Observed 4999053/1257870: exactly one native paragraph in the
+            # renderer SECTION plus its empty trailing P. Unknown/hidden nodes
+            # and comments cannot be discarded to manufacture this outcome.
+            roots = list(container.contents)
+            if (len(roots) == 2 and all(isinstance(node, Tag) for node in roots)
+                    and roots[0].name == 'section' and roots[0].attrs == {'style': 'margin-top:30px'}
+                    and roots[1].name == 'p' and not roots[1].attrs and not roots[1].contents
+                    and len(roots[0].contents) == 1):
+                paragraph = roots[0].contents[0]
+                if (isinstance(paragraph, Tag) and paragraph.name == 'p' and not paragraph.attrs
+                        and len(paragraph.contents) == 1 and type(paragraph.contents[0]) is NavigableString
+                        and str(paragraph.contents[0]) == declared_body):
+                    reveal = _cnyes_completed_stream_wrapper(soup, container.find_parent('article'))
+                    for node in (header, container, roots[0], paragraph, roots[1]):
+                        _cnyes_visible_after_completed_stream(node, reveal)
+                    content_matches = True
         if (not content_matches and declared_body == '' and not container.contents
-                and isinstance(content, str) and html.unescape(content) in (
-                    '<!--StartFragment -->', '<!--[if gte mso 9]>      <![endif]-->')):
-            # Six retained public originals contain only these exact, empty
-            # Office markers. The renderer emits no children at all. Never
+                and isinstance(decoded, str) and (decoded in (
+                    '<!--StartFragment -->', '<!--[if gte mso 9]>      <![endif]-->')
+                    or len(decoded) == _CNYES_EMPTY_STYLE_COMMENT[0]
+                    and hashlib.sha256(decoded.encode()).hexdigest() == _CNYES_EMPTY_STYLE_COMMENT[1])):
+            # Retained public originals contain only exact Office markers or
+            # the pinned whole CSS comment. The renderer has no children. Never
             # strip arbitrary comments/conditional content to invent absence;
             # the whole native container must be empty and visibly completed.
             reveal = _cnyes_completed_stream_wrapper(soup, container.find_parent('article'))
@@ -3849,7 +3874,22 @@ def cmnews_visible_article(soup, *, page_url):
     # actual direct table in this verified article after access checks; retain
     # the original response bytes and keep every other figure excluded.
     for figure in bodies[0].find_all("figure", class_="table"):
-        if len(figure.find_all("table", recursive=False)) == 1:
+        tables = figure.find_all("table", recursive=False)
+        if len(tables) == 1:
+            # CKEditor uses <aside> as a cell's description/heading, not an
+            # article sidebar. The generic cleaner would silently delete
+            # these source values. Admit only the observed exact editor shape
+            # in this current native table; retain every other aside exclusion.
+            from downloader.news_fulltext_public_originals import _visible
+            for node in tables[0].select('td > aside'):
+                if (set(node.get('class', [])) != {'ck-heading--viewHeading', 'ck-heading--description'}
+                        or node.find_parent('table') is not tables[0]):
+                    continue
+                if any(child.name not in {'span', 'strong'} for child in node.find_all()):
+                    raise NewsError('article_identity_not_verified')
+                for current in [node, *node.find_all()]:
+                    _visible(current)
+                node.name = 'div'  # Text order/values unchanged; original response stays immutable.
             figure.unwrap()
     return result, scope
 

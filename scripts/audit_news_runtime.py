@@ -11,6 +11,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -20,8 +21,21 @@ import time
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_queue import NewsQueue, utc_now, ARTICLE_DISPATCH_CONTRACT_VERSION
+from downloader.news_fulltext_host_circuit import host_filtered_query
 from downloader.news_fulltext_metrics import ROBOTS_ORIGIN_POLICY_CONTRACT_VERSION, metrics_snapshot_clock
 from stockagent.data.news_source_catalog import configuration_paths
+
+
+RUNTIME_ACCEPTANCE_CONTRACT_VERSION = 10
+
+
+def runtime_source_paths(repo):
+    """Include the out-of-prefix receipt reader used by owner recovery."""
+    return sorted((repo / 'downloader').glob('news_fulltext*.py')) + [
+        repo / 'downloader/news_receipt_io.py',
+        repo / 'stockagent/data/news_source_catalog.py', repo / 'stockagent/data/news_source_urls.py',
+        repo / 'stockagent/private_json.py',
+        repo / 'scripts/download_news_fulltext.py']
 
 
 def service_snapshot():
@@ -128,31 +142,93 @@ def baseline_progress_requirements(previous):
         elif item.get('next_attempt_at_utc') and datetime.fromisoformat(item['next_attempt_at_utc']) > observed:
             excluded[provider] = 'source_cooldown_at_baseline; backlog_not_complete'
         elif not item.get('has_dispatchable_missing_body_work', False):
-            excluded[provider] = 'article_retry_or_lease_not_ready_or_readiness_unknown; backlog_not_complete'
+            scope = item.get('request_scope_readiness', {})
+            excluded[provider] = ('due_missing_bodies_wait_for_request_scope_policy; backlog_not_complete'
+                if scope.get('has_unfiltered_due_work') and
+                    (scope.get('active_gateway_hosts') or scope.get('active_robots_origins')) else
+                'article_retry_or_lease_not_ready_or_readiness_unknown; backlog_not_complete')
         else:
             required.append(provider)
     return {'required_provider_ids': required, 'excluded_provider_reasons': excluded,
-            'basis': 'baseline enabled sources with due missing-body work or a current-owner active lease, and no persisted future cooldown; legacy readiness unknown stays excluded; not all-provider acceptance'}
+            'basis': 'baseline enabled sources with due missing-body work outside active host/origin pauses, '
+                'or a current-owner active lease, and no persisted future provider cooldown; '
+                'legacy readiness unknown stays excluded; not all-provider acceptance'}
 
 
-def has_dispatchable_missing_body_work(db, source, owner, now):
+def active_request_scope_pauses(control, now):
+    """Snapshot the same expiring host/origin gates used by the HTTP owner.
+
+    One paused origin never suspends a whole multi-origin publisher. Expiry
+    permits a policy probe, not body availability. Invalid telemetry must fail
+    this audit rather than silently make a blocked frontier appear healthy.
+    """
+    result = {}
+    for field, output in (('temporarily_paused_gateway_hosts', 'active_gateway_hosts'),
+                          ('temporarily_paused_robots_origins', 'active_robots_origins')):
+        pauses = control.get(field, {})
+        if not isinstance(pauses, dict) or any(type(until) not in (int, float)
+                or not math.isfinite(until) for until in pauses.values()):
+            raise ValueError('invalid_request_scope_pause_snapshot')
+        result[output] = {key: until for key, until in sorted(pauses.items()) if until > now}
+    # Validate exact origins and bounded host sets through the actual scheduler
+    # SQL builder. This does not execute SQL, acquire an HTTP root or mutate it.
+    host_filtered_query('SELECT 1 FROM articles WHERE provider=? LIMIT 1', ('scope-check',),
+        tuple(result['active_gateway_hosts']), excluded_origins=tuple(result['active_robots_origins']))
+    return result
+
+
+def has_dispatchable_missing_body_work(db, source, owner, now, *, excluded_hosts=(), excluded_origins=()):
     """Read the scheduler clock, not just membership in a retry state.
 
     Provider cooldown expiry does not erase a later per-article retry deadline.
     A current owner's active missing-body lease may finish during the window;
     old/expired leases, stored rechecks and unopened finite cohorts cannot prove
-    a stalled source. Indexed existence checks perform no queue mutation.
+    a stalled source. Apply the owner's exact host/origin SQL before LIMIT,
+    without suppressing an already dispatched current-owner lease. Indexed
+    existence checks perform no queue mutation or publisher requests.
     """
+    if not source.allowed:
+        return False
     if (source.acquisition_mode == 'finite'
             and not db.execute('SELECT 1 FROM finite_cohorts WHERE provider=?', (source.provider,)).fetchone()):
         return False
-    if db.execute("SELECT 1 FROM articles INDEXED BY dispatch WHERE provider=? "
+    statement, parameters = host_filtered_query(
+                  "SELECT 1 FROM articles INDEXED BY dispatch WHERE provider=? "
                   "AND state IN ('pending','retry','retry_cooldown') AND due<=? "
-                  "AND body_sha256 IS NULL LIMIT 1", (source.provider, now)).fetchone():
+                  "AND body_sha256 IS NULL LIMIT 1", (source.provider, now), excluded_hosts,
+                  excluded_origins=excluded_origins)
+    if db.execute(statement, parameters).fetchone():
         return True
     return bool(db.execute("SELECT 1 FROM articles INDEXED BY dispatch WHERE provider=? AND state='inflight' "
                            "AND body_sha256 IS NULL AND lease_owner=? AND lease_until>? LIMIT 1",
                            (source.provider, owner, now)).fetchone())
+
+
+def source_readiness_snapshot(db, source, owner, control, *, queue_observed_at_utc, metric_snapshot_at_utc):
+    """Do not invent a policy-probe result between two observation clocks.
+
+    An origin paused in the HTTP snapshot is not proved usable merely because
+    its deadline expired before SQLite was read. A policy probe may already
+    have failed in that gap. Evaluate each pause at its own snapshot clock;
+    keep article due/lease checks at the SQLite clock. Other origins and actual
+    current-owner leases retain their existing independent readiness rules.
+    """
+    queue_clock, metric_clock = (datetime.fromisoformat(value)
+        for value in (queue_observed_at_utc, metric_snapshot_at_utc))
+    if queue_clock.utcoffset() is None or metric_clock.utcoffset() is None:
+        raise ValueError('timezone_aware_readiness_clocks_required')
+    scopes = active_request_scope_pauses(control, metric_clock.timestamp())
+    unfiltered = has_dispatchable_missing_body_work(db, source, owner, queue_clock.timestamp())
+    ready = unfiltered and (not any(scopes.values()) or has_dispatchable_missing_body_work(
+        db, source, owner, queue_clock.timestamp(), excluded_hosts=tuple(scopes['active_gateway_hosts']),
+        excluded_origins=tuple(scopes['active_robots_origins'])))
+    return ready, {'contract_version': 2, 'evaluated_at_utc': queue_observed_at_utc,
+        'scope_snapshot_at_utc': metric_snapshot_at_utc, 'pause_evaluated_at_utc': metric_snapshot_at_utc,
+        'has_unfiltered_due_work': unfiltered, **scopes,
+        'scope_filter_clock_basis': 'HTTP metric snapshot; queue deadlines and leases use SQLite observation',
+        'expired_after_metric_snapshot': {key: {scope: until for scope, until in pauses.items()
+            if until <= queue_clock.timestamp()} for key, pauses in scopes.items()},
+        'permission_after_snapshot_inferred': False}
 
 
 def main(argv=None):
@@ -168,6 +244,7 @@ def main(argv=None):
     status = json.loads((root / "status.json").read_text())
     status_read_at = utc_now()
     start_clock = heartbeat_clock(status, status_read_at)
+    metric_stamp, metrics_clock_verified = metrics_snapshot_clock(status)
     service = service_snapshot()
     db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
@@ -180,20 +257,20 @@ def main(argv=None):
         index_stats = [dict(r) for r in db.execute("SELECT provider,kind,count(*) AS jobs,min(last_checked_at_utc) AS first_check,"
             "max(last_checked_at_utc) AS latest_check FROM discovery GROUP BY provider,kind")]
         disabled_jobs = {}
-        readiness = {}
-        observation_epoch = datetime.fromisoformat(observed).timestamp()
+        readiness, scope_readiness = {}, {}
         for p, source in registry.sources.items():
             clause, params = NewsQueue.discovery_dispatch_filter(source)
             disabled_jobs[p] = db.execute("SELECT count(*) FROM discovery WHERE provider=? AND kind IN "
                 "('wordpress_posts','cnyes_news','rss_fulltext') AND NOT " + clause, (p, *params)).fetchone()[0]
-            readiness[p] = has_dispatchable_missing_body_work(db, source, owner, observation_epoch)
+            control = status.get('http_capacity', {}).get('providers', {}).get(p, {})
+            readiness[p], scope_readiness[p] = source_readiness_snapshot(db, source, owner, control,
+                queue_observed_at_utc=observed, metric_snapshot_at_utc=metric_stamp.isoformat())
     finally:
         db.close()
     expected_policy = hashlib.sha256(json.dumps([
         (s.provider, s.allowed, s.domains, s.data_fingerprint) for s in registry.sources.values()
     ], sort_keys=True).encode()).hexdigest()
-    metric_stamp, metrics_clock_verified = metrics_snapshot_clock(status)
-    result = {"runtime_acceptance_contract_version": 7,
+    result = {"runtime_acceptance_contract_version": RUNTIME_ACCEPTANCE_CONTRACT_VERSION,
         "audit_implementation_sha256": sha256_file(Path(__file__)),
         "metrics_snapshot_at_utc": metric_stamp.isoformat(), "metrics_snapshot_clock_verified": metrics_clock_verified,
         "observed_at_utc": observed, "service": service, "config_sha256": sha256_file(args.config),
@@ -206,10 +283,7 @@ def main(argv=None):
         "official_numeric_rate_limits_verified": False, "all_history_complete": False,
         "all_configured_providers_successful": False, "publish": False, "remote_training_export": False}
     result['owner_process_clock_check'] = owner_process_clock_check(service, status)
-    source_files = sorted((repo / 'downloader').glob('news_fulltext*.py')) + [
-        repo / 'stockagent/data/news_source_catalog.py', repo / 'stockagent/data/news_source_urls.py',
-        repo / 'stockagent/private_json.py',
-        repo / 'scripts/download_news_fulltext.py']
+    source_files = runtime_source_paths(repo)
     process_started = result['owner_process_clock_check'].get('process_started_at_epoch', 0)
     result['source_code_sha256'] = {str(path.relative_to(repo)): sha256_file(path) for path in source_files}
     result['source_files_unchanged_since_owner_start'] = bool(process_started and all(path.stat().st_mtime <= process_started for path in source_files))
@@ -228,6 +302,7 @@ def main(argv=None):
             "known_urls": sum(states.values()), "stored_url_heads": heads.get(p, 0),
             "missing_body_work": sum(states.get(s, 0) for s in ready_states) - bodied_ready,
             "has_dispatchable_missing_body_work": readiness[p],
+            "request_scope_readiness": scope_readiness[p],
             "stored_body_recheck_work": bodied_ready, "states": states,
             "next_attempt_at_utc": status.get('provider_next_attempt_utc', {}).get(p),
             "performance": status.get('performance', {}).get('providers', {}).get(p, {})}

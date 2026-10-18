@@ -514,9 +514,11 @@ def incremental_reservation(root: Path, now: datetime, *,
         try:
             with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)) as conn:
                 from downloader.finmind_retry_cohorts import admission_clause
+                from downloader.finmind_queue_indexes import release_reserve_index
                 retry_filter, retry_args = admission_clause(conn, horizon)
+                release_index = release_reserve_index(conn)
                 rows = conn.execute(
-                    "SELECT dataset,next_attempt_at_utc,count(*) FROM tasks WHERE priority=0 AND kind!='derived' AND "
+                    f"SELECT dataset,next_attempt_at_utc,count(*) FROM tasks{release_index} WHERE priority=0 AND kind!='derived' AND "
                     "((state='pending' AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)) "
                     "OR (state IN ('complete','observed_empty','failed') "
                     "AND next_attempt_at_utc<=?))" + retry_filter + " GROUP BY dataset,next_attempt_at_utc",

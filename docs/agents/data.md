@@ -47,6 +47,66 @@ Rules:
   single-pass full-table read is faster than adding a per-file schema projection
   pass.
 
+## Immutable Panel storage
+
+Full/tail builders resolve model feature patterns through the same complete
+schema selector before payload decoding; excluded columns must not be read
+merely because an exclusion list is nonempty. Preserve model order, raw/gap
+opt-in, null/clock semantics and all independently enabled rule columns. Share
+contiguous normalized symbol buffers instead of copying the complete stock
+subset. This is physical work avoidance, not a smaller source/model ABI.
+
+Keep original cache keys. `load_cached_panel` accepts the same explicit
+`panel_cache_root` as the writer; audit also respects the configured root.
+Existing original or legacy projected hits remain usable; new audits write
+only the original config key. Unknown selection/source changes still fail
+closed. The native 08:30 audit dependency fingerprint includes shared Panel,
+cache and chunk implementations; old audit success is not current-code proof.
+
+`panel_cache_v2` keeps its canonical writer lock, atomic generation/variant
+commit and exact source/backend/version identity. `panel_time_chunks_v1` is an
+explicit storage marker, not a feature or precision change. Use
+`load_panel_cache_array` (or the full/pinned cache loaders), never assume an
+array manifest's `file` is a single NPY. Readers must be deployed before opting
+writers in with `STOCKAGENT_PANEL_CHUNK_STORAGE=1`; existing NPYs need no forced
+rebuild. A fresh source-bound commit may reuse old immutable payloads, so do not
+invalidate it from the oldest shared payload mtime. Sliding live tails opt out
+of byte chunks because removing their first row shifts the complete byte axis.
+See [producer evidence and rollout](../penguin_service_storage_layout_2026-10-15.md#1016-續修panel-追加只寫變動塊共用歷史而不另組整份副本).
+
+## Incremental dataset versions
+
+All registered `data_*` roots share complete logical inventories and immutable
+payload reuse. `configs/columnar_storage.json:source_versioning` records every
+root and its native/target grain; the existing packed catalog owns publication
+scope/rights. Shared v2 writers can chunk changed large files without altering
+their exact bytes; readers support both protocols. A new root must be registered,
+not silently excluded. Use `publish_data_releases.py layout` to distinguish code
+support, observed head format and native migration. Existing working paths,
+raw units/clocks and legacy payloads are not moved or deleted merely by adopting
+this policy. Reader-first activation and remaining producer migrations are
+explicit in [the common layout](../dataset_incremental_storage.md).
+
+### News native copy-on-write
+
+`data_news` versions are complete logical views, not new full physical copies.
+The canonical `scripts/build_news_dataset.py --refresh` uses manifest ABI 2:
+unchanged immutable Parquet parts are referenced, additions are written, and
+only retained rows in affected parts are rewritten for corrections/deletions.
+Complete typed row matching is a multiset, not semantic deduplication. Preserve
+original strings, null bodies, source clocks, provenance and use flags.
+
+Readers must use `news_table_paths` / corpus iterators or a pinned manifest;
+support legacy ABI 1 and root-relative ABI 2 paths. Never glob all versions.
+Input projection chunks reconstruct exact SQLite bytes and SHA; only the new
+transaction's reconstructible work files are removed after verification and
+commit. A crash after publication retries verification/cleanup, never rebuilds
+an accepted generation. Retained manifests protect all referenced old parts and
+chunks. No automatic legacy deletion, GC, compaction or remote publication is
+enabled. Full source comparison and acceptance still run; physical delta storage
+does not imply delta-only CPU work. Other providers are not implicitly migrated.
+See [implementation and evidence](../news_incremental_storage_2026-10-16.md).
+
 ## Crypto Downloader Baseline
 
 The active crypto downloader baseline is one-minute bars.

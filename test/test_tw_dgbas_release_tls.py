@@ -22,7 +22,8 @@ class Response:
         pass
 
     def raise_for_status(self):
-        assert self.status_code < 400
+        if self.status_code >= 400:
+            raise archive.requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def iter_content(self, **_kwargs):
         yield self.content
@@ -115,3 +116,38 @@ def test_redirect_to_unregistered_host_never_fetches_another_certificate_or_page
     with pytest.raises(ValueError, match="out-of-scope"):
         archive._fetch("https://www.stat.gov.tw/original", SimpleNamespace(wait=lambda: None), max_bytes=100)
     assert calls == ["https://www.stat.gov.tw/original"]
+
+
+@pytest.mark.parametrize("two_nodes", [False, True])
+def test_redirect_cycles_stop_before_repeating_any_page(monkeypatch, two_nodes):
+    original = "https://www.stat.gov.tw/original"
+    homepage = "https://www.stat.gov.tw/default.aspx"
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        return Response(301, location=homepage if two_nodes and url == original else original)
+
+    monkeypatch.setattr(archive, "_stat_ca_bundle", lambda: "stat-pinned-ca")
+    monkeypatch.setattr(archive, "_session", lambda: SimpleNamespace(get=get))
+    limiter = SimpleNamespace(wait=lambda: None, defer=lambda *args: pytest.fail("cycle retried"))
+    with pytest.raises(RuntimeError, match="redirect cycle"):
+        archive._fetch(original, limiter, max_bytes=100)
+    assert calls == ([original, homepage] if two_nodes else [original])
+
+
+@pytest.mark.parametrize("status,expected_calls", [(400, 1), (404, 1), (500, 5), (429, 5)])
+def test_only_transient_http_errors_use_retry_budget(monkeypatch, status, expected_calls):
+    calls, deferrals = [], []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        return Response(status)
+
+    monkeypatch.setattr(archive, "_stat_ca_bundle", lambda: "stat-pinned-ca")
+    monkeypatch.setattr(archive, "_session", lambda: SimpleNamespace(get=get))
+    limiter = SimpleNamespace(wait=lambda: None, defer=deferrals.append)
+    with pytest.raises((archive.requests.HTTPError, RuntimeError)):
+        archive._fetch("https://www.stat.gov.tw/original", limiter, max_bytes=100)
+    assert len(calls) == expected_calls
+    assert len(deferrals) == (5 if status in {429, 500} else 0)

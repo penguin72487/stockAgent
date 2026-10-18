@@ -29,6 +29,7 @@ from downloader.artifact_io import atomic_write_bytes, durable_replace
 CONTRACT = "taifex_history_projected_columns_v1"
 CACHE_ENV = "STOCKAGENT_TAIFEX_DASHBOARD_CACHE_DIR"
 ENABLE_ENV = "STOCKAGENT_TAIFEX_HISTORY_COLUMN_CACHE"
+LAYOUT_ENV = "STOCKAGENT_TAIFEX_HISTORY_COLUMN_LAYOUT"
 MIN_SOURCE_BYTES = 8 * 1024**2
 MAX_DELTA_BYTES = 64 * 1024**2
 _BLOCK_BYTES = 1024**2
@@ -121,9 +122,13 @@ def _verified_payload(path: str, generation: tuple[int, ...], expected: str) -> 
 
 def _receipt(path: Path, schema: dict[str, Any]) -> dict:
     try:
-        if path.stat().st_size > 64 * 1024:
-            return {}
-        value = json.loads(path.read_bytes())
+        descriptor = _open_regular(path)
+        try:
+            if os.fstat(descriptor).st_size > 64 * 1024:
+                return {}
+            value = json.loads(os.read(descriptor, 64 * 1024 + 1))
+        finally:
+            os.close(descriptor)
         if (not isinstance(value, dict) or value.get("contract") != CONTRACT
                 or value.get("polars") != pl.__version__
                 or value.get("columns") != [[name, str(dtype)] for name, dtype in schema.items()]):
@@ -249,6 +254,7 @@ def history_scan(source: Path, *, schema: dict[str, Any]) -> Iterator[pl.LazyFra
         return
     source = source.resolve(strict=True)
     lock_fd = payload_fd = None
+    segment_fds: list[int] = []
     try:
         try:
             root = Path(root_text).resolve(strict=True) / "history-columns-v1"
@@ -267,7 +273,12 @@ def history_scan(source: Path, *, schema: dict[str, Any]) -> Iterator[pl.LazyFra
             # multi-GB raw parser. Never bypass the proof or wait indefinitely.
             for attempt in range(MAX_GENERATION_ATTEMPTS):
                 try:
-                    payload_fd = _prepare(source, payload, receipt, schema)
+                    if os.environ.get(LAYOUT_ENV, "v1") == "base_delta_v2":
+                        from stockagent.live.taifex_history_segments import prepare
+
+                        segment_fds = prepare(source, payload, receipt, schema) or []
+                    else:
+                        payload_fd = _prepare(source, payload, receipt, schema)
                     break
                 except _SourceGenerationChanged:
                     if attempt + 1 == MAX_GENERATION_ATTEMPTS:
@@ -276,9 +287,15 @@ def history_scan(source: Path, *, schema: dict[str, Any]) -> Iterator[pl.LazyFra
             sys.stderr.write(f"taifex-history column_cache_unavailable error={type(error).__name__}\n")
         # Do not catch query failures across the yield or retry half a query.
         # The existing canonical parser decides fallback on source errors.
-        yield (pl.scan_parquet(f"/proc/self/fd/{payload_fd}") if payload_fd is not None
-               else pl.scan_ndjson(source, schema=schema, low_memory=True))
+        if segment_fds:
+            yield pl.concat([pl.scan_parquet(f"/proc/self/fd/{fd}") for fd in segment_fds],
+                            how="vertical", parallel=False)
+        else:
+            yield (pl.scan_parquet(f"/proc/self/fd/{payload_fd}") if payload_fd is not None
+                   else pl.scan_ndjson(source, schema=schema, low_memory=True))
     finally:
+        for fd in segment_fds:
+            os.close(fd)
         if payload_fd is not None:
             os.close(payload_fd)
         if lock_fd is not None:

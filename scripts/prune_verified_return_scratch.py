@@ -29,6 +29,10 @@ from stockagent.data_sync.remote_legacy_return import identity, metadata_tree, r
 
 STATE_ROOTS = {Path('/var/lib/stockagent-vast-legacy-return'), Path('/var/lib/stockagent-vast-legacy-return-partitions')}
 PACKED = Path('/srv/stockagent-packed')
+# This profile removes only an independent validation copy. The complete
+# sealed source packages on C and the D/NAS backups remain unchanged.
+PRIVATE_BACKUP_STATE = Path('/var/lib/stockagent/vast-pre-stop-20261010')
+PRIVATE_BACKUP_COHORT = '65800aa4a279bd876c120d5904c498080128cea9ae95d83a5f8556bb0e20270d'
 # Only these independently inventoried complete failed verification workspaces
 # are enrolled. Unknown partial/failed directories remain diagnostic evidence.
 REGISTERED_RECOVERY_SCRATCH = {
@@ -122,6 +126,131 @@ def safe_tree(tree):
             or (r['kind']=='file' and r['signature'][6] != 1) for r in data['rows'])):
         raise SnapshotError('private scratch is referenced, redirected, shared or crosses a filesystem')
     return data
+
+
+def private_validation_plan(state_root):
+    """Fully compare one enrolled restore copy to retained sealed originals.
+
+    This is byte-duplicate retirement, not source retirement or a new claim
+    of current D/NAS recovery. Never delete the retained packages or receipts.
+    """
+    if state_root != PRIVATE_BACKUP_STATE or real(state_root) != state_root:
+        raise SnapshotError('private validation copy is outside its enrolled incident')
+    target = state_root / ('independent-D-recovery-' + PRIVATE_BACKUP_COHORT)
+    control_paths = [state_root / name for name in ('final-acceptance.json', 'D-recovery-acceptance.json')]
+    if any(real(p) != p or not stat.S_ISREG(p.lstat().st_mode) or p.lstat().st_nlink != 1
+           for p in control_paths):
+        raise SnapshotError('private recovery acceptance is redirected or shared')
+    controls = {str(p): {'signature': signature(p.lstat()), 'sha256': sha256_file(p)} for p in control_paths}
+    accepted, recovered = [json.loads(p.read_bytes()) for p in control_paths]
+    if (accepted.get('contract') != 'stockagent.vast_pre_stop_acceptance.v1'
+            or accepted.get('private_cohort_identity_sha256') != PRIVATE_BACKUP_COHORT
+            or accepted.get('penguin_original_recovery_verified') is not True
+            or accepted.get('D_original_recovery_verified') is not True
+            or recovered.get('state') != 'independent_D_recovery_verified'
+            or recovered.get('original_content_verified') is not True
+            or recovered.get('restore') != str(target)):
+        raise SnapshotError('private validation copy lacks its exact original acceptance')
+    observed = safe_tree(target)
+    retained, expected = {}, {}
+    directories = set()
+    for group in ('recovery-package', 'final-code-delta'):
+        source = real(state_root / group)
+        tree = safe_tree(source)
+        retained[group] = tree
+        manifest_path = source / 'capture-files.json'
+        raw = manifest_path.read_bytes()
+        manifest_sha = hashlib.sha256(raw).hexdigest()
+        if (source / 'SOURCE-CAPTURE.READY').read_text().strip() != manifest_sha:
+            raise SnapshotError('retained private package seal differs')
+        if group == 'recovery-package' and recovered['source_verification'].get('capture_manifest_sha256') != manifest_sha:
+            raise SnapshotError('retained package differs from its independently recovered identity')
+        members = json.loads(raw)['files']
+        names = [m['relative'] for m in members]
+        if len(set(names)) != len(names):
+            raise SnapshotError('retained private package has duplicate paths')
+        declarations = {m['relative']: (m['bytes'], m['sha256']) for m in members}
+        declarations.update({name: ((source/name).stat().st_size, sha256_file(source/name))
+                             for name in ('capture-files.json', 'SOURCE-CAPTURE.READY')})
+        if set(declarations) != {r['path'] for r in tree['rows'] if r['kind'] == 'file'}:
+            raise SnapshotError('retained package has missing or unknown files')
+        for name, (size, digest) in declarations.items():
+            original = source / name
+            if (original.stat().st_size != size or sha256_file(original) != digest):
+                raise SnapshotError('retained private original SHA or size differs')
+            key = group + '/' + name
+            duplicate = target / key
+            if (not duplicate.is_file() or duplicate.is_symlink()
+                    or duplicate.stat().st_size != size or sha256_file(duplicate) != digest):
+                raise SnapshotError('validation copy differs from the retained original')
+            expected[key] = {'original': str(original), 'sha256': digest, 'bytes': size,
+                             'signature': signature(original.lstat())}
+        directories.add(group)
+        directories.update(group + '/' + r['path'] for r in tree['rows'] if r['kind'] == 'directory')
+        if safe_tree(source)['rows'] != tree['rows']:
+            raise SnapshotError('retained originals changed during duplicate validation')
+    if ({r['path'] for r in observed['rows'] if r['kind'] == 'file'} != set(expected)
+            or {r['path'] for r in observed['rows'] if r['kind'] == 'directory'} - directories
+            or safe_tree(target)['rows'] != observed['rows']):
+        raise SnapshotError('validation copy has unknown paths or changed during verification')
+    if (len(expected) != accepted['source_files']
+            or sum(row['bytes'] for row in expected.values()) != accepted['source_bytes']):
+        raise SnapshotError('validation copy totals differ from the fixed acceptance')
+    for name, before in controls.items():
+        if signature(Path(name).lstat()) != before['signature'] or sha256_file(Path(name)) != before['sha256']:
+            raise SnapshotError('private recovery acceptance changed during validation')
+    value = {'contract': 'retained-sealed-backup-validation-duplicate-v1', 'target': str(target),
+             'tree': observed, 'retained': retained, 'controls': controls, 'originals': expected,
+             'verified_at_epoch': time.time(), 'retained_originals_deleted': 0,
+             'cold_objects_deleted': 0, 'nas_snapshots_deleted': 0}
+    value['plan_fingerprint'] = identity(value)
+    return value
+
+
+def apply_private_validation_duplicate(state_root, before, receipt_dir):
+    """Quarantine and unlink only unchanged, fully matched validation names."""
+    current = private_validation_plan(state_root)
+    stable = lambda p: {k: v for k, v in p.items() if k not in {'verified_at_epoch', 'plan_fingerprint'}}
+    if stable(current) != stable(before):
+        raise SnapshotError('private validation copy changed after dry run')
+    source = Path(current['target'])
+    quarantine = source.with_name(source.name + '.verified-prune-' + uuid.uuid4().hex)
+    journal_path = receipt_dir / 'private-backup-validation.journal.json'
+    if journal_path.exists():
+        raise SnapshotError('private validation prune journal already exists; reconcile it first')
+    journal = {'contract': current['contract'], 'plan_fingerprint': before['plan_fingerprint'],
+               'source': str(source), 'quarantine': str(quarantine), 'state': 'prepared'}
+    atomic_write_json(journal_path, journal)
+    source.rename(quarantine)
+    journal['state'] = 'quarantined'
+    atomic_write_json(journal_path, journal)
+    if safe_tree(quarantine)['rows'] != current['tree']['rows']:
+        raise SnapshotError('private validation quarantine changed; retained')
+    for group, tree in current['retained'].items():
+        if safe_tree(state_root/group)['rows'] != tree['rows']:
+            raise SnapshotError('retained original changed after quarantine; duplicate retained')
+    for name, before_control in current['controls'].items():
+        if signature(Path(name).lstat()) != before_control['signature']:
+            raise SnapshotError('private acceptance changed after quarantine; duplicate retained')
+    for row in current['tree']['rows']:
+        if row['kind'] != 'file':
+            continue
+        path = quarantine / row['path']
+        original = current['originals'][row['path']]
+        if (signature(path.lstat()) != row['signature']
+                or signature(Path(original['original']).lstat()) != original['signature']
+                or process_references_many((source, quarantine))):
+            raise SnapshotError('private copy or retained original changed before unlink; retained')
+        path.unlink()
+    for row in sorted((r for r in current['tree']['rows'] if r['kind'] == 'directory'),
+                      key=lambda r: -len(Path(r['path']).parts)):
+        (quarantine/row['path']).rmdir()
+    quarantine.rmdir()
+    result = {'state': 'pruned', 'contract': current['contract'], 'pruned': True,
+              'target': str(source), 'reclaimed_allocated_file_bytes': current['tree']['reclaimable_allocated_file_bytes'],
+              'retained_originals_deleted': 0, 'cold_objects_deleted': 0, 'nas_snapshots_deleted': 0}
+    atomic_write_json(journal_path, {**journal, **result})
+    return result
 
 
 def cold_generation(dataset):
@@ -295,9 +424,28 @@ def main():
     parser.add_argument('--dataset',action='append')
     parser.add_argument('--receipt-dir',type=Path,required=True)
     parser.add_argument('--apply',action='store_true')
+    parser.add_argument('--private-backup-validation-copy', action='store_true',
+                        help='Only the enrolled Vast pre-stop validation duplicate; retain sealed original packages')
     parser.add_argument('--wait-for-owner',action='store_true',
                         help='Queue this exact local cleanup behind the retained original cohort')
     args=parser.parse_args()
+    if args.private_backup_validation_copy:
+        if args.dataset or args.state_root != PRIVATE_BACKUP_STATE or real(args.state_root) != args.state_root:
+            parser.error('private validation cleanup requires only its exact enrolled incident')
+        os.umask(0o077)
+        args.receipt_dir.mkdir(parents=True, exist_ok=True)
+        with cohort_owner(args.state_root, wait=args.wait_for_owner):
+            dry = private_validation_plan(args.state_root)
+            atomic_write_json(args.receipt_dir/'private-backup-validation.plan.json', dry)
+            result = {'apply_ready': True, 'pruned': False,
+                      'reclaimable_allocated_file_bytes': dry['tree']['reclaimable_allocated_file_bytes']}
+            if args.apply:
+                with PUBLICATION_OWNER.open('a') as common:
+                    fcntl.flock(common, fcntl.LOCK_EX)
+                    result = apply_private_validation_duplicate(args.state_root, dry, args.receipt_dir)
+            atomic_write_json(args.receipt_dir/'private-backup-validation.result.json', result)
+            print(json.dumps(result), flush=True)
+        return 0
     if args.state_root not in STATE_ROOTS or real(args.state_root) != args.state_root:
         parser.error('only the two retained private return cohorts are enrolled')
     os.umask(0o077)

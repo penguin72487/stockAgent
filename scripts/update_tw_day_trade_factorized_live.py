@@ -8,6 +8,7 @@ visibly; it cannot advertise a stale projection as ready for another session.
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import json
 from pathlib import Path
 import subprocess
@@ -27,6 +28,7 @@ from scripts.prepare_tw_day_trade_factorized_live import prepare
 from downloader.artifact_io import atomic_write_json
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 from stockagent.data.annual_cache_admission import AnnualCacheBuildDeferred
+from stockagent.config import load_config
 
 
 def _prepare_with_retry(operation, *, receipt_path: Path, phase: str,
@@ -84,6 +86,27 @@ def _processing_pools() -> dict:
             "arrow_observed_threads": pa.cpu_count(), "process_cpu_quota": False}
 
 
+def _projection_start_date(config_path: Path, parent_path: Path) -> str:
+    """One canonical projection must cover every consumer, not just live tails.
+
+    Live inference already selects its bounded working set at read time. A
+    producer-only 2025 cutoff made that tail look valid but permanently blocked
+    the same deployment's full-history maintenance. Use the selected model's
+    declared horizon; when omitted, retain the fixed trained parent's horizon.
+    """
+    configured = load_config(config_path).data.panel_start_date
+    parent = json.loads(parent_path.read_text(encoding="utf-8"))
+    dates = parent.get("dates")
+    if (not isinstance(dates, list) or not dates
+            or not all(isinstance(day, str) and date.fromisoformat(day).isoformat() == day for day in dates)
+            or dates != sorted(set(dates))):
+        raise ValueError("fixed parent requires a complete ordered ISO-date calendar")
+    start = date.fromisoformat(configured or dates[0])
+    if start < date.fromisoformat(dates[0]):
+        raise ValueError("selected projection horizon precedes the fixed trained source calendar")
+    return start.isoformat()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("preopen", "completed"), required=True)
@@ -94,6 +117,9 @@ def main():
         raise ValueError("attempts must be between one and four")
     if not 0 <= args.source_wait_seconds <= 1800:
         raise ValueError("source wait must be between zero and 1800 seconds")
+    config_path = ROOT / "configs/deployments/tw_day_trade_factorized_scale_separated_cash_fold11_candidate_v1.yaml"
+    parent_path = ROOT / "artifacts/data_preparation/tw_factorized_fold11_live_parent_20261013/factorized_manifest.json"
+    start_date = _projection_start_date(config_path, parent_path)
     command = ([sys.executable, str(ROOT / "scripts/activate_tw_public_opening_data.py"),
                 "--link", "data_tw_public"] if args.phase == "preopen" else
                [sys.executable, str(ROOT / "scripts/finalize_tw_public_completed_session.py")])
@@ -102,14 +128,15 @@ def main():
 
     def build():
         prepared = prepare(
-            config_path=ROOT / "configs/deployments/tw_day_trade_factorized_scale_separated_cash_fold11_candidate_v1.yaml",
-            parent_path=ROOT / "artifacts/data_preparation/tw_factorized_fold11_live_parent_20261013/factorized_manifest.json",
+            config_path=config_path,
+            parent_path=parent_path,
             native_source=Path("/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v4"),
             public=Path("/srv/stockagent-live/data_tw_public"), finlab=ROOT / "data_finlab",
             output=ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1",
-            start_date="2025-12-01",
+            start_date=start_date,
             annual_cache_root=ROOT / "artifacts/cache/tw_factorized_live/annual")
-        return {**prepared, "processing_pools": _processing_pools()}
+        return {**prepared, "requested_start_date": start_date,
+                "processing_pools": _processing_pools()}
 
     result = _prepare_with_retry(build,
         receipt_path=receipt_path, phase=args.phase, attempts=args.attempts,

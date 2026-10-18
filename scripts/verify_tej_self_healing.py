@@ -23,6 +23,7 @@ from downloader.tej_startup import interactive_transport
 from downloader.tej_operation_clock import CONTRACT as OPERATION_CLOCK_CONTRACT
 from downloader.tej_desktop_attempts import (
     ANNOTATION_RECONCILIATION_CONTRACT, deferred_unsent_annotation_proof,
+    interrupted_stage_write_proof,
 )
 from scripts.audit_tej_history import audit
 
@@ -65,7 +66,7 @@ def main(argv=None):
         recent=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='complete' AND kind='download' "
             "AND scope_contract=? AND timing_basis='fresh_end_to_end' ORDER BY completed_at_utc DESC LIMIT 128",(SOURCE_SCOPE_CONTRACT,))]
         retries=[dict(r) for r in con.execute('SELECT table_id,task_id,error_code,consecutive_failures,next_attempt_at_utc FROM desktop_retry_windows')]
-    protected={}; metadata=[]; prequery=[]
+    protected={}; metadata=[]; prequery=[]; interrupted=[]
     for task in [*blocked, *unfinished]:
         if task['kind']!='discover':
             continue
@@ -88,6 +89,20 @@ def main(argv=None):
         for task in blocked:
             if task['kind'] != 'download':
                 continue
+            if task['last_error_code'] == 'unknown_outcome_no_auto_retry':
+                from downloader.tej_history import task_request
+                try:
+                    attempt=task['active_attempt_id'];prepared=root/'requests'/(attempt+'.json')
+                    proof=interrupted_stage_write_proof(root,task,task_request(root,task),prepared)
+                    manifest=root/'launches'/(attempt+'.bridge.json')
+                    paths=[prepared,manifest,root/proof['original_stage_path'],root/proof['original_diagnostic_path']]
+                    progress=root/'progress'/(attempt+'.json.progress.json')
+                    if progress.is_file():paths.append(progress)
+                    protected.update({str(p.relative_to(root)):digest(p) for p in paths})
+                    interrupted.append({'task_id':task['task_id'],'query_attempt_id':attempt,
+                        'original_outcome':'unknown_retained_not_claimed_unsent',**proof})
+                except (OSError,ValueError,KeyError,TypeError):
+                    pass
             try:
                 proof=deferred_unsent_annotation_proof(root,con,task)
                 if proof is None:
@@ -109,6 +124,7 @@ def main(argv=None):
             'operation_clock_contract':OPERATION_CLOCK_CONTRACT,
             'attempt_annotation_reconciliation_contract':ANNOTATION_RECONCILIATION_CONTRACT,
             'original_failure_artifacts':protected,'metadata_failures':metadata,'prequery_failures':prequery,
+            'interrupted_stage_writes':interrupted,
             'blocked_tasks':len(blocked),'retry_windows':retries,'provider_queries_sent':0,
             'all_history_complete':False,'cold_boot_verified':False,
             'code_sha256':{str(p.relative_to(REPO)):digest(p) for p in (
@@ -156,7 +172,7 @@ def main(argv=None):
             raise ValueError('Original failed source proof required in baseline')
         for relative,expected in baseline['original_failure_artifacts'].items():
             path=root/relative
-            if path.resolve().parent not in {(root/name).resolve() for name in ('requests','raw','launches','diagnostics')} or digest(path)!=expected:
+            if path.resolve().parent not in {(root/name).resolve() for name in ('requests','raw','launches','diagnostics','progress')} or digest(path)!=expected:
                 raise ValueError('Original failure evidence changed')
         audited=audit(root,output.parent/(output.stem+'-receipts'),task_ids=[t['task_id'] for t in selected],verify_original_cells=True)
         if not audited['accepted'] or not empty_cohort and not audited['original_source_cells_verified']:

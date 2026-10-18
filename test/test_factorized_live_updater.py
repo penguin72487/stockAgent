@@ -2,6 +2,7 @@ import json
 from datetime import date
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import sys
 import pytest
@@ -53,6 +54,7 @@ print(json.dumps({'polars': pl.thread_pool_size(), 'arrow': pa.cpu_count(), 'exp
 def test_scheduled_entrypoint_uses_the_canonical_cache_and_records_actual_pools(tmp_path, monkeypatch, phase):
     monkeypatch.setattr(updater, "ROOT", tmp_path)
     monkeypatch.setattr(sys, "argv", [str(updater.__file__), "--phase", phase])
+    monkeypatch.setattr(updater, "_projection_start_date", lambda *_: "2014-01-06")
     pools = {"polars_observed_threads": 2, "arrow_observed_threads": 2,
              "process_cpu_quota": False}
     commands, preparation = [], []
@@ -74,11 +76,43 @@ def test_scheduled_entrypoint_uses_the_canonical_cache_and_records_actual_pools(
                        else "finalize_tw_public_completed_session.py")
     assert commands[0][:2] == [sys.executable, str(tmp_path / "scripts" / expected_script)]
     assert preparation[0]["annual_cache_root"] == tmp_path / "artifacts/cache/tw_factorized_live/annual"
-    assert preparation[0]["start_date"] == "2025-12-01"
+    assert preparation[0]["start_date"] == "2014-01-06"
     receipt = tmp_path / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/updater_status.json"
     status = json.loads(receipt.read_text())
     assert status["status"] == "verified" and status["phase"] == phase
     assert status["attempt"] == 1 and status["processing_pools"] == pools
+    assert status["requested_start_date"] == "2014-01-06"
+
+
+@pytest.mark.parametrize("configured,expected", [("2014-01-06", "2014-01-06"),
+                                                  ("2026-01-01", "2026-01-01"),
+                                                  (None, "2014-01-06")])
+def test_projection_scope_follows_selected_full_horizon(tmp_path, monkeypatch, configured, expected):
+    parent = tmp_path / "parent.json"
+    parent.write_text(json.dumps({"dates": ["2014-01-06", "2026-10-16"]}))
+    monkeypatch.setattr(updater, "load_config", lambda _: SimpleNamespace(
+        data=SimpleNamespace(panel_start_date=configured)))
+    assert updater._projection_start_date(tmp_path / "config.yaml", parent) == expected
+
+
+def test_projection_rejects_an_uncovered_earlier_horizon(tmp_path, monkeypatch):
+    parent = tmp_path / "parent.json"
+    parent.write_text(json.dumps({"dates": ["2014-01-06", "2026-10-16"]}))
+    monkeypatch.setattr(updater, "load_config", lambda _: SimpleNamespace(
+        data=SimpleNamespace(panel_start_date="2013-01-01")))
+    with pytest.raises(ValueError, match="precedes"):
+        updater._projection_start_date(tmp_path / "config.yaml", parent)
+
+
+@pytest.mark.parametrize("dates", [[], ["bad-date"], ["2026-10-16", "2014-01-06"],
+                                    ["2014-01-06", "2014-01-06"], [None]])
+def test_projection_rejects_invalid_parent_calendar(tmp_path, monkeypatch, dates):
+    parent = tmp_path / "parent.json"
+    parent.write_text(json.dumps({"dates": dates}))
+    monkeypatch.setattr(updater, "load_config", lambda _: SimpleNamespace(
+        data=SimpleNamespace(panel_start_date=None)))
+    with pytest.raises(ValueError):
+        updater._projection_start_date(tmp_path / "config.yaml", parent)
 
 
 def _clock(monkeypatch):

@@ -8,6 +8,7 @@ whole FinMind/FinLab dataset. Body batches are private, compressed and immutable
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import closing
 import codecs
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -29,10 +30,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file, table_from_records
-from downloader.news_fulltext_metrics import NewsMetrics, CNYES_NATIVE_BODY_FAILURE_STAGES
-from downloader.news_fulltext_policy import (CONTRACT_VERSION, NewsError, PolicyRegistry, normalize_url,
+from downloader.news_fulltext_metrics import (
+    NewsMetrics, CNYES_NATIVE_BODY_FAILURE_STAGES, ETTODAY_ATTRIBUTION_FAILURE_STAGES,
+)
+from downloader.news_fulltext_policy import (CONTRACT_VERSION, ETTODAY_LAYOUT_VERSIONS, NewsError, PolicyRegistry, normalize_url,
                                             REQUEST_DEFERRAL_CONTRACT_VERSION, REQUEST_DEFERRAL_CODES)
 from stockagent.private_json import loads as decode_private_json
+from downloader.news_receipt_io import (
+    RECEIPT_CHUNK, RECEIPT_PROBE_STRIDE, adaptive_receipt_readers, receipt_input_chunks,
+    receipt_parent_matches, RECEIPT_PREFETCH_MAX_CHUNKS, ADAPTIVE_RECEIPT_STRATEGY_VERSION,
+)
 from downloader.news_fulltext_status import (
     STATUS_PROJECTION_CONTRACT_VERSION, STATUS_QUERY_TIMING_CONTRACT_VERSION,
     BULK_ERROR_COUNT_CONTRACT_VERSION, bulk_item_error_count, initialize_bulk_error_count,
@@ -109,6 +116,23 @@ def parser_repair_changed(source, previous_capture, previous_identity):
     return True
 
 
+def ftv_native_parser_repair(source, previous_capture):
+    """The same complete FTV source contract, with only one native parser ABI."""
+    # v6 adds only a negative provenance guard. It grants no old-head retries.
+    return bool(source and source.allowed and source.provider == 'ftvnews'
+        and source.embedded_article_layout in {'ftv_visible_article_v2', 'ftv_visible_article_v3', 'ftv_visible_article_v4', 'ftv_visible_article_v5', 'ftv_visible_article_v7'}
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ftv_paired_quote_parser_repair(source, previous_capture):
+    """Retain the v2/v3 quote-specific public predicate for earlier repairs."""
+    return bool(source and source.embedded_article_layout in {'ftv_visible_article_v2', 'ftv_visible_article_v3'}
+        and ftv_native_parser_repair(source, previous_capture))
+
+
 def ftnn_clock_only_parser_repair(source, previous_capture):
     """Exact prior capture: same source/auth/scope with only adapter v1 -> v2.
 
@@ -124,6 +148,72 @@ def ftnn_clock_only_parser_repair(source, previous_capture):
         and previous_capture != source.data_fingerprint)
 
 
+def ftnn_native_v2_parser_repair(source, previous_capture):
+    """Only the attested v1/ABI2 -> v2/ABI3 native title/layout repair."""
+    return bool(source and source.allowed and source.provider == 'ftnn'
+        and source.embedded_article_layout == 'ftnn_visible_article_v2'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ftnn_native_v3_parser_repair(source, previous_capture):
+    """Exact v2/ABI3 -> v3/ABI4; no scope, HTTP or refusal identity reset."""
+    return bool(source and source.allowed and source.provider == 'ftnn'
+        and source.embedded_article_layout == 'ftnn_visible_article_v3'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ftnn_native_v4_parser_repair(source, previous_capture):
+    """Exact v3/ABI4 -> v4/ABI5; only the inspected hidden-asset failure."""
+    return bool(source and source.allowed and source.provider == 'ftnn'
+        and source.embedded_article_layout == 'ftnn_visible_article_v4'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ftnn_native_v5_parser_repair(source, previous_capture):
+    """Exact v4/ABI5 -> v5/ABI6, only the inspected complete short report."""
+    return bool(source and source.allowed and source.provider == 'ftnn'
+        and source.embedded_article_layout == 'ftnn_visible_article_v5'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ftnn_native_v6_parser_repair(source, previous_capture):
+    """Exact v5/ABI6 -> v6/ABI7; only inspected native prefix/flow failures."""
+    return bool(source and source.allowed and source.provider == 'ftnn'
+        and source.embedded_article_layout == 'ftnn_visible_article_v6'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+# This is a finite, independently inspected missing-body migration, not a
+# parsing exception or URL-based identity/body acceptance. The normal native
+# proof still applies to every fetched byte; all other failures stay untouched.
+FTNN_NATIVE_V3_REPAIR_COHORT = {
+    'https://www.ftnn.com.tw/news/561059': 'article_identity_not_verified',
+    'https://www.ftnn.com.tw/news/547631': 'article_attribution_not_verified',
+}
+FTNN_NATIVE_V4_REPAIR_COHORT = {'https://www.ftnn.com.tw/news/520952': 'article_identity_not_verified'}
+FTNN_NATIVE_V5_REPAIR_COHORT = {'https://www.ftnn.com.tw/news/254694': 'body_not_found'}
+FTNN_NATIVE_V6_REPAIR_COHORT = {
+    f'https://www.ftnn.com.tw/news/{number}': 'article_attribution_not_verified'
+    for number in (544755, 548752, 551249, 556762, 556785, 556793,
+                   560252, 560278, 560302, 568909, 577927)
+}
+
+
 def tvbs_native_v2_parser_repair(source, previous_capture):
     """Only the exact prior TVBS v1 capture, not changed rights/source scope."""
     return bool(source and source.allowed and source.provider == 'tvbs'
@@ -134,13 +224,225 @@ def tvbs_native_v2_parser_repair(source, previous_capture):
         and previous_capture != source.data_fingerprint)
 
 
-def ettoday_clock_only_parser_repair(source, previous_capture):
-    """Only ETtoday's exact prior source/scope; no fresh retry permission."""
-    return bool(source and source.allowed and source.provider == 'ettoday'
-        and source.embedded_article_layout == 'ettoday_visible_article_v2'
+def tvbs_native_v3_parser_repair(source, previous_capture):
+    """Only proved v2 failures, with unchanged authorization/HTTP ancestry."""
+    return bool(source and source.allowed and source.provider == 'tvbs'
+        and source.embedded_article_layout == 'tvbs_visible_article_v3'
         and source.data_fingerprint == source.parser_repair_capture_fingerprint
         and re.fullmatch(r'[0-9a-f]{64}', source.http_capacity_source_fingerprint)
-        and previous_capture == source.http_capacity_source_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def tvbs_native_v4_parser_repair(source, previous_capture):
+    """Exact v3 -> v4 native music-category proof, not a new HTTP budget."""
+    return bool(source and source.allowed and source.provider == 'tvbs'
+        and source.embedded_article_layout == 'tvbs_visible_article_v4'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.http_capacity_source_fingerprint)
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def _ettoday_native_parser_repair(source, previous_capture):
+    """Exact native parser ancestry; unchanged source/scope/HTTP identity."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout in {'ettoday_visible_article_v2', 'ettoday_visible_article_v3',
+            'ettoday_visible_article_v4', 'ettoday_visible_article_v5', 'ettoday_visible_article_v6'}
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.http_capacity_source_fingerprint)
+        and (previous_capture == source.http_capacity_source_fingerprint
+            or previous_capture in source.parser_repair_capture_history
+            and re.fullmatch(r'[0-9a-f]{64}', previous_capture))
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_clock_only_parser_repair(source, previous_capture):
+    """Only v2-v4 clock migrations; v5 must not replay completed clock work."""
+    return (_ettoday_native_parser_repair(source, previous_capture)
+        and source.embedded_article_layout in {'ettoday_visible_article_v2', 'ettoday_visible_article_v3', 'ettoday_visible_article_v4'})
+
+
+def ettoday_literal_value_parser_repair(source, previous_capture):
+    """v5's lossless JSON values, not changed permission or a generic retry."""
+    return (_ettoday_native_parser_repair(source, previous_capture)
+        and source.embedded_article_layout == 'ettoday_visible_article_v5')
+
+
+def native_body_only_layout(source):
+    return bool(source and (
+        source.provider == 'ettoday' and source.embedded_article_layout == 'ettoday_visible_article_v6'
+        or source.provider == 'cmnews' and source.embedded_article_layout == 'cmnews_visible_article_v1'))
+
+
+def native_body_only_parser_repair(source, previous_capture):
+    """Exact prior capture only; never a changed rights/scope or clock replay."""
+    return bool(native_body_only_layout(source) and source.allowed
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_social_headline_parser_repair(source, previous_capture):
+    """Only the attested v6-to-v7 title repair, with unchanged source scope."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v7'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_break_credit_parser_repair(source, previous_capture):
+    """Only v7-to-v8 native direct-BR interpretation; not broader rights."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v8'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_static_imgur_parser_repair(source, previous_capture):
+    """Exact v8-to-v9 parser ancestry; not new permission or a quota reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v9'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_static_threads_parser_repair(source, previous_capture):
+    """Only attested v9-to-v10 native UI repair; unchanged rights and HTTP."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v10'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_caption_credit_only_parser_repair(source, previous_capture):
+    """Only exact v10-to-v11 source-proved byline repair; no new permissions."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v11'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_two_threads_parser_repair(source, previous_capture):
+    """Exact v11-to-v12 parser ancestry; same authorization and HTTP identity."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v12'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_split_reporter_parser_repair(source, previous_capture):
+    """Exact v12-to-v13 literal-text repair; no whitespace/name inference."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v13'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_instagram_preview_parser_repair(source, previous_capture):
+    """Exact v13-to-v14 native-UI repair; not a source or permission change."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v14'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_finance_query_parser_repair(source, previous_capture):
+    """Exact v15-to-v16 query admission, never a permission/budget reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v16'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_source_redirect_parser_repair(source, previous_capture):
+    """Exact v16-to-v17 transport repair, not a body/authorization reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v17'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_author_url_comment_parser_repair(source, previous_capture):
+    """Exact v17-to-v18 lossless schema repair, not an access/budget reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v18'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_static_twitter_quote_parser_repair(source, previous_capture):
+    """Exact v18-to-v19 native quote separation, not a permission reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v19'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_static_facebook_video_parser_repair(source, previous_capture):
+    """Exact v19-to-v20 native preview repair; permission is unchanged."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v20'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_reporter_subset_parser_repair(source, previous_capture):
+    """Exact v20-to-v21 author-subset repair, never a scope/rate reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v21'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_3c_channel_parser_repair(source, previous_capture):
+    """Exact v21-to-v22 native label repair; never change source permission."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v22'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def ettoday_native_channel_parser_repair(source, previous_capture):
+    """Exact v22-to-v23 source-field repair, never permission/rate reset."""
+    return bool(source and source.allowed and source.provider == 'ettoday'
+        and source.embedded_article_layout == 'ettoday_visible_article_v23'
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
         and previous_capture != source.data_fingerprint)
 
 
@@ -184,7 +486,11 @@ def read_acceptance_receipt_input(path: Path):
     do not newly admit BOM/UTF-16/invalid UTF-8 through JSON's byte sniffing.
     Every receipt, including committed ones, is still fully decoded below.
     """
-    raw = path.read_bytes()
+    return acceptance_receipt_input_from_bytes(path.read_bytes())
+
+
+def acceptance_receipt_input_from_bytes(raw):
+    """Identical default-text conversion for one complete original input."""
     encoding = codecs.lookup(locale.getpreferredencoding(False)).name
     if encoding in {'utf-8', 'ascii'} and raw.isascii() and b'\x00' not in raw:
         return raw.replace(b'\r\n', b'\n').replace(b'\r', b'\n') if b'\r' in raw else raw
@@ -267,7 +573,7 @@ def summarize_bulk_coverage(db, registry):
 
 class NewsQueue:
     def __init__(self, root: Path, registry: PolicyRegistry, *, metrics: NewsMetrics | None = None,
-                 defer_initial_finite_freeze: bool = False):
+                 defer_initial_finite_freeze: bool = False, lifecycle=None):
         if type(defer_initial_finite_freeze) is not bool:
             raise ValueError('finite_cohort_freeze_switch_must_be_boolean')
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -280,6 +586,9 @@ class NewsQueue:
             self.owner_lock.close()
             raise RuntimeError("news_fulltext_owner_already_running") from None
         self.owner = uuid.uuid4().hex
+        self.lifecycle = lifecycle
+        if lifecycle is not None:
+            lifecycle.started(self.owner)
         self.metrics.owner_id = self.owner
         self.db = sqlite3.connect(root / "queue.sqlite3")
         self.db.row_factory = sqlite3.Row
@@ -294,7 +603,7 @@ class NewsQueue:
                 title TEXT, metadata_date_raw TEXT, metadata_order_day TEXT, first_seen_utc TEXT NOT NULL,
                 last_seen_utc TEXT NOT NULL, error_code TEXT, captured_at_utc TEXT, last_checked_at_utc TEXT,
                 body_bytes INTEGER DEFAULT 0, body_sha256 TEXT, parquet_path TEXT,
-                etag TEXT, last_modified TEXT, authorization_fingerprint TEXT
+                etag TEXT, last_modified TEXT, authorization_fingerprint TEXT, validator_url TEXT
             );
             CREATE INDEX IF NOT EXISTS dispatch ON articles(provider,state,due,metadata_date_raw DESC);
             CREATE INDEX IF NOT EXISTS host_state ON articles(host,state);
@@ -428,6 +737,10 @@ class NewsQueue:
                             "WHERE metadata_order_day IS NULL AND metadata_date_raw LIKE '____-__-__%'")
         if "last_checked_at_utc" not in {row[1] for row in self.db.execute("PRAGMA table_info(articles)")}:
             self.db.execute("ALTER TABLE articles ADD COLUMN last_checked_at_utc TEXT")
+        if "validator_url" not in {row[1] for row in self.db.execute("PRAGMA table_info(articles)")}:
+            # Additive cache metadata, not a source/body ABI change. Legacy
+            # heads are bound lazily from sealed evidence when actually due.
+            self.db.execute("ALTER TABLE articles ADD COLUMN validator_url TEXT")
         if "priority" not in {row[1] for row in self.db.execute("PRAGMA table_info(discovery)")}:
             self.db.execute("ALTER TABLE discovery ADD COLUMN priority INTEGER NOT NULL DEFAULT 100")
         discovery_columns = {row[1] for row in self.db.execute("PRAGMA table_info(discovery)")}
@@ -500,11 +813,15 @@ class NewsQueue:
         with self.metrics.measure('abandoned_work_recovery'):
             self.db.execute(ABANDONED_WORK_RECOVERY_SQL)
             self.db.commit()
+        if self.lifecycle is not None:
+            self.lifecycle.phase('acceptance_recovery', receipts_decoded=0)
         self.recover_acceptance()
         from downloader.news_fulltext_cnyes_history import initialize as initialize_cnyes_history
         initialize_cnyes_history(self)
         from downloader.news_fulltext_cnyes_index import initialize as initialize_cnyes_index
         initialize_cnyes_index(self)
+        if self.lifecycle is not None:
+            self.lifecycle.phase('policy_reconciliation')
         self.reconcile_policy()
         self.reconcile_successful_feed_rechecks()
         try:
@@ -517,6 +834,8 @@ class NewsQueue:
         initialize_original_urls(self)
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('current_owner_id',?)", (self.owner,))
+        if self.lifecycle is not None:
+            self.lifecycle.phase('awaiting_first_snapshot')
 
     def close(self):
         from downloader.news_fulltext_metadata_ingest import close_readers
@@ -966,8 +1285,33 @@ class NewsQueue:
         self.recheck_changed_cnyes_parser(prior_sources.get('source_capture_fingerprint:cnyes'),
                                          prior_parsers.get('source_parser_repair_fingerprint:cnyes'))
         self.recheck_ftnn_release_clocks(prior_sources.get('source_capture_fingerprint:ftnn'))
+        self.recheck_ftnn_native_titles(prior_sources.get('source_capture_fingerprint:ftnn'))
+        self.recheck_ftnn_native_layout(prior_sources.get('source_capture_fingerprint:ftnn'))
+        self.recheck_ftv_native_parser(prior_sources.get('source_capture_fingerprint:ftvnews'))
         self.recheck_tvbs_native_credits_and_clocks(prior_sources.get('source_capture_fingerprint:tvbs'))
+        self.recheck_tvbs_native_v3(prior_sources.get('source_capture_fingerprint:tvbs'))
+        self.recheck_tvbs_native_music(prior_sources.get('source_capture_fingerprint:tvbs'))
         self.recheck_ettoday_independent_release_revision_clocks(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_literal_json_values(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_verified_native_bodies(prior_sources)
+        self.recheck_ettoday_social_headlines(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_break_credits(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_static_imgur(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_static_threads(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_caption_credit_only(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_two_threads(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_split_reporter(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_instagram_preview(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_finance_query(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_source_redirects(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_author_url_comment(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_static_twitter_quote(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_static_facebook_video(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_reporter_subset(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_3c_channel(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_native_channel(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_house_paths(prior_sources.get('source_capture_fingerprint:ettoday'))
+        self.recheck_ettoday_house_native(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_changed_feed_parser(prior_sources, prior_parsers)
         self.recheck_taiwanhot_native_views(prior_sources.get('source_capture_fingerprint:taiwanhot'),
                                           prior_parsers.get('source_parser_repair_fingerprint:taiwanhot'))
@@ -1012,8 +1356,16 @@ class NewsQueue:
                                     "WHERE host=? AND state='awaiting_authorization'", (host,))
                     if (parser_changed and source.provider != 'cnyes'
                             and not ftnn_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ftnn'))
+                            and not (source.provider == 'ftnn'
+                                     and source.embedded_article_layout in {'ftnn_visible_article_v2', 'ftnn_visible_article_v3', 'ftnn_visible_article_v4', 'ftnn_visible_article_v5', 'ftnn_visible_article_v6'})
                             and not tvbs_native_v2_parser_repair(source, prior_sources.get('source_capture_fingerprint:tvbs'))
+                            and not (source.provider == 'tvbs' and source.embedded_article_layout in {'tvbs_visible_article_v3', 'tvbs_visible_article_v4'})
+                            and not (source.provider == 'ftvnews' and source.embedded_article_layout in {'ftv_visible_article_v2', 'ftv_visible_article_v3', 'ftv_visible_article_v4', 'ftv_visible_article_v5', 'ftv_visible_article_v6', 'ftv_visible_article_v7'})
                             and not ettoday_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
+                            and not ettoday_literal_value_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
+                            and not native_body_only_layout(source)
+                            and not (source.provider == 'ettoday'
+                                     and ETTODAY_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 7)
                             and not (source.provider == 'taiwanhot'
                                      and source.embedded_article_layout == 'taiwanhot_visible_article_v3')):
                         # Retry parser failures only after a parser repair,
@@ -1166,13 +1518,930 @@ class NewsQueue:
             'ftnn_native_release_revision_recheck_v1:',
             lambda url: bool(re.fullmatch(r'https://www[.]ftnn[.]com[.]tw/news/[1-9][0-9]*', url)))
 
+    def recheck_ftnn_native_titles(self, previous_capture):
+        """One normal retry of missing identities, never old credit failures.
+
+        Native trailing whitespace explains an identity cohort, not every
+        identity failure. An inspected photo-first credit still failed source
+        scope checks; no signature failure is reopened on that evidence.
+        Saved bodies, leases, rights/refusals, attempts, due and original
+        error/observation clocks stay intact. Acceptance still owns proof.
+        """
+        source = self.registry.sources.get('ftnn')
+        if not ftnn_native_v2_parser_repair(source, previous_capture):
+            return
+        marker = 'ftnn_native_title_recheck_v2:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired = []
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                "WHERE provider='ftnn' AND state='article_identity_not_verified' "
+                'AND state=error_code AND body_sha256 IS NULL AND parquet_path IS NULL '
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL '
+                'ORDER BY url').fetchall()
+            for row in rows:
+                if not re.fullmatch(r'https://www[.]ftnn[.]com[.]tw/news/[1-9][0-9]*', row['url']):
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ftnn_identity_changed_during_title_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'saved_heads_leases_refusals_clock_and_other_signature_cohorts_changed': False,
+                'all_failures_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_title_rechecks_v2', len(repaired))
+
+    def recheck_ftnn_native_layout(self, previous_capture):
+        """Reopen only a version's proved residuals, not accepted older cohorts.
+
+        A full prior capture pin, exact URL/error pair, observed aware clock,
+        missing head and no lease are required. Preserve every field except
+        state and save the original evidence once; never assume acceptance.
+        """
+        source = self.registry.sources.get('ftnn')
+        if ftnn_native_v3_parser_repair(source, previous_capture):
+            version, cohort = 3, FTNN_NATIVE_V3_REPAIR_COHORT
+        elif ftnn_native_v4_parser_repair(source, previous_capture):
+            version, cohort = 4, FTNN_NATIVE_V4_REPAIR_COHORT
+        elif ftnn_native_v5_parser_repair(source, previous_capture):
+            version, cohort = 5, FTNN_NATIVE_V5_REPAIR_COHORT
+        elif ftnn_native_v6_parser_repair(source, previous_capture):
+            version, cohort = 6, FTNN_NATIVE_V6_REPAIR_COHORT
+        else:
+            return
+        marker = f'ftnn_native_layout_recheck_v{version}:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired = []
+        placeholders = ','.join('?' for _ in cohort)
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                "WHERE provider='ftnn' AND url IN (" + placeholders + ') '
+                "AND state IN ('article_identity_not_verified','article_attribution_not_verified','body_not_found') "
+                'AND state=error_code AND body_sha256 IS NULL AND parquet_path IS NULL '
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL '
+                'ORDER BY url', tuple(cohort)).fetchall()
+            for row in rows:
+                if row['error_code'] != cohort[row['url']]:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ftnn_residual_changed_during_native_layout_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'saved_heads_leases_refusals_and_other_failure_cohorts_changed': False,
+                'all_failures_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, f'native_layout_rechecks_v{version}', len(repaired))
+
+    def recheck_verified_native_bodies(self, prior_sources):
+        """Requeue only observed, unsaved, unleased native missing bodies.
+
+        Older repaired clocks/JSON, healthy heads and source refusals must not
+        repeat. Preserve attempts, deadlines, error and the original observation;
+        the normal source HTTP/writer must still verify and durably commit.
+        """
+        for provider in ('cmnews', 'ettoday'):
+            source = self.registry.sources.get(provider)
+            previous_capture = prior_sources.get('source_capture_fingerprint:' + provider)
+            if not native_body_only_parser_repair(source, previous_capture):
+                continue
+            marker = 'verified_native_body_recheck_v1:' + provider + ':' + source.data_fingerprint
+            if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+                continue
+            with self.db:
+                rows = [dict(row) for row in self.db.execute(
+                    'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                    "WHERE provider=? AND state='body_not_found' AND error_code='body_not_found' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                    'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url', (provider,))]
+                for row in rows:
+                    if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                        raise ValueError('native_missing_body_changed_during_repair')
+                self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                    'contract_version': 1, 'provider': provider, 'old_source_fingerprint': previous_capture,
+                    'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                    'previous_state': 'body_not_found', 'target_state': 'retry',
+                    'rows': [{key: value for key, value in row.items() if key != 'id'} for row in rows],
+                    'attempts_due_error_and_observation_preserved': True,
+                    'stored_heads_source_refusals_leases_old_clock_or_identity_cohorts_changed': False,
+                    'accepted_as_bodies': False}, sort_keys=True)))
+                self.metrics.count(provider, 'verified_native_body_rechecks_v1', len(rows))
+
+    def recheck_ettoday_social_headlines(self, previous_capture):
+        """One normal retry of observed missing identities, never saved bodies.
+
+        Only literal finance/www routes in the exact preceding source contract
+        qualify. Preserve attempts, deadlines, errors and observation clocks;
+        refusals, signatures, old clock repairs and healthy heads do not reopen.
+        A retry is not evidence that every old identity failure was a title.
+        """
+        from downloader.news_fulltext_ettoday import ettoday_request_identity
+
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_social_headline_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_social_headline_recheck_v1:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired = []
+        with self.db:
+            candidates = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles INDEXED BY dispatch '
+                "WHERE provider='ettoday' AND state='article_identity_not_verified' "
+                "AND error_code='article_identity_not_verified' AND body_sha256 IS NULL AND parquet_path IS NULL "
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL '
+                'ORDER BY url').fetchall()
+            for row in candidates:
+                if not ettoday_request_identity(row['url'], requested=True):
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_identity_changed_during_title_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'saved_heads_leases_refusals_signature_or_clock_cohorts_changed': False,
+                'all_failures_assumed_to_be_titles': False, 'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_social_headline_identity_rechecks_v1', len(repaired))
+
+    def recheck_ettoday_break_credits(self, previous_capture):
+        """Reopen only the one observed missing signature, preserving history.
+
+        Thousands of other signature failures have not been proved to use this
+        layout. Neither an organization schema nor a parser version proves a
+        byline. No completed head, access refusal, lease or prior retry resets.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_break_credit_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_break_credit_recheck_v8:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V8_PROVED_BREAK_CREDIT_URLS
+        placeholders = ','.join('?' for _ in ETTODAY_V8_PROVED_BREAK_CREDIT_URLS)
+        repaired = []
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                'WHERE url IN (' + placeholders + ") AND provider='ettoday' "
+                "AND state='article_attribution_not_verified' AND error_code='article_attribution_not_verified' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url', ETTODAY_V8_PROVED_BREAK_CREDIT_URLS).fetchall()
+            for row in rows:
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_signature_changed_during_break_credit_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_attribution_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_break_credit_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_break_credit_rechecks_v8', len(repaired))
+
+    def recheck_ettoday_static_imgur(self, previous_capture):
+        """Retry only the two proved empty-declaration failures, once.
+
+        Saved heads and unrelated identity/attribution failures are not this
+        cohort. Preserve every original attempt, due time, error and clock;
+        future deadlines remain future deadlines even after this migration.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_static_imgur_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_static_imgur_recheck_v9:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V9_PROVED_STATIC_IMGUR_URLS
+        placeholders = ','.join('?' for _ in ETTODAY_V9_PROVED_STATIC_IMGUR_URLS)
+        repaired = []
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                'WHERE url IN (' + placeholders + ") AND provider='ettoday' "
+                "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url', ETTODAY_V9_PROVED_STATIC_IMGUR_URLS).fetchall()
+            for row in rows:
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_static_imgur_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_static_imgur_urls_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_static_imgur_rechecks_v9', len(repaired))
+
+    def recheck_ettoday_static_threads(self, previous_capture):
+        """Reopen only two source-proved missing heads, once, state only.
+
+        Do not repeat older repaired articles or assume other identity errors
+        share these templates. Even future due times and original errors stay
+        intact; no source refusal, quota, lease or successful head is reset.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_static_threads_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_static_threads_recheck_v10:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V10_PROVED_THREADS_URLS
+        placeholders = ','.join('?' for _ in ETTODAY_V10_PROVED_THREADS_URLS)
+        repaired = []
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                'WHERE url IN (' + placeholders + ") AND provider='ettoday' "
+                "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url', ETTODAY_V10_PROVED_THREADS_URLS).fetchall()
+            for row in rows:
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_static_threads_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_static_threads_urls_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_static_threads_rechecks_v10', len(repaired))
+
+    def recheck_ettoday_caption_credit_only(self, previous_capture):
+        """One attested missing, due and unleased head; state-only, once.
+
+        The other attribution failures are not evidence of this source shape.
+        Never reset their errors, clocks, budgets, deadlines or saved bodies.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_caption_credit_only_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_caption_credit_only_recheck_v11:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V11_PROVED_CAPTION_CREDIT_URLS
+        placeholders = ','.join('?' for _ in ETTODAY_V11_PROVED_CAPTION_CREDIT_URLS)
+        repaired = []
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                'WHERE url IN (' + placeholders + ") AND provider='ettoday' "
+                "AND state='article_attribution_not_verified' AND error_code='article_attribution_not_verified' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL AND due<=? ORDER BY url',
+                (*ETTODAY_V11_PROVED_CAPTION_CREDIT_URLS, time.time())).fetchall()
+            for row in rows:
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_caption_credit_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_attribution_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_caption_credit_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_caption_credit_only_rechecks_v11', len(repaired))
+
+    def recheck_ettoday_two_threads(self, previous_capture):
+        """Reopen only the attested missing identity once, not healthy heads."""
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_two_threads_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_two_threads_recheck_v12:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V12_PROVED_TWO_THREADS_URLS
+        repaired = []
+        now = time.time()
+        with self.db:
+            for url in ETTODAY_V12_PROVED_TWO_THREADS_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_two_threads_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 12, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_two_threads_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_two_threads_rechecks_v12', len(repaired))
+
+    def recheck_ettoday_split_reporter(self, previous_capture):
+        """Reopen one observed missing byline, not completed or leased heads."""
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_split_reporter_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_split_reporter_recheck_v13:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V13_PROVED_SPLIT_REPORTER_URLS
+        repaired = []
+        now = time.time()
+        with self.db:
+            for url in ETTODAY_V13_PROVED_SPLIT_REPORTER_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_attribution_not_verified' AND error_code='article_attribution_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_split_reporter_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 13, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_attribution_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_split_reporter_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_split_reporter_rechecks_v13', len(repaired))
+
+    def recheck_ettoday_instagram_preview(self, previous_capture):
+        """Retry only the observed missing head; preserve all prior evidence."""
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_instagram_preview_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_instagram_preview_recheck_v14:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V14_PROVED_INSTAGRAM_PREVIEW_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V14_PROVED_INSTAGRAM_PREVIEW_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_instagram_preview_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 14, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_instagram_preview_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_instagram_preview_rechecks_v14', len(repaired))
+
+    def recheck_ettoday_finance_query(self, previous_capture):
+        """One-time retry of observed, due missing heads on the proved route.
+
+        Identical numeric IDs are not body equivalence. Complete/saved heads,
+        other queries, source refusals, attempts and all observation clocks
+        remain untouched. The normal parser must still verify every article.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_finance_query_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_finance_query_recheck_v16:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired, now = [], time.time()
+        with self.db:
+            rows = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                "FROM articles INDEXED BY dispatch WHERE provider='ettoday' "
+                "AND state='unsupported_article_path' AND error_code='unsupported_article_path' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (now,)).fetchall()
+            for row in rows:
+                if not re.fullmatch(r'https://finance[.]ettoday[.]net/news/[1-9][0-9]*[?]redirect=1', row['url']):
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_finance_query_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 16, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'unsupported_article_path', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'saved_heads_leases_refusals_or_other_queries_changed': False,
+                'numeric_id_hint_is_not_body_equivalence': True, 'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_finance_query_rechecks_v16', len(repaired))
+
+    def recheck_ettoday_source_redirects(self, previous_capture):
+        """One retry for missing identity failures after source-chain repair.
+
+        A candidate is NOT an attested alias or accepted body. Each live
+        request must still supply its real connected redirects and pass all
+        native checks. Only state changes; saved heads, attempts, clocks,
+        leases, refusal budgets and future deadlines remain untouched.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_source_redirect_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_source_redirect_recheck_v17:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ettoday_request_identity
+        repaired, now = [], time.time()
+        with self.db:
+            rows = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                "FROM articles INDEXED BY dispatch WHERE provider='ettoday' "
+                "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (now,)).fetchall()
+            for row in rows:
+                if ettoday_request_identity(row['url'], requested=True, allow_finance_redirect_query=True) is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_source_redirect_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 17, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'saved_heads_leases_refusals_or_other_failures_changed': False,
+                'aliases_require_new_actual_source_chain_and_native_validation': True,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_source_redirect_rechecks_v17', len(repaired))
+
+    def recheck_ettoday_author_url_comment(self, previous_capture):
+        """One state-only retry of the independently witnessed schema defect.
+
+        Do not reopen the earlier 259 transport candidates or any saved head.
+        Original attempts, future deadlines, errors, clocks and leases stay
+        authoritative; a retry still needs a new complete native validation.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_author_url_comment_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_author_url_comment_recheck_v18:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V18_PROVED_AUTHOR_URL_COMMENT_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V18_PROVED_AUTHOR_URL_COMMENT_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_author_url_comment_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 18, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_author_url_comment_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_author_url_comment_rechecks_v18', len(repaired))
+
+    def recheck_ettoday_static_twitter_quote(self, previous_capture):
+        """Retry only the witnessed missing native report, once, state only.
+
+        Keep saved bodies, error/attempt/clock evidence, future deadlines,
+        leases, learned pacing, refusals and diagnostic budgets unchanged.
+        The retry itself proves neither a quote nor a whole article captured.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_static_twitter_quote_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_static_twitter_quote_recheck_v19:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V19_PROVED_STATIC_TWITTER_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V19_PROVED_STATIC_TWITTER_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_static_twitter_quote_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 19, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_static_twitter_quote_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_static_twitter_quote_rechecks_v19', len(repaired))
+
+    def recheck_ettoday_static_facebook_video(self, previous_capture):
+        """Once, state only, for the sole source-proved missing video preview.
+
+        Saved heads, attempts, deadlines, clocks, leases and refusal/diagnostic
+        budgets are not cleared. A retry is not evidence of article capture.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_static_facebook_video_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_static_facebook_video_recheck_v20:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V20_PROVED_STATIC_FACEBOOK_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V20_PROVED_STATIC_FACEBOOK_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_static_facebook_video_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 20, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_static_facebook_video_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_static_facebook_video_rechecks_v20', len(repaired))
+
+    def recheck_ettoday_reporter_subset(self, previous_capture):
+        """State-only retry of the one proved missing author-subset report."""
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_reporter_subset_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_reporter_subset_recheck_v21:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V21_PROVED_REPORTER_SUBSET_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V21_PROVED_REPORTER_SUBSET_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_reporter_subset_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 21, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_reporter_subset_url_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_reporter_subset_rechecks_v21', len(repaired))
+
+    def recheck_ettoday_3c_channel(self, previous_capture):
+        """State-only retry of two proved missing native 3C channel reports."""
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_3c_channel_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_3c_channel_recheck_v22:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V22_PROVED_3C_CHANNEL_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V22_PROVED_3C_CHANNEL_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_3c_channel_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 22, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_3c_channel_urls_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_3c_channel_rechecks_v22', len(repaired))
+
+    def recheck_ettoday_native_channel(self, previous_capture):
+        """Retry four source-proved missing heads; retain all original evidence."""
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_native_channel_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_native_channel_recheck_v23:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V23_PROVED_NATIVE_CHANNEL_URLS
+        repaired, now = [], time.time()
+        with self.db:
+            for url in ETTODAY_V23_PROVED_NATIVE_CHANNEL_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_head_changed_during_native_channel_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 23, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'only_observed_native_channel_urls_selected': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_channel_rechecks_v23', len(repaired))
+
+    def recheck_ettoday_house_native(self, previous_capture):
+        """Retry only two source-proved v24 failures; preserve all evidence."""
+        source = self.registry.sources.get('ettoday')
+        if (not source or not source.allowed or source.embedded_article_layout != 'ettoday_visible_article_v25'
+                or source.reviewed_article_subsites != ('house.ettoday.net',)
+                or source.data_fingerprint != source.parser_repair_capture_fingerprint
+                or not isinstance(previous_capture, str) or not re.fullmatch(r'[0-9a-f]{64}', previous_capture)
+                or previous_capture != source.parser_repair_prior_capture_fingerprint
+                or previous_capture == source.data_fingerprint):
+            return
+        marker = 'ettoday_house_native_recheck_v25:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V25_PROVED_HOUSE_NATIVE_FAILURES
+        repaired, now = [], time.time()
+        with self.db:
+            for url, error in ETTODAY_V25_PROVED_HOUSE_NATIVE_FAILURES:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE url=? AND provider='ettoday' AND host='house.ettoday.net' "
+                    'AND state=? AND error_code=? AND attempts>0 AND due<=? '
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND lease_owner IS NULL '
+                    'AND lease_until IS NULL AND last_checked_at_utc IS NOT NULL', (url, error, error, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_native_house_head_changed_during_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 25, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired, 'accepted_as_bodies': False,
+                'attempts_due_error_and_observation_preserved': True,
+                'unproved_attribution_failures_esg_redirect_or_healthy_heads_reopened': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'house_native_rechecks_v25', len(repaired))
+
+    def recheck_ettoday_house_paths(self, previous_capture):
+        """Once-only admission of newly reviewed missing native house routes.
+
+        This is a new explicit scope, not a same-authority parser alias. Only
+        the earlier local pre-HTTP path rejection is retryable. Never reopen
+        rights/identity/source failures, known redirects, stored bodies or
+        deadlines/leases. The current extractor still verifies every article.
+        """
+        source = self.registry.sources.get('ettoday')
+        if (not source or not source.allowed or source.embedded_article_layout != 'ettoday_visible_article_v24'
+                or source.reviewed_article_subsites != ('house.ettoday.net',)
+                or source.data_fingerprint != source.parser_repair_capture_fingerprint
+                or not isinstance(previous_capture, str) or not re.fullmatch(r'[0-9a-f]{64}', previous_capture)
+                or previous_capture == source.data_fingerprint):
+            return
+        marker = 'ettoday_house_path_recheck_v24:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ettoday_request_identity
+        repaired, now = [], time.time()
+        with self.db:
+            rows = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                "FROM articles INDEXED BY dispatch WHERE provider='ettoday' AND host='house.ettoday.net' "
+                "AND state='unsupported_article_path' AND error_code=state AND attempts>0 "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL '
+                'ORDER BY url', (now,)).fetchall()
+            for row in rows:
+                identity = ettoday_request_identity(row['url'], requested=True, allow_house=True)
+                if identity is None or identity[0] != 'house.ettoday.net':
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('ettoday_house_head_changed_during_admission')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 24, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'unsupported_article_path', 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'scope_was_explicitly_reviewed_not_an_authority_fingerprint_alias': True,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'house_path_rechecks_v24', len(repaired))
+
+    def recheck_ettoday_literal_json_values(self, previous_capture):
+        """Retry only three source-proved, missing/unleased identity failures.
+
+        The old clock cohort is already repaired: do not reopen its thousands
+        of healthy heads or assume all other identity errors are this defect.
+        Preserve attempts/deadlines/errors/clocks and every previous receipt.
+        """
+        source = self.registry.sources.get('ettoday')
+        if not ettoday_literal_value_parser_repair(source, previous_capture):
+            return
+        marker = 'ettoday_literal_json_value_recheck_v5:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_ettoday import ETTODAY_V5_PROVED_LITERAL_CONTROL_URLS
+        placeholders = ','.join('?' for _ in ETTODAY_V5_PROVED_LITERAL_CONTROL_URLS)
+        with self.db:
+            rows = [dict(row) for row in self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles '
+                "WHERE provider='ettoday' AND url IN (" + placeholders + ') '
+                "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                'AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url', ETTODAY_V5_PROVED_LITERAL_CONTROL_URLS)]
+            for row in rows:
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('exact_ettoday_literal_value_failure_changed_during_repair')
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': 'article_identity_not_verified', 'target_state': 'retry',
+                'rows': [{key: value for key, value in row.items() if key != 'id'} for row in rows],
+                'attempts_due_error_and_observation_preserved': True,
+                'refusals_leases_stored_heads_old_clock_cohorts_or_unrelated_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count('ettoday', 'literal_json_value_rechecks_v5', len(rows))
+
     def recheck_ettoday_independent_release_revision_clocks(self, previous_capture):
         source = self.registry.sources.get('ettoday')
         if not ettoday_clock_only_parser_repair(source, previous_capture):
             return
         from downloader.news_fulltext_ettoday import ettoday_request_identity
+        version = int(source.embedded_article_layout.rsplit('_v', 1)[1])
         self._recheck_native_release_revision_clocks(source, previous_capture,
-            'ettoday_independent_release_revision_recheck_v2:',
+            f'ettoday_independent_release_revision_recheck_v{version}:',
             lambda url: ettoday_request_identity(url, requested=True) is not None)
 
     def _recheck_native_release_revision_clocks(self, source, previous_capture, marker_prefix, admitted_url):
@@ -1246,6 +2515,134 @@ class NewsQueue:
                 'unknown_rights_refusals_leases_stored_heads_finite_cohorts_or_unrelated_failures_changed': False,
                 'accepted_as_bodies': False}, sort_keys=True)))
             self.metrics.count('tvbs', 'native_credit_clock_rechecks_v2', len(repaired))
+
+    def recheck_ftv_native_parser(self, previous_capture):
+        """Retry only source-proved missing heads once; preserve all evidence."""
+        source = self.registry.sources.get('ftvnews')
+        if not ftv_native_parser_repair(source, previous_capture):
+            return
+        version = int(source.embedded_article_layout.rsplit('_v', 1)[1])
+        repair = {4: 'literal_tab', 5: 'subsite_headline', 7: 'standalone_credit'}.get(version, 'paired_quote')
+        marker = f'ftv_{repair}_recheck_v{version}:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        urls = {2: ('https://www.ftvnews.com.tw/news/detail/2026A13W0651',),
+            3: ('https://www.ftvnews.com.tw/news/detail/2024730W0063',
+                'https://www.ftvnews.com.tw/news/detail/2025829W0721',
+                'https://www.ftvnews.com.tw/news/detail/2025903W0076'),
+            4: ('https://finance.ftvnews.com.tw/news/detail/2026501W0287',
+                'https://finance.ftvnews.com.tw/news/detail/2026507W0200',
+                'https://finance.ftvnews.com.tw/news/detail/2026510W0129'),
+            5: ('https://finance.ftvnews.com.tw/news/detail/2026610W0400',),
+            7: ('https://www.ftvnews.com.tw/news/detail/2021309W0100',
+                'https://www.ftvnews.com.tw/news/detail/2021316W0196')}[version]
+        failure_code = 'article_attribution_not_verified' if version == 7 else 'article_identity_not_verified'
+        now = time.time()
+        repaired = []
+        with self.db:
+            for url in urls:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE provider='ftvnews' AND url=? AND state=? "
+                    "AND error_code=state AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? "
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL',
+                    (url, failure_code, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    valid_clock = observed.tzinfo is not None and observed.timestamp() <= now + 2
+                except (ValueError, TypeError):
+                    valid_clock = False
+                if valid_clock:
+                    if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                        raise ValueError('ftv_exact_native_failure_changed_during_repair')
+                    repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': version, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'unproved_failures_saved_heads_leases_refusals_or_diagnostic_budgets_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count('ftvnews', f'{repair}_rechecks_v{version}', len(repaired))
+
+    def recheck_tvbs_native_v3(self, previous_capture):
+        """A single retry for six inspected heads; never reset refusal or due.
+
+        Every other TVBS head, including healthy bodies and old failures, stays
+        untouched. A source/parser upgrade is not a fresh diagnostic budget.
+        """
+        source = self.registry.sources.get('tvbs')
+        if not tvbs_native_v3_parser_repair(source, previous_capture):
+            return
+        marker = 'tvbs_native_remaining_recheck_v3:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_tvbs import TVBS_V3_PROVED_FAILURES
+        repaired = []
+        with self.db:
+            for url, error in TVBS_V3_PROVED_FAILURES.items():
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE provider='tvbs' AND url=? AND state=? AND error_code=? "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND last_checked_at_utc IS NOT NULL '
+                    'AND lease_owner IS NULL AND lease_until IS NULL', (url, error, error)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('tvbs_exact_remaining_failure_changed_during_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 3, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'unproved_failures_saved_heads_leases_refusals_or_diagnostic_budgets_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count('tvbs', 'native_remaining_rechecks_v3', len(repaired))
+
+    def recheck_tvbs_native_music(self, previous_capture):
+        """One due source-proved missing identity; preserve all failure evidence."""
+        source = self.registry.sources.get('tvbs')
+        if not tvbs_native_v4_parser_repair(source, previous_capture):
+            return
+        marker = 'tvbs_native_music_recheck_v4:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        from downloader.news_fulltext_tvbs import TVBS_V4_PROVED_MUSIC_URLS
+        repaired = []
+        now = time.time()
+        with self.db:
+            for url in TVBS_V4_PROVED_MUSIC_URLS:
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE provider='tvbs' AND url=? "
+                    "AND state='article_identity_not_verified' AND error_code='article_identity_not_verified' "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND due<=? '
+                    'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > now + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('tvbs_exact_music_failure_changed_during_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 4, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'unproved_failures_saved_heads_leases_refusals_or_diagnostic_budgets_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count('tvbs', 'native_music_rechecks_v4', len(repaired))
 
     def recheck_taiwanhot_native_views(self, previous_capture, previous_identity):
         """Pinned v1 URI admission defects, not body failures/source refusals.
@@ -2037,7 +3434,7 @@ class NewsQueue:
         self.metrics.count(provider, "frontier_missing_body_dispatches" if row['body_sha256'] is None else "frontier_stored_recheck_dispatches")
         if row['body_sha256'] is None and not row['metadata_order_day']:
             self.metrics.count(provider, "frontier_undated_missing_body_dispatches")
-        return dict(row)
+        return self._bind_saved_validators(dict(row))
 
     @staticmethod
     def discovery_dispatch_filter(source, bulk_allowed=True, *, include_circuits=True):
@@ -2177,7 +3574,7 @@ class NewsQueue:
             self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=? WHERE id=?",
                             (self.owner, now + lease_seconds, row["id"]))
         self.metrics.count(row["provider"], "frontier_attempts_started")
-        return dict(row)
+        return self._bind_saved_validators(dict(row))
 
     def schedule_recent_rechecks(self, seconds: int, days: int):
         now = datetime.now(timezone.utc)
@@ -2234,6 +3631,12 @@ class NewsQueue:
             # arbitrary metric names, extra parse, file or HTTP request. The
             # original error/deadline and diagnostic daily budget stay intact.
             self.metrics.count('cnyes', 'native_body_failure_stage_' + stage)
+        stage = getattr(error, 'ettoday_attribution_failure_stage', None)
+        if (row['provider'] == 'ettoday' and error.code == 'article_attribution_not_verified'
+                and type(stage) is str and stage in ETTODAY_ATTRIBUTION_FAILURE_STAGES):
+            # Static extractor branch only: no source text, extra parse, SQL,
+            # file or request, and no refill of bounded metadata witnesses.
+            self.metrics.count('ettoday', 'native_attribution_failure_stage_' + stage)
         if unknown_body:
             self.metrics.count('cnyes', 'unknown_body_failure_rechecks_deferred')
         if unknown_identity:
@@ -2242,19 +3645,58 @@ class NewsQueue:
             from downloader.news_fulltext_diagnostics import retain_failure_response
             retain_failure_response(self, row, error)
 
+    def _saved_body_record(self, row, *, validators=False):
+        """Verify the sealed batch and select this head using metadata only.
+
+        A valid batch for another article is not evidence for this head. Body
+        and raw-response columns are not decoded for conditional revalidation.
+        """
+        target = source_path(self.root, row['parquet_path'])
+        accepted = self.db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?',
+                                   (row['parquet_path'],)).fetchone()
+        receipt = json.loads(source_path(self.root, accepted[0]).read_text()) if accepted else None
+        if receipt is None or sha256_file(target) != receipt['sha256']:
+            raise ValueError('saved_body_digest_mismatch')
+        columns = ('article_id', 'body_sha256', 'source_request_url', 'etag', 'last_modified',
+                   'authorization_fingerprint')
+        batch = pq.ParquetFile(target)
+        records = batch.read(columns=[key for key in columns if key in batch.schema_arrow.names]).to_pylist()
+        matches = [record for record in records if record.get('article_id') == row['id'].hex()
+                   and record.get('body_sha256') == row['body_sha256']
+                   and (not validators or all(record.get(key) == row.get(key)
+                        for key in ('etag', 'last_modified', 'authorization_fingerprint')))]
+        if not matches or validators and len({r.get('source_request_url') for r in matches}) != 1:
+            raise ValueError('saved_body_head_not_verified')
+        return matches[-1]
+
+    def _bind_saved_validators(self, row):
+        if (row.get('validator_url') or not row.get('body_sha256') or not row.get('parquet_path')
+                or not (row.get('etag') or row.get('last_modified'))):
+            return row
+        try:
+            with self.metrics.measure('saved_validator_binding', row['provider']):
+                record = self._saved_body_record(row, validators=True)
+                bound_url = normalize_url(record['source_request_url'])
+        except (OSError, ValueError, TypeError, KeyError, NewsError, pa.ArrowException):
+            self.metrics.count(row['provider'], 'saved_validator_binding_unavailable')
+            return row  # No guessing from article URL, canonical tag or API item ID.
+        with self.db:
+            self.db.execute('UPDATE articles SET validator_url=? WHERE id=? AND body_sha256=? '
+                            'AND parquet_path=? AND validator_url IS NULL',
+                            (bound_url, row['id'], row['body_sha256'], row['parquet_path']))
+        row['validator_url'] = bound_url
+        self.metrics.count(row['provider'], 'saved_validator_binding_recovered')
+        return row
+
     def unchanged(self, row: dict, max_attempts: int = 6):
         if not row.get("parquet_path") or not row.get("body_sha256"):
             self.failed(row, NewsError("unverifiable_not_modified"), 1)
             return
         try:
-            target = source_path(self.root, row["parquet_path"])
-            accepted = self.db.execute("SELECT receipt_path FROM accepted_batches WHERE path=?", (row["parquet_path"],)).fetchone()
-            receipt = json.loads(source_path(self.root, accepted[0]).read_text()) if accepted else None
-            if receipt is None or sha256_file(target) != receipt["sha256"]:
-                raise ValueError("saved_body_digest_mismatch")
-        except (OSError, ValueError, KeyError):
+            self._saved_body_record(row)
+        except (OSError, ValueError, TypeError, KeyError, pa.ArrowException):
             with self.db:
-                self.db.execute("UPDATE articles SET etag=NULL,last_modified=NULL WHERE id=?", (row["id"],))
+                self.db.execute("UPDATE articles SET etag=NULL,last_modified=NULL,validator_url=NULL WHERE id=?", (row["id"],))
             self.failed(row, NewsError("saved_body_unavailable", retry=True, delay=1), max_attempts)
             return
         with self.db:
@@ -2422,12 +3864,13 @@ class NewsQueue:
                     metadata_heads += 1
                     continue
                 self.db.execute("""UPDATE articles SET state='complete',error_code=NULL,captured_at_utc=?,last_checked_at_utc=?,body_bytes=?,
-                    body_sha256=?,parquet_path=?,etag=?,last_modified=?,authorization_fingerprint=?,
+                    body_sha256=?,parquet_path=?,etag=?,last_modified=?,authorization_fingerprint=?,validator_url=?,
                     metadata_order_day=CASE WHEN coalesce(metadata_order_day,'')='' THEN ? ELSE metadata_order_day END,
                     lease_owner=NULL,lease_until=NULL WHERE id=?""",
                     (record["captured_at_utc"], (json.loads(record['retained_failure_head_json'])['last_checked_at_utc']
                         if record.get('retained_failure_head_json') is not None else record["captured_at_utc"]), record["body_bytes"], record["body_sha256"], relative,
                      record.get("etag"), record.get("last_modified"), record["authorization_fingerprint"],
+                     record.get('source_request_url') if record.get('etag') or record.get('last_modified') else None,
                      accepted_publication_sort_day(record.get('published_at_raw')),
                      bytes.fromhex(record["article_id"])))
                 http_attempts += 1
@@ -2438,7 +3881,7 @@ class NewsQueue:
                 self.counter('retained_metadata_versions', metadata_heads)
         return metadata_heads
 
-    def recover_acceptance(self, *, receipt_paths=None):
+    def recover_acceptance(self, *, receipt_paths=None, read_ahead_workers=None):
         # Only small commit receipts, not a recursive raw-data scan. Replay files
         # written before a crash between durable receipt and SQLite commit.
         # Read every JSON as before, including already committed receipts. A
@@ -2448,27 +3891,108 @@ class NewsQueue:
         paths = (sorted_acceptance_receipt_paths(self.root) if receipt_paths is None
                  else iter(sorted(receipt_paths)))
         receipt_directory = self.root / 'receipts'
-        with self.metrics.measure('acceptance_recovery'):
-            while chunk := list(islice(paths, 128)):
-                # Glob supplies direct children of this exact directory. Avoid
-                # Python 3.12 relative_to walking ancestor paths for each one;
-                # nonstandard explicit paths keep the original guarded route.
-                relative_receipts = [('receipts/' + path.name if path.parent == receipt_directory
-                                      else str(path.relative_to(self.root))) for path in chunk]
-                committed = {tuple(row) for row in self.db.execute('SELECT receipt_path,path FROM accepted_batches '
-                    'INDEXED BY accepted_batches_receipt_path WHERE receipt_path IN ('
-                    + ','.join('?' for _ in chunk) + ')', relative_receipts)}
-                for receipt_path, receipt_relative in zip(chunk, relative_receipts):
-                    self._recover_acceptance_receipt(receipt_path, receipt_relative, committed)
+        if read_ahead_workers is not None and (type(read_ahead_workers) is not int or not 0 <= read_ahead_workers <= 2):
+            raise ValueError('bounded_batched_receipt_readers_required')
+        observation = {'contract_version': 1, 'mode': 'adaptive' if read_ahead_workers is None else 'explicit',
+            'adaptive_strategy_version': ADAPTIVE_RECEIPT_STRATEGY_VERSION,
+            'chosen_readers': read_ahead_workers or 0, 'probes_checked': 0, 'last_probe': None,
+            'receipts_decoded': 0, 'prefetched_inputs': 0, 'synchronous_inputs': 0, 'completed': False,
+            'started_readers_after_receipts': 0 if read_ahead_workers else None,
+            'reader_mode_switches': 0, 'prefetch_slices': 0,
+            'adaptive_prefetch_slice_receipts': RECEIPT_CHUNK * RECEIPT_PREFETCH_MAX_CHUNKS,
+            # The owner can still hold its prior chunk while this iterator
+            # transfers the next and two workers fill bounded pending chunks.
+            'maximum_prefetch_raw_bytes': 4 * (1 << 20) + 2, 'all_json_and_replay_on_owner': True}
+        self.acceptance_receipt_io = observation
+        process_cpu_start = time.process_time()
+
+        def inputs():
+            if read_ahead_workers is not None:
+                with closing(receipt_input_chunks(paths, readers=read_ahead_workers, root=self.root)) as remaining:
+                    yield from remaining
+                return
+            chunk_number = 0
+            while chunk := list(islice(paths, RECEIPT_CHUNK)):
+                probe = ({'receipts': 0, 'wall_seconds': 0., 'cpu_seconds': 0.}
+                    if chunk_number % RECEIPT_PROBE_STRIDE == 0 else None)
+                self._acceptance_read_probe = probe
+                yield [(path, None, None) for path in chunk]
+                self._acceptance_read_probe = None
+                chunk_number += 1
+                if probe is not None:
+                    observation['probes_checked'] += 1
+                    observation['last_probe'] = probe
+                    chosen = adaptive_receipt_readers(probe)
+                    observation['reader_mode_switches'] += chosen != observation['chosen_readers']
+                    observation['chosen_readers'] = chosen
+                    if chosen:
+                        if observation['started_readers_after_receipts'] is None:
+                            observation['started_readers_after_receipts'] = observation['receipts_decoded']
+                        observation['prefetch_slices'] += 1
+                        # Exhaust this bounded slice and join every reader
+                        # before the next synchronous probe. Closing a live,
+                        # unbounded iterator here would drop prefetched inputs.
+                        prefetched = islice(paths, RECEIPT_CHUNK * RECEIPT_PREFETCH_MAX_CHUNKS)
+                        with closing(receipt_input_chunks(prefetched, readers=chosen, root=self.root)) as remaining:
+                            yield from remaining
+                        chunk_number = 0
+
+        try:
+            with self.metrics.measure('acceptance_recovery'), closing(inputs()) as input_batches:
+                for input_chunk in input_batches:
+                    self._recover_acceptance_chunk(input_chunk, receipt_directory, observation)
+                    if getattr(self, 'lifecycle', None) is not None:
+                        self.lifecycle.phase('acceptance_recovery',
+                            receipts_decoded=observation['receipts_decoded'], throttle=True)
+            observation['completed'] = True
+            if getattr(self, 'lifecycle', None) is not None:
+                self.lifecycle.phase('acceptance_recovery',
+                    receipts_decoded=observation['receipts_decoded'])
+        finally:
+            self._acceptance_read_probe = None
+            observation['process_cpu_seconds'] = time.process_time() - process_cpu_start
+
+    def _recover_acceptance_chunk(self, input_chunk, receipt_directory, observation):
+        """One canonical covering lookup; ordered decode/replay on the owner."""
+        chunk = [path for path, _, _ in input_chunk]
+        # Glob supplies direct children of this exact directory. Avoid
+        # Python 3.12 relative_to walking ancestor paths for each one;
+        # nonstandard explicit paths keep the original guarded route.
+        relative_receipts = [('receipts/' + path.name if receipt_parent_matches(path, receipt_directory)
+                              else str(path.relative_to(self.root))) for path in chunk]
+        committed = {tuple(row) for row in self.db.execute('SELECT receipt_path,path FROM accepted_batches '
+            'INDEXED BY accepted_batches_receipt_path WHERE receipt_path IN ('
+            + ','.join('?' for _ in chunk) + ')', relative_receipts)}
+        for (receipt_path, raw, error), receipt_relative in zip(input_chunk, relative_receipts):
+            if error is not None:
+                raise error
+            if raw is None:
+                observation['synchronous_inputs'] += 1
+                self._recover_acceptance_receipt(receipt_path, receipt_relative, committed)
+            else:
+                observation['prefetched_inputs'] += 1
+                self._recover_acceptance_receipt(receipt_path, receipt_relative, committed,
+                    receipt_text=acceptance_receipt_input_from_bytes(raw))
+            observation['receipts_decoded'] += 1
 
     def _recover_acceptance_receipt(self, receipt_path, receipt_relative, committed, *, receipt_text=None):
-        # The explicit text seam is for isolated read-only I/O benchmarks; the
-        # production owner always reads each original file synchronously.
+        # I/O may supply a complete bounded original input. JSON decoding,
+        # SQLite and all orphan validation always remain on this owner thread.
         # Decode the entire original input, including committed receipts. Reuse
         # the optional private-cache decoder; its stdlib fallback preserves
         # legacy JSON values/errors. Default-text input semantics, replay order and orphan
         # digest/row/contract verification are unchanged.
-        receipt = decode_private_json(read_acceptance_receipt_input(receipt_path) if receipt_text is None else receipt_text)
+        if receipt_text is None:
+            probe = getattr(self, '_acceptance_read_probe', None)
+            if probe is None:
+                receipt_text = read_acceptance_receipt_input(receipt_path)
+            else:
+                cpu, wall = time.process_time(), time.perf_counter()
+                receipt_text = read_acceptance_receipt_input(receipt_path)
+                probe['wall_seconds'] += time.perf_counter() - wall
+                probe['cpu_seconds'] += time.process_time() - cpu
+                probe['receipts'] += 1
+        receipt = decode_private_json(receipt_text)
         relative = receipt["parquet_path"]
         if ((receipt_relative, relative) in committed
                 or self.db.execute("SELECT 1 FROM accepted_batches WHERE path=?", (relative,)).fetchone()):
@@ -2611,6 +4135,8 @@ class NewsQueue:
                if getattr(self, 'failure_diagnostic_focus', None) is not None else {}),
             "acceptance_receipt_decode_version": ACCEPTANCE_RECEIPT_DECODE_VERSION,
             "acceptance_receipt_input_version": ACCEPTANCE_RECEIPT_INPUT_VERSION,
+            **({'acceptance_receipt_io': dict(self.acceptance_receipt_io)}
+               if hasattr(self, 'acceptance_receipt_io') else {}),
             "nonbody_scope_progress_query_version": NONBODY_SCOPE_PROGRESS_QUERY_VERSION,
             "article_dispatch_contract_version": ARTICLE_DISPATCH_CONTRACT_VERSION,
             "cnyes_window_dispatch_contract_version": CNYES_WINDOW_DISPATCH_CONTRACT_VERSION,
@@ -2680,6 +4206,8 @@ class NewsQueue:
         }
         with self.metrics.measure('status_json_publication'):
             atomic_write_json(self.root / "status.json", result, durable=False, compact=True)
+        if getattr(self, 'lifecycle', None) is not None:
+            self.lifecycle.snapshot_written()
         return result
 
 

@@ -1,4 +1,5 @@
 """A larger existing owner repairs a cold seed, not a stale GPU inference."""
+import fcntl
 import json
 from types import SimpleNamespace
 
@@ -6,12 +7,14 @@ import pytest
 
 from scripts import run_discord_artifact_maintenance as runner
 from stockagent.data.annual_cache_admission import CONTRACT
+from stockagent.live.market_config import LiveMarketConfig
 
 
 @pytest.fixture
 def owner(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "ROOT", tmp_path)
-    cfg = SimpleNamespace(market="factorized", completed_session_command=(
+    cfg = LiveMarketConfig(market="factorized", label="factorized", config_path="",
+        completed_session_timeout_seconds=1800, completed_session_command=(
         str(tmp_path / "scripts/update_tw_day_trade_factorized_live.py"), "--phase", "completed"))
     path = tmp_path / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/updater_status.json"
     path.parent.mkdir(parents=True)
@@ -21,7 +24,10 @@ def owner(tmp_path, monkeypatch):
     calls, emissions = [], []
     status = SimpleNamespace(market_open=False, data=SimpleNamespace(fresh=False))
     def command(got, *, bypass_cache):
-        assert got is cfg and bypass_cache is True
+        assert got is not cfg and bypass_cache is True
+        assert got.market == cfg.market and got.completed_session_command == cfg.completed_session_command
+        assert got.completed_session_timeout_seconds == runner.FACTORIZED_SOURCE_RECOVERY_SECONDS == 4800
+        assert cfg.completed_session_timeout_seconds == 1800
         calls.append("canonical_source")
         path.write_text(json.dumps({"status": "verified"}))
     bot = SimpleNamespace(_ensure_signal_ready=lambda _: status,
@@ -117,6 +123,55 @@ def test_deferred_cold_market_does_not_block_other_close_cache_consumers(owner, 
     bot._run_completed_session_signal_cache_sync = lambda current: cached.append(current.market)
     bot._log_exception = lambda *_a: pytest.fail("normal deferral is not an exception")
     monkeypatch.setattr(runner, "_load_discord_bot", lambda: bot)
-    assert runner._populate_postclose_signal_caches([cfg.market, other.market], allow_source_warming=False) == (2, 1)
+    assert runner._populate_postclose_signal_caches([cfg.market, other.market], allow_source_warming=False) == (2, 0, 1)
     assert calls == [] and cached == [other.market]
     assert emissions[-1]["reason"] == "isolated_source_owner_required"
+
+
+@pytest.mark.parametrize("lease", [None, fcntl.LOCK_SH, fcntl.LOCK_EX])
+def test_factorized_busy_probe_requires_a_live_exclusive_kernel_lease(owner, lease):
+    cfg, path, _state, _status, _bot, _calls, _emissions = owner
+    lock = path.with_name("prepare.lock")
+    assert not runner._factorized_source_preparation_busy(cfg)
+    with lock.open("a+") as handle:
+        if lease is not None:
+            fcntl.flock(handle.fileno(), lease)
+        assert runner._factorized_source_preparation_busy(cfg) is (lease == fcntl.LOCK_EX)
+        unrelated = SimpleNamespace(completed_session_command=("scripts/another_updater.py",))
+        assert not runner._factorized_source_preparation_busy(unrelated)
+    assert not runner._factorized_source_preparation_busy(cfg)
+
+
+def test_active_producer_defers_only_its_market_without_another_child_or_attempt(owner, monkeypatch):
+    cfg, path, _state, _status, bot, calls, emissions = owner
+    other = SimpleNamespace(market="other", completed_session_command=("scripts/another_updater.py",))
+    cached = []
+    bot._resolve_market = lambda name: cfg if name == cfg.market else other
+    bot._is_tw_daily_signal_market = lambda _cfg: True
+    bot._run_completed_session_signal_cache_sync = lambda current: cached.append(current.market)
+    bot._log_exception = lambda *_a: pytest.fail("normal producer wait is not an exception")
+    before = path.read_bytes()
+    with path.with_name("prepare.lock").open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        assert runner._populate_postclose_signal_caches([cfg.market, other.market]) == (2, 0, 1)
+    assert calls == [] and cached == [other.market]
+    assert path.read_bytes() == before
+    assert emissions[-1]["reason"] == "factorized_projection_in_progress"
+    assert emissions[-1]["model_executed"] is False
+
+
+def test_changed_loaded_code_stops_the_process_not_other_market_retry_budgets(owner, monkeypatch):
+    from stockagent.live.completed_inference_cache import LoadedImplementationChanged
+
+    cfg, path, _state, _status, bot, calls, _emissions = owner
+    path.write_text(json.dumps({"status": "verified"}))
+    bot._resolve_market = lambda _: cfg
+    bot._is_tw_daily_signal_market = lambda _cfg: True
+    def changed(_cfg):
+        calls.append("cache")
+        raise LoadedImplementationChanged()
+    bot._run_completed_session_signal_cache_sync = changed
+    bot._log_exception = lambda *_a: pytest.fail("global drift is not a per-market cache error")
+    with pytest.raises(LoadedImplementationChanged):
+        runner._populate_postclose_signal_caches([cfg.market, "next"])
+    assert calls == ["cache"]

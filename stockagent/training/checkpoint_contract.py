@@ -88,6 +88,15 @@ def _normalize_risk_objective(loss_type: str) -> str:
         "sharpck",
         "sharpe_ratio",
         "sortino",
+        "trajectory_sharpe",
+        "trajectory_return",
+        "trajectory_sortino",
+        "trajectory_mdd",
+        "trajectory_calmar",
+        "trajectory_pcgrad_return",
+        "trajectory_mgda_return",
+        "trajectory_pcgrad_parameter",
+        "trajectory_mgda_parameter",
         "log_utility",
         "log_util",
         "kelly",
@@ -141,7 +150,7 @@ def _normalized_model_name(model_name: str) -> str:
 
 def _is_tree_model_name(model_name: str) -> bool:
     normalized = _normalized_model_name(model_name)
-    return normalized in {"lightgbm", "lgbm", "xgboost", "xgb"}
+    return normalized in {"lightgbm", "lgbm", "xgboost", "xgb", "classical"}
 
 
 def _stable_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -195,6 +204,14 @@ def _project_temporal_basis_model_config(
     """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
+    if projected.get("portfolio_risk_calibration", "off") == "off":
+        projected.pop("portfolio_risk_calibration", None)
+    else:
+        projected["risk_calibration_contract"] = "identity_frozen_direction_conditional_risk_odds_v1"
+    if not int(projected.get("factorized_frozen_encoder_cache_bytes", 0)):
+        projected.pop("factorized_frozen_encoder_cache_bytes", None)
+    else:
+        projected["frozen_encoder_cache_contract"] = "owned_frozen_policy_or_encoder_parameters_buffers_mask_source_rows_v2"
     if projected.get("compiled_cross_attention_backend") == "sdpa_explicit":
         projected["sdpa_dispatch_contract"] = "masked_credit_math_only_v2"
     if projected.get("compiled_cross_attention_backend") == "sdpa_padded":
@@ -274,7 +291,10 @@ def _project_temporal_basis_model_config(
         projected.pop("factorized_sparse_projection", None)
         projected.pop("factorized_sparse_cache_bytes", None)
     else:
-        projected["factorized_sparse_projection_contract"] = "full_schema_csr_affine_stable_full_rows_gpu_resident_v2"
+        projected["factorized_sparse_projection_contract"] = "full_schema_csr_fixed_row_fp32_forward_v3"
+        from stockagent.models.factorized_sparse_projection import sparse_adjoint_contract
+        if (adjoint := sparse_adjoint_contract()) is not None:
+            projected["factorized_sparse_adjoint_contract"] = adjoint
     if int(projected.get("feature_bottleneck_dim", 0) or 0) == 0:
         # Zero is the historical direct-input architecture.  Omit the disabled
         # post-schema field so merely upgrading the runtime cannot invalidate
@@ -358,6 +378,9 @@ def _project_temporal_basis_model_config(
 def _factorized_input_graph_contract(config: ExperimentConfig) -> str:
     model = config.training.financial_transformer
     if bool(getattr(model, "factorized_sparse_projection", False)):
+        if (bool(getattr(model, "factorized_cuda_graphs", False))
+                or bool(getattr(model, "factorized_portfolio_cuda_graphs", False))):
+            return "compiled_partition_resident_csr_owned_accumulated_leaf_gradients_abi_v11"
         return "compiled_partition_resident_csr_stem_narrow_temporal_abi_v10"
     from stockagent.models.factorized_input import factorized_head_backend_contract
     if factorized_head_backend_contract(model) != "inductor_v1":
@@ -380,6 +403,11 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    # A disabled infer-only source binding must not change historical training
+    # configuration fingerprints. An enabled binding remains explicit in the
+    # runtime snapshot; the executor records its actual content receipts too.
+    if snapshot["data"]["day_trade_inference_public_feature_path"] is None:
+        snapshot["data"].pop("day_trade_inference_public_feature_path")
     if snapshot["training"]["ddp_broadcast_buffers"]:
         snapshot["training"].pop("ddp_broadcast_buffers")
     if snapshot["training"]["ddp_trajectory_gradient_sync"] == "batch":
@@ -427,6 +455,16 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     snapshot["training"].pop("factorized_encoder_checkpoint", None)
     if normalize_execution_mode(config.trading.execution_mode) == "tw_day_trade":
         from stockagent.backtest.tw_day_trade_carry import _carry_compile_options
+        from stockagent.backtest.tw_day_trade_inventory import INVENTORY_VOLUME_ADJOINT_ABI
+        snapshot["training"]["physical_fifo_volume_adjoint_contract"] = INVENTORY_VOLUME_ADJOINT_ABI
+        from stockagent.backtest.tw_inventory_scan import inventory_prefix_contract
+        prefix = inventory_prefix_contract()
+        if prefix is not None:
+            snapshot["training"]["physical_fifo_prefix_contract"] = prefix
+        from stockagent.backtest.tw_day_trade_graph_transport import packed_session_copy_contract
+        transport = packed_session_copy_contract()
+        if transport is not None:
+            snapshot["training"]["physical_fifo_packed_copy_contract"] = transport
         options = _carry_compile_options()
         default = {"triton.cudagraphs": False, "max_fusion_size": 8,
             "triton.coalesce_tiling_analysis": False}
@@ -485,6 +523,8 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     training = snapshot.get("training")
     if isinstance(training, dict):
         active_model_name = _normalized_model_name(config.training.model_name)
+        if active_model_name != "classical":
+            training.pop("classical", None)
         for config_name in (
             "transformer_base_portfolio",
             "financial_transformer",
@@ -900,11 +940,14 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
     if training.day_trade_sub_lot_recovery:
         fold_continuation_contract["day_trade_sub_lot_recovery"] = "one_lot_fifo_utility_v1"
     if training.day_trade_dense_allocation_backward:
-        fold_continuation_contract["day_trade_dense_allocation_backward"] = "dense_softmax_adjoint_sparse_exact_forward_v1"
+        fold_continuation_contract["day_trade_dense_allocation_backward"] = "dense_log_shape_softmax_adjoint_sparse_exact_forward_v2"
     if training.day_trade_training_annual_episodes:
         fold_continuation_contract["day_trade_training_annual_episodes"] = (
             day_trade_training_episode_contract(config)
         )
+    from stockagent.training.return_adjoint import RETURN_ADJOINT_OBJECTIVES, return_adjoint_contract
+    if objective in RETURN_ADJOINT_OBJECTIVES:
+        fold_continuation_contract["return_adjoint"] = return_adjoint_contract(objective)
     contract: dict[str, Any] = {
         "seed": int(training.seed),
         "objective": objective,
@@ -1001,6 +1044,17 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         contract["integer_gradient_contract_version"] = int(
             TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION
         )
+    if execution_mode == "tw_day_trade":
+        from stockagent.backtest.tw_day_trade_inventory import INVENTORY_VOLUME_ADJOINT_ABI
+        contract["physical_fifo_volume_adjoint_contract"] = INVENTORY_VOLUME_ADJOINT_ABI
+        from stockagent.backtest.tw_inventory_scan import inventory_prefix_contract
+        prefix = inventory_prefix_contract()
+        if prefix is not None:
+            contract["physical_fifo_prefix_contract"] = prefix
+        from stockagent.backtest.tw_day_trade_graph_transport import packed_session_copy_contract
+        transport = packed_session_copy_contract()
+        if transport is not None:
+            contract["physical_fifo_packed_copy_contract"] = transport
     if (execution_mode == "tw_day_trade" and
         str(os.environ.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0")).lower()
             not in {"0", "false", "off", "no"}):
@@ -1026,6 +1080,14 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         # metadata: older inner-DDP-split optimizer trajectories must not be
         # continued under the new compiled graph ownership.
         contract["factorized_input_graph_contract"] = _factorized_input_graph_contract(config)
+    if (training.model_name == "financial_transformer"
+            and getattr(config.data, "factorized_feature_manifest", "")
+            and training.financial_transformer.factorized_sparse_projection):
+        from stockagent.models.factorized_sparse_projection import sparse_adjoint_contract
+        if (adjoint := sparse_adjoint_contract()) is not None:
+            # The optimizer contract is a separate schema from the model
+            # fingerprint. Both must reject a changed FP32 accumulation schedule.
+            contract["factorized_sparse_adjoint_contract"] = adjoint
     # These rank objectives return before portfolio post-processing/backtest in
     # risk_aware_loss, so changing the loss activation cannot change gradients.
     if objective not in {"pure_rank", "rank_ic"}:
@@ -2240,6 +2302,12 @@ def _transformer_base_checkpoint_model_values(
         contract["portfolio_output_contract"] = (
             "contextual_cash_gate_signed_direction_v1"
         )
+    elif output_mode == "decoupled_entmax_cash":
+        contract["portfolio_output_contract"] = "independent_selection_direction_cash_entmax_v1"
+    elif output_mode == "decoupled_entmax_cash_v2":
+        contract["portfolio_output_contract"] = "independent_selection_direction_unit_l1_cash_entmax_v2"
+    elif output_mode == "score_entmax_scale_separated_cash_v2":
+        contract["portfolio_output_contract"] = "score_entmax_scale_separated_cash_implicit_vjp_v2"
     elif output_mode == "score_entmax_global_cash":
         contract["portfolio_output_contract"] = "score_entmax_global_cash_v1"
     elif output_mode == "score_entmax_bounded_cash":
@@ -2386,6 +2454,12 @@ def _checkpoint_model_values(
             contract["portfolio_output_contract"] = (
                 "contextual_cash_gate_signed_direction_v1"
             )
+        elif output_mode == "decoupled_entmax_cash":
+            contract["portfolio_output_contract"] = "independent_selection_direction_cash_entmax_v1"
+        elif output_mode == "decoupled_entmax_cash_v2":
+            contract["portfolio_output_contract"] = "independent_selection_direction_unit_l1_cash_entmax_v2"
+        elif output_mode == "score_entmax_scale_separated_cash_v2":
+            contract["portfolio_output_contract"] = "score_entmax_scale_separated_cash_implicit_vjp_v2"
         elif output_mode == "score_entmax_global_cash":
             contract["portfolio_output_contract"] = "score_entmax_global_cash_v1"
         elif output_mode == "score_entmax_bounded_cash":

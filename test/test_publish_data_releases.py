@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import shlex
+import select
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,61 @@ def test_writer_gate_uses_script_argv_not_waiting_shell_text():
     assert [r["pid"] for r in module._blockers(entry, commands)] == [2]
 
 
+def test_catalog_root_selection_uses_original_publisher_without_whole_root_copy(tmp_path, monkeypatch, capsys):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    names = ["accepted.forward", "accepted.receipt.json"]
+    for name in names:
+        (source / name).write_bytes((name + " original bytes").encode())
+    (source / "unique-unselected-source").write_bytes(b"must not publish implicitly")
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({"schema_version": 1, "datasets": [{
+        "dataset": "selected-results", "source": str(source), "role": "exact completed result fixture",
+        "publish": True, "note": "selected source only, not whole namespace completeness",
+        "pack_buckets": 1, "loose_threshold_mib": 8, "included_root_files": names,
+        "source_coordination_lock": "source/.owner.lock",
+    }]}))
+    cold = tmp_path / "cold"
+    assert module.main(["publish", "selected-results", "--catalog", str(catalog),
+                        "--sync-root", str(cold), "--node-id", "test-node"]) == 0
+    result = json.loads(capsys.readouterr().out)["published"][0]
+    fixed = packed_snapshots.resolve_packed_snapshot_id(cold, result["dataset"], result["snapshot_id"])
+    target = fetch_packed_snapshot(cold, tmp_path / "materialized", fixed)
+    assert sorted(p.name for p in target.iterdir()) == names
+    assert all((target / name).read_bytes() == (source / name).read_bytes() for name in names)
+    status = module._status(module._load_catalog(catalog)[0], [])
+    assert status["publish_ready"] and status["source_selection"]["scope"] == "explicit_root_files_only"
+    assert (source / "unique-unselected-source").read_bytes() == b"must not publish implicitly"
+
+
+@pytest.mark.parametrize("selection", [None, [], "one.forward", ["nested/file"], ["same", "same"]])
+def test_catalog_rejects_implicit_or_ambiguous_root_selection(tmp_path, selection):
+    module = _module()
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({"schema_version": 1, "datasets": [{
+        "dataset": "selected-results", "included_root_files": selection}]}))
+    with pytest.raises(SnapshotError):
+        module._load_catalog(catalog)
+
+
+def test_catalog_status_refuses_missing_or_redirected_selected_members(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    entry = {"dataset": "selected-results", "source": str(source), "role": "fixture",
+             "publish": True, "note": "fixture", "included_root_files": ["result.forward"]}
+    status = module._status(entry, [])
+    assert not status["publish_ready"] and status["selection_error"]
+    (source / "other").write_bytes(b"not the selected file")
+    (source / "result.forward").symlink_to("other")
+    status = module._status(entry, [])
+    assert not status["publish_ready"] and "not regular" in status["selection_error"]
+    assert (source / "result.forward").is_symlink()
+
+
 def test_writer_gate_also_recognizes_python_module_argv():
     module = _module()
     entry = {"active_process_substrings": ["build_shioaji_tw_minute_dataset.py"]}
@@ -59,6 +115,188 @@ def test_all_ready_failure_is_isolated_from_other_datasets(tmp_path, monkeypatch
     result = json.loads(capsys.readouterr().out)
     assert [r['dataset'] for r in result['published']] == ['good']
     assert result['skipped'][0]['validation_or_publication_error'] == 'source validation rejected'
+
+
+def test_all_ready_defers_busy_source_without_sleeping(tmp_path, monkeypatch, capsys):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = _source(tmp_path, "2026-10-16")
+    good = {**_entry(source), "loose_threshold_mib": 8, "pack_buckets": 2}
+    busy = {**good, "dataset": "busy", "source_coordination_lock": "busy.lock"}
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: [busy, good])
+    monkeypatch.setattr(module.time, "sleep", lambda *_: pytest.fail("batch must not wait"))
+    with module._source_coordination_lock(busy, wait_seconds=0):
+        assert module.main(["publish", "--all-ready", "--sync-root", str(tmp_path / "cold"),
+                            "--node-id", "test-node"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [item["dataset"] for item in result["published"]] == ["prices"]
+    skipped = result["skipped"][0]
+    assert skipped["retryable"] is True and skipped["dataset"] == "busy"
+    assert skipped["committed_head_outcome"] == "not_started_source_lock_busy"
+    assert not (tmp_path / "cold/heads/busy").exists()
+
+
+def test_disabled_publication_never_acquires_source_lock(tmp_path, monkeypatch):
+    module = _module()
+    status = {"publish_ready": False, "publish": False}
+    monkeypatch.setattr(module, "_status", lambda *_a, **_k: status)
+    monkeypatch.setattr(module, "_running_commands", lambda: [])
+    monkeypatch.setattr(module, "_source_coordination_lock",
+                        lambda *_a, **_k: pytest.fail("disabled source has no transaction"))
+    actual, result = module._publish_entry({"publish": False}, argparse.Namespace(), tmp_path / "cold")
+    assert actual is status and result is None
+
+
+def test_deferred_batch_checkpoints_each_attempt_without_scanning(tmp_path, monkeypatch, capsys):
+    from stockagent.data_sync import syncthing_scan
+    module = _module()
+    source = _source(tmp_path, "2026-10-16")
+    entries = [{**_entry(source), "dataset": name, "loose_threshold_mib": 8, "pack_buckets": 2}
+               for name in ("first", "second")]
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: entries)
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    (cold / syncthing_scan.D_PRIMARY_MARKER).touch()
+    monkeypatch.setattr(syncthing_scan, "CANONICAL_ROOT", cold)
+    monkeypatch.setattr(syncthing_scan, "_scan_pending",
+                        lambda *_a, **_k: pytest.fail("existing drain owns network scans"))
+    receipt = tmp_path / "batch/progress.json"
+    observations = []
+    write_json = module.atomic_write_json
+
+    def record(path, payload):
+        observations.append(json.loads(json.dumps(payload)))
+        write_json(path, payload)
+
+    monkeypatch.setattr(module, "atomic_write_json", record)
+    assert module.main(["publish", "--all-ready", "--sync-root", str(cold), "--node-id", "test-node",
+                        "--defer-scan", "--batch-progress-receipt", str(receipt)]) == 0
+    stdout = json.loads(capsys.readouterr().out)
+    final = json.loads(receipt.read_text())
+    assert final["published"] == stdout["published"] and final["skipped"] == []
+    assert final["state"] == "finished" and final["completed_attempts"] == 2
+    assert final["active_dataset"] is None and not final["all_dataset_migration_complete"]
+    assert final["peer_convergence"] == final["release_restore_acceptance"] == "not_checked"
+    assert [item["active_dataset"] for item in observations if item["active_dataset"]] == ["first", "second"]
+    assert [item["completed_attempts"] for item in observations] == [0, 0, 1, 1, 2, 2]
+    for name in ("first", "second"):
+        assert (cold / f".local-state/scan-pending/{name}.json").is_file()
+
+
+def test_batch_receipt_failure_retains_unknown_outcome_and_queued_commit(tmp_path, monkeypatch, capsys):
+    from stockagent.data_sync import syncthing_scan
+    module = _module()
+    source = _source(tmp_path, "2026-10-16")
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: [
+        {**_entry(source), "loose_threshold_mib": 8, "pack_buckets": 2}])
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    (cold / syncthing_scan.D_PRIMARY_MARKER).touch()
+    monkeypatch.setattr(syncthing_scan, "CANONICAL_ROOT", cold)
+    receipt = tmp_path / "batch.json"
+    write_json = module.atomic_write_json
+
+    def fail_after_commit(path, payload):
+        if payload["published"]:
+            raise OSError("post-commit receipt failure")
+        write_json(path, payload)
+
+    monkeypatch.setattr(module, "atomic_write_json", fail_after_commit)
+    assert module.main(["publish", "--all-ready", "--sync-root", str(cold), "--node-id", "test-node",
+                        "--defer-scan", "--batch-progress-receipt", str(receipt)]) == 2
+    assert "post-commit receipt failure" in capsys.readouterr().err
+    pending = json.loads(receipt.read_text())
+    assert pending["active_dataset"] == "prices" and pending["active_outcome"] == "unknown_check_current_head"
+    assert pending["state"] == "running" and not pending["published"]
+    assert packed_snapshots.resolve_latest_packed(cold, "prices").manifest["snapshot_id"]
+    assert (cold / ".local-state/scan-pending/prices.json").is_file()
+
+
+@pytest.mark.parametrize("args", [["status"], ["publish", "prices"], ["layout"]])
+def test_batch_progress_rejects_non_batch_scope(tmp_path, monkeypatch, args):
+    module = _module()
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: pytest.fail("reject before catalog"))
+    assert module.main([*args, "--batch-progress-receipt", str(tmp_path / "new.json")]) == 2
+
+
+def test_batch_progress_cannot_overwrite_existing_receipt(tmp_path, monkeypatch):
+    module = _module()
+    receipt = tmp_path / "existing.json"
+    original = '{"state":"previous evidence"}'
+    receipt.write_text(original)
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: pytest.fail("reject before catalog"))
+    assert module.main(["publish", "--all-ready", "--batch-progress-receipt", str(receipt)]) == 2
+    assert receipt.read_text() == original
+
+
+@pytest.mark.parametrize("location", ["source", "cold"])
+def test_batch_progress_cannot_mutate_selected_source_or_cold_tree(tmp_path, monkeypatch, capsys, location):
+    module = _module()
+    source = _source(tmp_path, "2026-10-16")
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: [_entry(source)])
+    monkeypatch.setattr(module, "initialize_packed_layout", lambda *_a, **_k: pytest.fail("reject before cold writes"))
+    cold = tmp_path / "cold"
+    receipt = (source if location == "source" else cold) / "progress.json"
+    assert module.main(["publish", "--all-ready", "--sync-root", str(cold),
+                        "--batch-progress-receipt", str(receipt)]) == 2
+    assert "outside cold and selected source" in capsys.readouterr().err
+    assert not receipt.exists() and not cold.exists()
+
+
+@pytest.mark.parametrize("cursor,expected", [("first", ["second", "last"]), ("last", [])])
+def test_batch_resume_cursor_bounds_attempts_without_claiming_previous_sources(tmp_path, monkeypatch, cursor, expected):
+    module = _module()
+    source = _source(tmp_path, "2026-10-16")
+    entries = [{**_entry(source), "dataset": name} for name in ("first", "second", "last")]
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: entries)
+    attempts = []
+
+    def publish(entry, *_):
+        attempts.append(entry["dataset"])
+        return {"dataset": entry["dataset"], "publish_ready": False}, None
+
+    monkeypatch.setattr(module, "_publish_entry", publish)
+    receipt = tmp_path / "batch.json"
+    assert module.main(["publish", "--all-ready", "--sync-root", str(tmp_path / "cold"), "--node-id", "test-node",
+                        "--after-dataset", cursor, "--batch-progress-receipt", str(receipt)]) == 0
+    progress = json.loads(receipt.read_text())
+    assert attempts == progress["selected_datasets"] == expected
+    assert progress["state"] == "finished" and progress["resume_after_dataset"] == cursor
+    assert progress["prior_sources_accepted_by_this_receipt"] is False
+    assert progress["all_dataset_migration_complete"] is False
+
+
+def test_unknown_batch_resume_cursor_cannot_initialize_cold_store(tmp_path, monkeypatch, capsys):
+    module = _module()
+    source = _source(tmp_path, "2026-10-16")
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: [_entry(source)])
+    monkeypatch.setattr(module, "initialize_packed_layout", lambda *_a, **_k: pytest.fail("invalid cursor wrote state"))
+    receipt = tmp_path / "batch.json"
+    assert module.main(["publish", "--all-ready", "--sync-root", str(tmp_path / "cold"),
+                        "--after-dataset", "absent", "--batch-progress-receipt", str(receipt)]) == 2
+    assert "not in the selected catalog scope" in capsys.readouterr().err
+    assert not receipt.exists()
+
+
+def test_batch_resume_receipt_cannot_write_into_skipped_source(tmp_path, monkeypatch, capsys):
+    module = _module()
+    prior = _source(tmp_path, "2026-10-15")
+    later = _source(tmp_path, "2026-10-16")
+    entries = [{**_entry(prior), "dataset": "prior"}, {**_entry(later), "dataset": "later"}]
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: entries)
+    monkeypatch.setattr(module, "initialize_packed_layout", lambda *_a, **_k: pytest.fail("receipt wrote source"))
+    receipt = prior / "progress.json"
+    assert module.main(["publish", "--all-ready", "--sync-root", str(tmp_path / "cold"),
+                        "--after-dataset", "prior", "--batch-progress-receipt", str(receipt)]) == 2
+    assert "outside cold and selected source" in capsys.readouterr().err
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("args", [["status"], ["publish", "prices"], ["publish", "--all-ready"]])
+def test_resume_cursor_requires_durable_batch_scope_before_any_io(args, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: pytest.fail("invalid resume read catalog"))
+    assert module.main([*args, "--after-dataset", "prior"]) == 2
 
 
 def test_bybit_release_keeps_data_but_excludes_rebuildable_panel_cache(
@@ -142,6 +380,137 @@ def test_catalog_publish_holds_source_lock_through_snapshot(tmp_path, monkeypatc
     with (tmp_path / lock_relative).open("a+b") as other:
         fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(other, fcntl.LOCK_UN)
+
+
+@pytest.mark.parametrize("provider", ["okx", "bybit", "binance"])
+def test_publication_borrows_native_collector_and_materializer_owner(tmp_path, monkeypatch, provider):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / ("data_" + provider)
+    for grain in ("1m", "daily"):
+        (source / grain).mkdir(parents=True)
+    entry = {**_entry(source), "dataset": provider, "loose_threshold_mib": 8, "pack_buckets": 1}
+    entry.pop("freshness")
+    if provider == "bybit":
+        entry["source_coordination_lock"] = "artifacts/daily_downloader/bybit_source_publish.lock"
+    monkeypatch.setattr(module, "_running_commands", lambda: [])
+    observed = []
+    def pack(*_args, **_options):
+        for grain in ("1m", "daily"):
+            with (source / grain / ".download.lock").open("a+b") as other:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed.append(True)
+        return object()
+    monkeypatch.setattr(module, "publish_packed_snapshot", pack)
+    args = argparse.Namespace(node_id=None, recover_missing_base_objects=False, all_ready=True)
+    status, result = module._publish_entry(entry, args, tmp_path / "cold")
+    assert status["publish_ready"] and result is not None and observed == [True]
+    assert not (source / "15m").exists(), "publication must not invent another source grain"
+    for grain in ("1m", "daily"):
+        with (source / grain / ".download.lock").open("a+b") as other:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_busy_native_writer_yields_without_packing_or_retaining_other_locks(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / "data_okx"
+    for grain in ("1m", "daily"):
+        (source / grain).mkdir(parents=True)
+    entry = {**_entry(source), "dataset": "okx", "source_coordination_lock": "outer.lock"}
+    monkeypatch.setattr(module.time, "sleep", lambda *_: pytest.fail("all-ready admission slept"))
+    with (source / "1m/.download.lock").open("a+b") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX)
+        with pytest.raises(module.SourceCoordinationLockTimeout):
+            with module._publication_source_locks(entry, wait_seconds=0):
+                pytest.fail("admitted a live collector")
+        with (tmp_path / "outer.lock").open("a+b") as other:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_native_lock_mapping_cannot_capture_other_sources_or_redirected_grains(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / "data_okx"
+    source.mkdir()
+    elsewhere = tmp_path / "another-source"
+    elsewhere.mkdir()
+    assert module._native_source_lock_entries({**_entry(elsewhere), "dataset": "okx"}) == []
+    (source / "1m").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(SnapshotError, match="redirected"):
+        module._native_source_lock_entries({**_entry(source), "dataset": "okx"})
+
+
+def test_native_lock_mapping_keeps_the_enrolled_whole_root_alias(tmp_path, monkeypatch):
+    module = _module()
+    repo, live = tmp_path / "repo", tmp_path / "live/data_bybit"
+    repo.mkdir()
+    (live / "1m").mkdir(parents=True)
+    alias = repo / "data_bybit"
+    alias.symlink_to(live, target_is_directory=True)
+    monkeypatch.setattr(module, "REPO_ROOT", repo)
+    entry = {**_entry(alias), "dataset": "bybit"}
+    with module._publication_source_locks(entry, wait_seconds=0):
+        with (live / "1m/.download.lock").open("a+b") as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("provider", ["binance", "okx", "bybit"])
+@pytest.mark.parametrize("writer_kind", ["original", "custom_output", "unknown_script"])
+def test_native_writer_admission_requires_live_original_inode(
+        tmp_path, monkeypatch, provider, writer_kind):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / ("data_" + provider)
+    (source / "1m").mkdir(parents=True)
+    script_dir = tmp_path / "downloader"
+    script_dir.mkdir()
+    known_name = "download_" + provider + "_perp_1m.py"
+    script = script_dir / ("unknown_writer.py" if writer_kind == "unknown_script" else known_name)
+    script.write_text("import fcntl,sys\nwith open(sys.argv[1], 'a+b') as lock:\n"
+                      " print('opened-original-lock',flush=True)\n"
+                      " fcntl.flock(lock,fcntl.LOCK_EX)\n")
+    entry = {**_entry(source), "dataset": provider,
+             "active_process_substrings": [known_name, "unknown_writer.py"]}
+    entry.pop("freshness")
+    with module._publication_source_locks(entry, wait_seconds=0) as owners:
+        lock = source / ("custom-output.lock" if writer_kind == "custom_output" else "1m/.download.lock")
+        argv = [sys.executable, str(script), str(lock)]
+        child = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        try:
+            assert select.select([child.stdout], [], [], 5)[0], "collector did not reach its lock"
+            assert child.stdout.readline().strip() == "opened-original-lock"
+            commands = [(child.pid, shlex.join(argv))]
+            ordinary = module._status(entry, commands)
+            assert not ordinary["publish_ready"] and ordinary["active_blockers"]
+            admitted = module._status(entry, commands, held_native_lock_fds=owners["native_lock_fds"])
+            if writer_kind == "original":
+                assert admitted["publish_ready"] and not admitted["active_blockers"]
+                assert admitted["coordinated_writer_waiters"][0]["pid"] == child.pid
+                assert child.poll() is None, "native waiter escaped the publisher lock"
+                # Being a waiting writer never excuses a missing source proof.
+                with_missing_receipt = {**entry, "freshness": {"receipt": "missing.json", "field": "date"}}
+                rejected = module._status(with_missing_receipt, commands,
+                                          held_native_lock_fds=owners["native_lock_fds"])
+                assert not rejected["publish_ready"] and rejected["freshness_error"]
+            else:
+                assert not admitted["publish_ready"] and admitted["active_blockers"]
+                assert not admitted.get("coordinated_writer_waiters")
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.communicate(timeout=5)
+
+
+def test_native_waiter_status_without_source_keeps_missing_source_status(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    entry = {**_entry(tmp_path / "data_okx"), "dataset": "okx"}
+    entry.pop("freshness")
+    status = module._status(entry, [])
+    assert not status["publish_ready"] and not status["source_exists"]
 
 
 def test_catalog_publish_rechecks_writer_after_acquiring_lock(tmp_path, monkeypatch):
@@ -249,6 +618,17 @@ def test_source_lock_timeout_fails_closed(tmp_path, monkeypatch):
         with pytest.raises(module.SourceCoordinationLockTimeout, match="timed out waiting"):
             with module._source_coordination_lock(entry):
                 pytest.fail("must not enter while writer owns the lock")
+
+
+def test_source_lock_rejects_redirect_even_inside_original_root(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    original = tmp_path / "original.lock"
+    original.touch()
+    (tmp_path / "source.lock").symlink_to(original.name)
+    with pytest.raises(SnapshotError, match="redirected"):
+        with module._source_coordination_lock({"source_coordination_lock": "source.lock"}):
+            pytest.fail("a different lock inode cannot replace the original owner")
 
 
 def test_source_lock_zero_wait_never_sleeps(tmp_path, monkeypatch):

@@ -207,6 +207,64 @@ def test_whole_raw_proof_reuse_requires_unchanged_source_and_gate(tmp_path, monk
     assert first['identity'] != second['identity'] and len(calls) == 2
 
 
+def test_real_minute_audit_bridge_keeps_semantics_and_rejects_corrupt_bytes(tmp_path, monkeypatch):
+    from scripts import validate_training_sources as gates
+    source = tmp_path / 'source'
+    path, *_ = minute_source(source)
+    entry = {'dataset': 'runtime-bridge-fixture', 'source': str(source),
+             'validation_gate': {'kind': 'stock_minute_source'}}
+    monkeypatch.setattr(gates.importlib.util, 'find_spec', lambda _: None)
+    monkeypatch.setenv('PYTHON_BIN', '/deliberately/unavailable-storage-role/python')
+    monkeypatch.setenv('FINTECH_ENV_PATH', '/deliberately/unavailable-storage-role')
+    proof = gates.validate_catalog_source(entry, repo_root=tmp_path)
+    assert proof['result']['rows'] == 1 and proof['result']['checked_files'] == 1
+    assert proof['result']['terminal_catalog']['receipts'] == 1
+    assert gates.validate_catalog_source(entry, repo_root=tmp_path) == proof
+    path.write_bytes(b'corrupt source must never pass the isolated auditor')
+    with pytest.raises(SnapshotError, match='canonical data-runtime semantic audit failed'):
+        gates.validate_catalog_source(entry, repo_root=tmp_path)
+
+
+def test_derived_minute_runtime_bridge_runs_real_calendar_and_bar_auditor(tmp_path, monkeypatch):
+    from scripts import validate_training_sources as gates
+    from scripts.build_shioaji_tw_minute_dataset import build_research_frame, SCHEMA_VERSION
+    from downloader.download_tw_public_data import TAIEX_SESSION_CALENDAR_SUMMARY_SCHEMA_VERSION
+    raw, *_ = minute_source(tmp_path / 'raw')
+    source, calendar = tmp_path / 'derived', tmp_path / 'calendar'
+    part = source / 'trade_date=2026-10-06/data.parquet'
+    part.parent.mkdir(parents=True)
+    frame = build_research_frame(pl.read_parquet(raw).with_columns(pl.lit('twse').alias('market')).lazy()).collect()
+    frame.write_parquet(part)
+    write_json(source / 'manifest.json', {'schema_version': SCHEMA_VERSION, 'status': 'research_ready',
+        'research_ready': True, 'dates': ['2026-10-06'], 'partitions': [{
+            'trade_date': '2026-10-06', 'rows': frame.height, 'output_sha256': sha256_file(part)}]})
+    calendar.mkdir()
+    cal = calendar / 'twse_taiex_ohlc.parquet'
+    pl.DataFrame({'date': [date(2026, 10, 6)], 'opening_index': [10000.],
+        'highest_index': [10100.], 'lowest_index': [9900.], 'closing_index': [10050.],
+        '_dataset': ['twse_taiex_ohlc'], '_source': ['TWSE'],
+        '_source_product': ['indicesReport/MI_5MINS_HIST']}).write_parquet(cal)
+    write_json(calendar / 'twse_taiex_ohlc.summary.json', {
+        'schema_version': TAIEX_SESSION_CALENDAR_SUMMARY_SCHEMA_VERSION, 'dataset': 'twse_taiex_ohlc',
+        'coverage_complete': True, 'baseline_established': True, 'replacement_promoted': True,
+        'effective_start_date': '2026-10-06', 'effective_end_date': '2026-10-06',
+        'unresolved_month_count': 0, 'failed_count': 0, 'canonical_path': str(cal), 'output_rows': 1,
+        'output_receipt': {'path': cal.name, 'size': cal.stat().st_size, 'sha256': sha256_file(cal)}})
+    entry = {'dataset': 'derived-bridge-fixture', 'source': str(source), 'validation_gate': {
+        'kind': 'stock_minute_dataset', 'calendar_root': str(calendar)}}
+    monkeypatch.setattr(gates.importlib.util, 'find_spec', lambda _: None)
+    proof = gates.validate_catalog_source(entry, repo_root=tmp_path)
+    assert proof['result']['status'] == 'research_ready'
+    assert proof['result']['calendar']['checked'] is True
+    assert proof['result']['rows'] == frame.height
+    assert not proof['result']['calendar']['per_symbol_session_completeness_checked']
+    # The child auditor must reject a changed original partition, not reuse a
+    # prior successful JSON or confuse progress stdout with its result.
+    part.write_bytes(b'changed partition')
+    with pytest.raises(SnapshotError, match='canonical data-runtime semantic audit failed'):
+        gates.validate_catalog_source(entry, repo_root=tmp_path)
+
+
 def recipe_fixture(tmp_path):
     repo = tmp_path/'repo'
     repo.mkdir()
@@ -385,7 +443,8 @@ def test_tampered_recipe_is_rejected_before_any_hydration_or_builder(tmp_path):
 
 
 @pytest.mark.parametrize('wrapper', ['run_data_release.sh', 'run_training_dataset_recipes.sh'])
-def test_publication_shell_keeps_parsed_body_across_in_place_rollout(tmp_path, wrapper):
+@pytest.mark.parametrize('replacement', ['shorter', 'longer'])
+def test_publication_shell_keeps_parsed_body_across_in_place_rollout(tmp_path, wrapper, replacement):
     """A long child must not resume at offsets in a newly edited shell file."""
     repo = tmp_path/'repo'
     scripts = repo/'scripts'
@@ -426,7 +485,12 @@ if previous == 0:
                 pytest.fail('fixture child never started')
             time.sleep(.01)
         # Deliberately overwrite the exact script inode while the child runs.
-        path.write_text('#!/usr/bin/env bash\nexit 91\n')
+        if replacement == 'shorter':
+            path.write_text('#!/usr/bin/env bash\nexit 91\n')
+        else:
+            # A function protects its body, but the shell must not resume its
+            # top-level reader at the old EOF, now inside appended commands.
+            path.write_bytes(b' ' * len(original.read_bytes()) + b'\nexit 91\n')
         (tmp_path/'proceed').touch()
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, (stdout, stderr)
@@ -438,3 +502,30 @@ if previous == 0:
         if process.poll() is None:
             process.terminate()
             process.communicate(timeout=10)
+
+
+@pytest.mark.parametrize("selection,child_status,refresh", [
+    (["publish", "completed-tw-forward", "--completed-forward-key", "1" * 64], 0, False),
+    (["publish", "completed-tw-forward", "--completed-forward-key=" + "1" * 64], 0, False),
+    (["publish", "training-dataset-recipes"], 0, False),
+    (["publish", "tw-public"], 0, True),
+    (["status", "completed-tw-forward"], 0, False),
+    (["publish", "completed-tw-forward", "--completed-forward-key", "1" * 64], 2, False),
+])
+def test_cache_publication_does_not_rebuild_unaffected_training_recipes(
+    tmp_path, selection, child_status, refresh,
+):
+    scripts = tmp_path / "repo" / "scripts"
+    scripts.mkdir(parents=True)
+    wrapper = scripts / "run_data_release.sh"
+    wrapper.write_bytes((Path(__file__).resolve().parents[1] / "scripts/run_data_release.sh").read_bytes())
+    (scripts / "runtime_env.sh").write_text(
+        'run_fintech_python() { return "$TEST_CHILD_STATUS"; }\n')
+    (scripts / "run_training_dataset_recipes.sh").write_text(
+        '#!/usr/bin/env bash\nprintf refreshed > "$TEST_POSTHOOK"\n')
+    marker = tmp_path / "posthook"
+    result = subprocess.run(["bash", str(wrapper), *selection, "--sync-root", str(tmp_path / "cold")],
+        env={**os.environ, "TEST_CHILD_STATUS": str(child_status), "TEST_POSTHOOK": str(marker)},
+        text=True, capture_output=True, check=False, timeout=10)
+    assert result.returncode == child_status, result.stderr
+    assert marker.exists() is refresh

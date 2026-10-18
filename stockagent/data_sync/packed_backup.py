@@ -7,6 +7,7 @@ and fetch commands can restore it without a second archive implementation.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import threading
 import time
 from typing import Any
 
@@ -131,22 +133,28 @@ def signature_from_stat(info: os.stat_result) -> tuple[int, ...]:
 
 
 class PinnedObjectSignatures:
-    """Read target object metadata through no-follow, pass-local directory FDs.
+    """Read target metadata through a bounded, pass-local no-follow FD cache.
 
     DrvFs makes repeated ``resolve``/``is_symlink`` calls expensive. Pin each
-    object shard once, then recheck that every pinned directory still occupies
-    its original path before trusting the pass. New/copy paths retain the
-    existing ``safe_path`` and checksum-readback rules.
+    recently used directory, retain every observed directory identity, and
+    recheck all names before trusting the pass. Reopening an evicted directory
+    must match its first identity. The root stays pinned throughout. Bound the
+    descriptors, not the catalog scope: nested readers share a worker's finite
+    FD limit with SQLite, Temporal and concurrent migration activities.
     """
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, max_open_directories: int = 64):
+        if type(max_open_directories) is not int or max_open_directories < 2:
+            raise ValueError("directory descriptor budget must be at least two")
         self.root = root
+        self._limit = max_open_directories
+        self._lock = threading.RLock()
         self._flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         root_fd = os.open(root, self._flags)
         try:
-            self._directories: dict[tuple[str, ...], tuple[int, tuple[int, int]]] = {
-                (): (root_fd, self._identity(os.fstat(root_fd))),
-            }
+            identity = self._identity(os.fstat(root_fd))
+            self._directories = OrderedDict({(): (root_fd, identity)})
+            self._identities = {(): identity}
         except BaseException:
             os.close(root_fd)
             raise
@@ -157,33 +165,106 @@ class PinnedObjectSignatures:
 
     def signature(self, relative: str) -> tuple[int, ...]:
         object_descriptor(relative)
-        parts = tuple(Path(relative).parts)
+        # Export workers share this scanner. A different worker must not evict
+        # a directory between obtaining its descriptor and using it.
+        with self._lock:
+            parts, parent_fd = self._parent(relative)
+            info = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                raise SnapshotError(f"not a regular backup object: {relative}")
+            return signature_from_stat(info)
+
+    def _parent(self, relative: str) -> tuple[tuple[str, ...], int]:
+        if not self._directories:
+            raise ValueError("directory reader is closed")
+        path = Path(relative)
+        if path.is_absolute() or not path.parts or any(part in {".", ".."} for part in path.parts):
+            raise SnapshotError(f"unsafe backup relative path: {relative}")
+        parts = path.parts
+        cached = self._directories.get(parts[:-1])
+        if cached is not None:
+            # Consecutive vintages share a directory. Do not walk/move every
+            # ancestor on a cache hit; its no-follow identity is already bound
+            # and all observed ancestors still pass the final recheck.
+            self._directories.move_to_end(parts[:-1])
+            return parts, cached[0]
+        parent_fd = self._directories[()][0]
         for length in range(1, len(parts)):
             prefix = parts[:length]
             if prefix not in self._directories:
-                parent_fd = self._directories[parts[:length - 1]][0]
                 fd = os.open(parts[length - 1], self._flags, dir_fd=parent_fd)
                 try:
-                    self._directories[prefix] = (fd, self._identity(os.fstat(fd)))
+                    identity = self._identity(os.fstat(fd))
+                    if prefix in self._identities and self._identities[prefix] != identity:
+                        raise SnapshotError("backup object directory changed during scan: "
+                                            + str(self.root.joinpath(*prefix)))
                 except BaseException:
                     os.close(fd)
                     raise
-        info = os.stat(parts[-1], dir_fd=self._directories[parts[:-1]][0], follow_symlinks=False)
-        if not stat.S_ISREG(info.st_mode):
-            raise SnapshotError(f"not a regular backup object: {relative}")
-        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                self._identities[prefix] = identity
+                self._directories[prefix] = (fd, identity)
+                if len(self._directories) > self._limit:
+                    # The new child is already open, so the former parent may
+                    # be evicted safely. Never evict the authority root. There
+                    # is at most one transient extra directory descriptor.
+                    oldest = next(key for key in self._directories if key)
+                    stale_fd, _ = self._directories.pop(oldest)
+                    os.close(stale_fd)
+            self._directories.move_to_end(prefix)
+            parent_fd = self._directories[prefix][0]
+        return parts, parent_fd
+
+    def read_metadata(self, relative: str) -> tuple[bytes, tuple[int, ...]]:
+        """Read full metadata through pass-pinned, no-follow directory FDs.
+
+        The leaf is checked against its open descriptor before/after reading;
+        callers must recheck all pinned directory names before admitting the
+        completed capture. O_NONBLOCK prevents a substituted FIFO from hanging.
+        No object payload, source or catalog is changed.
+        """
+        with self._lock:
+            parts, parent_fd = self._parent(relative)
+            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+            try:
+                stream = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with stream:
+                before = os.fstat(stream.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise SnapshotError(f"not a regular backup metadata file: {relative}")
+                raw = stream.read()
+                after = os.fstat(stream.fileno())
+            named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            observed = signature_from_stat(before)
+            if (observed != signature_from_stat(after) or observed != signature_from_stat(named)
+                    or len(raw) != before.st_size):
+                raise SnapshotError(f"backup metadata changed during read: {relative}")
+            return raw, observed
 
     def recheck(self) -> None:
-        for parts, (_fd, identity) in self._directories.items():
-            path = self.root.joinpath(*parts)
-            info = os.stat(path, follow_symlinks=False)
-            if not stat.S_ISDIR(info.st_mode) or self._identity(info) != identity:
-                raise SnapshotError(f"backup object directory changed during scan: {path}")
+        with self._lock:
+            if not self._directories:
+                raise ValueError("directory reader is closed")
+            for parts, identity in self._identities.items():
+                path = self.root.joinpath(*parts)
+                info = os.stat(path, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode) or self._identity(info) != identity:
+                    raise SnapshotError(f"backup object directory changed during scan: {path}")
 
     def close(self) -> None:
-        for fd, _identity in self._directories.values():
-            os.close(fd)
-        self._directories.clear()
+        with self._lock:
+            error = None
+            while self._directories:
+                _, (fd, _identity) = self._directories.popitem()
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    error = error or exc
+            self._identities.clear()
+            if error is not None:
+                raise error
 
     def __enter__(self) -> "PinnedObjectSignatures":
         return self

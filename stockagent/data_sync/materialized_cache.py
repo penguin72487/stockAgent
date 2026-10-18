@@ -8,6 +8,7 @@ expired, manifest-backed trees that are not pinned or in use.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -337,6 +338,23 @@ def _path_is_under(value: str, target: Path) -> bool:
     return cleaned == target_text or cleaned.startswith(target_text + os.sep)
 
 
+def _reference_read_error(path: Path, error: OSError) -> None:
+    """Allow exited processes/closed FDs, never turn lost visibility into no use."""
+
+    if error.errno in (errno.ENOENT, errno.ESRCH):
+        return
+    raise SnapshotError(f"incomplete process-reference scan at {path}: {error}") from error
+
+
+def _process_directories() -> list[Path]:
+    # Path.glob can suppress directory-read errors. A missing/unmounted /proc
+    # is also incomplete, unlike an individual process that exited mid-scan.
+    try:
+        return sorted(path for path in Path("/proc").iterdir() if path.name.isdecimal())
+    except OSError as error:
+        raise SnapshotError(f"incomplete process-reference scan at /proc: {error}") from error
+
+
 def process_references(target: Path, *, limit: int = 20) -> list[str]:
     """Return bounded evidence that a running process still uses ``target``."""
 
@@ -344,26 +362,34 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
 
 
 def process_references_many(targets: Iterable[Path], *, limit: int = 20,
-                            inode_keys: set[tuple[int, int]] | None = None) -> list[str]:
-    """Scan /proc once for exact selected roots, excluding unrelated siblings."""
+                            inode_keys: set[tuple[int, int]] | None = None,
+                            include_current_process: bool = False) -> list[str]:
+    """Return bounded positive references; unreadable live scope raises, not [].
 
+    This is a fresh observation, not a lease or an exhaustive per-key pin list.
+    Callers still need writer locks and their final retirement/recovery gates.
+    """
+
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("process-reference limit must be a positive integer")
     targets = tuple(sorted({target.resolve() for target in targets}))
     inode_keys = set(inode_keys or ())
     if not targets and not inode_keys:
         return []
     references: list[str] = []
     own_pid = os.getpid()
-    for process in sorted(Path("/proc").glob("[0-9]*")):
+    for process in _process_directories():
         try:
             pid = int(process.name)
         except ValueError:
             continue
-        if pid == own_pid:
+        if pid == own_pid and not include_current_process:
             continue
         for name in ("cwd", "root", "exe"):
             try:
                 value = os.readlink(process / name)
-            except OSError:
+            except OSError as error:
+                _reference_read_error(process / name, error)
                 continue
             if any(_path_is_under(value, target) for target in targets):
                 references.append(f"pid={pid}:{name}:{value}")
@@ -371,20 +397,22 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
                     return references
         try:
             descriptors = list((process / "fd").iterdir())
-        except OSError:
+        except OSError as error:
+            _reference_read_error(process / "fd", error)
             descriptors = []
         for descriptor in descriptors:
             try:
                 value = os.readlink(descriptor)
-            except OSError:
+            except OSError as error:
+                _reference_read_error(descriptor, error)
                 continue
             matches = any(_path_is_under(value, target) for target in targets)
             if inode_keys and not matches:
                 try:
                     info = descriptor.stat()
                     matches = (info.st_dev, info.st_ino) in inode_keys
-                except OSError:
-                    pass
+                except OSError as error:
+                    _reference_read_error(descriptor, error)
             if matches:
                 references.append(f"pid={pid}:fd={descriptor.name}:{value}")
                 if len(references) >= limit:
@@ -393,7 +421,8 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
             maps = (process / "maps").read_text(
                 encoding="utf-8", errors="replace"
             )
-        except OSError:
+        except OSError as error:
+            _reference_read_error(process / "maps", error)
             maps = ""
         map_lines = maps.splitlines()
         if inode_keys:

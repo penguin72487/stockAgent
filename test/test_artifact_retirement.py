@@ -102,6 +102,31 @@ def test_retirement_enrolls_before_seven_day_deletion(tmp_path: Path, monkeypatc
     assert "seven-day-use-lease-active" in later["blockers"]
 
 
+@pytest.mark.parametrize('scope', ['outside', 'source', 'descendant', 'sibling'])
+def test_unlink_consumer_scope_cannot_escape_or_skip_source_ancestors(tmp_path, monkeypatch, scope):
+    spec, _resolved, source, _hot, options = _fixture(tmp_path, monkeypatch)
+    plan = {'source': str(source), 'hot_tree': str(tmp_path/'hot'/spec.relative_root),
+            'snapshot_id': 'fixed-release'}
+    candidate = {'outside': tmp_path, 'source': source, 'descendant': source/'child',
+                 'sibling': options['artifact_root']/'ablations'}[scope]
+    with pytest.raises(SnapshotError, match='process scope'):
+        retirement._assert_unlink_gates(plan, tmp_path/'quarantine',
+                                       _process_scope_root=candidate, **options)
+    assert (source/'checkpoint.pt').is_file()
+
+
+def test_unlink_default_consumer_scope_remains_the_full_artifact_root(tmp_path, monkeypatch):
+    spec, _resolved, source, _hot, options = _fixture(tmp_path, monkeypatch)
+    observed = []
+    monkeypatch.setattr(retirement, 'artifact_process_references',
+                        lambda path, scope: observed.append((path, scope)) or ['ancestor-holder'])
+    plan = {'source': str(source), 'hot_tree': str(tmp_path/'hot'/spec.relative_root),
+            'snapshot_id': 'fixed-release'}
+    with pytest.raises(SnapshotError, match='post-rename process references'):
+        retirement._assert_unlink_gates(plan, tmp_path/'quarantine', **options)
+    assert observed == [(source, options['artifact_root'])]
+
+
 def test_full_run_retirement_protects_enabled_service(tmp_path, monkeypatch):
     spec, _resolved, source, hot_tree, options = _fixture(tmp_path, monkeypatch)
     service = options["artifact_root"].parent / "services/discord_bot/markets/paper.yaml"

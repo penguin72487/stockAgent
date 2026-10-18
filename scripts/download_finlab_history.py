@@ -170,34 +170,8 @@ def verified_source_empty(key: str, output_root: Path, attempt: dict) -> bool:
     binding = ("source_empty", output_root, key)
     if cache is not None and binding in cache:
         return cache[binding]
-    valid = False
-    try:
-        rel = Path(str(attempt["empty_evidence_path"]))
-        root = output_root.resolve()
-        proof = (root / rel).resolve()
-        if (rel.is_absolute() or ".." in rel.parts or rel.parts[:1] != ("empty_evidence",)
-                or not proof.is_relative_to(root) or proof.stat().st_size > 32768):
-            return False
-        report = json.loads(proof.read_text(encoding="utf-8"))
-        raw_rel = Path(str(report.get("raw_path") or ""))
-        raw = (root / raw_rel).resolve()
-        expected = report.get("raw_sha256")
-        if (report.get("dataset") == key and report.get("status") == "source_all_null"
-                and report.get("usable_observations") is False
-                and type(report.get("raw_non_null_values")) is int and report["raw_non_null_values"] == 0
-                and not raw_rel.is_absolute() and ".." not in raw_rel.parts
-                and raw_rel.parts[:1] == ("empty_evidence",) and raw.is_relative_to(root)
-                and isinstance(expected, str) and len(expected) == 64):
-            before = raw.stat()
-            if 0 < before.st_size <= 8 * 1024**2:
-                with raw.open("rb") as handle:
-                    actual = hashlib.file_digest(handle, "sha256").hexdigest()
-                after = raw.stat()
-                valid = (actual == expected and (before.st_dev, before.st_ino, before.st_size,
-                         before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino,
-                         after.st_size, after.st_mtime_ns, after.st_ctime_ns))
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
+    from stockagent.data.finlab_acquisition_contract import read_verified_empty_evidence
+    valid = read_verified_empty_evidence(key, output_root, attempt) is not None
     if cache is not None:
         cache[binding] = valid
     return valid
@@ -571,7 +545,6 @@ def audit_local(output_root: Path, *, volume_only: bool = False) -> tuple[int, i
 
 def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
               incremental: bool = False) -> dict:
-    from downloader.artifact_io import durable_replace
     from downloader.parquet_integrity import parquet_receipt_error
 
     started = time.monotonic()
@@ -699,7 +672,8 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
                 repair_content_addressed_collision(temp, data_path, output_root,
                                                    finlab_digest=content_hash)
         else:
-            durable_replace(temp, data_path)
+            from stockagent.data.finlab_storage import install_history_payload
+            install_history_payload(temp, data_path, content_hash)
         if previous.get("dataset") == key and previous.get("sha256") != content_hash:
             old_relative = Path(str(previous.get("parquet_path") or ""))
             if (not old_relative.is_absolute() and ".." not in old_relative.parts

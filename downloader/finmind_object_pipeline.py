@@ -46,15 +46,15 @@ def recover_claims(connection):
                        'PRIMARY KEY(dataset,data_id,partition))')
     connection.execute('UPDATE tasks SET state=(SELECT prior_state FROM finmind_object_prefetch_claims c '
                        'WHERE c.dataset=tasks.dataset AND c.data_id=tasks.data_id AND c.partition=tasks.partition) '
-                       "WHERE state='inflight' AND EXISTS (SELECT 1 FROM finmind_object_prefetch_claims c "
-                       'WHERE c.dataset=tasks.dataset AND c.data_id=tasks.data_id AND c.partition=tasks.partition)')
+                       "WHERE state='inflight' AND (dataset,data_id,partition) IN "
+                       '(SELECT dataset,data_id,partition FROM finmind_object_prefetch_claims)')
     connection.execute('DELETE FROM finmind_object_prefetch_claims')
     connection.execute('CREATE TABLE IF NOT EXISTS finmind_pipeline_samples ('
                        'id INTEGER PRIMARY KEY,dataset TEXT,requests INTEGER,seconds REAL,rows INTEGER,'
                        'configuration_sha256 TEXT,observed_at_utc TEXT)')
 
 
-def _claim(connection, task):
+def _claim(connection, task, *, advance_cursor=False):
     key = (task.dataset, task.data_id, task.partition)
     connection.execute('INSERT INTO finmind_object_prefetch_claims VALUES (?,?,?,?)', (*key, task.state))
     changed = connection.execute("UPDATE tasks SET state='inflight' WHERE dataset=? AND data_id=? AND partition=? AND state=?",
@@ -62,6 +62,13 @@ def _claim(connection, task):
     if changed != 1:
         connection.rollback()
         raise RuntimeError('object_pipeline_claim_conflict')
+    if advance_cursor:
+        # The selector's fairness cursor and the admitted key have the same
+        # durability boundary. No separate commit before this durable claim.
+        connection.execute('CREATE TABLE IF NOT EXISTS dispatch_cursor '
+                           '(priority INTEGER PRIMARY KEY,last_dataset TEXT NOT NULL)')
+        connection.execute('INSERT OR REPLACE INTO dispatch_cursor VALUES (?,?)',
+                           (task.priority, task.dataset))
     connection.commit()  # Crash recovery precedes HTTP/CPU work.
 
 

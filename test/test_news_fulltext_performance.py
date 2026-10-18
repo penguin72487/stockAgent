@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import json
 import errno
 from pathlib import Path
@@ -612,6 +613,43 @@ def test_config_change_hands_off_after_drained_cycle(config, tmp_path, monkeypat
     assert cli.main(["run", "--continuous", "--config", str(path), "--root", str(tmp_path / "queue"), "--skip-local-ingest"]) == 75
     assert json.loads(capsys.readouterr().out)["activity"] == "configuration_reload_requested"
     assert not session.calls
+
+
+@pytest.mark.parametrize('skip_ingest', [False, True])
+def test_config_change_during_initial_recovery_hands_off_without_http_or_ingest(config, tmp_path, monkeypatch, capsys, skip_ingest):
+    from scripts import download_news_fulltext as cli
+
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+    owners = []
+
+    def recovered_queue(*args, **kwargs):
+        queue = NewsQueue(*args, **kwargs)
+        owners.append(queue.owner)
+        updated = {**config, 'batch_articles': config['batch_articles'] + 1}
+        atomic_write_json(path, updated)
+        return queue
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('stale startup must not construct HTTP, ingest metadata, or run work')
+
+    monkeypatch.setattr(cli, 'NewsQueue', recovered_queue)
+    monkeypatch.setattr(cli, 'NewsHTTP', forbidden)
+    monkeypatch.setattr(cli, 'run_service', forbidden)
+    monkeypatch.setattr(NewsQueue, 'ingest_local_slice', forbidden)
+    args = ['run', '--continuous', '--config', str(path), '--root', str(root)]
+    if skip_ingest:
+        args.append('--skip-local-ingest')
+    assert cli.main(args) == 75
+    result = json.loads(capsys.readouterr().out)
+    persisted = json.loads((root / 'status.json').read_bytes())
+    assert result['activity'] == persisted['activity'] == 'configuration_reload_requested'
+    assert result['owner_id'] == persisted['owner_id'] == owners[0]
+    # A second owner must acquire the released canonical lock and find no
+    # changed attempt/deadline or invented completion after the handoff.
+    with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+        assert queue.db.execute("SELECT value FROM counters WHERE key='last_metadata_ingest_epoch'").fetchone() is None
 
 
 @pytest.mark.parametrize("value", [float("inf"), float("nan")])

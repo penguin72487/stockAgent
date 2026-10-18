@@ -1,0 +1,14 @@
+[Unit]
+Description=Retain comparable full-market source timings during and after the TW stock session
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 10:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 13:40:00 Asia/Taipei
+Persistent=false
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=stockagent-tw-quote-phase-benchmark.service
+
+[Install]
+WantedBy=timers.target
+

@@ -461,6 +461,59 @@ def test_same_feature_abi_preserves_learned_bottleneck_checkpoint_exactly() -> N
     )
 
 
+def test_no_bottleneck_transfer_preserves_rms_output_and_gradients_exactly() -> None:
+    torch.manual_seed(151)
+    source = _TinyFinancialStem(num_features=3, feature_bottleneck_dim=0, causal_rms=True)
+    target = _TinyFinancialStem(num_features=3, feature_bottleneck_dim=0, causal_rms=True)
+    source.candle_encoder.set_causal_feature_rms_normalizer(
+        torch.tensor([2., 7., 11.]), torch.ones(3, dtype=torch.bool)
+    )
+    initialization = _PretrainedInitialization(
+        checkpoint_path=Path("source.pt"),
+        checkpoint={"model_state_dict": deepcopy(source.state_dict())},
+        source_feature_names=["a", "b", "c"],
+        provenance={},
+    )
+    report = _transfer_pretrained_feature_identity(
+        target, initialization, target_feature_names=["a", "b", "c"],
+        require_exact_backbone=True, trainable_parameter_prefixes=(),
+    )
+    inputs = torch.randn(5, 3)
+    source.eval()
+    target.eval()
+    expected, actual = source(inputs), target(inputs)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    for name, parameter in target.named_parameters():
+        torch.testing.assert_close(parameter.grad, dict(source.named_parameters())[name].grad,
+                                   atol=0, rtol=0)
+    for name, value in source.state_dict().items():
+        torch.testing.assert_close(target.state_dict()[name], value, atol=0, rtol=0)
+    assert report["adapter_output_features"] is None
+    assert report["incompatible_source_tensor_count"] == 0
+    assert report["trainable_parameters"] == report["total_parameters"]
+
+
+@pytest.mark.parametrize("features", [["b", "a", "c"], ["a", "b", "new"], ["a", "a", "c"]])
+def test_no_bottleneck_transfer_rejects_changed_feature_identity_before_loading(features) -> None:
+    source = _TinyFinancialStem(num_features=3, feature_bottleneck_dim=0, causal_rms=True)
+    target = _TinyFinancialStem(num_features=3, feature_bottleneck_dim=0, causal_rms=True)
+    before = deepcopy(target.state_dict())
+    initialization = _PretrainedInitialization(
+        checkpoint_path=Path("source.pt"),
+        checkpoint={"model_state_dict": source.state_dict()},
+        source_feature_names=["a", "b", "c"], provenance={},
+    )
+    with pytest.raises(RuntimeError, match="feature"):
+        _transfer_pretrained_feature_identity(
+            target, initialization, target_feature_names=features,
+            require_exact_backbone=True, trainable_parameter_prefixes=(),
+        )
+    for name, value in before.items():
+        torch.testing.assert_close(target.state_dict()[name], value, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("training_continues", [False, True])
 @pytest.mark.parametrize("feature_svd", [False, True])
 def test_resume_preserves_pretrained_rms_and_optimizer_trajectory(

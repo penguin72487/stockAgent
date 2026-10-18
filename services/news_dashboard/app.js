@@ -16,6 +16,7 @@ const labels = Object.freeze({
   metadata_polling: "RSS 資訊追新，非全文",
   stopped: "下載器已停止", stale: "觀測已過期", unavailable: "尚無有效快照", invalid: "快照版本不相容", degraded: "快照數量不一致",
   draining: "正在排空保存", waiting_disk: "等待磁碟空間", waiting_restart: "設定交接，等待續跑",
+  initializing: "啟動中，恢復本機資料", initializing_stale: "啟動中，進度觀測已過期",
 });
 const stateLabels = Object.freeze({
   complete: "已完成狀態", pending: "待回補", inflight: "處理中", retry: "待重試", retry_cooldown: "重試冷卻",
@@ -73,7 +74,7 @@ function currentSnapshot(data) {
   const at = Date.parse(data?.observed_at_utc);
   const age = Date.now() - at;
   return Number.isFinite(at) && age >= -5000 && age <= 180000
-    && !["stale", "unavailable", "invalid", "degraded"].includes(data?.health);
+    && !["stale", "unavailable", "invalid", "degraded", "initializing", "initializing_stale"].includes(data?.health);
 }
 function live(data) {
   return currentSnapshot(data) && ["running", "idle", "waiting", "inventorying"].includes(data.health);
@@ -230,9 +231,13 @@ function render(data) {
   state.latest = data;
   const acquisition = data.acquisition;
   const badge = $("news-health");
-  badge.className = `status ${data.health === "running" ? "updating" : data.health}`;
+  badge.className = `status ${data.health === "running" ? "updating" : data.health === "initializing" ? "loading" : data.health === "initializing_stale" ? "stale" : data.health}`;
   badge.lastChild.textContent = labels[data.health] || "狀態待確認";
-  text("news-freshness", `來源快照 ${stamp(data.observed_at_utc)} · 每 15 秒刷新唯讀快照`);
+  const initializing = ["initializing", "initializing_stale"].includes(data.health);
+  const lifecycle = data.worker.lifecycle;
+  text("news-freshness", initializing
+    ? `啟動觀測 ${stamp(lifecycle?.observed_at_utc)} · 數量沿用前次快照 ${stamp(data.observed_at_utc)}`
+    : `來源快照 ${stamp(data.observed_at_utc)} · 每 15 秒刷新唯讀快照`);
   text("body-count", count(acquisition.stored_body_articles));
   text("body-bytes", `正文 UTF-8 ${bytes(acquisition.text_bytes)} · 非壓縮容量`);
   text("known-count", count(acquisition.known_urls));
@@ -273,7 +278,12 @@ function render(data) {
   const stale = !live(data);
   $("pipeline-alert").hidden = !stale && blocked.length === 0;
   text("alert-title", stale ? labels[data.health] || "資料不可用" : `${count(blocked.length)} 個已啟用來源需要注意`);
-  text("alert-copy", stale ? "保留既有數量；停止、排空、等待磁碟／交接或過期時不提供有效完成估時。" : blocked.map(source => `${source.name}：${errorLabel(source)}`).join("；"));
+  $("alert-details").hidden = stale || blocked.length === 0;
+  text("alert-details-label", `查看 ${count(blocked.length)} 個來源的原因與重試時間`);
+  text("alert-source-copy", blocked.map(source => `${source.name}：${errorLabel(source)}`).join("\n\n"));
+  text("alert-copy", initializing
+    ? `${data.health === "initializing_stale" ? "程序仍存在，但進度觀測已過期。" : "正在恢復本機資料。"}數量沿用前次快照，不使用前程序速度估時。${lifecycle?.receipts_decoded != null ? `本次已檢查 ${count(lifecycle.receipts_decoded)} 份收據；不是新增新聞篇數。` : ""}`
+    : stale ? "保留既有數量；停止、排空、等待磁碟／交接或過期時不提供有效完成估時。" : "下載仍按各來源規則平行進行；來源暫停、資料待修與存取限制分開保留，展開可查完整原因。");
   renderSources(data); renderTraffic(data); renderStages(data); renderOriginalURLs(data);
 }
 

@@ -25,6 +25,28 @@ from stockagent.data.finlab_quota_policy import ACQUISITION_POLICY_VERSION, load
 STAGE_DATASET = "tw-public-research-finlab-2014-v4"
 
 
+def _intraday_configuration(settings, kind: str) -> dict:
+    """One acquisition identity for worker checks and both ETA projections."""
+    if kind not in {"tw_minute", "tw_tick"}:
+        raise ValueError("unsupported FinLab configuration family")
+    prefix = "minute" if kind == "tw_minute" else "tick"
+    workers = getattr(settings, f"{prefix}_workers")
+    span = getattr(settings, f"{prefix}_range_calendar_days")
+    depth = getattr(settings, f"{prefix}_queue_depth")
+    threads = settings.minute_download_threads if kind == "tw_minute" else 1
+    pipeline = workers > 1 or span > 1 or threads > 1 or depth > 1
+    return {
+        "acquisition_policy_version": ACQUISITION_POLICY_VERSION,
+        "configuration_fingerprint": settings.fingerprint,
+        "processing_engine": "rolling_range_process_pool" if pipeline and depth > 1 else
+                             "bounded_range_process_pool" if pipeline else "single_stock_day",
+        "pipeline_workers": workers, "range_calendar_days": span, "download_threads": threads,
+        "queue_depth": depth,
+        "authorization_slots": min(workers, getattr(settings, f"{prefix}_authorization_slots")),
+        "http_keepalive": getattr(settings, f"{prefix}_http_keepalive") if pipeline else False,
+    }
+
+
 def _public_workload(root: Path, datasets: list[dict], now: datetime) -> dict:
     """Project only workload counters; no cache paths, raw frames or SDK calls."""
     raw = _read_json(root / "artifacts/live/finlab/workload_latest.json", {})
@@ -634,14 +656,10 @@ def build_finlab_public_status(
             "worker_policy_current": isinstance(tick_worker.get("quota_policy"), Mapping)
                 and tick_worker["quota_policy"].get("configuration_fingerprint") == quota_settings.fingerprint
                 and tick_worker.get("kind") in {"tw_minute", "tw_tick"}
-                and (tick_worker.get("kind") != "tw_minute" or all((
-                    tick_worker.get("pipeline_workers") == quota_settings.minute_workers,
-                    tick_worker.get("range_calendar_days") == quota_settings.minute_range_calendar_days,
-                    tick_worker.get("download_threads", 1) == quota_settings.minute_download_threads,
-                    tick_worker.get("queue_depth", 1) == quota_settings.minute_queue_depth,
-                    tick_worker.get("authorization_slots", tick_worker.get("pipeline_workers"))
-                        == min(quota_settings.minute_workers, quota_settings.minute_authorization_slots),
-                    tick_worker.get("http_keepalive") == quota_settings.minute_http_keepalive)))
+                and all(tick_worker.get(field, tick_worker.get("pipeline_workers") if field == "authorization_slots"
+                                        else 1 if field in {"download_threads", "queue_depth"} else None) == expected
+                        for field, expected in _intraday_configuration(quota_settings, tick_worker["kind"]).items()
+                        if field not in {"acquisition_policy_version", "configuration_fingerprint", "processing_engine"})
                 and tick_worker["quota_policy"].get("normal_reserve_mb") == quota_admission(
                     kind=tick_worker["kind"], now=observed, policy=quota_settings,
                     scheduled_reserve_mb=admission.get("scheduled_reserve_mb", 0))["normal_reserve_mb"],
@@ -675,21 +693,12 @@ def build_finlab_public_status(
         timer_active=acquisition.get("timer_active") is True,
         opening_policy=_opening_policy(root),
     )
-    tick_progress = estimate_tick_progress(market_status, reserve_mb=intraday_quota_policy.get(
+    tick_configuration = (_intraday_configuration(quota_settings, "tw_tick")
+                          if intraday_quota_policy.get("state") == "available" else {})
+    tick_progress = estimate_tick_progress(market_status, measurement_configuration=tick_configuration,
+        reserve_mb=intraday_quota_policy.get(
         "tick", {}).get("effective_reserve_mb", 500), **estimate_args)
-    minute_configuration = ({"acquisition_policy_version": ACQUISITION_POLICY_VERSION,
-        "configuration_fingerprint": quota_settings.fingerprint,
-        "processing_engine": "rolling_range_process_pool" if quota_settings.minute_queue_depth > 1 else "bounded_range_process_pool" if (
-            quota_settings.minute_workers > 1 or quota_settings.minute_range_calendar_days > 1
-            or quota_settings.minute_download_threads > 1) else "single_stock_day",
-        "pipeline_workers": quota_settings.minute_workers,
-        "range_calendar_days": quota_settings.minute_range_calendar_days,
-        "download_threads": quota_settings.minute_download_threads,
-        "queue_depth": quota_settings.minute_queue_depth,
-        "authorization_slots": min(quota_settings.minute_workers, quota_settings.minute_authorization_slots),
-        "http_keepalive": quota_settings.minute_http_keepalive if (
-            quota_settings.minute_workers > 1 or quota_settings.minute_range_calendar_days > 1
-            or quota_settings.minute_download_threads > 1) else False}
+    minute_configuration = (_intraday_configuration(quota_settings, "tw_minute")
         if intraday_quota_policy.get("state") == "available" else {})
     minute_progress = estimate_tick_progress(market_status, kind="tw_minute", measurement_configuration=minute_configuration,
         reserve_mb=intraday_quota_policy.get(

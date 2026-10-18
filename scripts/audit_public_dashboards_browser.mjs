@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const port = Number(process.argv[2] || 9222);
-const baseUrl = String(process.argv[3] || "https://penguin72487.ddnsgeek.com").replace(/\/$/, "");
+const baseUrl = String(process.argv[3] || "https://www.penguin72487.dpdns.org").replace(/\/$/, "");
 const outputDir = String(process.argv[4] || "/tmp/stockagent-dashboard-browser-audit");
 const width = Number(process.argv[5] || 1366);
 const height = Number(process.argv[6] || 768);

@@ -54,6 +54,16 @@ def test_maintenance_preflight_import_does_not_load_training_runtime() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_minute_curve_and_replay_defaults_share_one_lightweight_declaration() -> None:
+    from scripts.rebuild_tw_day_trade_minute_curves import DEFAULT_LOCAL_MINUTE_CACHE_ROOTS
+    from scripts.rebuild_tw_day_trade_open_price_replay import DEFAULT_MINUTE_DATA_ROOTS
+    from stockagent.live import minute_source_paths as paths
+
+    assert DEFAULT_LOCAL_MINUTE_ROOTS is paths.DEFAULT_LOCAL_MINUTE_ROOTS
+    assert DEFAULT_MINUTE_DATA_ROOTS is paths.DEFAULT_LOCAL_MINUTE_ROOTS
+    assert DEFAULT_LOCAL_MINUTE_CACHE_ROOTS is paths.DEFAULT_LOCAL_MINUTE_CACHE_ROOTS
+
+
 def test_public_history_prewarm_uses_only_local_read_only_gateway(monkeypatch) -> None:
     from scripts import maintain_tw_day_trade_minute_curves as maintenance
 

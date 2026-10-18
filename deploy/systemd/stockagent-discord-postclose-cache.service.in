@@ -10,6 +10,7 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+Environment="STOCKAGENT_PANEL_CHUNK_STORAGE=1"
 ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh" --minimum-runway-minutes 13 --protected-until 13:40
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh" --signal-cache-only
 TimeoutStartSec=10m

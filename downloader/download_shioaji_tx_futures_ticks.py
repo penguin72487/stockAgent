@@ -7,6 +7,7 @@ import argparse
 import copy
 from datetime import UTC, date, datetime, timedelta
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ from stockagent.live.shioaji_traffic_ledger import shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
 )
+from stockagent.live.shioaji_storage_epoch import history_storage_writer
 
 from downloader.download_shioaji_tw_kbars import (
     TrafficBudgetReached,
@@ -102,7 +104,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--official-activity', type=Path, default=DEFAULT_FUTURES_ACTIVITY)
     parser.add_argument('--dates-per-contract', type=int, default=32)
     parser.add_argument('--empty-probes-per-contract', type=int, default=2)
-    return parser.parse_args()
+    parser.add_argument('--prepare-storage-epochs', action='store_true',
+                        help='Local-only upgrade of existing history locks; no login or provider calls.')
+    args = parser.parse_args()
+    if (args.prepare_storage_epochs
+            and args.batch_receipt == Path('artifacts/data_repair/shioaji_futures_history/latest_batch.json')):
+        args.batch_receipt = args.batch_receipt.with_name('latest_storage_epoch_enrollment.json')
+    return args
 
 
 def _calendar(path: Path, start: date, end: date) -> list[date]:
@@ -328,7 +336,7 @@ def pending_dates(root: Path, expected: list[date], *, refresh_empty: bool,
 
 def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None) -> int:
     args = args or parse_args()
-    if args.contracts_file is not None:
+    if args.contracts_file is not None or getattr(args, 'prepare_storage_epochs', False):
         return run_batch(args)
     if args.request_interval is not None and float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be >= 0")
@@ -376,6 +384,16 @@ def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None)
             f"range={expected[0]}..{expected[-1]} output={args.output_dir}"
         )
         return 0
+    with history_storage_writer(args.output_dir):
+        return _download_selected(
+            args, expected=expected, pending=pending, positive_dates=positive_dates,
+            rate_limiter=rate_limiter, shared_api=shared_api,
+        )
+
+
+def _download_selected(args, *, expected, pending, positive_dates, rate_limiter,
+                       shared_api=None) -> int:
+    """The original acquisition path, fenced through its final manifest commit."""
     if not pending:
         manifest = _write_manifest(
             args.output_dir,
@@ -396,14 +414,6 @@ def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None)
             flush=True,
         )
         return 0
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    lock_handle = (args.output_dir / "download.lock").open("a+b")
-    try:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        lock_handle.close()
-        raise RuntimeError("another TX history downloader holds the lock") from exc
 
     import shioaji as sj
 
@@ -547,11 +557,8 @@ def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None)
             current = api.usage()
             usage = int(current.bytes), int(current.limit_bytes)
     finally:
-        try:
-            if logged_in and shared_api is None:
-                api.logout()
-        finally:
-            lock_handle.close()
+        if logged_in and shared_api is None:
+            api.logout()
     manifest = _write_manifest(
         args.output_dir,
         contract=str(args.contract),
@@ -578,14 +585,84 @@ def main(args=None, *, shared_api=None, activity: FuturesActivity | None = None)
 def run_batch(args) -> int:
     """One bounded sweep, one client; shell supervisor owns timing/publication."""
     if args.dry_run:
-        return _run_batch(args)
+        return (_prepare_storage_epochs(args) if getattr(args, 'prepare_storage_epochs', False)
+                else _run_batch(args))
     args.history_root.mkdir(parents=True, exist_ok=True)
     with (args.history_root / 'batch.lock').open('a+b') as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
+            if getattr(args, 'prepare_storage_epochs', False):
+                print(json.dumps({'state': 'deferred_active_history_batch', 'provider_calls': 0}), flush=True)
+                return 75
             raise RuntimeError('another futures history batch holds the lock') from exc
-        return _run_batch(args)
+        return (_prepare_storage_epochs(args) if getattr(args, 'prepare_storage_epochs', False)
+                else _run_batch(args))
+
+
+def _active_history_processes() -> list[int]:
+    """Reject enrollment while an already imported legacy writer may exist."""
+    processes = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+            continue
+        try:
+            argv = (entry / 'cmdline').read_bytes().decode().strip('\0').split('\0')
+            if (any(left == '-m' and right == 'downloader.download_shioaji_tx_futures_ticks'
+                    for left, right in zip(argv, argv[1:]))
+                    or any(Path(value).name == 'download_shioaji_tx_futures_ticks.py'
+                           for value in argv[1:4])):
+                processes.append(int(entry.name))
+        except (OSError, UnicodeError):
+            continue
+    return processes
+
+
+def _prepare_storage_epochs(args) -> int:
+    """Enroll existing owned roots while the original batch lock is held.
+
+    A frozen legacy single-contract process must also finish first. We only
+    update the existing download.lock, never the data/receipts/manifests.
+    """
+    processes = _active_history_processes()
+    if processes:
+        print(json.dumps({'state': 'deferred_legacy_history_process', 'pids': processes}), flush=True)
+        return 75
+    records = []
+    parents = {Path(args.history_root), Path(args.tx_history_root).parent}
+    for parent in sorted(parents):
+        if not parent.is_dir() or parent.is_symlink():
+            continue
+        for root in sorted(parent.iterdir()):
+            if not root.is_dir() or root.is_symlink():
+                continue
+            try:
+                with (root / 'manifest.json').open('rb') as stream:
+                    raw = stream.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise ValueError('oversized manifest')
+                manifest = json.loads(raw)
+                if (not isinstance(manifest, dict)
+                        or manifest.get('dataset') not in {SOURCE, LEGACY_TX_SOURCE}
+                        or manifest.get('contract') != root.name):
+                    raise ValueError('unrecognized history owner')
+                manifest_sha256 = hashlib.sha256(raw).hexdigest()
+                if not args.dry_run:
+                    with history_storage_writer(root):
+                        if (root / 'manifest.json').read_bytes() != raw:
+                            raise RuntimeError('manifest changed during enrollment')
+                records.append({'root': str(root), 'state': 'planned' if args.dry_run else 'enrolled',
+                                'unchanged_manifest_sha256': manifest_sha256})
+            except (OSError, ValueError, RuntimeError) as exc:
+                records.append({'root': str(root), 'state': 'retained_full_scan',
+                                'reason': type(exc).__name__})
+    receipt = {'contract': 'shioaji_history_storage_epoch_enrollment_v1',
+               'state': 'planned' if args.dry_run else 'complete',
+               'observed_at_utc': utc_stamp(), 'provider_calls': 0, 'logins': 0,
+               'data_or_receipt_writes': 0, 'roots': records}
+    _atomic_write_json(args.batch_receipt, receipt)
+    print(json.dumps({key: receipt[key] for key in ('state', 'provider_calls', 'logins')}), flush=True)
+    return 0
 
 
 def _run_batch(args) -> int:
@@ -665,9 +742,10 @@ def _run_batch(args) -> int:
                     consecutive_failures = 0
                     stats['provider_unavailable'] = rc == CONTRACT_UNAVAILABLE_EXIT
                     if rc == CONTRACT_UNAVAILABLE_EXIT:
-                        manifest = json.loads((root / 'manifest.json').read_text())
-                        manifest['catalog_sha256'] = catalog_sha
-                        _atomic_write_json(root / 'manifest.json', manifest)
+                        with history_storage_writer(root):
+                            manifest = json.loads((root / 'manifest.json').read_text())
+                            manifest['catalog_sha256'] = catalog_sha
+                            _atomic_write_json(root / 'manifest.json', manifest)
                     else:
                         manifest = json.loads((root / 'manifest.json').read_text())
                         stats['missing_dates_after_batch'] = len(manifest['missing_trading_dates'])

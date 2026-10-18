@@ -53,7 +53,7 @@ def test_all_modes_full_targets_not_registration_or_fast_subset():
     rows += sample({"slow": modes["slow"]}, GATE + timedelta(seconds=20))
     result = audit(modes, rows, ("mode", "slow"))
     assert result["all_modes_complete_from_open_ms"] == 20000
-    assert [stage["passed"] for stage in result["stages"]] == [True, True, False, False, False]
+    assert [stage["passed"] for stage in result["stages"]] == [True, True, False, False, False, False]
 
 
 def test_partial_unsized_or_bad_quantities_cannot_count_as_full_target():
@@ -65,6 +65,14 @@ def test_partial_unsized_or_bad_quantities_cannot_count_as_full_target():
         result = audit({"mode": current}, sample({"mode": current}, GATE + timedelta(milliseconds=900)))
         assert result["all_modes_complete_from_open_ms"] is None
         assert all(not stage["passed"] for stage in result["stages"])
+
+
+@pytest.mark.parametrize("elapsed,passed", [(11000, True), (11001, False)])
+def test_eleven_second_full_fill_deadline_does_not_mean_signal_registration(elapsed, passed):
+    modes = {"mode": filled()}
+    result = audit(modes, sample(modes, GATE + timedelta(milliseconds=elapsed)))
+    stage = next(row for row in result["stages"] if row["target_ms"] == 11000)
+    assert stage["passed"] is passed
 
 
 def test_cash_only_mode_is_no_execution_required_never_a_successful_fill():

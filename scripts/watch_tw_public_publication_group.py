@@ -24,6 +24,7 @@ from datetime import datetime, time as datetime_time, timedelta
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -198,7 +199,7 @@ def parse_args() -> argparse.Namespace:
         "--auto-window-minutes",
         type=float,
         default=20.0,
-        help="maximum distance from a scheduled boundary when --phase=auto",
+        help="maximum elapsed minutes after a scheduled boundary when --phase=auto",
     )
     return parser.parse_args()
 
@@ -318,24 +319,24 @@ def _file_hashes(live_root: Path, names: list[str]) -> dict[str, dict[str, objec
     }
 
 
-def _minutes_since_midnight(value: datetime_time) -> float:
-    return value.hour * 60.0 + value.minute + value.second / 60.0
+def resolve_phase(observed: datetime, *, window_minutes: float) -> PublicationPhase | None:
+    """Select an elapsed release window, never the nearest future boundary.
 
-
-def resolve_phase(observed: datetime, *, window_minutes: float) -> PublicationPhase:
+    systemd can coalesce a timer while its previous invocation is still busy.
+    A delayed invocation outside every retry window is not permission to query
+    future releases or expand to all 159 sources. Persistent source-event
+    monitoring and the scheduled preopen sweep keep their existing owners;
+    an intentional full recovery can still use ``--phase=preopen_all``.
+    """
+    if not math.isfinite(window_minutes) or window_minutes <= 0:
+        raise ValueError("--auto-window-minutes must be finite and positive")
     local = observed.astimezone(TAIPEI)
-    current = _minutes_since_midnight(local.timetz().replace(tzinfo=None))
-    distances = [
-        (abs(current - _minutes_since_midnight(phase.anchor)), phase)
+    elapsed = [
+        ((local - datetime.combine(local.date(), phase.anchor, tzinfo=TAIPEI)).total_seconds() / 60.0, phase)
         for phase in PUBLICATION_PHASES.values()
     ]
-    distance, phase = min(distances, key=lambda item: item[0])
-    if distance > window_minutes:
-        # A Persistent systemd timer may catch up a missed event at an arbitrary
-        # boot time.  A full mutable sweep is the only honest fallback because
-        # systemd does not pass the missed OnCalendar expression to the service.
-        return PUBLICATION_PHASES["preopen_all"]
-    return phase
+    due = [(minutes, phase) for minutes, phase in elapsed if 0 <= minutes <= window_minutes]
+    return min(due, key=lambda item: item[0])[1] if due else None
 
 
 def _taiex_calendar_command(*, live_root: Path, args: argparse.Namespace) -> list[str]:
@@ -562,10 +563,10 @@ def _write_receipts(
     receipt_root: Path,
     payload: dict[str, object],
     *,
-    phase: PublicationPhase,
+    phase: PublicationPhase | None,
     started: datetime,
 ) -> None:
-    phase_root = receipt_root / phase.name
+    phase_root = receipt_root / (phase.name if phase is not None else "auto")
     _atomic_json(phase_root / "latest.json", payload)
     run_name = started.astimezone(TAIPEI).strftime("%Y%m%dT%H%M%S%f") + ".json"
     _atomic_json(phase_root / "runs" / run_name, payload)
@@ -607,8 +608,8 @@ def main() -> int:
         raise ValueError("worker counts must be positive")
     if args.timeout <= 0 or args.retries < 0:
         raise ValueError("timeout must be positive and retries non-negative")
-    if args.auto_window_minutes <= 0:
-        raise ValueError("--auto-window-minutes must be positive")
+    if not math.isfinite(args.auto_window_minutes) or args.auto_window_minutes <= 0:
+        raise ValueError("--auto-window-minutes must be finite and positive")
 
     started = datetime.now(TAIPEI)
     phase = (
@@ -616,12 +617,33 @@ def main() -> int:
         if args.phase == "auto"
         else PUBLICATION_PHASES[args.phase]
     )
-    live_root = args.live_root.expanduser().resolve(strict=True)
     receipt_root = (
         args.receipt_root
         if args.receipt_root.is_absolute()
         else REPO_ROOT / args.receipt_root
     ).resolve(strict=False)
+    if phase is None:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "phase_selection_contract": "elapsed_publication_window_v2",
+            "status": "skipped_outside_publication_window",
+            "data_status": "not_requested",
+            "phase": "auto",
+            "auto_window_minutes": args.auto_window_minutes,
+            "started_at_taipei": started.isoformat(),
+            "completed_at_taipei": datetime.now(TAIPEI).isoformat(),
+            "selected_dataset_count": 0,
+            "selected_datasets": [],
+            "changed_dataset_count": 0,
+            "changed_datasets": [],
+            "content_change_observed": False,
+            "commands": [],
+            "return_codes": [],
+        }
+        _write_receipts(receipt_root, payload, phase=None, started=started)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    live_root = args.live_root.expanduser().resolve(strict=True)
     metadata_run_name = started.strftime("%Y%m%dT%H%M%S%f")
     metadata_dir = (
         receipt_root / phase.name / "download_runs" / metadata_run_name

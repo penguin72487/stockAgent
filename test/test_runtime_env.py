@@ -11,6 +11,23 @@ import pytest
 from stockagent.runtime_env import normalize_cuda_env, normalize_python_env
 
 
+def test_unattended_publication_bootstrap_resolves_enrollment_without_windows_or_api(tmp_path):
+    import json
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs/training_rescue.json").write_text(json.dumps({
+        "contract": "stockagent.training_rescue.v1", "schema_version": 1,
+        "windows_distribution": "registered-node",
+    }))
+    environment = dict(os.environ, PYTHON_BIN=sys.executable, FINTECH_ENV_PATH=sys.prefix)
+    environment.pop("WSL_DISTRO_NAME", None)
+    result = subprocess.run([
+        "bash", "-c", 'source scripts/runtime_env.sh; uname() { printf "microsoft\\n"; }; '
+        'ensure_enrolled_wsl_identity "$1"; printf "%s\\n" "$WSL_DISTRO_NAME"', "--", str(tmp_path),
+    ], cwd=root, env=environment, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "registered-node"
+
+
 def test_supervised_python_replaces_shell_and_preserves_runtime_discovery():
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, 'PYTHON_BIN': sys.executable, 'FINTECH_ENV_PATH': sys.prefix}
@@ -19,6 +36,20 @@ def test_supervised_python_replaces_shell_and_preserves_runtime_discovery():
         cwd=root, env=env, capture_output=True, text=True, check=True)
     pids = result.stdout.strip().splitlines()
     assert len(pids) == 2 and pids[0] == pids[1]
+
+
+def test_wsl_publication_bootstrap_restores_native_reader_with_existing_identity():
+    executable = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    if not executable.is_file():
+        pytest.skip("native WSL bridge is not installed")
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, PATH="/usr/bin:/bin", WSL_DISTRO_NAME="registered-node",
+               PYTHON_BIN=sys.executable, FINTECH_ENV_PATH=sys.prefix)
+    result = subprocess.run([
+        "bash", "-c", 'source scripts/runtime_env.sh; uname() { printf "microsoft\\n"; }; '
+        'ensure_enrolled_wsl_identity "$1"; command -v powershell.exe', "--", str(root),
+    ], cwd=root, env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == str(executable)
 
 
 def test_coda_runner_shell_and_config_attribute_contract() -> None:

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "contract": "completed_forward_payload_sharing_v1",
+  "cache_roots": [
+    "artifacts/cache/completed_live_inference"
+  ]
+}

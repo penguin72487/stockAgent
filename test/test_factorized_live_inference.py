@@ -71,6 +71,14 @@ def test_live_transport_complete_outputs_preserve_bits_and_source(tmp_path, devi
         candidate = call_model(model, window, mask, return_aux=True)
         assert_tree_bits(control, candidate)
         assert_tree_bits(candidate, call_model(model, window, mask, return_aux=True))
+        lean = call_model(model, window, mask, return_aux=True, materialize_candle_aux=False)
+        assert_tree_bits(control[:2], lean[:2])
+        assert lean[2].keys() == control[2].keys()
+        for key, value in lean[2].items():
+            if key in {"candle_tokens", "candle_token_weights", "candle_embedding"}:
+                assert value is None
+            else:
+                assert_tree_bits(control[2][key], value)
     assert view[1:5].tobytes() == original.tobytes()
 
 

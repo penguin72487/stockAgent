@@ -50,6 +50,7 @@ UNIT_PROPERTIES = (
     "NextElapseUSecRealtime",
     "NextElapseUSecMonotonic",
     "TimersMonotonic",
+    "TimersCalendar",
     "Result",
 )
 JOURNAL_START_MESSAGE_ID = "7d4958e842da4a758f6c1cdc7b36dcc5"
@@ -111,7 +112,7 @@ PRODUCT_STATUS_PATHS = (
     "/openbb/api/status",
     "/data-monitor/api/summary",
 )
-PUBLIC_IPV6_HOSTNAME = "penguin72487.ddnsgeek.com"
+PUBLIC_IPV6_HOSTNAME = "www.penguin72487.dpdns.org"
 PUBLIC_IPV6_RECEIPT = (
     REPO_ROOT / "artifacts/benchmarks/dashboards/public-ipv6-audit.json"
 )
@@ -657,7 +658,7 @@ def _unit_blocks(text: str, *, suffix: str) -> dict[str, dict[str, str]]:
             if "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            if key == "TimersMonotonic" and key in values:
+            if key in {"TimersMonotonic", "TimersCalendar"} and key in values:
                 values[key] += "\n" + value
             else:
                 values[key] = value

@@ -73,6 +73,34 @@ def add(
     )
 
 
+@pytest.mark.parametrize('direction', [1, -1])
+@pytest.mark.parametrize('quantity', [1000., 2000., 3000., 4000.])
+def test_fifo_volume_adjoint_telescopes_and_ignores_absent_minute_padding(direction, quantity):
+    results = []
+    for padding in [0, 12, 120]:
+        state = add(DayTradeInventoryState.empty(1), q=direction * quantity)
+        cohorts = state.cohorts.detach().clone().requires_grad_()
+        state = replace(state, cohorts=cohorts)
+        prices = torch.full((1, 3 + 2*padding), float('nan'), dtype=torch.float64)
+        capacity = torch.zeros_like(prices)
+        indices = torch.tensor([padding, padding+1, padding+2])
+        prices[:, indices] = torch.tensor([1020., 1030., 1040.], dtype=torch.float64)
+        capacity[:, indices] = 1000.
+        actual = reduce_inventory_fifo_path(state, prices=prices, capacity_shares=capacity)
+        legacy = torch.minimum(capacity, (quantity - (capacity.cumsum(-1)-capacity)).clamp_min(0))
+        torch.testing.assert_close(actual.minute_filled_shares, legacy, rtol=0, atol=0)
+        dclosed, = torch.autograd.grad(actual.minute_filled_shares.sum(), cohorts, retain_graph=True)
+        expected = 1. if quantity < 3000. else .5 if quantity == 3000. else 0.
+        assert dclosed[0, 0, F.SHARES].item() == direction * expected
+        objective = (actual.reduction.state.realized_net_pnl
+                     + 37. * actual.reduction.state.shares.sum())
+        gradient, = torch.autograd.grad(objective, cohorts)
+        results.append((objective.detach(), gradient))
+    for value, gradient in results[1:]:
+        torch.testing.assert_close(value, results[0][0], rtol=0, atol=0)
+        torch.testing.assert_close(gradient, results[0][1], rtol=0, atol=1e-12)
+
+
 def paper_initial_state(mode, *, device="cpu"):
     """Feed the same initial acquisition facts, not a reconstructed final NAV."""
     state = DayTradeInventoryState.empty(1, device=device)

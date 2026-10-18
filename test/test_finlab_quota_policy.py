@@ -46,6 +46,7 @@ def test_invalid_floor_is_not_a_quota_bypass(bad):
 @pytest.mark.parametrize("field,bad", [
     ("drain_before_reset_minutes", 181), ("quota_sample_interval_seconds", 61),
     ("quota_sample_max_requests", 0), ("minute_partitions_per_pass", 0),
+    ("tick_partitions_per_pass", 0), ("tick_partitions_per_pass", 2049), ("tick_partitions_per_pass", True),
     ("maximum_intraday_passes", 9), ("catalog_refresh_minutes", True),
     ("minute_reserve_mb", float("nan")), ("schema_version", True),
     ("minute_workers", 33), ("minute_workers", 0), ("minute_workers", True),
@@ -54,6 +55,10 @@ def test_invalid_floor_is_not_a_quota_bypass(bad):
     ("minute_download_threads", 0), ("minute_download_threads", 6), ("minute_download_threads", True),
     ("minute_queue_depth", 0), ("minute_queue_depth", 5), ("minute_queue_depth", True),
     ("minute_authorization_slots", 0), ("minute_authorization_slots", 33), ("minute_authorization_slots", True),
+    ("tick_workers", 9), ("tick_workers", 0), ("tick_workers", True),
+    ("tick_range_calendar_days", 0), ("tick_range_calendar_days", 32), ("tick_range_calendar_days", True),
+    ("tick_queue_depth", 0), ("tick_queue_depth", 5),
+    ("tick_authorization_slots", 9), ("tick_http_keepalive", "true"),
     ("unused_option", 1),
 ])
 def test_configuration_rejects_unbounded_or_ignored_options(tmp_path, field, bad):
@@ -68,6 +73,18 @@ def test_default_and_explicit_configuration_have_identical_fingerprint(tmp_path)
     path = tmp_path / "policy.json"
     path.write_text(json.dumps({"schema_version": 1, **asdict(policy)}))
     assert load_policy(path).fingerprint == policy.fingerprint
+
+
+def test_owner_refresh_projection_includes_bounded_tick_quantum(tmp_path, monkeypatch, capsys):
+    from scripts import finlab_refresh_policy
+    configs = tmp_path / 'configs'
+    configs.mkdir()
+    (configs / 'finlab_quota_policy.json').write_text(json.dumps({
+        'schema_version': 1, 'tick_partitions_per_pass': 1024, 'tick_workers': 8}))
+    monkeypatch.setattr(finlab_refresh_policy, 'ROOT', tmp_path)
+    assert finlab_refresh_policy.main() == 0
+    value = json.loads(capsys.readouterr().out)
+    assert value['tick_partitions_per_pass'] == 1024 and value['tick_workers'] == 8
 
 
 def test_short_quota_window_is_bounded_by_time_and_request_count():
@@ -94,6 +111,27 @@ def test_near_floor_reset_changed_policy_and_failed_refresh_never_use_stale_quot
     assert window.needs_refresh(now=NOW, clock=2, reserve_mb=50)
     for invalid in [(float("nan"), 5000), (True, 5000), (-1, 5000), (5001, 5000)]:
         assert window.observe(invalid, now=NOW, clock=2, reserve_mb=50) is None
+
+
+def test_tick_sampling_reuses_only_four_requests_five_seconds_far_from_floor():
+    window = QuotaSampleWindow(QuotaPolicy(quota_sample_max_requests=32), kind="tw_tick")
+    window.observe((700, 5000), now=NOW, clock=1, reserve_mb=500)
+    for _ in range(3):
+        window.requested()
+    assert not window.needs_refresh(now=NOW, clock=5.9, reserve_mb=500)
+    assert window.needs_refresh(now=NOW, clock=6, reserve_mb=500)
+    window.requested()
+    assert window.needs_refresh(now=NOW, clock=2, reserve_mb=500)
+    window.observe((600, 5000), now=NOW, clock=2, reserve_mb=500)
+    assert window.needs_refresh(now=NOW, clock=2, reserve_mb=500)
+    window.observe((700, 5000), now=NOW, clock=2, reserve_mb=500)
+    assert window.needs_refresh(now=DRAIN + timedelta(hours=1), clock=3, reserve_mb=500)
+    window.observe(None, now=NOW, clock=3, reserve_mb=500)
+    assert window.needs_refresh(now=NOW, clock=3, reserve_mb=500)
+    stricter = QuotaSampleWindow(QuotaPolicy(quota_sample_interval_seconds=0,
+                                           quota_sample_max_requests=1), kind="tw_tick")
+    stricter.observe((700, 5000), now=NOW, clock=1, reserve_mb=500)
+    assert stricter.needs_refresh(now=NOW, clock=1, reserve_mb=500)
 
 
 def test_catalog_reuse_requires_validated_bounded_freshness():

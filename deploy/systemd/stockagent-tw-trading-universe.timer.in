@@ -1,0 +1,21 @@
+[Unit]
+Description=Prepare the official daily Taiwan trading universe independently of Discord
+
+[Timer]
+OnBootSec=90s
+OnCalendar=*-*-* 07:30:00 Asia/Taipei
+OnCalendar=*-*-* 08:00:00 Asia/Taipei
+OnCalendar=*-*-* 08:15:00 Asia/Taipei
+OnCalendar=*-*-* 08:30:00 Asia/Taipei
+OnCalendar=*-*-* 08:45:00 Asia/Taipei
+OnCalendar=*-*-* 08:55:00 Asia/Taipei
+# Only recover a missing same-day receipt after the protected opening window.
+# A valid existing scope stays immutable after the open.
+OnCalendar=*-*-* 09:15:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-trading-universe.service
+
+[Install]
+WantedBy=timers.target

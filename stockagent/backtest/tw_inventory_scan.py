@@ -10,18 +10,99 @@ The composed searchsorted/gather NAV kernel also produced uninitialized reads
 under Compute Sanitizer at [2754,270] on Torch 2.11 / RTX 5090. Keep that
 non-differentiable index lookup native as well: it prevents unsafe indirect
 read fusion/buffer reuse without changing FIFO algebra or moving work to CPU.
+An explicit bounded Triton scan experiment retains that opaque boundary and
+FP64 storage; its execution contract prevents native-optimizer resume.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+import os
+
 import torch
 from torch import Tensor
+
+
+POSITIVE_PREFIX_ABI = 'opaque_int64_nonpositive_prefix_v1'
+
+
+@torch.library.custom_op('stockagent::inventory_positive_prefix_v1', mutates_args=())
+def inventory_positive_prefix(value: Tensor, dim: int = 0) -> Tensor:
+    """Absorbing positive-state mask through the opaque canonical scan.
+
+    Counting failed comparisons preserves boolean cumprod exactly, including
+    NaNs and signed zero. Keeping the scan opaque also avoids a PyTorch 2.11
+    batched cumprod/pointwise codegen failure in parallel session maps.
+    """
+    return (~(value > 0)).to(torch.int64).cumsum(dim) == 0
+
+
+@inventory_positive_prefix.register_fake
+def _positive_prefix_fake(value: Tensor, dim: int = 0) -> Tensor:
+    if not -value.ndim <= dim < value.ndim:
+        raise ValueError('invalid positive prefix dimension')
+    return value.new_empty(value.shape, dtype=torch.bool)
+
+
+def inventory_prefix_contract() -> str | None:
+    backend = os.environ.get('STOCKAGENT_DAY_TRADE_PREFIX_BACKEND', 'native')
+    if backend not in {'native', 'triton'}:
+        raise ValueError('inventory prefix backend must be native or triton')
+    return 'fp64_strided_short_axis_triton_v2' if backend == 'triton' else None
+
+
+@lru_cache(maxsize=1)
+def _prefix_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(source, target, ROWS: tl.constexpr, WIDTH: tl.constexpr,
+               ROW_STRIDE: tl.constexpr, COLUMN_STRIDE: tl.constexpr,
+               OUTPUT_ROW_STRIDE: tl.constexpr, OUTPUT_COLUMN_STRIDE: tl.constexpr,
+               R: tl.constexpr, C: tl.constexpr):
+        row = tl.program_id(0) * R + tl.arange(0, R)
+        column = tl.arange(0, C)
+        mask = (row[:, None] < ROWS) & (column[None, :] < WIDTH)
+        values = tl.load(source + row[:, None] * ROW_STRIDE
+                         + column[None, :] * COLUMN_STRIDE, mask, 0.)
+        cumulative = tl.cumsum(values, axis=1)
+        tl.store(target + row[:, None] * OUTPUT_ROW_STRIDE
+                 + column[None, :] * OUTPUT_COLUMN_STRIDE, cumulative, mask)
+
+    return kernel
+
+
+def _device_prefix_sum(value: Tensor, dim: int) -> Tensor:
+    """Bounded FP64 scan behind the existing opaque compiler boundary.
+
+    Short cohort/opportunity axes fit one independent row scan. Preserve FP64,
+    arbitrary positive input strides, output ownership
+    and the existing reverse-prefix adjoint. Larger/ranked inputs keep ATen.
+    This is an explicit numerical scheduling experiment, never a price cast.
+    """
+    contract = inventory_prefix_contract()
+    if (contract is None or value.device.type != 'cuda' or value.ndim != 2
+            or not -2 <= dim < 2 or not 0 < value.size(dim) <= 32):
+        return torch.cumsum(value, dim=dim)
+    import triton
+    axis = dim % 2
+    other = 1 - axis
+    rows, width = value.size(other), value.size(axis)
+    result = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+    if rows:
+        columns = triton.next_power_of_2(width)
+        row_tile = max(1, 128 // columns)
+        _prefix_kernel()[(triton.cdiv(rows, row_tile),)](
+            value, result, rows, width, value.stride(other), value.stride(axis),
+            result.stride(other), result.stride(axis), row_tile, columns, num_warps=4)
+    return result
 
 
 @torch.library.custom_op("stockagent::inventory_prefix_sum", mutates_args=())
 def inventory_prefix_sum(value: Tensor, dim: int) -> Tensor:
     if value.dtype != torch.float64:
         raise ValueError("physical inventory scan requires float64")
-    return torch.cumsum(value, dim=dim)
+    return _device_prefix_sum(value, dim)
 
 
 @inventory_prefix_sum.register_fake

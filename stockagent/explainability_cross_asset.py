@@ -490,6 +490,14 @@ def _portfolio_weights_from_scores(
     output_mode = normalize_portfolio_output_mode(
         str(getattr(raw_model, "portfolio_output_mode", "activation_l1"))
     )
+    if output_mode in {"decoupled_entmax_cash", "decoupled_entmax_cash_v2"}:
+        raise ValueError(
+            "decoupled selection scores cannot reconstruct allocations without "
+            "the independently learned direction and cash; use model forward"
+        )
+    if output_mode == "score_entmax_scale_separated_cash_v2":
+        # This helper only reconstructs forward actions, which v2 preserves.
+        output_mode = "score_entmax_scale_separated_cash"
     scale_projection_by_active_count = bool(
         getattr(raw_model, "projection_l1_scale_by_active_count", False)
     )

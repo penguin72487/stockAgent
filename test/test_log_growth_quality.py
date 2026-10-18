@@ -52,6 +52,20 @@ def test_sparse_support_cannot_receive_excluded_payoff_but_dense_adjoint_can():
     assert g0.abs().sum() == 0 and g1[0, 1] > 0
 
 
+@pytest.mark.parametrize('symbols', [17, 2757])
+def test_discovery_credit_does_not_saturate_at_real_universe_width(symbols):
+    x = torch.tensor([[4., .1, -.2, .05] + [.01] * (symbols - 4)], requires_grad=True)
+    hard = allocate(x, None)
+    proxy = allocate(x, None, dense_backward=True)
+    torch.testing.assert_close(proxy, hard, atol=0, rtol=0)
+    gradient, = torch.autograd.grad(proxy[0, 1], x)
+    assert hard[0, 1] == 0
+    assert torch.isfinite(gradient).all()
+    # The per-name signal may scale with universe size; exponential collapse
+    # would make it numerically irrelevant to the configured optimizer.
+    assert float(gradient[0, 1]) > .1 / symbols
+
+
 def test_date_weighted_risk_utility_is_value_and_gradient_decomposable():
     r = torch.tensor([.02, -.03, .01, -.04, .02], dtype=torch.float64, requires_grad=True)
     b = torch.tensor([.01, -.01, -.02, .01, .03], dtype=torch.float64)
@@ -63,6 +77,28 @@ def test_date_weighted_risk_utility_is_value_and_gradient_decomposable():
     torch.testing.assert_close(whole, chunks, atol=1e-14, rtol=1e-14)
     torch.testing.assert_close(gw, gc, atol=1e-14, rtol=1e-14)
     assert gw[1] < -252 / len(r) and gw[3] < gw[1]
+
+
+def test_plain_log_utility_value_and_gradient_ignore_benchmark_and_risk_metric_settings():
+    r = torch.tensor([.02, -.03, .01, -.04, .02], dtype=torch.float64, requires_grad=True)
+    zero = dict(log_utility_risk_aversion=0., log_utility_downside_aversion=0.,
+                log_utility_benchmark_shortfall_aversion=0.)
+    # Benchmark and the legacy risk-metric settings must not become hidden
+    # objectives when the selected objective is plain after-cost log utility.
+    options = dict(loss_options(), objective='log_utility', gamma_turnover=0., **zero)
+    b1, b2 = torch.zeros_like(r), torch.full_like(r, .3)
+    loss1 = _loss_from_backtest_series(r, b1, torch.ones_like(r), **options)
+    options.update(gamma_drawdown=100., gamma_underperformance=888.)
+    loss2 = _loss_from_backtest_series(r, b2, torch.ones_like(r), **options)
+    expected = -252 * r.mean()
+    torch.testing.assert_close(loss1.double(), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(loss2, loss1, atol=0, rtol=0)
+    g1, = torch.autograd.grad(loss1, r, retain_graph=True)
+    g2, = torch.autograd.grad(loss2, r, retain_graph=True)
+    ge, = torch.autograd.grad(expected, r)
+    torch.testing.assert_close(g1, ge, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(g2, g1, atol=0, rtol=0)
+    assert risk_adjusted_log_growth(r, b2) is r
 
 
 def test_eval_segments_use_same_risk_objective_without_changing_return_tape():
@@ -116,7 +152,8 @@ def test_new_controls_default_to_historical_resume_contract_and_fingerprint_opt_
     c.training.day_trade_dense_allocation_backward = True
     after = _training_checkpoint_contract(c)
     assert before != after
-    assert 'day_trade_dense_allocation_backward' in after['fold_continuation']
+    assert after['fold_continuation']['day_trade_dense_allocation_backward'] == (
+        'dense_log_shape_softmax_adjoint_sparse_exact_forward_v2')
 
 
 def test_model_factory_uses_dense_backward_only_during_training():

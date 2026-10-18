@@ -179,6 +179,26 @@ def test_wantmedia_primary_review_is_permission_work_not_an_implicit_enable():
     assert source['authorization']['kind'] == 'awaiting_authorization'
 
 
+@pytest.mark.parametrize('provider,decision,evidence', [
+    ('vocus', 'permission_required', 'https://vocus.cc/terms/member'),
+    ('mirrormedia', 'permission_required', 'https://www.mirrormedia.mg/story/service-rule'),
+    ('storm', 'permission_required', 'https://www.storm.mg/terms'),
+    ('setn', 'review_incomplete', 'https://www.setn.com/'),
+])
+def test_creator_and_publisher_policy_reviews_do_not_enable_downloads(provider, decision, evidence):
+    reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = reviews[provider]
+    assert review['capture_decision'] == decision
+    assert evidence in review['evidence_urls']
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == provider)
+    assert source['enabled'] is False
+    assert source['authorization']['kind'] == 'awaiting_authorization'
+    assert not any(source.get(key) for key in (
+        'cnyes_apis', 'wordpress_apis', 'fulltext_feeds', 'feeds', 'sitemaps', 'index_pages'))
+    assert config['remote_training_export'] is False
+
+
 def test_cmoney_official_metadata_review_never_registers_body_API_or_credentials():
     reviews = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
     review = reviews['cmoney']

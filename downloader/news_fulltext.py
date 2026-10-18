@@ -9,6 +9,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import asdict
 import hashlib
 import json
 import math
@@ -28,7 +29,8 @@ from downloader.news_fulltext_bulk import (cnyes_history_priority, cnyes_paginat
                                           cnyes_unseeded_intervals,
                                           wordpress_base, wordpress_page, wordpress_records, wordpress_url)
 from downloader.news_fulltext_policy import (CONTRACT_VERSION, NewsError, PolicyRegistry, capture_usage,
-                                             cnyes_bulk_fingerprint, extract_article, normalize_url)
+                                             cnyes_bulk_fingerprint, extract_article, normalize_url,
+                                             ETTODAY_LAYOUT_VERSIONS)
 from downloader.news_fulltext_feed import XML_BODY_METADATA_FALLBACK, feed_page, feed_records, feed_url
 from downloader.news_fulltext_queue import NewsQueue, utc_now
 
@@ -132,6 +134,7 @@ def article_response_record(source, row, response, article, *, captured_at_utc,
     This deliberately performs no request and grants no source/body permission.
     Retained replay must not label its processing time as an HTTP observation.
     """
+    redirects = getattr(response, 'redirects', ())
     return {
         **article, **capture_usage(source), "article_id": row["id"].hex(), "requested_url": row["url"], "final_url": response.url,
         "provider": source.provider, "metadata_date_raw": row.get("metadata_date_raw"),
@@ -141,6 +144,10 @@ def article_response_record(source, row, response, article, *, captured_at_utc,
         "source_response_article_id": row["id"].hex(), "source_request_url": response.url,
         "data_fingerprint": source.data_fingerprint, "parser_backend": source.html_parser,
         "url_resolution_basis": resolution_basis,
+        **({"transport_redirect_contract_version": 1,
+            "transport_redirects_json": json.dumps([asdict(hop) for hop in redirects], ensure_ascii=False, sort_keys=True),
+            "http_total_response_bytes": len(response.body) + sum(hop.response_bytes for hop in redirects)}
+           if redirects else {}),
         **({"url_resolution_evidence_json": json.dumps(resolution, ensure_ascii=False, sort_keys=True),
             "url_resolution_response_body": resolution_response.body,
             "url_resolution_response_sha256": hashlib.sha256(resolution_response.body).hexdigest(),
@@ -161,6 +168,7 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     headers = {}
     request_url = row["url"]
     resolution_basis = "requested_public_url"
+    ettoday_version = ETTODAY_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0)
     # Verified publisher permalink alias, not another observation/URL identity.
     # Keep the original print URL in the frontier and acceptance receipt.
     if source.provider == "cnyes" and urlsplit(request_url).hostname in {"news.cnyes.com", "m.cnyes.com"}:
@@ -185,34 +193,51 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         from downloader.news_fulltext_tvbs import tvbs_request_identity
         if tvbs_request_identity(request_url, requested=True) is None:
             raise NewsError('unsupported_article_path')
-    elif source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
+    elif ettoday_version:
         from downloader.news_fulltext_ettoday import ettoday_request_identity
-        if ettoday_request_identity(request_url, requested=True) is None:
+        if ettoday_request_identity(request_url, requested=True,
+                allow_finance_redirect_query=ettoday_version >= 16,
+                allow_house=ettoday_version >= 24 and 'house.ettoday.net' in source.reviewed_article_subsites) is None:
             raise NewsError('unsupported_article_path')
-    if row.get("body_sha256"):
+    validator_url = row.get('validator_url')
+    if row.get("body_sha256") and validator_url:
         if row.get("etag"):
             headers["If-None-Match"] = row["etag"]
         if row.get("last_modified"):
             headers["If-Modified-Since"] = row["last_modified"]
     started = time.monotonic()
-    response = http.get(request_url, headers=headers)
-    if response.status == 304:
-        return None
-    _require_article_response(response, source)
-    if source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2', 'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
+    response = http.get(request_url, headers=headers,
+                        **({'conditional_url': validator_url} if headers else {}))
+    if response.status != 304:
+        _require_article_response(response, source)
+    if ettoday_version or source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
         # Transport may upgrade a literal HTTP link; it cannot replace its
         # article/category/host with another currently available report.
-        if source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
+        identity_options = {}
+        if ettoday_version:
             from downloader.news_fulltext_ettoday import ettoday_request_identity as request_identity
+            identity_options['allow_finance_redirect_query'] = ettoday_version >= 16
+            identity_options['allow_house'] = ettoday_version >= 24 and 'house.ettoday.net' in source.reviewed_article_subsites
         else:
             from downloader.news_fulltext_tvbs import tvbs_request_identity as request_identity
-        if request_identity(response.url) != request_identity(request_url, requested=True):
+        different_identity = (request_identity(response.url, **identity_options)
+                              != request_identity(request_url, requested=True, **identity_options))
+        source_alias = False
+        if different_identity and ettoday_version >= 17:
+            from downloader.news_fulltext_ettoday import ettoday_source_redirect_verified
+            source_alias = ettoday_source_redirect_verified(request_url, response,
+                allow_house=identity_options['allow_house'])
+        if different_identity and not source_alias:
             from downloader.news_fulltext_diagnostics import FailureResponse
             error = NewsError('article_identity_not_verified')
             error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
             raise error
-        if response.url != request_url:
+        if source_alias:
+            resolution_basis = 'verified_ettoday_literal_source_redirect_v17; original_frontier_url_retained'
+        elif response.url != request_url:
             resolution_basis = f'verified_{source.provider}_same_host_path_source_redirect_v1; original_frontier_url_retained'
+        if not source_alias and ettoday_version >= 16 and (urlsplit(request_url).query or urlsplit(response.url).query):
+            resolution_basis = 'verified_ettoday_finance_redirect_parameter_v16; literal_request_retained'
     if source.embedded_article_layout in {'taiwanhot_visible_article_v1', 'taiwanhot_visible_article_v2', 'taiwanhot_visible_article_v3'}:
         mismatch = (not taiwanhot_request_ids(response.url).intersection(taiwanhot_request_ids(request_url))
                     if route_views else taiwanhot_article_id(response.url, native_view=native_view)
@@ -229,8 +254,16 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         # The reviewed portal has no verified article alias contract. A
         # different current release is not the originally requested ID.
         raise NewsError("article_identity_not_verified")
+    if response.status == 304:
+        # A 304 has no article body to parse. It proves freshness only for the
+        # exact saved representation whose validators were actually requested,
+        # never a different final URL or an unsolicited not-modified response.
+        if (not headers or not row.get('parquet_path') or response.body
+                or normalize_url(response.url) != normalize_url(validator_url)):
+            raise NewsError('unverifiable_not_modified', retry=True, delay=60)
+        return None
     resolution, resolution_response = None, None
-    if source.embedded_article_layout == "ftv_visible_article_v1" and urlsplit(response.url).hostname != "www.ftvnews.com.tw":
+    if source.embedded_article_layout in {"ftv_visible_article_v1", "ftv_visible_article_v2", "ftv_visible_article_v3", "ftv_visible_article_v4", "ftv_visible_article_v5", "ftv_visible_article_v6", "ftv_visible_article_v7"} and urlsplit(response.url).hostname != "www.ftvnews.com.tw":
         from downloader.news_fulltext_public_originals import ftv_declared_public_canonical
         try:
             resolution = ftv_declared_public_canonical(response.body, source, page_url=response.url)
@@ -864,6 +897,8 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     last_cached_replay = started - 10
     last_failure_replay = started - 10
     last_metadata_replay = started
+    from downloader.news_fulltext_repairs import PUMP_INTERVAL_SECONDS
+    last_reviewed_repair = started - PUMP_INTERVAL_SECONDS
     next_cnyes_work_backfill = started
     next_cnyes_history_backfill = started
     last_original_resolution = started - config['original_url_resolution_interval_seconds']
@@ -920,6 +955,12 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
             if now - last_disk_check >= 10:
                 low_disk = shutil.disk_usage(queue.root).free < config["min_free_disk_bytes"]
                 last_disk_check = now
+            if (continuous_budgets and not draining and not low_disk and provider_ids is None
+                    and now - last_reviewed_repair >= PUMP_INTERVAL_SECONDS):
+                from downloader.news_fulltext_repairs import consume_repairs
+                with queue.metrics.measure('reviewed_repair_admission'):
+                    consume_repairs(queue, stop=http.stop)
+                last_reviewed_repair = time.monotonic()
             if (continuous_budgets and not draining and not low_disk
                     and 'cnyes' in active and now >= next_cnyes_work_backfill):
                 from downloader.news_fulltext_cnyes_work import backfill as backfill_cnyes_work, maintenance_delay

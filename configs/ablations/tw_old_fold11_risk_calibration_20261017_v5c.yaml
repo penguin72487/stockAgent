@@ -1,0 +1,4 @@
+# Owned frozen-policy weights/features; separate fused risk readout backward.
+# New cache ABI: never resume the interrupted v5/v5b optimizer trajectory.
+base_spec: tw_old_fold11_risk_calibration_20261017_v5.yaml
+output_root: artifacts/markets/tw_old_fold11_risk_calibration_20261017_v5c

@@ -1,0 +1,21 @@
+[Unit]
+Description=Bounded full-market intraday/postclose source latency probe without broker polling
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.benchmark_tw_opening_sources --scheduled'
+TimeoutStartSec=120
+Nice=10
+CPUWeight=10
+IOWeight=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=@REPO_ROOT@/artifacts/operations
+UMask=0077
+

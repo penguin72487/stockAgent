@@ -48,6 +48,15 @@ from stockagent.live.tw_public_opening_revision import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+AUDIT_CODE_DEPENDENCIES = (
+    "scripts/audit_tw_public_data_layer.py",
+    "scripts/build_tw_official_symbol_parquets.py",
+    "scripts/build_tw_public_training_features.py",
+    "stockagent/data/tw_public_features.py",
+    "stockagent/data/panel.py",
+    "stockagent/data/panel_cache.py",
+    "stockagent/data/panel_chunks.py",
+)
 
 
 def _downgrade_refresh_lock_for_audit(lock_handle: TextIO) -> None:
@@ -56,7 +65,7 @@ def _downgrade_refresh_lock_for_audit(lock_handle: TextIO) -> None:
     The audit only reads canonical inputs and writes cache/report artifacts.
     A shared lease still excludes source writers. Lock conversion can yield to
     a waiting writer, so callers revalidate derived dependencies after it and
-    retain the final exclusive revision/receipt fence before acceptance.
+    retain the final shared revision/receipt fence before acceptance.
     """
 
     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
@@ -278,7 +287,7 @@ def _defer_opening_bulk_step(step: str, observed: datetime) -> bool:
         return False
     local = observed.astimezone(TAIPEI)
     minute = local.hour * 60 + local.minute
-    return 8 * 60 + 40 <= minute < 9 * 60 + 5
+    return 8 * 60 + 40 <= minute < 9 * 60 + 10
 
 
 def _audit_command(
@@ -308,10 +317,7 @@ def _audit_dependency_state(*, config: Path, live_root: Path) -> dict[str, Any]:
 
     paths = (
         config,
-        REPO_ROOT / "scripts" / "audit_tw_public_data_layer.py",
-        REPO_ROOT / "scripts" / "build_tw_official_symbol_parquets.py",
-        REPO_ROOT / "scripts" / "build_tw_public_training_features.py",
-        REPO_ROOT / "stockagent" / "data" / "tw_public_features.py",
+        *(REPO_ROOT / relative for relative in AUDIT_CODE_DEPENDENCIES),
         live_root / "download_summary.json",
         live_root / "tw_short_sale_download_report.json",
         live_root / "twse_taiex_ohlc.summary.json",
@@ -1150,12 +1156,16 @@ def main() -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     if not _derived_refresh_blockers(failures):
         with lock_path.open("a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            # Read-only acceptance must coexist with live inference. Escalate
+            # only when a builder really needs to mutate canonical source data.
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+            write_lease = False
             derived_status_before = _derived_data_status(
                 live_root,
                 expected_latest=expected_latest,
                 session_date=session_date,
             )
+            current_status = derived_status_before
             step_names = (
                 "refresh_corporate_action_reference",
                 "build_official_symbol_panel",
@@ -1175,11 +1185,6 @@ def main() -> int:
             for step_name, status_label, command in zip(
                 step_names, status_labels, commands, strict=True
             ):
-                current_status = _derived_data_status(
-                    live_root,
-                    expected_latest=expected_latest,
-                    session_date=session_date,
-                )
                 if not current_status["errors"][status_label]:
                     continue
                 if _defer_opening_bulk_step(step_name, datetime.now(TAIPEI)):
@@ -1189,6 +1194,18 @@ def main() -> int:
                     )
                     failures.append(f"derived_data:{step_name} deferred until 09:10")
                     break
+                if not write_lease:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                    write_lease = True
+                    # flock conversion may yield to another producer. Recheck
+                    # the actual dependencies, never a pre-upgrade snapshot.
+                    current_status = _derived_data_status(
+                        live_root,
+                        expected_latest=expected_latest,
+                        session_date=session_date,
+                    )
+                    if not current_status["errors"][status_label]:
+                        continue
                 derived_started = time.perf_counter()
                 completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
                 steps.append(
@@ -1206,6 +1223,15 @@ def main() -> int:
                         f"derived_data:{step_name} failed rc={completed.returncode}"
                     )
                     break
+                # A successful command alone does not prove its new source
+                # generation is valid. Refresh once after each real mutation;
+                # unchanged layers reuse the same protected status instead of
+                # rehashing every input four times.
+                current_status = _derived_data_status(
+                    live_root,
+                    expected_latest=expected_latest,
+                    session_date=session_date,
+                )
             _downgrade_refresh_lock_for_audit(lock_handle)
             steps.append({"step": "source_read_lease", "status": "ok", "mode": "shared"})
             print("[tw-public-0830] source phase=read_only_audit lock=shared", flush=True)
@@ -1346,15 +1372,17 @@ def main() -> int:
             }
         )
     # Freeze the accepted dependency revision through the final checks and
-    # receipt commit.  The source-event daemon uses this same exclusive lock;
-    # without this second barrier it can apply a queued event in the gap after
-    # the expensive audit and force an avoidable retry storm.
+    # receipt commit. A shared lease excludes all source writers just as an
+    # exclusive lease does, without blocking unrelated live inference readers.
+    # Do not drop this second barrier: a queued writer can otherwise invalidate
+    # the expensive audit in the gap before receipt publication.
     final_lock_started = time.perf_counter()
     final_lock_handle = lock_path.open("a+", encoding="utf-8")
-    fcntl.flock(final_lock_handle.fileno(), fcntl.LOCK_EX)
+    fcntl.flock(final_lock_handle.fileno(), fcntl.LOCK_SH)
     steps.append(
         {
             "step": "freeze_final_acceptance_revision",
+            "mode": "shared",
             "lock_wait_seconds": round(
                 time.perf_counter() - final_lock_started, 3
             ),

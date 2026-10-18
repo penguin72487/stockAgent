@@ -78,7 +78,13 @@ def test_source_change_during_owner_wait_blocks_publication(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "PUBLICATION_OWNER", tmp_path / "owner.lock")
     monkeypatch.setattr(cli, "remote", lambda *a: {"fingerprint": "changed", "process_references": []})
     published = []
-    monkeypatch.setattr(cli, "publish_archive", lambda *a, **kw: published.append(True))
+    def publish(*args, **kwargs):
+        # The real publisher validates its private stage before taking the
+        # callback's owner. Exercise that callback rather than bypassing the
+        # source recheck with an unrealistically inert test double.
+        with kwargs["publication_owner"]():
+            published.append(True)
+    monkeypatch.setattr(cli, "publish_archive", publish)
     with pytest.raises(SnapshotError, match="changed while"):
         cli.commit_prepared_archive(args, {}, row, spec, before, tmp_path, tmp_path, {}, tmp_path)
     assert not published
@@ -105,9 +111,11 @@ def test_full_recovery_and_peer_wait_release_owner_but_exact_retirement_holds_it
         return False
     published, recovered, observations = [], [], []
     def publish(*args, **kwargs):
-        assert lock_held()
-        published.append(True)
-        return result
+        assert not lock_held()
+        with kwargs["publication_owner"]():
+            assert lock_held()
+            published.append(True)
+            return result
     def recovery(*args, **kwargs):
         assert not lock_held()
         recovered.append(True)

@@ -221,10 +221,7 @@ def seed(connection: sqlite3.Connection, universes: dict[str, list[str]], now: d
             # Retain an early intraday observation, but do not seal the session
             # for 90 days. The old US anchor advanced at Taipei midnight while
             # the corresponding US cash session was still trading.
-            for identifier, partition in connection.execute(
-                    "SELECT data_id,partition FROM tasks WHERE dataset=? AND state='complete' AND rows>0 "
-                    'AND julianday(last_attempt_at_utc)<julianday(partition)+1+(?-8)/24.0+?/1440.0',
-                    (dataset, source.release_hour, source.release_minute)).fetchall():
+            for identifier, partition in unfinalized_us_observations(connection, dataset, source):
                 publication = datetime.combine(date.fromisoformat(partition) + timedelta(days=1),
                                                datetime.min.time(), TAIPEI).replace(hour=source.release_hour,
                                                                                    minute=source.release_minute)
@@ -266,6 +263,20 @@ def seed(connection: sqlite3.Connection, universes: dict[str, list[str]], now: d
     # Do not aggregate all identifiers/tasks twice when the caller discards it.
     # Independent audit callers keep the existing complete return by default.
     return frontier_status(connection, now) if include_status else {}
+
+
+def unfinalized_us_observations(connection, dataset, source):
+    from downloader.finmind_queue_indexes import US_PUBLICATION_PREDICATE, us_publication_index
+    # The canonical publication threshold below is < partition + 2 days for
+    # every valid Taipei clock (0..23:59). This redundant, wider predicate lets
+    # SQLite use a tiny partial index while preserving the original expression
+    # exactly, including its floating-point boundary and NULL behavior.
+    bounded = 0 <= source.release_hour < 24 and 0 <= source.release_minute < 60
+    index = us_publication_index(connection) if bounded else ''
+    predicate = US_PUBLICATION_PREDICATE if bounded else "state='complete' AND rows>0"
+    return connection.execute(f'SELECT data_id,partition FROM tasks{index} WHERE dataset=? AND {predicate} '
+        'AND julianday(last_attempt_at_utc)<julianday(partition)+1+(?-8)/24.0+?/1440.0',
+        (dataset, source.release_hour, source.release_minute)).fetchall()
 
 
 def refill_history(connection: sqlite3.Connection, dataset: str, now: datetime, *, day_decision=None) -> int:

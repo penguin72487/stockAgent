@@ -1,0 +1,27 @@
+[Unit]
+Description=Refresh and cross-check the current official Taiwan stock/ETF universe
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.refresh_tw_trading_universe --scheduled'
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=30s
+RestartPreventExitStatus=65
+Nice=5
+CPUWeight=25
+IOWeight=25
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=@REPO_ROOT@/artifacts/live/tw_trading_universe /tmp/stockagent-rate-limits-@SERVICE_UID@
+UMask=0077
+

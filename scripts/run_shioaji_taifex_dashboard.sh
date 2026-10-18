@@ -12,6 +12,10 @@ export STOCKAGENT_TAIFEX_DASHBOARD_CACHE_DIR="$history_cache_dir"
 # Only this read-only display owner opts in. Capture, paper accounting and
 # training keep their original sources; set 0 to use the canonical raw reader.
 export STOCKAGENT_TAIFEX_HISTORY_COLUMN_CACHE="${STOCKAGENT_TAIFEX_HISTORY_COLUMN_CACHE:-1}"
+# Reuse the verified history inode; only its small delta is rewritten. This
+# role-local layout is disposable, bounded to two referenced objects per source.
+# Set v1 for rollback; original ledgers and capture/strategy owners do not change.
+export STOCKAGENT_TAIFEX_HISTORY_COLUMN_LAYOUT="${STOCKAGENT_TAIFEX_HISTORY_COLUMN_LAYOUT:-base_delta_v2}"
 # Measured on this host's complete seven-range workflow, not a global CPU cap.
 # Keep an explicit operator pool override; acquisition/training are unaffected.
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-${STOCKAGENT_TAIFEX_DASHBOARD_POLARS_THREADS:-4}}"

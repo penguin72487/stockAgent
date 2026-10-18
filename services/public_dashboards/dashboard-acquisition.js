@@ -205,6 +205,13 @@
     }
     const directory = cards.querySelector("a[href='data-monitor/']");
     if (directory) cards.prepend(directory);
+    if (!cards.querySelector("a.dashboard-card")) {
+      // Public projection contains only strategy cards. Do not leave an
+      // empty private-source heading/section, and preserve the skip target.
+      trading.id = cards.id;
+      cards.replaceWith(trading);
+      return;
+    }
     cards.before(node("h2", "acq-hub-title", "資料抓取與來源總覽"));
     cards.after(node("h2", "acq-hub-title", "策略模擬"), trading);
   }

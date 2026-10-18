@@ -1,0 +1,81 @@
+# Fresh policies test output conditioning and training-distribution age.
+# The historical MGDA checkpoint is comparison-only; no weights are imported.
+base_spec: tw_scratch_strategy_20261017_v9.yaml
+output_root: artifacts/markets/tw_scratch_budget_recency_20261018_v1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: budget
+      enabled: true
+      variants:
+        - name: independent_log
+          description: Cash gate alone controls gross; preserve independent stock direction.
+          overrides:
+            training:
+              loss_type: log_utility
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash_v2
+        - name: reference_mgda
+          description: Repeat the analytic-entmax MGDA control from the completed study.
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: score_entmax_scale_separated_cash_v2
+        - name: independent_mgda
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash_v2
+        - name: independent_lot_credit
+          description: Same exact orders and returns; train-only sub-lot credit.
+          overrides:
+            training:
+              loss_type: log_utility
+              day_trade_sub_lot_recovery: true
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash_v2
+        - name: recent4_reference_mgda
+          description: Train 2021-2024, validate 2025, diagnose 2026; keep older panel context.
+          overrides:
+            walk_forward:
+              split_start_year: 2021
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: score_entmax_scale_separated_cash_v2
+        - name: recent2_reference_mgda
+          description: Train 2023-2024 with the same validation and diagnostic dates.
+          overrides:
+            walk_forward:
+              split_start_year: 2023
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: score_entmax_scale_separated_cash_v2
+        - name: recent4_independent_log
+          overrides:
+            walk_forward:
+              split_start_year: 2021
+            training:
+              loss_type: log_utility
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash_v2
+        - name: recent4_independent_mgda
+          overrides:
+            walk_forward:
+              split_start_year: 2021
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash_v2
+        - name: encoded_history_log
+          description: Encode history at unchanged d32/L32 with a smaller lossless device cache.
+          overrides:
+            training:
+              loss_type: log_utility
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash_v2
+                temporal_query_mode: full_then_last
+                factorized_sparse_cache_bytes: 10737418240

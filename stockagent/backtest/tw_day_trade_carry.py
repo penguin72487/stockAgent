@@ -30,6 +30,7 @@ from stockagent.backtest.tw_day_trade_inventory import (
     settle_inventory_claims,
     validate_inventory_state,
 )
+from stockagent.backtest.tw_inventory_scan import inventory_positive_prefix
 
 CARRY_SESSION_ABI = "tw_day_trade_physical_fifo_sessions_v5_pending_stock"
 
@@ -773,7 +774,7 @@ def _compiled_session_execution(
                     before_alive = torch.cat(
                         (
                             torch.ones_like(first_marks[:1], dtype=torch.bool),
-                            (first_marks[:-1] > 0).cumprod(0).bool(),
+                            inventory_positive_prefix(first_marks[:-1]),
                         )
                     )
                     path = reduce_inventory_fifo_path(
@@ -1937,7 +1938,7 @@ def _finalize_carry_session_core(previous_alive, session_marks, terminal_price, 
     valid = valid & _require(torch.isfinite(closing_nav), "carry account close valuation is invalid")
     final_alive = intraday_alive & (closing_nav > 0)
     raw_marks = torch.cat((marks[:-1], closing_nav.reshape(1)))
-    mark_alive = trade_alive & (raw_marks > 0).cumprod(0).bool()
+    mark_alive = trade_alive & inventory_positive_prefix(raw_marks)
     committed_marks = torch.where(mark_alive, raw_marks, 0)
     committed_marks = torch.where(valid, committed_marks, float("nan"))
     if event_compression:
@@ -2153,7 +2154,7 @@ def execute_carry_session(
             )
             if not first_pass_solvent:
                 before_alive = torch.cat((torch.ones_like(marks[:1], dtype=torch.bool),
-                                          (marks[:-1] > 0).cumprod(0).bool()))
+                                          inventory_positive_prefix(marks[:-1])))
                 path, marks = _run_inventory_path(
                     opening.state,
                     prices=prices,
@@ -2554,9 +2555,15 @@ def run_day_trade_carry_sessions(
     rebate_rate: Tensor, initial_capital: float, initial_state: DayTradeCarryState | None = None,
     event_compression: bool = False,
     require_minute_nav_grad: bool = True,
+    replay_log_returns: Tensor | None = None,
     _allow_flat_terminal: bool = True,
 ) -> DayTradeCarryResult:
     """Exact physical FIFO; block rematerialization never detaches state."""
+    if replay_log_returns is not None and (
+            replay_log_returns.ndim != 1 or replay_log_returns.numel() != len(sessions)
+            or not replay_log_returns.is_floating_point()
+            or replay_log_returns.device != weights.device):
+        raise ValueError("recorded return candidates must align with every physical session and device")
     common = dict(can_enter=can_enter, buy_fee_rate=buy_fee_rate,
         day_sell_fee_rate=day_sell_fee_rate, normal_sell_fee_rate=normal_sell_fee_rate,
         rebate_rate=rebate_rate, initial_capital=initial_capital,
@@ -2568,9 +2575,10 @@ def run_day_trade_carry_sessions(
         and (not require_minute_nav_grad or not torch.is_grad_enabled())
         and weights.ndim == 2 and bool(sessions)
         and all(s.terminal_liquidation_price is not None and s.entry_path is None
-                and not s.uses_sparse_events for s in sessions)):
+                and (not s.uses_sparse_events or event_compression) for s in sessions)):
         from stockagent.backtest.tw_day_trade_graph import run_flat_graph_sessions
-        graphed = run_flat_graph_sessions(weights, sessions, **common)
+        graphed = run_flat_graph_sessions(weights, sessions, **common,
+                                          replay_log_returns=replay_log_returns)
         if graphed is not None:
             return graphed
     block_rows = _carry_checkpoint_block_rows(weights)

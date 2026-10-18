@@ -1,0 +1,21 @@
+[Unit]
+Description=Read native TW opening clocks and retain daily full-target deadline evidence
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.audit_tw_opening_latency --daily'
+TimeoutStartSec=120
+Nice=10
+CPUWeight=10
+IOWeight=10
+PrivateNetwork=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=@REPO_ROOT@/artifacts/live
+UMask=0077
+

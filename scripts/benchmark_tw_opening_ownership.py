@@ -11,6 +11,7 @@ import argparse
 import ast
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import copy
 from datetime import datetime, timedelta
 from functools import lru_cache
 import hashlib
@@ -18,6 +19,7 @@ import json
 from pathlib import Path
 import shutil
 import statistics
+import stat
 import subprocess
 import sys
 import tempfile
@@ -41,6 +43,170 @@ from stockagent.live.tw_public_source_guard import live_tw_public_source_read_gu
 # History-cleaned identities; the pinned baseline source blobs are unchanged.
 BASELINE_COMMIT = "8b094a64b720eeac7cd84b6515bb37566bc129d7"
 STAGE_BASELINE_COMMIT = "c6f4c70465c43efd4e9ed8d6314c92a4dfa977a9"
+CACHE_FLUSH_BASELINE_COMMIT = "5a9383607ddb46fa4951d8f42c0de64afba8d8d0"
+
+
+def cache_flush_trial(receipt, directory, *, enabled, stall_ms):
+    """Complete recorded axis, real durable writes, explicit storage delay.
+
+    The old functions execute verbatim from the pinned source, in an isolated
+    namespace. Both variants read the same retained facts; they do not acquire
+    new market observations or write the original receipt. The optional stall
+    models storage tail latency, not a measured provider/network delay.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    namespace = dict(vars(quotes))
+    baseline_sha = None
+    if not enabled:
+        code = subprocess.run(
+            ["git", "show", f"{CACHE_FLUSH_BASELINE_COMMIT}:stockagent/live/quote_provider.py"],
+            cwd=ROOT, check=True, capture_output=True).stdout
+        baseline_sha = hashlib.sha256(code).hexdigest()
+        names = {"seed_tw_opening_snapshot_cache", "persist_tw_opening_snapshot_cache",
+                 "fetch_tw_mis_opening_snapshot"}
+        nodes = [node for node in ast.parse(code).body
+                 if isinstance(node, ast.FunctionDef) and node.name in names]
+        if {node.name for node in nodes} != names:
+            raise RuntimeError("pinned opening cache functions not found")
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-opening-cache>", "exec"), namespace)
+    else:
+        # Rebind the current functions to the same isolated globals, rather
+        # than mutate the importing process's live cache/locks.
+        import types
+        for name in ("seed_tw_opening_snapshot_cache", "persist_tw_opening_snapshot_cache",
+                     "fetch_tw_mis_opening_snapshot"):
+            fn = getattr(quotes, name)
+            namespace[name] = types.FunctionType(fn.__code__, namespace, fn.__name__, fn.__defaults__, fn.__closure__)
+            namespace[name].__kwdefaults__ = fn.__kwdefaults__
+    day, symbols = receipt["session_date"], receipt["requested_symbols"]
+    root = str((directory.parent / "offline-stocks").resolve())
+    fixed = datetime.fromisoformat(day + "T12:00:00+08:00")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz)
+
+    source = copy.deepcopy(receipt["rows"])
+    namespace.update(datetime=Clock, _TW_MIS_OPENING_LOCK=threading.RLock(),
+                     _TW_MIS_OPENING_PERSIST_LOCK=threading.Lock(),
+                     _TW_MIS_OPENING_CACHE_KEY=(root, day), _TW_MIS_OPENING_DIRTY=True,
+                     _TW_MIS_OPENING_REVISION=1,
+                     _TW_MIS_OPENING_CACHE={s: (time.monotonic(), row) for s, row in source.items()},
+                     _TW_MIS_OPENING_REQUESTED=set(symbols))
+    snapshot_read = namespace["fetch_tw_mis_opening_snapshot"]
+    merge, flush = namespace["seed_tw_opening_snapshot_cache"], namespace["persist_tw_opening_snapshot_cache"]
+    fallback = np.full(len(symbols), np.nan)
+    entered, release, writes, syncs = threading.Event(), threading.Event(), [], []
+    original = quotes._persist_tw_mis_opening_receipt
+    original_fsync = quotes.os.fsync
+
+    def writer(**kwargs):
+        writes.append(len(kwargs["rows"]))
+        if len(writes) == 1:
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("offline storage delay was not released")
+        return original(**kwargs)
+
+    def synced(fd):
+        syncs.append("directory" if stat.S_ISDIR(quotes.os.fstat(fd).st_mode) else "file")
+        original_fsync(fd)
+
+    def forbid_network(*_a, **_kw):
+        raise AssertionError("opening cache benchmark forbids network")
+
+    namespace["_persist_tw_mis_opening_receipt"] = writer
+    with patch.dict(quotes.os.environ, {"STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": str(directory)}), \
+            patch.object(quotes, "datetime", Clock), \
+            patch.object(quotes.os, "fsync", synced), \
+            patch("requests.sessions.Session.request", forbid_network):
+        frozen = snapshot_read(symbols, fallback, parquet_root=root, allow_network=False)
+
+        def merge_provider():
+            started = time.perf_counter()
+            merge(symbols, frozen, parquet_root=root, session_date=day, persist=False)
+            return (time.perf_counter() - started) * 1000
+
+        def read_provider():
+            started = time.perf_counter()
+            value = snapshot_read(symbols, fallback, parquet_root=root, allow_network=False)
+            return value, (time.perf_counter() - started) * 1000
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            started = time.perf_counter()
+            writing = pool.submit(flush, parquet_root=root, session_date=day)
+            if not entered.wait(2):
+                raise RuntimeError("offline durable writer did not start")
+            merging = pool.submit(merge_provider)
+            reading = pool.submit(read_provider)
+            try:
+                time.sleep(stall_ms / 1000)
+            finally:
+                release.set()
+            path = writing.result(timeout=5)
+            flush_ms = (time.perf_counter() - started) * 1000
+            merge_ms = merging.result(timeout=5)
+            _concurrent_snapshot, read_ms = reading.result(timeout=5)
+        # A newer accepted generation requires its own durable barrier. Do not
+        # declare a late merge durable just because the first writer returned.
+        flush(parquet_root=root, session_date=day)
+        committed = json.loads(path.read_bytes())
+        if syncs != [kind for _ in writes for kind in ("file", "directory")]:
+            raise AssertionError("source durability barriers changed")
+        final = snapshot_read(symbols, fallback, parquet_root=root, allow_network=False)
+        namespace.update(_TW_MIS_OPENING_CACHE_KEY=None, _TW_MIS_OPENING_CACHE={},
+                         _TW_MIS_OPENING_REQUESTED=set(), _TW_MIS_OPENING_DIRTY=False)
+        restored = snapshot_read(symbols, fallback, parquet_root=root, allow_network=False)
+        fields = ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
+                  "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms")
+        result_hash = hashlib.sha256()
+        for name in fields:
+            left, right = getattr(final, name), getattr(restored, name)
+            if left.dtype != right.dtype or left.shape != right.shape or left.tobytes() != right.tobytes():
+                raise AssertionError(f"complete cold-restore mismatch: {name}")
+            result_hash.update(name.encode())
+            result_hash.update(left.tobytes())
+        committed["parquet_root"] = "<isolated-scope>"
+        if set(committed["requested_symbols"]) != set(symbols):
+            raise AssertionError("source receipt lost requested universe")
+        result_hash.update(json.dumps(committed, sort_keys=True, allow_nan=False).encode())
+    return {"merge_during_flush_ms": merge_ms, "read_during_flush_ms": read_ms,
+            "first_durable_flush_ms": flush_ms, "durable_write_count": len(writes),
+            "file_and_directory_fsync_count": len(syncs), "restored_full_output_sha256": result_hash.hexdigest(),
+            "restored_row_count": len(committed["rows"]), "baseline_code_sha256": baseline_sha}
+
+
+def run_cache_flush(receipt_path, output, *, repeats=3, stall_ms=100):
+    raw = receipt_path.read_bytes()
+    receipt = json.loads(raw)
+    symbols = receipt["requested_symbols"]
+    if not symbols or len(symbols) != len(set(symbols)) or len(symbols) != receipt["requested_count"]:
+        raise ValueError("complete unique recorded universe required")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pairs = []
+    with tempfile.TemporaryDirectory(prefix="opening-cache-flush-", dir=output.parent) as temp:
+        for index in range(repeats):
+            pair = {}
+            for enabled in ([False, True] if index % 2 == 0 else [True, False]):
+                name = "off_lock" if enabled else "original"
+                pair[name] = cache_flush_trial(receipt, Path(temp) / f"{index}-{name}",
+                                              enabled=enabled, stall_ms=stall_ms)
+            if pair["original"]["restored_full_output_sha256"] != pair["off_lock"]["restored_full_output_sha256"]:
+                raise AssertionError("full opening source/clock/coverage restore parity failed")
+            pairs.append(pair)
+    result = {"contract": "opening_cache_flush_paired_offline_v1",
+              "scope": "full_recorded_axis_merge_read_and_durable_restore_not_live_opening_slo",
+              "observed_at": datetime.now().astimezone().isoformat(), "symbol_count": len(symbols),
+              "input_receipt_sha256": hashlib.sha256(raw).hexdigest(), "injected_storage_stall_ms": stall_ms,
+              "baseline_commit": CACHE_FLUSH_BASELINE_COMMIT,
+              "api_requests": 0, "broker_orders": 0, "production_receipt_writes": 0, "ledger_writes": 0,
+              "all_outputs_equal": True, "pairs": pairs,
+              "median": {name: {field: statistics.median(pair[name][field] for pair in pairs)
+                                    for field in ("merge_during_flush_ms", "read_during_flush_ms", "first_durable_flush_ms")}
+                         for name in ("original", "off_lock")}}
+    atomic_write_json(output, result)
+    return result
 
 
 def factorized_stage_trial(panel, config, *, checkpoint_payload, checkpoint_key,
@@ -242,7 +408,13 @@ def ipc_trial(state_dir, symbols, *, autonomous, stall_ms):
     fixture = quotes.PriceSnapshot(prices=prices, open_prices=prices.copy(),
         source="offline_transport_fixture_not_market_data", requested_count=len(symbols),
         available_count=len(symbols), available_mask=np.ones(len(symbols), dtype=bool),
-        timestamps_ms=np.full(len(symbols), int(base.timestamp() * 1000), dtype=np.int64))
+        timestamps_ms=np.full(len(symbols), int(base.timestamp() * 1000), dtype=np.int64),
+        exchange_timestamps_ms=np.full(len(symbols), int(base.timestamp() * 1000), dtype=np.int64),
+        no_open_print_timestamps_ms=np.zeros(len(symbols), dtype=np.int64),
+        simtrade_flags=np.zeros(len(symbols), dtype=np.int8))
+    for index, field in enumerate(quotes._PRICE_SNAPSHOT_ARRAY_FIELDS):
+        if getattr(fixture, field) is None:
+            setattr(fixture, field, prices + index + .125)
     published, write_json = threading.Event(), quotes._atomic_write_json
 
     def publish(path, payload):
@@ -275,15 +447,55 @@ def ipc_trial(state_dir, symbols, *, autonomous, stall_ms):
                 result = client.result(timeout=1)
         finally:
             broker.close()
-    if not (np.array_equal(result.prices, fixture.prices)
-            and np.array_equal(result.open_prices, fixture.open_prices)
-            and np.array_equal(result.available_mask, fixture.available_mask)
-            and np.array_equal(result.timestamps_ms, fixture.timestamps_ms)
-            and result.available_count == len(symbols)):
-        raise AssertionError("full IPC snapshot/clock/coverage parity failed")
+    digest = hashlib.sha256()
+    for field in ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
+                  "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms", "simtrade_flags"):
+        left, right = getattr(result, field), getattr(fixture, field)
+        if left.dtype != right.dtype or left.shape != right.shape or left.tobytes() != right.tobytes():
+            raise AssertionError(f"full IPC snapshot/clock/coverage parity failed: {field}")
+        digest.update(field.encode())
+        digest.update(right.dtype.str.encode())
+        digest.update(right.tobytes())
+    if result.available_count != len(symbols) or result.requested_count != len(symbols):
+        raise AssertionError("full IPC requested/available count changed")
     return {"client_total_ms": result.transport_timing["client_total_ms"],
             "server_request_queue_ms": result.transport_timing["server_request_queue_ms"],
-            "fixture_output_sha256": hashlib.sha256(prices.tobytes()).hexdigest()}
+            "server_receiver_thread": result.transport_timing["server_receiver_thread"],
+            "fixture_output_sha256": digest.hexdigest()}
+
+
+def run_ipc(receipt_path, output, *, repeats=7, stall_ms=200):
+    """Full-axis transport A/B without decoding or locking unrelated features."""
+    raw = receipt_path.read_bytes()
+    receipt = json.loads(raw)
+    symbols = receipt["requested_symbols"]
+    if not symbols or len(symbols) != len(set(symbols)) or len(symbols) != receipt["requested_count"]:
+        raise ValueError("complete unique recorded universe required")
+    pairs = []
+    with tempfile.TemporaryDirectory(prefix="opening-ipc-benchmark-") as temp:
+        for index in range(repeats):
+            pair = {}
+            for enabled in ([False, True] if index % 2 == 0 else [True, False]):
+                label = "autonomous_shared" if enabled else "manual_unshared"
+                pair[label] = ipc_trial(Path(temp) / f"{index}-{label}", symbols,
+                                       autonomous=enabled, stall_ms=stall_ms)
+            if len({row["fixture_output_sha256"] for row in pair.values()}) != 1:
+                raise AssertionError("paired full IPC output mismatch")
+            if pair["autonomous_shared"]["server_receiver_thread"] != "tw-shared-quote-owner":
+                raise AssertionError("autonomous receiver did not serve the IPC request")
+            pairs.append(pair)
+    result = {"contract": "opening_ipc_ownership_paired_offline_v2",
+        "scope": "full_axis_local_ipc_fixture_not_provider_model_or_live_opening_slo",
+        "observed_at": datetime.now().astimezone().isoformat(),
+        "official_receipt_sha256": hashlib.sha256(raw).hexdigest(),
+        "symbol_count": len(symbols), "session_date": receipt["session_date"],
+        "injected_ledger_stall_ms": stall_ms, "api_requests": 0, "broker_orders": 0,
+        "ledger_writes": 0, "all_outputs_equal": True, "pairs": pairs,
+        "median": {label: {field: statistics.median(pair[label][field] for pair in pairs)
+                          for field in ("client_total_ms", "server_request_queue_ms")}
+                   for label in ("manual_unshared", "autonomous_shared")}}
+    atomic_write_json(output, result)
+    return result
 
 
 def run(receipt_path, output, *, repeats=7, stall_ms=200):
@@ -340,6 +552,10 @@ def run(receipt_path, output, *, repeats=7, stall_ms=200):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--cache-flush", action="store_true",
+                        help="With --receipt, compare full-axis cache read/merge during durable flush")
+    parser.add_argument("--ipc-only", action="store_true",
+                        help="With --receipt, isolate full-axis IPC from feature-source rebuilding")
     parser.add_argument("--factorized-market-config", type=Path,
                         help="Instead measure complete verified attachment/alignment, no model or quotes")
     parser.add_argument("--output", type=Path, required=True)
@@ -350,7 +566,13 @@ if __name__ == "__main__":
         parser.error("require repeats >= 1 and 0 <= stall-ms <= 1000")
     if bool(args.receipt) == bool(args.factorized_market_config):
         parser.error("select exactly one of --receipt or --factorized-market-config")
-    measured = (run_factorized_stages(args.factorized_market_config, args.output, repeats=args.repeats)
+    if args.cache_flush and not args.receipt:
+        parser.error("--cache-flush requires --receipt")
+    if args.ipc_only and (not args.receipt or args.cache_flush):
+        parser.error("--ipc-only requires --receipt and cannot combine with --cache-flush")
+    measured = (run_ipc(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms)
+                if args.ipc_only else run_cache_flush(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms)
+                if args.cache_flush else run_factorized_stages(args.factorized_market_config, args.output, repeats=args.repeats)
                 if args.factorized_market_config else
                 run(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms))
     print(json.dumps({"symbol_count": measured.get("symbol_count"), "scope": measured["scope"],

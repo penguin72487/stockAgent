@@ -581,3 +581,136 @@ def test_shared_readiness_does_not_claim_or_change_reservation(tmp_path):
     assert 4 <= second.remaining_delay_seconds() <= 5
     assert first._state_path.read_bytes() == original
     assert second.pending_waiters() == 0
+
+
+def test_idle_limiter_threads_retire_and_restart_without_losing_claims(tmp_path):
+    claims = []
+    limiter = SharedRateLimiter(
+        0.001, name="idle-retirement", state_dir=tmp_path,
+        on_claim=lambda: claims.append(1), idle_timeout_seconds=0.02,
+    )
+    for _ in range(3):
+        limiter.wait()
+        limiter.flush_claim_observations()
+        dispatcher = limiter._dispatcher_thread
+        observer = limiter._claim_observer_thread
+        if dispatcher is not None:
+            dispatcher.join(timeout=1)
+            assert not dispatcher.is_alive()
+        if observer is not None:
+            observer.join(timeout=1)
+            assert not observer.is_alive()
+        assert limiter._dispatcher_thread is None
+        assert limiter._claim_observer_thread is None
+    assert len(claims) == limiter.grant_activity()["grants_total"] == 3
+
+
+def test_idle_observer_restarts_while_dispatcher_has_long_pending_wait(tmp_path):
+    claims = []
+    limiter = SharedRateLimiter(
+        0.04, name="observer-retirement-race", state_dir=tmp_path,
+        on_claim=lambda: claims.append(1), idle_timeout_seconds=0.003,
+    )
+    threads = [threading.Thread(target=limiter.wait) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+    limiter.flush_claim_observations()
+    assert len(claims) == 8
+    assert limiter.pending_waiters() == 0
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_invalid_idle_timeout_is_rejected(timeout):
+    with pytest.raises(ValueError, match="idle_timeout_seconds"):
+        SharedRateLimiter(0.1, idle_timeout_seconds=timeout)
+
+
+def test_okx_archive_families_share_official_ip_bucket():
+    client = OkxClient(request_interval=None, max_retries=0, retry_base=0.1)
+    first = client._limiter_for_request("/api/v5/public/market-data-history", {"instFamilyList": "BTC-USDT"})
+    second = client._limiter_for_request("/api/v5/public/market-data-history", {"instFamilyList": "ETH-USDT"})
+    assert first is second
+    assert first.interval_seconds == provider_rate_limit("okx_market_data_history").interval_seconds == 0.4
+
+
+@pytest.mark.parametrize("path,interval", [
+    ("/api/v5/rubik/stat/contracts/open-interest-history", 0.2),
+    ("/api/v5/rubik/stat/taker-volume-contract", 0.4),
+    ("/api/v5/rubik/stat/contracts/long-short-account-ratio-contract", 0.4),
+    ("/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader", 0.4),
+    ("/api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader", 0.4),
+])
+@pytest.mark.parametrize("requested", [None, 0.8])
+def test_okx_statistics_use_official_instrument_scope(path, interval, requested):
+    client = OkxClient(request_interval=requested, max_retries=0, retry_base=0.1)
+    first = client._limiter_for_request(path, {"instId": "BTC-USDT-SWAP"})
+    assert first is client._limiter_for_request(path, {"instId": "BTC-USDT-SWAP"})
+    assert first is not client._limiter_for_request(path, {"instId": "ETH-USDT-SWAP"})
+    assert first.interval_seconds == max(interval, requested or 0)
+    assert all(row["sharing_scope"] == "per_instrument" for row in client.limiter_activity().values())
+
+
+@pytest.mark.parametrize("failures", [1, 100])
+def test_observer_start_failure_never_strands_granted_tickets_or_flush(tmp_path, monkeypatch, failures):
+    claims = []
+    limiter = SharedRateLimiter(
+        0.001, name="observer-start-failure", state_dir=tmp_path,
+        on_claim=lambda: claims.append(1),
+    )
+    original_start = threading.Thread.start
+
+    def start(thread):
+        nonlocal failures
+        if thread.name == "observer-start-failure-claim-observer" and failures:
+            failures -= 1
+            raise RuntimeError("fixture: OS cannot start an observer")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+    def run():
+        limiter.wait()
+        limiter.wait()
+        limiter.flush_claim_observations()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert len(claims) == limiter.grant_activity()["grants_total"] == 2
+    assert limiter.pending_waiters() == 0
+    assert limiter._claim_observer_queue.unfinished_tasks == 0
+
+
+def test_dispatcher_io_failure_unblocks_all_waiters_and_recovers_without_issuing_claims(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from downloader.common import RateLimitStateError
+    limiter = SharedRateLimiter(0.001, name="broken-local-state", state_dir=tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original = limiter._claim_process_shared
+
+    def failed_claim(**_kwargs):
+        entered.set()
+        assert release.wait(2)
+        raise OSError("fixture: too many open files")
+
+    monkeypatch.setattr(limiter, "_claim_process_shared", failed_claim)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(limiter.wait) for _ in range(4)]
+        assert entered.wait(2)
+        deadline = time.monotonic() + 2
+        while limiter.pending_waiters() < 4 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        release.set()
+        for future in futures:
+            with pytest.raises(RateLimitStateError, match="OSError"):
+                future.result(timeout=2)
+    assert limiter.pending_waiters() == 0
+    assert limiter.grant_activity()["grants_total"] == 0
+    monkeypatch.setattr(limiter, "_claim_process_shared", original)
+    limiter.wait()
+    assert limiter.grant_activity()["grants_total"] == 1

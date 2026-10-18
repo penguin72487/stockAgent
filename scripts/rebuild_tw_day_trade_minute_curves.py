@@ -39,6 +39,10 @@ from stockagent.live.tw_day_trade_simulation import (
 from stockagent.live.benchmark_accounting import previous_close_return
 from stockagent.live.benchmark_history_projection import write_benchmark_projection
 from stockagent.live.shioaji_schedule import HISTORICAL_MAX_TRAFFIC_FRACTION
+from stockagent.live.minute_source_paths import (
+    DEFAULT_LOCAL_MINUTE_ROOTS,
+    DEFAULT_LOCAL_MINUTE_CACHE_ROOTS,
+)
 
 
 SESSION_OPEN = datetime_time(9, 0)
@@ -48,15 +52,6 @@ MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
 MINUTE_SESSION_POINTS = 270
 LAST_TRADE_SETTLEMENT_CONTRACT = (
     "user_authorized_last_traded_price_paper_settlement_v1"
-)
-DEFAULT_LOCAL_MINUTE_ROOTS = (
-    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
-    Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
-    Path("data_tw_minute/research_dataset"),
-    Path("data_tw_minute/shioaji_1m"),
-)
-DEFAULT_LOCAL_MINUTE_CACHE_ROOTS = (
-    Path("artifacts/data_repair/tw_day_trade_minute_curve/rebuilt/tick_minutes"),
 )
 
 

@@ -39,10 +39,32 @@ def qualification(record: dict, *, market: str, panel_date: str) -> str:
             or record.get("completed_session_cache") is not True):
         raise ValueError("independent full-forward benchmark qualification is missing")
     controls = record.get("full_forward_controls")
+    projection = bool(isinstance(controls, list) and controls
+                      and controls[0].get("projection_contract") ==
+                      signal_engine._COMPLETED_SIGNAL_PROJECTION)
+    candle_policy = bool(projection and controls[0].get("candle_aux_policy") ==
+                         signal_engine._COMPLETED_CANDLE_AUX_POLICY)
+    model_equal = bool(isinstance(controls, list) and controls and
+                       controls[0].get("full_model_output_bitwise_equal") is True)
+    if candle_policy:
+        model_equal = (
+            controls[0].get("full_default_model_output_bitwise_equal") is True
+            and controls[0].get("non_candle_output_bitwise_equal") is True
+            and controls[0].get("oracle_model_calls") == 1
+            and bool(controls[0].get("omitted_candle_fields"))
+            and all(row.get("candle_aux_policy") == signal_engine._COMPLETED_CANDLE_AUX_POLICY
+                    for row in controls)
+            and all(row.get("oracle_model_calls") == 0 for row in controls[1:]))
+    outputs_equal = (
+        model_equal
+        and all(row.get("projection_contract") == signal_engine._COMPLETED_SIGNAL_PROJECTION
+                and row.get("complete_signal_projection_bitwise_equal") is True for row in controls)
+        if projection else isinstance(controls, list)
+        and all(row.get("whole_output_bitwise_equal") is True for row in controls))
     if (not isinstance(controls, list) or len(controls) < 2
             or controls[0].get("model_calls") != 1
             or any(row.get("model_calls") != 0 for row in controls[1:])
-            or any(row.get("whole_output_bitwise_equal") is not True for row in controls)
+            or not outputs_equal
             or len({row.get("candidate_key") for row in controls}) != 1):
         raise ValueError("a complete new-code forward and independent warm-cache oracle are required")
     samples = record.get("samples")

@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from zoneinfo import ZoneInfo
@@ -26,7 +27,17 @@ from downloader.dataset_lock import exclusive_dataset_lock
 from stockagent.data.tw_security import classify_tw_stock_or_etf
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+# Stable reader envelope: existing execution owners can read a corrected
+# source generation without replacing their process or touching pending orders.
+# Membership policy has its own version, pinned inside the envelope's hash.
 CONTRACT = "tw_official_current_regular_stock_etf_universe_v3"
+MEMBERSHIP_CONTRACT = "tw_official_active_stock_etf_membership_v1"
+TPEX_ETF_CATALOGS = {
+    name: "https://www.tpex.org.tw/www/zh-tw/ETF/list?type=" + query
+    for name, query in (("domestic", "domestic"), ("foreign", "foreign"),
+        ("bond", "bond&bondType=0"), ("multi", "multi"), ("active", "active"),
+        ("leveraged", "leveraged"), ("futures", "futures"))
+}
 SOURCES = {
     "twse_registry": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
     "tpex_registry": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
@@ -34,7 +45,12 @@ SOURCES = {
     "twse_suspensions": "https://www.twse.com.tw/rwd/zh/violation/stop?response=json",
     "tpex_status": "https://www.tpex.org.tw/openapi/v1/tpex_cmode",
     "tpex_halts": "https://www.tpex.org.tw/openapi/v1/tpex_spendi_history",
+    "twse_etf_catalog": "https://www.twse.com.tw/rwd/zh/ETF/list?response=json",
+    **{"tpex_etf_" + name: url for name, url in TPEX_ETF_CATALOGS.items()},
 }
+CATALOG_NAMES = ("twse_etf_catalog", *("tpex_etf_" + name for name in TPEX_ETF_CATALOGS))
+MEMBERSHIP_SOURCE = "active_product_membership"
+MEMBERSHIP_URL = "canonical:tw_current_trading_universe:active_product_membership"
 _REFRESH_LOCK = threading.Lock()
 
 
@@ -111,6 +127,114 @@ def parse_registry(content: bytes, market: str, as_of: datetime) -> list[dict]:
     if not result:
         raise ValueError("official current-session registry is empty")
     return result
+
+
+def parse_tpex_etf_catalog(content: bytes, session_date: str) -> set[str]:
+    """Validate all rows, including future listings, before taking membership."""
+    payload = json.loads(content)
+    if not isinstance(payload, dict) or payload.get("date") != session_date.replace("-", ""):
+        raise ValueError("TPEx ETF catalogue date mismatch")
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or len(tables) != 1:
+        raise ValueError("TPEx ETF catalogue table missing/ambiguous")
+    table = tables[0]
+    if not isinstance(table, dict) or table.get("fields") != ["證券代號", "ETF簡稱", "上櫃日期"]:
+        raise ValueError("TPEx ETF catalogue schema mismatch")
+    rows, count = table.get("data"), table.get("totalCount")
+    if (not isinstance(rows, list) or type(count) is not int or count != len(rows)
+            or payload.get("stat") != ("ok" if rows else "暫無相關商品")):
+        raise ValueError("TPEx ETF catalogue status/count mismatch")
+    symbols, seen = set(), set()
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError("TPEx ETF catalogue row width mismatch")
+        symbol, name, listed = row
+        if (not isinstance(symbol, str) or classify_tw_stock_or_etf(symbol) != "etf"
+                or not isinstance(name, str) or not name.strip() or symbol in seen):
+            raise ValueError("TPEx ETF catalogue invalid/duplicate symbol")
+        seen.add(symbol)
+        listing_date = _date(listed)
+        if listing_date is None:
+            raise ValueError("TPEx ETF catalogue listing date missing")
+        if listing_date <= date.fromisoformat(session_date):
+            symbols.add(symbol)
+    return symbols
+
+
+def parse_twse_etf_catalog(content: bytes, session_date: str) -> set[str]:
+    """Include every currency counter; future listings are not active yet.
+
+    This endpoint has no source-date/totalCount fields. Its real acquisition
+    clock is mandatory in the receipt; never manufacture a publication date.
+    """
+    payload = json.loads(content)
+    if (not isinstance(payload, dict) or payload.get("stat") != "OK"
+            or payload.get("fields") != ["上市日期", "證券代號", "證券簡稱", "發行人", "標的指數"]
+            or not isinstance(payload.get("data"), list) or not payload["data"]):
+        raise ValueError("TWSE ETF catalogue status/schema missing")
+    symbols, seen = set(), set()
+    for row in payload["data"]:
+        if (not isinstance(row, list) or len(row) != 5
+                or not all(isinstance(v, str) for v in row[:4])
+                or row[4] is not None and not isinstance(row[4], str)):
+            raise ValueError("TWSE ETF catalogue row width/type mismatch")
+        dates, codes, names = (re.split(r"<br\s*/?>", value, flags=re.IGNORECASE) for value in row[:3])
+        if not len(dates) == len(codes) == len(names):
+            raise ValueError("TWSE ETF currency counters are misaligned")
+        for listed, code, name in zip(dates, codes, names, strict=True):
+            matched_code = re.fullmatch(r"([0-9A-Z]+)(?:\([^()]+\))?", code.strip())
+            matched_date = re.fullmatch(r"(\d{4}\.\d{2}\.\d{2})(?:\([^()]+\))?", listed.strip())
+            if not matched_code or not matched_date or not name.strip():
+                raise ValueError("TWSE ETF catalogue counter/date malformed")
+            symbol = matched_code[1]
+            if classify_tw_stock_or_etf(symbol) != "etf" or symbol in seen:
+                raise ValueError("TWSE ETF catalogue invalid/duplicate symbol")
+            seen.add(symbol)
+            if _date(matched_date[1].replace(".", "/")) <= date.fromisoformat(session_date):
+                symbols.add(symbol)
+    return symbols
+
+
+def _listed_records_identity(records: list[dict]) -> str:
+    projection = sorted(({k: v for k, v in row.items() if k != "trading_status"}
+                         for row in records), key=lambda row: row["symbol"])
+    return hashlib.sha256(json.dumps(projection, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":")).encode()).hexdigest()
+
+
+def reconcile_active_etfs(records: list[dict], catalogs: dict[str, set[str]]) -> tuple[list[dict], dict]:
+    """Current product tables govern ETF membership, not quote availability.
+
+    An absent ETF is an explicitly evidenced current-catalog exclusion, not
+    an invented permanent-exit date. No historical price/ledger is rewritten.
+    Catalogue-only eligible symbols require an updated registry, never a
+    silently smaller universe or guessed ISIN/venue metadata.
+    """
+    if set(catalogs) != set(CATALOG_NAMES):
+        raise ValueError("official ETF catalogue coverage is incomplete")
+    active = {"twse": catalogs["twse_etf_catalog"],
+              "tpex": set().union(*(catalogs["tpex_etf_" + name] for name in TPEX_ETF_CATALOGS))}
+    excluded, comparisons = [], {}
+    for market, symbols in active.items():
+        registry = {r["symbol"] for r in records if r["market"] == market and r["security_type"] == "etf"}
+        if registry and not symbols:
+            raise ValueError("official ETF catalogue unexpectedly empty: " + market)
+        if symbols - registry:
+            raise ValueError("official ETF registry missing eligible catalogue symbols: "
+                             + market + ":" + ",".join(sorted(symbols - registry)))
+        comparisons[market] = {"registry_count": len(registry), "active_catalog_count": len(symbols),
+            "excluded_symbols": sorted(registry - symbols), "catalog_only_symbols": []}
+    kept = []
+    for row in records:
+        if row["security_type"] == "etf" and row["symbol"] not in active[row["market"]]:
+            excluded.append({**row, "exclusion_reason": "not_in_complete_current_official_etf_catalog"})
+        else:
+            kept.append(row)
+    return kept, {"contract": MEMBERSHIP_CONTRACT, "registry_count": len(records),
+                  "listed_count": len(kept), "excluded_count": len(excluded),
+                  "listed_records_sha256": _listed_records_identity(kept),
+                  "excluded_records": sorted(excluded, key=lambda row: row["symbol"]),
+                  "etf_catalog_comparison": comparisons}
 
 
 def halted_symbols(payloads: dict[str, list], as_of: datetime) -> set[str]:
@@ -246,9 +370,10 @@ def _identity(payload: dict) -> str:
 
 
 def _fetch(url: str) -> bytes:
-    response = requests.get(url, timeout=(3, 15))
-    response.raise_for_status()
-    return response.content
+    from downloader.download_tw_short_sale_restrictions import _rate_limited_call
+    with _rate_limited_call(requests.get, url, timeout=(3, 15)) as response:
+        response.raise_for_status()
+        return response.content
 
 
 def _cached_source(name: str, root: Path, session_date: str, max_age: float) -> tuple[bytes, dict] | None:
@@ -257,6 +382,8 @@ def _cached_source(name: str, root: Path, session_date: str, max_age: float) -> 
         state_path = root / "source_state" / session_date / (name + ".json")
         if state_path.exists():
             source = json.loads(state_path.read_text())
+            if not isinstance(source, dict):
+                return None
         else:
             # Upgrade already archived partial refreshes without losing their
             # real observation clock or redownloading successful large pages.
@@ -285,6 +412,47 @@ def _publish_refresh_status(root: Path, payload: dict) -> None:
     atomic_write_json(root / "refresh_status.json", payload)
 
 
+def collect_current_sources(names, root: Path, session_date: str, *, fetch=None,
+                            force=False, max_age_seconds=900) -> tuple[dict, dict, dict]:
+    """One raw-source/cache owner shared by promotion and source-only audits."""
+    fetch = fetch or _fetch
+    raw, sources, failures = {}, {}, {}
+
+    def receive(name):
+        age = 86400 if name.endswith("registry") else max_age_seconds
+        cached = None if force else _cached_source(name, root, session_date, age)
+        if cached is not None:
+            return cached
+        content = fetch(SOURCES[name])
+        observed = datetime.now(TAIPEI)
+        if observed.date().isoformat() != session_date:
+            raise ValueError("official source observation crossed the day")
+        digest = hashlib.sha256(content).hexdigest()
+        path = root / "raw" / session_date / (name + "." + digest + (".html" if name.endswith("registry") else ".json"))
+        atomic_write_bytes(path, content, durable=True)
+        source = {"url": SOURCES[name], "sha256": digest, "bytes": len(content),
+                  "raw_path": str(path.resolve()), "observed_at_taipei": observed.isoformat(), "status": "received"}
+        atomic_write_json(root / "source_state" / session_date / (name + ".json"), source)
+        return content, source
+
+    with ThreadPoolExecutor(max_workers=min(8, len(names)), thread_name_prefix="tw-official-registry") as pool:
+        pending = {pool.submit(receive, name): name for name in names}
+        for future in as_completed(pending):
+            name = pending[future]
+            try:
+                raw[name], sources[name] = future.result()
+            except Exception as exc:
+                failures[name] = type(exc).__name__
+                # Keep the accepted generation/raw bytes, but do not let a
+                # force-refresh failure silently reuse that older successful
+                # transport as the retry of this failed request.
+                atomic_write_json(root / "source_state" / session_date / (name + ".json"),
+                    {"url": SOURCES[name], "status": "transport_failed",
+                     "observed_at_taipei": datetime.now(TAIPEI).isoformat(),
+                     "error_type": type(exc).__name__})
+    return raw, sources, failures
+
+
 def refresh_current_universe(session_date: str, *, force: bool = False,
                              max_age_seconds: float | None = None, fetch=None,
                              parquet_root: str | Path | None = None) -> dict:
@@ -300,48 +468,23 @@ def refresh_current_universe(session_date: str, *, force: bool = False,
             try:
                 previous = load_current_universe(session_date)
                 age = (datetime.now(TAIPEI) - datetime.fromisoformat(previous["observed_at_taipei"])).total_seconds()
-                if max_age_seconds is None or age <= max_age_seconds:
+                try:
+                    attempt = json.loads((receipt_path(session_date).parent / "refresh_status.json").read_bytes())
+                    recovery_due = (isinstance(attempt, dict) and attempt.get("session_date") == session_date
+                        and attempt.get("status") in {"waiting_source", "invalid_source"})
+                except (OSError, ValueError, TypeError):
+                    recovery_due = False
+                if not recovery_due and (max_age_seconds is None or age <= max_age_seconds):
                     return previous
             except TWTradingUniversePending:
                 pass
         started = time.perf_counter()
         path = receipt_path(session_date)
-        fetch = fetch or _fetch
-        raw, failures, transport = {}, {}, {}
-        with ThreadPoolExecutor(max_workers=len(SOURCES), thread_name_prefix="tw-official-registry") as pool:
-            pending = {}
-            def receive(url):
-                content = fetch(url)
-                return content, datetime.now(TAIPEI).isoformat()
-            for name, url in SOURCES.items():
-                # ISIN membership is daily; halt/status inputs are short-lived.
-                # Keep each real source clock rather than refreshing successful
-                # multi-MB registry pages whenever one status request fails.
-                source_age = 86400 if name.endswith("registry") else (max_age_seconds if max_age_seconds is not None else 900)
-                cached = None if force else _cached_source(name, path.parent, session_date, source_age)
-                if cached is not None:
-                    raw[name], transport[name] = cached
-                else:
-                    pending[pool.submit(receive, url)] = name
-            for future in as_completed(pending):
-                name = pending[future]
-                try:
-                    raw[name], observed_at = future.result()
-                    transport[name] = {"observed_at_taipei": observed_at, "status": "received"}
-                except Exception as exc:
-                    failures[name] = type(exc).__name__
+        raw, sources, failures = collect_current_sources(tuple(SOURCES), path.parent, session_date,
+            fetch=fetch, force=force, max_age_seconds=max_age_seconds if max_age_seconds is not None else 900)
         captured = datetime.now(TAIPEI)
         if captured.date().isoformat() != session_date:
             raise ValueError("official registry acquisition crossed the session date")
-        sources = {}
-        for name, content in raw.items():
-            digest = hashlib.sha256(content).hexdigest()
-            raw_path = path.parent / "raw" / session_date / (name + "." + digest + (".html" if name.endswith("registry") else ".json"))
-            atomic_write_bytes(raw_path, content, durable=True)
-            sources[name] = {"url": SOURCES[name], "sha256": digest,
-                             "bytes": len(content), "raw_path": str(raw_path.resolve()),
-                             "observed_at_taipei": transport[name]["observed_at_taipei"], "status": "received"}
-            atomic_write_json(path.parent / "source_state" / session_date / (name + ".json"), sources[name])
         # A failed refresh preserves both successful source bytes and the last
         # accepted pointer. Never publish a partial registry as a smaller market.
         if failures:
@@ -364,6 +507,17 @@ def refresh_current_universe(session_date: str, *, force: bool = False,
             records = parse_source("twse_registry", lambda content: parse_registry(content, "listed", as_of)) + parse_source("tpex_registry", lambda content: parse_registry(content, "otc", as_of))
             if len({r["symbol"] for r in records}) != len(records):
                 raise ValueError("official venues have conflicting symbol membership")
+            catalogs = {name: parse_source(name,
+                lambda content, name=name: (parse_twse_etf_catalog if name == "twse_etf_catalog" else parse_tpex_etf_catalog)(content, session_date))
+                for name in CATALOG_NAMES}
+            try:
+                records, membership = reconcile_active_etfs(records, catalogs)
+            except ValueError:
+                # A newly active product may arrive in the catalogue before
+                # ISIN catches up. Refresh those registries on retry instead
+                # of waiting out their normal daily cache TTL.
+                invalid_sources.update(("twse_registry", "tpex_registry"))
+                raise
             lifecycle_names = ("twse_halts", "tpex_status", "tpex_halts")
             lifecycle = {k: parse_source(k, json.loads) for k in lifecycle_names}
             try:
@@ -377,6 +531,16 @@ def refresh_current_universe(session_date: str, *, force: bool = False,
                 as_of, path.parent / "raw" / session_date)
             halted.update(corporate)
             sources.update(corporate_sources)
+            membership.update(session_date=session_date, observed_at_taipei=captured.isoformat(),
+                evaluated_at_taipei=as_of.isoformat(), historical_pit_claim=False,
+                source_sha256={name: sources[name]["sha256"] for name in ("twse_registry", "tpex_registry", *CATALOG_NAMES)})
+            policy_raw = json.dumps(membership, ensure_ascii=False, sort_keys=True).encode()
+            policy_digest = hashlib.sha256(policy_raw).hexdigest()
+            policy_path = path.parent / "raw" / session_date / (MEMBERSHIP_SOURCE + "." + policy_digest + ".json")
+            atomic_write_bytes(policy_path, policy_raw, durable=True)
+            sources[MEMBERSHIP_SOURCE] = {"url": MEMBERSHIP_URL, "contract": MEMBERSHIP_CONTRACT,
+                "sha256": policy_digest, "bytes": len(policy_raw), "raw_path": str(policy_path.resolve()),
+                "observed_at_taipei": captured.isoformat()}
         except (OSError, ValueError, KeyError, TypeError) as exc:
             for name in invalid_sources:
                 sources[name]["status"] = "invalid_source"
@@ -389,6 +553,8 @@ def refresh_current_universe(session_date: str, *, force: bool = False,
         for row in records:
             row["trading_status"] = "halted" if row["symbol"] in halted else "listed_for_regular_trading"
         payload = {"schema_version": 1, "contract": CONTRACT, "session_date": session_date,
+                   "membership_contract": MEMBERSHIP_CONTRACT,
+                   "registry_count": membership["registry_count"], "excluded_count": membership["excluded_count"],
                    "observed_at_taipei": captured.isoformat(), "evaluated_at_taipei": as_of.isoformat(),
                    "historical_pit_claim": False, "sources": sources,
                    "records": sorted(records, key=lambda r: r["symbol"]),
@@ -403,7 +569,8 @@ def refresh_current_universe(session_date: str, *, force: bool = False,
             "status": "ready", "session_date": session_date,
             "observed_at_taipei": captured.isoformat(), "fingerprint": payload["fingerprint"],
             "listed_count": payload["listed_count"], "trading_count": payload["trading_count"],
-            "halted_count": payload["halted_count"], "elapsed_ms": payload["elapsed_ms"]})
+            "halted_count": payload["halted_count"], "elapsed_ms": payload["elapsed_ms"],
+            "membership_contract": MEMBERSHIP_CONTRACT, "excluded_count": payload["excluded_count"]})
         return payload
 
 
@@ -411,7 +578,9 @@ def refresh_current_universe(session_date: str, *, force: bool = False,
 def _read_receipt(path: str, mtime_ns: int, size: int) -> dict:
     del mtime_ns, size
     payload = json.loads(Path(path).read_text())
-    if payload.get("schema_version") != 1 or payload.get("contract") != CONTRACT or payload.get("fingerprint") != _identity(payload):
+    if (not isinstance(payload, dict) or payload.get("schema_version") != 1 or payload.get("contract") != CONTRACT
+            or payload.get("membership_contract") != MEMBERSHIP_CONTRACT
+            or payload.get("fingerprint") != _identity(payload)):
         raise ValueError("official trading registry fingerprint mismatch")
     records = payload["records"]
     if not records or len({r["symbol"] for r in records}) != len(records):
@@ -423,13 +592,49 @@ def _read_receipt(path: str, mtime_ns: int, size: int) -> dict:
                    or r["security_type"] not in {"stock", "etf"}
                    or classify_tw_stock_or_etf(r["symbol"]) != r["security_type"] for r in records)):
         raise ValueError("official trading registry type/status mismatch")
-    for name in (*SOURCES, "share_replacement_reference", "share_replacement_summary", "share_replacement_manifest"):
+    raw_sources = {}
+    for name in (*SOURCES, "share_replacement_reference", "share_replacement_summary", "share_replacement_manifest", MEMBERSHIP_SOURCE):
         source = payload["sources"][name]
         raw = Path(source["raw_path"]).read_bytes()
-        expected_url = SOURCES.get(name, "canonical:tw_share_replacement_reference")
+        expected_url = MEMBERSHIP_URL if name == MEMBERSHIP_SOURCE else SOURCES.get(name, "canonical:tw_share_replacement_reference")
         if (source["url"] != expected_url or len(raw) != source["bytes"]
                 or hashlib.sha256(raw).hexdigest() != source["sha256"]):
             raise ValueError("official trading registry raw evidence mismatch")
+        if name in SOURCES or name == MEMBERSHIP_SOURCE:
+            observed = datetime.fromisoformat(source["observed_at_taipei"])
+            if (observed.tzinfo is None or observed.astimezone(TAIPEI).date().isoformat() != payload["session_date"]
+                    or observed > datetime.fromisoformat(payload["observed_at_taipei"])):
+                raise ValueError("official membership source clock mismatch")
+            raw_sources[name] = raw
+    # The policy version is bound by the existing wire fingerprint through its
+    # source receipt. Do not change the envelope hash formula: old execution
+    # readers must safely consume the same atomically published generation.
+    policy = json.loads(raw_sources[MEMBERSHIP_SOURCE])
+    if (not isinstance(policy, dict)
+            or payload["sources"][MEMBERSHIP_SOURCE].get("contract") != MEMBERSHIP_CONTRACT
+            or policy.get("contract") != MEMBERSHIP_CONTRACT
+            or policy.get("session_date") != payload["session_date"]
+            or any(policy.get(key) != payload.get(key) for key in (
+                "observed_at_taipei", "evaluated_at_taipei", "historical_pit_claim"))
+            or policy.get("historical_pit_claim") is not False
+            or policy.get("source_sha256") != {name: payload["sources"][name]["sha256"]
+                for name in ("twse_registry", "tpex_registry", *CATALOG_NAMES)}):
+        raise ValueError("official membership policy/source binding mismatch")
+    as_of = datetime.fromisoformat(payload["evaluated_at_taipei"])
+    if as_of.tzinfo is None or as_of.astimezone(TAIPEI).date().isoformat() != payload["session_date"]:
+        raise ValueError("official membership effective clock mismatch")
+    # The writer already parsed every source before atomically publishing its
+    # immutable policy/projection. Bind that exact projection here while still
+    # verifying ALL raw hashes above; do not parse multi-megabyte ISIN HTML or
+    # import its downloader in a 09:00 consumer. Independent engineering checks
+    # can replay the same canonical reconciliation from the archived sources.
+    if (policy.get("listed_records_sha256") != _listed_records_identity(records)
+            or any(type(policy.get(key)) is not int or policy[key] != payload[key]
+                for key in ("registry_count", "listed_count", "excluded_count"))
+            or policy["registry_count"] != policy["listed_count"] + policy["excluded_count"]
+            or not isinstance(policy.get("excluded_records"), list)
+            or len(policy["excluded_records"]) != policy["excluded_count"]):
+        raise ValueError("official membership reconciliation mismatch")
     return payload
 
 
@@ -475,6 +680,8 @@ def opening_scope(symbols: list[str], session_date: str) -> tuple[np.ndarray, di
     # A caller owns its arrays/lists; it cannot mutate a subsequent mode's view.
     mask = mask.copy()
     return mask, {"contract": CONTRACT, "fingerprint": payload["fingerprint"],
+                  "membership_contract": MEMBERSHIP_CONTRACT,
+                  "official_registry_count": payload["registry_count"], "official_excluded_count": payload["excluded_count"],
                   "session_date": session_date, "observed_at_taipei": payload["observed_at_taipei"],
                   "official_listed_count": payload["listed_count"], "official_trading_count": len(official),
                   "official_halted_count": payload["halted_count"],
@@ -493,6 +700,8 @@ def public_current_universe(session_date: str) -> dict:
         return {"status": "waiting_source", "contract": CONTRACT,
                 "session_date": session_date, "historical_pit_claim": False}
     return {"status": "ready", "contract": CONTRACT,
+            "membership_contract": MEMBERSHIP_CONTRACT,
+            "registry_count": payload["registry_count"], "excluded_count": payload["excluded_count"],
             "session_date": session_date, "fingerprint": payload["fingerprint"],
             "observed_at_taipei": payload["observed_at_taipei"],
             "listed_count": payload["listed_count"], "halted_count": payload["halted_count"],

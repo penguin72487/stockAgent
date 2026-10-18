@@ -14,6 +14,65 @@ STATUS_COLUMNS = (
     "dataset", "state", "rows", "bytes", "first_data_date",
     "last_data_date", "last_attempt_at_utc",
 )
+RELEASE_RESERVE_INDEX = "idx_finmind_release_reserve_covering"
+RELEASE_RESERVE_COLUMNS = ("priority", "state", "next_attempt_at_utc", "dataset", "kind",
+                           "data_id", "error_code", "rows")
+RELEASE_RESERVE_PREDICATE = "priority=0 AND kind!='derived'"
+US_PUBLICATION_INDEX = "idx_finmind_us_unfinalized"
+US_PUBLICATION_COLUMNS = ("dataset", "data_id", "partition", "last_attempt_at_utc")
+US_PUBLICATION_PREDICATE = ("state='complete' AND rows>0 AND "
+                            "julianday(last_attempt_at_utc)<julianday(partition)+2")
+PERIODIC_INDEX = "idx_finmind_periodic_covering"
+PERIODIC_COLUMNS = ("kind", "partition", "state", "dataset", "data_id", "last_attempt_at_utc",
+                    "next_attempt_at_utc", "priority")
+PERIODIC_PREDICATE = "kind IN ('snapshot','year')"
+
+
+def ensure_release_reserve_index(connection: sqlite3.Connection) -> None:
+    """Original owner only: the small release-hour cohort, not all history."""
+    connection.execute(f"CREATE INDEX IF NOT EXISTS {RELEASE_RESERVE_INDEX} "
+                       f"ON tasks({','.join(RELEASE_RESERVE_COLUMNS)}) WHERE {RELEASE_RESERVE_PREDICATE}")
+
+
+def ensure_us_publication_index(connection: sqlite3.Connection) -> None:
+    """Keep early observations searchable without scanning finalized history."""
+    connection.execute(f"CREATE INDEX IF NOT EXISTS {US_PUBLICATION_INDEX} "
+                       f"ON tasks({','.join(US_PUBLICATION_COLUMNS)}) WHERE {US_PUBLICATION_PREDICATE}")
+
+
+def ensure_periodic_index(connection: sqlite3.Connection) -> None:
+    """Periodic policy reconciliation must not traverse all minute history."""
+    connection.execute(f"CREATE INDEX IF NOT EXISTS {PERIODIC_INDEX} "
+                       f"ON tasks({','.join(PERIODIC_COLUMNS)}) WHERE {PERIODIC_PREDICATE}")
+
+
+def periodic_index(connection: sqlite3.Connection) -> str:
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                             (PERIODIC_INDEX,)).fetchone()
+    expected = (f"CREATE INDEX {PERIODIC_INDEX} "
+                f"ON tasks({','.join(PERIODIC_COLUMNS)}) WHERE {PERIODIC_PREDICATE}")
+    return (f" INDEXED BY {PERIODIC_INDEX}"
+            if row and isinstance(row[0], str) and row[0].split() == expected.split() else "")
+
+
+def us_publication_index(connection: sqlite3.Connection) -> str:
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                             (US_PUBLICATION_INDEX,)).fetchone()
+    expected = (f"CREATE INDEX {US_PUBLICATION_INDEX} "
+                f"ON tasks({','.join(US_PUBLICATION_COLUMNS)}) WHERE {US_PUBLICATION_PREDICATE}")
+    return (f" INDEXED BY {US_PUBLICATION_INDEX}"
+            if row and isinstance(row[0], str) and row[0].split() == expected.split() else "")
+
+
+def release_reserve_index(connection: sqlite3.Connection) -> str:
+    """Pin only an exactly recognized physical projection; legacy readers work."""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                             (RELEASE_RESERVE_INDEX,)).fetchone()
+    expected = (f"CREATE INDEX {RELEASE_RESERVE_INDEX} "
+                f"ON tasks({','.join(RELEASE_RESERVE_COLUMNS)}) WHERE {RELEASE_RESERVE_PREDICATE}")
+    if not row or not isinstance(row[0], str) or row[0].split() != expected.split():
+        return ""
+    return f" INDEXED BY {RELEASE_RESERVE_INDEX}"
 
 
 def ensure_status_index(connection: sqlite3.Connection) -> None:

@@ -15,6 +15,7 @@ const fetchMinuteHistory = Dashboard.createFetch({timeoutMs: 60000});
 const SIGNAL_PAGE_SIZE = 100;
 const POSITION_PAGE_SIZE = 100;
 const EVENT_PAGE_SIZE = 100;
+const DEFAULT_PERFORMANCE_START_DATE = "2026-01-01";
 const DATA_MONITOR_STATUS_PATHS = [
   "api/public-data-status",
   "/data-monitor/api/status",
@@ -62,7 +63,8 @@ let featurePanelSignalKey = "";
 let featurePanelScopeText = "";
 let signalFilterTimer = null;
 let dateFilterTimer = null;
-let followLatestSession = true;
+let followLatestSession = false;
+let followPerformanceRange = true;
 let sessionRolloverTimer = null;
 let sessionRolloverDeadline = "";
 let sessionRolloverDue = Infinity;
@@ -312,8 +314,15 @@ const shortTime = (value) => {
 };
 const replayTimingText = (row = {}, fallbackAt = null) => {
   const rebuiltAt = row.open_reconstructed_at || fallbackAt || row.signal_at;
+  if (row.replay_signal_origin === "current_model_counterfactual"
+      || /-counterfactual-official-open-\d{4}-\d{2}-\d{2}$/.test(String(row.signal_id || ""))) {
+    return `${shortTime(rebuiltAt)} · 目前模型反事實回放（非當時訊號）`;
+  }
   const originalAt = row.source_signal_at;
-  return `${shortTime(rebuiltAt)} · 開盤價重建${originalAt ? `；原始訊號 ${shortTime(originalAt)}` : ""}`;
+  // An isolated replay envelope may repeat the effective ledger clock here.
+  // Do not claim that duplicate is the immutable model generation time.
+  const distinctOriginalAt = originalAt && originalAt !== rebuiltAt;
+  return `${shortTime(rebuiltAt)} · 開盤價重建${distinctOriginalAt ? `；原始訊號 ${shortTime(originalAt)}` : ""}`;
 };
 const signalTimingText = (row = {}, fallbackAt = null) => row.counterfactual_open_replay
   ? replayTimingText(row, fallbackAt)
@@ -642,6 +651,7 @@ function engineStatusLabel(value) {
     critical_unflattened_after_13_24: "13:24 市價重試後有殘餘，已轉 13:25 集合競價",
     blocked_missing_eligibility: "缺少當日當沖資格資料，已停止執行",
     blocked_missing_checkpoint: "缺少模型權重，已停止執行",
+    blocked_mode_configuration: "模式設定驗證失敗，已停止執行",
     waiting_13_25_signal: "等待舊版 13:25 訊號",
     waiting_close_auction_match: "等待實際收盤撮合",
     carrying_to_next_open: "持有至次一交易日開盤",
@@ -886,20 +896,31 @@ function syncFilters(data) {
     if ([...mode.options].some((option) => option.value === previousMode)) mode.value = previousMode;
     const earliest = availableDetailDates.at(-1) || data.session_date || "";
     const latest = availableDetailDates[0] || data.session_date || "";
-    startDate.min = earliest; startDate.max = latest;
-    endDate.min = earliest; endDate.max = latest;
-    const withinCoverage = (value) => Boolean(value && earliest <= value && value <= latest);
+    // A requested calendar boundary may precede the first retained observation.
+    // Keep it visible; the chart reports its real data coverage, not fake marks.
+    const minimum = earliest && earliest < DEFAULT_PERFORMANCE_START_DATE
+      ? earliest : DEFAULT_PERFORMANCE_START_DATE;
+    startDate.min = minimum; startDate.max = latest;
+    endDate.min = minimum; endDate.max = latest;
+    const withinCoverage = (value) => Boolean(value && minimum <= value && value <= latest);
     startDate.value = withinCoverage(previousStart) ? previousStart : data.session_date;
     endDate.value = withinCoverage(previousEnd) ? previousEnd : data.session_date;
     lastFilterRevision = revision;
   }
   if (!endDate.value) endDate.value = data.session_date;
   if (!startDate.value) startDate.value = endDate.value;
+  if (followPerformanceRange && data.session_date) {
+    startDate.value = data.session_date < DEFAULT_PERFORMANCE_START_DATE
+      ? availableDetailDates.at(-1) || data.session_date
+      : DEFAULT_PERFORMANCE_START_DATE;
+    endDate.value = data.session_date;
+  }
   if (followLatestSession && data.session_date) {
     startDate.value = data.session_date;
     endDate.value = data.session_date;
   }
   const followButton = $("follow-latest-session");
+  $("performance-range")?.setAttribute("aria-pressed", String(followPerformanceRange));
   if (followButton) {
     followButton.setAttribute("aria-pressed", String(followLatestSession));
     const rollover = data.service_sync?.session_clock?.rollover_local_time || (IS_OVERNIGHT ? "13:00" : "08:30");
@@ -927,7 +948,7 @@ function clearDateScopedViews() {
 }
 
 function scheduleSessionRollover(serviceSync) {
-  if (!followLatestSession) return;
+  if (!followLatestSession && !followPerformanceRange) return;
   const deadline = String(serviceSync?.session_clock?.next_rollover_at || "");
   const serverNow = Date.parse(serviceSync?.generated_at_utc || "");
   const remaining = Date.parse(deadline) - serverNow;
@@ -944,7 +965,7 @@ function scheduleSessionRollover(serviceSync) {
   sessionRolloverTimer = window.setTimeout(() => {
     sessionRolloverDeadline = "";
     sessionRolloverDue = Infinity;
-    if (followLatestSession) void refresh();
+    if (followLatestSession || followPerformanceRange) void refresh();
   }, Math.min(remaining, 2147483647));
 }
 
@@ -1715,8 +1736,9 @@ async function loadChartHistory({preferCache = false} = {}) {
     const coversAllAvailableDates = Boolean(
       requestedStart
       && requestedEnd
-      && requestedStart === availableDetailDates.at(-1)
-      && requestedEnd === availableDetailDates[0]
+      && availableDetailDates.length
+      && requestedStart <= availableDetailDates.at(-1)
+      && requestedEnd >= availableDetailDates[0]
     );
     if (requestedStart && !coversAllAvailableDates) params.set("start_date", requestedStart);
     if (requestedEnd && !coversAllAvailableDates) params.set("end_date", requestedEnd);
@@ -1730,9 +1752,9 @@ async function loadChartHistory({preferCache = false} = {}) {
       chartHistoryCache.delete(chartHistoryCache.keys().next().value);
     }
     const decodedPayload = decodeChartHistory(payload);
-    // The canonical unbounded projection is exactly the selected range when
-    // both calendar controls equal the available extrema. Reuse its startup-
-    // warmed cache key, while retaining the explicit client selection contract.
+    // A range enclosing all retained dates has exactly the unbounded points.
+    // Reuse the startup-warmed projection without inventing earlier data;
+    // retain the requested calendar boundaries and actual coverage separately.
     const decoded = coversAllAvailableDates
       ? {...decodedPayload, start_date: requestedStart, end_date: requestedEnd}
       : decodedPayload;
@@ -2352,6 +2374,7 @@ function filtersChanged({debounceSignals = false, includeChart = false, reloadEv
 $("mode-filter").addEventListener("change", () => filtersChanged({includeChart: true}));
 function detailDateChanged(event) {
   followLatestSession = false;
+  followPerformanceRange = false;
   window.clearTimeout(sessionRolloverTimer);
   sessionRolloverDeadline = "";
   const startInput = $("detail-start-date");
@@ -2392,6 +2415,14 @@ $("detail-start-date").addEventListener("change", detailDateChanged);
 $("detail-end-date").addEventListener("change", detailDateChanged);
 $("follow-latest-session")?.addEventListener("click", () => {
   followLatestSession = true;
+  followPerformanceRange = false;
+  lastFilterRevision = null;
+  clearDateScopedViews();
+  void refresh();
+});
+$("performance-range")?.addEventListener("click", () => {
+  followLatestSession = false;
+  followPerformanceRange = true;
   lastFilterRevision = null;
   clearDateScopedViews();
   void refresh();

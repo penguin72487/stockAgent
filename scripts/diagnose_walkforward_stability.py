@@ -200,9 +200,9 @@ def diagnose_checkpoint(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        import torch
+        from stockagent.training.runtime import load_checkpoint
 
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        checkpoint = load_checkpoint(path)
     except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         return {}
     if not isinstance(checkpoint, dict):

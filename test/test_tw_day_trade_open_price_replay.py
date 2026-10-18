@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,46 @@ from stockagent.live.tw_day_trade_simulation import (
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+@pytest.mark.parametrize("verified_open", [True, False])
+def test_local_open_read_benchmark_requires_exact_source_parity(
+    tmp_path: Path, verified_open: bool,
+) -> None:
+    root = tmp_path / "minute"
+    partition = root / "trade_date=2026-08-13/data.parquet"
+    partition.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["2330", "2330"],
+        "ts": [datetime(2026, 8, 13, 9, 1), datetime(2026, 8, 13, 9, 2)],
+        "Open": [100.0 if verified_open else None, 101.0],
+        "Low": [99.0, 100.0], "High": [102.0, 103.0], "Close": [101.0, 102.0],
+        "volume_shares": [1_000.0, 1_000.0], "Amount": [100_500.0, 101_500.0],
+    }).write_parquet(partition)
+    output = tmp_path / "measurement.json"
+    command = [sys.executable, str(Path(replay.__file__).with_name("benchmark_tw_day_trade_0901_open_read.py")),
+               "--trading-date", "2026-08-13", "--symbols-from", str(partition),
+               "--minute-data-root", str(root), "--output", str(output)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+    if not verified_open:
+        assert result.returncode != 0
+        assert "refusing a speed claim" in result.stderr
+        assert not output.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(output.read_bytes())
+    assert receipt["status"] == "verified"
+    assert receipt["exact_price_and_symbol_parity"] is True
+    assert receipt["additional_provider_requests"] == 0
+    assert receipt["ledger_modified"] is False
+    assert 0 < receipt["pools"]["polars_observed_threads"] <= receipt["pools"]["effective_threads"]
+    assert receipt["pools"]["arrow_observed_threads"] > 0
+    assert receipt["implementation_sha256"]["scripts/benchmark_tw_day_trade_0901_open_read.py"]
+    assert [row["variant"] for row in receipt["samples"]] == [
+        "full_day", "first_minute", "first_minute", "full_day"]
+    before = output.read_bytes()
+    assert subprocess.run(command, capture_output=True, timeout=45).returncode != 0
+    assert output.read_bytes() == before
 
 
 def test_replay_parser_accepts_isolated_market_filter() -> None:
@@ -845,6 +887,90 @@ def test_first_minute_open_overlay_uses_only_positive_0901_bar(
 
     assert opens == {"2330": 100.0}
     assert receipt["resolved_first_minute_open_symbols"] == 1
+    assert receipt["additional_shioaji_requests"] == 0
+
+
+@pytest.mark.parametrize("opening,volume,expected", [
+    (100.0, 1_000.0, 100.0),
+    (None, 1_000.0, None),
+    (100.0, 0.0, None),
+    (105.0, 1_000.0, None),
+])
+def test_local_first_print_open_is_distinct_from_execution_and_mark(
+    tmp_path: Path, opening: float | None, volume: float, expected: float | None,
+) -> None:
+    partition = tmp_path / "trade_date=2026-08-13"
+    partition.mkdir()
+    pl.DataFrame({
+        "symbol": ["2330"], "ts": [datetime(2026, 8, 13, 9, 1)],
+        "Open": [opening], "Low": [99.0], "High": [102.0],
+        "Close": [101.0], "volume_shares": [volume],
+        "Amount": [100.5 * volume],
+    }).write_parquet(partition / "data.parquet")
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path,), symbols=["2330"], trading_date=date(2026, 8, 13),
+    )
+    assert rows["2330"]["session_open_price_0900"] == expected
+    assert rows["2330"]["execution_price_0901"] == (100.5 if volume else 101.0)
+    assert receipt["resolved_session_open_symbols"] == int(expected is not None)
+    if expected is not None:
+        assert "first_print_open:" in rows["2330"]["session_open_price_source"]
+    opens, _ = replay._local_first_minute_session_opens(
+        (tmp_path,), symbols={"2330"}, trading_date=date(2026, 8, 13),
+    )
+    assert opens == ({"2330": expected} if expected is not None else {})
+
+
+@pytest.mark.parametrize("layout", ["partition", "chunk"])
+@pytest.mark.parametrize("clock", ["missing", "conflicting_minute", "conflicting_date", "conflicting_offset"])
+def test_local_0901_loader_rejects_ambiguous_or_conflicting_clocks(
+    tmp_path: Path, clock: str, layout: str,
+) -> None:
+    path = (tmp_path / "trade_date=2026-08-13/data.parquet" if layout == "partition"
+            else tmp_path / "minute_chunks/2330/2026-08-13_2026-08-13.parquet")
+    path.parent.mkdir(parents=True)
+    row = {"symbol": "2330", "Close": 101.0, "volume_shares": 1_000.0}
+    if clock != "missing":
+        row.update(minutes_from_open=1, date=date(2026, 8, 13))
+        row["ts"] = datetime(2026, 8, 13, 9, 1)
+        if clock == "conflicting_minute":
+            row["ts"] = datetime(2026, 8, 13, 9, 2)
+        elif clock == "conflicting_date":
+            row["ts"] = datetime(2026, 8, 12, 9, 1)
+        elif clock == "conflicting_offset":
+            row["minutes_from_open"] = 2
+    pl.DataFrame([row]).write_parquet(path)
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path,), symbols=["2330"], trading_date=date(2026, 8, 13),
+    )
+    assert rows == {}
+    assert receipt["unresolved_symbols"] == 1
+    if clock == "missing":
+        assert receipt["error_counts"] == {
+            "missing_minute_clock" if layout == "partition" else "missing_symbol_or_timestamp": 1}
+
+
+@pytest.mark.parametrize("layout", ["partition", "chunk"])
+@pytest.mark.parametrize("timezone", ["UTC", "Asia/Taipei"])
+def test_local_0901_clock_uses_taipei_session_for_explicit_timezone(
+    tmp_path: Path, layout: str, timezone: str,
+) -> None:
+    path = (tmp_path / "trade_date=2026-08-13/data.parquet" if layout == "partition"
+            else tmp_path / "minute_chunks/2330/2026-08-13_2026-08-13.parquet")
+    path.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["2330"],
+        "ts": [datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI).astimezone(ZoneInfo(timezone))],
+        "Open": [100.0], "Close": [101.0], "Low": [99.0], "High": [102.0],
+        "volume_shares": [1_000.0], "Amount": [100_500.0],
+    }).write_parquet(path)
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path,), symbols=["2330"], trading_date=date(2026, 8, 13),
+    )
+    assert receipt["error_counts"] == {}
+    assert rows["2330"]["execution_price_0901"] == 100.5
+    assert rows["2330"]["session_open_price_0900"] == 100.0
+    assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
 
 
 def test_local_0901_vwap_loader_uses_amount_over_normalized_shares(
@@ -1061,6 +1187,43 @@ def test_intraday_bar_loader_preserves_right_label_and_observed_vwap(
 
 
 @pytest.mark.parametrize("layout", ["partition", "chunk"])
+@pytest.mark.parametrize("redirected", [False, True])
+def test_minute_provenance_resolution_is_per_file_with_redirect_fence(tmp_path, monkeypatch, layout, redirected):
+    root = tmp_path / "minute"
+    if layout == "partition":
+        path = root / "trade_date=2026-02-25/data.parquet"
+    else:
+        path = root / "minute_chunks/2330/2026-02-25_2026-02-25.parquet"
+    path.parent.mkdir(parents=True)
+    stamps = [datetime(2026, 2, 25, 9, minute) for minute in range(1, 60)]
+    pl.DataFrame({"symbol": ["2330"] * len(stamps), "ts": stamps,
+        **{name: [100.0] * len(stamps) for name in ("Open", "High", "Low", "Close")},
+        "Amount": [100_000.0] * len(stamps), "volume_shares": [1_000.0] * len(stamps)}).write_parquet(path)
+    original = Path.resolve
+    resolutions = 0
+
+    def resolve(self, *args, **kwargs):
+        nonlocal resolutions
+        if self == path:
+            resolutions += 1
+            if redirected and resolutions == 2:
+                return tmp_path / "redirected.parquet"
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    if redirected:
+        with pytest.raises(ValueError, match="redirected during frame read"):
+            replay._minute_bar_rows((root,), trading_date=date(2026, 2, 25), symbols={"2330"})
+    else:
+        bars, receipt = replay._minute_bar_rows((root,), trading_date=date(2026, 2, 25), symbols={"2330"})
+        assert len(bars["2330"]) == len(stamps)
+        assert all(row["vwap"] == 100.0 and row["volume_shares"] == 1_000 for row in bars["2330"].values())
+        assert receipt["source_counts"] == {str(path): 1}
+        assert receipt["source_files"][0]["sha256"] == replay._sha256(path)
+    assert resolutions == 2
+
+
+@pytest.mark.parametrize("layout", ["partition", "chunk"])
 @pytest.mark.parametrize(
     ("raw_volume", "amount", "canonical_shares", "expected_shares"),
     [
@@ -1231,6 +1394,78 @@ def test_latest_valid_signal_rejects_backdated_signal_without_contract(
         replay._latest_valid_signal(spec, trading_date)
 
 
+def _compact_signal_candidate(tmp_path):
+    day = date(2026, 8, 13)
+    spec = _write_signal_candidate(tmp_path, market="mode_a", trading_date=day,
+        generated_at=datetime(2026, 8, 13, 9, 0, 2, tzinfo=TAIPEI))
+    spec.uses_realistic_execution = False
+    summary_path = next(tmp_path.rglob("summary.json"))
+    parquet = summary_path.with_name("target_weights.parquet")
+    rows = pl.read_parquet(parquet).to_dicts()
+    compact = summary_path.with_name("execution_weights.json")
+    compact.write_text(json.dumps({"schema_version": 1, "market": spec.market,
+        "signal_id": "compact-signal", "rows": rows}))
+    summary = json.loads(summary_path.read_text()) | {"signal_id": "compact-signal",
+        "symbol_count": len(rows), "execution_weights_path": str(compact)}
+    summary_path.write_text(json.dumps(summary))
+    parquet.unlink()
+    return spec, day, summary_path, compact, rows
+
+
+def test_compact_only_signal_is_shared_with_live_and_pinned_without_recreation(tmp_path):
+    spec, day, summary_path, compact, rows = _compact_signal_candidate(tmp_path)
+    result = replay._preflight_replay_signals([spec], {day}, source_signal_ids={},
+        source_signal_artifacts={}, missing_signal_root=None)
+    assert result["status"] == "accepted_sources_only"
+    proof, = result["artifacts"]
+    assert proof["weights_path"] == str(compact)
+    live = live_runner._latest_signal(spec, datetime(2026, 8, 13, 9, 0, 3, tzinfo=TAIPEI))
+    assert live is not None and live[1] == rows
+    assert not summary_path.with_name("target_weights.parquet").exists()
+    # Later full-artifact publication must not replace the preflight's bytes.
+    pl.DataFrame([{"symbol": "2330", "target_weight": -1.}]).write_parquet(
+        summary_path.with_name("target_weights.parquet"))
+    actual = replay._latest_valid_signal(spec, day,
+        preferred_signal_id=proof["signal_id"], pinned_artifact=proof)
+    assert actual[2] == compact and actual[4] == rows
+    compact.write_text(compact.read_text() + " ")
+    with pytest.raises(ValueError, match="hash changed"):
+        replay._latest_valid_signal(spec, day,
+            preferred_signal_id=proof["signal_id"], pinned_artifact=proof)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schema_version", 2), ("market", "other"), ("signal_id", "other"),
+    ("rows", {}), ("rows", ["not-a-row"]),
+])
+def test_compact_signal_rejects_wrong_identity_or_schema(tmp_path, field, value):
+    spec, day, _summary, compact, _rows = _compact_signal_candidate(tmp_path)
+    data = json.loads(compact.read_text()) | {field: value}
+    compact.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="identity/schema mismatch"):
+        replay._latest_valid_signal(spec, day)
+
+
+def test_compact_signal_rejects_truncation_and_path_substitution(tmp_path):
+    spec, day, summary_path, compact, _rows = _compact_signal_candidate(tmp_path)
+    summary = json.loads(summary_path.read_text())
+    summary_path.write_text(json.dumps(summary | {"symbol_count": 2}))
+    with pytest.raises(ValueError, match="row count differs"):
+        replay._latest_valid_signal(spec, day)
+    summary_path.write_text(json.dumps(summary | {"execution_weights_path": str(tmp_path / "outside.json")}))
+    with pytest.raises(ValueError, match="escaped signal directory"):
+        replay._latest_valid_signal(spec, day)
+
+
+def test_missing_explicit_parquet_pin_cannot_fall_back_to_compact(tmp_path):
+    spec, day, summary_path, compact, _rows = _compact_signal_candidate(tmp_path)
+    proof = {"summary_path": str(summary_path), "summary_sha256": replay._sha256(summary_path),
+             "weights_path": str(summary_path.with_name("target_weights.parquet")),
+             "weights_sha256": replay._sha256(compact)}
+    with pytest.raises(FileNotFoundError):
+        replay._latest_valid_signal(spec, day, preferred_signal_id="compact-signal", pinned_artifact=proof)
+
+
 def test_replay_resolves_accepted_isolated_artifact_not_same_id_live_copy(tmp_path):
     day = date(2026, 8, 13)
     specs = []
@@ -1281,6 +1516,72 @@ def test_declared_missing_signal_artifact_never_falls_back_to_live_directory(tmp
         replay._source_ledger_signal_artifacts(tmp_path, {("2026-08-13", "mode_a"): "id"})
 
 
+def _additive_signal_receipt_fixture(tmp_path):
+    source = tmp_path / "ledger"
+    evidence = source / "addition_evidence"
+    component = evidence / "new_mode"
+    component.mkdir(parents=True)
+    day = date(2026, 8, 13)
+    rows = []
+    for market in ("prior_mode", "added_mode"):
+        spec = _write_signal_candidate(tmp_path / market, market=market, trading_date=day,
+            generated_at=datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI))
+        path = next(spec.live_output_dir.rglob("summary.json"))
+        summary = json.loads(path.read_text()) | {"signal_id": market + "-original"}
+        path.write_text(json.dumps(summary))
+        weights = path.with_name("target_weights.parquet")
+        rows.append({"market": market, "signal_id": summary["signal_id"],
+                     "summary_path": str(path), "weights_path": str(weights),
+                     "summary_sha256": replay._sha256(path), "weights_sha256": replay._sha256(weights)})
+    prior = evidence / "prior_rebuild_receipt.json"
+    prior.write_text(json.dumps({"sessions": [{"session_date": str(day), "modes": rows[:1]}]}))
+    (component / "rebuild_receipt.json").write_text(json.dumps({"sessions": [
+        {"session_date": str(day), "modes": rows[1:]}]}))
+    receipt = {"contract": "additive_independent_paper_mode_v1", "simulation_only": True,
+               "production_order_possible": False, "old_signal_pins_and_executions_unchanged": True,
+               "prior_rebuild_receipt": "addition_evidence/prior_rebuild_receipt.json",
+               "new_mode_component": "addition_evidence/new_mode", "sessions": []}
+    (source / "rebuild_receipt.json").write_text(json.dumps(receipt))
+    ids = {(str(day), row["market"]): row["signal_id"] for row in rows}
+    return source, receipt, ids, rows
+
+
+def test_source_artifact_pins_follow_declared_additive_evidence(tmp_path):
+    source, receipt, ids, rows = _additive_signal_receipt_fixture(tmp_path)
+    pins = replay._source_ledger_signal_artifacts(source, ids)
+    assert set(pins) == set(ids)
+    for row in rows:
+        assert pins[("2026-08-13", row["market"])]["weights_sha256"] == row["weights_sha256"]
+    # A missing declared original is fatal, even if same-ID output could exist.
+    Path(rows[0]["summary_path"]).unlink()
+    with pytest.raises(FileNotFoundError):
+        replay._source_ledger_signal_artifacts(source, ids)
+
+
+@pytest.mark.parametrize("failure", ["cycle", "escape", "symlink", "production", "mutable", "nested_component"])
+def test_additive_signal_evidence_rejects_unsafe_graph(tmp_path, failure):
+    source, receipt, ids, _ = _additive_signal_receipt_fixture(tmp_path)
+    if failure == "cycle":
+        receipt["prior_rebuild_receipt"] = "rebuild_receipt.json"
+    elif failure == "escape":
+        receipt["prior_rebuild_receipt"] = "../outside.json"
+        (tmp_path / "outside.json").write_text("{}")
+    elif failure == "symlink":
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}")
+        (source / "escaped.json").symlink_to(outside)
+        receipt["prior_rebuild_receipt"] = "escaped.json"
+    elif failure == "production":
+        receipt["production_order_possible"] = True
+    elif failure == "mutable":
+        receipt["old_signal_pins_and_executions_unchanged"] = False
+    else:
+        (source / "addition_evidence/new_mode/rebuild_receipt.json").write_text(json.dumps(receipt))
+    (source / "rebuild_receipt.json").write_text(json.dumps(receipt))
+    with pytest.raises(ValueError):
+        replay._source_ledger_signal_artifacts(source, ids)
+
+
 def test_conflicting_accepted_artifacts_with_same_id_are_rejected(tmp_path):
     day = date(2026, 8, 13)
     rows = []
@@ -1320,6 +1621,53 @@ def test_realistic_replay_policy_preflight_rejects_unversioned_signal():
         replay._validate_replay_policy_summary(spec, date(2026, 8, 13), {})
     replay._validate_replay_policy_summary(spec, date(2026, 8, 13), {
         "day_trade_policy_mask_contract": "exact_session_eligibility_before_forward_v1"})
+
+
+def test_signal_preflight_reports_all_missing_sessions_before_replay(tmp_path):
+    spec = type("Spec", (), {"market": "mode_a", "live_output_dir": tmp_path,
+                             "signal_market": None, "uses_realistic_execution": False})()
+    result = replay._preflight_replay_signals([spec], {date(2026, 1, 2), date(2026, 1, 5)},
+        source_signal_ids={}, source_signal_artifacts={}, missing_signal_root=None)
+    assert result["status"] == "rejected"
+    assert result["expected_signals"] == 2
+    assert len(result["failures"]) == 2
+    assert result["artifacts"] == []
+    assert result["execution_or_minute_coverage_accepted"] is False
+
+
+def test_signal_preflight_freezes_discovered_counterfactual_bytes(tmp_path):
+    day = date(2026, 1, 2)
+    spec = _write_signal_candidate(tmp_path, market="mode_a", trading_date=day,
+        generated_at=datetime(2026, 10, 18, 17, 0, tzinfo=TAIPEI), counterfactual=True)
+    spec.uses_realistic_execution = True
+    summary_path = next(tmp_path.rglob("summary.json"))
+    data = json.loads(summary_path.read_text()) | {"signal_id": "prefix-replay",
+        "day_trade_policy_mask_contract": "exact_session_eligibility_before_forward_v1"}
+    summary_path.write_text(json.dumps(data))
+    result = replay._preflight_replay_signals([spec], {day}, source_signal_ids={},
+        source_signal_artifacts={}, missing_signal_root=None)
+    assert result["status"] == "accepted_sources_only"
+    assert result["accepted_signals"] == 1
+    proof = result["artifacts"][0]
+    replay._latest_valid_signal(spec, day, preferred_signal_id=proof["signal_id"], pinned_artifact=proof)
+    summary_path.write_text(summary_path.read_text() + " ")
+    with pytest.raises(ValueError, match="hash changed"):
+        replay._latest_valid_signal(spec, day, preferred_signal_id=proof["signal_id"], pinned_artifact=proof)
+
+
+def test_signal_preflight_checks_actual_counterfactual_input_hash(tmp_path):
+    day = date(2026, 1, 2)
+    spec = _write_signal_candidate(tmp_path, market="mode_a", trading_date=day,
+        generated_at=datetime(2026, 10, 18, 17, 0, tzinfo=TAIPEI), counterfactual=True)
+    spec.uses_realistic_execution = False
+    path = next(tmp_path.rglob("summary.json"))
+    data = json.loads(path.read_text()) | {"signal_id": "prefix-replay"}
+    path.write_text(json.dumps(data))
+    Path(data["counterfactual_open_provenance"]["input_path"]).write_text("changed")
+    result = replay._preflight_replay_signals([spec], {day}, source_signal_ids={},
+        source_signal_artifacts={}, missing_signal_root=None)
+    assert result["status"] == "rejected"
+    assert "open input hash changed" in result["failures"][0]["error"]
 
 
 def test_retained_twse_openapi_rule_receipt_uses_exact_parser() -> None:
@@ -1387,6 +1735,108 @@ def test_source_ledger_pins_each_date_mode_signal_identity(tmp_path: Path) -> No
     }
     assert provenance["signal_registrations"] == 2
     assert len(provenance["sha256"]) == 64
+
+
+def _applied_repair_lineage_fixture(tmp_path, *, preserve_original):
+    source = tmp_path / "ledger"
+    source.mkdir()
+    original_dir = tmp_path / "original"
+    original_dir.mkdir()
+    original_summary = original_dir / "summary.json"
+    original_weights = original_dir / "target_weights.parquet"
+    original_summary.write_text(json.dumps({"signal_id": "original"}))
+    original_weights.write_bytes(b"original weights")
+    contract = ("never_filled_original_signal_append_only_minute_repair_v2" if preserve_original
+                else "never_filled_missing_open_append_only_minute_repair_v1")
+    repaired_id = "original:minute-repair:accepted" if preserve_original else "regenerated"
+    canonical_id = "original" if preserve_original else repaired_id
+    if preserve_original:
+        summary, weights = original_summary, original_weights
+    else:
+        repair_dir = tmp_path / "repaired"
+        repair_dir.mkdir()
+        summary, weights = repair_dir / "summary.json", repair_dir / "target_weights.parquet"
+        summary.write_text(json.dumps({"signal_id": repaired_id}))
+        weights.write_bytes(b"regenerated weights")
+    manifest = {"contract": contract, "status": "applied", "market": "mode_a",
+                "simulation_only": True, "production_order_possible": False,
+                "original_journals_retained": True, "live_dir": str(source),
+                "preserve_original_signal": preserve_original,
+                "sessions": [{"session_date": "2026-10-06", "summary_path": str(summary),
+                              "original": {"signal_id": "original", "summary_path": str(original_summary),
+                                           "weights_path": str(original_weights),
+                                           "original_weights_preserved": preserve_original}}],
+                "applied_sessions": [{"session_date": "2026-10-06", "signal_id": repaired_id}],
+                "source_pins": [{"path": str(path), "sha256": replay._sha256(path)}
+                                for path in sorted({original_summary, original_weights, summary, weights})]}
+    path = tmp_path / "ledger_repair_manifest.json"
+    path.write_text(json.dumps(manifest))
+    events = [{"event": "signal_registered", "recorded_at": "2026-10-06T09:00:03+08:00",
+               "market": "mode_a", "signal_id": "original"},
+              {"event": "signal_registered", "recorded_at": "2026-10-06T09:01:00+08:00",
+               "market": "mode_a", "signal_id": repaired_id, "simulation_replay": True,
+               "replay_basis": contract}]
+    (source / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in events))
+    return source, path, manifest, events, canonical_id, weights
+
+
+@pytest.mark.parametrize("preserve_original", [False, True])
+def test_source_lineage_requires_explicit_applied_repair_and_preserves_decision_identity(tmp_path, preserve_original):
+    source, manifest, _payload, _events, canonical, weights = _applied_repair_lineage_fixture(
+        tmp_path, preserve_original=preserve_original)
+    kwargs = {"start_date": date(2026, 10, 6), "end_date": date(2026, 10, 6)}
+    with pytest.raises(ValueError, match="conflicting source signal ids"):
+        replay._source_ledger_signal_ids(source, **kwargs)
+    ids, provenance = replay._source_ledger_signal_ids(source, accepted_repair_manifests=(manifest,), **kwargs)
+    assert ids == {("2026-10-06", "mode_a"): canonical}
+    assert provenance["accepted_repair_lineage"][0]["manifest_sha256"] == replay._sha256(manifest)
+    pins = replay._source_ledger_signal_artifacts(source, ids, accepted_repair_manifests=(manifest,))
+    assert pins[("2026-10-06", "mode_a")]["weights_sha256"] == replay._sha256(weights)
+
+
+@pytest.mark.parametrize("invalid", ["candidate", "changed_weights", "third_signal", "uncommitted", "wrong_ledger", "unmarked_repair"])
+def test_source_lineage_rejects_unapproved_or_changed_repair(tmp_path, invalid):
+    source, manifest, payload, events, _canonical, weights = _applied_repair_lineage_fixture(
+        tmp_path, preserve_original=True)
+    if invalid == "candidate":
+        payload["status"] = "candidate_validated"
+    elif invalid == "changed_weights":
+        weights.write_bytes(b"changed source")
+    elif invalid == "third_signal":
+        events.append({**events[0], "signal_id": "unrelated-newer"})
+    elif invalid == "uncommitted":
+        events = events[:1]
+    elif invalid == "wrong_ledger":
+        payload["live_dir"] = str(tmp_path / "different-ledger")
+    elif invalid == "unmarked_repair":
+        events[1]["simulation_replay"] = False
+    manifest.write_text(json.dumps(payload))
+    (source / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in events))
+    with pytest.raises(ValueError):
+        replay._source_ledger_signal_ids(source, start_date=date(2026, 10, 6),
+                                        end_date=date(2026, 10, 6), accepted_repair_manifests=(manifest,))
+
+
+def test_missing_signal_supplement_cannot_override_a_retained_identity(tmp_path):
+    from dataclasses import replace
+    spec = replay.ModeSpec(market="mode_a", label="a", initial_capital_twd=10_000_000,
+                           config_path="", checkpoint_path=None, fee_schedule=None,
+                           live_output_dir=tmp_path / "retained", parquet_root=tmp_path)
+    day = date(2026, 1, 2)
+    root = tmp_path / "supplement"
+    selected = replay._retained_or_missing_signal_spec(spec, day, source_signal_ids={}, missing_signal_root=root)
+    assert selected == replace(spec, live_output_dir=root / "mode_a")
+    assert replay._retained_or_missing_signal_spec(spec, day,
+        source_signal_ids={(day.isoformat(), "mode_a"): "retained-id"}, missing_signal_root=root) is spec
+
+
+def test_missing_pending_entry_path_is_not_missing_held_valuation():
+    assert replay._classify_missing_intraday_paths({"unfilled", "held", "official_no_trade"},
+        held_symbols={"held", "official_no_trade"}, official_no_trade_carries={"official_no_trade"}) == {
+            "missing_held_symbols": ["held"], "unavailable_unopened_entry_symbols": ["unfilled"]}
+    assert replay._classify_missing_intraday_paths({"unfilled"}, held_symbols=set(),
+        official_no_trade_carries=set()) == {
+            "missing_held_symbols": [], "unavailable_unopened_entry_symbols": ["unfilled"]}
 
 
 def test_source_signal_pins_replace_only_the_selected_stable_market() -> None:

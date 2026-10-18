@@ -1,0 +1,38 @@
+# Pure log utility with the selected old policy's relative stock legs frozen.
+# Newly introduced risk heads are zero-initialized: epoch0 preserves old sizing.
+base_spec: tw_old_fold11_refinement_20261017_v4.yaml
+output_root: artifacts/markets/tw_old_fold11_risk_calibration_20261017_v5
+postprocess_plots:
+  - {split: val, prefix: risk_val, scope_label: calendar 2025 / pure log validation selected}
+  - {split: test, prefix: risk_test_diagnostic, scope_label: calendar 2026 / retrospective diagnostic}
+matrix:
+  base_overrides:
+    training:
+      learning_rate: 0.001
+      financial_transformer:
+        portfolio_risk_calibration: linear
+  fixed_overrides:
+    training:
+      pretrained_initialization_trainable_parameter_prefixes: [risk_calibration_head.]
+      financial_transformer:
+        factorized_frozen_encoder_cache_bytes: 1610612736
+  dimensions:
+    - name: risk
+      enabled: true
+      variants:
+        - name: constant_annual
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_risk_calibration: constant
+        - name: conditional_annual
+          overrides: {}
+        - name: conditional_continuous
+          overrides:
+            training:
+              day_trade_training_annual_episodes: false
+              day_trade_annual_episode_sharding: false
+        - name: conditional_recent
+          overrides:
+            walk_forward:
+              split_start_year: 2020

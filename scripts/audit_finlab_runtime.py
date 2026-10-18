@@ -37,6 +37,17 @@ UNITS = (
 )
 
 
+def systemd_properties(output: str) -> dict[str, str]:
+    """Retain repeated list properties, e.g. every monotonic/calendar timer."""
+    result = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        result[key] = result[key] + "\n" + value if key in result else value
+    return result
+
+
 def _interval_seconds(intervals: list[tuple[datetime, datetime]]) -> float:
     """Union owner intervals; overlapping workers/runs never add wall time."""
     total = 0.0
@@ -238,15 +249,17 @@ def write_inventory(path: Path, public: dict, workload: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def verify_recent_partitions(root: Path, count: int) -> list[dict]:
+def verify_recent_partitions(root: Path, count: int, *, kind: str = "tw_minute") -> list[dict]:
     """Check bounded immutable source objects, not the entire history."""
+    if kind not in {"tw_minute", "tw_tick"} or type(count) is not int or not 0 <= count <= 32:
+        raise ValueError("invalid bounded FinLab verification scope")
     source = root / "data_finlab"
     index = source / "intraday/market_index.sqlite3"
     with sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True, timeout=5) as db:
         rows = db.execute("SELECT symbol,trade_date,rows,parquet_bytes,checked_at_utc FROM partitions "
-                          "WHERE kind='tw_minute' AND status='downloaded_unverified_for_pit' "
-                          "ORDER BY checked_at_utc DESC LIMIT ?", (count,)).fetchall()
-    return _verify_partition_rows(source, rows)
+                          "WHERE kind=? AND status='downloaded_unverified_for_pit' "
+                          "ORDER BY checked_at_utc DESC LIMIT ?", (kind, count)).fetchall()
+    return _verify_partition_rows(source, rows, kind=kind)
 
 
 def verify_partition_windows(root: Path, windows: list[tuple[str, str, str]]) -> list[dict]:
@@ -268,7 +281,7 @@ def verify_partition_windows(root: Path, windows: list[tuple[str, str, str]]) ->
     return _verify_partition_rows(source, list(rows.values()))
 
 
-def _verify_partition_rows(source: Path, rows: list) -> list[dict]:
+def _verify_partition_rows(source: Path, rows: list, *, kind: str = "tw_minute") -> list[dict]:
     import polars as pl
     from scripts.download_finlab_intraday import (
         _file_sha256, _partition_paths, _stored_receipt, _validate_frame,
@@ -276,7 +289,7 @@ def _verify_partition_rows(source: Path, rows: list) -> list[dict]:
 
     result = []
     for symbol, day_text, expected_rows, expected_bytes, checked in rows:
-        key, day = f"tw_minute:{symbol}", date.fromisoformat(day_text)
+        key, day = f"{kind}:{symbol}", date.fromisoformat(day_text)
         receipt = _stored_receipt(_partition_paths(source, key, day)[0], source, key, day)
         checks = {"valid_receipt": receipt is not None}
         if receipt:
@@ -294,7 +307,8 @@ def _verify_partition_rows(source: Path, rows: list) -> list[dict]:
 
 
 def audit(root: Path, *, baseline: Path | None = None, inventory: Path | None = None,
-          recent_partitions: int = 0, source_windows: list | None = None) -> dict:
+          recent_partitions: int = 0, source_windows: list | None = None,
+          recent_kind: str = "tw_minute") -> dict:
     now = datetime.now(UTC)
     quota = read_json(root / "artifacts/live/finlab/quota_latest.json")
     workload = read_json(root / "artifacts/live/finlab/workload_latest.json")
@@ -379,7 +393,7 @@ def audit(root: Path, *, baseline: Path | None = None, inventory: Path | None = 
                                  "TimersMonotonic,TimersCalendar,ExecCondition,MemoryCurrent,MemoryPeak,"
                                  "MemoryHigh,MemoryMax,MemorySwapMax,MemorySwapCurrent,CPUUsageNSec"],
                                 capture_output=True, text=True, timeout=5)
-        services[unit] = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        services[unit] = systemd_properties(result.stdout)
     protected = None
     if baseline:
         before = read_json(baseline).get("services", {})
@@ -394,7 +408,7 @@ def audit(root: Path, *, baseline: Path | None = None, inventory: Path | None = 
         checks["pre_reset_timer_deployed"] = "07:00:05 Asia/Taipei" in services[
             "stockagent-finlab-local-refresh.timer"].get("TimersCalendar", "")
     market = read_json(root / "data_finlab/intraday/market_status.json")
-    verified = verify_recent_partitions(root, recent_partitions) if recent_partitions else []
+    verified = verify_recent_partitions(root, recent_partitions, kind=recent_kind) if recent_partitions else []
     if recent_partitions:
         checks["recent_source_objects_verified"] = (
             len(verified) == recent_partitions and all(item["accepted"] for item in verified))
@@ -420,7 +434,7 @@ def audit(root: Path, *, baseline: Path | None = None, inventory: Path | None = 
         if isinstance(row, dict) and baseline_at and row.get("started_at_utc", "") >= baseline_at
         and row.get("kind") == "tw_minute"]
     return {
-        "schema_version": 2, "observed_at_utc": now.isoformat(), "provider_calls": 0,
+        "schema_version": 3, "observed_at_utc": now.isoformat(), "provider_calls": 0,
         "checks": checks, "accepted": all(checks.values()), "services": services,
         "public_build_seconds": round(elapsed, 4), "public_health": public["health"],
         "protected_units": protected, "inventory_path": str(inventory) if inventory else None,
@@ -436,7 +450,7 @@ def audit(root: Path, *, baseline: Path | None = None, inventory: Path | None = 
         "intraday_worker": read_json(root / "data_finlab/intraday/active_run.json"),
         "recent_source_objects": verified,
         "repaired_source_objects": repaired,
-        "source_validation_scope": "bounded_latest_direct_minute_objects_not_all_history",
+        "source_validation_scope": f"bounded_latest_direct_{recent_kind}_objects_not_all_history",
         "recent_policy_batches": recent_batches,
         "pipeline_measurement": processing,
         "throughput_candidate_batches": candidate_batches,
@@ -458,6 +472,8 @@ def main() -> int:
                         help="Audit all receipt/journal work for one Taipei calendar date, without API calls")
     parser.add_argument("--recent-partitions", type=int, default=0, choices=range(0, 33),
                         metavar="0..32", help="Bounded read-only source SHA/schema verification")
+    parser.add_argument("--recent-kind", choices=("tw_minute", "tw_tick"), default="tw_minute",
+                        help="Source family to verify; minute and tick receipts are never interchangeable")
     parser.add_argument("--verify-window", nargs=3, action="append", metavar=("SYMBOL", "START", "END"),
                         help="Verify receipted minute objects in an inventoried error window without API calls")
     args = parser.parse_args()
@@ -470,7 +486,8 @@ def main() -> int:
                           "quota_cycles": result["quota_cycles"]}, ensure_ascii=False))
         return 0
     result = audit(args.root, baseline=args.baseline, inventory=args.inventory,
-                   recent_partitions=args.recent_partitions, source_windows=args.verify_window)
+                   recent_partitions=args.recent_partitions, source_windows=args.verify_window,
+                   recent_kind=args.recent_kind)
     _atomic_json(args.output, result)
     print(json.dumps({"accepted": result["accepted"], "checks": result["checks"],
                       "public_build_seconds": result["public_build_seconds"],

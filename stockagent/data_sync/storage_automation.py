@@ -123,11 +123,17 @@ def lakehouse_readiness(*, policy=Path('/etc/stockagent/lakehouse-control.json')
             live = probe()
         worker = bounded_receipt(base / 'worker-ready.json', ('code_identity_sha256',), now=now)
         same_code = worker.get('values', {}).get('code_identity_sha256') == live.get('worker_code_identity_sha256')
+        root = repo_root or Path(__file__).resolve().parents[2]
+        version_settings = json.loads((root / 'configs/columnar_storage.json').read_bytes()).get('dataset_version_lifecycle', {})
+        versions_ready = (version_settings.get('enabled') is not True
+                          or live.get('dataset_version_workflow', {}).get('status') == 'RUNNING')
         workflows_ready = (live.get('status') == 'RUNNING' and live.get('source_replication_workflow', {}).get('status') == 'RUNNING'
+                           and versions_ready
                            and bool(live.get('worker_code_identity_sha256')) and same_code)
         return {'required': True, 'ready': owners_ready and receipts_fresh and relay_identity and workflows_ready,
                 'owners_ready': owners_ready, 'receipts_fresh': receipts_fresh, 'relay_pairing_and_guards_verified': relay_identity,
                 'workflow_queries_verified': workflows_ready, 'loaded_worker_matches_current_code': same_code,
+                'dataset_version_workflow_ready': versions_ready,
                 'owners': owners, 'catalog': catalog, 'source_replication': source, 'relay': relay, 'live': live,
                 'full_history_archive_verified': False}
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:

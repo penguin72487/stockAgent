@@ -8,12 +8,15 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 # The systemd D: mount owner and WSL IDE shells can have different mount
 # namespaces. Use the enrolled owner's namespace, never relax its mount guard.
 release_sync_root="${STOCKAGENT_PACKED_SYNC_ROOT:-/srv/stockagent-packed}"
+release_completed_forward=false
 release_argv=("$@")
 for ((i=0; i<${#release_argv[@]}; i++)); do
   if [[ "${release_argv[$i]}" == --sync-root && $((i+1)) -lt ${#release_argv[@]} ]]; then
     release_sync_root="${release_argv[$((i+1))]}"
   elif [[ "${release_argv[$i]}" == --sync-root=* ]]; then
     release_sync_root="${release_argv[$i]#--sync-root=}"
+  elif [[ "${release_argv[$i]}" == --completed-forward-key || "${release_argv[$i]}" == --completed-forward-key=* ]]; then
+    release_completed_forward=true
   fi
 done
 if [[ $EUID == 0 && "$release_sync_root" == /srv/stockagent-packed \
@@ -25,7 +28,15 @@ cd "$REPO_ROOT"
 
 # shellcheck source=scripts/runtime_env.sh
 source "${REPO_ROOT}/scripts/runtime_env.sh"
+ensure_enrolled_wsl_identity "$REPO_ROOT"
 run_fintech_python "${REPO_ROOT}/scripts/publish_data_releases.py" "$@"
+if [[ "${1:-}" == publish && "$release_completed_forward" == true ]]; then
+  # The CLI has accepted one registered completed-output key. It changes no
+  # training source or recipe input: do not rebuild/publish the same cookbook
+  # once for every output. Invalid selections still propagate the child error.
+  echo "[data-release] completed_forward_only=true training_sources_changed=false recipe_refresh=not_needed" >&2
+  return 0
+fi
 if [[ "${1:-}" == publish ]]; then
   recipe_sync_root="/srv/stockagent-packed"
   release_argv=("$@")
@@ -45,6 +56,9 @@ if [[ "${1:-}" == publish ]]; then
   fi
 fi
 }
-# Parse the whole body before starting a long child; an in-place rollout must
-# not make a resumed shell read unrelated offsets from a newly edited script.
-stockagent_release_main "$@"
+# Parse the final exit together with the call. A function alone does not stop
+# a resumed top-level reader from reading the new tail of a growing script.
+{
+  stockagent_release_main "$@"
+  exit "$?"
+}

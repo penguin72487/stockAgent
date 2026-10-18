@@ -26,7 +26,10 @@ def verify(output:Path)->dict:
     if output.exists():raise FileExistsError('Retain original entry-gate acceptance evidence')
     output.mkdir(parents=True)
     results=[]
-    for case,code in [('before_entry','function Broken {'),('after_entry',"throw 'Owned fake after-entry failure; no TEJ interaction'")]:
+    before='function Broken {'
+    after="throw 'Owned fake after-entry failure; no TEJ interaction'"
+    for case,code in [('before_entry',before),('before_entry_cache_hit',before),
+                      ('after_entry',after),('after_entry_cache_hit',after)]:
         repo=output/case;root=repo/'data';source=repo/'scripts/tej_smart_wizard_bridge.ps1'
         atomic_write_text(source,code)
         request={'action':'download','contract_version':4,'type':'fixture','smart_id':'fixture','table':'fixture',
@@ -43,14 +46,14 @@ def verify(output:Path)->dict:
             bridge.execute(root,task)
             raise AssertionError('Fault-injection case unexpectedly succeeded')
         except BeforeDataQueryError as exc:
-            assert case=='before_entry' and exc.error_code=='local_query_preparation_failed_before_preview'
+            assert case.startswith('before_entry') and exc.error_code=='local_query_preparation_failed_before_preview'
         except RuntimeError:
-            assert case=='after_entry'
+            assert case.startswith('after_entry')
         with closing(connect(root)) as con:
             attempt=dict(con.execute('SELECT * FROM desktop_attempts WHERE task_id=?',(task_id,)).fetchone())
         raw=root/attempt['raw_path'];outcome=raw.with_suffix('.json.outcome.json')
         assert not raw.exists() and not raw.with_suffix('.json.stage.json').exists()
-        if case=='before_entry':
+        if case.startswith('before_entry'):
             proof=json.loads(outcome.read_text(encoding='utf-8-sig'))
             assert proof['bridge_invoked'] is False and proof['market_data_query_submission_possible'] is False
             assert proof['query_attempt_id']==attempt['attempt_id']

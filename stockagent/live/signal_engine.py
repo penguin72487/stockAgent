@@ -54,6 +54,7 @@ from stockagent.live.portfolio_state import (
     estimate_drifted_weights,
     portfolio_risk_summary,
 )
+from stockagent.live.market_config import live_panel_disk_cache_root as _live_panel_disk_cache_root
 from stockagent.live.quote_provider import (
     PriceSnapshot,
     fetch_shared_day_trade_stock_snapshots,
@@ -576,15 +577,6 @@ def _live_panel_disk_backend_key(
     return f"live-tail-v1:{digest}"
 
 
-def _live_panel_disk_cache_root(*, repo_root: Path | None = None) -> Path:
-    configured = str(os.getenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", "")).strip()
-    if configured:
-        path = Path(configured).expanduser()
-        return path if path.is_absolute() else Path.cwd() / path
-    root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
-    return root / "artifacts" / "cache" / "live_signal_panels"
-
-
 def _shared_live_panel_build(key, builder, progress_callback=None, *,
                              cache=None, max_entries=None):
     """One immutable panel per source/feature revision, not one per requester.
@@ -1020,6 +1012,9 @@ def _load_live_tail_panel(config, *, live_tail_rows, panel_kwargs, cache_key,
             save_panel_cache_v2(
                 disk_cache_root, panel, source_hash=cache_key,
                 backend_key=disk_backend_key, version=PANEL_CACHE_VERSION,
+                # A sliding tail shifts its byte boundaries every session;
+                # keep this already bounded projection on the NPY path.
+                chunk_storage=False,
             )
             print(f"[panel] live disk cache committed dates={panel.num_dates} symbols={panel.num_symbols} root={disk_cache_root}", flush=True)
         except Exception as exc:
@@ -1463,6 +1458,7 @@ def _fetch_tw_opening_source(
         providers=configured_opening_providers(parquet_root, broker_fetch=fetch_shared_day_trade_stock_snapshots),
         minimum_coverage=_tw_opening_minimum_coverage(),
         cache_reader=read_scope,
+        poll_opening_snapshots=True,
     )
     if tw_trading_universe is not None:
         scoped = fetch_mis(allow_network=False)
@@ -1485,8 +1481,10 @@ def _require_day_trade_opening_coverage(
     *, live_session: bool, active: int, opens: int, responses: int,
     required: int, model_observation: str, no_prints: int = 0,
 ) -> None:
-    # A source-proven absence uses the existing open-gap zero sentinel. An
-    # unknown/failed source row never counts as a resolved model input.
+    # A source-proven absence uses yesterday's panel close provisionally:
+    # log(previous_close / previous_close) == 0 in the existing gap ABI. An
+    # unknown/failed source row never counts as a resolved model input, and
+    # this provisional model basis is never an observed opening/fill price.
     inputs = responses if model_observation == "latest_quote" else opens + no_prints
     if not live_session or inputs < required:
         raise TWOpeningInputCoveragePending(
@@ -2544,6 +2542,10 @@ def _day_trade_live_model_window(
         gap_idx = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
     except ValueError:
         return base, feature_cutoff, decision_time, True, observed_open
+    # Verified no-first-print rows provisionally use the previous session's
+    # close, hence a zero gap. Unknown rows retain the ABI sentinel too, but
+    # do NOT count toward readiness; the coverage gate distinguishes them.
+    # Never write this model-only basis into the raw opening quote or mask.
     gap = np.zeros((panel.num_symbols,), dtype=np.float32)
     gap[observed_open] = np.log(
         observed_prices_np[observed_open] / closes_np[observed_open]
@@ -3475,6 +3477,51 @@ def _reject_unready_opening_prefetch(
         raise
 
 
+# This is a consumer ABI, not a change to the model/training/explainability ABI.
+# Bump it if the live signal starts consuming another auxiliary value. Complete
+# diagnostic tensors remain available from the ordinary model forward; they are
+# not daily service dependencies merely because return_aux=True produces them.
+_COMPLETED_SIGNAL_PROJECTION = "completed_tw_signal_values_v1"
+_COMPLETED_CANDLE_AUX_POLICY = "candle_and_basis_diagnostics_metadata_only_v1"
+_COMPLETED_SIGNAL_AUX_KEYS = frozenset({
+    "score_logits", "rank_logits", "centered_score_logits",
+    "stock_market_gate", "z_market_delta",
+})
+
+
+def _completed_signal_projection(output: Any) -> dict[str, Any]:
+    """Retain every live value, without copying unused diagnostic allocations.
+
+    Preserve the source field inventory separately so the existing explanation
+    metadata stays truthful and unchanged. No tensor is quantized, recomputed,
+    transferred or mutated here. The canonical cache owns isolated CPU copies.
+    """
+    weights, aux = extract_weights_and_aux(output)
+    if isinstance(output, dict):
+        projected = {key: value for key, value in output.items()
+                     if key == "weights" or key in _COMPLETED_SIGNAL_AUX_KEYS}
+    elif isinstance(output, tuple):
+        scores = output[1] if len(output) >= 2 and isinstance(output[1], torch.Tensor) else None
+        projected = (weights, scores, None if aux is None else
+                     {key: value for key, value in aux.items() if key in _COMPLETED_SIGNAL_AUX_KEYS})
+    else:
+        projected = output
+    _, retained_aux = extract_weights_and_aux(projected)
+    return {"contract": _COMPLETED_SIGNAL_PROJECTION, "output": projected,
+            "source_aux_fields": sorted(str(key) for key in aux) if aux is not None else [],
+            "retained_aux_fields": sorted(str(key) for key in retained_aux)
+            if retained_aux is not None else []}
+
+
+def _completed_signal_projection_result(
+    value: dict[str, Any], receipt: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    if not isinstance(value, dict) or value.get("contract") != _COMPLETED_SIGNAL_PROJECTION:
+        raise ValueError("completed signal cache has a different output projection")
+    metadata = {key: value[key] for key in ("contract", "source_aux_fields", "retained_aux_fields")}
+    return value["output"], {**receipt, "output_projection": metadata}
+
+
 def _live_forward_outputs(
     *, config: ExperimentConfig, config_path: str | Path, checkpoint: Path,
     checkpoint_key: str, state_dict: dict[str, Any], panel: PanelData,
@@ -3485,7 +3532,7 @@ def _live_forward_outputs(
     loaded_config_identity: dict[str, Any] | None = None,
     loaded_checkpoint_identity: dict[str, Any] | None = None,
 ) -> tuple[Any, Any, bool, dict[str, Any] | None]:
-    """One canonical forward; completed sessions may reuse lossless CPU outputs."""
+    """One canonical forward; completed sessions cache only consumed signal values."""
     model_cache_hit = False
     model = None
     x = None
@@ -3507,12 +3554,13 @@ def _live_forward_outputs(
             mask = torch.from_numpy(mask_values).unsqueeze(0).to(
                 device=runtime_device, non_blocking=non_blocking)
             with autocast_context(runtime_device, amp_dtype):
-                output = call_model(model, x, mask, return_aux=True)
+                output = call_model(model, x, mask, return_aux=True,
+                                    materialize_candle_aux=False if completed_cache else None)
                 weights, _aux = extract_weights_and_aux(output)
                 _require_single_target_live_weights(weights,
                     execution_mode=config.trading.execution_mode,
                     expected_symbols=panel.num_symbols)
-            return output
+            return _completed_signal_projection(output) if completed_cache else output
 
     if not completed_cache:
         output = forward(mask_np)
@@ -3526,7 +3574,9 @@ def _live_forward_outputs(
 
     repo = Path(__file__).resolve().parents[2]
     identity = {
-        "contract": CONTRACT, "config": loaded_config_identity or file_identity(config_path),
+        "contract": CONTRACT, "output_profile": _COMPLETED_SIGNAL_PROJECTION,
+        "candle_aux_policy": _COMPLETED_CANDLE_AUX_POLICY,
+        "config": loaded_config_identity or file_identity(config_path),
         "checkpoint": loaded_checkpoint_identity or file_identity(checkpoint),
         "resolved_config": configuration_identity(config), "code": loaded_implementation_identity(),
         "symbols": panel.symbols, "features": panel.feature_names,
@@ -3555,6 +3605,7 @@ def _live_forward_outputs(
     output, receipt = cached_forward(cache_root,
         {**identity, "mask": array_identity(mask_np)}, lambda: forward(mask_np),
         validate_before_commit=validate_identity)
+    output, receipt = _completed_signal_projection_result(output, receipt)
     # A source revision must rebuild prices/eligibility/display rows, but it
     # need not repeat GPU math when the complete input and mask are unchanged.
     # The generation fences the published summary, not this pure forward key.
@@ -3565,6 +3616,7 @@ def _live_forward_outputs(
         raw, raw_receipt = cached_forward(cache_root,
             {**identity, "mask": array_identity(all_symbols)}, lambda: forward(all_symbols),
             validate_before_commit=validate_identity)
+        raw, raw_receipt = _completed_signal_projection_result(raw, raw_receipt)
         receipt = {**receipt, "unconstrained": raw_receipt}
     return output, raw, model_cache_hit, receipt
 
@@ -4514,6 +4566,11 @@ def generate_live_signal(
                 "panel_price": float(panel_prices[idx]) if np.isfinite(panel_prices[idx]) else None,
                 "current_price": float(current_prices[idx]) if np.isfinite(current_prices[idx]) else None,
                 "open_price": float(opening_prices[idx]) if np.isfinite(opening_prices[idx]) else None,
+                "model_input_price_basis": (
+                    normalized_day_trade_observation if day_trade_observed_model_price[idx]
+                    else "previous_close_provisional_no_first_print" if tw_session_no_print[idx]
+                    and normalized_day_trade_observation == "session_open" else "unresolved_source"
+                ) if execution_mode == "tw_day_trade" and day_trade_live_session else None,
                 "price_return": raw_price_return,
                 "stock_return": _position_stock_return(current_weight, raw_price_return),
                 "portfolio_contribution": _position_portfolio_contribution(current_weight, raw_price_return),
@@ -4707,6 +4764,8 @@ def generate_live_signal(
         "opening_input_resolved_count": day_trade_active_open_count + day_trade_active_no_print_count,
         "opening_input_required_count": day_trade_required_quote_count,
         "opening_absent_print_feature_policy": "existing_zero_gap_sentinel_not_an_opening_price",
+        "opening_no_print_model_price_policy": "previous_session_close_provisional_log_gap_zero_not_executable_v1",
+        "opening_no_print_model_price_reference_field": "panel_price",
         "opening_model_inputs_ready": True if execution_mode == "tw_day_trade" and day_trade_live_session else None,
         "opening_source_complete": day_trade_active_open_count == day_trade_active_symbol_count if execution_mode == "tw_day_trade" and day_trade_live_session else None,
         "opening_all_symbols_complete": day_trade_active_open_count == day_trade_active_symbol_count,
@@ -4808,7 +4867,11 @@ def generate_live_signal(
             "decision_rows": int(len(decision_rows)),
             "actionable_decision_rows": int(len(actionable_decisions)),
             "action_counts": decision_action_counts,
-            "aux_fields": sorted(str(key) for key in aux.keys()) if isinstance(aux, dict) else [],
+            "aux_fields": (
+                completed_forward_cache["output_projection"]["source_aux_fields"]
+                if completed_forward_cache is not None else
+                sorted(str(key) for key in aux.keys()) if isinstance(aux, dict) else []
+            ),
         },
         "top_positions": top_positions,
         "rebalance": rebalance_rows[: max(0, int(top_n))],

@@ -414,6 +414,33 @@ def _expanded_requests(plan: dict[str, Any]):
                    'dependency_dataset': request['dataset']}
 
 
+def _matching_tasks(connection: sqlite3.Connection, request: dict[str, Any], now: datetime) -> list[dict]:
+    """Push necessary scope bounds to SQL; keep _matches authoritative.
+
+    Day/id-day/derived-date tasks can only overlap the same ISO date range.
+    History, year, month and two-day ranges still use their original Python
+    bounds. Do not materialize millions of impossible day tasks per notice.
+    """
+    query = 'SELECT * FROM tasks WHERE dataset=?'
+    arguments = [request['dataset']]
+    if request.get('scope_kind') == 'snapshot':
+        query += " AND kind='snapshot'"
+    else:
+        query += (" AND (kind NOT IN ('day','id_day','derived') OR partition BETWEEN ? AND ? "
+                  "OR (kind='derived' AND partition='history'))")
+        arguments.extend((request['start_date'], request['end_date']))
+    ids = request.get('data_ids')
+    if ids and len(ids) <= 900 and request.get('scope_kind') != 'snapshot':
+        # Retain whole-market and legacy NULL IDs, and portability to SQLite's
+        # older variable limit. Snapshot matching intentionally ignores IDs.
+        query += " AND (data_id IS NULL OR data_id='' OR data_id IN (" + ','.join('?' for _ in ids) + '))'
+        arguments.extend(ids)
+    cursor = connection.execute(query, arguments)
+    columns = [column[0] for column in cursor.description]
+    tasks = (dict(zip(columns, row)) for row in cursor)
+    return [task for task in tasks if _matches(task, request, now)]
+
+
 def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: str,
                              now: datetime, *, max_receipts: int = 128) -> dict[str, Any]:
     """Mark existing overlapping tasks due; repeated calls discover late seeds."""
@@ -427,10 +454,7 @@ def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: 
             if request['owner'] != owner:
                 summary['owner_skipped'] += 1
                 continue
-            cursor = connection.execute('SELECT * FROM tasks WHERE dataset=?', (request['dataset'],))
-            columns = [column[0] for column in cursor.description]
-            tasks = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            matched = [task for task in tasks if _matches(task, request, now)]
+            matched = _matching_tasks(connection, request, now)
             summary['unmatched_requests'] += int(not matched)
             for task in matched:
                 key = (owner, request['correction_id'], task['dataset'], task['data_id'], task['partition'])

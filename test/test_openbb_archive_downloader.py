@@ -1436,6 +1436,249 @@ def test_manifest_reconciles_terminal_and_orphan_shards_across_data_tree(
     assert (quarantine / "equity/profile/orphan.parquet").is_file()
 
 
+@pytest.mark.parametrize("fail_move", [False, True])
+def test_manifest_reconciliation_streams_join_and_cleans_index_on_failure(
+    tmp_path: Path, monkeypatch, fail_move: bool,
+) -> None:
+    from downloader import download_openbb_archive as archive
+
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    source = tmp_path / "data"
+    source.mkdir()
+    tasks = []
+    for index, status in enumerate(("success", "pending", "running", "empty", "failed", "unavailable")):
+        path = source / f"{index}.parquet"
+        path.write_bytes(f"original-{status}".encode())
+        tasks.append(DownloadTask(f"legacy-owner-{index}", "equity.profile", "equity", str(index), {}, ("yfinance",), str(path)))
+    manifest.upsert_tasks(tasks, plan_token="plan")
+    for task, status in zip(tasks, ("success", "pending", "running", "empty", "failed", "unavailable"), strict=True):
+        manifest.connection.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, task.task_id))
+    manifest.connection.commit()
+    real_connection = manifest.connection
+    joins, writes = [], []
+
+    class BoundedCursor:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def fetchmany(self, size):
+            raise AssertionError("join should execute entirely within SQLite")
+
+        def fetchall(self):
+            raise AssertionError("ownership join must never materialize all owners")
+
+        def close(self):
+            self.cursor.close()
+
+    class Connection:
+        def execute(self, query, parameters=()):
+            result = real_connection.execute(query, parameters)
+            if "SELECT tasks.output_path,tasks.status" in query:
+                joins.append(query)
+                assert "ON CONFLICT(path) DO UPDATE" in query
+                return BoundedCursor(result)
+            return result
+
+        def executemany(self, query, parameters):
+            parameters = list(parameters)
+            writes.append(len(parameters))
+            assert len(parameters) <= 2
+            return real_connection.executemany(query, parameters)
+
+    manifest.connection = Connection()
+    def fail_before_move(path):
+        raise OSError("injected quarantine error")
+
+    if fail_move:
+        monkeypatch.setattr(archive, "_quarantine_obsolete_output_path", fail_before_move)
+    try:
+        if fail_move:
+            with pytest.raises(OSError, match="injected quarantine error"):
+                manifest.quarantine_terminal_output_shards(plan_token="plan", batch_size=2)
+            assert len(list(source.glob("*.parquet"))) == 6
+        else:
+            assert manifest.quarantine_terminal_output_shards(plan_token="plan", batch_size=2) == (6, 3)
+            assert sorted(path.name for path in source.glob("*.parquet")) == ["0.parquet", "1.parquet", "2.parquet"]
+            recovered = tmp_path / "_quarantine/obsolete_task_outputs"
+            assert sorted(path.read_bytes() for path in recovered.glob("*.parquet")) == sorted(
+                f"original-{status}".encode() for status in ("empty", "failed", "unavailable")
+            )
+        assert len(joins) == 1 and writes
+        assert not real_connection.execute(
+            "SELECT name FROM sqlite_temp_master WHERE name='openbb_existing_output_paths'"
+        ).fetchall()
+    finally:
+        manifest.connection = real_connection
+        manifest.close()
+
+
+def test_output_contract_exception_index_tracks_updates_plans_and_rollback(tmp_path: Path) -> None:
+    from downloader.download_openbb_archive import OUTPUT_CONTRACT_VIOLATION_PREDICATE
+
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    task_id = "a" * 64
+    canonical = str(tmp_path / f"data/scope-{task_id[:16]}.parquet")
+    task = DownloadTask(task_id, "equity.profile", "equity", "scope", {}, ("yfinance",), canonical)
+    query = "SELECT 1 FROM tasks INDEXED BY idx_tasks_output_contract_violations_v1 WHERE plan_token=? AND " + OUTPUT_CONTRACT_VIOLATION_PREDICATE + " LIMIT 1"
+    indexed_rows = "SELECT COUNT(*) FROM tasks INDEXED BY idx_tasks_output_contract_violations_v1 WHERE " + OUTPUT_CONTRACT_VIOLATION_PREDICATE
+    try:
+        manifest.upsert_tasks([task], plan_token="plan")
+        plan = [str(row[3]) for row in manifest.connection.execute("EXPLAIN QUERY PLAN " + query, ("plan",))]
+        assert any("SEARCH tasks USING INDEX idx_tasks_output_contract_violations_v1" in entry for entry in plan)
+        statements = []
+        manifest.connection.set_trace_callback(statements.append)
+        assert manifest._outputs_follow_task_id_contract(plan_token="plan")
+        manifest.connection.set_trace_callback(None)
+        assert any("FROM tasks INDEXED BY idx_tasks_output_contract_violations_v1" in statement for statement in statements)
+        assert manifest.connection.execute(indexed_rows).fetchone()[0] == 0
+
+        manifest.connection.execute("UPDATE tasks SET output_path='legacy.parquet'")
+        assert not manifest._outputs_follow_task_id_contract(plan_token="plan")
+        assert manifest._outputs_follow_task_id_contract(plan_token="other")
+        assert manifest.connection.execute(indexed_rows).fetchone()[0] == 1
+        manifest.connection.rollback()
+        assert manifest._outputs_follow_task_id_contract(plan_token="plan")
+        assert manifest.connection.execute(indexed_rows).fetchone()[0] == 0
+
+        manifest.connection.execute("UPDATE tasks SET task_id=?", ("g" + task_id[1:],))
+        assert not manifest._outputs_follow_task_id_contract(plan_token="plan")
+        manifest.connection.rollback()
+        manifest.connection.execute("UPDATE tasks SET output_path='legacy.parquet',active=0")
+        assert manifest._outputs_follow_task_id_contract(plan_token="plan")
+        manifest.connection.execute("UPDATE tasks SET active=1,plan_token='other'")
+        assert manifest._outputs_follow_task_id_contract(plan_token="plan")
+        assert not manifest._outputs_follow_task_id_contract(plan_token="other")
+        manifest.connection.execute("UPDATE tasks SET output_path=?", (canonical,))
+        assert manifest._outputs_follow_task_id_contract(plan_token="other")
+        assert manifest.connection.execute(indexed_rows).fetchone()[0] == 0
+        manifest.connection.execute("DROP INDEX idx_tasks_output_contract_violations_v1")
+        assert manifest._outputs_follow_task_id_contract(plan_token="other")
+        manifest.connection.execute("UPDATE tasks SET output_path='legacy.parquet'")
+        assert not manifest._outputs_follow_task_id_contract(plan_token="other")
+    finally:
+        manifest.close()
+
+
+def test_canonical_reconciliation_uses_bounded_primary_key_reads_and_exact_paths(tmp_path: Path) -> None:
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    source = tmp_path / "data"
+    source.mkdir()
+    tasks = []
+    for index in range(600):
+        task_id = f"{index:016x}" + "a" * 48
+        scope = "資料\n調整" if index == 0 else f"scope-{index}"
+        path = source / f"{scope}-{task_id[:16]}.parquet"
+        path.write_bytes(f"original-{index}".encode())
+        tasks.append(DownloadTask(task_id, "equity.profile", "equity", str(index), {}, ("yfinance",), str(path)))
+    manifest.upsert_tasks(tasks, plan_token="plan")
+    manifest.connection.execute("UPDATE tasks SET status='success'")
+    for index, status in ((1, "pending"), (2, "running"), (3, "failed")):
+        manifest.connection.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, tasks[index].task_id))
+    manifest.connection.commit()
+    duplicate = source / "different-directory" / Path(tasks[0].output_path).name
+    duplicate.parent.mkdir()
+    duplicate.write_bytes(b"same filename is not the same owner")
+    orphan = source / "unknown.parquet"
+    orphan.write_bytes(b"orphan source remains recoverable")
+    real = manifest.connection
+    lookups = []
+
+    class Connection:
+        def execute(self, query, parameters=()):
+            assert "TEMP TABLE" not in query  # No rebuilt whole-filesystem index.
+            if "WITH requested(lo,hi)" in query:
+                assert 1 < len(parameters) <= 513 and len(parameters) % 2 == 1
+                lookups.append((len(parameters) - 1) // 2)
+                plan = [str(row[3]) for row in real.execute("EXPLAIN QUERY PLAN " + query, parameters)]
+                assert any("SEARCH task USING INDEX" in entry and "task_id>? AND task_id<?" in entry for entry in plan)
+            return real.execute(query, parameters)
+
+    manifest.connection = Connection()
+    try:
+        assert manifest.quarantine_terminal_output_shards(plan_token="plan", batch_size=1000) == (602, 3)
+        assert max(lookups) <= 256 and 600 <= sum(lookups) <= 601
+        assert Path(tasks[0].output_path).read_bytes() == b"original-0"
+        assert Path(tasks[1].output_path).is_file()
+        assert Path(tasks[2].output_path).is_file()
+        assert not Path(tasks[3].output_path).exists()
+        recovered = tmp_path / "_quarantine/obsolete_task_outputs"
+        assert (recovered / Path(tasks[3].output_path).name).read_bytes() == b"original-3"
+        assert (recovered / "different-directory" / duplicate.name).read_bytes() == b"same filename is not the same owner"
+        assert (recovered / "unknown.parquet").read_bytes() == b"orphan source remains recoverable"
+    finally:
+        manifest.connection = real
+        manifest.close()
+
+
+def test_canonical_reconciliation_preserves_callers_pending_transaction(tmp_path: Path) -> None:
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    task_id = "a" * 64
+    path = tmp_path / f"data/id-{task_id[:16]}.parquet"
+    path.parent.mkdir()
+    path.write_bytes(b"preserved pending source")
+    task = DownloadTask(task_id, "equity.profile", "equity", "id", {}, ("yfinance",), str(path))
+    try:
+        manifest.upsert_tasks([task], plan_token="plan")
+        manifest.connection.execute("UPDATE tasks SET status='running'")
+        assert manifest.connection.in_transaction
+        assert manifest.quarantine_terminal_output_shards(plan_token="plan") == (1, 0)
+        assert manifest.connection.in_transaction  # RELEASE must not commit the caller's UPDATE.
+        manifest.connection.rollback()
+        assert manifest.connection.execute("SELECT status FROM tasks").fetchone()[0] == "pending"
+    finally:
+        manifest.close()
+
+
+def test_canonical_reconciliation_failure_releases_its_snapshot_and_keeps_source(tmp_path: Path, monkeypatch) -> None:
+    from downloader import download_openbb_archive as archive
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    task_id = "a" * 64
+    path = tmp_path / f"data/id-{task_id[:16]}.parquet"
+    path.parent.mkdir()
+    path.write_bytes(b"original source before failed move")
+    task = DownloadTask(task_id, "equity.profile", "equity", "id", {}, ("yfinance",), str(path))
+    try:
+        manifest.upsert_tasks([task], plan_token="plan")
+        manifest.connection.execute("UPDATE tasks SET status='failed'")
+        manifest.connection.commit()
+        def fail_move(_path):
+            raise OSError("injected canonical move failure")
+        monkeypatch.setattr(archive, "_quarantine_obsolete_output_path", fail_move)
+        with pytest.raises(OSError, match="injected canonical move failure"):
+            manifest.quarantine_terminal_output_shards(plan_token="plan")
+        assert not manifest.connection.in_transaction
+        assert path.read_bytes() == b"original source before failed move"
+    finally:
+        manifest.close()
+
+
+@pytest.mark.parametrize("duplicate_path", [False, True])
+def test_canonical_reconciliation_streams_prefix_collisions_and_rejects_ambiguous_owners(tmp_path: Path, duplicate_path: bool) -> None:
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+    prefix = "0123456789abcdef"
+    tasks = []
+    for index in range(1024):
+        task_id = prefix + f"{index:048x}"
+        path = tmp_path / "data" / f"scope-{0 if duplicate_path else index}-{prefix}.parquet"
+        tasks.append(DownloadTask(task_id, "equity.profile", "equity", str(index), {}, ("yfinance",), str(path)))
+    path = Path(tasks[0].output_path)
+    path.parent.mkdir()
+    path.write_bytes(b"preserve source even when prefixes collide")
+    try:
+        manifest.upsert_tasks(tasks, plan_token="plan")
+        manifest.connection.execute("UPDATE tasks SET status='success'")
+        manifest.connection.commit()
+        if duplicate_path:
+            with pytest.raises(RuntimeError, match="ambiguous duplicate"):
+                manifest.quarantine_terminal_output_shards(plan_token="plan", batch_size=1)
+        else:
+            assert manifest.quarantine_terminal_output_shards(plan_token="plan", batch_size=1) == (1, 0)
+        assert path.read_bytes() == b"preserve source even when prefixes collide"
+        assert not manifest.connection.in_transaction
+    finally:
+        manifest.close()
+
+
 def test_worker_terminal_outcome_overrides_earlier_transient_attempt(
     tmp_path: Path,
 ) -> None:
@@ -12473,6 +12716,7 @@ def test_manifest_keeps_only_nonredundant_scheduler_indexes(tmp_path: Path) -> N
 
         assert "idx_tasks_schedule_age_v2" in indexes
         assert "idx_tasks_active_plan" in indexes
+        assert "idx_tasks_output_contract_violations_v1" in indexes
         assert "idx_l1_tasks_compaction_order" in indexes
         assert not indexes.intersection(
             {

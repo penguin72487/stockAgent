@@ -32,7 +32,8 @@ def lake_readiness(tmp_path):
     owners = {name: {'scheduler_active': True, 'scheduler_enabled': True}
               for name in ('temporal_server', 'lake_lifecycle', 'lifecycle_control_backup', 'lake_transport_gc')}
     live = {'status': 'RUNNING', 'worker_code_identity_sha256': 'fixed-current-code',
-            'source_replication_workflow': {'status': 'RUNNING'}}
+            'source_replication_workflow': {'status': 'RUNNING'},
+            'dataset_version_workflow': {'status': 'RUNNING'}}
     return {'policy': policy, 'now': now, 'observations': owners, 'probe': lambda: live}, base, receipts, live
 
 
@@ -43,7 +44,7 @@ def test_selected_lakehouse_runtime_gate_keeps_pending_coverage_separate(lake_re
     assert result['full_history_archive_verified'] is False
 
 
-@pytest.mark.parametrize('damage', ['stale', 'pair', 'loaded_code', 'owner', 'workflow', 'policy_mode'])
+@pytest.mark.parametrize('damage', ['stale', 'pair', 'loaded_code', 'owner', 'workflow', 'dataset_workflow', 'policy_mode'])
 def test_lakehouse_runtime_gate_refuses_stale_wrong_peer_code_or_disabled_owner(lake_readiness, damage):
     args, base, receipts, live = lake_readiness
     if damage in ('stale', 'pair'):
@@ -60,6 +61,8 @@ def test_lakehouse_runtime_gate_refuses_stale_wrong_peer_code_or_disabled_owner(
         args['observations']['lake_lifecycle']['scheduler_enabled'] = False
     elif damage == 'workflow':
         live['source_replication_workflow']['status'] = 'FAILED'
+    elif damage == 'dataset_workflow':
+        live['dataset_version_workflow']['status'] = 'FAILED'
     else:
         args['policy'].chmod(0o644)
     assert not automation.lakehouse_readiness(**args)['ready']

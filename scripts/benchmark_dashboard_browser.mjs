@@ -4,7 +4,7 @@
 import fs from "node:fs";
 
 const port = Number(process.argv[2] || 9224);
-const url = process.argv[3] || "https://penguin72487.ddnsgeek.com/tw-day-trade/";
+const url = process.argv[3] || "https://www.penguin72487.dpdns.org/tw-day-trade/";
 const output = process.argv[4];
 const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {method:"PUT"})).json();
 const socket = new WebSocket(target.webSocketDebuggerUrl);

@@ -51,6 +51,7 @@ from stockagent.live.quote_provider import (  # noqa: E402
     warm_shioaji_stock_quote_client,
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
+from stockagent.live.signal_artifacts import read_execution_weight_rows  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
@@ -741,20 +742,11 @@ def _latest_signal(
             rows: list[dict[str, Any]] | None = None
             if execution_weights_path.is_file():
                 try:
-                    execution_payload = json.loads(
-                        execution_weights_path.read_text(encoding="utf-8")
+                    rows = read_execution_weight_rows(
+                        execution_weights_path,
+                        market=str(spec.signal_market or spec.market),
+                        signal_id=str(summary.get("signal_id") or ""),
                     )
-                    execution_rows = execution_payload.get("rows")
-                    if (
-                        int(execution_payload.get("schema_version") or 0) == 1
-                        and str(execution_payload.get("market") or "")
-                        == str(spec.signal_market or spec.market)
-                        and str(execution_payload.get("signal_id") or "")
-                        == str(summary.get("signal_id") or "")
-                        and isinstance(execution_rows, list)
-                        and all(isinstance(row, dict) for row in execution_rows)
-                    ):
-                        rows = [dict(row) for row in execution_rows]
                 except (OSError, TypeError, ValueError, json.JSONDecodeError):
                     rows = None
             if rows is None:
@@ -807,10 +799,23 @@ def _latest_signal(
         return None
     _generated, summary_path, summary = max(ranked, key=lambda item: item[0])
     weights_path = summary_path.with_name("target_weights.parquet")
-    if not weights_path.is_file():
-        _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
-        return None
-    rows = pl.read_parquet(weights_path).to_dicts()
+    execution_path = summary_path.with_name("execution_weights.json")
+    rows = None
+    if execution_path.is_file() and str(summary.get("execution_weights_path") or ""):
+        declared = Path(summary["execution_weights_path"])
+        if declared.resolve() == execution_path.resolve():
+            try:
+                rows = read_execution_weight_rows(
+                    execution_path, market=str(spec.signal_market or spec.market),
+                    signal_id=str(summary.get("signal_id") or ""),
+                )
+            except (OSError, TypeError, ValueError):
+                pass
+    if rows is None:
+        if not weights_path.is_file():
+            _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
+            return None
+        rows = pl.read_parquet(weights_path).to_dicts()
     summary = dict(summary)
     summary["summary_path"] = str(summary_path)
     result = (summary, rows)
@@ -2118,6 +2123,7 @@ def main(argv: list[str] | None = None) -> int:
             engine.update_readiness(
                 specs,
                 now=observed,
+                configured_markets=list(live_configs),
                 errors={
                     **errors,
                     **{
@@ -2179,9 +2185,13 @@ def main(argv: list[str] | None = None) -> int:
                 engine.update_readiness(
                     specs,
                     now=observed,
+                    configured_markets=list(live_configs),
                     errors={
-                        market: f"market_session_blocked: {reason}"
-                        for market, reason in session_errors.items()
+                        **errors,
+                        **{
+                            market: f"market_session_blocked: {reason}"
+                            for market, reason in session_errors.items()
+                        },
                     },
                 )
                 last_readiness = monotonic_now
@@ -2215,7 +2225,8 @@ def main(argv: list[str] | None = None) -> int:
         readiness_interval = _readiness_refresh_interval_seconds(observed)
         if monotonic_now - last_readiness >= readiness_interval:
             readiness_started = time_module.perf_counter()
-            engine.update_readiness(specs, now=observed)
+            engine.update_readiness(specs, now=observed, configured_markets=list(live_configs),
+                                    errors=errors)
             notify_systemd(
                 f"STATUS={_executor_runtime_status(engine, specs, observed)}"
             )

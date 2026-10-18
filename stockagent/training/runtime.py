@@ -144,6 +144,19 @@ def _model_accepts_portfolio_context(model: nn.Module) -> bool:
     return bool(accepts)
 
 
+def _model_accepts_candle_aux_materialization(model: nn.Module) -> bool:
+    target = unwrap_model(model)
+    cached = getattr(target, "_stockagent_accepts_candle_aux_materialization", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        accepts = "materialize_candle_aux" in inspect.signature(target.forward).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    setattr(target, "_stockagent_accepts_candle_aux_materialization", accepts)
+    return accepts
+
+
 def call_model(
     model: nn.Module,
     x: torch.Tensor,
@@ -152,6 +165,7 @@ def call_model(
     return_aux: bool | None = None,
     symbol_indices: torch.Tensor | None = None,
     portfolio_context: dict[str, torch.Tensor] | None = None,
+    materialize_candle_aux: bool | None = None,
 ) -> Any:
     """Call a StockAgent model through the canonical mask/aux ABI."""
     model_mask = model_attention_mask(mask)
@@ -160,6 +174,8 @@ def call_model(
         kwargs["symbol_indices"] = symbol_indices
     if return_aux is not None and _model_accepts_return_aux(model):
         kwargs["return_aux"] = return_aux
+    if materialize_candle_aux is not None and _model_accepts_candle_aux_materialization(model):
+        kwargs["materialize_candle_aux"] = materialize_candle_aux
     if portfolio_context is not None:
         if not _model_accepts_portfolio_context(model):
             raise ValueError(
@@ -185,7 +201,8 @@ def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
             f"Checkpoint must contain a mapping, got {type(checkpoint).__name__}: "
             f"{checkpoint_path}"
         )
-    return checkpoint
+    from stockagent.training.checkpoint_transport import decode_checkpoint_manifest
+    return decode_checkpoint_manifest(checkpoint)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:

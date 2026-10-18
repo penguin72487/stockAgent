@@ -1,4 +1,4 @@
-"""Replay both existing persistent storage histories; never execute activities.
+"""Replay existing persistent storage histories; never execute activities.
 
 Use the locked lakehouse control role. Fetch history from pinned native run IDs,
 preserve every event privately, and replay through the production SDK sandbox.
@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text
 from scripts.manage_lakehouse import worker_code_identity
-from scripts.rollout_lakehouse_source_policy import IDS, OWNER
+from scripts.rollout_lakehouse_source_policy import IDS, OPTIONAL_IDS, OWNER
 from stockagent.control.lakehouse import configuration, guard
 
 
@@ -35,7 +35,7 @@ def validate_events(history):
         raise ValueError('history must preserve every event in original order')
 
 
-async def replay(c, root):
+async def replay(c, root, *, include_dataset_versions=False):
     from temporalio.client import Client, WorkflowHistory
     from temporalio.worker import Replayer
     from stockagent.control import storage_workflow as sw
@@ -45,9 +45,14 @@ async def replay(c, root):
     # A replayer consumes recorded activity results, never a live activity
     # executor. A bounded executor prevents diagnostic thread oversubscription.
     with ThreadPoolExecutor(max_workers=2) as executor:
-        replayer = Replayer(workflows=[sw.StorageLifecycle, sw.SourceReplicationLifecycle],
+        workflows = [sw.StorageLifecycle, sw.SourceReplicationLifecycle]
+        names = IDS
+        if include_dataset_versions:
+            workflows.append(sw.DatasetVersionLifecycle)
+            names = (*IDS, *OPTIONAL_IDS)
+        replayer = Replayer(workflows=workflows,
                             workflow_task_executor=executor, namespace=c['temporal_namespace'])
-        for name in IDS:
+        for name in names:
             description = await client.get_workflow_handle(name).describe()
             if description.status.name != 'RUNNING':
                 raise ValueError('canonical persistent workflow is not running')
@@ -80,6 +85,8 @@ async def replay(c, root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-root', required=True, type=Path)
+    parser.add_argument('--include-dataset-versions', action='store_true',
+                        help='also require and replay the enrolled all-source version lifecycle')
     args = parser.parse_args(argv)
     root = args.output_root.absolute()
     if root.exists() or not root.resolve().is_relative_to(Path('artifacts/operations').resolve()):
@@ -91,7 +98,7 @@ def main(argv=None):
     verifier_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     if owner.get('ActiveState') != 'active':
         raise ValueError('native storage owner is not active')
-    results = asyncio.run(replay(c, root))
+    results = asyncio.run(replay(c, root, include_dataset_versions=args.include_dataset_versions))
     if (owner_identity() != owner or worker_code_identity() != code
             or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != verifier_sha):
         raise ValueError('native owner or code changed during replay')

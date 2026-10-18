@@ -8,7 +8,7 @@ const SOURCE = readFileSync(
   "utf8",
 );
 
-function fakeDocument(current = "tw-day-trade") {
+function fakeDocument(current = "tw-day-trade", audience = "owner") {
   const listeners = new Map();
   const nav = {
     dataset: {dashboardNav: current},
@@ -19,6 +19,10 @@ function fakeDocument(current = "tw-day-trade") {
     documentElement: {dataset: {}},
     hidden: false,
     getElementById() { return null; },
+    querySelector(selector) {
+      return selector === 'meta[name="stockagent-audience"]' && audience != null
+        ? {getAttribute: () => audience} : null;
+    },
     querySelectorAll(selector) { return selector === "nav[data-dashboard-nav]" ? [nav] : []; },
     createDocumentFragment() {
       return {children: [], append(node) { this.children.push(node); }};
@@ -48,8 +52,8 @@ function fakeDocument(current = "tw-day-trade") {
   return {document, nav, listeners};
 }
 
-function loadCore({current = "tw-day-trade", fetchImpl, localStorage, globals = {}, beforeInstall} = {}) {
-  const {document, nav, listeners} = fakeDocument(current);
+function loadCore({current = "tw-day-trade", audience = "owner", fetchImpl, localStorage, globals = {}, beforeInstall} = {}) {
+  const {document, nav, listeners} = fakeDocument(current, audience);
   const requests = [];
   const sandbox = {
     AbortController,
@@ -73,6 +77,17 @@ function loadCore({current = "tw-day-trade", fetchImpl, localStorage, globals = 
   vm.runInContext(SOURCE, sandbox, {filename: "dashboard-core.js"});
   return {core: sandbox.StockAgentDashboard, document, listeners, nav, requests, sandbox};
 }
+
+test("public and missing audience show only the three permitted navigation entries", () => {
+  for (const audience of ["public", null, "visitor", "OWNER"]) {
+    const {core} = loadCore({audience});
+    assert.deepEqual(Array.from(core.NAV_ITEMS, item => item.id), ["overview", "tw-day-trade", "tw-overnight"]);
+    assert.equal(core.isOwnerView(), false);
+  }
+  const {core} = loadCore({audience: "owner"});
+  assert.equal(core.isOwnerView(), true);
+  assert.equal(core.NAV_ITEMS.length, 12);
+});
 
 test("deferred rendering keeps only the latest hidden snapshot and flushes on reveal without fetching", async () => {
   let closed = true;

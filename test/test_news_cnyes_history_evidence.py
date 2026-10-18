@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import time
 from urllib.parse import parse_qs
 
 import pytest
@@ -10,7 +11,7 @@ from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha2
 from downloader.news_fulltext import accept_discovery
 from downloader.news_fulltext_bulk import cnyes_pagination, cnyes_records, cnyes_scope, cnyes_url, cnyes_window_partitions
 from downloader.news_fulltext_cnyes_history import (
-    CONTRACT_VERSION, backfill, index_children, record_page, progress,
+    CONTRACT_VERSION, backfill, index_children, record_page, progress, repair_incomplete_scopes,
 )
 from downloader.news_fulltext_queue import NewsQueue
 from test_cnyes_news_bulk import BASE, cfg, payload, registry_http, response
@@ -489,3 +490,112 @@ def test_same_raw_bytes_new_contract_preserve_old_observation_and_current_head(q
     assert current['state'] == 'list_complete' and current['source_bulk_fingerprint'] == source.cnyes_bulk_data_fingerprint
     assert current['authorization_fingerprint'] == source.authorization_fingerprint
     assert current['evidence_contract_version'] == history.CONTRACT_VERSION
+
+
+def legacy_missing_page(queue, *, failure=None):
+    low = 1388534400
+    first = cnyes_url(BASE, start=low, end=low + 100)
+    second = cnyes_url(BASE, 2, start=low, end=low + 100)
+    capture(queue, first, source_payload(range(1, 31), epoch=low, total=31))
+    with queue.db:
+        queue.db.execute('UPDATE discovery SET due=9e9,etag=?,last_modified=?,error_code=?,attempts=?,'
+            'response_sha256=?,last_checked_at_utc=? WHERE url=?',
+            ('old-etag', 'old-last-modified', failure, int(failure is not None),
+             'old-response', '2020-01-01T00:00:00+00:00', second))
+    return first, second
+
+
+def test_restart_repair_only_missing_successful_page_and_no_repeat_or_body_rewrite(queue):
+    first, second = legacy_missing_page(queue)
+    before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (first,)).fetchone())
+    bodies = [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    proof = head(queue, first)['proof_sha256']
+    result = repair_incomplete_scopes(queue, max_seconds=10)
+    assert result == {'scopes_checked': 1, 'retained_pages_queued': 0, 'page_checks_scheduled': 1}
+    job = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (second,)).fetchone())
+    assert job['due'] < 9e9 and job['etag'] is None and job['last_modified'] is None
+    assert head(queue, first)['proof_sha256'] == proof
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (first,)).fetchone()) == before
+    assert [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')] == bodies
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 0
+    with queue.db:  # Same failed-to-finish evidence after an unchanged owner restart.
+        queue.db.execute('UPDATE discovery SET due=9e9 WHERE url=?', (second,))
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 0
+    capture(queue, second, source_payload([31], epoch=bounds(first)[0], page=2, total=31))
+    assert head(queue, first)['state'] == 'list_complete'
+    assert repair_incomplete_scopes(queue, max_seconds=10)['scopes_checked'] == 0
+    assert queue.db.execute('SELECT 1 FROM cnyes_history_scope_proofs WHERE proof_sha256=?', (proof,)).fetchone()
+
+
+@pytest.mark.parametrize('gate', ['http_403', 'http_429', 'transport_retry', 'split', 'due', 'inflight_article'])
+def test_incomplete_repair_preserves_refusals_split_active_jobs_and_article_leases(queue, gate):
+    first, second = legacy_missing_page(queue, failure=gate if gate.startswith(('http_', 'transport_')) else None)
+    with queue.db:
+        if gate == 'split':
+            queue.db.execute('UPDATE discovery SET superseded_by_windows_json=? WHERE url=?', ('[]', second))
+        elif gate == 'due':
+            queue.db.execute('UPDATE discovery SET due=0 WHERE url=?', (second,))
+        elif gate == 'inflight_article':
+            queue.db.execute("UPDATE articles SET state='inflight',lease_owner='real-owner',lease_until=9e9 WHERE id=(SELECT id FROM articles LIMIT 1)")
+    original = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (second,)).fetchone())
+    bodies = [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    result = repair_incomplete_scopes(queue, max_seconds=10)
+    assert [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')] == bodies
+    if gate != 'inflight_article':
+        assert result['page_checks_scheduled'] == 0
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (second,)).fetchone()) == original
+
+
+def test_missing_list_evidence_reuses_verified_retained_envelope_without_http_or_body_reaccept(queue):
+    from downloader.news_fulltext_cnyes_history import reconcile_scope
+    url, _ = seed_retained_work(queue)
+    with queue.db:
+        queue.db.execute('DELETE FROM cnyes_history_retained_work')
+        queue.db.execute('INSERT INTO bulk_page_evidence VALUES (?,1,2,?,?)',
+            (cnyes_scope(url), cnyes_pagination(response(source_payload([1, 2], epoch=bounds(url)[0]), url))[0]['ids_sha256'],
+             '2020-01-01T00:00:00+00:00'))
+        reconcile_scope(queue, cnyes_scope(url), queue.registry.sources['cnyes'])
+    original = tuple(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+    assert queue.db.execute('SELECT state FROM cnyes_history_retained_work').fetchone()[0] == 'pending'
+    assert backfill(queue, max_seconds=10)['processed'] == 1
+    assert head(queue, url)['state'] == 'list_complete'
+    assert tuple(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == original
+    assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+    observation = json.loads(queue.db.execute('SELECT observation_json FROM cnyes_history_page_observations').fetchone()[0])
+    assert observation['source_observed_at_utc'] == '2020-01-01T00:00:00+00:00'
+
+
+def test_new_source_total_rechecks_only_conflicting_page_once_until_actual_source_converges(queue):
+    low = 1388534400
+    first = cnyes_url(BASE, start=low, end=low + 100)
+    second = cnyes_url(BASE, 2, start=low, end=low + 100)
+    capture(queue, first, source_payload(range(1, 31), epoch=low, total=31))
+    old = head(queue, first)['proof_sha256']
+    capture(queue, second, source_payload([31, 32], epoch=low, page=2, total=32))
+    assert head(queue, first)['state'] == 'inconsistent_source_snapshot'
+    assert queue.db.execute('SELECT due FROM discovery WHERE url=?', (first,)).fetchone()[0] <= time.time()
+    assert queue.db.execute('SELECT etag FROM discovery WHERE url=?', (first,)).fetchone()[0] is None
+    markers = queue.db.execute("SELECT count(*) FROM queue_settings WHERE key LIKE 'cnyes_history_direct_page_recheck_v1:%'").fetchone()[0]
+    assert markers == 1
+    capture(queue, second, source_payload([31, 32], epoch=low, page=2, total=32))
+    assert queue.db.execute("SELECT count(*) FROM queue_settings WHERE key LIKE 'cnyes_history_direct_page_recheck_v1:%'").fetchone()[0] == markers
+    capture(queue, first, source_payload(range(1, 31), epoch=low, total=32))
+    assert head(queue, first)['state'] == 'list_complete'
+    assert queue.db.execute('SELECT 1 FROM cnyes_history_scope_proofs WHERE proof_sha256=?', (old,)).fetchone()
+
+
+def test_repair_frontier_rotates_past_unresolved_scope_and_stops_without_cursor_mutation(queue):
+    import threading
+    from downloader.news_fulltext_cnyes_history import REPAIR_CURSOR
+    for day in range(3):
+        low = 1388534400 + day * 86400
+        capture(queue, cnyes_url(BASE, start=low, end=low + 100), source_payload(range(1, 31), epoch=low, total=31))
+    assert repair_incomplete_scopes(queue, limit=1, max_seconds=10)['scopes_checked'] == 1
+    cursor = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (REPAIR_CURSOR,)).fetchone()[0]
+    stop = threading.Event()
+    stop.set()
+    assert repair_incomplete_scopes(queue, stop=stop)['scopes_checked'] == 0
+    assert repair_incomplete_scopes(queue, max_seconds=0)['scopes_checked'] == 0
+    assert queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (REPAIR_CURSOR,)).fetchone()[0] == cursor
+    assert repair_incomplete_scopes(queue, limit=1, max_seconds=10)['scopes_checked'] == 1
+    assert queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (REPAIR_CURSOR,)).fetchone()[0] > cursor

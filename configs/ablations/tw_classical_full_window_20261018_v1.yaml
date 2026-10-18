@@ -1,0 +1,59 @@
+# Full 32-day / 14,726-channel classical controls for the fresh v9 baseline.
+# Native supervised fitting differs; causal inputs, allocation, financial
+# selection, 2330 buy-and-hold benchmark, accounting and artifacts are shared.
+base_spec: tw_scratch_strategy_20261017_v9.yaml
+output_root: artifacts/markets/tw_classical_full_window_20261018_v1
+fold_selection: last
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 16
+  capacity_retry: {max_retries: 0, minimum_train_batch: 32}
+matrix:
+  include_baseline: false
+  fixed_overrides:
+    training:
+      model_name: classical
+      multi_gpu_strategy: none
+      enable_torch_compile: false
+      day_trade_annual_episode_sharding: false
+      classical:
+        threads: 16
+        batch_rows: 1024
+        cache_root: artifacts/operations/training-quality-audit-20261015/classical-v1/physical-csr
+        host_memory_budget_gib: 160
+        device_memory_budget_gib: 26
+        max_bin: 63
+        bin_sample_count: 20000
+        max_depth: 6
+        num_leaves: 31
+        learning_rate: 0.05
+        reg_lambda: 1.0
+        min_data_in_leaf: 100
+        ridge_alpha: 1.0
+        ridge_tolerance: 0.00001
+        ridge_max_iter: 1000
+        rank_levels: 16
+  dimensions:
+    - name: classical
+      enabled: true
+      variants:
+        - name: ridge
+          overrides:
+            training:
+              classical: {kind: ridge, backend: cuda, gpu_device_id: 1}
+        - name: lightgbm
+          overrides:
+            training:
+              classical: {kind: lightgbm}
+        - name: lightgbm_ranker
+          overrides:
+            training:
+              classical: {kind: lightgbm_ranker}
+        - name: xgboost
+          overrides:
+            training:
+              classical: {kind: xgboost, backend: cuda, gpu_device_id: 1}
+        - name: catboost
+          overrides:
+            training:
+              classical: {kind: catboost, backend: cpu}

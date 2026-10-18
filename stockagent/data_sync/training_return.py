@@ -135,25 +135,9 @@ def admitted(relative: str, policy: dict) -> bool:
 
 
 def admit_workspace(path: Path, required_bytes: int) -> dict:
-    """Mutable ingress/DB state uses a native local filesystem and real space."""
-    path = _real(path)
-    if not path.is_dir():
-        raise SnapshotError("training return workspace must already exist")
-    result = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", str(path)],
-                            capture_output=True, text=True, check=True, timeout=10)
-    filesystem = result.stdout.strip()
-    if filesystem not in {"ext4", "xfs", "btrfs", "zfs"}:
-        raise SnapshotError("authority mutable return state needs a native local filesystem")
-    fs = os.statvfs(path)
-    free = fs.f_bavail * fs.f_frsize
-    if "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower():
-        from stockagent.data_sync.recovery_queue import physical_free_bytes
-        config = {"windows_distribution": os.environ.get("WSL_DISTRO_NAME", ""),
-                  "powershell": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"}
-        free = min(free, physical_free_bytes(config))
-    if free < required_bytes:
-        raise SnapshotError("training return workspace lacks real physical free space")
-    return {"filesystem": filesystem, "physical_free_bytes": free, "required_bytes": required_bytes}
+    """Compatibility entrypoint for the dependency-light native scratch gate."""
+    from stockagent.data_sync.windows_cold_io import admit_workspace as admit_native_workspace
+    return admit_native_workspace(path, required_bytes)
 
 
 def make_ack(sync_root: Path, resolved, *, relative_root: str, origin: str) -> dict:

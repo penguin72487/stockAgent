@@ -8,6 +8,9 @@ from scripts import verify_completed_session_cache as verifier
 
 @pytest.fixture
 def reusable(tmp_path, monkeypatch):
+    # This fixture models a separate cold observer, including in a full suite
+    # where earlier model tests legitimately initialized this pytest process.
+    monkeypatch.setattr(verifier.torch.cuda, "is_initialized", lambda: False)
     weights = tmp_path / "weights.csv"
     weights.write_text("symbol,weight\n2330,0.1\n")
     cfg = SimpleNamespace(market="tw", day_trade_simulation_enabled=True,
@@ -63,6 +66,12 @@ def test_reuse_verifier_actually_forbids_model_work(reusable, monkeypatch):
     monkeypatch.setattr(verifier.discord_bot, "_run_completed_session_signal_cache_sync",
                         lambda cfg: verifier.discord_bot.generate_live_signal())
     with pytest.raises(AssertionError, match="model or CUDA"):
+        verifier.verify()
+
+
+def test_reuse_verifier_rejects_a_process_that_already_initialized_cuda(monkeypatch):
+    monkeypatch.setattr(verifier.torch.cuda, "is_initialized", lambda: True)
+    with pytest.raises(RuntimeError, match="CUDA-cold"):
         verifier.verify()
 
 

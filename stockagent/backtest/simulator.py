@@ -3332,6 +3332,7 @@ def run_backtest_torch(
     initial_day_trade_carry_state: DayTradeCarryState | None = None,
     day_trade_carry_event_compression: bool = False,
     day_trade_carry_require_minute_nav_grad: bool = True,
+    day_trade_replay_log_returns: Tensor | None = None,
     crypto_announced_exit_unlimited_volume: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
@@ -3402,7 +3403,8 @@ def run_backtest_torch(
             rebate_rate=rate(commission_rebate_rates, 0), initial_capital=day_trade_execution_initial_capital,
             initial_state=initial_day_trade_carry_state,
             event_compression=day_trade_carry_event_compression,
-            require_minute_nav_grad=day_trade_carry_require_minute_nav_grad)
+            require_minute_nav_grad=day_trade_carry_require_minute_nav_grad,
+            replay_log_returns=day_trade_replay_log_returns)
         return BacktestResultTensor(strategy_returns=carry.strategy_returns,
             benchmark_returns=benchmark_returns.to(device=weights.device, dtype=torch.float64),
             turnovers=carry.turnovers, weights_history=carry.weights_history,
@@ -3415,6 +3417,8 @@ def run_backtest_torch(
             day_trade_carry_state=carry.final_state, minute_nav=carry.minute_nav)
     if initial_day_trade_carry_state is not None:
         raise ValueError("physical FIFO state cannot be silently consumed by another executor")
+    if day_trade_replay_log_returns is not None:
+        raise ValueError("recorded physical returns cannot be consumed by another executor")
     if overnight_fixed_close_to_open:
         if mode != "tw_overnight":
             raise ValueError("fixed close-to-open requires tw_overnight")

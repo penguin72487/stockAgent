@@ -107,6 +107,12 @@ _TW_PHASE_RETURN_OBJECTIVES = frozenset(
         "mean_log_return",
     }
 )
+_ANNUAL_TRAJECTORY_OBJECTIVES = frozenset({
+    "trajectory_sharpe", "trajectory_return", "trajectory_sortino", "trajectory_mdd",
+    "trajectory_calmar",
+    "trajectory_pcgrad_return", "trajectory_mgda_return",
+    "trajectory_pcgrad_parameter", "trajectory_mgda_parameter",
+})
 _TW_INDEX_FUTURES_MODEL_NAMES = frozenset(
     {
         "cross_sectional_index_futures",
@@ -1572,6 +1578,10 @@ class DataConfig:
     # Physical FIFO may need the canonical public archive when model inputs
     # come from a separate research-only feature table.
     day_trade_physical_public_feature_path: str | None = None
+    # Infer-only localization of the executor's current receipt-verified
+    # archive. Keep the immutable training path above in the checkpoint ABI.
+    # Never use this override for training/resume or as a model feature.
+    day_trade_inference_public_feature_path: str | None = None
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
@@ -2318,6 +2328,10 @@ class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     # Stabilize the compact stock/market attention and allocation head across
     # partitioned compilation and multiple optimizer steps; opt-in only.
     portfolio_blocks_fp32: bool = False
+    # Optional identity-initialized risk odds head; stock selection is retained.
+    portfolio_risk_calibration: str = "off"
+    # Only immutable, fully frozen encoder outputs may persist across updates.
+    factorized_frozen_encoder_cache_bytes: int = 0
     # The minute path may fuse a separately encoded causal history of completed
     # daily features.  A value of one preserves the historical broadcast-only
     # checkpoint schema; values greater than one create a new model contract.
@@ -2470,6 +2484,31 @@ class XGBoostModelConfig:
     reg_lambda: float = 1.0
     n_jobs: int = -1
     random_state: int = 42
+
+
+@dataclass(slots=True)
+class ClassicalModelConfig:
+    """Full-window classical baselines; execution remains owned by the trainer."""
+    kind: str = "ridge"
+    backend: str = "cpu"
+    gpu_device_id: int = 0
+    threads: int = 16
+    batch_rows: int = 1024
+    cache_root: str = "artifacts/data_preparation/classical_full_window_v1"
+    cache_bytes: int = 2147483648
+    host_memory_budget_gib: float = 300.0
+    device_memory_budget_gib: float = 26.0
+    max_bin: int = 63
+    bin_sample_count: int = 20000
+    max_depth: int = 6
+    num_leaves: int = 31
+    learning_rate: float = 0.05
+    reg_lambda: float = 1.0
+    min_data_in_leaf: int = 100
+    ridge_alpha: float = 1.0
+    ridge_tolerance: float = 1e-5
+    ridge_max_iter: int = 1000
+    rank_levels: int = 16
 
 
 @dataclass(slots=True)
@@ -2826,6 +2865,7 @@ class TrainingConfig:
     )
     lightgbm: LightGBMModelConfig = field(default_factory=LightGBMModelConfig)
     xgboost: XGBoostModelConfig = field(default_factory=XGBoostModelConfig)
+    classical: ClassicalModelConfig = field(default_factory=ClassicalModelConfig)
 
 
 @dataclass(slots=True)
@@ -2887,6 +2927,7 @@ def _nested_training_schemas() -> dict[str, type[Any]]:
         "portfolio_autoencoder_loss": PortfolioAutoencoderLossConfig,
         "lightgbm": LightGBMModelConfig,
         "xgboost": XGBoostModelConfig,
+        "classical": ClassicalModelConfig,
     }
 
 
@@ -3583,6 +3624,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["portfolio_blocks_fp32"] = bool(
         financial_transformer["portfolio_blocks_fp32"]
     )
+    risk_calibration = str(financial_transformer["portfolio_risk_calibration"]).strip().lower()
+    if risk_calibration not in {"off", "constant", "linear"}:
+        raise ValueError("portfolio_risk_calibration must be off, constant or linear")
+    if risk_calibration != "off" and financial_transformer["portfolio_output_mode"] != "score_entmax_scale_separated_cash":
+        raise ValueError("risk calibration requires score_entmax_scale_separated_cash")
+    financial_transformer["portfolio_risk_calibration"] = risk_calibration
+    financial_transformer["factorized_frozen_encoder_cache_bytes"] = int(
+        financial_transformer["factorized_frozen_encoder_cache_bytes"])
+    if financial_transformer["factorized_frozen_encoder_cache_bytes"] < 0:
+        raise ValueError("factorized_frozen_encoder_cache_bytes must be nonnegative")
     financial_transformer["causal_feature_rms_normalization"] = bool(
         financial_transformer["causal_feature_rms_normalization"]
     )
@@ -3968,6 +4019,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     xgboost = training.setdefault("xgboost", {})
     _set_dataclass_defaults(xgboost, XGBoostModelConfig)
 
+    classical = training.setdefault("classical", {})
+    _set_dataclass_defaults(classical, ClassicalModelConfig)
+
     # Remove legacy flat model keys from normalized payload.
     training.pop("hidden_dim", None)
     training.pop("hidden_layers", None)
@@ -4108,12 +4162,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["factorized_host_cache_bytes"] = _normalize_optional_positive_int(
         data["factorized_host_cache_bytes"], field_name="data.factorized_host_cache_bytes"
     )
-    raw_physical_public_path = data["day_trade_physical_public_feature_path"]
-    data["day_trade_physical_public_feature_path"] = (
-        None
-        if raw_physical_public_path is None or not str(raw_physical_public_path).strip()
-        else str(raw_physical_public_path).strip()
-    )
+    for path_field in (
+        "day_trade_physical_public_feature_path",
+        "day_trade_inference_public_feature_path",
+    ):
+        raw_public_path = data[path_field]
+        data[path_field] = (
+            None
+            if raw_public_path is None or not str(raw_public_path).strip()
+            else str(raw_public_path).strip()
+        )
     tw_public_market_symbol_default = _dataclass_default_values(DataConfig)[
         "tw_public_market_symbol"
     ]
@@ -4917,14 +4975,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "data.day_trade_minute_execution_root"
         )
     if (
-        data["day_trade_physical_public_feature_path"] is not None
+        (data["day_trade_physical_public_feature_path"] is not None
+         or data["day_trade_inference_public_feature_path"] is not None)
         and not (
             trading["execution_mode"] == "tw_day_trade"
             and trading["tw_day_trade_unlimited_margin_conversion"]
         )
     ):
         raise ValueError(
-            "data.day_trade_physical_public_feature_path requires "
+            "data.day_trade_physical_public_feature_path / "
+            "data.day_trade_inference_public_feature_path requires "
             "physical-FIFO tw_day_trade"
         )
     if bool(trading["tw_day_trade_unlimited_margin_conversion"]):
@@ -5041,9 +5101,32 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 or not trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]
                 or not trading["tw_day_trade_unlimited_margin_conversion"]
                 or not data["day_trade_minute_execution_root"]
-                or training["loss_type"] != "log_utility"
+                or training["loss_type"] not in {"log_utility"} | _ANNUAL_TRAJECTORY_OBJECTIVES
                 or not training["day_trade_optimizer_step_per_trajectory"]):
-            raise ValueError("annual training episodes require a flat-terminal physical log-utility trajectory")
+            raise ValueError("annual training episodes require a flat-terminal physical return trajectory")
+    if training["loss_type"] in _ANNUAL_TRAJECTORY_OBJECTIVES:
+        if (not training["day_trade_training_annual_episodes"]
+                or not training["day_trade_annual_episode_sharding"]
+                or training["multi_gpu_strategy"] != "distributed_data_parallel"
+                or training["ddp_trajectory_gradient_sync"] != "trajectory"
+                or training["day_trade_sub_lot_recovery"]
+                or training["day_trade_dense_allocation_backward"]
+                or any(phase_model_config[name] != 0.0 for name in (
+                    "dropout", "input_dropout", "candle_dropout"))
+                or evaluation["eval_log_utility_periods_per_year"] != 252.0
+                or evaluation["gamma_sharpe"] != 1.0
+                or evaluation["gamma_turnover"] != 0.0
+                or any(evaluation[name] != 0.0 for name in (
+                    "log_utility_risk_aversion", "log_utility_downside_aversion",
+                    "log_utility_benchmark_shortfall_aversion"))
+                or any(training["multitask_loss"][name] != 0.0 for name in (
+                    "return_rank_ic_weight", "direction_weight", "volatility_regime_weight",
+                    "concentration_weight", "net_exposure_weight"))):
+            raise ValueError("whole-account return adjoints require annual physical trajectory DDP without auxiliary losses")
+        if (training["loss_type"] in {"trajectory_pcgrad_return", "trajectory_mgda_return",
+                                      "trajectory_pcgrad_parameter", "trajectory_mgda_parameter"}
+                and str(environment.get("amp_dtype", "bf16")).lower() in {"fp16", "float16", "half"}):
+            raise ValueError("multiobjective gradient surgery requires unscaled BF16/FP32 gradients")
     if bool(training["day_trade_optimizer_step_per_trajectory"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
@@ -5061,11 +5144,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "minute/daily-proxy physical sessions"
             )
         if _normalized_contract_name(training["loss_type"]) not in (
-            _TW_PHASE_RETURN_OBJECTIVES
+            _TW_PHASE_RETURN_OBJECTIVES | _ANNUAL_TRAJECTORY_OBJECTIVES
         ):
             raise ValueError(
-                "day_trade_optimizer_step_per_trajectory requires decomposable "
-                "exact log utility"
+                "day_trade_optimizer_step_per_trajectory requires log utility "
+                "or an explicitly supported complete-account return adjoint"
             )
         if bool(training["compile_loss"]):
             raise ValueError(
@@ -5999,6 +6082,7 @@ def load_config(
             ),
             lightgbm=LightGBMModelConfig(**training_raw["lightgbm"]),
             xgboost=XGBoostModelConfig(**training_raw["xgboost"]),
+            classical=ClassicalModelConfig(**training_raw["classical"]),
         ),
         evaluation=EvaluationConfig(**raw["evaluation"]),
     )

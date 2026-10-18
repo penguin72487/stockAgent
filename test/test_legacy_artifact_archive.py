@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 import os
@@ -60,6 +61,54 @@ def test_legacy_archive_roundtrip_is_non_deployable_and_exact(tmp_path: Path) ->
         restore_archive(spec, sync_root, destination, materialized_root=tmp_path / "restore-cache")
 
 
+def test_real_publisher_holds_owner_only_for_canonical_commit(tmp_path, monkeypatch):
+    spec, artifact_root, source = _fixture(tmp_path)
+    prepare_archive(spec, artifact_root)
+    events = []
+    held = False
+    verify_original = archive_module.verify_archive_directory
+    publish_original = archive_module.publish_packed_snapshot
+    verify_packed_original = archive_module.verify_packed_snapshot
+
+    @contextmanager
+    def owner():
+        nonlocal held
+        assert not held
+        held = True
+        events.append("acquire")
+        try:
+            yield
+        finally:
+            held = False
+            events.append("release")
+
+    def verify(*args, **kwargs):
+        assert not held
+        events.append("verify-originals")
+        return verify_original(*args, **kwargs)
+
+    def publish(*args, **kwargs):
+        assert held
+        events.append("publish")
+        return publish_original(*args, **kwargs)
+
+    def verify_packed(*args, **kwargs):
+        assert not held
+        events.append("verify-cold")
+        return verify_packed_original(*args, **kwargs)
+
+    monkeypatch.setattr(archive_module, "verify_archive_directory", verify)
+    monkeypatch.setattr(archive_module, "publish_packed_snapshot", publish)
+    monkeypatch.setattr(archive_module, "verify_packed_snapshot", verify_packed)
+    result = publish_archive(spec, artifact_root, tmp_path / "packed", repo_root=tmp_path,
+                             publication_owner=owner)
+    assert events == ["verify-originals", "acquire", "publish", "release",
+                      "verify-cold", "verify-originals"]
+    assert not held
+    assert result["source_files"] == 2
+    assert (source / "fold_01/checkpoint_best.pt").read_bytes() == b"legacy incomplete checkpoint"
+
+
 def test_selected_restore_keeps_full_archive_verification_and_exact_members(tmp_path):
     spec, artifact_root, source = _fixture(tmp_path)
     sync_root = tmp_path / "packed"
@@ -77,6 +126,28 @@ def test_selected_restore_keeps_full_archive_verification_and_exact_members(tmp_
         with pytest.raises(SnapshotError):
             restore_archive(spec, sync_root, tmp_path / "invalid",
                             materialized_root=tmp_path / "restore-cache", include_paths=paths)
+
+
+def test_restore_can_pin_exact_snapshot_without_reading_current_head(tmp_path, monkeypatch):
+    spec, artifact_root, source = _fixture(tmp_path)
+    sync_root = tmp_path / "packed"
+    release = publish_archive(spec, artifact_root, sync_root, repo_root=tmp_path)
+
+    def moving_head(*args, **kwargs):
+        raise AssertionError("a fixed recovery must not resolve the moving head")
+
+    monkeypatch.setattr(archive_module, "resolve_latest_packed", moving_head)
+    destination = tmp_path / "fixed-recovery"
+    result = restore_archive(spec, sync_root, destination,
+                             materialized_root=tmp_path / "restore-cache",
+                             snapshot_id=release["snapshot_id"])
+    assert result["snapshot_id"] == release["snapshot_id"]
+    assert result["archive_files_verified"] == 2
+    assert (destination / "fold_01/checkpoint_best.pt").read_bytes() == (source / "fold_01/checkpoint_best.pt").read_bytes()
+    with pytest.raises((OSError, SnapshotError)):
+        restore_archive(spec, sync_root, tmp_path / "absent-recovery",
+                        materialized_root=tmp_path / "restore-cache", snapshot_id="absent-release")
+    assert not (tmp_path / "absent-recovery").exists()
 
 
 def test_adaptive_large_binary_compression_keeps_exact_recovery(tmp_path):
@@ -209,8 +280,8 @@ def test_explicit_verification_workspace_preserves_failed_reconstruction(tmp_pat
     monkeypatch.setattr(training_return, "admit_workspace", lambda *a: {})
     original_fetch = archive_module.fetch_packed_snapshot
 
-    def corrupt_reconstructed_manifest(cold, destination, resolved):
-        archive = original_fetch(cold, destination, resolved)
+    def corrupt_reconstructed_manifest(cold, destination, resolved, **options):
+        archive = original_fetch(cold, destination, resolved, **options)
         (archive / "legacy_archive_manifest.json").write_bytes(b"corrupted reconstruction")
         return archive
 
@@ -220,6 +291,29 @@ def test_explicit_verification_workspace_preserves_failed_reconstruction(tmp_pat
         archive_module.verify_cold_archive(spec, packed, verification_root=scratch)
     assert list(scratch.glob("stockagent-legacy-verify-*"))
     assert (source / "fold_01/checkpoint_best.pt").exists()
+
+
+def test_full_cold_recovery_progress_preserves_all_three_independent_steps(tmp_path):
+    spec, artifact_root, source = _fixture(tmp_path)
+    packed = tmp_path / 'packed'
+    published = publish_archive(spec, artifact_root, packed, repo_root=tmp_path)
+    events = []
+    proof = archive_module.verify_cold_archive(spec, packed, progress=events.append)
+    assert proof['cold_verified'] and proof['decoded_originals_verified']
+    assert proof['verification_scratch_removed']
+    assert proof['snapshot_id'] == published['snapshot_id']
+    assert proof['manifest_sha256'] == published['manifest_sha256']
+    assert {event['recovery_step'] for event in events} == {
+        'fetch-encoded-archive', 'decode-originals', 'independent-cold-reconstruction'}
+    decoded = [event for event in events if event['stage'] == 'decode-originals']
+    assert decoded[0]['completed_items'] == decoded[0]['completed_bytes'] == 0
+    assert decoded[-1]['completed_items'] == decoded[-1]['total_items'] == proof['files']
+    assert decoded[-1]['completed_bytes'] == decoded[-1]['total_bytes'] == proof['original_bytes']
+    last = events[-1]
+    assert last['recovery_step'] == 'independent-cold-reconstruction'
+    assert last['completed_items'] == last['total_items']
+    assert last['completed_bytes'] == last['total_bytes']
+    assert (source / 'fold_01/checkpoint_best.pt').exists()
 
 
 @pytest.mark.parametrize("redirect", [False, True])

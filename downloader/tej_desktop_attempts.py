@@ -20,6 +20,7 @@ ATTEMPT_CONTRACT = 'attempt_scoped_preview_v1'
 ANNOTATION_RECONCILIATION_CONTRACT = 'exact_unsent_attempt_annotation_reconciliation_v1'
 OPERATOR_REPLAY_CONTRACT = 'exact_unknown_download_operator_replay_v1'
 AUTHORIZED_REPLAY_CONTRACT = 'exact_unknown_download_user_authorized_replay_v1'
+INTERRUPTED_STAGE_CONTRACT = 'exact_interrupted_stage_write_authorized_replay_v1'
 
 
 def authorized_replay_policy(config: dict) -> dict | None:
@@ -664,10 +665,90 @@ def unstaged_interop_diagnostic(root: Path, task: dict, request: dict, prepared:
     return diagnostic
 
 
+def interrupted_stage_write_proof(root: Path, task: dict, request: dict, prepared: Path) -> dict:
+    """Recognize a failed legacy stage write without rewriting unknown evidence.
+
+    This is eligibility for an explicitly authorized replay, NOT a new negative
+    source receipt. Bind the diagnostic callsite to the attempt's immutable
+    script, rather than today's checkout or merely an empty JSON document.
+    """
+    from downloader.tej_history import DesktopBridge
+    active = task.get('active_attempt_id')
+    if (not isinstance(active, str)
+            or not re.fullmatch(re.escape(task['task_id']) + r'-[0-9a-f]{32}', active)
+            or prepared.resolve() != (root / 'requests' / (active + '.json')).resolve()):
+        raise ValueError('Exact interrupted stage attempt required')
+    original = _read_private(prepared, root / 'requests', task['task_id'])
+    if (not prepared_request_matches(original, request, task)
+            or original.get('query_attempt_id') != active):
+        raise ValueError('Interrupted stage request scope differs')
+    raw = root / 'raw' / (active + '.json')
+    stage = raw.with_suffix('.json.stage.json')
+    if (stage.is_symlink() or not stage.is_file() or stage.stat().st_size != 0
+            or any(p.exists() for p in (raw, raw.with_suffix('.json.outcome.json')))):
+        raise ValueError('Exact empty failed stage and no source result required')
+    diagnostic = root / 'diagnostics' / (active + '.txt')
+    if diagnostic.is_symlink() or not diagnostic.is_file() or diagnostic.stat().st_size > 4096:
+        raise ValueError('Bounded interrupted write diagnostic required')
+    lines = diagnostic.read_text(encoding='utf-8-sig').splitlines()
+    match = re.fullmatch(
+        r'at <ScriptBlock>, [A-Za-z]:\\Users\\[^\\\r\n]+\\AppData\\Local\\StockAgent\\'
+        r'TEJSmartWizard\\worker-[0-9a-f]{32}\\bridge\.ps1: line ([1-9][0-9]*)',
+        lines[1] if len(lines) == 3 else '')
+    if (not match or lines[0] != 'Exception calling "WriteAllText" with "3" argument(s): "The operation was canceled."'
+            or lines[2] != 'at <ScriptBlock>, <No file>: line 1'):
+        raise ValueError('Unreviewed interrupted write diagnostic')
+    manifest = root / 'launches' / (active + '.bridge.json')
+    if not manifest.is_file():
+        raise ValueError('Original immutable bridge manifest required')
+    # Existing-manifest branch is read-only and validates both SHA256 bindings.
+    release, digest = DesktopBridge.bound_script_release(root, active, prepared)
+    code = release.read_text(encoding='utf-8-sig').splitlines()
+    index = int(match[1]) - 1
+    legacy_write = "[IO.File]::WriteAllText(($Output+'.stage.json'),($stage|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))"
+    preview = '[TejBridgeNative]::BeginPreviewDefaultAction($ExpectedWindow,$previewButton)'
+    if (not 0 <= index < len(code) or code[index].strip() != legacy_write
+            or sum(line.strip() == preview for line in code) != 1):
+        raise ValueError('Diagnostic is not the original pre-Preview stage writer')
+    following = [line.strip() for line in code[index+1:index+9]
+                 if line.strip() and not line.lstrip().startswith('#')]
+    if following[:4] != ['$querySubmissionPossible=$true',
+            '$flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds',
+            '$queryClock=[Diagnostics.Stopwatch]::StartNew()', preview]:
+        raise ValueError('Unreviewed original stage/submission boundary')
+    with closing(_connect(root)) as con:
+        attempt = con.execute('SELECT * FROM desktop_attempts WHERE attempt_id=?', (active,)).fetchone()
+    if (attempt is None or attempt['task_id'] != task['task_id'] or attempt['state'] != 'unknown_outcome'
+            or not attempt['finished_at_utc']
+            or attempt['request_path'] != str(prepared.relative_to(root))
+            or attempt['raw_path'] != str(raw.relative_to(root))):
+        raise ValueError('Exact finished interrupted attempt required')
+    progress = root / 'progress' / (active + '.json.progress.json')
+    progress_digest = None
+    if progress.exists():
+        value = _read_private(progress, root / 'progress', task['task_id'])
+        if (set(value) != {'contract', 'task_id', 'attempt_id', 'stage', 'observed_at_utc'}
+                or value.get('contract') != 'tej_native_readback_progress_v1'
+                or value.get('task_id') != task['task_id'] or value.get('attempt_id') != active
+                or value.get('stage') != 'preparing_scope'):
+            raise ValueError('Post-submission or unreviewed progress requires retained result recovery')
+        source_operation_clock(value['observed_at_utc'],
+            datetime.fromisoformat(attempt['started_at_utc']), datetime.fromisoformat(attempt['finished_at_utc']))
+        progress_digest = hashlib.sha256(progress.read_bytes()).hexdigest()
+    return {'contract': INTERRUPTED_STAGE_CONTRACT,
+            'original_stage_path': str(stage.relative_to(root)),
+            'original_stage_sha256': hashlib.sha256(stage.read_bytes()).hexdigest(),
+            'original_diagnostic_path': str(diagnostic.relative_to(root)),
+            'original_diagnostic_sha256': hashlib.sha256(diagnostic.read_bytes()).hexdigest(),
+            'original_bridge_sha256': digest, 'original_callsite_line': index + 1,
+            'original_preparation_progress_sha256': progress_digest}
+
+
 def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
                            allow_unstaged_interop: bool = False,
                            allow_unstaged_script_preparation: bool = False,
                            allow_orphaned_desktop_loss: bool = False,
+                           allow_interrupted_stage_write: bool = False,
                            standing_authorization: dict | None = None) -> dict:
     """Canonical one-shot replay, with manual or bounded standing user authority.
 
@@ -703,11 +784,16 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
                 or original.get('query_attempt_id') != task.get('active_attempt_id')
                 or (root / 'raw' / (task['active_attempt_id'] + '.json')).exists()):
             raise ValueError('Reconcile exact saved response before any authorized replay')
-    modes = (allow_unstaged_interop, allow_unstaged_script_preparation, allow_orphaned_desktop_loss)
+    modes = (allow_unstaged_interop, allow_unstaged_script_preparation,
+             allow_orphaned_desktop_loss, allow_interrupted_stage_write)
     if any(type(mode) is not bool for mode in modes) or sum(modes) > 1:
         raise ValueError('Explicit operator replay mode required')
     unstaged=any(modes)
-    if allow_orphaned_desktop_loss:
+    interrupted = None
+    if allow_interrupted_stage_write:
+        interrupted = interrupted_stage_write_proof(root, task, request, prepared)
+        diagnostic = root / interrupted['original_diagnostic_path']
+    elif allow_orphaned_desktop_loss:
         from downloader.tej_startup import orphan_desktop_loss_proof
         diagnostic = orphan_desktop_loss_proof(root, task, request, prepared)
     else:
@@ -755,6 +841,8 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
             or not isinstance(role_state, list) or len(role_state) != 2 or role_state[0] != 43
             or button.get('default_action') != 'Press' or payload.get('source_key_mode') not in (1, 2, 3)):
         raise ValueError('Exact idle owned query button required; unknown barrier preserved')
+    if interrupted is not None and interrupted_stage_write_proof(root, task, request, prepared) != interrupted:
+        raise ValueError('Interrupted stage evidence changed during fresh readback')
     authorization = uuid.uuid4().hex
     audit_path = root / 'operator_replays' / (task_id + '-' + authorization + '.json')
     audit = {'contract':AUTHORIZED_REPLAY_CONTRACT if automatic else OPERATOR_REPLAY_CONTRACT,
@@ -767,6 +855,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
              'unstaged_interop_replay_explicitly_authorized':allow_unstaged_interop,
              'unstaged_script_preparation_replay_explicitly_authorized':allow_unstaged_script_preparation,
              'orphaned_desktop_loss_replay_authorized':allow_orphaned_desktop_loss,
+             'interrupted_stage_write_replay_proof':interrupted,
              'original_launch_diagnostic_path':str(diagnostic.relative_to(root)) if diagnostic else None,
              'original_launch_diagnostic_sha256':hashlib.sha256(diagnostic.read_bytes()).hexdigest() if diagnostic else None,
              'readback_path':str(output.relative_to(root)), 'readback_sha256':hashlib.sha256(output.read_bytes()).hexdigest(),

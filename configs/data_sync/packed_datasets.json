@@ -1,8 +1,23 @@
 {
   "schema_version": 1,
+  "publication_families": [
+    {
+      "dataset": "completed-tw-forward",
+      "publication_family": "completed_tw_panel_forward_cpu_v3",
+      "source": "artifacts/cache/completed_live_inference",
+      "role": "private-derived-completed-forward-cpu-cache",
+      "publish": true,
+      "pack_buckets": 1,
+      "loose_threshold_bytes": 1,
+      "active_process_substrings": [],
+      "note": "Explicit full-key publication only: original immutable CPU output plus its exact v3 receipt, under the existing key owner. No whole-cache publication, provider raw data, checkpoint, usage metadata or locks. Standard immutable pins live under the configured materialized retention root. This enrollment alone authorizes neither cache eviction nor automatic model recomputation."
+    }
+  ],
   "datasets": [
     {
       "dataset": "training-dataset-recipes",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "artifacts/operations/training_dataset_recipes",
       "role": "source-pinned-rebuild-methods-no-training-data",
       "publish": true,
@@ -15,6 +30,8 @@
     },
     {
       "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v4",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v4",
       "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
       "publish": true,
@@ -31,6 +48,8 @@
     },
     {
       "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v3",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v3",
       "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
       "publish": false,
@@ -47,6 +66,8 @@
     },
     {
       "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v1",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v1",
       "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
       "publish": false,
@@ -63,6 +84,8 @@
     },
     {
       "dataset": "tw-daytrade-panel-sources-20261004-gaprepair-v2",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_gaprepair_v2",
       "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
       "publish": true,
@@ -79,6 +102,8 @@
     },
     {
       "dataset": "tw-daytrade-physical-20261004-v1",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_physical_20261004_v1",
       "role": "owner-private-physical-execution-source-companions",
       "publish": true,
@@ -92,6 +117,8 @@
     },
     {
       "dataset": "tw-daytrade-panel-sources-20261004-v3",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_panel_sources_20261004_v3",
       "role": "owner-private-nullable-native-panel-sources-for-vastai1T-research",
       "publish": true,
@@ -108,6 +135,8 @@
     },
     {
       "dataset": "tw-daytrade-mixed-sources-20261004-v1",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_daytrade_mixed_sources_20261004_v1",
       "role": "owner-private-source-observations-for-remote-research-not-live",
       "publish": true,
@@ -132,6 +161,8 @@
     },
     {
       "dataset": "tw-public",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_public",
       "source_coordination_lock": ".locks/tw-public-refresh.lock",
       "source_coordination_lock_scope": "source_parent",
@@ -180,6 +211,8 @@
     },
     {
       "dataset": "tw-public-research-wide-2014",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_public_research_wide_2014_v1",
       "role": "private-research-training-not-live-or-strict-pit",
       "publish": true,
@@ -202,6 +235,8 @@
     },
     {
       "dataset": "tw-public-research-all-observed-2014-v3",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_public_research_all_observed_2014_v3",
       "role": "private-research-training-not-live-or-strict-pit",
       "publish": true,
@@ -224,6 +259,8 @@
     },
     {
       "dataset": "tw-public-research-finlab-2014-v4",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "/srv/stockagent-live/data_tw_public_research_finlab_2014_v4",
       "role": "private-owner-research-training-not-live-or-strict-pit",
       "publish": true,
@@ -251,6 +288,8 @@
     },
     {
       "dataset": "tw-minute-train",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_minute/research_dataset",
       "role": "training",
       "publish": true,
@@ -265,6 +304,8 @@
     },
     {
       "dataset": "tw-minute-source-cold",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_minute/shioaji_1m",
       "role": "cold-audit",
       "publish": true,
@@ -280,6 +321,8 @@
     },
     {
       "dataset": "tw-microstructure-train",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_microstructure/hft_dataset",
       "role": "training",
       "publish": true,
@@ -292,6 +335,8 @@
     },
     {
       "dataset": "tw-microstructure-captures-cold",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_microstructure/captures",
       "role": "cold-audit",
       "publish": true,
@@ -305,6 +350,8 @@
     },
     {
       "dataset": "openbb-compact",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_openBB/compact",
       "role": "analytics",
       "publish": true,
@@ -318,6 +365,8 @@
     },
     {
       "dataset": "yahoo-market",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_yahoo",
       "role": "training",
       "publish": true,
@@ -331,6 +380,8 @@
     },
     {
       "dataset": "okx",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_okx",
       "role": "training",
       "publish": true,
@@ -345,6 +396,8 @@
     },
     {
       "dataset": "bybit",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_bybit",
       "role": "training",
       "publish": true,
@@ -366,6 +419,8 @@
     },
     {
       "dataset": "binance",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_binance",
       "role": "training",
       "publish": true,
@@ -378,6 +433,8 @@
     },
     {
       "dataset": "binance-public-archive",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_binance_archive",
       "role": "training-and-point-in-time-audit",
       "publish": true,
@@ -390,6 +447,8 @@
     },
     {
       "dataset": "crypto-reference",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_crypto_reference",
       "role": "local-analytics-and-source-resolution",
       "publish": false,
@@ -402,6 +461,8 @@
     },
     {
       "dataset": "finmind-free",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_finmind",
       "role": "local-public-raw-research-not-pit-validated",
       "publish": false,
@@ -419,6 +480,8 @@
     },
     {
       "dataset": "finlab-research",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_finlab",
       "role": "local-licensed-research-not-pit-validated",
       "publish": false,
@@ -431,6 +494,8 @@
     },
     {
       "dataset": "tej-research",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tej",
       "role": "local-licensed-query-grid-research-not-native-pit-validated",
       "publish": false,
@@ -441,6 +506,8 @@
     },
     {
       "dataset": "free-public-context",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_free_public",
       "role": "analytics-and-audit",
       "publish": true,
@@ -453,6 +520,8 @@
     },
     {
       "dataset": "public-economic-history",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_public_economic",
       "role": "local-economic-history-and-quality-audit",
       "publish": false,
@@ -463,6 +532,8 @@
     },
     {
       "dataset": "keyed-public-catalogs",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_keyed_public_catalogs",
       "role": "local-metadata-discovery-and-prospective-snapshots",
       "publish": false,
@@ -473,6 +544,8 @@
     },
     {
       "dataset": "coinmetrics-community",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_coinmetrics_community",
       "role": "local-analytics-and-vintage-audit",
       "publish": false,
@@ -485,6 +558,8 @@
     },
     {
       "dataset": "dune-crypto",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_dune_crypto",
       "role": "local-analytics-and-query-lineage",
       "publish": false,
@@ -497,6 +572,8 @@
     },
     {
       "dataset": "crypto-etf-history",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_crypto_etf",
       "role": "regulatory-and-issuer-history",
       "publish": false,
@@ -509,6 +586,8 @@
     },
     {
       "dataset": "fred-crypto-macro",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_fred_crypto_macro",
       "role": "local-analytics-and-point-in-time-macro",
       "publish": false,
@@ -521,6 +600,8 @@
     },
     {
       "dataset": "crypto-historical-public",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_crypto_historical_public",
       "role": "local-research-sidecar",
       "publish": false,
@@ -533,6 +614,8 @@
     },
     {
       "dataset": "tw-index-futures",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_index_futures",
       "role": "training",
       "publish": true,
@@ -555,6 +638,8 @@
     },
     {
       "dataset": "tw-index-derivatives-ticks",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_index_derivatives_ticks",
       "role": "training-and-audit",
       "publish": true,
@@ -571,6 +656,8 @@
     },
     {
       "dataset": "tw-index-options-daily",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_index_options_daily",
       "role": "training-and-audit",
       "publish": true,
@@ -583,6 +670,8 @@
     },
     {
       "dataset": "taifex-public-history",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_taifex_public_history",
       "excluded_subtrees": ["rules"],
       "freshness": {
@@ -607,6 +696,8 @@
     },
     {
       "dataset": "taifex-rule-history",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_taifex_public_history/rules",
       "role": "official-rule-archive-pending-validation",
       "publish": false,
@@ -617,6 +708,8 @@
     },
     {
       "dataset": "cftc-legacy-pre2000",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_cftc_legacy",
       "role": "training-and-source-audit",
       "publish": true,
@@ -629,6 +722,8 @@
     },
     {
       "dataset": "tw-shioaji-history",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_shioaji_history",
       "role": "training-and-audit",
       "publish": true,
@@ -641,6 +736,8 @@
     },
     {
       "dataset": "tw-futures",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_futures",
       "role": "training",
       "publish": true,
@@ -667,6 +764,8 @@
     },
     {
       "dataset": "tw-futures-margin-sources",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_tw_index_futures/preparation_sources/margin_sources",
       "role": "official-source-and-rule-evidence",
       "publish": true,
@@ -677,6 +776,8 @@
     },
     {
       "dataset": "forex-frankfurter",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_forex_frankfurter",
       "excluded_subtrees": ["official_v2"],
       "role": "training",
@@ -690,6 +791,8 @@
     },
     {
       "dataset": "forex-frankfurter-official",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_forex_frankfurter/official_v2",
       "role": "local-official-reference-rate-history",
       "publish": false,
@@ -700,6 +803,8 @@
     },
     {
       "dataset": "forex-pepperstone",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_peperstone",
       "role": "training",
       "publish": true,
@@ -713,6 +818,8 @@
     },
     {
       "dataset": "legacy-parquet",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_parquet",
       "role": "legacy",
       "publish": true,
@@ -722,7 +829,33 @@
       "note": "Legacy Parquet root; keep separate until every consumer has an explicit owner."
     },
     {
+      "dataset": "news-training-local",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
+      "source": "data_news",
+      "role": "local-news-training-copy-on-write-parts",
+      "publish": false,
+      "pack_buckets": 32,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["build_news_dataset.py"],
+      "note": "Logical versions are selected by news_table_paths and complete manifests, never cross-version glob. Native v2 part sharing is available; a catalog entry is not proof the live generation has migrated. No new full-text rights or remote/public delivery is granted."
+    },
+    {
+      "dataset": "news-fulltext-local",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
+      "source": "data_news_fulltext",
+      "role": "local-immutable-article-bodies-and-transactional-state",
+      "publish": false,
+      "pack_buckets": 32,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": ["download_news_fulltext.py", "news_fulltext_queue.py"],
+      "note": "Immutable body objects and source receipts remain local. Active SQLite/WAL state needs its existing consistent snapshot owner, not a raw live-file copy. This enrollment grants no publisher rights and starts no crawler, migration, snapshot or transport."
+    },
+    {
       "dataset": "openbb-task-shards-local",
+      "reader_contract": "packed-v2-chunks",
+      "file_chunk_bytes": 8388608,
       "source": "data_openBB/data",
       "role": "local-work-only",
       "publish": false,

@@ -7,6 +7,7 @@ and convergence of the intended Syncthing peer.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -26,7 +27,12 @@ from stockagent.data_sync.desync_snapshots import (
     _utc_iso_from_ns,
     atomic_write_json,
 )
-from stockagent.data_sync.materialized_cache import process_references, process_references_many
+from stockagent.data_sync.materialized_cache import (
+    _process_directories,
+    _reference_read_error,
+    process_references,
+    process_references_many,
+)
 from stockagent.data_sync.packed_snapshots import (
     resolve_latest_packed,
     verify_packed_snapshot,
@@ -116,16 +122,21 @@ def artifact_process_references_many(sources: Iterable[Path], scope_root: Path) 
 
 
 def _ancestor_process_references(sources, scope_root: Path, references: list[str]) -> list[str]:
+    if len(references) >= 20:
+        return references
     sources = tuple(source.resolve() for source in sources)
     scope_root = scope_root.resolve()
     own_pid = os.getpid()
-    for process in sorted(Path("/proc").glob("[0-9]*")):
+    for process in _process_directories():
         try:
             pid = int(process.name)
             if pid == own_pid:
                 continue
             raw = (process / "cmdline").read_bytes()
-        except (OSError, ValueError):
+        except ValueError:
+            continue
+        except OSError as error:
+            _reference_read_error(process / "cmdline", error)
             continue
         for raw_arg in raw.split(b"\0"):
             if not raw_arg:
@@ -138,13 +149,25 @@ def _ancestor_process_references(sources, scope_root: Path, references: list[str
                     text = text.split("=", 1)[1]
                 argument = Path(text)
                 if not argument.is_absolute():
-                    argument = (process / "cwd").resolve(strict=True) / argument
+                    try:
+                        cwd = (process / "cwd").resolve(strict=True)
+                    except OSError as error:
+                        _reference_read_error(process / "cwd", error)
+                        continue
+                    argument = cwd / argument
                 argument = argument.resolve(strict=False)
                 # An orchestrator naming this artifact scope is a consumer.
                 # A generic Jupyter/server root such as '/' is not proof that
                 # it consumes every completed artifact on the machine.
                 argument.relative_to(scope_root)
-            except (OSError, ValueError):
+            except ValueError:
+                continue
+            except OSError as error:
+                # Commands may contain shell bodies, URLs or other non-path
+                # arguments. Invalid path syntax is not lost /proc visibility.
+                if error.errno in (errno.ENAMETOOLONG, errno.ELOOP, errno.ENOTDIR):
+                    continue
+                _reference_read_error(argument, error)
                 continue
             if not any(source == argument or argument in source.parents for source in sources):
                 continue

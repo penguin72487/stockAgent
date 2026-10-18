@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -173,6 +176,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Open every successful Parquet shard.",
     )
+    parser.add_argument("--file-audit-workers", type=int, choices=range(1, 33), default=8,
+                        help="Bounded spawned Parquet readers for --audit-files only; 1 keeps serial decoding.")
     parser.add_argument("--write-snapshot", action="store_true")
     parser.add_argument("--append-history", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -1222,6 +1227,65 @@ def _audit_catalog_followups(
     }
 
 
+def _resolve_ownership_paths_reference(paths: Sequence[Path]) -> list[str]:
+    """Original per-file resolution oracle, including symlinks and missing paths."""
+    return [str(path.resolve()) for path in paths]
+
+
+def _resolve_ownership_paths(paths: Sequence[Path]) -> list[str]:
+    """Resolve a bounded batch without re-walking ordinary shared ancestors.
+
+    The fast path is deliberately narrow: absolute, dot-dot-free paths through
+    existing non-symlink directories. Every leaf is still inspected. Symlinks,
+    missing components and unusual roots use Path.resolve, not lexical guesses.
+    Directory certificates are invocation-local and checked again before any
+    result escapes; a concurrent namespace change fails closed, never a TTL hit.
+    No state is reused between batches or audits.
+    """
+    cwd = Path.cwd()
+    directories: dict[Path, tuple[int, int, int, int, int] | None] = {}
+
+    def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (value.st_dev, value.st_ino, value.st_mode,
+                value.st_mtime_ns, value.st_ctime_ns)
+
+    def ordinary_directory(path: Path) -> bool:
+        if path in directories:
+            return directories[path] is not None
+        if path.parent != path and not ordinary_directory(path.parent):
+            directories[path] = None
+            return False
+        try:
+            value = path.lstat()
+        except OSError:
+            directories[path] = None
+            return False
+        if not stat.S_ISDIR(value.st_mode):
+            directories[path] = None
+            return False
+        directories[path] = identity(value)
+        return True
+
+    resolved = []
+    for path in paths:
+        absolute = path if path.is_absolute() else cwd / path
+        if (absolute.anchor != "/" or ".." in absolute.parts
+                or not ordinary_directory(absolute.parent)):
+            resolved.append(str(path.resolve()))
+            continue
+        try:
+            leaf = absolute.lstat()
+        except OSError:
+            resolved.append(str(path.resolve()))
+            continue
+        resolved.append(str(path.resolve()) if stat.S_ISLNK(leaf.st_mode)
+                        else str(absolute))
+    for path, certificate in directories.items():
+        if certificate is not None and identity(path.lstat()) != certificate:
+            raise RuntimeError(f"OpenBB ownership directory changed during batch: {path}")
+    return resolved
+
+
 def _audit_parquet_ownership(
     connection: sqlite3.Connection,
     *,
@@ -1269,11 +1333,12 @@ def _audit_parquet_ownership(
                 parameters,
             )
             while batch := cursor.fetchmany(batch_size):
+                keys = _resolve_ownership_paths([Path(str(row[0])) for row in batch])
                 index.executemany(
                     "INSERT INTO owners(path,ownership) VALUES (?,?) "
                     "ON CONFLICT(path) DO UPDATE SET "
                     "ownership=owners.ownership | excluded.ownership",
-                    ((str(Path(str(row[0])).resolve()), int(row[1])) for row in batch),
+                    ((key, int(row[1])) for key, row in zip(keys, batch, strict=True)),
                 )
                 indexed_tasks += len(batch)
             index.commit()
@@ -1282,7 +1347,7 @@ def _audit_parquet_ownership(
 
             def check_batch(paths: list[Path]) -> None:
                 nonlocal scanned_files, inactive_files, non_success_files
-                resolved = [(path, str(path.resolve())) for path in paths]
+                resolved = list(zip(paths, _resolve_ownership_paths(paths), strict=True))
                 placeholders = ",".join("?" for _ in resolved)
                 owners = dict(
                     index.execute(
@@ -1366,13 +1431,132 @@ def _archive_first_row(parquet_file: pq.ParquetFile, columns: Sequence[str], *,
     return first
 
 
+def _audit_archive_file(row: sqlite3.Row, *, use_threads: bool = True) -> dict[str, Any]:
+    """Same footer/schema/complete-first-group checks, with a private reader."""
+    missing = unreadable = row_mismatch = metadata_mismatch = encoded_wrapper = checked_rows = 0
+    path = Path(str(row["output_path"]))
+    issue: str | None = None
+    parquet_file = None
+    if not path.is_file():
+        missing += 1
+        issue = "missing"
+    else:
+        try:
+            parquet_file = pq.ParquetFile(path)
+            parquet_rows = int(parquet_file.metadata.num_rows)
+            checked_rows += parquet_rows
+            if parquet_rows != int(row["rows"]):
+                row_mismatch += 1
+                issue = f"row_mismatch manifest={row['rows']} parquet={parquet_rows}"
+            missing_columns = sorted(
+                set(REQUIRED_ARCHIVE_COLUMNS)
+                - set(parquet_file.schema_arrow.names)
+            )
+            if issue is None and missing_columns:
+                metadata_mismatch += 1
+                issue = f"missing_archive_columns={missing_columns}"
+            if issue is None and parquet_rows > 0 and parquet_file.metadata.row_group(0).num_rows > 8192:
+                # Validate schema first: some Arrow versions reject an
+                # unknown dictionary column before we can classify it
+                # as missing provenance. Tiny files need no second
+                # reader. Reuse the footer for larger metadata groups.
+                footer = parquet_file.metadata
+                parquet_file.close()
+                parquet_file = pq.ParquetFile(
+                    path, metadata=footer, read_dictionary=list(REQUIRED_ARCHIVE_COLUMNS))
+            if (
+                issue is None
+                and parquet_rows == 1
+                and {"result", "metadata"}.issubset(
+                    parquet_file.schema_arrow.names
+                )
+            ):
+                wrapper = _archive_first_row(parquet_file, ("result", "metadata"), use_threads=use_threads)
+                raw_result = wrapper.get("result")
+                raw_metadata = wrapper.get("metadata")
+                if (
+                    isinstance(raw_result, str)
+                    and raw_result.lstrip().startswith(("[", "{"))
+                    and isinstance(raw_metadata, str)
+                    and raw_metadata.lstrip().startswith("{")
+                ):
+                    encoded_wrapper += 1
+                    issue = "encoded_result_wrapper_not_row_normalized"
+            if issue is None and parquet_rows > 0:
+                metadata = _archive_first_row(parquet_file, REQUIRED_ARCHIVE_COLUMNS, use_threads=use_threads)
+                expected = {
+                    "_openbb_endpoint": str(row["endpoint"]),
+                    "_provider": str(row["selected_provider"]),
+                    "_scope_key": str(row["scope_key"]),
+                    "_query_json": str(row["kwargs_json"]),
+                }
+                differences = {
+                    key: {"manifest": value, "parquet": metadata.get(key)}
+                    for key, value in expected.items()
+                    if metadata.get(key) != value
+                }
+                if not metadata.get("_retrieved_at"):
+                    differences["_retrieved_at"] = {
+                        "manifest": "non-empty",
+                        "parquet": metadata.get("_retrieved_at"),
+                    }
+                if differences:
+                    metadata_mismatch += 1
+                    issue = f"archive_metadata_mismatch={differences}"
+        except (
+            Exception
+        ) as exc:  # Corrupt files can raise several Arrow/OS exception types.
+            unreadable += 1
+            issue = f"unreadable {type(exc).__name__}: {str(exc)[:300]}"
+    if parquet_file is not None:
+        parquet_file.close()
+    return {
+        "missing": missing,
+        "unreadable": unreadable,
+        "row_mismatch": row_mismatch,
+        "metadata_mismatch": metadata_mismatch,
+        "encoded_wrapper": encoded_wrapper,
+        "checked_rows": checked_rows,
+        "sample": {"task_id": str(row["task_id"]), "path": str(path), "issue": issue} if issue is not None else None,
+    }
+
+
+def _audit_archive_batch(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_audit_archive_file(row, use_threads=False) for row in rows]
+
+
+def _ordered_archive_results(cursor: sqlite3.Cursor, workers: int):
+    """Keep source order and bound both IPC batches and independent readers.
+
+    Metadata conversion holds the Python GIL; a thread pool measured slower.
+    Spawn avoids inheriting SQLite snapshots or native Arrow pool locks. Each
+    child handles at most 64 files sequentially, with no nested Arrow threads.
+    The source connection and all counters remain in the parent process.
+    """
+    if workers == 1:
+        for row in cursor:
+            yield _audit_archive_file(row)
+        return
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
+        pending = deque()
+        while rows := cursor.fetchmany(64):
+            pending.append(pool.submit(_audit_archive_batch, [dict(row) for row in rows]))
+            if len(pending) >= 2 * workers:
+                yield from pending.popleft().result()
+        while pending:
+            yield from pending.popleft().result()
+
+
 def _audit_success_files(
     connection: sqlite3.Connection,
     *,
     output_dir: Path,
     plan_token: str | None,
     show_progress: bool,
+    workers: int = 1,
 ) -> dict[str, Any]:
+    if not 1 <= workers <= 32:
+        raise ValueError("OpenBB file audit workers must be 1..32")
     active_where, active_parameters = _active_where(plan_token)
     total = int(
         connection.execute(
@@ -1448,98 +1632,35 @@ def _audit_success_files(
         disable=not show_progress,
     )
     try:
-        for row in cursor:
-            path = Path(str(row["output_path"]))
-            issue: str | None = None
-            if not path.is_file():
-                missing += 1
-                issue = "missing"
-            else:
-                try:
-                    parquet_file = pq.ParquetFile(path)
-                    parquet_rows = int(parquet_file.metadata.num_rows)
-                    checked_rows += parquet_rows
-                    if parquet_rows != int(row["rows"]):
-                        row_mismatch += 1
-                        issue = f"row_mismatch manifest={row['rows']} parquet={parquet_rows}"
-                    missing_columns = sorted(
-                        set(REQUIRED_ARCHIVE_COLUMNS)
-                        - set(parquet_file.schema_arrow.names)
-                    )
-                    if issue is None and missing_columns:
-                        metadata_mismatch += 1
-                        issue = f"missing_archive_columns={missing_columns}"
-                    if issue is None and parquet_rows > 0 and parquet_file.metadata.row_group(0).num_rows > 8192:
-                        # Validate schema first: some Arrow versions reject an
-                        # unknown dictionary column before we can classify it
-                        # as missing provenance. Tiny files need no second
-                        # reader. Reuse the footer for larger metadata groups.
-                        footer = parquet_file.metadata
-                        parquet_file.close()
-                        parquet_file = pq.ParquetFile(
-                            path, metadata=footer, read_dictionary=list(REQUIRED_ARCHIVE_COLUMNS))
-                    if (
-                        issue is None
-                        and parquet_rows == 1
-                        and {"result", "metadata"}.issubset(
-                            parquet_file.schema_arrow.names
-                        )
-                    ):
-                        wrapper = _archive_first_row(parquet_file, ("result", "metadata"))
-                        raw_result = wrapper.get("result")
-                        raw_metadata = wrapper.get("metadata")
-                        if (
-                            isinstance(raw_result, str)
-                            and raw_result.lstrip().startswith(("[", "{"))
-                            and isinstance(raw_metadata, str)
-                            and raw_metadata.lstrip().startswith("{")
-                        ):
-                            encoded_wrapper += 1
-                            issue = "encoded_result_wrapper_not_row_normalized"
-                    if issue is None and parquet_rows > 0:
-                        metadata = _archive_first_row(parquet_file, REQUIRED_ARCHIVE_COLUMNS)
-                        expected = {
-                            "_openbb_endpoint": str(row["endpoint"]),
-                            "_provider": str(row["selected_provider"]),
-                            "_scope_key": str(row["scope_key"]),
-                            "_query_json": str(row["kwargs_json"]),
-                        }
-                        differences = {
-                            key: {"manifest": value, "parquet": metadata.get(key)}
-                            for key, value in expected.items()
-                            if metadata.get(key) != value
-                        }
-                        if not metadata.get("_retrieved_at"):
-                            differences["_retrieved_at"] = {
-                                "manifest": "non-empty",
-                                "parquet": metadata.get("_retrieved_at"),
-                            }
-                        if differences:
-                            metadata_mismatch += 1
-                            issue = f"archive_metadata_mismatch={differences}"
-                except (
-                    Exception
-                ) as exc:  # Corrupt files can raise several Arrow/OS exception types.
-                    unreadable += 1
-                    issue = f"unreadable {type(exc).__name__}: {str(exc)[:300]}"
-            if issue is not None and len(samples) < 50:
-                samples.append(
-                    {"task_id": str(row["task_id"]), "path": str(path), "issue": issue}
-                )
+        for result in _ordered_archive_results(cursor, workers):
+            missing += int(result["missing"])
+            unreadable += int(result["unreadable"])
+            row_mismatch += int(result["row_mismatch"])
+            metadata_mismatch += int(result["metadata_mismatch"])
+            encoded_wrapper += int(result["encoded_wrapper"])
+            checked_rows += int(result["checked_rows"])
+            if result["sample"] is not None and len(samples) < 50:
+                samples.append(result["sample"])
             progress.update(1)
             if progress.n % 1000 == 0:
                 progress.set_postfix(
-                    missing=missing,
-                    unreadable=unreadable,
-                    mismatch=row_mismatch,
-                    metadata=metadata_mismatch,
-                    refresh=False,
+                    missing=missing, unreadable=unreadable, mismatch=row_mismatch,
+                    metadata=metadata_mismatch, refresh=False,
                 )
     finally:
+        cursor.close()
         progress.close()
     return {
         "checked_files": total,
         "checked_rows": checked_rows,
+        "execution_contract": {
+            "version": 1,
+            "workers": workers,
+            "backend": "serial" if workers == 1 else "spawned_processes",
+            "batch_files": 1 if workers == 1 else 64,
+            "maximum_inflight_batches": 1 if workers == 1 else 2 * workers,
+            "decode_scope": "footer_schema_and_complete_first_row_group_provenance_columns",
+        },
         "missing_files": missing,
         "unreadable_files": unreadable,
         "row_mismatch_files": row_mismatch,
@@ -1574,6 +1695,7 @@ def collect_status(
     accepted_stall_minutes: int = 120,
     min_free_gib: float = 100.0,
     audit_files: bool = False,
+    file_audit_workers: int = 1,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     state_dir = output_dir / "_state"
@@ -2917,7 +3039,7 @@ def collect_status(
         status_progress.update(1)
         status_progress.set_postfix(stage="build status and audit", refresh=False)
         status: dict[str, Any] = {
-            "schema_version": 15,
+            "schema_version": 16,
             "checked_at": now.isoformat(),
             "output_dir": str(output_dir.resolve()),
             "active_plan_token": plan_token,
@@ -3135,6 +3257,7 @@ def collect_status(
                 output_dir=output_dir,
                 plan_token=plan_token,
                 show_progress=show_progress,
+                workers=file_audit_workers,
             )
             status["catalog_followup_audit"] = _audit_catalog_followups(
                 connection,
@@ -4180,6 +4303,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         accepted_stall_minutes=max(1, args.accepted_stall_minutes),
         min_free_gib=max(0.0, args.min_free_gib),
         audit_files=args.audit_files,
+        file_audit_workers=args.file_audit_workers,
         show_progress=not args.no_progress,
     )
     status["snapshot_delta"] = _snapshot_delta(previous_snapshot, status)

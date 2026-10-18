@@ -225,13 +225,14 @@ def test_canonical_watch_recovers_the_retained_response_before_continuing_queue(
 
 
 @pytest.mark.parametrize('action,deadline',[
-    ('inspect_notices',30),('inspect_source_binding',30),('inspect_query_runtime',30),
-    ('confirm_metadata_error_cleared',30),('recover_preview',900),('repair_source_binding',900)])
+    ('inspect_notices',120),('inspect_source_binding',120),('inspect_query_runtime',120),
+    ('confirm_metadata_error_cleared',120),('recover_preview',900),('repair_source_binding',900)])
 def test_metadata_probes_cannot_block_for_the_full_grid_readback_deadline(registry,monkeypatch,action,deadline):
-    repo,root,_,_=registry;captured=[]
+    repo,root,_,_=registry;captured=[];commands=[]
     monkeypatch.setattr(DesktopBridge,'windows_path',staticmethod(str))
     def windows(*args,**kwargs):
         captured.append(kwargs['timeout'])
+        commands.append(args[0])
         raise RuntimeError('fixture transport ended, no provider call')
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',windows)
     bridge=DesktopBridge(Path(__file__).resolve().parents[1],{'TejProcessId':1,'ExpectedWindow':2,'ExpectedTitle':'fixture',
@@ -239,6 +240,13 @@ def test_metadata_probes_cannot_block_for_the_full_grid_readback_deadline(regist
     with pytest.raises(RuntimeError,match='fixture transport ended'):
         bridge.execute(root,{'task_id':'a'*24,'request_json':json.dumps({'action':action})})
     assert captured==[deadline]
+    command=commands[0]
+    assert 'StockAgent\\TEJSmartWizard\\bridge-cache\\' in command
+    assert "'worker-'+[Guid]" not in command
+    assert 'Bridge cache directory redirects ownership' in command
+    assert 'Bridge cache file redirects ownership' in command
+    assert ".retained-'" in command and '[IO.File]::Move($temporary,$p)' in command
+    assert command.index('Script copy mismatch') < command.index('Parser]::ParseFile') < command.index('$bridgeEntered=$true')
 
 
 def test_prequery_catch_guard_and_binding_repair_have_no_preview_submission_path():
@@ -250,6 +258,19 @@ def test_prequery_catch_guard_and_binding_repair_have_no_preview_submission_path
     assert "-not (Test-Path -LiteralPath ($Output+'.stage.json'))" in catch[1]
     assert 'SignedControlResult(Message(control,0x147u,0,0))' in source
     assert "contract_version=4;provider='tej_smart_wizard';action='inspect_notices'" in source
+
+
+@pytest.mark.parametrize('document',[[],None,7])
+def test_bound_bridge_manifest_rejects_non_object_json_without_replacing_evidence(tmp_path,document):
+    root=tmp_path/'data';request=root/'requests'/('a'*24+'-'+'b'*32+'.json')
+    atomic_write_json(request,{'task_id':'a'*24})
+    manifest=root/'launches'/(request.stem+'.bridge.json')
+    atomic_write_json(manifest,document)
+    before=manifest.read_bytes()
+    with pytest.raises(ValueError,match='must be an object'):
+        DesktopBridge.bound_script_release(root,request.stem,request)
+    assert manifest.read_bytes()==before
+    assert not (root/'bridge_releases').exists()
 
 
 def test_active_script_release_does_not_change_when_the_checkout_is_updated(tmp_path):

@@ -278,7 +278,7 @@ def _stable_negative_tstat(values: Tensor, valid_mask: Tensor | None = None) -> 
         return values.sum() * 0.0
     mean = values.mean()
     std = torch.sqrt((values - mean).pow(2).mean() + 1e-8)
-    n_eff = torch.sqrt(values.new_tensor(float(max(1, int(values.numel())))))
+    n_eff = torch.sqrt(values.new_full((), float(max(1, int(values.numel())))))
     return -(mean / std) * n_eff
 
 
@@ -909,7 +909,7 @@ def portfolio_autoencoder_loss(
     mean_return = (net_return * valid_f).sum() / valid_count
     centered = (net_return - mean_return) * valid_f
     std_return = torch.sqrt(centered.pow(2).sum() / valid_count + 1e-8)
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=net_return.dtype))
+    annualizer = torch.sqrt(torch.full((), 252.0, device=weights.device, dtype=net_return.dtype))
     sharpe = mean_return / std_return * annualizer
 
     total = -sharpe
@@ -1016,7 +1016,7 @@ def sharpe_aware_loss(
     mean_return = valid_returns.mean()
     variance = (valid_returns - mean_return).pow(2).mean()
     std_return = torch.sqrt(variance + 1e-8)
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=valid_returns.dtype))
+    annualizer = torch.sqrt(torch.full((), 252.0, device=weights.device, dtype=valid_returns.dtype))
     sharpe = mean_return / std_return * annualizer
 
     # Keep turnover regularization, but source it from the same backtest path.
@@ -1032,7 +1032,7 @@ def sharpe_aware_loss(
 def _compute_risk_ratio(valid_returns: Tensor, objective: str) -> Tensor:
     objective_norm = objective.strip().lower()
     mean_return = valid_returns.mean()
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype))
+    annualizer = torch.sqrt(torch.full((), 252.0, device=valid_returns.device, dtype=valid_returns.dtype))
 
     if objective_norm == "sortino":
         downside = torch.minimum(valid_returns, torch.zeros_like(valid_returns))
@@ -1047,7 +1047,7 @@ def _compute_risk_ratio(valid_returns: Tensor, objective: str) -> Tensor:
 def _compute_log_utility(valid_returns: Tensor) -> Tensor:
     """Annualized expected net log utility from canonical backtest log returns."""
     valid_returns = torch.nan_to_num(valid_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    annualizer = torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype)
+    annualizer = torch.full((), 252.0, device=valid_returns.device, dtype=valid_returns.dtype)
     return valid_returns.mean() * annualizer
 
 
@@ -1258,6 +1258,7 @@ def risk_aware_loss(
     log_utility_downside_aversion: float = 0.0,
     log_utility_benchmark_shortfall_aversion: float = 0.0,
     log_return_weights: Tensor | None = None,
+    day_trade_replay_log_returns: Tensor | None = None,
     aux_outputs: dict[str, Tensor] | None = None,
     rank_ic_weight: float = 1.0,
     return_rank_ic_weight: float = 0.0,
@@ -1323,10 +1324,17 @@ def risk_aware_loss(
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
     if log_return_weights is not None and (
-        objective_norm != "log_utility" or mode != "tw_stock_context_futures_portfolio"
+        objective_norm != "log_utility" or not (
+            mode == "tw_stock_context_futures_portfolio"
+            or (mode == "tw_day_trade" and day_trade_carry_sessions is not None))
         or log_return_weights.ndim != 1 or log_return_weights.shape[0] != weights.shape[0]
     ):
-        raise ValueError("return VJP weights require aligned futures log_utility rows")
+        raise ValueError("return VJP weights require aligned physical log_utility rows")
+    if day_trade_replay_log_returns is not None and (
+            mode != "tw_day_trade" or day_trade_carry_sessions is None
+            or day_trade_replay_log_returns.ndim != 1
+            or day_trade_replay_log_returns.shape[0] != weights.shape[0]):
+        raise ValueError("recorded return candidates require aligned physical day-trade rows")
     if day_trade_carry_sessions is not None and objective_norm not in {
         "log_utility", "log_util", "kelly", "growth", "mean_log_return",
     }:
@@ -1890,6 +1898,7 @@ def risk_aware_loss(
         day_trade_carry_sessions=day_trade_carry_sessions,
         initial_day_trade_carry_state=initial_day_trade_carry_state,
         day_trade_carry_event_compression=day_trade_carry_event_compression,
+        day_trade_replay_log_returns=day_trade_replay_log_returns,
         # No objective below consumes the physical intraday NAV diagnostics.
         # Keep their exact values/solvency checks, but avoid retaining and
         # differentiating that 270-minute branch in the compiled FIFO kernel.
@@ -1920,10 +1929,16 @@ def risk_aware_loss(
     )
     _loss_timer_stop("backtest", backtest_start)
 
+    if aux_outputs is not None and aux_outputs.get("_capture_daily_log_returns", False):
+        # Copy the small return vector before a later CUDA Graph replay can
+        # reuse its storage. It carries no model or ledger activation graph.
+        aux_outputs["_daily_log_returns"] = backtest.strategy_returns.detach().clone()
+
     if aux_outputs is not None and backtest.final_weights is not None:
         state_update_start = _loss_timer_start()
         if backtest.day_trade_carry_state is not None:
-            aux_outputs["_final_day_trade_carry_state"] = backtest.day_trade_carry_state.detached()
+            from stockagent.backtest.tw_day_trade_graph import detached_carry_state
+            aux_outputs["_final_day_trade_carry_state"] = detached_carry_state(backtest.day_trade_carry_state)
         if backtest.final_futures_carry_state is not None:
             aux_outputs["_final_futures_carry_state"] = _clone_portfolio_state_for_loss(
                 backtest.final_futures_carry_state, stat_prefix="final_futures_carry_state_clone")
@@ -2088,8 +2103,11 @@ def risk_aware_loss(
             raise ValueError(
                 "log_utility_periods_per_year must be positive and finite"
             )
-        annualizer = torch.as_tensor(
-            periods_per_year,
+        # Construct on the consuming stream: a Python scalar converted with
+        # as_tensor(device='cuda') first stages a pageable host scalar and can
+        # wait for the preceding NN/ledger work on every batch.
+        annualizer = torch.full(
+            (), periods_per_year,
             device=clean_returns.device,
             dtype=clean_returns.dtype,
         )

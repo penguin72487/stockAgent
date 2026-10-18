@@ -12,7 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 import re
 import socket
 import sys
@@ -421,6 +421,44 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         source_url="https://www.okx.com/docs-v5/en/",
         note="GET /api/v5/public/funding-rate-history; limiter is partitioned by instId.",
     ),
+    "okx_market_data_history": ProviderRateLimit(
+        provider="okx_market_data_history",
+        requests=5,
+        seconds=2,
+        basis="official historical market archive endpoint limit; IP",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/public/market-data-history; all instrument families share this bucket.",
+    ),
+    "okx_open_interest_history": ProviderRateLimit(
+        provider="okx_open_interest_history", requests=10, seconds=2,
+        basis="official endpoint limit; IP + Instrument ID",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/rubik/stat/contracts/open-interest-history",
+    ),
+    "okx_taker_volume_contract": ProviderRateLimit(
+        provider="okx_taker_volume_contract", requests=5, seconds=2,
+        basis="official endpoint limit; IP + Instrument ID",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/rubik/stat/taker-volume-contract",
+    ),
+    "okx_long_short_account_ratio": ProviderRateLimit(
+        provider="okx_long_short_account_ratio", requests=5, seconds=2,
+        basis="official endpoint limit; IP + Instrument ID",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
+    ),
+    "okx_top_trader_account_ratio": ProviderRateLimit(
+        provider="okx_top_trader_account_ratio", requests=5, seconds=2,
+        basis="official endpoint limit; IP + Instrument ID",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader",
+    ),
+    "okx_top_trader_position_ratio": ProviderRateLimit(
+        provider="okx_top_trader_position_ratio", requests=5, seconds=2,
+        basis="official endpoint limit; IP + Instrument ID",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader",
+    ),
     "bybit_public_rest": ProviderRateLimit(
         provider="bybit_public_rest",
         requests=600,
@@ -735,6 +773,17 @@ class RateLimitWaitCancelled(RuntimeError):
     """A caller withdrew before issuing a provider request; not a rate error."""
 
 
+class RateLimitStateError(RuntimeError):
+    """Local pacing state failed; no provider request was authorized."""
+
+
+@dataclass(eq=False, slots=True)
+class _RateLimitTicket:
+    ready: threading.Event
+    cost: float
+    error: RateLimitStateError | None = None
+
+
 class SharedRateLimiter:
     def __init__(
         self,
@@ -744,6 +793,7 @@ class SharedRateLimiter:
         state_dir: str | Path | None = None,
         on_claim: Callable[[], None] | None = None,
         on_caller_claim: Callable[[], None] | None = None,
+        idle_timeout_seconds: float = 30.0,
     ) -> None:
         self.interval_seconds = max(0.0, float(interval_seconds))
         self.name = str(name)
@@ -753,6 +803,9 @@ class SharedRateLimiter:
         # Keep these callbacks separate so pacing remains single-leader and
         # request attribution can use worker-local context safely.
         self._on_caller_claim = on_caller_claim
+        self._idle_timeout_seconds = float(idle_timeout_seconds)
+        if not math.isfinite(self._idle_timeout_seconds) or self._idle_timeout_seconds <= 0:
+            raise ValueError("idle_timeout_seconds must be finite and positive")
         self._lock = threading.Lock()
         self._next_time = 0.0
         # A stable FIFO dispatcher owns the local schedule.  Handing leadership
@@ -763,7 +816,7 @@ class SharedRateLimiter:
         # request-start rate.  The dispatcher never performs provider work: it
         # only claims the host-global slot, records it, and releases one waiter.
         self._dispatch_condition = threading.Condition()
-        self._dispatch_queue: deque[tuple[threading.Event, float]] = deque()
+        self._dispatch_queue: deque[_RateLimitTicket] = deque()
         self._dispatcher_thread: threading.Thread | None = None
         # Granted-slot telemetry can persist JSON and contend with hundreds of
         # provider workers. It must never run in the cadence-owning dispatcher
@@ -920,7 +973,16 @@ class SharedRateLimiter:
     def _observe_claims(self) -> None:
         """Record granted slots independently from request-slot cadence."""
         while True:
-            self._claim_observer_queue.get()
+            try:
+                self._claim_observer_queue.get(timeout=self._idle_timeout_seconds)
+            except Empty:
+                # Enqueue/start and retirement share this lock. Otherwise a
+                # grant can be stranded behind an observer that just exited.
+                with self._dispatch_condition:
+                    if self._claim_observer_queue.empty():
+                        self._claim_observer_thread = None
+                        return
+                continue
             try:
                 self._notify_claim()
             finally:
@@ -931,10 +993,33 @@ class SharedRateLimiter:
         while True:
             with self._dispatch_condition:
                 while not self._dispatch_queue:
-                    self._dispatch_condition.wait()
-                ticket, cost = self._dispatch_queue[0]
+                    self._dispatch_condition.wait(timeout=self._idle_timeout_seconds)
+                    if not self._dispatch_queue:
+                        # Instrument-scoped buckets can number in the hundreds.
+                        # Keep the host-global reservation, not an idle thread
+                        # (and a strong reference to this limiter), forever.
+                        self._dispatcher_thread = None
+                        return
+                ticket = self._dispatch_queue[0]
 
-            claimed, wait_s = self._claim_process_shared(cost=cost)
+            try:
+                claimed, wait_s = self._claim_process_shared(cost=ticket.cost)
+            except Exception as exc:
+                # An I/O error (e.g. ENOSPC/EMFILE) used to kill the daemon
+                # dispatcher and leave every caller blocked forever. Fail the
+                # queued claims explicitly, without granting or bypassing the
+                # shared bucket. A subsequent call can restart after recovery.
+                with self._dispatch_condition:
+                    failed = list(self._dispatch_queue)
+                    self._dispatch_queue.clear()
+                    self._dispatcher_thread = None
+                    for pending in failed:
+                        pending.error = RateLimitStateError(
+                            f"shared request pacing state unavailable ({type(exc).__name__})"
+                        )
+                for pending in failed:
+                    pending.ready.set()
+                return
             if not claimed:
                 if wait_s > 0.0:
                     time.sleep(wait_s)
@@ -943,15 +1028,21 @@ class SharedRateLimiter:
             with self._dispatch_condition:
                 # Only this dispatcher removes local tickets.  Keeping the
                 # identity check makes a future cancellation extension safe.
-                if not self._dispatch_queue or self._dispatch_queue[0][0] is not ticket:
+                if not self._dispatch_queue or self._dispatch_queue[0] is not ticket:
                     continue
                 self._dispatch_queue.popleft()
-                self._record_grant_locked(cost=cost)
+                self._record_grant_locked(cost=ticket.cost)
             if self._on_claim is not None:
                 with self._dispatch_condition:
-                    self._ensure_claim_observer_locked()
-                self._claim_observer_queue.put(None)
-            ticket.set()
+                    self._claim_observer_queue.put(None)
+                    try:
+                        self._ensure_claim_observer_locked()
+                    except Exception:
+                        # Diagnostics must not strand an already granted API
+                        # ticket if the OS cannot start another thread. Keep
+                        # observations queued for the next successful start.
+                        self._claim_observer_thread = None
+            ticket.ready.set()
 
     def wait(self, cost: float = 1.0, *, cancel_event: threading.Event | None = None) -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -963,24 +1054,30 @@ class SharedRateLimiter:
             self._notify_claim()
             self._notify_caller_claim()
             return
-        ticket = threading.Event()
+        ticket = _RateLimitTicket(threading.Event(), claim_cost)
         with self._dispatch_condition:
-            self._dispatch_queue.append((ticket, claim_cost))
-            self._ensure_dispatcher_locked()
+            self._dispatch_queue.append(ticket)
+            try:
+                self._ensure_dispatcher_locked()
+            except Exception:
+                self._dispatch_queue.remove(ticket)
+                raise
             self._dispatch_condition.notify()
         if cancel_event is None:
-            ticket.wait()
+            ticket.ready.wait()
         else:
-            while not ticket.wait(0.05):
+            while not ticket.ready.wait(0.05):
                 if cancel_event.is_set():
                     with self._dispatch_condition:
                         try:
-                            self._dispatch_queue.remove((ticket, claim_cost))
+                            self._dispatch_queue.remove(ticket)
                         except ValueError:
                             pass  # A raced grant is conservatively consumed.
                     raise RateLimitWaitCancelled()
             if cancel_event.is_set():
                 raise RateLimitWaitCancelled()
+        if ticket.error is not None:
+            raise ticket.error from None
         self._notify_caller_claim()
 
     def _notify_claim(self) -> None:
@@ -1056,6 +1153,26 @@ class SharedRateLimiter:
         """
         if threading.current_thread() is self._claim_observer_thread:
             return
+        drain_in_caller = False
+        with self._dispatch_condition:
+            if not self._claim_observer_queue.empty():
+                try:
+                    self._ensure_claim_observer_locked()
+                except Exception:
+                    self._claim_observer_thread = None
+                    drain_in_caller = True
+        if drain_in_caller:
+            # Only this explicit quota/evidence barrier can run persistence in
+            # the caller. Never stall the normal request-start dispatcher.
+            while True:
+                try:
+                    self._claim_observer_queue.get_nowait()
+                except Empty:
+                    break
+                try:
+                    self._notify_claim()
+                finally:
+                    self._claim_observer_queue.task_done()
         self._claim_observer_queue.join()
 
     def defer(self, seconds: float) -> None:

@@ -32,8 +32,13 @@ def _check_d_primary_mount(sync_root: Path) -> None:
             timeout=30,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SnapshotError("D cold primary mount check failed") from exc
+    except OSError as exc:
+        # FD exhaustion is not evidence that D: was unmounted. Keep the guard
+        # fail-closed while retaining the actionable, non-secret error class.
+        raise SnapshotError("D cold primary mount check failed: "
+                            f"{type(exc).__name__} errno={exc.errno}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SnapshotError("D cold primary mount check failed: checker timed out after 30s") from exc
     if result.returncode != 0:
         raise SnapshotError(
             "D cold primary mount check failed: " + result.stderr.strip()

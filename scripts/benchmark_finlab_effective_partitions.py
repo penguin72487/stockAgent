@@ -7,6 +7,7 @@ Only private copies and receipts are written. This is not API throughput proof.
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import ExitStack, closing
 import cProfile
 from datetime import UTC, date, datetime
@@ -17,6 +18,7 @@ import pstats
 import shutil
 import sqlite3
 import statistics
+import subprocess
 import sys
 import time
 from unittest.mock import patch
@@ -69,7 +71,19 @@ def effective_digest(connection) -> tuple[int, str]:
     return count, result.hexdigest()
 
 
-def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int = 2) -> dict:
+def coverage_reference():
+    """Load the pre-change function from tracked HEAD, not a proxy query."""
+    source = subprocess.run(['git', 'show', 'HEAD:scripts/download_finlab_market_intraday.py'],
+                            cwd=ROOT, capture_output=True, text=True, check=True, timeout=5).stdout
+    tree = ast.parse(source)
+    selected = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_coverage_phases')
+    namespace = dict(vars(market))
+    exec(compile(ast.Module(body=[selected], type_ignores=[]), '<tracked-coverage-reference>', 'exec'), namespace)
+    return namespace['_coverage_phases'], hashlib.sha256(ast.unparse(selected).encode()).hexdigest()
+
+
+def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int = 2,
+              candidate: str = 'effective_view') -> dict:
     if pairs not in (1, 2, 3):
         raise ValueError("one to three matched pairs required")
     # Retain all evidence and never overwrite a previous trial or native root.
@@ -78,6 +92,8 @@ def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int 
     source = source_root / "intraday/market_index.sqlite3"
     code_paths = [Path(market.__file__), Path(__file__)]
     code_identity = {str(path.relative_to(ROOT)): file_sha(path) for path in code_paths}
+    native_phases = market._coverage_phases
+    reference_phases, oracle_sha = coverage_reference() if candidate == 'coverage' else (native_phases, None)
     if shutil.disk_usage(output.parent).free < 32 * 1024**3 + source.stat().st_size * 4:
         raise RuntimeError("private benchmark disk reserve unavailable")
     output.mkdir(parents=False, exist_ok=False)
@@ -114,6 +130,9 @@ def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int 
         if not days or not universe:
             raise ValueError("missing canonical full-market input")
         preparation_seconds = time.monotonic() - preparation
+        from scripts.benchmark_finlab_minute_admission import snapshot_attempts
+        pinned_source = output / 'pinned-attempts'
+        pinned = snapshot_attempts(index, source_root, pinned_source)
         atomic_write_json(output / "fixed-input-context.json", {
             "observed_at_utc": stamp.isoformat(), "universe": universe,
             "days": [str(day) for day in days], "daily": daily,
@@ -124,9 +143,10 @@ def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int 
         for number, variant in enumerate(order):
             trial = output / f"case-{number}-{variant}.sqlite3"
             shutil.copyfile(index, trial)
-            with closing(market._open_index(trial)) as connection:
+            phases = reference_phases if variant == 'reference' else native_phases
+            with closing(market._open_index(trial)) as connection, patch.object(market, '_coverage_phases', phases):
                 connection.execute("DROP VIEW IF EXISTS temp.effective_partitions")
-                if variant == "candidate":
+                if variant == "candidate" or candidate == 'coverage':
                     candidate_view(connection)
                 else:
                     connection.execute(REFERENCE_VIEW)
@@ -141,7 +161,7 @@ def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int 
                 summary_start = time.monotonic()
                 summary = market._summarize(connection, universe, days, started=stamp, attempts=64,
                     successes=64, state="offline_index_benchmark", daily_price_coverage=daily,
-                    source_root=source_root)
+                    source_root=pinned_source)
                 first = summary["by_kind"]["tw_minute"]["first_data_date"]
                 holes = market._unchecked_known_minutes(connection, universe, days,
                     first_observed=first, limit=256)
@@ -169,7 +189,7 @@ def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int 
                     profiler = cProfile.Profile()
                     profiler.runcall(market._summarize, connection, universe, days, started=stamp,
                         attempts=64, successes=64, state="offline_index_benchmark",
-                        daily_price_coverage=daily, source_root=source_root)
+                        daily_price_coverage=daily, source_root=pinned_source)
                     profiler.dump_stats(str(output / "reference-full-summary.prof"))
                     stats = pstats.Stats(profiler)
                     profile_rows = [{"file": key[0], "line": key[1], "function": key[2],
@@ -181,17 +201,18 @@ def benchmark(source_root: Path, public_root: Path, output: Path, *, pairs: int 
     if {str(path.relative_to(ROOT)): file_sha(path) for path in code_paths} != code_identity:
         raise AssertionError("benchmark code changed during comparison")
     reference = statistics.median(case["owner_wall_seconds"] for case in cases if case["variant"] == "reference")
-    candidate = statistics.median(case["owner_wall_seconds"] for case in cases if case["variant"] == "candidate")
+    candidate_seconds = statistics.median(case["owner_wall_seconds"] for case in cases if case["variant"] == "candidate")
     result = {"contract": "finlab_full_partition_inventory_trial_v1", "state": "accepted_bounded_comparison",
         "observed_at_utc": stamp.isoformat(), "source_snapshot_sha256": fixed_sha,
         "source_partition_rows": partitions, "source_schema": native_schema, "code_identity": code_identity,
         "universe_symbols": len(universe), "sessions": len(days), "target_start": days[0].isoformat(),
         "target_end": days[-1].isoformat(), "input_preparation_seconds": preparation_seconds,
         "full_input_context_sha256": digest({"universe": universe, "days": [str(day) for day in days], "daily": daily}),
-        "cases": cases, "reference_median_seconds": reference, "candidate_median_seconds": candidate,
-        "bounded_full_inventory_speed_ratio": reference / candidate, "full_outputs_equal": True,
+        "cases": cases, "reference_median_seconds": reference, "candidate_median_seconds": candidate_seconds,
+        "bounded_full_inventory_speed_ratio": reference / candidate_seconds, "full_outputs_equal": True,
         "reference_profile": profile_rows, "provider_calls": 0, "native_source_writes": 0,
         "production_deployment_proven": False, "full_download_speedup_claim": False,
+        "candidate": candidate, "reference_function_sha256": oracle_sha, "pinned_attempts": pinned,
         "os_cache_not_cleared": True, "host_nonexclusive": True}
     atomic_write_json(output / "comparison.json", result, durable=True)
     return result
@@ -203,8 +224,9 @@ def main() -> int:
     parser.add_argument("--public-root", type=Path, default=market.DEFAULT_PUBLIC_ROOT)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--pairs", type=int, choices=(1, 2, 3), default=2)
+    parser.add_argument('--candidate', choices=('effective_view', 'coverage'), default='effective_view')
     args = parser.parse_args()
-    result = benchmark(args.source_root, args.public_root, args.output, pairs=args.pairs)
+    result = benchmark(args.source_root, args.public_root, args.output, pairs=args.pairs, candidate=args.candidate)
     print(json.dumps({key: result[key] for key in ("state", "reference_median_seconds", "candidate_median_seconds", "bounded_full_inventory_speed_ratio")}))
     return 0
 

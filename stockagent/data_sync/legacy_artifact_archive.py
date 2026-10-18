@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
 from stockagent.data_sync.desync_snapshots import (
@@ -38,6 +38,7 @@ from stockagent.data_sync.packed_snapshots import (
     fetch_packed_snapshot,
     publish_packed_snapshot,
     resolve_latest_packed,
+    resolve_packed_snapshot_id,
     verify_packed_snapshot,
 )
 
@@ -54,7 +55,7 @@ COMPRESSION_PROFILES = {DEFAULT_COMPRESSION_PROFILE, ADAPTIVE_COMPRESSION_PROFIL
 CODEC_SUFFIXES = {"raw": "raw", "gzip": "gz", "zstd": "zst"}
 C_TEMP_STAGE_ROOT = Path("/var/lib/stockagent-legacy-archive-stage")
 MANUAL_WSL_CAPTURE_CONTRACT = "manual-wsl-artifact-preservation-v1"
-MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "maintenance", "operations"}
+MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "maintenance", "operations", "benchmarks"}
 MANUAL_OFFLINE_SIMULATION_CONTRACT = "manual-wsl-offline-simulation-preservation-v1"
 MANUAL_TRANSFER_QUARANTINE_CONTRACT = "manual-wsl-retired-transfer-preservation-v1"
 MANUAL_MINUTE_DERIVED_VIEW_CONTRACT = "manual-wsl-retired-minute-view-preservation-v1"
@@ -66,6 +67,13 @@ RETIRED_MINUTE_DERIVED_VIEWS = frozenset({
 })
 OFFLINE_SIMULATION_PREFIXES = ("official-close-settlement-", "account-addition-",
                                "recompute-all-", "tw-day-trade-independent-")
+
+
+def reviewed_wsl_artifact_root(relative: str) -> bool:
+    """An explicit case, never an entire benchmark suite or namespace."""
+    path = _safe_relative_path(relative, "reviewed WSL artifact root")
+    return (len(path.parts) >= 2 and path.parts[0] in MANUAL_WSL_SCOPES
+            and (path.parts[0] != "benchmarks" or len(path.parts) == 3))
 
 
 def reviewed_offline_simulation_root(relative: str) -> bool:
@@ -128,6 +136,8 @@ def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
             raise SnapshotError("unknown manual artifact preservation contract")
         allowed = {"markets", "ablations"}
         if capture_contract == MANUAL_WSL_CAPTURE_CONTRACT:
+            if relative.parts[0] in MANUAL_WSL_SCOPES and not reviewed_wsl_artifact_root(relative.as_posix()):
+                raise SnapshotError("manual WSL capture requires one reviewed artifact case")
             allowed |= MANUAL_WSL_SCOPES
         if capture_contract == MANUAL_OFFLINE_SIMULATION_CONTRACT:
             if not reviewed_offline_simulation_root(relative.as_posix()):
@@ -195,6 +205,10 @@ def source_plan(
         raise SnapshotError("manual capture must be an explicit boolean")
     if spec.capture_contract is not None and not manual_capture:
         raise SnapshotError("reviewed WSL artifacts require explicit manual capture; no automatic enrollment")
+    if (spec.capture_contract == MANUAL_WSL_CAPTURE_CONTRACT
+            and spec.relative_root.split("/", 1)[0] in MANUAL_WSL_SCOPES
+            and not reviewed_wsl_artifact_root(spec.relative_root)):
+        raise SnapshotError("manual WSL capture requires one reviewed artifact case")
     if (spec.capture_contract == MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT
             and not reviewed_vast_offline_root(spec.relative_root)):
         raise SnapshotError("Vast offline capture is outside its reviewed namespaces")
@@ -215,6 +229,10 @@ def source_plan(
         raise SnapshotError("manual capture is not allowlisted for this source")
     if source.is_symlink() or not source.is_dir():
         raise SnapshotError(f"legacy source file missing or root is not a real directory: {source}")
+    if (spec.capture_contract == MANUAL_WSL_CAPTURE_CONTRACT
+            and spec.relative_root.split("/", 1)[0] == "benchmarks"):
+        from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+        completed_benchmark_evidence(source)
     stability_hours = (
         spec.manual_capture_min_stable_hours if manual_capture
         else spec.minimum_stable_days * 24
@@ -552,6 +570,7 @@ def verify_archive_directory(
     archive: Path, source: Path | None = None, *, spec: LegacyArchiveSpec | None = None,
     manual_capture: bool = False, artifact_root: Path | None = None,
     repo_root: Path | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     manifest = json.loads((archive / "legacy_archive_manifest.json").read_text(encoding="utf-8"))
     if (
@@ -612,7 +631,11 @@ def verify_archive_directory(
     expected_original: set[str] = set()
     source_metadata_drift: list[dict[str, Any]] = []
     total = 0
-    for row in rows:
+    original_bytes = sum(int(row['source']['size']) for row in rows)
+    if progress is not None:
+        progress({'stage': 'decode-originals', 'completed_items': 0, 'total_items': len(rows),
+                  'completed_bytes': 0, 'total_bytes': original_bytes})
+    for index, row in enumerate(rows, start=1):
         relative = _safe_relative_path(row["path"], "legacy archived path").as_posix()
         encoded = _safe_relative_path(row["encoded_path"], "legacy payload path").as_posix()
         if relative in expected_original or encoded in expected_encoded:
@@ -651,6 +674,9 @@ def verify_archive_directory(
                 source_metadata_drift.append({"path": relative, "changed_observations": changed,
                                               "current_signature": before, "exact_sha256": original_digest})
         total += size
+        if progress is not None:
+            progress({'stage': 'decode-originals', 'completed_items': index, 'total_items': len(rows),
+                      'completed_bytes': total, 'total_bytes': original_bytes})
     observed = {p.relative_to(archive).as_posix() for p in archive.rglob("*") if p.is_file()}
     if observed != expected_encoded:
         raise SnapshotError("legacy encoded tree has extra or missing files")
@@ -736,6 +762,7 @@ def publish_archive(
 
 def verify_cold_archive(
     spec: LegacyArchiveSpec, sync_root: Path, *, verification_root: Path | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Explicit full recovery check without retaining a second cold copy on C.
 
@@ -766,15 +793,21 @@ def verify_cold_archive(
         from stockagent.data_sync.training_return import admit_workspace
         admission = admit_workspace(scratch_parent, needed + 32 * 1024**3)
     temporary = Path(tempfile.mkdtemp(prefix="stockagent-legacy-verify-", dir=scratch_parent))
+    def progress_options(step):
+        if progress is None:
+            return {}
+        return {'progress': lambda value: progress({'recovery_step': step, **value})}
     try:
         native = _native_read_options(sync_root)
-        archive = fetch_packed_snapshot(sync_root, temporary, resolved, verification_only=True, **native)
+        archive = fetch_packed_snapshot(sync_root, temporary, resolved, verification_only=True,
+                                       **native, **progress_options('fetch-encoded-archive'))
         if sha256_file(archive / "legacy_archive_manifest.json") != metadata.get("legacy_manifest_sha256"):
             raise SnapshotError("reconstructed legacy manifest differs from cold metadata")
-        proof = verify_archive_directory(archive, spec=spec)
+        proof = verify_archive_directory(archive, spec=spec, **progress_options('decode-originals'))
         inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
         verify_packed_snapshot(sync_root, resolved,
-                               reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"], **native)
+                               reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
+                               **native, **progress_options('independent-cold-reconstruction'))
     except Exception as exc:
         raise SnapshotError(f"cold verification failed; scratch retained at {temporary}: {exc}") from exc
     shutil.rmtree(temporary)
@@ -1002,10 +1035,12 @@ def restore_archive(
     *,
     materialized_root: Path,
     include_paths: list[str] | None = None,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     if destination.exists() or destination.is_symlink():
         raise SnapshotError(f"refusing to overwrite existing restore path: {destination}")
-    resolved = resolve_latest_packed(sync_root, spec.dataset)
+    resolved = (resolve_packed_snapshot_id(sync_root, spec.dataset, snapshot_id)
+                if snapshot_id is not None else resolve_latest_packed(sync_root, spec.dataset))
     metadata = resolved.manifest.get("metadata", {})
     if (
         metadata.get("transport_role") != "legacy-quarantine-archive"

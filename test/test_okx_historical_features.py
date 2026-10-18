@@ -14,6 +14,108 @@ import pytest
 from downloader import okx_historical_features as features
 
 
+def _funding_prefix_frame() -> tuple[pl.DataFrame, int]:
+    start = 1_767_225_600_000
+    frame = pl.DataFrame({
+        "date": [features._ms_to_date_string(start + i * 60_000) for i in range(6)],
+        "okx_funding_realized_rate": [-0.0001] * 6,
+        "okx_funding_interval_hours": [None, None, 2 / 60, 2 / 60, 2 / 60, 2 / 60],
+        "okx_funding_age_hours": [0., 1 / 60, 0., 1 / 60, 2 / 60, 3 / 60],
+    })
+    return frame, start
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_funding_initial_event_interval_null_is_not_a_history_query_hole(reverse):
+    frame, start = _funding_prefix_frame()
+    if reverse:
+        frame = frame.reverse()
+    before = frame.clone()
+    assert features._funding_history_start(frame, start) == start + 4 * 60_000
+    assert frame.equals(before)  # No fill, rounding or invented interval in source values.
+
+
+@pytest.mark.parametrize("problem", ["later_hole", "mixed_first_interval", "absent_age", "null_age", "negative_age", "nan_age", "nan_rate"])
+def test_funding_repair_keeps_rewinding_unproven_or_later_metadata_holes(problem):
+    frame, start = _funding_prefix_frame()
+    if problem == "later_hole":
+        frame = frame.with_columns(pl.Series("okx_funding_interval_hours", [None, None, 2 / 60, None, 2 / 60, 2 / 60]))
+        expected = start + 3 * 60_000
+    elif problem == "mixed_first_interval":
+        frame = frame.with_columns(pl.Series("okx_funding_interval_hours", [None, 8., 2 / 60, 2 / 60, 2 / 60, 2 / 60]))
+        expected = start
+    elif problem == "absent_age":
+        frame = frame.drop("okx_funding_age_hours")
+        expected = start
+    elif problem == "nan_rate":
+        frame = frame.with_columns(pl.Series("okx_funding_realized_rate", [float("nan"), -0.0001, -0.0001, -0.0001, -0.0001, -0.0001]))
+        expected = start
+    else:
+        ages = frame["okx_funding_age_hours"].to_list()
+        ages[0] = {"null_age": None, "negative_age": -1., "nan_age": float("nan")}[problem]
+        frame = frame.with_columns(pl.Series("okx_funding_age_hours", ages))
+        expected = start
+    assert features._funding_history_start(frame, start) == expected
+
+
+def test_funding_start_without_history_or_all_null_rates_keeps_original_fallback():
+    frame, start = _funding_prefix_frame()
+    assert features._funding_history_start(frame.select("date"), start) == start
+    frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias("okx_funding_realized_rate"))
+    assert features._funding_history_start(frame, start) == start
+
+
+@pytest.mark.parametrize("features_enabled", [False, True])
+def test_targeted_quality_run_preserves_global_evidence(tmp_path, monkeypatch, features_enabled):
+    from downloader import download_okx_perp_daily as collector
+
+    output = tmp_path / "candles"
+    output.mkdir()
+    global_names = ["symbols.csv", "download_report.csv", "download_summary.json",
+                    "download_receipt.json", "progress.json", "historical_feature_report.csv",
+                    "okx_historical_feature_catalog.json", "historical_feature_summary.json"]
+    for name in global_names:
+        (output / name).write_bytes(b"preserved existing global evidence")
+    records = [collector.SymbolRecord(code=f"{base}USDTSWAP", name=base, market="okx_perp",
+        okx_symbol=f"{base}-USDT-SWAP", base_ccy=base, quote_ccy="USDT", settle_ccy="USDT",
+        ct_type="linear", inst_family=f"{base}-USDT", uly=f"{base}-USDT", state="live",
+        list_time=None) for base in ("BTC", "ETH")]
+    monkeypatch.setattr(collector, "OkxClient", lambda **_: SimpleNamespace(limiter_activity=lambda: {}))
+    monkeypatch.setattr(collector, "_fetch_swap_symbols", lambda *_a, **_k: records)
+    seen, enriched = [], []
+
+    def download(_client, record, folder, *_args, **_kwargs):
+        seen.append(record.code)
+        return collector.DownloadResult("crypto_okx_perp", record.code, record.okx_symbol,
+            record.market, "skipped_up_to_date", 1, str(folder / f"{record.code}_features.parquet"))
+
+    monkeypatch.setattr(collector, "_download_symbol_1m", download)
+    if features_enabled:
+        pl.DataFrame({"date": ["2026-01-01 00:00:00"]}).write_parquet(output / "BTCUSDTSWAP_features.parquet")
+
+        def enrich(_client, selected, _output, **kwargs):
+            for record in selected:
+                enriched.append(record.code)
+                for stage in features.FEATURE_STAGE_IDS:
+                    kwargs["stage_progress_callback"](record.code, stage, "ok")
+            return [features.HistoricalFeatureResult("BTCUSDTSWAP", "BTC-USDT-SWAP", "unchanged",
+                1, str(output / "BTCUSDTSWAP_features.parquet"), False, "{}", "{}", "{}")]
+
+        monkeypatch.setattr(collector, "run_historical_feature_downloads", enrich)
+    monkeypatch.setattr(collector.sys, "argv", ["collector", "--output-dir", str(output),
+        "--symbols", "BTC-USDT-SWAP", "--start-date", "2026-01-01", "--end-date", "2026-01-01",
+        "--workers", "1"] + ([] if features_enabled else ["--skip-historical-features"]))
+    collector.main()
+    assert seen == ["BTCUSDTSWAP"]
+    assert enriched == (["BTCUSDTSWAP"] if features_enabled else [])
+    assert all((output / name).read_bytes() == b"preserved existing global evidence" for name in global_names)
+    reports = list((output / "quality_repair_runs").glob("*/download_summary.json"))
+    assert len(reports) == 1
+    summary = json.loads(reports[0].read_text())
+    assert summary["provider_scope_is_complete"] is False
+    assert summary["requested_symbol_filter"] == ["BTC-USDT-SWAP"]
+
+
 def test_enrichment_records_each_stage_time_even_when_source_fails(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,6 +319,26 @@ def test_funding_archive_parser_filters_symbol_and_range() -> None:
     assert rows[0]["realizedRate"] == "0.001"
 
 
+@pytest.mark.parametrize("months", [1, 10, 11, 20, 21])
+def test_monthly_archive_queries_use_maximum_ten_inclusive_utc8_months(months):
+    from datetime import datetime, timedelta, timezone
+    tz = timezone(timedelta(hours=8))
+    first = datetime(2025, 11, 1, tzinfo=tz)
+    last = features._add_months(first, months - 1) + timedelta(days=20, hours=12)
+    ranges = features._monthly_query_ranges(int((first + timedelta(hours=3)).timestamp() * 1000),
+                                           int(last.timestamp() * 1000))
+    assert len(ranges) == (months + 9) // 10
+    assert ranges[0][0] == int(first.timestamp() * 1000)
+    assert ranges[-1][1] == int(last.timestamp() * 1000)
+    for index, (begin, end) in enumerate(ranges):
+        a, b = (datetime.fromtimestamp(value / 1000, tz=tz) for value in (begin, end))
+        assert 1 <= (b.year - a.year) * 12 + b.month - a.month + 1 <= 10
+        assert a.day == 1 and a.hour == 0
+        if index:
+            assert begin == ranges[index - 1][1] + 1
+    assert features._monthly_query_ranges(2, 1) == []
+
+
 class _PricePages:
     def __init__(self, *, now_ms, recent_problem=None, history_problem=None):
         self.now_ms = now_ms
@@ -371,10 +493,10 @@ def test_acquisition_fingerprint_is_stable_separate_from_unchanged_feature_abi()
     encoded = json.dumps(acquisition["contract"], sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(encoded).hexdigest() == acquisition["fingerprint_sha256"]
     assert catalog["acquisition"] == acquisition
-    assert acquisition["contract"]["version"] == 3
+    assert acquisition["contract"]["version"] == 5
     assert acquisition["contract"]["feature_schema_version"] == catalog["schema_version"] == 1
     acquisition["contract"]["version"] = -1
-    assert features.feature_acquisition_payload()["contract"]["version"] == 3
+    assert features.feature_acquisition_payload()["contract"]["version"] == 5
 
 
 def test_oversized_history_page_retries_exact_request_without_committing_bad_rows():

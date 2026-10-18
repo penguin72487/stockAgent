@@ -28,14 +28,59 @@ coordinated code, config, test, and documentation change.
   dataset or training directory.
 - Deduplication is content-addressed.  File names, sizes, mtimes, and apparent
   similarity are not deletion proof.  Preserve one verified object per digest
-  and let manifests retain logical paths.  An identical inventory is a semantic
-  no-op: reuse the current release and do not advance a timestamp-only head.
+  and let manifests retain logical paths. An identical inventory under the same
+  reader/storage contract is a semantic no-op: reuse the current release and do
+  not advance a timestamp-only head. Explicit v1-to-v2 reader enrollment may
+  commit one metadata-only manifest reusing the exact inventory and all payloads;
+  this persists the chunk policy for subsequent native scheduled publications.
   Never delete a source merely because another path looks duplicated.
 - Small-file query layout and transport layout solve different problems.  Keep
   canonical Parquet/receipt grains needed by readers, but publish them through
-  deterministic fixed hash buckets plus large-file blobs.  Do not replace this
+  deterministic fixed hash buckets plus large-file blobs (or exact v2 byte
+  chunks after reader-first rollout). Do not replace this
   with raw small-file Syncthing or a single giant archive whose smallest change
   retransmits the entire dataset.
+- Every registered `data_*` follows complete logical inventories with shared
+  immutable payloads, not another full physical copy per version. The common
+  policy/roots live in `configs/columnar_storage.json:source_versioning`; the
+  existing publication catalog still owns scope, locks and transport rights.
+  Packed v2 adds bounded SHA-256 byte chunks; updated readers retain v1 release support;
+  deploy v2 consumers before explicitly opting a source in. Once enabled,
+  scheduled releases inherit its chunk policy. Registration is not native
+  migration, cold recovery, remote rollout or deletion proof. See
+  [all-dataset layout](../dataset_incremental_storage.md).
+- Bound publication metadata as well as payload buffers. Consume already
+  validated prior-file reuse hints once and release their rows progressively.
+  The shared `packed_metadata.MetadataRows` keeps small inventories in RAM and
+  spills larger ones to its own private disposable `/var/tmp` SQLite index,
+  with a bounded page cache and free-space floor. Do not spill to penguin's
+  `/tmp` tmpfs or treat scratch indexes as authorities. Publication, full-file
+  verification and full fetch reuse the streaming/indexed inventory; cap new
+  ZIP member counts as well as payload bytes. First-baseline small files with
+  no reusable donor are fully SHA-hashed while packing, not pre-read merely
+  to discover that no donor exists. Preserve before/after source-stat fences.
+  The final complete source-stability walk computes every existing fingerprint
+  and path/type/symlink guard without retaining a second file inventory.
+  Preserve the original census scope/order and all source/cold SHA gates;
+  report storage-assignment and final-stability phases separately from hashing.
+  A bounded metadata-memory benchmark is not full migration or RSS acceptance.
+  A failed disposable metadata index may be retired only through
+  `packed_snapshot metadata-scratch-plan` / `metadata-scratch-apply`: explicitly
+  name the exact canonical failed attempt and superseded activity, require its
+  original operation/plan binding, private owned directory, single-link exact
+  SQLite producer schema and integrity, full stable SHA and fresh process/inode
+  references **including the cleanup process**. Persist intent, quarantine and
+  repeat the file/hash/reference gates before unlinking its one index and empty
+  directory. Unknown members, schemas, aliases and live references stay intact.
+  These indexes are reconstructible scratch, not source/CAS/NAS authorities;
+  this is not prefix-based `/var/tmp` GC or permission to remove cold history.
+  Complete-file cold verification may fuse ZIP CRC and original-file SHA in
+  one decompression pass, but must still read every stored member (including
+  unused members of a reused subset pack) and reconstruct every current
+  original with exact size/hash/count/byte checks. Durable materialization may
+  overlap a bounded number of per-file fsync jobs using owned duplicate file
+  descriptors; drain every barrier before publishing a target or `READY`, and
+  propagate any barrier failure. No skipped durability or early readiness.
 - Immutable TAIFEX rule evidence may share SHA-256-addressed, read-only local
   objects through `artifact_dedup.link_immutable_source`. Copy the producer once
   into `.rule-source-objects` beside the preparation bundles; never hard-link
@@ -205,14 +250,156 @@ The restored result, fixed migration and current busy queue are documented in
   and redistribution restrictions are authoritative.  A dataset with
   `publish: false` stays local.  Do not create an unregistered alias or bypass a
   catalog restriction to make synchronization convenient.
+- Local version preservation is a separate operation of that same publisher.
+  Restricted sources may use its existing packed implementation only in the
+  authority's enrolled `.local-state/private-history` namespace. This is a
+  host-private security domain, not another shared authority: validate the
+  parent D mount, the original `.local-state` Syncthing exclusion, restrictive
+  root permissions and a policy-bound marker before use. Its objects, heads
+  and manifests must never enter shared catalog discovery, export or scans.
+  `publish: false` remains false; a local recovery receipt grants neither NAS
+  export nor retirement of a source observation. Reuse the original source
+  gates, publisher, reconstruction engine and operation journal. No separate
+  collector, daemon or database is authorized by this namespace.
+- Publication holds the existing global publication/retention inode in shared
+  mode and its own dataset lock exclusively. Different datasets may progress
+  independently; retention/deletion still requires the global exclusive lock.
+  Concurrent first installers of an immutable CAS object use no-replace
+  promotion and verify an existing winner's SHA; they must not replace that
+  winner's inode. Keep lock inode, source-owner and full reconstruction gates.
+- Large inventories on the enrolled D authority may reuse the native Windows
+  byte adapter, complete compressed SHA and inode/generation fences, then
+  decode from bounded anonymous native-SSD scratch. Do not import training/ML
+  dependencies merely to admit storage scratch. Unattended WSL capacity checks
+  use the existing node distribution enrollment, never a guessed distribution
+  or virtual VHDX free-space figure; unavailable identity remains a hard error.
+- The same publisher supports opt-in `included_root_files`: an explicit,
+  nonempty list of at most 4096 immediate regular files, not a glob or subtree.
+  It publishes directly from the original root without a duplicate staging
+  tree, records the narrow scope in the manifest, and retains full source,
+  object and reconstruction verification. Do not combine it with omission
+  filters, describe it as full-tree coverage, or reuse a whole-tree release
+  as its proof. Catalog/source-owner/rights gates still apply; this option
+  alone enrolls no cache and authorizes no retirement.
+- `resolve_packed_pin` reads the existing bounded standard pin and resolves its
+  exact immutable manifest, never a moving head. Missing, changed, malformed or
+  unavailable fixed bindings are errors, not cache misses or permission to run
+  a GPU fallback. `stage_packed_root_files` reconstructs the entire explicit
+  root-file release into fresh flat temporary names in the consumer namespace,
+  using the full-tree fetcher's shared copy/checksum engine; it creates no
+  second managed tree or READY. Its original publication/retention lock must
+  already exist, keep the same inode across acquisition and reconstruction,
+  and cannot be recreated or followed through a link. Admit the originally
+  requested authority before resolving aliases, then check a changed target;
+  resolving first must not bypass the canonical mount guard. The caller owns
+  key locking, full-growth reservation, ABI validation, durable commit, and
+  exact failed-stage disposition. These APIs alone enroll no cold policy,
+  writer, capacity limit or retirement permission.
+- The shared packed member copier stops before writing beyond its admitted
+  complete file size, including a source that grows after cold verification.
+  Successful bytes/checksum and final permissions precede the same optional
+  file fsync; a second data barrier is unnecessary. This ordering is verified
+  in fault tests, not a claim of physical power-loss acceptance on every host.
 - Packed and materialized trees are never downloader destinations.  A consumer
   that writes panel caches, metadata, checkpoints, logs, or temporary files must
   use a separate writable live/cache/artifact root.  In particular,
   `stocks/panel_cache_v2` is reproducible node-local state and is excluded from
-  the `tw-public` release.  `artifacts/cache` is also node-local derived state:
+  the `tw-public` release. `artifacts/cache` is also node-local derived state:
   neither the hot artifact bridge nor its Syncthing folder may publish or
-  rehydrate it. Only exact byte-identical, stable cache files may share an
-  inode; a cache directory name is not proof that unique source data can go.
+  rehydrate that tree. The explicit `completed-tw-forward` catalog family is a
+  narrow exception for private completed outputs: one full v3 SHA-256 key,
+  its original immutable `.forward` and exact `.receipt.json`, under the
+  existing key owner and canonical packed publisher. Family templates live in
+  the catalog's optional `publication_families`, not the concrete `datasets`
+  used by training/source registries. The template itself is never
+  `--all-ready`; raw provider data, locks, usage state and other keys
+  are not included. Full original CPU ABI/hash validation and independent
+  cold member verification precede an exclusive standard fixed pin in the
+  configured retention owner's materialized pin tree. Reusing an accepted
+  binding does not repack, advance its head or rewrite its pin. A missing,
+  redirected or damaged binding fails closed; enrollment does not authorize
+  eviction, whole-cache synchronization or a GPU fallback. Only exact
+  byte-identical, stable cache files may share an inode; a cache directory name
+  is not proof that unique source data can go.
+- Completed-forward publications use the same existing cold blob CAS with an
+  explicit one-byte loose threshold: identical complete payloads across keys
+  share one immutable object instead of being embedded in different receipt
+  ZIPs. Existing fixed bindings are retained, not repacked to change format.
+  This catalog-only output changes no training input, so its successful
+  wrapper invocation skips the unrelated training-recipe refresh. All other
+  source publication hooks and failure propagation remain unchanged. Shell
+  wrappers parse their final exit together with the long function call; a
+  function alone cannot prevent reading new bytes appended past the old EOF.
+- Panel byte chunks remain generation-owned immutable links under the existing
+  writer/manifest lifecycle, not a second global object pool. A format-aware
+  reader must precede writer opt-in; preserve complete array/axis fingerprints,
+  CoW isolation and commit durability. Cache format adoption does not authorize
+  deleting older unique generations, changing source scope or bypassing the
+  process-reference/recovery gates below.
+- A private, not-yet-published Panel generation may batch its directory-entry
+  synchronization. Every original payload/JSON data fsync is retained. Required
+  generation, generations-parent, cache and immediate cache-parent directory
+  barriers precede variant publication; an error refuses commit and retains the
+  previous accepted generation. Standalone writes keep immediate directory
+  sync; chunk/link durability and the original atomic publication stay intact.
+  Fault injection and process readback are not physical power-loss proof. See
+  [shared-producer evidence](../penguin_service_storage_layout_2026-10-15.md#shared-panel-producer-20261016).
+- The factorized live preparation owner also reuses sealed, fully hashed
+  payloads/common arrays/dictionaries instead of rewriting identical generation
+  members. Under the same `prepare.lock`, a failed attempt may checkpoint its
+  completed members in one durable, atomically replaced readonly
+  `storage_progress.json`. Retry donors must be bounded, owned attempts of the
+  exact same source/config/code generation; every input bit/coordinate key and
+  complete payload SHA still has to match. Writable, corrupt, redirected,
+  unknown or uncheckpointed members are retained but not adopted. The checkpoint
+  is neither a complete factorized manifest nor a cold-recovery/retirement proof:
+  full original validation/source fences precede the original atomic `current`
+  switch. Do not create another CAS, sidecar per block, automatic partial GC,
+  timer or service to implement retries. See the
+  [producer reuse and recovery evidence](../penguin_service_storage_layout_2026-10-15.md#1016-續修factorized-失敗重試重用已完成區塊).
+- Completed-forward successful-use samples are separate advisory metadata,
+  written only after full cache/input validation under the original key lock,
+  at most once per minute/key. They are not total hit counts or exhaustive
+  consumer pins. Missing, corrupt, future-clock or failed usage writes must not
+  cause a valid forward to recompute. The existing daily compactor's inode-aware
+  working-set plan counts hardlinks once and retains unknown/busy/referenced
+  entries. A soft capacity target or oldest-use ranking does not authorize
+  eviction: require exact cold recovery and fresh authoritative consumer pins.
+- The original canonical completed-forward writer checks a fully validated hot
+  hit before loading cold/config/capacity dependencies. A miss reserves the full
+  bounded transaction and checks fixed standard pins through the original
+  catalog/retention owner before computing. Restore stages the original two
+  files directly into that flat namespace, validates the complete CPU v3 output,
+  full SHA and input generations, then durably commits payload before receipt.
+  A registered missing/corrupt release fails closed; only a never-enrolled key
+  may compute. Private offline cache overrides remain standalone. This does not
+  automatically publish new keys, evict entries or move current consumer pins.
+- `completed_forward_capacity` counts physical namespace allocations and
+  kernel-held transaction reservations; unknown data stays counted and retained.
+  The canonical writer holds `2 * MAX_PAYLOAD_BYTES + 8 MiB` across its entire
+  miss/restore, serialization, temporary growth and durable commit, and reserves
+  a 32 GiB filesystem-free margin. This is cooperating-writer physical headroom
+  admission, **not** an installed namespace/filesystem quota or eviction policy;
+  unrelated filesystem writers are not controlled. Transient control records
+  need atomic visibility while original payload/receipt durability is unchanged.
+  A valid hit must not recompute because capacity, usage metadata or cold storage
+  is unavailable.
+- The same daily owner discovers current TW day-trade forward pins through
+  canonical market/model-selection resolution and the selected
+  `latest_signal.json` / `summary.json`, without model or provider imports.
+  Check control generations and the market namespace before/after the complete
+  metadata plan. Missing, changed or unsupported metadata retains the whole
+  inventory; preserve both observed key sets on a race. This bounded current
+  signal census is not an exhaustive all-fleet dependency graph, payload
+  integrity acceptance, or automatic capacity eviction.
+- Those current v3 pins include both the masked result and its optional
+  `unconstrained` result, even when both roles share one key. Retain observed
+  keys and mark the census incomplete on unknown optional/nested metadata.
+  The completed-forward namespace is also an implicit service dependency;
+  a live output directory alone does not cover it. Shared minute-source defaults
+  live in `live.minute_source_paths`, with original replay/curve names retained
+  as aliases: metadata discovery must not import a valuation/replay engine just
+  to read these paths. Keep full canonical experiment-config validation intact.
 - Runtime `data_*` paths may be local directories or atomic symlinks, but the
   target's role must remain explicit.  A writable service must target its
   catalog-resolved live workspace, not a packed materialization.  Never infer
@@ -268,12 +455,155 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   durable catalog/source-replication workflows. Activities have heartbeats,
   durable publication/copy intents and canonical locks; no arbitrary received
   code, provider queries, GPU jobs or broker orders are dispatched.
+  The same worker also owns the catalog-backed dataset-version rollout. It
+  advances one fully recovered source per activity from a durable all-source
+  journal, retries busy owners without holding their locks, and checks again
+  on the configured daily cycle after the baseline. Restricted sources stay
+  under the ignored host-private history boundary; their database states use
+  native SQLite backup and their append-only observation cohorts remain
+  explicitly non-atomic. For live WAL sources, pin a native read transaction
+  before incremental backup so concurrent writers do not continually restart
+  the copy. Do not hold this long read transaction on rollback-journal sources.
+  Commit and explicitly close destination/source connections, convert only the
+  owned backup destination to a standalone DELETE-journal database, quick-check
+  it, then fsync/hash it and seal its receipt. Connection context managers alone
+  do not close SQLite connections. Never publish transient backup WAL/SHM files
+  or mutate the original source journal mode. Recursively recognized bounded mutable JSON controls,
+  the operational `.sync.lock` bytes, and the specifically named Shioaji
+  `shioaji/download_report.csv` / `shioaji_1m/download_report.csv` control reports
+  (including either named source root) are captured from stable open descriptors
+  before packing. v6 upgrades completed v3/v4/v5 preparations through named-path
+  probes, not another recursive census or repeated database backup. It also
+  recognizes the existing rule-only `data_taifex_public_history/rules` source;
+  the whole-root and rule-only catalogs must freeze the same normalized
+  publisher outputs, without accepting unrelated directories named `rules`.
+  NewsHTTP's direct `data_news_fulltext/cooldowns/*.json` and
+  `robots/*.json` caches are also named mutable controls, not immutable article
+  JSON. Preserve their first captured bytes across retries, the size/JSON/FD
+  checks and exclusions; do not recursively admit arbitrary JSON as mutable.
+  The same
+  private cohort may freeze precisely known atomically published CEX hot tails,
+  TAIFEX normalized rule tables and OpenBB closed validated catalog/status outputs.
+  These use bounded 8 MiB streaming, full stat/SHA fences, a 5 GiB scratch reserve,
+  fsync and atomic no-replace installation; an OpenBB catalog with a WAL requires
+  original-owner recovery instead. Retain unknown payload mutation rejection,
+  fixed observations across retry, and the non-atomic/local-only claim. No
+  general live DuckDB byte-copy or shared-publication exception is granted.
+  Only precisely recognized uncommitted writer names (the
+  canonical artifact_io atomic siblings, FinMind Parquet promotion staging and
+  the narrowly declared OpenBB L1 compactor siblings)
+  may be skipped, with manifest-declared rules and counts; unknown changing
+  source payloads still fail closed. Reuse prepared backups/captured controls
+  across retries. Recover an already committed fixed version first, then
+  untouched sources, then eligible retries, honoring each retry deadline.
+  Progress is bound to attempt, exclusive operation owner, boot ID and PID start
+  generation; a live PID alone or a pre-reboot row is not an active activity.
+  Reconcile abandoned in-flight rows only after taking that exact operation's
+  exclusive lock, retaining the old attempt, fixed snapshot and interruption
+  receipt. Dependency errors defer that source rather than starving all sources.
+  Public-to-private donor reuse streams its verified inventory into the same
+  bounded metadata index, with last-donor-wins logical paths; transfer that
+  disposable index to the publisher rather than decoding/copying it again.
+  Hints never replace full current-source hashes or independent cold recovery.
+  A bounded seekable pack-write buffer may coalesce ZIP header backpatches,
+  preserving exactly the legacy archive bytes. Drain failures must leave the
+  old accepted head intact; retain full source stat/SHA fences and the original
+  fsync-before-install barriers. Measure initial publication and the complete
+  publish/incremental/recovery/old-version-readback workflow separately, not
+  small-write counts alone. Attempt-bound work samples and transition-journal
+  timestamps are different clocks; stale samples alone cannot authorize a
+  restart or claim a deadlock.
+  The reviewed `data_tw_futures` interfaces `margin_sources`,
+  `margin_repair_pending` and `margin_repair_inputs` may bind exact recovered
+  `local-tw-index-futures` release/subtree IDs instead of storing another copy
+  or admitting arbitrary absolute symlinks. Validate the complete fixed target
+  inventory, all admitted current file bytes/modes and link identity fences.
+  Native SQLite exclusions retain the original separately recovered consistent
+  backup bindings, explicitly not current main/WAL byte copies. The private
+  `packed_snapshot fetch-source-view` reader composes those fixed subtrees and
+  SQLite states through portable local links; only its final `VIEW.json` proves
+  the complete interface, while a component `READY` proves that component only.
+  Preserve original absolute-link bytes as provenance. No shared/NAS export,
+  source retirement, generic link-following or new source authority is granted.
+  Public CEX publishers additionally acquire the original existing grain
+  `.download.lock` in deterministic order through publication, then release it
+  before cold recovery. A canonical collector still opening the same native
+  lock inode is a coordinated waiter only while the publisher holds all those
+  owners; fresh `/proc` command/FD readback must prove that identity. Preserve
+  that waiter evidence separately from active blockers. Unknown scripts,
+  unrelated/custom-output locks and source completion/freshness errors still
+  block publication. Busy all-ready admission yields immediately. FinLab
+  derived staging uses a shared formal-source read lease plus its own
+  `.locks/tw-public-research-finlab-2014-v4.lock` write lease; its publisher
+  acquires the same write inode, not an unrelated model reader's formal lease.
+  The `finlab_general_catalog_release_v2` gate uses canonical SDK check expiry
+  clocks, not a 24-hour rule for low-frequency tables; catalog discovery is
+  still limited to 24 hours. Date-window minute/tick capabilities are explicitly
+  outside general-table completion. All-null tables require retained raw SHA
+  evidence and an unexpired original retry deadline, never zero-filled values.
+  Seal full source hashes and a future `catalog_valid_until_utc`; recheck this
+  versioned scope and expiry before publication commit. Rebuild a stale union
+  through the original builder rather than editing its lineage receipt.
+  An uncommitted first private baseline may checkpoint only fully installed,
+  directory-synced packs in bounded, content-hashed fragments under that exact
+  operation's owned `sealed-pack-checkpoints/<dataset>` directory. Bind cold
+  authority, source and dataset; hash every current original again on retry.
+  Invalid, redirected or missing hints are retained as rejected cache evidence,
+  not recovery acceptance. Partial ZIPs and uncheckpointed orphan packs are not
+  donors. Committed inventories always retain priority. Retire these disposable
+  fragments only after the fixed release and its database states pass full
+  recovery, using exact-path/hash/link/final-stat checks and a fresh batched
+  process-reference scan. A positive reference holds the entire owned batch;
+  persist intent before unlink and reconcile interruption without inventing
+  reclaimed bytes. Never delete originals or CAS members through this path.
+  Database discovery rejects non-database names before file-level stat calls.
+  Preparation stages report examined rows/files, not fictitious completed bytes.
+  Fingerprinting semantic validators must not import their numerical packages
+  into the locked storage role. When required, invoke the original full auditor
+  in the existing native data runtime through `runtime_env.sh`, keeping the
+  source lock and unchanged-source guards in the publisher. This is not a
+  reduced audit, new environment or permission to bypass the source gate.
+  Stale or differently pinned progress is historical evidence, not current
+  completion. This is not shared-publication, training or deletion
+  acceptance. It adds no collector, service, database or transport owner.
+  A code-only worker rollout waits for the existing dataset/source/catalog
+  owner locks (with a declared bounded deadline), rejects candidate code drift
+  during the wait, then verifies the actually loaded code and persistent chain
+  IDs. Waiting longer is not permission to interrupt an active publisher or
+  delete its lock; PG/Temporal servers remain running. When the user explicitly
+  authorizes immediate code replacement, the same rollout entrypoint accepts
+  `--reload-code-only --restart-active-owner`: first persist restart intent and
+  exact accepted-version bindings, stop only the worker with bounded systemd
+  drain, then acquire the unchanged owner lock inodes. Preserve unsealed staging;
+  never reset workflows or manually rewrite an in-flight row. Verify actual
+  loaded code, persistent chains, preserved bindings, native history replay and
+  the journal owner's subsequent interruption reconciliation/retry separately.
+- Full catalog capture may stream the identical canonical JSON identity and
+  pool already validated descriptors within one pass. Keep every original
+  manifest byte hash, head/HLC/owner binding, conflicting-descriptor rejection
+  and missing-object diagnostic. Pass-local no-follow directory descriptors
+  use a bounded LRU, retaining all observed directory identities. Reopening an
+  evicted directory must match its original identity, and every observed name
+  is rechecked before acceptance. Keep the root pinned; close every retained
+  descriptor on success or failure. Shared export threads serialize descriptor
+  lookup/use/eviction so another thread cannot close an in-use descriptor.
+  Do not increase the process FD limit or omit catalog rows to hide exhaustion;
+  this is not a cross-pass stat-only integrity cache.
+  Native D pack verification may also serve the exact ignored private-history
+  root, but only after its existing mount/owner/0700/marker/export-false policy
+  passes without initialization. Large packs keep full native SHA, guarded
+  staging and all-member CRC/original-file SHA. This does not enable private
+  blob shortcuts, NAS export, source retirement or generic alternate roots.
 - lab203's fixed `lab203-lake-relay` rclone-copies closed deliveries to a
   separate immutable NAS archive. Accept only exact paired ACKs after full
   file/set/byte checks, independent NAS readback, mount/runtime/owner guards
   and, for catalogs, isolated PG plus native DuckLake restore. Syncthing is
   the private ingress/receipt channel; live catalog/repository files never sync.
 - Restic continues code/config/SQL backup and retains original raw history.
+  A timeout notifying Syncthing after sealing a SQL backup is a retained
+  per-envelope scan intent, not a failed SQL dump or permission to republish it.
+  The same control-backup service resumes only that dispatch/batch notification;
+  encrypted NAS backup and independent semantic restore remain separate ACKs.
   `cold_object_replication_enabled: false` delegates new cold payload waves to
   Temporal; `cold_metadata_replication_enabled: true` keeps exact packed
   manifest/head bytes in the original stream, alongside old ACKs and
@@ -594,6 +924,19 @@ catalog credentials or hard-code an interpreter path.
   pin, transport and quarantine gate. Existing enrolled archives may be selected
   by `--existing-dataset`; bind the catalog SHA in the inventory and reuse their
   exact cold release only after full original recovery and source comparison.
+  The 2026-10-16 producer-architecture work extends that **explicit manual**
+  scope to one completed `benchmarks/<suite>/<case>`, never a suite root or
+  automatic benchmark discovery. Require its existing producer's supported
+  completed comparison receipts, retain exact small JSON evidence separately
+  in the retirement receipt directory, and verify that evidence again before
+  source unlink and during final readback. Completion admission lives in the
+  shared benchmark implementation and canonical source plan as well as the CLI;
+  bypassing the outer inventory command must not admit unknown/unfinished work.
+  This is producer-declared completion, not a fresh numerical benchmark oracle.
+  Large mutable SQLite work copies
+  cannot share immutable-input hardlinks. A cold publication or copied report
+  alone still cannot retire them; all original recovery, consumer, transport
+  and quarantine gates remain mandatory.
   Historical simulations require the separate
   `manual-wsl-offline-simulation-preservation-v1` contract and one explicit
   child with a reviewed `official-close-settlement-`, `account-addition-`,
@@ -608,6 +951,13 @@ catalog credentials or hard-code an interpreter path.
   `rebuild_receipt.json`, including configured state-directory overrides. Missing
   pinned files remain protected recovery dependencies. Malformed source pins
   deny retirement; a readable file is not proof its SHA still matches a pin.
+  The canonical historical-minute counterfactual producer can emit a known
+  zero-request scope when there are no held or pending symbols. Empty minute
+  source pins are valid only with its recognized contract, explicit integer
+  zero request/resolution/ignored-row counters, no missing/carried symbols or
+  source counts, and no historical Bid/Ask claim. This admits no minute input
+  for that scope only; other sessions, implicit minute roots and all remaining
+  consumers stay protected. Unknown or contradictory empty scopes fail closed.
   A root restored for a current service is retained on a manual cleanup retry;
   its historical retirement receipt is not current permission to remove it.
   A retained hot mirror that differs from the authority source is a separate
@@ -630,8 +980,12 @@ catalog credentials or hard-code an interpreter path.
   fixed name without putting source paths in an invoker argv. Repository data
   paths and config `Path` values participate in consumer checks. Physical
   capture stays rooted at the repository, while ancestor process references
-  use the `data_tw_minute` domain; direct cwd/FD/mmap/config and data ancestor
-  holders remain protected. Current `research_dataset`, broker chunks and
+  use the `data_tw_minute` domain consistently through initial planning,
+  post-rename unlink checks and interrupted quarantine resume. Derive that
+  domain only from the reviewed capture spec, never a CLI override; reject a
+  domain outside the capture root or not a proper ancestor of the source.
+  Direct cwd/FD/mmap/config and data ancestor holders remain protected, including
+  exact hot/quarantine references after rename. Current `research_dataset`, broker chunks and
   other raw roots are excluded. Archived buggy views remain non-deployable
   preservation evidence, with their original metadata and values intact.
   Private Vast return scratch is distinct from remote source retirement:
@@ -646,6 +1000,16 @@ catalog credentials or hard-code an interpreter path.
   hashes and portable fingerprint, original decoding, exact READY/lock/file/
   directory sets, no FD/mmap/shared names and unchanged quarantine signatures;
   never discover or delete other failed workspaces by their name prefix.
+  The explicit `--private-backup-validation-copy` profile of the same pruner
+  covers only the registered 2026-10-10 Vast pre-stop independent restore copy.
+  It is duplicate retirement, not source retirement: keep both complete sealed
+  original packages on C, D/NAS backups and all original acceptance receipts.
+  Require the fixed incident/cohort/restore identity, unchanged accepted
+  receipts, exact sealed file sets, full SHA of every retained original and
+  duplicate, no unknown paths/shared files/process references, then a fresh
+  comparison, private quarantine and final source/signature/reference checks.
+  Record the cleanup separately; historical D recovery receipts do not become
+  a new full D/NAS recovery claim. Never enroll other incidents by prefix.
   A complete interrupted legacy quarantine may be resumed through the same
   manual retirement owner, using its original plan/state/path and exact fixed
   release. Repeat independent cold recovery and a full source/mirror audit;
@@ -729,6 +1093,77 @@ catalog credentials or hard-code an interpreter path.
   Cache names do not prove regenerability. Known stable immutable generation
   `.npy` duplicates may be exact-SHA hardlinked under panel writer locks with
   logical paths retained; unsupported/original/active/service caches stay.
+  The later user-authorized penguin service-cache optimization has one separate
+  supported exception, not an expansion of generic artifact dedup: a locally
+  enrolled `/etc/stockagent/service-cache-compaction.json` may select explicit
+  direct `artifacts/cache` children for `physical_minute_session_sharing_v1`.
+  Only committed v12 physical-minute `session-YYYY-MM-DD.npz` payloads with the
+  known uncompressed encoding are supported. Verify manifest/READY identities,
+  complete SHA of each session inode, exact membership, permissions/xattrs and
+  all inode aliases; preserve unsupported, incomplete, externally linked or
+  process-referenced caches. Keep all logical paths, manifest/READY bytes,
+  source/financial ABI, unique payloads and original cold objects. Shared derived
+  files become read-only; metadata-only hardlink sharing can change their inode,
+  ctime and derived mtime, invalidating the old run-scoped stat proof and requiring
+  the canonical reader's fresh SHA verification. It is not original-source
+  metadata migration or cold recovery acceptance.
+  Reuse the physical writer's per-generation locks and atomic-replace contract;
+  never link mutable producer observations or allow in-place writes to shared
+  payloads. Full-cache SHA must not hold writer locks: use optimistic stable
+  inventories, then short nonblocking group locks, fresh SHA and atomic link
+  replacement. Busy groups stay for retry. Exact independent alias/readback and
+  old-inode process checks gate reclaimed-byte claims. Pin retired inode file
+  descriptors through each bounded post-unlink reference check, so inode-number
+  reuse by an unrelated writer cannot be mistaken for a retained old payload.
+  Store durable plans and
+  results; count unique `st_blocks`, not logical filenames. No separate CAS is
+  created, so removing one generation cannot orphan another generation's data.
+  The existing daily artifact-dedup owner reads this root-owned local policy;
+  no new scheduler, general service-data deletion or cold-object GC is enrolled.
+  Prevention belongs to the canonical producers, not only this backfill:
+  `physical_minute_incremental_build_v1` indexes committed manifests in memory
+  for one build. Bind each reusable session to its full original partition SHA,
+  ordered axes, per-session canonical prices/limits/previous observable marks,
+  execution masks and policies; bind its gap/valuation/count diagnostics to the
+  same manifest. Recheck original partition SHA even on a hit. Reuse a verified
+  read-only payload under its donor writer lock before parsing/serialization;
+  legacy manifests can fall back to exact output-SHA reuse after computation.
+  The panel writer similarly shares bitwise-identical shape/dtype/content arrays
+  across committed backend manifests before opening a new output memmap. Never
+  chmod a writable legacy donor just to qualify it. Busy/changed/unsupported
+  donors are cache misses, not source authority or grounds to weaken acceptance.
+  Each generation owns its links; keep the original atomic publication and
+  generation-retirement contracts, with no permanent payload pool or second GC.
+  Preserve source/feature/financial ABI and required file hashes; optional storage
+  diagnostics are not source revisions. Include native reuse helpers in live
+  implementation admission and perform a qualified reload before claiming the
+  running owner uses changed producer code. Completed CPU forward publication
+  also reuses bitwise-identical whole payloads under nonblocking donor-key locks,
+  with full SHA, separate input-bound receipts and private read mappings. Each
+  changed input still requires its own computation/acceptance; equal output
+  bytes only share storage and never authorize relabelling another input's
+  result. Revalidate inputs after content lookup before receipt commit. Leave
+  writable legacy donors unchanged. Full-array shape changes and forward
+  cache byte budgets remain separate work, not implied by session/array reuse.
+  See [service storage optimization](../penguin_service_storage_layout_2026-10-15.md).
+  The continuous-futures history storage monitor reuses daily metadata aggregates
+  only under the canonical `download.lock` mutation-epoch contract. The original
+  downloader persists its nonce before mutation and retains the lock through the
+  final manifest; never replace the lock inode. Full scans run outside reader
+  leases and are cached only after stable before/after controls. Legacy, busy,
+  invalid or expired epochs retain the original scan. Manual out-of-protocol
+  in-place edits require `update_shioaji_storage_summary.py --force-full-scan`;
+  a daily reconciliation is also retained. These are storage-accounting caches,
+  not source-integrity, coverage, cold-recovery or retirement receipts. See
+  [native measurement and rollout](../penguin_service_storage_layout_2026-10-15.md#1016-0456-續修原下載器版本驅動的儲存清冊).
+  TAIFEX's read-only history projection reuses a verified immutable Parquet base
+  with a bounded source-tail delta under its existing per-source lease. Retain
+  full changed-source prefix SHA and pinned payload verification; the original
+  live JSONL and replay receipts remain authoritative. Retire only previous
+  verified private parts no longer referenced by a committed new manifest, not
+  unknown files or a whole tree. Two referenced objects do not establish an
+  all-directory byte budget or cold recovery. See the
+  [base/delta producer evidence](../penguin_service_storage_layout_2026-10-15.md#1016-0520-續修taifex-曲線投影重用固定歷史與小型增量).
   WSL 64 KiB 9p bulk I/O failed ENOMEM here. Do not promote it from a small
   benchmark or remount an in-flight authority. The validated Windows native
   FileStream adapter changes byte I/O only, retaining D enrollment and inode
@@ -804,6 +1239,11 @@ catalog credentials or hard-code an interpreter path.
 - Native full-blob SHA batching retains before/after signatures and full digest
   comparison. Bound each invocation by 16 objects, 8 GiB per object and 16 GiB
   total, matching the adapter contract; larger blobs use full streaming SHA.
+  Refresh the full enrolled-D mount guard before and after each hash batch,
+  before accepting any member proof; do not cache it across batches or rerun
+  the shell guard per member. Every member still has path/role admission,
+  complete SHA and exact before/after signatures. Single reads and writes
+  retain their own current mount admission.
   Batch size never authorizes partial hashing or inference of recovery.
 - A training-only role can exclude foreign penguin service templates only
   through a root-owned local enrollment, matching node identity, index-only
@@ -824,7 +1264,13 @@ catalog credentials or hard-code an interpreter path.
   A real 876 kB, 67-member pack was faster using one full-SHA bounded memory
   read than launching native SSD scratch. Only packs at most 1 MiB with at
   most 128 stored members use that path; unknown counts, larger packs and
-  larger subsets retain native admission. Both paths retain complete original
+  larger subsets prefer native SSD admission. If the SSD lacks the pack size
+  plus its 32 GiB reserve, the canonical reader first hashes the entire D object
+  through the native adapter, then uses the portable seekable D path without
+  allocating SSD scratch. It retains before/after immutable signatures and
+  full CRC/member/original hashes; this is not a partial-hash or capacity waiver.
+  If virtual space is sufficient but physical backing-drive admission fails,
+  keep that failure rather than bypassing it. All paths retain complete original
   reconstruction, CRC/member hashes and immutable source signatures. The
   interleaved measurement does not establish whole-release throughput.
   Independent legacy verification may reconstruct into a newly created,
@@ -836,6 +1282,12 @@ catalog credentials or hard-code an interpreter path.
   consumer remain durable. Persist a cold proof only after complete recovery;
   failed scratch stays for diagnosis. The real complete-release check and
   measured scratch comparison are in the linked Vast cleanup report.
+  The local offline retirement owner records `recovery-progress.json` and
+  emits bounded progress for full cold hashing, private materialization,
+  original decoding and independent cold reconstruction. Counts/bytes refer
+  only to the named stage, not the total transaction. This telemetry is marked
+  `acceptance_proof: false`; interrupted/failed attempts preserve that state
+  and never authorize unlink or replace final retirement/prune receipts.
 - Archive encoding scratch is not a cold authority. The four manual legacy
   roots enrolled on 2026-10-03 may use the bounded
   `/var/lib/stockagent-legacy-archive-stage` C-side work area to avoid DrvFs
@@ -906,6 +1358,12 @@ catalog credentials or hard-code an interpreter path.
   references.  An observed reference renews `last_used_at` and extends the same
   lease TTL; recursive `atime` scanning is not a substitute.  A short job that
   can open and close between monitor scans must call `stockagent-data use` first.
+- Shared process-reference scans distinguish an individual exited process or
+  closed descriptor (`ENOENT`/`ESRCH`) from lost visibility. Unreadable `/proc`,
+  live links, FD lists/inodes, maps or required orchestrator metadata raise an
+  incomplete-scan error; callers must not turn it into a clean empty reference
+  list or permission to retire. A successful bounded scan is still not an
+  exhaustive consumer graph, lease, writer lock or cold-recovery proof.
 - `stockagent-data gc --dry-run` must expose would-renew and would-evict actions.
   Automatic or manual eviction must refuse an active reference, pin, incomplete
   cold release, missing object, or mismatched `READY` proof.  `evict` may bypass
@@ -963,6 +1421,21 @@ catalog credentials or hard-code an interpreter path.
   containing exactly one aged, inactive, exclusively unlockable `swap.vhdx`
   may be removed, with an audit/apply receipt and an immediate pre-delete
   recheck.  The swap belonging to any current `wslhost.exe --vm-id` is protected.
+- WSL ext4 free space, VHD virtual capacity and Windows physical allocation are
+  separate measurements. Do not enable a version-gated unsafe sparse conversion
+  to promise instant reclamation. Use the existing `fstrim.timer` plus
+  `scripts/maintain_windows_wsl_storage.ps1`: default Plan, pinned native VHD,
+  single owner, no logical shrink; automatic CompactIfStopped never boots or
+  stops WSL. Explicitly authorized Expand runs from a verified Windows-native
+  copy, preserves/restores the three named startup tasks, requires graceful
+  systemd shutdown, and verifies capacity, root UUID and canonical boot recovery.
+  Preserve journals and original cold-recovery tasks across maintenance. A
+  successfully dispatched Windows task is not completed resize or readiness.
+  Changing ext4 reserved-block percentage is separate from file retirement:
+  require explicit user agreement, verify the mounted block device/UUID and
+  original reserve, retain before/after readback, and never report newly
+  available reserved blocks as deleted bytes or reclaimed Windows allocation.
+  See the [README usage](../../README.md#wsl-容量與-vhdx-回收).
 
 ### Acceptance and reporting
 

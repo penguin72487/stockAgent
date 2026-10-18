@@ -22,6 +22,35 @@ import pyarrow.parquet as pq
 HOT_TAIL_DIRNAME = "_hot_tail"
 
 
+def canonical_date_frame(frame: pl.DataFrame) -> pl.DataFrame | None:
+    """Reuse already-normalized writer dates, or decline to the caller's rules.
+
+    Validate every value, not just the first/last date or a sortedness marker.
+    The exact ASCII grammar excludes leap seconds and variable-width fields
+    whose parse/format round trip can change text. Explicit parsing still
+    rejects impossible calendar dates. Other dtypes, nulls, timezones and
+    subsecond values retain the collector's established normalization path.
+    Strict ascending order is checked from the values, not metadata. Duplicate
+    or unordered dates retain the original sort's row-priority semantics.
+    This neither deduplicates rows nor changes any value column.
+    """
+    if frame.is_empty() or frame.schema.get("date") != pl.String:
+        return None
+    dates = frame.get_column("date")
+    if dates.null_count() or not bool(dates.str.contains(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-5][0-9]:[0-5][0-9]$"
+    ).all()):
+        return None
+    parsed = dates.str.to_datetime(
+        format="%Y-%m-%d %H:%M:%S", time_unit="us", strict=False, exact=True,
+    )
+    if parsed.null_count():
+        return None
+    if len(dates) > 1 and not bool((dates.slice(1) > dates.slice(0, len(dates) - 1)).all()):
+        return None
+    return frame
+
+
 def tail_newer_summary(
     frame: pl.DataFrame,
     *,

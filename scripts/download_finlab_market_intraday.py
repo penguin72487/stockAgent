@@ -81,11 +81,14 @@ def default_market_end(now: datetime) -> date:
 
 
 def plan_minute_window(anchor: date, sessions: list[date], *, lower_bound: date,
-                       calendar_days: int, limit: int, available) -> list[date]:
+                       calendar_days: int, limit: int, available,
+                       upper_bound: date | None = None) -> list[date]:
     """Consecutive missing verified sessions only; never span a cached hole.
 
     Actual provider supply remains unverified. Latest-day and discovery probes
     use single dates; this bounded range planner is for known-history work.
+    Prefer older sessions, then fill forward if the caller supplies a verified
+    history bound. An oldest-first frontier need not cost a one-day SDK query.
     """
     result = [anchor]
     cutoff = max(lower_bound, anchor - timedelta(days=calendar_days - 1))
@@ -94,6 +97,12 @@ def plan_minute_window(anchor: date, sessions: list[date], *, lower_bound: date,
         if day < cutoff or len(result) >= limit or not available(day):
             break
         result.append(day)
+    if upper_bound is not None:
+        ceiling = min(upper_bound, min(result) + timedelta(days=calendar_days - 1))
+        for day in sessions[position+1:]:
+            if day > ceiling or len(result) >= limit or not available(day):
+                break
+            result.append(day)
     return sorted(result)
 
 
@@ -540,6 +549,39 @@ def _former_probe_tasks(universe: list[dict], days: list[date], *, kind: str = "
     return [(kind, item, day) for item, day in candidates]
 
 
+def _coverage_context(db: sqlite3.Connection, universe: list[dict], days: list[date]) -> None:
+    """Small immutable lifecycle/session dimensions, never a cached decision.
+
+    Keep the ~symbols + sessions inputs in TEMP, not their Cartesian product
+    or a duplicate source table. Actual partition counts are always read live.
+    A SAVEPOINT preserves the caller's transaction and rollback semantics.
+    """
+    symbols = [(item['symbol'], item['first_candidate_date'],
+                None if item['current'] else item['delisting_date'] or item['last_local_daily_date'] or '')
+               for item in universe]
+    sessions = [(day.isoformat(),) for day in days]
+    identity = hashlib.sha256(json.dumps([symbols, sessions], separators=(',', ':')).encode()).hexdigest()
+    db.execute('CREATE TEMP TABLE IF NOT EXISTS _finlab_coverage_identity(identity TEXT)')
+    db.execute('CREATE TEMP TABLE IF NOT EXISTS _finlab_coverage_symbols('
+               'symbol TEXT PRIMARY KEY,first TEXT,last TEXT) WITHOUT ROWID')
+    db.execute('CREATE TEMP TABLE IF NOT EXISTS _finlab_coverage_sessions(day TEXT PRIMARY KEY) WITHOUT ROWID')
+    if db.execute('SELECT identity FROM _finlab_coverage_identity').fetchone() == (identity,):
+        return
+    db.execute('SAVEPOINT finlab_coverage_context')
+    try:
+        db.execute('DELETE FROM _finlab_coverage_identity')
+        db.execute('DELETE FROM _finlab_coverage_symbols')
+        db.execute('DELETE FROM _finlab_coverage_sessions')
+        db.executemany('INSERT INTO _finlab_coverage_symbols VALUES (?,?,?)', symbols)
+        db.executemany('INSERT INTO _finlab_coverage_sessions VALUES (?)', sessions)
+        db.execute('INSERT INTO _finlab_coverage_identity VALUES (?)', (identity,))
+        db.execute('RELEASE finlab_coverage_context')
+    except BaseException:
+        db.execute('ROLLBACK TO finlab_coverage_context')
+        db.execute('RELEASE finlab_coverage_context')
+        raise
+
+
 def _coverage_phases(db: sqlite3.Connection, universe: list[dict], days: list[date],
                      *, first_observed: str | None, kind: str = "tw_tick") -> list[dict]:
     """Disjoint candidate windows; published partitions are an unknown subset.
@@ -556,31 +598,34 @@ def _coverage_phases(db: sqlite3.Connection, universe: list[dict], days: list[da
         ("observed_history", "已觀測起點以後的歷史回補", [d for d in earlier if d >= first]),
         ("older_discovery", "更早歷史可得性探索", [d for d in earlier if d < first]),
     ]
-    known = {item["symbol"]: item for item in universe}
     accepted = ACCEPTED | {"derived_unverified_for_pit", "derived_no_regular_trades"}
+    _coverage_context(db, universe, days)
+    counts = {name: [0, 0, 0, 0, 0] for name, _, _ in ranges}
+    # Filter official sessions/lifecycles and aggregate inside SQLite. The old
+    # Python path decoded and parsed every partition, three times per summary.
+    # Do not turn a calendar candidate into an assertion of published supply.
+    for phase, status, number, rows, size in db.execute(
+        "SELECT CASE WHEN p.trade_date=? THEN 'latest_session' "
+        "WHEN p.trade_date>=? THEN 'observed_history' ELSE 'older_discovery' END AS phase,"
+        "p.status,COUNT(*),SUM(p.rows),SUM(p.parquet_bytes) FROM effective_partitions AS p "
+        "JOIN _finlab_coverage_symbols AS u ON u.symbol=p.symbol "
+        "JOIN _finlab_coverage_sessions AS s ON s.day=p.trade_date "
+        "WHERE p.kind=? AND p.trade_date>=u.first AND (u.last IS NULL OR p.trade_date<=u.last) "
+        "GROUP BY phase,p.status", (latest.isoformat(), first.isoformat(), kind),
+    ):
+        values = counts[phase]
+        if status in accepted:
+            values[0] += number
+            values[3] += rows
+            values[4] += size
+        elif status == 'partition_not_ready':
+            values[1] += number
+        else:
+            values[2] += number
     result = []
     for identity, label, window in ranges:
         target = sum(_target_count(item, window) for item in universe)
-        got = not_ready = failed = rows = size = 0
-        if window:
-            start, end = window[0].isoformat(), window[-1].isoformat()
-            session_set = set(window)
-            for symbol, day_text, status, count, parquet_bytes in db.execute(
-                "SELECT symbol,trade_date,status,rows,parquet_bytes FROM effective_partitions "
-                "WHERE kind=? AND trade_date BETWEEN ? AND ?", (kind, start, end),
-            ):
-                item = known.get(symbol)
-                day = date.fromisoformat(day_text)
-                if item is None or day not in session_set or not _eligible(item, day):
-                    continue
-                if status in accepted:
-                    got += 1
-                    rows += count
-                    size += parquet_bytes
-                elif status == "partition_not_ready":
-                    not_ready += 1
-                else:
-                    failed += 1
+        got, not_ready, failed, rows, size = counts[identity]
         tested = got + not_ready + failed
         result.append({
             "id": identity, "label": label,
@@ -837,8 +882,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     if (type(workers) is not int or not 1 <= workers <= 32
             or type(range_calendar_days) is not int or not 1 <= range_calendar_days <= 31):
         raise ValueError("invalid bounded FinLab pipeline")
-    if kind != "tw_minute" and (workers != 1 or range_calendar_days != 1):
-        raise ValueError("large Tick partitions retain single-request admission")
+    if kind == "tw_tick" and workers > 8:
+        raise ValueError("Tick uses at most eight bounded processes")
     source_kind = kind
     quota_policy = quota_policy or load_policy()
     download_threads = (quota_policy.minute_download_threads if kind == "tw_minute" else 1
@@ -846,16 +891,16 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     # Explicit serial library callers (including custom per-day fetch hooks)
     # must not silently inherit a deployed process queue and invoke real SDK
     # range downloads. CLI production supplies its configured worker/range.
-    queue_depth = (quota_policy.minute_queue_depth if kind == "tw_minute"
-                   and (workers > 1 or range_calendar_days > 1 or download_threads > 1) else 1
+    queue_depth = ((quota_policy.minute_queue_depth if kind == "tw_minute" else quota_policy.tick_queue_depth)
+                   if workers > 1 or range_calendar_days > 1 or download_threads > 1 else 1
                    ) if queue_depth is None else queue_depth
-    authorization_slots = (quota_policy.minute_authorization_slots if kind == "tw_minute" else 1
+    authorization_slots = (quota_policy.minute_authorization_slots if kind == "tw_minute" else quota_policy.tick_authorization_slots
                            ) if authorization_slots is None else authorization_slots
     if type(download_threads) is not int or not 1 <= download_threads <= 5 or kind != "tw_minute" and download_threads != 1:
         raise ValueError("invalid bounded signed-object parallelism")
-    if type(queue_depth) is not int or not 1 <= queue_depth <= 4 or kind != "tw_minute" and queue_depth != 1:
+    if type(queue_depth) is not int or not 1 <= queue_depth <= 4:
         raise ValueError("invalid bounded FinLab work queue")
-    if type(authorization_slots) is not int or not 1 <= authorization_slots <= 32 or kind != "tw_minute" and authorization_slots != 1:
+    if type(authorization_slots) is not int or not 1 <= authorization_slots <= (32 if kind == "tw_minute" else 8):
         raise ValueError("invalid bounded FinLab authorization concurrency")
     if kind == "tw_minute":
         # CLI experiments have an exact effective fingerprint, not the deployed
@@ -863,11 +908,15 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         quota_policy = replace(quota_policy, minute_workers=workers,
             minute_range_calendar_days=range_calendar_days, minute_download_threads=download_threads,
             minute_queue_depth=queue_depth, minute_authorization_slots=authorization_slots)
+    else:
+        quota_policy = replace(quota_policy, tick_workers=workers, tick_range_calendar_days=range_calendar_days,
+            tick_queue_depth=queue_depth, tick_authorization_slots=authorization_slots)
+    http_keepalive = quota_policy.minute_http_keepalive if kind == "tw_minute" else quota_policy.tick_http_keepalive
     authorization_slots = min(workers, authorization_slots)
     pipeline = workers > 1 or range_calendar_days > 1 or download_threads > 1 or queue_depth > 1
     engine = ("rolling_range_process_pool" if pipeline and queue_depth > 1 else
               "bounded_range_process_pool" if pipeline else "single_stock_day")
-    quota_window = QuotaSampleWindow(quota_policy)
+    quota_window = QuotaSampleWindow(quota_policy, kind=source_kind)
     policy_state = quota_admission(kind=kind, now=now, reserve_mb=reserve_mb, policy=quota_policy)
     full_started_clock = time.monotonic()
     full_started_at = datetime.now(UTC)
@@ -1030,13 +1079,16 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             "attempt_limit": limit, "attempted": attempts, "successful": successes,
             "scanned_candidates": scanned, "cached_skips": cached_skips,
             "quota_checks": quota_checks, "quota_cache_hits": quota_cache_hits,
+            "quota_observation_bounds": {"maximum_requests": quota_window.maximum_requests,
+                "maximum_age_seconds": quota_window.interval_seconds,
+                "per_request_within_reserve_mb": quota_window.near_floor_mb},
             "processing_engine": engine,
             "partition_index_view": index_view_identity,
             "minute_priority_admission": minute_admission_observation,
             "data_processing_engine": "polars_arrow_v1", "processing_threads": quota_policy.processing_threads,
             "pipeline_workers": workers, "range_calendar_days": range_calendar_days,
             "download_threads": download_threads, "queue_depth": queue_depth, "authorization_slots": authorization_slots,
-            "http_keepalive": quota_policy.minute_http_keepalive if pipeline else False,
+            "http_keepalive": http_keepalive if pipeline else False,
             "sdk_calls": sdk_calls if pipeline else attempts,
             "window_requests": window_requests, "fallback_calls": fallback_calls,
             "inflight_partitions": inflight_partitions,
@@ -1121,10 +1173,10 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         policy_state = quota_admission(kind=source_kind, now=boundary, reserve_mb=reserve_mb,
             scheduled_reserve_mb=general_admission.get("scheduled_reserve_mb", 0), policy=quota_policy)
         effective_reserve = policy_state["effective_reserve_mb"]
-        # Bounded private reuse avoids a quota round trip for every tiny minute
-        # file. The SDK still enforces official quota on each source request.
-        # Tick files are larger/variable and keep the per-request quota check.
-        fresh = source_kind == "tw_tick" or quota_window.needs_refresh(
+        # The SDK still enforces official quota on every source request.
+        # Reuse local observations for at most 4 Tick requests / 5 seconds;
+        # within 100 MB of the reserve Tick returns to per-request sampling.
+        fresh = quota_window.needs_refresh(
             now=boundary, clock=time.monotonic(), reserve_mb=effective_reserve)
         if fresh:
             quota_checks += 1
@@ -1160,7 +1212,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         old = index.execute("SELECT status FROM partitions WHERE kind=? AND symbol=? AND trade_date=?",
                             (kind, symbol, day.isoformat())).fetchone()
         identity = phase_for_day(day.isoformat(), latest=days[-1].isoformat(), first_observed=first_observed)
-        if source_kind == "tw_minute" and identity == "older_discovery":
+        if identity == "older_discovery":
             cursor["older_probe_attempts"] = int(cursor.get("older_probe_attempts", 0)) + 1
             if retry:
                 cursor["older_retry_attempts"] = int(cursor.get("older_retry_attempts", 0)) + 1
@@ -1202,8 +1254,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         last_completed_clock = completed_clock
         active_key = active_day = None
         checkpoint()
-        if source_kind == "tw_tick" or attempts % 64 == 0:
-            gc.collect()  # Tiny acyclic minute frames do not need a full scan per file.
+        if attempts % 64 == 0:
+            gc.collect()  # Normal GC remains enabled; no full-heap scan per stock-day.
 
     def acquire_wave(jobs):
         """A bounded work-conserving pool; the cohort frontier commits last.
@@ -1220,12 +1272,12 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         cohort_remaining = sum(len(job[2]) for job in jobs)
         inflight_partitions = 0
         queued_windows = len(jobs)
-        active_key, active_day = f"tw_minute:{jobs[0][0]}", jobs[0][2][0].isoformat()
+        active_key, active_day = f"{source_kind}:{jobs[0][0]}", jobs[0][2][0].isoformat()
         # Mark in-flight before auth/pool startup: an initialization failure
         # must not let the final checkpoint publish the advanced frontier.
         checkpoint()
         if pool is None:
-            pool = _minute_pool(workers, keepalive=quota_policy.minute_http_keepalive,
+            pool = _minute_pool(workers, keepalive=http_keepalive,
                                 download_threads=download_threads, rate_gate=rate_shared,
                                 authorization_gate=authorization_gate)
         old_states = {}
@@ -1249,7 +1301,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             quota_window.requested()
             window_requests += 1
             sent_at = time.monotonic()
-            future = pool.apply_async(range_fetch, (root, f"tw_minute:{symbol}", target_days),
+            future = pool.apply_async(range_fetch, (root, f"{source_kind}:{symbol}", target_days),
                                       {"now": datetime.now(UTC)})
             futures[future] = (symbol, target_days, sent_at)
             inflight_partitions += len(target_days)
@@ -1271,7 +1323,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     if not may_acquire():
                         break
                     small_room = quota_window.sample[0] <= (
-                        policy_state["effective_reserve_mb"] + quota_policy.quota_sample_near_floor_mb)
+                        policy_state["effective_reserve_mb"] + quota_window.near_floor_mb)
                     if small_room and (len(jobs[next_job][2]) > 1 or futures):
                         break  # Replan single stock-days after admitted slots drain.
                     dispatch(jobs[next_job])
@@ -1282,6 +1334,10 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     worker_slot_seconds += time.monotonic() - sent_at
                     inflight_windows = len(futures)
                     yield symbol, target_days, future.get()
+                    # Parent validation/index/derivation may take time. Refill
+                    # this released worker before consuming another completed
+                    # range; queued ready results still count against workers.
+                    break
                 if not futures and (state != "batch_limit" or not ready and next_job < len(jobs)):
                     break
                 if futures and any(time.monotonic() >= sent_at + 180 for _, _, sent_at in futures.values()):
@@ -1355,7 +1411,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             if len(reported) != len(target_days) and state == "batch_limit":
                 state = "incomplete_window_result"
             last_completed_clock = time.monotonic()
-            print(f"[finlab-market] window tw_minute:{symbol} {min(target_days)}..{max(target_days)}: "
+            print(f"[finlab-market] window {source_kind}:{symbol} {min(target_days)}..{max(target_days)}: "
                   f"{sum('receipt' in outcome for outcome in outcomes)}/{len(target_days)} persisted", flush=True)
             checkpoint()
         persist_source_backoff()
@@ -1443,15 +1499,17 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         known = {item["symbol"]: item for item in universe}
         retry_jobs = []
         retry_planned = set()
+        retry_older_planned = 0
         for kind, symbol, day_text in due:
             if attempts + sum(len(job[2]) for job in retry_jobs) >= limit or len(retry_jobs) >= retry_budget:
                 break
             day = date.fromisoformat(day_text)
             if kind != source_kind or symbol not in known or day not in days or not _eligible(known[symbol], day):
                 continue
-            if (source_kind == "tw_minute"
-                    and (int(cursor.get("older_probe_attempts", 0)) >= 16 or int(cursor.get("older_retry_attempts", 0)) >= 4)
-                    and phase_for_day(day_text, latest=days[-1].isoformat(), first_observed=first_observed) == "older_discovery"):
+            older_retry = phase_for_day(day_text, latest=days[-1].isoformat(), first_observed=first_observed) == "older_discovery"
+            if ((int(cursor.get("older_probe_attempts", 0)) + retry_older_planned >= 16
+                    or int(cursor.get("older_retry_attempts", 0)) + retry_older_planned >= 4)
+                    and older_retry):
                 continue
             key = f"{kind}:{symbol}"
             receipt = _available_receipt(root, kind, symbol, day)
@@ -1475,11 +1533,12 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             if pipeline:
                 target_days = [day]
                 small_room = quota_window.sample[0] <= (policy_state["effective_reserve_mb"]
-                                                       + quota_policy.quota_sample_near_floor_mb)
+                                                       + quota_window.near_floor_mb)
                 publication_recheck = (attempt_payload.get("status") == "partition_not_ready"
                     and phase_for_day(day_text, latest=days[-1].isoformat(), first_observed=first_observed)
                         != "older_discovery")
-                if (attempt_payload.get("status") == "provider_error" or publication_recheck) and not small_room:
+                if (source_kind == 'tw_minute' and not older_retry
+                        and (attempt_payload.get("status") == "provider_error" or publication_recheck) and not small_room):
                     def retry_available(candidate):
                         if (symbol, candidate) in retry_planned or not _eligible(known[symbol], candidate):
                             return False
@@ -1502,6 +1561,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                         calendar_days=range_calendar_days,
                         limit=limit-attempts-sum(len(job[2]) for job in retry_jobs), available=retry_available)
                 retry_jobs.append((symbol, {**known[symbol], "_publication_retry": True}, target_days))
+                retry_older_planned += len(target_days) if older_retry else 0
                 retry_planned.update((symbol, value) for value in target_days)
                 if small_room:
                     break
@@ -1526,7 +1586,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             # Near the 50 MB floor use one stock-day per request, not a multi-
             # date/pool overshoot. Official SDK quota always remains binding.
             small_room = quota_window.sample is not None and quota_window.sample[0] <= (
-                policy_state["effective_reserve_mb"] + quota_policy.quota_sample_near_floor_mb)
+                policy_state["effective_reserve_mb"] + quota_window.near_floor_mb)
             wave_width = workers * queue_depth if pipeline and not small_room else 1
             # The quota-sampling request bound is real even when testing more
             # workers. A fresh sample admits one bounded wave, never more than
@@ -1567,7 +1627,14 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     continue
                 if _checked_this_cycle(attempt_path, "attempted_at_utc", now):
                     continue
-                if source_kind == "tw_minute" and (first_observed is None or day.isoformat() < first_observed):
+                if first_observed is None or day.isoformat() < first_observed:
+                    # Known old failures belong to the fair, bounded retry
+                    # queue above. The two discovery frontiers must not bypass
+                    # its retry cap and probe the same failed stock-day again.
+                    if read_json(attempt_path).get("status") in {
+                        "partition_not_ready", "provider_error", "source_rate_limited"
+                    }:
+                        continue
                     # Unpublished ancient candidates are not millions of
                     # required downloads. Retain their discovery frontier.
                     if int(cursor.get("older_probe_attempts", 0)) + planned_older >= 16:
@@ -1583,11 +1650,11 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     break
                 if not jobs and pipeline:
                     small_room = quota_window.sample is not None and quota_window.sample[0] <= (
-                        policy_state["effective_reserve_mb"] + quota_policy.quota_sample_near_floor_mb)
+                        policy_state["effective_reserve_mb"] + quota_window.near_floor_mb)
                     if small_room:
                         wave_width = 1
                 target_days = [day]
-                if (pipeline and not small_room and source_kind == "tw_minute" and first_observed
+                if (pipeline and not small_room and first_observed
                         and first_observed <= day.isoformat() < days[-1].isoformat()):
                     def available(candidate):
                         if not _eligible(item, candidate) or (symbol, candidate) in planned:
@@ -1596,7 +1663,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                         return (_available_receipt(root, kind, symbol, candidate) is None
                                 and not _checked_this_cycle(apath, "attempted_at_utc", now))
                     target_days = plan_minute_window(day, days, lower_bound=date.fromisoformat(first_observed),
-                        calendar_days=range_calendar_days, limit=limit-attempts-len(planned), available=available)
+                        calendar_days=range_calendar_days, limit=limit-attempts-len(planned), available=available,
+                        upper_bound=days[-1] - timedelta(days=1))
                 jobs.append((symbol, item, target_days))
                 planned.update((symbol, candidate) for candidate in target_days)
                 if not pipeline:
@@ -1656,11 +1724,14 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 "kind": source_kind, "acquisition_policy_version": ACQUISITION_POLICY_VERSION,
                 "quota_policy": policy_state, "quota_checks": quota_checks,
                 "quota_cache_hits": quota_cache_hits,
+                "quota_observation_bounds": {"maximum_requests": quota_window.maximum_requests,
+                    "maximum_age_seconds": quota_window.interval_seconds,
+                    "per_request_within_reserve_mb": quota_window.near_floor_mb},
                 "processing_engine": engine,
                 "data_processing_engine": "polars_arrow_v1", "processing_threads": quota_policy.processing_threads,
                 "pipeline_workers": workers, "range_calendar_days": range_calendar_days,
                 "download_threads": download_threads, "queue_depth": queue_depth, "authorization_slots": authorization_slots,
-                "http_keepalive": quota_policy.minute_http_keepalive if pipeline else False,
+                "http_keepalive": http_keepalive if pipeline else False,
                 "sdk_calls": sdk_calls if pipeline else attempts, "window_requests": window_requests,
                 "fallback_calls": fallback_calls, "source_seconds": source_seconds,
                 "persist_seconds": persist_seconds,
@@ -1703,8 +1774,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=64)
     parser.add_argument("--kind", choices=KINDS, default="tw_minute",
                         help="Download minutes first; Tick is admitted only after the minute pass")
-    parser.add_argument("--workers", type=int, default=None, help="Bounded minute SDK processes; default from shared policy")
-    parser.add_argument("--range-calendar-days", type=int, default=None, help="Minute stock windows, at most 31 calendar days")
+    parser.add_argument("--workers", type=int, default=None, help="Bounded SDK processes; defaults to the family policy")
+    parser.add_argument("--range-calendar-days", type=int, default=None, help="Intraday stock windows, at most 31 calendar days")
     parser.add_argument("--download-threads", type=int, default=None,
                         help="Parallel reads inside the native signed group; minute-only, at most 5")
     parser.add_argument("--queue-depth", type=int, default=None,
@@ -1724,9 +1795,10 @@ def main() -> int:
                         help="with --status-only, replay all stored ticks into derived minutes")
     args = parser.parse_args()
     settings = load_policy()
-    workers = args.workers if args.workers is not None else (settings.minute_workers if args.kind == "tw_minute" else 1)
+    workers = args.workers if args.workers is not None else (
+        settings.minute_workers if args.kind == "tw_minute" else settings.tick_workers)
     range_days = args.range_calendar_days if args.range_calendar_days is not None else (
-        settings.minute_range_calendar_days if args.kind == "tw_minute" else 1)
+        settings.minute_range_calendar_days if args.kind == "tw_minute" else settings.tick_range_calendar_days)
     if (args.end_date < args.start_date or args.limit < 1
             or args.reserve_mb is not None and args.reserve_mb < 0 or args.minimum_free_gb < 0
             or args.max_run_seconds is not None and not 180 < args.max_run_seconds <= 3600):

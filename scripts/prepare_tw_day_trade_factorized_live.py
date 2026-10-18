@@ -40,6 +40,10 @@ from stockagent.data.tw_public_features import _exchange_session_dates
 from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
 from stockagent.live.market_status import tw_stock_day_decision, TW_HOLIDAY_SCHEDULE_NAME
 from stockagent.storage_layout import admit_output
+from stockagent.data_sync.factorized_projection_reuse import (
+    FactorizedProjectionReuse, implementation_identity as storage_implementation_identity,
+    seal_new_file,
+)
 from stockagent.training.checkpoint_contract import subset_panel_symbols
 from train import _build_panel_kwargs
 
@@ -98,8 +102,37 @@ def _native_context_identity(native_source: Path, manifest: dict) -> dict:
 
 def _verify_preparation_inputs(config_path, native_source, source_manifest, identity):
     if (file_sha256(config_path) != identity["config_sha"]
-            or _native_context_identity(native_source, source_manifest) != identity["native_context"]):
+            or _native_context_identity(native_source, source_manifest) != identity["native_context"]
+            or ("storage_implementation" in identity
+                and storage_implementation_identity() != identity["storage_implementation"])):
         raise ValueError("configuration/publication context changed during projection; last good generation retained")
+
+
+def _fixed_seed_event_paths(parent_path: Path, parent: dict, years: set[int]) -> list[Path]:
+    """Admit the exact fixed seed before expensive source/panel preparation.
+
+    Original manifests use annual_events/YEAR.parquet; deployed bounded parents
+    may materialize the same receipt-bound member as YEAR.parquet. Neither
+    layout permits a missing year, an escaping path, duplicate or changed bytes.
+    """
+    root = parent_path.parent.resolve(strict=True)
+    selected: dict[int, Path] = {}
+    for proof in parent["annual_events"]:
+        relative = Path(proof["path"])
+        year = int(relative.stem)
+        if year not in years:
+            continue
+        if relative.is_absolute() or ".." in relative.parts or year in selected:
+            raise ValueError("invalid or duplicate fixed seed member")
+        original = root / relative
+        local = original if original.exists() or original.is_symlink() else root / relative.name
+        if (not local.is_file() or not local.resolve(strict=True).is_relative_to(root)
+                or file_sha256(local) != proof["sha256"]):
+            raise ValueError(f"required fixed seed events are missing or changed: {original}")
+        selected[year] = local
+    if set(selected) != years:
+        raise ValueError("source events do not cover the full TTL initialization horizon")
+    return [selected[year] for year in sorted(selected)]
 
 
 def prepare(*, config_path: Path, parent_path: Path, native_source: Path,
@@ -138,6 +171,14 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
     completed = date.fromisoformat(public_summary["requested_end_date"])
     decision, decision_proof = _next_projection_session(public, completed)
     sessions = sorted(set(day for day in sessions if day <= completed) | {decision})
+    first_session = next((day for day in sessions
+                          if date.fromisoformat(start_date) <= day <= completed), None)
+    if first_session is None:
+        raise ValueError("projection horizon has no completed source sessions")
+    horizon = max(max(rule_from_spec(d).carry_days, rule_from_spec(d).older_carry_days) for d in all_defs)
+    seed_end = min(decision, date.fromisoformat(parent["dates"][-1]))
+    needed_years = set(range((first_session-timedelta(days=horizon)).year, seed_end.year+1))
+    seed_paths = _fixed_seed_event_paths(parent_path, parent, needed_years)
     calendar_inputs = {name: file_sha256(public / name) for name in (
         TW_HOLIDAY_SCHEDULE_NAME, "twse_taiex_ohlc.parquet", "twse_taiex_ohlc.summary.json")}
     source_manifest_bytes = (native_source / "source_manifest.json").read_bytes()
@@ -168,6 +209,7 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
         "sweep_sha": file_sha256(ROOT / "scripts/prepare_tw_day_trade_factorized_panel.py"),
         "annual_preparation": annual_preparation_identity(),
         "writer_sha": file_sha256(Path(write_array_block.__code__.co_filename)),
+        "storage_implementation": storage_implementation_identity(),
         "config_sha": file_sha256(config_path), "native_context": native_context,
     }
     generation = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -184,7 +226,11 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
     # Partial attempts never occupy the committed identity or poison retries.
     # Preserve failed attempt bytes; only a fully verified generation is renamed.
     out = target.parent / f".{generation}.attempt.{uuid.uuid4().hex}"
-    out.mkdir(parents=True)
+    out.mkdir(parents=True, mode=0o700)
+    previous = output / "current" / "factorized_manifest.json"
+    reuse = FactorizedProjectionReuse(
+        out, previous.resolve(strict=True) if previous.is_file() else None,
+        resume_generation=generation)
     config = load_config(config_path)
     data = replace(config.data, parquet_root=str(public / "stocks"),
                    tw_public_feature_path=str(public / "features/tw_public_stock_daily.parquet"),
@@ -197,19 +243,8 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
     dates = [date.fromisoformat(str(d)[:10]) for d in panel.dates]
     if dates[-1] != completed or panel.feature_names != parent["base_feature_names"]:
         raise ValueError("live executable base/calendar does not match the selected trained ABI")
-    horizon = max(max(rule_from_spec(d).carry_days, rule_from_spec(d).older_carry_days) for d in all_defs)
-    seed_end = min(decision, date.fromisoformat(parent["dates"][-1]))
-    needed_years = set(range((dates[0]-timedelta(days=horizon)).year, seed_end.year+1))
-    seed_paths = []
-    for proof in parent["annual_events"]:
-        if int(Path(proof["path"]).stem) not in needed_years:
-            continue
-        local = parent_path.parent / Path(proof["path"]).name
-        if not local.is_file() or file_sha256(local) != proof["sha256"]:
-            raise ValueError(f"required fixed seed events are missing or changed: {local}")
-        seed_paths.append(local)
-    if {int(path.stem) for path in seed_paths} != needed_years:
-        raise ValueError("source events do not cover the full TTL initialization horizon")
+    if set(range((dates[0]-timedelta(days=horizon)).year, seed_end.year+1)) != needed_years:
+        raise ValueError("executable BASE calendar changed the admitted seed horizon")
     delta_path = out / "delta_events.parquet"
     cutoff = date.fromisoformat(parent["dates"][-1])
     quality = []
@@ -291,8 +326,8 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
             continue
         parts = []
         for symbol_start, columns, part in values.symbol_blocks:
-            proof = write_array_block(out / f"individual_{begin:05d}_{symbol_start:05d}.npy.zst", part[:keep], omit_zero_columns=True,
-                                      logical_columns=columns, logical_shape=(keep, part.shape[1], values.shape[2]))
+            proof = reuse.block(f"individual_{begin:05d}_{symbol_start:05d}.npy.zst", part[:keep],
+                                logical_columns=columns, logical_shape=(keep, part.shape[1], values.shape[2]))
             proof["symbol_start"] = symbol_start
             parts.append(proof)
         blocks.append({"start": begin, "shape": [keep, len(panel.symbols), len(individual)], "symbol_blocks": parts})
@@ -301,22 +336,26 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
         paths, cache_root=annual_cache_root, seed_paths=seed_paths)
     common_parts = [values[:, 0] for _, values, _ in causal_state_blocks(sweep_dates, ["*"], common, common_events, None, model_channel_policy="value_only")]
     shared = np.concatenate(common_parts)[:len(dates)]
-    np.save(out / "common.npy", shared, allow_pickle=False)
-    os.link(dictionary_path, out / "feature_dictionary.json")
+    common_proof = reuse.common(shared)
+    reuse.dictionary(dictionary_path.resolve(strict=True), parent["feature_dictionary_sha256"])
+    storage_stats = reuse.stats()
     receipt = {"contract": "factorized_paper_projection_lag1_v1", "status": "verified",
                "decision_session": str(decision), "completed_session": str(completed),
                "parent_manifest_sha256": parent_sha, "source_identity": identity,
                "delta_observations": delta_rows, "raw_source_publication": False,
                "historical_pit_proven": False, "publication_clocks": "original selected research normalization; retained raw capture receipts, no broker fill claim",
-               "source_update_owner": str(Path(__file__).resolve()), "built_at_utc": datetime.now(UTC).isoformat()}
+               "source_update_owner": str(Path(__file__).resolve()), "built_at_utc": datetime.now(UTC).isoformat(),
+               "storage_build": storage_stats}
     manifest = {**parent, "dates": [str(day) for day in dates], "blocks": blocks,
-                "common": {"path": "common.npy", "shape": list(shared.shape), "sha256": file_sha256(out / "common.npy"), "bytes": (out / "common.npy").stat().st_size},
+                "common": common_proof, "storage_build": storage_stats,
                 "observations": [], "annual_events": [], "paper_inference": receipt,
                 "host_cache_bytes": 512*1024**2, "max_slab_bytes": 12*1024**3,
                 "build_wall_seconds": time.perf_counter()-started}
     verify_factorized_members(out, manifest)
     atomic_write_json(out / "factorized_manifest.json", manifest)
     atomic_write_json(out / "projection_receipt.json", receipt)
+    seal_new_file(out / "factorized_manifest.json")
+    seal_new_file(out / "projection_receipt.json")
     if file_sha256(parent_path) != parent_sha:
         raise ValueError("fixed parent changed during projection")
     current_summary = json.loads(summary_path.read_text())
@@ -331,6 +370,7 @@ def _prepare(*, config_path, parent_path, native_source, public, finlab, output,
     publish_link(output, target)
     return {"status": "verified", "manifest": str(target / "factorized_manifest.json"), "decision_session": str(decision),
             "dates": len(dates), "features": parent["logical_model_channels"], "wall_seconds": time.perf_counter()-started,
+            "storage_build": storage_stats,
             "annual_cache": {"individual": individual_events.cache_stats(), "common": common_events.cache_stats()}}
 
 

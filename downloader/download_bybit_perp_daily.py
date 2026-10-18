@@ -12,15 +12,10 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 import polars as pl
 import pyarrow.parquet as pq
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -39,11 +34,18 @@ from common import (
     run_parallel_tasks,
 )
 from artifact_io import archive_run_reports
+from dataset_lock import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    exclusive_dataset_lock,
+    parse_lock_timeout_seconds,
+)
 from candle_frame_buffer import CandleFrameBuffer
 from candle_columns import numeric_candle_page
 from quality_priority import collect_with_quality_priority, prioritize_records
 from http_transport import RETRYABLE_NETWORK_ERRORS
+from http_pool import close_pooled_connections, pooled_urlopen as urlopen
 from ohlcv_hot_tail import (
+    canonical_date_frame,
     has_contiguous_timestamps,
     hot_tail_path,
     plan_candle_reconcile_windows,
@@ -232,6 +234,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional per-run report archive before later jobs replace latest reports.",
     )
+    parser.add_argument(
+        "--lock-timeout-seconds",
+        type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="Maximum dataset-writer lock wait; 0 makes one nonblocking attempt.",
+    )
     return parser.parse_args()
 
 
@@ -261,6 +269,9 @@ def _date_to_ms(date_str: str, *, end_of_day: bool) -> int:
 def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.is_empty() or "date" not in frame.columns:
         return frame
+    reused = canonical_date_frame(frame)
+    if reused is not None:
+        return reused
     normalized = frame.with_columns(
         pl.col("date")
         .str.to_datetime(strict=False)
@@ -619,23 +630,25 @@ class BybitClient:
                 code = str(payload.get("retCode"))
                 message = str(payload.get("retMsg") or "")
                 retriable_code = {"10006", "429", "10000", "10016"}
-                if code in retriable_code and attempt < self.max_retries:
+                if code in retriable_code:
                     self._defer_retry(attempt, headers=response_headers)
-                    continue
+                    if attempt < self.max_retries:
+                        continue
                 raise RuntimeError(f"Bybit API error retCode={code} retMsg={message}")
 
             except HTTPError as exc:
                 last_error = exc
-                if (
-                    exc.code in {403, 429, 500, 502, 503, 504}
-                    and attempt < self.max_retries
-                ):
+                if exc.code in {403, 429, 500, 502, 503, 504}:
+                    if exc.code == 403:
+                        close_pooled_connections()
                     self._defer_retry(
                         attempt,
                         headers=exc.headers,
                         minimum_seconds=600.0 if exc.code == 403 else 0.0,
                     )
-                    continue
+                    if attempt < self.max_retries:
+                        exc.close()
+                        continue
                 raise
             except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
@@ -1076,13 +1089,24 @@ def main() -> None:
     args = parse_args()
     if args.tail_only and (args.refresh or args.mode == "full"):
         raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
-    categories = _resolve_categories(args.categories)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lock_handle = (output_dir / ".download.lock").open("a+", encoding="utf-8")
-    if fcntl is not None:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    print(f"[bybit] acquired exclusive dataset lock: {lock_handle.name}", flush=True)
+    with exclusive_dataset_lock(
+        output_dir / ".download.lock", provider="bybit",
+        timeout_seconds=args.lock_timeout_seconds,
+    ) as acquisition:
+        _run_locked_download(
+            args, output_dir, started_at=started_at,
+            lock_wait_seconds=acquisition.wait_seconds,
+        )
+
+
+def _run_locked_download(
+    args: argparse.Namespace, output_dir: Path, *,
+    started_at: datetime, lock_wait_seconds: float,
+) -> None:
+    work_started_at = datetime.now(timezone.utc)
+    work_started = time.monotonic()
+    categories = _resolve_categories(args.categories)
 
     start_date = args.start_date.strip()
     end_date = resolve_end_date(args.end_date)
@@ -1234,6 +1258,7 @@ def main() -> None:
         current_codes={record.code for record in symbols},
     )
 
+    ended_at = datetime.now(timezone.utc)
     summary = {
         "asset_class": "crypto_bybit_perp",
         "interval": KLINE_INTERVAL_LABEL,
@@ -1250,7 +1275,11 @@ def main() -> None:
         "start_date": start_date,
         "end_date": end_date,
         "started_at_utc": started_at.isoformat(),
-        "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+        "ended_at_utc": ended_at.isoformat(),
+        "elapsed_seconds": (ended_at - started_at).total_seconds(),
+        "lock_wait_seconds": round(lock_wait_seconds, 6),
+        "work_started_at_utc": work_started_at.isoformat(),
+        "work_elapsed_seconds": round(time.monotonic() - work_started, 6),
     }
     atomic_write_text(
         summary_path,
@@ -1273,7 +1302,6 @@ def main() -> None:
     print(f"[bybit] download_report.csv -> {report_path}")
     print(f"[bybit] download_summary.json -> {summary_path}")
     print(f"[bybit] report: {json.dumps(summary, ensure_ascii=False)}")
-    lock_handle.close()
     if source_incomplete or pipeline_progress.current != pipeline_progress.total:
         raise RuntimeError(
             "Bybit download incomplete: "

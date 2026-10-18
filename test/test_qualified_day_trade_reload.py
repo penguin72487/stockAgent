@@ -1,4 +1,4 @@
-"""Discord-only updates must not interrupt execution or accept stale evidence."""
+"""Independent owner updates must not accept stale evidence or change accounts."""
 from copy import deepcopy
 from datetime import datetime, timedelta
 import json
@@ -126,6 +126,132 @@ def test_engine_still_requires_offsession_flat_and_no_pending_orders():
     assert len(reload.reload_plan(state, bot, sync, now=closed, discord_only=False)["services"]) == 2
 
 
+@pytest.mark.parametrize("change", ["in_session", "position", "pending_entry", "pending_reduction"])
+def test_engine_only_retains_every_flat_and_clock_guard(change):
+    state, bot, sync = receipts()
+    mode = state["modes"]["tw_day_trade_100m"]
+    mode["positions"]["2330"]["signed_shares"] = 0
+    mode["pending_entry_orders"].clear()
+    now = NOW.replace(hour=14)
+    if change == "in_session":
+        now = NOW
+    elif change == "position":
+        mode["positions"]["2330"]["signed_shares"] = -1000
+    else:
+        field = "pending_entry_orders" if change == "pending_entry" else "pending_reduction_orders"
+        mode[field] = {"2330": {"remaining": 1000}}
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = now.isoformat()
+    with pytest.raises(ValueError, match="off-session|nonflat|pending orders"):
+        reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+
+
+@pytest.mark.parametrize("change", [None, "old_engine", "new_bot", "wrong_ack", "old_code",
+                                    "wrong_signal", "broker_enabled", "ledger_unaccepted"])
+def test_engine_only_accepts_new_engine_not_new_bot_or_fake_gpu_residency(change):
+    state, bot, sync = receipts()
+    state["modes"]["tw_day_trade_100m"]["positions"].clear()
+    state["modes"]["tw_day_trade_100m"]["pending_entry_orders"].clear()
+    now = NOW.replace(hour=14)
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = now.isoformat()
+    bot["startup_inference_warmup"]["model_cache_resident_ready"] = False
+    plan = reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+    assert plan["services"] == [reload.SERVICES[1]]
+    bot["live_implementation_admission"] = {"code_sha256": "qualified", "entrypoint_sha256": "bot"}
+    bot["engine_run_id"] = sync["engine_run_id"] = "new-engine"
+    if change == "old_engine":
+        bot["engine_run_id"] = sync["engine_run_id"] = plan["engine_run_id"]
+    elif change == "new_bot":
+        bot["run_id"] = "different-bot"
+    elif change == "wrong_ack":
+        bot["engine_state_revision"] -= 1
+    elif change == "old_code":
+        bot["live_implementation_admission"]["code_sha256"] = "old"
+    elif change == "wrong_signal":
+        sync["modes"]["tw_day_trade_100m"]["signal_id"] = "changed"
+    elif change == "broker_enabled":
+        sync["production_order_possible"] = True
+    elif change == "ledger_unaccepted":
+        sync["ledger_integrity_ready"] = False
+    assert reload.native_ready(bot, sync, plan, now=now, expected_code="qualified", expected_entrypoint="bot") is (change is None)
+    assert bot["startup_inference_warmup"]["model_cache_resident_ready"] is False
+
+
+def test_selecting_both_independent_owners_is_not_an_engine_only_bypass():
+    with pytest.raises(ValueError, match="one independent owner"):
+        reload.reload_plan(*receipts(), now=NOW, discord_only=True, engine_only=True)
+    with pytest.raises(SystemExit):
+        from unittest.mock import patch
+        with patch("sys.argv", ["reload", "--engine-only", "--discord-only", "--apply"]):
+            reload.main()
+
+
+@pytest.mark.parametrize("change", [None, "stale_heartbeat", "future_heartbeat", "missing_commit",
+                                    "wrong_ack_commit", "heartbeat_before_commit", "malformed_heartbeat"])
+def test_idle_commit_age_is_not_heartbeat_age_and_unknown_liveness_fails_closed(change):
+    state, bot, sync = receipts()
+    state["modes"]["tw_day_trade_100m"]["positions"].clear()
+    state["modes"]["tw_day_trade_100m"]["pending_entry_orders"].clear()
+    now = NOW.replace(hour=14)
+    bot["updated_at"] = sync["heartbeat_at"] = now.isoformat()
+    bot["engine_published_at"] = sync["published_at"] = (now - timedelta(minutes=1)).isoformat()
+    if change == "stale_heartbeat":
+        sync["heartbeat_at"] = (now - timedelta(seconds=11)).isoformat()
+    elif change == "future_heartbeat":
+        sync["heartbeat_at"] = (now + timedelta(seconds=1)).isoformat()
+    elif change == "missing_commit":
+        sync.pop("published_at")
+    elif change == "wrong_ack_commit":
+        bot["engine_published_at"] = (now - timedelta(minutes=2)).isoformat()
+    elif change == "heartbeat_before_commit":
+        sync["published_at"] = bot["engine_published_at"] = (now + timedelta(seconds=1)).isoformat()
+    elif change == "malformed_heartbeat":
+        sync["heartbeat_at"] = None
+    if change is not None:
+        with pytest.raises(ValueError):
+            reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+        return
+    plan = reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+    bot["engine_run_id"] = sync["engine_run_id"] = "new-engine"
+    bot["live_implementation_admission"] = {"code_sha256": "qualified", "entrypoint_sha256": "bot"}
+    assert reload.native_ready(bot, sync, plan, now=now, expected_code="qualified", expected_entrypoint="bot")
+
+
+@pytest.mark.parametrize("field", ["pending_entry_orders", "pending_reduction_orders"])
+@pytest.mark.parametrize("change", [None, "remaining", "unknown_quantity", "bool_quantity",
+                                    "unsized", "missing_sizing", "working", "cancelled", "malformed"])
+def test_preserved_filled_rows_are_not_active_orders_but_ambiguous_rows_block(field, change):
+    state, bot, sync = receipts()
+    mode = state["modes"]["tw_day_trade_100m"]
+    mode["positions"].clear()
+    mode["pending_entry_orders"].clear()
+    order = {"status": "filled", "remaining_shares": 0, "sizing_pending": False}
+    mode[field] = {"2330": order}
+    now = NOW.replace(hour=14)
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = now.isoformat()
+    if change == "remaining":
+        order["remaining_shares"] = 1000
+    elif change == "unknown_quantity":
+        order.pop("remaining_shares")
+    elif change == "bool_quantity":
+        order["remaining_shares"] = False
+    elif change == "unsized":
+        order["sizing_pending"] = True
+    elif change == "missing_sizing":
+        order.pop("sizing_pending")
+    elif change in {"working", "cancelled"}:
+        order["status"] = change
+    elif change == "malformed":
+        mode[field]["2330"] = None
+    before = deepcopy(state)
+    if change is None:
+        plan = reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+        assert plan["pending_orders"] == 0 and plan["retained_terminal_orders"] == 1
+    else:
+        with pytest.raises(ValueError, match="pending orders"):
+            reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+    assert state == before
+
+
 def test_opening_protection_applies_even_to_discord_only():
     state, bot, sync = receipts()
     opening = NOW.replace(hour=9, minute=0)
@@ -193,8 +319,12 @@ def test_cli_default_is_plan_not_restart(tmp_path, monkeypatch):
     assert result["status"] == "planned" and not result["restart_requested"]
 
 
-@pytest.mark.parametrize("failure", [None, "prefix_changed", "protected_changed", "not_ready"])
-def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("engine_only,code_only", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("failure", [None, "prefix_changed", "protected_changed", "not_ready", "accounting_changed",
+                                    "preexisting_old_code", "preexisting_old_entrypoint", "malformed_admission",
+                                    "reported_current_code", "journal_fatal", "journal_pending", "slow_prefix_check",
+                                    "code_changed_during_start"])
+def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from scripts import audit_tw_day_trade_restart as audit
@@ -202,10 +332,17 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     import stockagent.config as config_module
 
     state, bot, sync = receipts()
+    now = NOW.replace(hour=14) if engine_only else NOW
+    if engine_only:
+        state["modes"]["tw_day_trade_100m"]["positions"].clear()
+        state["modes"]["tw_day_trade_100m"]["pending_entry_orders"].clear()
+        bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = now.isoformat()
+        bot["startup_inference_warmup"]["model_cache_resident_ready"] = False
     class Clock(datetime):
+        offset_seconds = 0
         @classmethod
         def now(cls, tz=None):
-            return NOW
+            return now + timedelta(seconds=cls.offset_seconds)
     paths = [tmp_path / name for name in ("state.json", "bot.json", "sync.json")]
     for path, value in zip(paths, (state, bot, sync)):
         path.write_text(json.dumps(value))
@@ -215,26 +352,60 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         (tmp_path / name).write_text("immutable ledger prefix\n")
     monkeypatch.setattr(reload, "datetime", Clock)
     monkeypatch.setattr(reload, "control_lease", lambda **_: nullcontext())
-    monkeypatch.setattr(cache, "implementation_identity", lambda: [{"qualified": "implementation"}])
+    code_changed = [False]
+    monkeypatch.setattr(cache, "implementation_identity", lambda: [{"qualified": "changed" if code_changed[0] else "implementation"}])
     expected = cache.identity_digest({"code": cache.implementation_identity()})
+    bot["live_implementation_admission"] = {"code_sha256": expected,
+        "entrypoint_sha256": cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")["sha256"]}
+    if code_only:
+        bot["live_implementation_admission"]["code_sha256"] = "old"
+        bot["startup_inference_warmup"].update(status="degraded", ready_count=0,
+            model_cache_resident_ready=False, markets=[{"market": "tw_day_trade_100m", "status": "failed",
+                "error_type": "LoadedImplementationChanged", "retryable": True}])
+        from scripts import verify_discord_gpu_idle_runtime as idle
+        monkeypatch.setattr(idle, "command_sync_since_restart", lambda: {
+            "commands_sync_or_deferred_observed": failure != "journal_pending",
+            "watchdog_or_fatal_observed": failure == "journal_fatal"})
+        if failure == "reported_current_code":
+            bot["live_implementation_admission"]["code_sha256"] = expected
+    preflight_mismatch = failure in {"preexisting_old_code", "preexisting_old_entrypoint", "malformed_admission"}
+    if failure == "preexisting_old_code":
+        bot["live_implementation_admission"]["code_sha256"] = "old"
+    elif failure == "preexisting_old_entrypoint":
+        bot["live_implementation_admission"]["entrypoint_sha256"] = "old"
+    elif failure == "malformed_admission":
+        bot["live_implementation_admission"] = "not a verified admission"
+    paths[1].write_text(json.dumps(bot))
     monkeypatch.setattr(market_config, "load_market_config", lambda _: SimpleNamespace(config_path="qualified.yaml"))
     monkeypatch.setattr(config_module, "load_config", lambda _: SimpleNamespace(data=SimpleNamespace(parquet_root="source")))
     monkeypatch.setattr(tw_public_source_guard, "live_tw_public_source_read_guard", lambda _: nullcontext())
     restarts = []
+    selected = reload.SERVICES[int(engine_only)]
 
     def owner(service):
-        changed = bool(restarts) and (service == reload.SERVICES[0] or failure == "protected_changed")
+        changed = bool(restarts) and (service == selected or failure == "protected_changed")
         return {"ActiveState": "active", "MainPID": "200" if changed else "100",
                 "InvocationID": "new" if changed else "original"}
 
     def restart(command, **kwargs):
-        assert command == ["systemctl", "restart", reload.SERVICES[0]]
+        assert command == ["systemctl", "restart", selected]
         restarts.append(command)
+        if failure == "code_changed_during_start":
+            code_changed[0] = True
+        bot["live_implementation_admission"] = {"code_sha256": expected,
+            "entrypoint_sha256": cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")["sha256"]}
         if failure != "not_ready":
-            bot.update(run_id="new-bot", live_implementation_admission={"code_sha256": expected,
-                "entrypoint_sha256": cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")["sha256"]})
-            bot["startup_inference_warmup"]["run_id"] = "new-bot"
+            if engine_only:
+                bot["engine_run_id"] = sync["engine_run_id"] = "new-engine"
+                paths[2].write_text(json.dumps(sync))
+            else:
+                bot["run_id"] = bot["startup_inference_warmup"]["run_id"] = "new-bot"
+                if code_only:
+                    bot["startup_inference_warmup"].update(status="pending", markets=[])
             paths[1].write_text(json.dumps(bot))
+        if failure == "accounting_changed":
+            state["modes"]["tw_day_trade_100m"]["cumulative_realized_net_pnl_twd"] = 123
+            paths[0].write_text(json.dumps(state))
         # Native append progress is allowed; rewriting a prior prefix is not.
         with (tmp_path / "events.jsonl").open("a") as handle:
             handle.write("native engine continued\n")
@@ -245,16 +416,150 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     monkeypatch.setattr(reload.subprocess, "run", restart)
     monkeypatch.setattr(reload, "read_service_ack_pair", lambda *_a, **_kw: (
         reload.read_object(paths[2]), reload.read_object(paths[1]), {"matched": True}))
+    if failure == "slow_prefix_check":
+        verify_prefix = audit.verify_prefix
+        def slow_prefix(*args, **kwargs):
+            result = verify_prefix(*args, **kwargs)
+            Clock.offset_seconds = 20
+            bot["updated_at"] = sync["heartbeat_at"] = (now+timedelta(seconds=20)).isoformat()
+            paths[1].write_text(json.dumps(bot))
+            paths[2].write_text(json.dumps(sync))
+            return result
+        monkeypatch.setattr(audit, "verify_prefix", slow_prefix)
     ticks = iter((0., 2.))
     monkeypatch.setattr(reload.time, "monotonic", lambda: next(ticks))
     output = tmp_path / "applied.json"
-    monkeypatch.setattr("sys.argv", ["reload", "--discord-only", "--apply", "--timeout-seconds", "1",
-                                    "--output", str(output)])
-    assert reload.main() == (0 if failure is None else 75)
+    monkeypatch.setattr("sys.argv", ["reload", "--engine-only" if engine_only else "--discord-only", "--apply", "--timeout-seconds", "1",
+                                    "--output", str(output), *(["--code-admission-only"] if code_only else [])])
+    accepted = failure is None or ((failure == "accounting_changed" or preflight_mismatch) and not engine_only)
+    accepted = accepted or (not code_only and failure in {"reported_current_code", "journal_fatal", "journal_pending"})
+    accepted = accepted or failure == "slow_prefix_check"
+    assert reload.main() == (0 if accepted else 75)
     result = json.loads(output.read_bytes())
+    if engine_only and preflight_mismatch or code_only and failure == "reported_current_code":
+        assert not restarts and not result["restart_requested"]
+        assert result["status"] == "blocked" and ("code admission" in result["error"] or "code drift" in result["error"])
+        return
     assert len(restarts) == 1 and result["restart_requested"]
-    assert result["status"] == ("accepted" if failure is None else "failed_after_restart")
-    if failure is None:
-        assert not result["engine_restarted"]
+    assert result["status"] == (("accepted_code_admission_only" if code_only else "accepted")
+                                if accepted else "failed_after_restart")
+    if failure == "code_changed_during_start":
+        assert result["error_type"] == "RuntimeError" and "code changed during startup" in result["error"]
+    if accepted:
+        if failure == "slow_prefix_check":
+            assert result["engine_heartbeat_at"] == (now+timedelta(seconds=20)).isoformat()
+        assert result["gpu_warmup_verified"] is not (code_only or engine_only)
+        if code_only:
+            assert result["gpu_warmup_verified"] is False
+            assert result["acceptance_scope"] == "loaded_code_gateway_ack_not_gpu_readiness"
+        assert result["engine_restarted"] is engine_only
+        assert result["inventory_restored_exactly"] is engine_only
         assert result["protected_before"] == result["protected_after"]
+        if engine_only:
+            assert reload.SERVICES[0] in result["protected_after"]
+            assert result["new_discord_run_id"] == "old-bot"
+            assert result["native_warmup"]["model_cache_resident_ready"] is False
         assert audit.verify_prefix(tmp_path, {"inputs": result["ledger_inputs"]}) == result["ledger_prefixes"]
+
+
+def code_drift_receipts():
+    state, bot, sync = receipts()
+    bot["startup_inference_warmup"].update(status="degraded", ready_count=0,
+        model_cache_resident_ready=False, markets=[{"market": "tw_day_trade_100m", "status": "failed",
+            "error_type": "LoadedImplementationChanged", "retryable": True}])
+    return state, bot, sync
+
+
+@pytest.mark.parametrize("change", [None, "old_run", "unknown_error", "not_retryable", "missing_mode",
+    "duplicate_mode", "wrong_mode", "unknown_status", "not_degraded", "resident", "ready_count",
+    "bool_ready_count", "bool_market_count", "nonlist_rows", "malformed_market", "duplicate_enabled"])
+def test_code_drift_recovery_is_explicit_complete_and_same_run(change):
+    state, bot, sync = code_drift_receipts()
+    w = bot["startup_inference_warmup"]
+    if change == "old_run": w["run_id"] = "another"
+    elif change == "unknown_error": w["markets"][0]["error_type"] = "OutOfMemoryError"
+    elif change == "not_retryable": w["markets"][0]["retryable"] = False
+    elif change == "missing_mode": w["markets"].clear()
+    elif change == "duplicate_mode": w["markets"] *= 2
+    elif change == "wrong_mode": w["markets"][0]["market"] = "different"
+    elif change == "unknown_status": w["markets"][0]["status"] = "running"
+    elif change == "not_degraded": w["status"] = "running"
+    elif change == "resident": w["model_cache_resident_ready"] = True
+    elif change == "ready_count": w["ready_count"] = 1
+    elif change == "bool_ready_count": w["ready_count"] = False
+    elif change == "bool_market_count": w["market_count"] = True
+    elif change == "nonlist_rows": w["markets"] = {}
+    elif change == "malformed_market": w["markets"][0]["market"] = []
+    elif change == "duplicate_enabled":
+        state["enabled_markets"] *= 2
+        w["markets"] *= 2
+        w["market_count"] = 2
+    with pytest.raises(ValueError, match="warmup"):
+        reload.reload_plan(state, bot, sync, now=NOW, discord_only=True)
+    if change is None:
+        plan = reload.reload_plan(state, bot, sync, now=NOW, discord_only=True, code_admission_only=True)
+        assert plan["code_admission_only"] and plan["services"] == [reload.SERVICES[0]]
+    else:
+        with pytest.raises(ValueError, match="warmup"):
+            reload.reload_plan(state, bot, sync, now=NOW, discord_only=True, code_admission_only=True)
+
+
+@pytest.mark.parametrize("change", ["busy", "opening", "stale", "wrong_ack", "broker"])
+def test_code_recovery_does_not_bypass_existing_guards(change):
+    state, bot, sync = code_drift_receipts()
+    now = NOW
+    if change == "busy": bot["interactive_signal_jobs"]["queued_count"] = 1
+    elif change == "opening":
+        now = NOW.replace(hour=9, minute=0)
+        bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = now.isoformat()
+    elif change == "stale": bot["updated_at"] = (NOW-timedelta(seconds=11)).isoformat()
+    elif change == "wrong_ack": sync["modes"]["tw_day_trade_100m"]["signal_id"] = "wrong"
+    elif change == "broker": sync["production_order_possible"] = True
+    with pytest.raises(ValueError):
+        reload.reload_plan(state, bot, sync, now=now, discord_only=True, code_admission_only=True)
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "disabled", "ready", "degraded", "unknown"])
+def test_code_admission_never_claims_deferred_gpu_residency(status):
+    state, bot, sync = receipts()
+    plan = reload.reload_plan(state, bot, sync, now=NOW, discord_only=True, code_admission_only=True)
+    bot.update(run_id="fresh", live_implementation_admission={"code_sha256": "qualified", "entrypoint_sha256": "bot"})
+    bot["startup_inference_warmup"].update(run_id="fresh", status=status, model_cache_resident_ready=False)
+    assert reload.native_ready(bot, sync, plan, now=NOW, expected_code="qualified", expected_entrypoint="bot") is (
+        status in {"pending", "running", "disabled", "ready"})
+    assert not reload.native_ready(bot, sync, {**plan, "code_admission_only": False}, now=NOW,
+                                   expected_code="qualified", expected_entrypoint="bot")
+    bot["live_implementation_admission"]["code_sha256"] = "old"
+    assert not reload.native_ready(bot, sync, plan, now=NOW, expected_code="qualified", expected_entrypoint="bot")
+
+
+def test_code_admission_cannot_select_an_engine(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="independent Discord"):
+        reload.reload_plan(*receipts(), now=NOW, code_admission_only=True)
+    monkeypatch.setattr("sys.argv", ["reload", "--engine-only", "--code-admission-only", "--apply"])
+    with pytest.raises(SystemExit): reload.main()
+
+
+@pytest.mark.parametrize("matched", [True, False])
+def test_plan_uses_original_coherent_pair_not_three_independent_reads(tmp_path, monkeypatch, matched):
+    from contextlib import nullcontext
+    state, bot, sync = code_drift_receipts()
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None): return NOW
+    monkeypatch.setattr(reload, "datetime", Clock)
+    monkeypatch.setattr(reload, "control_lease", lambda **_: nullcontext())
+    monkeypatch.setattr(reload, "read_object", lambda path: state if path == reload.STATE_PATH
+                        else pytest.fail("split native-pair read"))
+    observations = []
+    def pair(*args, **kwargs):
+        observations.append((args, kwargs))
+        return sync, bot, {"matched": matched}
+    monkeypatch.setattr(reload, "read_service_ack_pair", pair)
+    monkeypatch.setattr(reload, "owner", lambda _: {"ActiveState": "active"})
+    monkeypatch.setattr(reload.subprocess, "run", lambda *a, **kw: pytest.fail("plan changed a service"))
+    output = tmp_path / "plan.json"
+    monkeypatch.setattr("sys.argv", ["reload", "--discord-only", "--code-admission-only", "--output", str(output)])
+    assert reload.main() == (0 if matched else 75)
+    assert len(observations) == 1 and observations[0][1]["timeout_seconds"] == 5.
+    assert json.loads(output.read_text())["restart_requested"] is False

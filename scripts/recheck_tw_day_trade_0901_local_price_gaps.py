@@ -207,7 +207,7 @@ def main() -> None:
     if args.minute_data_root:
         roots = tuple(path.resolve() for path in args.minute_data_root)
     else:
-        from scripts.rebuild_tw_day_trade_open_price_replay import DEFAULT_MINUTE_DATA_ROOTS
+        from stockagent.live.minute_source_paths import DEFAULT_LOCAL_MINUTE_ROOTS as DEFAULT_MINUTE_DATA_ROOTS
 
         roots = tuple(path.resolve() for path in DEFAULT_MINUTE_DATA_ROOTS)
     report = recheck(

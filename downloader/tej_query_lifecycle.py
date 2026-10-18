@@ -3,6 +3,7 @@ from contextlib import closing
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import uuid
@@ -99,9 +100,22 @@ def _execute_phase(bridge, root: Path, phase: str, output: Path, *, restart_pins
         f"-BridgeScript {bridge.quote(bridge.windows_path(bridge.repo/'scripts/tej_smart_wizard_bridge.ps1'))} "
         f"-Output {bridge.quote(bridge.windows_path(output))}}}"
         "catch{[Console]::Error.WriteLine($_.Exception.Message);[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1}")
+    # The systemd/boot relay can be Windows Session 0 while the owned Excel
+    # lives in the logged-in desktop. Reuse the SAME birth-pinned interactive
+    # relay as acquisition; an unrelated COM namespace cannot restore it.
+    environment = None
+    with closing(connect(root)) as con:
+        stored = con.execute("SELECT value FROM meta WHERE key='runtime_policy'").fetchone()
+    startup = (json.loads(stored[0]).get('desktop_startup') or {}) if stored else {}
+    if startup.get('enabled') is True:
+        from downloader.tej_startup import interactive_transport
+        relay = interactive_transport(root)
+        command = ("if([Diagnostics.Process]::GetCurrentProcess().SessionId -ne "
+                   + str(relay['windows_session_id']) + "){exit 77};" + command)
+        environment = {**os.environ, 'WSL_INTEROP': relay['interop_socket']}
     try:
         result=subprocess.run(['/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe',
-            '-NoProfile','-NonInteractive','-Command',command],capture_output=True,timeout=60)
+            '-NoProfile','-NonInteractive','-Command',command],capture_output=True,timeout=60,env=environment)
     except subprocess.TimeoutExpired:
         raise RuntimeError('query_lifecycle_phase_unresolved_no_repeat') from None
     if result.returncode or not output.is_file():

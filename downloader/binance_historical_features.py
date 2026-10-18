@@ -19,10 +19,14 @@ from tqdm import tqdm
 try:
     from .artifact_io import atomic_write_parquet
     from .feature_stage_timing import feature_run_summary_path, stage_latency_summary
+    from .feature_overlay import (feature_coverage, latest_non_null_ms as _latest_non_null_ms,
+                                  overlay_feature_frame as _overlay_feature_frame)
     from .ohlcv_hot_tail import hot_tail_path
 except ImportError:  # direct execution/import from downloader/
     from artifact_io import atomic_write_parquet
     from feature_stage_timing import feature_run_summary_path, stage_latency_summary
+    from feature_overlay import (feature_coverage, latest_non_null_ms as _latest_non_null_ms,
+                                 overlay_feature_frame as _overlay_feature_frame)
     from ohlcv_hot_tail import hot_tail_path
 
 
@@ -48,8 +52,16 @@ KLINE_REQUEST_WEIGHT = 2.0
 FUNDING_LIMIT = 1000
 SHORT_HISTORY_LIMIT = 500
 # Binance rejects queries older than its rolling 30-day statistics window.
-# One hour of guard avoids a race at the exact moving boundary.
-SHORT_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000 - 60 * 60 * 1000
+# The clock advances per worker/stage. One native period protects the moving
+# request boundary without permanently discarding an unnecessary hour of data.
+SHORT_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000 - STATISTICS_INTERVAL_MS
+STATISTICS_CLOCK_KEY = b"stockagent.binance.statistics_clock"
+STATISTICS_CLOCK_CONTRACT = b"period-start-available-at-close-v1"
+START_STAMPED_COLUMNS = (
+    "binance_taker_buy_volume", "binance_taker_sell_volume", "binance_taker_buy_sell_ratio",
+    "binance_basis_index_price", "binance_basis_futures_price", "binance_basis_value",
+    "binance_basis_rate", "binance_basis_annualized_rate",
+)
 
 FEATURE_STAGE_IDS = (
     "mark_price",
@@ -269,6 +281,7 @@ def feature_catalog_payload() -> dict[str, Any]:
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "bar": KLINE_BAR,
         "statistics_period": STATISTICS_PERIOD,
+        "statistics_clock_contract": STATISTICS_CLOCK_CONTRACT.decode(),
         "causal_clock": {
             "event_ts": "timestamp assigned by Binance to the source observation",
             "published_at": "source publication time when supplied; otherwise event boundary",
@@ -301,24 +314,30 @@ def _read_parquet(path: Path) -> pl.DataFrame:
     return pl.from_arrow(pq.read_table(path, memory_map=True))
 
 
+def preserved_statistics_clock(paths: list[Path]) -> dict[bytes, bytes]:
+    """Carry the clock proof through candle-only merges, never through unknown rows.
+
+    Fresh candles have no statistics. Any contributing source with statistics
+    columns but no matching proof makes the merged file require one migration.
+    A footer is not evidence of coverage, only of this writer's alignment ABI.
+    """
+    certified = False
+    for path in paths:
+        if not path.is_file():
+            continue
+        schema = pq.read_schema(path)
+        if set(START_STAMPED_COLUMNS).intersection(schema.names):
+            if (schema.metadata or {}).get(STATISTICS_CLOCK_KEY) != STATISTICS_CLOCK_CONTRACT:
+                return {}
+            certified = True
+    return {STATISTICS_CLOCK_KEY: STATISTICS_CLOCK_CONTRACT} if certified else {}
+
+
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
-
-
-def _latest_non_null_ms(
-    frame: pl.DataFrame,
-    column: str,
-    fallback_start_ms: int,
-) -> int:
-    if column not in frame.columns or "date" not in frame.columns:
-        return fallback_start_ms
-    available = frame.filter(pl.col(column).is_not_null())
-    if available.is_empty():
-        return fallback_start_ms
-    latest = available.select(_datetime_ms_expr("date").max()).item()
-    if latest is None:
-        return fallback_start_ms
-    return max(fallback_start_ms, int(latest) - CANDLE_INTERVAL_MS)
+    table = frame.to_arrow().replace_schema_metadata({
+        STATISTICS_CLOCK_KEY: STATISTICS_CLOCK_CONTRACT,
+    })
+    atomic_write_parquet(path, table, compression="snappy", write_statistics=True)
 
 
 def _timestamp_from_row(row: Any, field: str | int) -> int | None:
@@ -574,32 +593,6 @@ def _materialize_funding_asof(
     )
 
 
-def _overlay_feature_frame(
-    base: pl.DataFrame,
-    fresh: pl.DataFrame,
-    columns: tuple[str, ...],
-) -> pl.DataFrame:
-    if fresh.is_empty():
-        return base
-    fresh_columns = [column for column in columns if column in fresh.columns]
-    if not fresh_columns:
-        return base
-    renamed = fresh.select(["date", *fresh_columns]).rename(
-        {column: f"__fresh_{column}" for column in fresh_columns}
-    )
-    joined = base.join(renamed, on="date", how="left")
-    expressions: list[pl.Expr] = []
-    for column in fresh_columns:
-        incoming = pl.col(f"__fresh_{column}")
-        if column in joined.columns:
-            expressions.append(pl.coalesce([incoming, pl.col(column)]).alias(column))
-        else:
-            expressions.append(incoming.alias(column))
-    return joined.with_columns(expressions).drop(
-        [f"__fresh_{column}" for column in fresh_columns]
-    )
-
-
 def _ensure_raw_columns(frame: pl.DataFrame) -> pl.DataFrame:
     missing = [
         pl.lit(None, dtype=pl.Float64).alias(column)
@@ -746,18 +739,7 @@ def _add_derived_features(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _coverage_summary(frame: pl.DataFrame) -> dict[str, Any]:
-    coverage: dict[str, Any] = {}
-    for family, column in FAMILY_PRIMARY_COLUMN.items():
-        if column not in frame.columns:
-            coverage[family] = {"rows": 0, "start": None, "end": None}
-            continue
-        selected = frame.filter(pl.col(column).is_not_null())
-        coverage[family] = {
-            "rows": selected.height,
-            "start": selected["date"].min() if not selected.is_empty() else None,
-            "end": selected["date"].max() if not selected.is_empty() else None,
-        }
-    return coverage
+    return feature_coverage(frame, FAMILY_PRIMARY_COLUMN)
 
 
 def enrich_symbol_historical_features(
@@ -772,6 +754,7 @@ def enrich_symbol_historical_features(
 ) -> HistoricalFeatureResult:
     started = time.perf_counter()
     original = _read_parquet(output_path)
+    aligned_statistics = bool(preserved_statistics_clock([output_path]))
     frame = original
     stage_status: dict[str, str] = {}
     errors: dict[str, str] = {}
@@ -788,7 +771,6 @@ def enrich_symbol_historical_features(
     observation_ms = observed_at_ms or int(
         datetime.now(timezone.utc).timestamp() * 1000
     )
-    short_start_floor = observation_ms - SHORT_HISTORY_RETENTION_MS
 
     def run_stage(stage: str, fn: Callable[[], None]) -> None:
         stage_started = time.perf_counter()
@@ -896,19 +878,42 @@ def enrich_symbol_historical_features(
     ) -> Callable[[], None]:
         def execute() -> None:
             nonlocal frame
-            if timestamp_semantics == "period_start":
+            if timestamp_semantics == "period_start" and not aligned_statistics:
                 # Previously these start-stamped observations were attached
                 # before their 5m window closed.  The upstream retains only
                 # 30 days, so unrecoverable older misaligned values must be
-                # masked, not silently left in the training table.
+                # masked once, not on every refresh. A versioned Parquet clock
+                # proof preserves verified history beyond the source's 30 days.
                 frame = frame.with_columns(
                     [pl.lit(None, dtype=pl.Float64).alias(column) for column in field_map.values()]
                 )
+            # Queued symbols and previous stages can take hours. Retention is
+            # relative to request time, not the beginning of a long batch.
+            short_start_floor = (
+                observation_ms + int((time.perf_counter() - started) * 1000)
+                - SHORT_HISTORY_RETENTION_MS
+            )
+            incremental_start = _latest_non_null_ms(
+                frame, FAMILY_PRIMARY_COLUMN[stage], dataset_start_ms
+            )
+            # The shared planner deliberately re-reads one 1m bar of overlap.
+            # Recover the observed point, not an assumed exclusive cursor.
+            last_observation = incremental_start + CANDLE_INTERVAL_MS
+            if (
+                incremental_start > dataset_start_ms
+                and (last_observation + CANDLE_INTERVAL_MS) % STATISTICS_INTERVAL_MS == 0
+                and last_observation + STATISTICS_INTERVAL_MS > closed_end_ms
+            ):
+                # An observed native 5m point establishes its phase. Until the
+                # next period closes there is no new statistic to request.
+                # Unknown/legacy phases still query; never postpone a due row.
+                return
+            source_to_bar_shift = (
+                STATISTICS_INTERVAL_MS - CANDLE_INTERVAL_MS
+                if timestamp_semantics == "period_start" else -CANDLE_INTERVAL_MS
+            )
             feature_start = max(
-                short_start_floor,
-                _latest_non_null_ms(
-                    frame, FAMILY_PRIMARY_COLUMN[stage], dataset_start_ms
-                ),
+                short_start_floor + source_to_bar_shift, incremental_start,
             )
             if feature_start > closed_end_ms:
                 return
@@ -916,11 +921,10 @@ def enrich_symbol_historical_features(
                 client,
                 path,
                 {**base_params, "period": STATISTICS_PERIOD},
-                start_ms=(
-                    feature_start - STATISTICS_INTERVAL_MS
-                    if timestamp_semantics == "period_start"
-                    else feature_start
-                ),
+                # Retention is in source timestamps, while incremental_start
+                # is in 1m bar-open/availability timestamps. Invert that clock
+                # exactly; subtracting an extra 5m crossed the live 30d floor.
+                start_ms=max(short_start_floor, feature_start - source_to_bar_shift),
                 end_ms=(
                     closed_end_ms + CANDLE_INTERVAL_MS
                     if timestamp_semantics == "period_end"
@@ -1066,7 +1070,7 @@ def enrich_symbol_historical_features(
     frame = _add_derived_features(frame)
     stage_elapsed_seconds["derive"] = round(time.perf_counter() - stage_started, 6)
     stage_started = time.perf_counter()
-    changed = not original.equals(frame)
+    changed = not aligned_statistics or not original.equals(frame)
     stage_elapsed_seconds["compare"] = round(time.perf_counter() - stage_started, 6)
     if changed:
         stage_started = time.perf_counter()
@@ -1155,6 +1159,7 @@ def run_historical_feature_downloads(
         return []
     progress = _StageProgress(len(eligible), external_callback=stage_progress_callback)
     results: list[HistoricalFeatureResult] = []
+    batch_started = time.perf_counter()
 
     def worker(record: Any) -> HistoricalFeatureResult:
         base_path = output_dir / f"{record.code}_features.parquet"
@@ -1165,7 +1170,8 @@ def run_historical_feature_downloads(
             tail_path if tail_only and tail_path.is_file() else base_path,
             start_ms=start_ms,
             end_ms=end_ms,
-            observed_at_ms=observed_at_ms,
+            observed_at_ms=(observed_at_ms + int((time.perf_counter() - batch_started) * 1000)
+                            if observed_at_ms is not None else None),
             stage_callback=lambda stage, status: progress.update(
                 str(record.code), stage, status
             ),

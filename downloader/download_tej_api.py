@@ -135,8 +135,9 @@ def _partition_at_cap(con, task: dict, receipt: dict, api: TejTrialAPI) -> str:
 
 
 def run_queue(api: TejTrialAPI, *, max_pages: int = 500) -> dict:
-    from downloader.tej_value_priority import refresh_if_due
-    refresh_if_due(api.root.parent)
+    # Received source pages must still be recovered locally without quota.
+    # Global inventory/ranking is useful only when this owner can acquire new
+    # pages; never pay that cost before a quota/cooldown/auth short circuit.
     api.recover_saved_pages()
     with closing(connect(api.root)) as con:
         before = api.budget(con, api.now())
@@ -156,6 +157,8 @@ def run_queue(api: TejTrialAPI, *, max_pages: int = 500) -> dict:
         result = {**status(api), "pages_received_this_run": 0, "reason": str(exc)}
         atomic_write_json(api.root / "worker_status.json", result)
         return result
+    from downloader.tej_value_priority import refresh_if_due
+    refresh_if_due(api.root.parent)
     attempted = 0
     reason = "bounded_batch_finished"
     for _ in range(max_pages):

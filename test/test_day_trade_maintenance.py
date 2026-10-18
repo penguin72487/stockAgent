@@ -104,10 +104,11 @@ def test_schedule_update_does_not_expand_an_existing_all_policy(tmp_path, schedu
     assert path.read_text().startswith(original)
 
 
-def test_consumer_recovery_never_replays_an_unpromoted_operation(tmp_path):
+@pytest.mark.parametrize("operation", ["add_independent_mode", "extend_history"])
+def test_consumer_recovery_never_replays_an_unpromoted_operation(tmp_path, operation):
     from types import SimpleNamespace
-    plan = {"operation": "add_independent_mode", "replacement": {"stable_market_id": "fifth"},
+    plan = {"operation": operation, "replacement": {"stable_market_id": "fifth"},
             "history": {}, "active_markets": ["fifth"], "current_deployment": {"matches": True}}
     with pytest.raises(ValueError, match="already-promoted"):
-        switch._recover_promoted_addition(SimpleNamespace(), plan,
+        switch._recover_promoted_consumers(SimpleNamespace(), plan,
             {"status": "failed_retryable", "promotion_completed": False})

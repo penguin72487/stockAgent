@@ -47,7 +47,7 @@ def test_explicit_incremental_sources_retain_original_observation_guards(provide
     assert not any((source.feeds, source.sitemaps, source.wordpress_apis, source.cnyes_apis,
                     source.index_pages, source.incremental_index_pages, source.fulltext_feeds))
     if provider == 'ftvnews':
-        assert source.embedded_article_layout == 'ftv_visible_article_v1'
+        assert source.embedded_article_layout == 'ftv_visible_article_v7'
         assert source.selectors == ('#contentarea[itemprop=articleBody]',)
     else:
         assert source.selectors == ('.post-content-single > .post-item > .post-content-details',)

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen as archive_urlopen
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -40,6 +40,7 @@ from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
 from candle_columns import numeric_candle_page  # noqa: E402
 from quality_priority import collect_with_quality_priority, prioritize_records  # noqa: E402
 from http_transport import RETRYABLE_NETWORK_ERRORS  # noqa: E402
+from http_pool import pooled_urlopen as urlopen  # noqa: E402
 from dataset_lock import (  # noqa: E402
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     exclusive_dataset_lock,
@@ -55,6 +56,7 @@ from okx_historical_features import (  # noqa: E402
     stage_latency_summary,
 )
 from ohlcv_hot_tail import (
+    canonical_date_frame,
     plan_candle_reconcile_windows,  # noqa: E402
     hot_tail_path,
     read_logical_parquet,
@@ -239,6 +241,9 @@ def _date_to_ms(date_str: str, *, end_of_day: bool) -> int:
 def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.is_empty() or "date" not in frame.columns:
         return frame
+    reused = canonical_date_frame(frame)
+    if reused is not None:
+        return reused
     normalized = frame.with_columns(
         pl.col("date")
         .str.to_datetime(strict=False)
@@ -251,6 +256,12 @@ def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
         .alias("date")
     )
     return normalized.drop_nulls("date").sort("date")
+
+
+INSTRUMENT_RATE_LIMITED_PROFILES = frozenset({
+    "okx_funding_rate_history", "okx_open_interest_history", "okx_taker_volume_contract",
+    "okx_long_short_account_ratio", "okx_top_trader_account_ratio", "okx_top_trader_position_ratio",
+})
 
 
 class OkxClient:
@@ -280,6 +291,12 @@ class OkxClient:
             "/api/v5/market/history-index-candles": "okx_history_index_candles",
             "/api/v5/market/index-candles": "okx_index_candles",
             "/api/v5/public/funding-rate-history": "okx_funding_rate_history",
+            "/api/v5/public/market-data-history": "okx_market_data_history",
+            "/api/v5/rubik/stat/contracts/open-interest-history": "okx_open_interest_history",
+            "/api/v5/rubik/stat/taker-volume-contract": "okx_taker_volume_contract",
+            "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract": "okx_long_short_account_ratio",
+            "/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader": "okx_top_trader_account_ratio",
+            "/api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader": "okx_top_trader_position_ratio",
         }
         profile_name = profile_by_path.get(path)
         interval = self.request_interval
@@ -287,7 +304,7 @@ class OkxClient:
         if profile_name is not None:
             interval = max(interval, provider_rate_limit(profile_name).interval_seconds)
             limiter_name = profile_name
-        if path == "/api/v5/public/funding-rate-history":
+        if profile_name in INSTRUMENT_RATE_LIMITED_PROFILES:
             instrument = str((params or {}).get("instId") or "unknown")
             limiter_name = f"{limiter_name}:{instrument}"
 
@@ -313,7 +330,7 @@ class OkxClient:
                     "interval_seconds": limiter.interval_seconds,
                     "limiter_count": 0,
                     "sharing_scope": (
-                        "per_instrument" if endpoint == "okx_funding_rate_history"
+                        "per_instrument" if endpoint in INSTRUMENT_RATE_LIMITED_PROFILES
                         else "per_endpoint"
                     ),
                     "grants_total": 0,
@@ -369,14 +386,15 @@ class OkxClient:
                 msg = str(payload.get("msg") or "")
                 code = str(payload.get("code") or "")
                 retriable_code = {"50011", "50040", "50061"}
-                if code in retriable_code and attempt < self.max_retries:
+                if code in retriable_code:
                     self._defer_retry(limiter, attempt, retry_after=retry_after)
-                    continue
+                    if attempt < self.max_retries:
+                        continue
                 raise RuntimeError(f"OKX API error code={code} msg={msg}")
 
             except HTTPError as exc:
                 last_error = exc
-                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                if exc.code in {429, 500, 502, 503, 504}:
                     self._defer_retry(
                         limiter,
                         attempt,
@@ -386,7 +404,9 @@ class OkxClient:
                             else None
                         ),
                     )
-                    continue
+                    if attempt < self.max_retries:
+                        exc.close()
+                        continue
                 raise
             except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
@@ -412,11 +432,11 @@ class OkxClient:
                 },
             )
             try:
-                with urlopen(req, timeout=60) as response:
+                with archive_urlopen(req, timeout=60) as response:
                     return response.read()
             except HTTPError as exc:
                 last_error = exc
-                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                if exc.code in {429, 500, 502, 503, 504}:
                     self._defer_retry(
                         limiter,
                         attempt,
@@ -426,7 +446,9 @@ class OkxClient:
                             else None
                         ),
                     )
-                    continue
+                    if attempt < self.max_retries:
+                        exc.close()
+                        continue
                 raise
             except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
@@ -1052,8 +1074,6 @@ def _run_locked_download(
     symbols = _fetch_swap_symbols(client, limit=None if args.symbols else args.limit)
     report_root = output_dir
     if args.symbols:
-        if not args.skip_historical_features:
-            raise ValueError('--symbols quality repair requires --skip-historical-features')
         wanted = set(args.symbols)
         symbols = [row for row in symbols if row.code in wanted or row.okx_symbol in wanted]
         if wanted - {value for row in symbols for value in (row.code, row.okx_symbol)}:

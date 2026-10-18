@@ -5,6 +5,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+import json
 import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
@@ -108,6 +109,8 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
     timing = result[0].transport_timing
     assert timing is not None
     assert timing["clock"] == "monotonic_durations_and_utc_wall_timestamps"
+    assert timing["server_pid"] > 0
+    assert timing["server_receiver_thread"] == threading.current_thread().name
     assert timing["server_provider_fetch_ms"] >= 0.0
     assert timing["server_snapshot_serialize_ms"] >= 0.0
     assert timing["client_round_trip_ms"] >= 0.0
@@ -557,6 +560,42 @@ def test_mis_empty_probe_invalidates_previous_readiness_and_closes_session(monke
     assert closed == [True]
 
 
+def test_optional_mis_warmup_never_holds_up_real_quote_workers(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    probe_started, release_probe = threading.Event(), threading.Event()
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.cookies = requests.cookies.RequestsCookieJar()
+
+        def get(self, _url, params=None, **_kwargs):
+            if params is None:
+                probe_started.set()
+                assert release_probe.wait(timeout=3)
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                json=lambda: {"msgArray": [{"c": "2330", "z": "101", "o": "100"}]})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        probe = pool.submit(quote_provider.warm_tw_mis_quote_client, force=True)
+        try:
+            assert probe_started.wait(timeout=1)
+            work = pool.submit(fetch_tw_mis_last_prices, ["2330"], np.array([np.nan]),
+                parquet_root=tmp_path, empty_chunk_retry_attempts=0, on_progress=lambda *_args: None)
+            result = work.result(timeout=1)
+            assert not release_probe.is_set()
+            assert result.open_prices[0] == 100
+        finally:
+            release_probe.set()
+        assert probe.result(timeout=2)["ready"]
+
+
 def test_tw_mis_opening_snapshot_persists_same_session_observation(
     monkeypatch,
     tmp_path,
@@ -637,6 +676,130 @@ def test_mis_failed_requests_keep_safe_transport_evidence(monkeypatch, tmp_path)
     assert snapshot.transport_timing["mis_failure_types"] == ["ConnectionError"]
     assert "private credential" not in str(snapshot.transport_timing)
     assert not np.isfinite(snapshot.open_prices).any()
+
+
+def test_mis_timeout_burst_defers_unsent_scope_instead_of_waiting_every_wave(monkeypatch, tmp_path):
+    symbols = [f"{index:04d}" for index in range(2301)]
+    monkeypatch.setattr(quote_provider, "_tw_mis_candidates", lambda symbol, _yahoo: [f"tse_{symbol}.tw"])
+    class TimeoutSession:
+        def __init__(self):
+            self.headers = {}
+        def get(self, *_args, **_kwargs):
+            raise quote_provider.requests.ReadTimeout("private URL must not persist")
+        def close(self):
+            pass
+    monkeypatch.setattr(quote_provider.requests, "Session", TimeoutSession)
+    snapshot = fetch_tw_mis_last_prices(symbols, np.full(2301, np.nan), parquet_root=tmp_path,
+        max_parallel_requests=4, request_timeout_seconds=4, empty_chunk_retry_attempts=2,
+        on_progress=lambda *_args: None)
+    timing = snapshot.transport_timing
+    assert timing["mis_dispatch_stopped"]
+    assert timing["mis_dispatch_stop_reason"] == "consecutive_transport_failures"
+    assert timing["mis_request_count"] == 4
+    assert timing["mis_deferred_channel_count"] == 2301 - 4 * 80
+    assert timing["mis_retry_rounds"] == 0
+    assert snapshot.requested_count == 2301 and snapshot.available_count == 0
+    assert "private URL" not in str(timing)
+    assert all(row["failure_phase"] == "connect_tls_or_response_headers" for row in timing["mis_requests"])
+
+
+def test_mis_isolated_timeout_restores_parallel_pipeline_on_healthy_peer(monkeypatch, tmp_path):
+    import threading
+    barrier = threading.Barrier(4)
+    failed = threading.Event()
+    symbols = [f"{index:04d}" for index in range(12)]
+    monkeypatch.setattr(quote_provider, "_tw_mis_candidates", lambda symbol, _yahoo: [f"tse_{symbol}.tw"])
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, *_args, params, **_kwargs):
+            code = params["ex_ch"].split("_")[1].split(".")[0]
+            if int(code) < 4:
+                barrier.wait(timeout=2)
+            if code == "0000":
+                failed.set()
+                raise quote_provider.requests.ReadTimeout("isolated source failure")
+            assert failed.wait(timeout=2)
+            return _FakeMisResponse([{"c": code, "z": "101", "o": "100"}])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    result = fetch_tw_mis_last_prices(symbols, np.full(12, np.nan), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=4, empty_chunk_retry_attempts=0, on_progress=lambda *_: None)
+    assert result.available_count == 11
+    assert result.transport_timing["mis_request_count"] == 12
+    assert not result.transport_timing["mis_dispatch_stopped"]
+    assert result.transport_timing["mis_failed_request_count"] == 1
+
+
+def test_mis_timeout_guard_keeps_partial_success_and_reports_remaining_scope(monkeypatch, tmp_path):
+    symbols = [f"{index:04d}" for index in range(10)]
+    monkeypatch.setattr(quote_provider, "_tw_mis_candidates", lambda symbol, _yahoo: [f"tse_{symbol}.tw"])
+    class PartialSession:
+        def __init__(self):
+            self.headers = {}
+        def get(self, *_args, params, **_kwargs):
+            if params["ex_ch"] == "tse_0000.tw":
+                return _FakeMisResponse([{"c": "0000", "z": "101", "o": "100"}])
+            raise quote_provider.requests.ReadTimeout("unavailable source")
+        def close(self):
+            pass
+    monkeypatch.setattr(quote_provider.requests, "Session", PartialSession)
+    progress = []
+    snapshot = fetch_tw_mis_last_prices(symbols, np.full(10, np.nan), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=1, empty_chunk_retry_attempts=0,
+        on_progress=lambda names, _snapshot: progress.extend(names))
+    assert snapshot.requested_count == 10 and snapshot.available_count == 1
+    assert snapshot.open_prices[0] == 100 and progress == ["0000"]
+    assert not snapshot.available_mask[1:].any()
+    assert snapshot.transport_timing["mis_request_count"] == 5
+    assert snapshot.transport_timing["mis_deferred_channel_count"] == 5
+    assert snapshot.transport_timing["mis_dispatch_stopped"]
+
+
+@pytest.mark.parametrize("broken_body", [False, True])
+def test_mis_stream_separates_body_failure_and_closes_response(monkeypatch, tmp_path, broken_body):
+    from urllib3.exceptions import ReadTimeoutError
+    closed = []
+    class BodyResponse:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        @property
+        def content(self):
+            if broken_body:
+                raise quote_provider.requests.ConnectionError(ReadTimeoutError(None, "private", "secret"))
+            return b'{"msgArray":[{"c":"2330","o":"100","z":"101"}]}'
+        def json(self):
+            return json.loads(self.content)
+        def close(self):
+            closed.append(True)
+    class BodySession:
+        def __init__(self):
+            self.headers = {}
+        def get(self, *_args, stream, **_kwargs):
+            assert stream is True
+            return BodyResponse()
+        def close(self):
+            pass
+    monkeypatch.setattr(quote_provider.requests, "Session", BodySession)
+    snapshot = fetch_tw_mis_last_prices(["2330"], np.array([np.nan]), parquet_root=tmp_path,
+        max_parallel_requests=1, empty_chunk_retry_attempts=0, on_progress=lambda *_args: None)
+    row = snapshot.transport_timing["mis_requests"][0]
+    assert closed == [True]
+    assert row["http_headers_ms"] >= 0 and row["worker_queue_ms"] >= 0
+    if broken_body:
+        assert row["failure_phase"] == "body_read" and row["http_status"] == 200
+        assert "ReadTimeoutError" in row["error_chain_types"]
+        assert snapshot.available_count == 0 and "secret" not in str(row)
+    else:
+        assert row["body_read_ms"] >= 0 and row["json_decode_ms"] >= 0
+        assert row["body_bytes"] == len(BodyResponse().content)
+        assert snapshot.available_count == 1 and snapshot.open_prices[0] == 100
 
 
 def test_fetch_tw_mis_retries_empty_chunks_without_using_last_as_open(monkeypatch, tmp_path) -> None:
@@ -771,6 +934,167 @@ def test_tw_opening_snapshot_is_single_flight_and_shared_across_models(
     np.testing.assert_allclose(first.open_prices, [101.0, 201.0])
     np.testing.assert_allclose(second.open_prices, [201.0])
     assert second.source.endswith("+cache_hit")
+
+
+def test_opening_row_projection_reuses_only_immutable_rows_and_still_checks_ttl(monkeypatch, tmp_path, opening_clock):
+    day = opening_clock.date().isoformat()
+    stamp = int(opening_clock.timestamp() * 1000)
+    rows = {"A": (1., {"available": True, "price": 101., "open_prices": 100.,
+                        "timestamp_ms": stamp, "open_timestamp_ms": stamp, "source": "shioaji:fixture"}),
+            "B": (18., {"available": True, "price": 99., "timestamp_ms": stamp,
+                         "no_open_print_observed_ms": stamp, "source": "twse_tpex:mis"}),
+            "C": (1., {"available": True, "price": 99., "timestamp_ms": stamp})}
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", (str(tmp_path.resolve()), day))
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE", rows)
+    clock = SimpleNamespace(monotonic=lambda: 20.)
+    monkeypatch.setattr(quote_provider, "time", clock)
+    original = quote_provider._opening_row_has_open
+    validations = []
+    monkeypatch.setattr(quote_provider, "_opening_row_has_open", lambda row, date: (
+        validations.append(id(row)), original(row, date))[1])
+
+    def read():
+        return fetch_tw_mis_opening_snapshot(list("ABCD"), np.full(4, 50.),
+            parquet_root=tmp_path, allow_network=False, cache_ttl_seconds=15.)
+
+    result = read()
+    assert result.available_mask.tolist() == [True, True, False, False]
+    assert result.prices.tolist() == [101., 99., 50., 50.]
+    result.prices[0] = result.open_prices[0] = -999.
+    assert read().open_prices[0] == 100.
+    assert len(validations) == 3, "full-market wakes must not revalidate unchanged rows"
+    clock.monotonic = lambda: 36.
+    expired = read()
+    assert expired.available_mask.tolist() == [True, False, False, False]
+    assert expired.no_open_print_timestamps_ms.tolist() == [0, 0, 0, 0]
+    rows["A"] = (36., {**rows["A"][1], "price": 102., "bid_prices": 101.5})
+    changed = read()
+    assert changed.prices[0] == 102. and changed.bid_prices[0] == 101.5
+    assert len(validations) == 4
+
+
+def test_opening_columns_keep_axis_fallback_removal_and_generation_isolated(monkeypatch, tmp_path, opening_clock):
+    day = opening_clock.date().isoformat()
+    stamp = int(opening_clock.timestamp() * 1000)
+    root = str(tmp_path.resolve())
+    row = {"available": True, "price": 101., "open_prices": 100.,
+           "timestamp_ms": stamp, "open_timestamp_ms": stamp, "source": "shioaji:fixture"}
+    rows = {"A": (1., row)}
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", (root, day))
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE", rows)
+    monkeypatch.setattr(quote_provider, "time", SimpleNamespace(monotonic=lambda: 2.))
+    def read(names, fallback=None):
+        return fetch_tw_mis_opening_snapshot(names, np.full(len(names), 50.) if fallback is None else fallback,
+            parquet_root=tmp_path, allow_network=False)
+    first = read(["A", "missing"])
+    np.testing.assert_array_equal(read(["missing", "A"], np.array([60., 70.])).prices, [60., 101.])
+    first.open_prices[:] = first.bid_prices[:] = -100.
+    first.timestamps_ms[:] = 0
+    assert read(["A", "missing"]).open_prices[0] == 100.
+    assert read(["A", "missing"]).timestamps_ms[0] == stamp
+    del rows["A"]
+    removed = read(["A", "missing"], np.array([80., 90.]))
+    np.testing.assert_array_equal(removed.prices, [80., 90.])
+    assert not removed.available_mask.any() and np.isnan(removed.open_prices).all()
+    # Same key, new map object: none of the earlier row/view identities survive.
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE", {"A": (1., {**row, "open_prices": 102.})})
+    assert read(["A", "missing"]).open_prices[0] == 102.
+    for i in range(12):
+        read(["A", f"axis-{i}"])
+    assert len(quote_provider._TW_MIS_OPENING_COLUMNS) <= 8
+
+
+@pytest.mark.parametrize("field", ["open_prices", "volumes", "bid_volumes", "ask_volumes"])
+@pytest.mark.parametrize("dtype", [np.float64, np.float32, object, str])
+def test_opening_numeric_columns_preserve_scalar_normalization(field, dtype):
+    values = np.array([1.1, 0., -0., -1., np.nan, np.inf, -np.inf, 3.141592653589793], dtype=dtype)
+    expected = [quote_provider._snapshot_field_or_none(field, value) for value in values]
+    assert quote_provider._opening_numeric_column(field, values) == expected
+    if dtype is object:
+        values = np.array([True, False, "1,234.50", None, "-", "nan", "inf"], dtype=object)
+        assert quote_provider._opening_numeric_column(field, values) == [
+            quote_provider._snapshot_field_or_none(field, value) for value in values]
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("body,encoding", [
+    ('{"name":"台積電","large":123456789012345678901234567890}'.encode(), "utf-8"),
+    (b'\xef\xbb\xbf{"open":100}', None),
+    ('{"name":"台積電"}'.encode("utf-16"), None),
+    (b'{"name":"caf\xe9"}', "iso-8859-1"),
+    (b'{"name":"\xff"}', "utf-8"),
+    (b'{"name":"\xff"}', None),
+    (b'{"open":NaN,"high":Infinity}', "utf-8"),
+])
+def test_quote_response_decoder_preserves_requests_semantics(monkeypatch, body, encoding, native):
+    if not native:
+        monkeypatch.setattr(quote_provider.private_json, "_native", None)
+    response = requests.Response()
+    response._content, response.encoding, response.status_code = body, encoding, 200
+    expected = response.json()
+    actual = quote_provider._decode_quote_response(response, body)
+    assert json.dumps(actual, sort_keys=True, allow_nan=True) == json.dumps(expected, sort_keys=True, allow_nan=True)
+
+
+@pytest.mark.parametrize("conflicting_channels", [False, True])
+def test_mis_only_coalesces_ready_disjoint_rows_preserving_conflicts(monkeypatch, tmp_path, opening_clock, conflicting_channels):
+    from concurrent.futures import Future
+    class ImmediatePool:
+        def submit(self, function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+    class Session:
+        def __init__(self):
+            self.headers = {}
+        def get(self, _url, *, params, **_kwargs):
+            channel = params["ex_ch"]
+            code = channel.split("_", 1)[1].split(".", 1)[0]
+            price = 101. if channel.startswith("otc_") else 100.
+            return _FakeMisResponse([{"c": code, "z": str(price), "o": str(price),
+                "v": "1", "tlong": str(int(opening_clock.timestamp() * 1000))}])
+    monkeypatch.setattr(quote_provider, "_TW_MIS_HTTP_POOL", ImmediatePool())
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda _: {} if conflicting_channels else {
+        "2330": "2330.TW", "2317": "2317.TW"})
+    names = ["2330"] if conflicting_channels else ["2330", "2317"]
+    progress = []
+    result = fetch_tw_mis_last_prices(names, np.zeros(len(names)), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=2, empty_chunk_retry_attempts=0,
+        on_progress=lambda scope, snapshot: progress.append((scope, snapshot)))
+    assert result.transport_timing["mis_request_count"] == 2
+    assert result.transport_timing["mis_progress_batch_count"] == (2 if conflicting_channels else 1)
+    if conflicting_channels:
+        assert sorted(snapshot.open_prices[0] for _, snapshot in progress) == [100., 101.]
+        assert all(scope == ["2330"] for scope, _snapshot in progress)
+    else:
+        assert set(progress[0][0]) == set(names) and progress[0][1].available_count == 2
+    assert all((snapshot.timestamps_ms > 0).all() for _scope, snapshot in progress)
+    assert all((snapshot.exchange_timestamps_ms == int(opening_clock.timestamp() * 1000)).all()
+               for _scope, snapshot in progress)
+
+
+def test_mis_ready_cohort_never_waits_for_unfinished_peer(monkeypatch, tmp_path, opening_clock):
+    delivered = threading.Event()
+    class Session:
+        def __init__(self):
+            self.headers = {}
+        def get(self, _url, *, params, **_kwargs):
+            code = params["ex_ch"].split("_", 1)[1].split(".", 1)[0]
+            if code == "2317":
+                assert delivered.wait(2.), "the fast batch was withheld behind an unfinished peer"
+            return _FakeMisResponse([{"c": code, "z": "100", "o": "100", "v": "1",
+                                      "tlong": str(int(opening_clock.timestamp() * 1000))}])
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda _: {"2330": "2330.TW", "2317": "2317.TW"})
+    batches = []
+    def progress(names, _snapshot):
+        batches.append(names)
+        if names == ["2330"]:
+            delivered.set()
+    result = fetch_tw_mis_last_prices(["2330", "2317"], np.zeros(2), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=2, empty_chunk_retry_attempts=0, on_progress=progress)
+    assert result.available_count == 2 and batches == [["2330"], ["2317"]]
 
 
 def test_tw_opening_snapshot_does_not_cache_all_empty_preopen_observation(

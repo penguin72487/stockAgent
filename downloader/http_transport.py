@@ -161,7 +161,10 @@ class ResilientHttpTransport:
                     }
                 return HttpResponse(status, body, response_headers, attempt + 1)
             except HTTPError as exc:
-                body = exc.read()
+                try:
+                    body = exc.read()
+                finally:
+                    exc.close()
                 status = int(exc.code)
                 headers_map = {
                     str(key): str(value)
@@ -169,7 +172,7 @@ class ResilientHttpTransport:
                 }
                 if status in accepted_statuses:
                     return HttpResponse(status, body, headers_map, attempt + 1)
-                if status not in self.policy.retryable_statuses or attempt >= retries:
+                if status not in self.policy.retryable_statuses:
                     # The original HTTPError.reason may itself contain the
                     # credential-bearing URL; don't leak it through traceback.
                     raise HttpStatusError(status, url, body) from None
@@ -191,6 +194,10 @@ class ResilientHttpTransport:
                 # worker as well would apply the same backoff twice and leave
                 # the official bucket unnecessarily idle.
                 self.limiter.defer(cooldown)
+                if attempt >= retries:
+                    # This worker can be exhausted while sibling workers are
+                    # still queued. The upstream cooldown applies to them too.
+                    raise HttpStatusError(status, url, body) from None
             except (OSError, IncompleteRead) as exc:
                 if attempt >= retries:
                     detail = _sanitized_error_body(str(exc).encode(), url).decode(errors="replace")

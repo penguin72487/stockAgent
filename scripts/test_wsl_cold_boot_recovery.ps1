@@ -1,5 +1,5 @@
 param(
-    [string]$PublicOrigin = "https://penguin72487.ddnsgeek.com",
+    [string]$PublicOrigin = "https://www.penguin72487.dpdns.org",
     [string]$TaskName = "StockAgent Public Caddy",
     [string]$ReportRoot = "$env:LOCALAPPDATA\StockAgentPublic\logs",
     [string]$DistroName = "",

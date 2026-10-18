@@ -14,6 +14,79 @@ from scripts import promote_tw_day_trade_replay as promotion
 MARKETS = {"mode_a", "mode_b", "mode_c"}
 
 
+def test_daily_entry_sweeps_and_lifetime_reductions_have_distinct_clocks(tmp_path, monkeypatch):
+    from copy import deepcopy
+
+    candidate = _candidate(tmp_path)
+    receipt_path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["replay_contract"] = {"entry": promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT}
+    first = receipt["sessions"][0]
+    second = deepcopy(first)
+    second["session_date"] = "2026-08-14"
+    receipt["sessions"].append(second)
+    for session, entry_count, reduction_count in ((first, 3, 2), (second, 1, 3)):
+        for mode in session["modes"]:
+            mode["after_close"].update(entry_post_0901_minute_price_fill_count=entry_count,
+                                       rebalance_reduction_post_0901_fill_count=reduction_count)
+    receipt_path.write_text(json.dumps(receipt))
+    observed = {}
+    monkeypatch.setattr(promotion, "_validate_minute_curve_coverage", lambda *a, **kw: {})
+    monkeypatch.setattr(promotion, "_validate_0901_minute_price_signal_ledger", lambda *a, **kw: {})
+    def fills(*args, **kwargs):
+        observed.update(kwargs)
+        return {}
+    monkeypatch.setattr(promotion, "_validate_0901_minute_price_fill_ledger", fills)
+    promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+    assert observed["expected_post_0901_sweep_fills"] == 7 * len(MARKETS)
+    assert observed["expected_sweep_by_session"] == {
+        (day, market): counts for day, counts in (("2026-08-13", (3, 2)), ("2026-08-14", (1, 1)))
+        for market in MARKETS
+    }
+    second["modes"][0]["after_close"]["rebalance_reduction_post_0901_fill_count"] = 1
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(RuntimeError, match="counters regressed"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+
+def test_sweep_counts_are_checked_per_session_not_just_grand_total(tmp_path):
+    rows = [dict(session_date=day, market="a", symbol="2330", position_id=f"p-{day}",
+                 fill_at=f"{day}T09:02:00+08:00", price=100., quantity=1000,
+                 observed_minute_volume_lots=2., entry_fill_policy=promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+                 entry_price_method="minute_vwap", simulation_replay=True,
+                 counterfactual_minute_sweep_fill=True, purpose="entry",
+                 fill_contract=promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT)
+            for day in ("2026-08-13", "2026-08-14")]
+    (tmp_path / "fills.jsonl").write_text("".join(json.dumps(row)+"\n" for row in rows))
+    failures = []
+    promotion._validate_0901_minute_price_fill_ledger(
+        tmp_path, expected_fills=0, failures=failures, expected_post_0901_sweep_fills=2,
+        expected_sweep_by_session={(day, "a"): (1, 0) for day in ("2026-08-13", "2026-08-14")})
+    assert not failures
+    promotion._validate_0901_minute_price_fill_ledger(
+        tmp_path, expected_fills=0, failures=failures, expected_post_0901_sweep_fills=2,
+        expected_sweep_by_session={("2026-08-13", "a"): (0, 0), ("2026-08-14", "a"): (2, 0)})
+    assert len(failures) == 2
+    assert all("minute-sweep session counts" in error for error in failures)
+
+
+def test_failed_validation_writes_full_non_promotable_receipt(tmp_path, monkeypatch):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    output = tmp_path / "failure.json"
+    def fail(*args, **kwargs):
+        raise promotion.ReplayValidationError(["first gate", "second gate"])
+    monkeypatch.setattr(promotion, "_validate_rebuild", fail)
+    monkeypatch.setattr(sys, "argv", ["promote", "--live-dir", str(live), "--candidate-dir", str(candidate),
+                                     "--expected-market", "mode_a", "--validate-only",
+                                     "--validation-receipt", str(output)])
+    with pytest.raises(promotion.ReplayValidationError):
+        promotion.main()
+    assert json.loads(output.read_text())["failures"] == ["first gate", "second gate"]
+    assert json.loads(output.read_text())["cutover"]["ready"] is False
+
+
 def test_minute_sweep_validator_shares_capacity_across_reduction_and_entry(
     tmp_path: Path,
 ) -> None:
@@ -223,6 +296,22 @@ def test_cutover_only_excludes_explicitly_retired_modes(tmp_path):
     state['modes']['retired'].pop('configured_enabled')
     (live / 'state.json').write_text(json.dumps(state))
     assert promotion._cutover_blockers(live, candidate, MARKETS)
+
+
+def test_cutover_restores_an_explicitly_expected_previously_hidden_mode(tmp_path):
+    candidate = _candidate(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    hidden = sorted(MARKETS)[0]
+    state = {"enabled_markets": sorted(MARKETS - {hidden}), "modes": {
+        market: {"configured_enabled": market != hidden, "positions": {}}
+        for market in MARKETS}}
+    (live / "state.json").write_text(json.dumps(state))
+    assert promotion._cutover_blockers(live, candidate, MARKETS) == []
+    state["modes"][hidden]["positions"] = {"owned": {"signed_shares": 1000}}
+    (live / "state.json").write_text(json.dumps(state))
+    assert promotion._cutover_blockers(live, candidate, MARKETS) == [
+        f"{hidden}: live paper inventory remains open"]
 
 
 def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:

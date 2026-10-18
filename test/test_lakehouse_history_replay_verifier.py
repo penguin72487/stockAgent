@@ -18,7 +18,8 @@ def test_complete_history_order_is_preserved():
     verifier.validate_events(SimpleNamespace(events=[SimpleNamespace(event_id=value) for value in range(1, 12)]))
 
 
-def test_replay_fetches_pinned_histories_and_never_starts_a_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize('include_versions', [False, True])
+def test_replay_fetches_pinned_histories_and_never_starts_a_worker(tmp_path, monkeypatch, include_versions):
     from temporalio.client import Client, WorkflowHistory
     from temporalio.worker import Replayer
     from stockagent.control import storage_workflow as sw
@@ -36,7 +37,10 @@ def test_replay_fetches_pinned_histories_and_never_starts_a_worker(tmp_path, mon
 
     class FakeReplayer:
         def __init__(self, **options):
-            assert options['workflows'] == [sw.StorageLifecycle, sw.SourceReplicationLifecycle]
+            expected = [sw.StorageLifecycle, sw.SourceReplicationLifecycle]
+            if include_versions:
+                expected.append(sw.DatasetVersionLifecycle)
+            assert options['workflows'] == expected
             assert options['workflow_task_executor']._max_workers == 2
 
         async def replay_workflow(self, restored, **options):
@@ -46,7 +50,9 @@ def test_replay_fetches_pinned_histories_and_never_starts_a_worker(tmp_path, mon
             return SimpleNamespace(replay_failure=None)
 
     monkeypatch.setattr(Replayer, '__new__', lambda *args, **kwargs: FakeReplayer(**kwargs))
-    result = asyncio.run(verifier.replay({'temporal_endpoint': 'local', 'temporal_namespace': 'private'}, tmp_path))
-    assert len(result) == 2 and all(row['events'] == 1 for row in result)
-    assert seen == [(name, options) for name in verifier.IDS for options in ({}, {'run_id': 'fixed-run'})]
-    assert all((tmp_path / (name + '.history.json')).read_text() == '{"events":[1]}' for name in verifier.IDS)
+    result = asyncio.run(verifier.replay({'temporal_endpoint': 'local', 'temporal_namespace': 'private'},
+                                        tmp_path, include_dataset_versions=include_versions))
+    names = (*verifier.IDS, *verifier.OPTIONAL_IDS) if include_versions else verifier.IDS
+    assert len(result) == len(names) and all(row['events'] == 1 for row in result)
+    assert seen == [(name, options) for name in names for options in ({}, {'run_id': 'fixed-run'})]
+    assert all((tmp_path / (name + '.history.json')).read_text() == '{"events":[1]}' for name in names)

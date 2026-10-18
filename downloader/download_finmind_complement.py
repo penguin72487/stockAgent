@@ -25,7 +25,9 @@ import sqlite3
 import sys
 import time
 from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retryable_queue_error, optimize_queue
-from downloader.finmind_queue_indexes import dispatch_indexes, ensure_status_index
+from downloader.finmind_queue_indexes import (dispatch_indexes, ensure_status_index, ensure_release_reserve_index,
+                                             ensure_us_publication_index, ensure_periodic_index,
+                                             periodic_index, PERIODIC_PREDICATE)
 from downloader.finmind_status_aggregates import StatusConnection, task_status_aggregates
 from typing import Any
 
@@ -171,6 +173,9 @@ def _db(path: Path) -> sqlite3.Connection:
         # Bounded planner maintenance below is essential: an unanalyzed wide
         # index can otherwise hurt the independent frontier/dispatch joins.
         ensure_status_index(connection)
+        ensure_release_reserve_index(connection)
+        ensure_us_publication_index(connection)
+        ensure_periodic_index(connection)
         retry_cohorts.ensure_schema(connection)
         retry_policy.migrate(connection, path.parent, _now())
         retry_cohorts.reconcile(connection, _now())
@@ -404,6 +409,15 @@ def _reconcile_current_supplemental_history(connection: sqlite3.Connection, toda
             (cutoff, source.priority, dataset, cutoff, source.priority))
 
 
+def _periodic_refresh_tasks(connection: sqlite3.Connection, year: int) -> list:
+    return connection.execute(
+        "SELECT dataset,data_id,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc "
+        f"FROM tasks{periodic_index(connection)} WHERE {PERIODIC_PREDICATE} "
+        "AND state IN ('complete','observed_empty') "
+        "AND (kind='snapshot' OR (kind='year' AND partition=?))", (str(year),),
+    ).fetchall()
+
+
 def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> None:
     _recover_bulk_year_claims(connection)
     json_pipeline.recover_claims(connection)
@@ -447,21 +461,16 @@ def _populate(connection: sqlite3.Connection, root: Path, *, today: date) -> Non
     # Queue priorities are policy, not immutable receipts: adjust earlier
     # deployments that seeded every historical year with the same priority.
     connection.execute(
-        "UPDATE tasks SET priority=CASE WHEN partition=? THEN 0 "
+        f"UPDATE tasks{periodic_index(connection)} SET priority=CASE WHEN partition=? THEN 0 "
         "WHEN CAST(partition AS INTEGER)>=2014 THEN 1 ELSE 3 END "
-        "WHERE kind='year' AND priority!=CASE WHEN partition=? THEN 0 "
+        f"WHERE {PERIODIC_PREDICATE} AND kind='year' AND priority!=CASE WHEN partition=? THEN 0 "
         "WHEN CAST(partition AS INTEGER)>=2014 THEN 1 ELSE 3 END",
         (str(today.year), str(today.year)),
     )
     _migrate_gold_timestamp_boundary(connection, root, _now())
     _reconcile_periodic_publication(connection, _now())
     connection.commit()
-    for dataset, data_id, partition, kind, task_state, last_attempt, next_attempt in connection.execute(
-        "SELECT dataset,data_id,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc "
-        "FROM tasks WHERE state IN ('complete','observed_empty') "
-        "AND (kind='snapshot' OR (kind='year' AND partition=?))",
-        (str(today.year),),
-    ).fetchall():
+    for dataset, data_id, partition, kind, task_state, last_attempt, next_attempt in _periodic_refresh_tasks(connection, today.year):
         if not last_attempt:
             continue
         try:
@@ -1710,7 +1719,8 @@ def _next_refresh(task: Task, now: datetime, *, empty: bool, latest_date: str | 
     return _iso(now + delay)
 
 
-def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, Any], now: datetime) -> None:
+def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, Any], now: datetime,
+                 *, commit: bool = True) -> None:
     request = receipt.get('request', {})
     if request.get('endpoint') == 'storage_objects' and receipt['rows'] > 0:
         connection.execute('INSERT INTO finmind_object_transfer_samples '
@@ -1760,10 +1770,12 @@ def _save_result(connection: sqlite3.Connection, task: Task, receipt: dict[str, 
                            "VALUES ('TaiwanStockTradingDailyReportSecIdAgg',?,?,'derived',7,'pending') "
                            "ON CONFLICT(dataset,data_id,partition) DO UPDATE SET state='pending',next_attempt_at_utc=NULL",
                            (task.data_id, task.partition))
-    connection.commit()
+    if commit:
+        connection.commit()
 
 
-def _save_failure(connection: sqlite3.Connection, task: Task, error: SourceError, now: datetime) -> None:
+def _save_failure(connection: sqlite3.Connection, task: Task, error: SourceError, now: datetime,
+                  *, commit: bool = True) -> None:
     queue_path = connection.execute('PRAGMA database_list').fetchone()[2]
     if queue_path:
         record_failure(Path(queue_path).parent, task, error.code, now)
@@ -1795,7 +1807,8 @@ def _save_failure(connection: sqlite3.Connection, task: Task, error: SourceError
     )
     retry_policy.record_failure(connection, task, error.code, now)
     retry_cohorts.record_failure(connection, task, error.code, now)
-    connection.commit()
+    if commit:
+        connection.commit()
 
 
 def _status(connection: sqlite3.Connection, root: Path, *, state: str,
@@ -1874,7 +1887,8 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
 
 def run_once(root: Path, *, max_requests: int = 0,
              datasets: tuple[str, ...] | None = None,
-             required_keys: tuple[tuple[str, str, str], ...] | None = None) -> dict[str, Any]:
+             required_keys: tuple[tuple[str, str, str], ...] | None = None,
+             keep_prepared_on_priority_wait: bool = False) -> dict[str, Any]:
     cycle_started = time.monotonic()
     if required_keys is not None:
         required_keys = tuple(dict.fromkeys(required_keys))
@@ -1897,7 +1911,7 @@ def run_once(root: Path, *, max_requests: int = 0,
     json_config = json_pipeline.settings(max_requests_per_cycle=max_requests)
     with closing(_db(root / "queue.sqlite3")) as connection, connection, requests.Session() as session, \
             json_pipeline.CycleCosts(connection, cycle_started) as cycle_costs, \
-            json_pipeline.Sessions() as json_sessions, \
+            json_pipeline.Sessions(traffic_root=root.parent) as json_sessions, \
             ThreadPoolExecutor(max_workers=json_config['download_workers'], thread_name_prefix='finmind-json-fetch') as json_downloads, \
             ThreadPoolExecutor(max_workers=pipeline_config['download_workers'], thread_name_prefix='finmind-object-fetch') as downloads, \
             ProcessPoolExecutor(max_workers=pipeline_config['derivation_workers'],
@@ -1957,6 +1971,24 @@ def run_once(root: Path, *, max_requests: int = 0,
                     and _refill_current_history(connection, root, now, delegated=delegated, datasets=datasets)):
                 task = _next_task(connection, now, delegated=delegated, datasets=datasets, advance_cursor=True)
             if task is None:
+                if (keep_prepared_on_priority_wait and required_keys is None
+                        and budget.get('priority_wait') and budget.get('schedule_verified')
+                        and budget.get('remaining', 0) > budget.get('reserve', 0)):
+                    # Another canonical lane owns the due release. Keep this
+                    # drained owner's connection/status memo/pools alive while
+                    # it yields, instead of repeating full seeding and receipt
+                    # audits after every short cross-lane preemption. The same
+                    # 1,200-call quantum and all next-dispatch checks remain.
+                    connection.commit()
+                    waiting = _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
+                    waiting_started = time.monotonic()
+                    wait_for_next_cycle(root, waiting, 60, sources=supplemental.SOURCES.values(),
+                        snapshot_hours=(0, 8, 14, 17),
+                        wake_if=lambda: _next_task(connection, _now(), delegated=delegated,
+                                                  incremental_only=True, datasets=datasets) is not None)
+                    cycle_costs.exclude_elapsed(waiting_started)
+                    last_status_at = time.monotonic()
+                    continue
                 first_history = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
                 if first_history and connection.execute(
                         "SELECT 1 FROM tasks WHERE dataset=? AND state='failed' "
@@ -2006,7 +2038,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 last = parallel_json['last'] or last
                 reconcile_worker_corrections(connection, root, 'complement', _now())
                 connection.commit()
-                if parallel_json['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'}:
+                if parallel_json['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'} | json_pipeline.LOCAL_PREFLIGHT_ERRORS:
                     return _status(connection, root, state=parallel_json['state'], last=last, delegated=delegated)
                 if parallel_json['state'] == 'incremental_reserve' and not parallel_json['calls']:
                     return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
@@ -2225,7 +2257,8 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     result = run_once(root, max_requests=args.max_requests,
                                       datasets=tuple(args.dataset) if args.dataset is not None else None,
-                                      required_keys=required_keys)
+                                      required_keys=required_keys,
+                                      **({'keep_prepared_on_priority_wait': True} if args.loop else {}))
                 except sqlite3.OperationalError as error:
                     if not args.loop or not retryable_queue_error(error):
                         raise

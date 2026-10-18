@@ -89,7 +89,10 @@ def with_field_batch(cases: list[dict], task_id: str | None) -> list[dict]:
     fields = original['request'].get('fields')
     if original['task']['kind'] != 'download' or not isinstance(fields, list) or len(fields) < 2:
         raise ValueError('Field-batch comparison requires a multi-field historical download')
-    request = {**original['request'], 'fields': fields[:len(fields)//2]}
+    # This is a new, isolated query, not a tile of the production plan. Do not
+    # falsely attribute its half-schema to the original full-field partition.
+    request = {**{k:v for k,v in original['request'].items() if k!='field_partition'},
+               'fields': fields[:len(fields)//2]}
     task = {**original['task'], 'task_id': stable_id(request)}
     if task['task_id'] == task_id or any(case['task']['task_id'] == task['task_id'] for case in cases):
         raise ValueError('Field-batch comparison must retain distinct attempt scopes')
@@ -152,11 +155,12 @@ def sample_result(path: Path, case: dict, repo: Path, task: dict, wall: float) -
     return sample
 
 
-def execute_case(path: Path, case: dict, repo: Path, session: dict, config: dict, policy: dict, relay: dict) -> dict:
+def execute_case(path: Path, case: dict, repo: Path, session: dict, config: dict, policy: dict, relay: dict,
+                 *, cache_script: bool = True) -> dict:
     prepare_trial(path, case, config, policy, relay)
     with exclusive_dataset_lock(path/'.download.lock', provider='tej_full_flow_comparison', timeout_seconds=0):
         started = time.monotonic()
-        state = run_one(path, DesktopBridge(repo, session), kind=case['task']['kind'])
+        state = run_one(path, DesktopBridge(repo, session, cache_script=cache_script), kind=case['task']['kind'])
         wall = time.monotonic()-started
     if state != 'completed_task':
         raise RuntimeError('Source comparison did not complete; exact trial evidence retained; no automatic repetition')
@@ -242,7 +246,8 @@ def benchmark_queue(root: Path, baseline: Path, output: Path, case_ids: list[str
 
 
 def benchmark(root: Path, baseline: Path, output: Path, case_ids: list[str], *, dense_start: str, dense_end: str,
-              candidate: Path | None = None, field_batch_case: str | None = None) -> dict:
+              candidate: Path | None = None, field_batch_case: str | None = None,
+              compare_script_cache: bool = False) -> dict:
     root, baseline, output = root.resolve(), baseline.resolve(), output.resolve()
     if output.exists() or not baseline.is_file() or baseline.stat().st_size > 256*1024:
         raise ValueError('New evidence directory and preserved bounded baseline required')
@@ -251,6 +256,8 @@ def benchmark(root: Path, baseline: Path, output: Path, case_ids: list[str], *, 
     candidate=(candidate or ROOT/'scripts/tej_smart_wizard_bridge.ps1').resolve()
     if not candidate.is_file() or candidate.stat().st_size>256*1024:
         raise ValueError('Reviewed bounded candidate bridge required')
+    if compare_script_cache and baseline.read_bytes() != candidate.read_bytes():
+        raise ValueError('Script-cache comparison requires identical baseline/candidate source')
     with exclusive_dataset_lock(root/'.download.lock', provider='tej_full_flow_performance', timeout_seconds=180):
         config, cases, dense, policy = read_snapshot(root, case_ids)
         cases = with_field_batch(cases, field_batch_case)
@@ -304,7 +311,8 @@ def benchmark(root: Path, baseline: Path, output: Path, case_ids: list[str], *, 
                     chain_started = time.monotonic()
                     for number, case in enumerate(cases):
                         trial = output/'trials'/f'{pass_id}-{mode}-{number}'
-                        sample = execute_case(trial, case, repos[mode], session, config, policy, relay)
+                        sample = execute_case(trial, case, repos[mode], session, config, policy, relay,
+                            cache_script=not compare_script_cache or mode=='candidate')
                         sample.update(mode=mode, pass_id=pass_id)
                         samples.append(sample)
                         atomic_write_json(output/'progress.json', {'contract':CONTRACT,'samples':samples,
@@ -331,6 +339,7 @@ def benchmark(root: Path, baseline: Path, output: Path, case_ids: list[str], *, 
             report = {'contract':CONTRACT,'accepted':True,'observed_at_utc':datetime.now(UTC).isoformat(),
                       'source_values_equal':True,'source_values_exposed':False,'production_receipts_modified':False,
                       'data_queries_sent':sum(s['kind']=='download' for s in samples),
+                      'script_cache_comparison':compare_script_cache,
                       'metadata_plans':1+sum(s['kind']=='discover' for s in samples),
                       'summary':summary,'samples':samples,
                       'wall_speedup':summary['baseline']['sum_complete_wall_seconds']/summary['candidate']['sum_complete_wall_seconds'],
@@ -356,13 +365,15 @@ def main(argv=None):
     p.add_argument('--compare-queue-locality',action='store_true',help='Four original scopes in two exact-priority tables, actual canonical scheduler included')
     p.add_argument('--candidate',type=Path,help='Reviewed candidate snapshot; production bridge is unchanged during an experiment')
     p.add_argument('--field-batch-case',help='One selected original case; add an adjacent half-field query on its identical axes')
+    p.add_argument('--compare-script-cache',action='store_true',help='Same bridge bytes, full canonical lifecycle: per-query copy versus verified code-only cache')
     a=p.parse_args(argv)
     if not a.allow_source_requeries:p.error('Real full-flow benchmark requires --allow-source-requeries')
     if a.compare_queue_locality and a.candidate:p.error('Explicit candidate is supported only for the full-flow comparison')
     if a.compare_queue_locality and a.field_batch_case:p.error('Field-batch cases require the full-flow comparison')
+    if a.compare_queue_locality and a.compare_script_cache:p.error('Script-cache cases require the full-flow comparison')
     r=(benchmark_queue(a.root,a.baseline,a.output,a.case) if a.compare_queue_locality else
        benchmark(a.root,a.baseline,a.output,a.case,dense_start=a.dense_start,dense_end=a.dense_end,
-                 candidate=a.candidate,field_batch_case=a.field_batch_case))
+                 candidate=a.candidate,field_batch_case=a.field_batch_case,compare_script_cache=a.compare_script_cache))
     print(json.dumps({k:v for k,v in r.items() if k!='samples'},ensure_ascii=False))
     return 0
 

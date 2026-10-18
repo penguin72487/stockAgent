@@ -19,6 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stockagent.training.lifecycle import validate_completed_training_artifacts
+from stockagent.training.runtime import load_checkpoint
 from stockagent.backtest.report import compute_metrics
 from stockagent.backtest.simulator import BacktestResult
 
@@ -54,8 +55,8 @@ def audit_variant(root: Path, fold_id: int) -> tuple[dict, dict, dict]:
     by_epoch = {row["epoch"]: row for row in rows}
     if len(by_epoch) != len(rows):
         raise ValueError(f"duplicate epochs in {group}")
-    ck = torch.load(fold / "checkpoint_best.pt", map_location="cpu", weights_only=False)
-    last = torch.load(group / "checkpoint_last.pt", map_location="cpu", weights_only=False)
+    ck = load_checkpoint(fold / "checkpoint_best.pt")
+    last = load_checkpoint(group / "checkpoint_last.pt")
     config = read_json(root / "run_manifest.json")["configuration"]
     best_epoch = int(ck["epoch"])
     selected = by_epoch.get(best_epoch, {})  # epoch-zero cash is a valid checkpoint

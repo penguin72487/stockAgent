@@ -1,7 +1,7 @@
 {
-	# Separate address-family wildcards survive DHCP and IPv6 prefix changes.
-	# DNS and WAN forwarding remain router-owned; admin stays loopback-only.
-	default_bind tcp4/0.0.0.0 tcp6/[::]
+	auto_https disable_redirects
+	# Cloudflare Tunnel is the public website ingress; origin stays loopback-only.
+	default_bind tcp4/127.0.0.1 tcp6/[::1]
 	admin 127.0.0.1:2019
 	grace_period 10s
 	log default {
@@ -14,6 +14,8 @@
 		level INFO
 	}
 	servers {
+		trusted_proxies static 127.0.0.1/32 ::1/128
+		client_ip_headers CF-Connecting-IP
 		protocols h1 h2
 		max_header_size 16KB
 		timeouts {
@@ -25,12 +27,7 @@
 	}
 }
 
-http://penguin72487.ddnsgeek.com {
-	header -Server
-	redir https://penguin72487.ddnsgeek.com{uri} permanent
-}
-
-penguin72487.ddnsgeek.com {
+http://penguin72487.dpdns.org {
 	encode zstd gzip
 
 	header {
@@ -52,8 +49,14 @@ penguin72487.ddnsgeek.com {
 	@write_methods not method GET HEAD
 	header @write_methods Allow "GET, HEAD"
 	respond @write_methods 405
+	@public_identity path /_vpn/identity
+	header @public_identity Content-Type application/json
+	respond @public_identity `{"role":"public-anonymous","authentication":"none"}` 200
 
 	reverse_proxy 127.0.0.1:8770 {
+		header_up X-WireGuard-Identity public-anonymous
+		header_up -X-WireGuard-Device
+		header_up -X-WireGuard-Role
 		# There is one upstream, so active ejection cannot fail over and only
 		# amplifies a transient event-loop stall into a synthetic 503.  The
 		# Windows supervisor probes /healthz every five seconds and restarts WSL;
@@ -77,3 +80,13 @@ penguin72487.ddnsgeek.com {
 		format json
 	}
 }
+
+http://www.penguin72487.dpdns.org {
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+	}
+	redir https://penguin72487.dpdns.org{uri} 308
+}
+
+import C:/Users/agari/AppData/Local/StockAgentPublic/Caddyfile.private

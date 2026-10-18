@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import json
+import sqlite3
 import threading
 import time
 
@@ -42,7 +43,7 @@ def run(runtime, **changes):
     options.update(changes)
     account = {'tier': 'SponsorPro', 'observed_at_utc': NOW.isoformat(),
                'official_requests_per_hour': 20000, 'provider_used_in_hour': 0}
-    with pipeline.Sessions() as sessions, ThreadPoolExecutor(2) as executor:
+    with pipeline.Sessions() as sessions, ThreadPoolExecutor(options['config']['download_workers']) as executor:
         return pipeline.run_batch(conn, executor, sessions, root, worker._next_task(conn, NOW),
             account, {'allowed': True, 'remaining': 20000, 'reserve': 2}, {'ready_requests': 0}, NOW,
             SharedRateLimiter(0, name='test-finmind-json'), 'not-a-token', **options)
@@ -70,11 +71,49 @@ def test_single_writer_parallel_and_exact_source_values(runtime, monkeypatch):
     assert conn.execute('SELECT count(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM tasks WHERE state='complete'").fetchone()[0] == 4
     assert conn.execute('SELECT requests FROM finmind_json_pipeline_samples').fetchone()[0] == 4
+    observed = json.loads((root / 'json_pipeline_last.json').read_bytes())
+    assert observed['accepted_requests'] == observed['calls'] == 4
+    assert observed['batch_capacity_candidate'] is True and observed['whole_cycle_cost_verified'] is False
     for code, day in calls:
         path = conn.execute('SELECT receipt_path FROM tasks WHERE data_id=?', (code,)).fetchone()[0]
         receipt = json.loads((root / path).read_bytes())
         assert pq.read_table(root / receipt['parquet_path']).to_pylist() == rows(worker.Task(US, code, day, 'id_day', 8, 'pending'))
         assert receipt['request']['json_pipeline_contract_version'] == pipeline.CONTRACT_VERSION
+
+
+@pytest.mark.parametrize('requested,buffered,peak_expected', [(8, 8, 8), (16, 16, 16), (16, 8, 8)])
+def test_larger_download_pool_retains_response_bound_and_single_account_limiter(
+        runtime, monkeypatch, requested, buffered, peak_expected):
+    root, conn = runtime
+    # 16 unique, ordinary queue tasks: no duplicate request or alternate owner.
+    worker._add_tasks(conn, [(US, f'EXTRA{index}', '2024-06-03', 'id_day', 8) for index in range(12)])
+    conn.commit()
+    barrier = threading.Barrier(peak_expected)
+    lock = threading.Lock()
+    active = peak = 0
+    calls, limiter_ids = [], set()
+
+    def fetch(sessions, limiter, root, task, token, today):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            calls.append((task.data_id, task.partition))
+            limiter_ids.add(id(limiter.limiter))
+        try:
+            barrier.wait(timeout=10)
+            return rows(task), {'request_count': 1}
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    config = {**pipeline.settings(), 'download_workers': requested,
+              'max_buffered_response_bytes': buffered * worker.BULK_MAX_RESPONSE_BYTES}
+    result = run(runtime, config=config, max_calls=16)
+    assert peak == peak_expected and len(limiter_ids) == 1
+    assert result['calls'] == result['accepted_requests'] == len(set(calls)) == 16
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
 
 
 def test_complete_empty_and_exhausted_not_reopened(runtime, monkeypatch):
@@ -86,6 +125,85 @@ def test_complete_empty_and_exhausted_not_reopened(runtime, monkeypatch):
     assert result['accepted_requests'] == 2 and result['nonempty_requests'] == 0
     assert dict(conn.execute('SELECT data_id,state FROM tasks')) == {
         'AAPL': 'observed_empty', 'MSFT': 'observed_empty', 'NVDA': 'complete', 'SPY': 'retry_exhausted'}
+
+
+def test_completed_response_burst_refills_before_second_publication(runtime, monkeypatch):
+    from concurrent.futures import ALL_COMPLETED, wait
+    original = worker._store
+    fetched = []
+    third_started = threading.Event()
+    initial_pair = threading.Barrier(2)
+    lock = threading.Lock()
+    publications = 0
+
+    def complete_wave(jobs, **kwargs):
+        return wait(jobs, timeout=5, return_when=ALL_COMPLETED)
+
+    def fetch(sessions, limiter, root, task, *args):
+        with lock:
+            fetched.append(task.data_id)
+            number = len(fetched)
+        if number <= 2:
+            initial_pair.wait(timeout=5)
+        else:
+            third_started.set()
+        return rows(task), {}
+
+    def store(*args, **kwargs):
+        nonlocal publications
+        publications += 1
+        if publications == 1:
+            # Ensure both initial responses form a completion burst.
+            assert len(fetched) >= 2
+        if publications == 2:
+            assert third_started.wait(timeout=5), 'free HTTP slot waited behind a second publication'
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    monkeypatch.setattr(pipeline, 'wait', complete_wave)
+    monkeypatch.setattr(worker, '_store', store)
+    assert run(runtime)['accepted_requests'] == publications == 4
+
+
+def test_queue_result_and_release_share_one_commit_and_cursor_is_claimed(runtime, monkeypatch):
+    _, conn = runtime
+    statements = []
+    conn.set_trace_callback(statements.append)
+    monkeypatch.setattr(pipeline, '_fetch', lambda sessions, limiter, root, task, *args: (rows(task), {}))
+    assert run(runtime)['accepted_requests'] == 4
+    conn.set_trace_callback(None)
+    # One durable claim and one durable finalization per key, plus the sample.
+    assert sum(statement == 'COMMIT' for statement in statements) == 9
+    for index, statement in enumerate(statements):
+        if statement.startswith("UPDATE tasks SET state='complete'"):
+            following = statements[index+1:]
+            release = next(i for i, query in enumerate(following)
+                           if query.startswith('DELETE FROM finmind_object_prefetch_claims'))
+            assert 'COMMIT' not in following[:release]
+    assert conn.execute('SELECT last_dataset FROM dispatch_cursor WHERE priority=8').fetchone() == (US,)
+    assert not conn.in_transaction
+
+
+def test_interrupted_finalization_keeps_claim_recoverable_and_source_receipt(runtime, monkeypatch):
+    from downloader import finmind_object_pipeline as objects
+    root, conn = runtime
+    monkeypatch.setattr(pipeline, '_fetch', lambda sessions, limiter, root, task, *args: (rows(task), {}))
+    def power_loss(*args):
+        raise RuntimeError('power-loss fixture')
+    monkeypatch.setattr(objects, '_release', power_loss)
+    with pytest.raises(RuntimeError, match='power-loss fixture'):
+        run(runtime)
+    conn.rollback()  # A killed process loses only its uncommitted finalization.
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE state='complete'").fetchone()[0] == 0
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 2
+    receipts = list((root / 'receipts' / US).glob('*/*.json'))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_bytes())
+    assert pq.read_table(root / receipt['parquet_path']).num_rows == receipt['rows'] == 1
+    objects.recover_claims(conn)
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE state='pending'").fetchone()[0] == 4
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
 
 
 def test_wrong_identity_source_fails_without_touching_other_accepted_key(runtime, monkeypatch):
@@ -101,6 +219,68 @@ def test_wrong_identity_source_fails_without_touching_other_accepted_key(runtime
     assert runtime[1].execute("SELECT count(*) FROM finmind_json_pipeline_samples").fetchone()[0] == 0
     assert runtime[1].execute("SELECT state FROM tasks WHERE data_id='AAPL'").fetchone()[0] == 'failed'
     assert runtime[1].execute("SELECT error_code FROM tasks WHERE data_id='AAPL'").fetchone()[0] == 'supplemental_wrong_data_id'
+    observed = json.loads((runtime[0] / 'json_pipeline_last.json').read_bytes())
+    assert observed['failure_codes'] == {'supplemental_wrong_data_id': 1}
+
+
+@pytest.mark.parametrize('code', sorted(pipeline.LOCAL_PREFLIGHT_ERRORS))
+def test_local_preflight_holds_are_not_http_calls_or_a_hot_zero_call_loop(runtime, monkeypatch, code):
+    def fetch(*args):
+        raise worker.SourceError(code, retry_after=15)
+
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    result = run(runtime, config={**pipeline.settings(), 'download_workers': 1})
+    assert result['state'] == code
+    assert result['calls'] == result['accepted_requests'] == 0
+    assert result['failed_tasks'] == 1
+    root, conn = runtime
+    observed = json.loads((root / 'json_pipeline_last.json').read_bytes())
+    assert observed['claimed_attempts'] == observed['local_preflight_holds'] == 1
+    assert observed['failure_codes'] == {code: 1}
+    assert not observed['batch_capacity_candidate']
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE state='pending'").fetchone()[0] == 3
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE state='failed' AND error_code=?", (code,)).fetchone()[0] == 1
+    assert conn.execute('SELECT COUNT(*) FROM finmind_task_retries').fetchone()[0] == 0
+
+
+def test_account_wal_stays_open_without_pinning_a_read_snapshot(tmp_path):
+    from contextlib import closing
+    from downloader import download_finmind_free as free
+    free._record_request_start(tmp_path, 'initial')
+    with pipeline.Sessions(traffic_root=tmp_path) as sessions:
+        anchor = sessions.traffic_anchor
+        assert anchor is not None and not anchor.in_transaction
+        assert anchor.execute('PRAGMA query_only').fetchone() == (1,)
+        free._record_request_start(tmp_path, 'second')
+        assert (tmp_path / 'request_traffic.sqlite3-wal').stat().st_size > 32
+        assert anchor.execute('SELECT count(*) FROM requests').fetchone() == (2,)
+        assert not anchor.in_transaction
+        with closing(sqlite3.connect((tmp_path / 'request_traffic.sqlite3').as_uri()+'?mode=ro', uri=True)) as reader:
+            assert reader.execute('SELECT count(*) FROM requests').fetchone() == (2,)
+        free._record_request_start(tmp_path, 'third')
+        assert anchor.execute('SELECT count(*) FROM requests').fetchone() == (3,)
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        anchor.execute('SELECT 1')
+
+
+def test_missing_account_ledger_is_not_created_for_a_lifetime_optimization(tmp_path):
+    with pipeline.Sessions(traffic_root=tmp_path) as sessions:
+        assert sessions.traffic_anchor is None
+    assert not (tmp_path / 'request_traffic.sqlite3').exists()
+
+
+def test_wal_anchor_closes_even_if_an_http_session_close_fails(tmp_path):
+    from unittest.mock import Mock
+    from downloader import download_finmind_free as free
+    free._record_request_start(tmp_path, 'initial')
+    with pytest.raises(RuntimeError, match='HTTP close fixture'):
+        with pipeline.Sessions(traffic_root=tmp_path) as sessions:
+            anchor = sessions.traffic_anchor
+            sessions.sessions.append(Mock(close=Mock(side_effect=RuntimeError('HTTP close fixture'))))
+    assert sessions.traffic_anchor is None
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        anchor.execute('SELECT 1')
 
 
 def test_shared_request_contract_and_body_bound(runtime, monkeypatch):

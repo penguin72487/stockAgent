@@ -282,9 +282,10 @@ def _save(root: Path, status: dict) -> None:
     atomic_write_json(root / "data_news_fulltext/status.json", status)
 
 
-def _server(root: Path) -> gateway.PublicDashboardServer:
+def _server(root: Path, *, audience: str = "owner") -> gateway.PublicDashboardServer:
+    """News is owner-only; exercise its reader through the actual owner listener."""
     return gateway.PublicDashboardServer(
-        ("127.0.0.1", 0), public_static_root=REPO / "services/public_dashboards",
+        ("127.0.0.1", 0), audience=audience, public_static_root=REPO / "services/public_dashboards",
         taifex_static_root=REPO / "services/taifex_dashboard", tw_static_root=REPO / "services/tw_day_trade_dashboard",
         shioaji_static_root=REPO / "services/shioaji_api_dashboard", finlab_static_root=REPO / "services/finlab_dashboard",
         finmind_static_root=REPO / "services/finmind_dashboard", news_static_root=REPO / "services/news_dashboard",
@@ -768,6 +769,26 @@ def test_canonical_routes_and_immediate_snapshot_revision_invalidation(tmp_path,
         assert server._cache_bytes == sum(entry.response.resident_bytes for entry in server._cache.values())
     finally:
         server.server_close()
+
+
+@pytest.mark.parametrize("path", ["/news", "/news/", "/news/app.js", "/news/api/status"])
+@pytest.mark.parametrize("headers", [{}, {"X-StockAgent-Audience": "owner",
+    "X-WireGuard-Role": "owner", "X-Forwarded-For": "192.168.50.100"}])
+def test_public_news_is_denied_even_with_client_supplied_owner_headers(tmp_path, path, headers):
+    _seed(tmp_path, now=datetime.now(UTC))
+    server = _server(tmp_path, audience="public")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    conn = HTTPConnection(*server.server_address, timeout=5)
+    try:
+        conn.request("GET", path, headers=headers)
+        response = conn.getresponse()
+        assert response.status == 403
+        assert json.loads(response.read()) == {"error": "access_denied"}
+        assert response.getheader("Cache-Control") == "no-store"
+        assert response.getheader("X-StockAgent-Audience") == "public"
+    finally:
+        conn.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
 def test_news_endpoint_is_same_origin_and_rejects_control_requests(tmp_path):

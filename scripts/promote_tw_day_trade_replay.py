@@ -83,6 +83,17 @@ MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
 }
 
 
+class ReplayValidationError(RuntimeError):
+    """Retain every failed gate for an inspectable, non-promotable receipt."""
+
+    def __init__(self, failures: list[str]) -> None:
+        self.failures = list(failures)
+        super().__init__(
+            f"replay promotion validation failed ({len(failures)} failures): "
+            + "; ".join(failures[:50])
+        )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -759,6 +770,7 @@ def _validate_0901_minute_price_fill_ledger(
     failures: list[str],
     expected_prior_fills: int = 0,
     expected_post_0901_sweep_fills: int = 0,
+    expected_sweep_by_session: Mapping[tuple[str, str], tuple[int, int]] | None = None,
     prior_manifest: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     path = candidate / "fills.jsonl"
@@ -775,6 +787,7 @@ def _validate_0901_minute_price_fill_ledger(
     sweep_usage: dict[tuple[str, str, str, str], tuple[int, int]] = {}
     reduction_sweep_buckets: set[tuple[str, str, str, str]] = set()
     opened_positions: set[tuple[str, str, str]] = set()
+    entry_sweeps_by_session: dict[tuple[str, str], int] = {}
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
@@ -886,6 +899,11 @@ def _validate_0901_minute_price_fill_ledger(
                         opened_positions.add(position_key)
                     elif purpose == "next_signal_inventory_delta_minute_sweep":
                         reduction_sweep_buckets.add(key)
+                    if purpose != "next_signal_inventory_delta_minute_sweep":
+                        session_key = key[:2]
+                        entry_sweeps_by_session[session_key] = (
+                            entry_sweeps_by_session.get(session_key, 0) + 1
+                        )
                 continue
             fill_count += 1
             try:
@@ -939,6 +957,20 @@ def _validate_0901_minute_price_fill_ledger(
     # therefore append multiple fill rows.  Entry counters are per fill row.
     entry_sweep_fill_count = post_0901_sweep_count - reduction_sweep_fill_rows
     receipt_counter_units = entry_sweep_fill_count + len(reduction_sweep_buckets)
+    if expected_sweep_by_session is not None:
+        reduction_by_session: dict[tuple[str, str], int] = {}
+        for key in reduction_sweep_buckets:
+            session_key = key[:2]
+            reduction_by_session[session_key] = reduction_by_session.get(session_key, 0) + 1
+        for key in sorted(set(expected_sweep_by_session) | set(entry_sweeps_by_session)
+                          | set(reduction_by_session)):
+            observed = (entry_sweeps_by_session.get(key, 0), reduction_by_session.get(key, 0))
+            expected = expected_sweep_by_session.get(key, (0, 0))
+            if observed != expected:
+                failures.append(
+                    f"{key[0]}/{key[1]}: minute-sweep session counts "
+                    f"ledger={observed} receipt={expected}"
+                )
     if receipt_counter_units != expected_post_0901_sweep_fills:
         failures.append(
             "fills ledger post-09:01 receipt counter units="
@@ -1025,7 +1057,8 @@ def _validate_rebuild(
     minute_price_0901_fills = 0
     prior_paper_fills = 0
     post_0901_sweep_fills = 0
-    post_0901_cumulative_by_market: dict[str, tuple[int, int]] = {}
+    post_0901_reductions_by_market: dict[str, int] = {}
+    post_0901_sweep_by_session: dict[tuple[str, str], tuple[int, int]] = {}
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -1190,21 +1223,24 @@ def _validate_rebuild(
                 int(terminal_entry.get("entry_post_0901_minute_price_fill_count") or 0),
                 int(terminal_entry.get("rebalance_reduction_post_0901_fill_count") or 0),
             )
-            prior_sweep_counts = post_0901_cumulative_by_market.get(str(market))
-            if prior_sweep_counts and any(
-                current < prior
-                for current, prior in zip(current_sweep_counts, prior_sweep_counts)
-            ):
+            # register_signal resets entry completions each session; carried
+            # inventory reduction attempts remain lifetime counters. Never
+            # compare a daily entry count against yesterday's daily count.
+            prior_reductions = post_0901_reductions_by_market.get(market, 0)
+            if current_sweep_counts[0] < 0 or current_sweep_counts[1] < prior_reductions:
                 failures.append(
                     f"{session_date}/{market}: cumulative minute-sweep counters regressed"
                 )
-            post_0901_cumulative_by_market[str(market)] = current_sweep_counts
+            post_0901_reductions_by_market[market] = current_sweep_counts[1]
+            post_0901_sweep_by_session[(session_date, market)] = (
+                current_sweep_counts[0], current_sweep_counts[1] - prior_reductions,
+            )
 
     if session_dates != sorted(set(session_dates)):
         failures.append("session dates are duplicated or not strictly increasing")
     post_0901_sweep_fills = sum(
         entry_count + reduction_count
-        for entry_count, reduction_count in post_0901_cumulative_by_market.values()
+        for entry_count, reduction_count in post_0901_sweep_by_session.values()
     )
 
     final_open_positions: dict[str, int] = {}
@@ -1363,7 +1399,7 @@ def _validate_rebuild(
             expected_fills=expected_minute_price_fills,
             failures=failures,
             require_capacity=receipt_entry_contract == MINUTE_PRICE_0901_REPLAY_CONTRACT,
-            allow_receipted_absence=allow_margin_carry,
+            allow_receipted_absence=allow_margin_carry or terminal_unlimited,
             expected_prior_fills=prior_paper_fills,
             prior_manifest=prior_manifest,
         )
@@ -1374,6 +1410,7 @@ def _validate_rebuild(
                 failures=failures,
                 expected_prior_fills=prior_paper_fills,
                 expected_post_0901_sweep_fills=post_0901_sweep_fills,
+                expected_sweep_by_session=post_0901_sweep_by_session,
                 prior_manifest=prior_manifest,
             )
         )
@@ -1400,7 +1437,7 @@ def _validate_rebuild(
     if input_hashes != _promotion_input_hashes(candidate):
         failures.append("candidate history changed during validation")
     if failures:
-        raise RuntimeError(f"replay promotion validation failed ({len(failures)} failures): " + "; ".join(failures[:50]))
+        raise ReplayValidationError(failures)
     return {
         "session_dates": session_dates,
         "promotion_input_hashes": input_hashes,
@@ -1458,12 +1495,14 @@ def _cutover_blockers(
     live_modes = live_state.get("modes") or {}
     candidate_modes = _load_object(candidate / "state.json").get("modes") or {}
     blockers: list[str] = []
-    # Explicitly retired modes remain immutable rollback evidence, not active
-    # accounts. Both runtime enablement and per-mode retirement must agree.
+    # Exclude a retired account only when it is absent from the explicitly
+    # expected roster. A previously failed configuration may have hidden an
+    # otherwise configured mode; validated restoration must not hide it again.
     retired = {m for m, row in live_modes.items()
                if row.get("configured_enabled") is False
                and isinstance(live_state.get("enabled_markets"), list)
-               and m not in live_state["enabled_markets"]}
+               and m not in live_state["enabled_markets"]
+               and m not in expected_markets}
     added = added_markets or set()
     aborted = None
     if added:
@@ -1476,7 +1515,11 @@ def _cutover_blockers(
                 blockers.append(f"aborted activation recovery is not valid: {exc}")
     if not added.issubset(expected_markets) or (added & set(live_modes) and aborted is None):
         blockers.append("added modes must be new members of the exact candidate mode set")
-    if set(live_modes) - retired != expected_markets - added:
+    # Only the separately validated never-funded aborted addition may already
+    # have its new ID in live state. A restored historical mode is not an
+    # addition and must remain in the ordinary roster/inventory checks.
+    superseded_additions = added & set(live_modes) if aborted is not None else set()
+    if set(live_modes) - retired - superseded_additions != expected_markets - added:
         blockers.append(
             f"live mode set differs from expected: {sorted(live_modes)}"
         )
@@ -1654,12 +1697,21 @@ def main(*, before_exchange: Callable[[], None] | None = None, argv=None) -> Non
     expected_markets = {str(value).strip() for value in args.expected_market}
     if not expected_markets or "" in expected_markets:
         raise ValueError("--expected-market values must be non-empty")
-    acceptance = _validate_rebuild(
-        candidate,
-        expected_markets=expected_markets,
-        allow_current_open_session=bool(args.allow_current_open_session),
-        allow_margin_carry=bool(args.allow_margin_carry),
-    )
+    try:
+        acceptance = _validate_rebuild(
+            candidate,
+            expected_markets=expected_markets,
+            allow_current_open_session=bool(args.allow_current_open_session),
+            allow_margin_carry=bool(args.allow_margin_carry),
+        )
+    except ReplayValidationError as exc:
+        if args.validation_receipt is not None:
+            _atomic_json(args.validation_receipt, {
+                "status": "failed_validation", "cutover": {"ready": False},
+                "failure_count": len(exc.failures), "failures": exc.failures,
+                "candidate_directory": str(candidate),
+            })
+        raise
     added_markets = set(getattr(args, "added_market", ()) or ())
     cutover_blockers = _cutover_blockers(live, candidate, expected_markets, added_markets=added_markets)
     if args.validate_only:

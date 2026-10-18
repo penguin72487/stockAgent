@@ -270,6 +270,8 @@ def test_native_failure_metadata_has_shapes_not_prose_names_or_capture_grants(ho
     facts = ettoday_validation_metadata(soup, page_url=URLS[host == 'www'])
     assert facts['native_story_count'] == 1 and facts['native_release_node_count'] == 1
     assert facts['declared_publication'] == [PUB] and facts['declared_modification'] == [MOD]
+    assert facts['contract_version'] == 2
+    assert facts['schema_publication'] == [PUB] and facts['schema_modification'] == [MOD]
     assert facts['native_credit_shapes'][0]['native_reporter_signature_shape']
     assert facts['native_credit_shapes'][0]['reporter_count'] == (1 if host == 'finance' else 2)
     text = json.dumps(facts, ensure_ascii=False)
@@ -290,5 +292,32 @@ def test_bad_source_clock_and_schema_are_diagnostic_not_silently_repaired():
 
 def test_unknown_route_does_not_export_metadata_or_authority():
     facts = ettoday_validation_metadata(page(), page_url='https://house.ettoday.net/news/3254747')
-    assert facts == {'contract_version': 1, 'literal_route_verified': False,
+    assert facts == {'contract_version': 2, 'literal_route_verified': False,
         'body_text_retained': False, 'raw_scope_or_article_acceptance_granted': False}
+
+
+def test_finite_failed_clock_probe_includes_native_facts_without_body_or_raw_capture(tmp_path, capsys):
+    from scripts.probe_news_sources import probe_provider
+    soup = page()
+    soup.select_one('meta[name=lastmod]')['content'] = '1970-01-01T08:00:00+08:00'
+    http = SimpleNamespace(registry=PolicyRegistry(config(), base=Path.cwd()),
+        provider_not_before={}, robot_delays={}, get=lambda url: Response(
+            url, 200, {'content-type': 'text/html'}, str(soup).encode()))
+    result = probe_provider(http, [URLS[0]], output_root=tmp_path)[0]
+    assert result['extraction_error'] == 'invalid_bulk_publication_clock'
+    facts = result['ettoday_native_validation']
+    assert facts['declared_publication'] == [PUB] and facts['schema_publication'] == [PUB]
+    assert facts['declared_modification'] == ['1970-01-01T08:00:00+08:00']
+    assert facts['schema_modification'] == [MOD]
+    assert not facts['body_text_retained'] and not facts['raw_scope_or_article_acceptance_granted']
+    assert PROSE not in json.dumps(result, ensure_ascii=False) and PROSE not in capsys.readouterr().out
+    assert 'private_diagnostic_path' not in result and not list(tmp_path.rglob('*.parquet'))
+
+
+def test_native_diagnostic_does_not_export_nonclock_schema_field_text():
+    soup = page()
+    update_schema(soup, datePublished=PROSE, dateModified={'secret': NOTICE})
+    soup = BeautifulSoup(str(soup), 'lxml')
+    facts = ettoday_validation_metadata(soup, page_url=URLS[0])
+    assert facts['schema_publication'] == [None] and facts['schema_modification'] == [None]
+    assert PROSE not in json.dumps(facts, ensure_ascii=False) and NOTICE not in json.dumps(facts, ensure_ascii=False)

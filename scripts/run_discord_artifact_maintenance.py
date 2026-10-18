@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import date, datetime, time as wall_time, timezone
 from pathlib import Path
 from types import ModuleType
@@ -36,6 +37,11 @@ ARTIFACT_OWNER_UNIT = "stockagent-discord-artifact-maintenance.service"
 ARTIFACT_RETRY_RUNWAY_MINUTES = 123
 RETRY_RECEIPT_MAX_BYTES = 16 * 1024 * 1024
 UNCHANGED_RETRY_WAKEUP_SECONDS = 300
+# Measured complete 2014--2026 cold source: 3812 s plus source-owner wait.
+# Keep the isolated recovery within its 120-min unit, reserving 30 min for
+# formal inference and 10 min for cache/control overhead. Interactive callers
+# retain their configured ordinary completed-session timeout.
+FACTORIZED_SOURCE_RECOVERY_SECONDS = 80 * 60
 
 
 def _load_discord_bot() -> ModuleType:
@@ -136,7 +142,7 @@ def _deferred_factorized_source_request() -> dict | None:
     return state
 
 
-def _stale_factorized_projection_request() -> dict | None:
+def _stale_factorized_projection_request(*, config_path: str | Path | None = None) -> dict | None:
     """A no-model wakeup hint for a preopen projection after an accepted close.
 
     A decision-session label is not proof its calendar includes that session's
@@ -173,10 +179,32 @@ def _stale_factorized_projection_request() -> dict | None:
             or any(not isinstance(day, str) or date.fromisoformat(day).isoformat() != day for day in dates)
             or len(dates) != len(set(dates)) or dates != sorted(dates)):
         raise ValueError("factorized projection dates must be unique ordered canonical dates")
-    if dates[-1] >= expected:
+    # A current tail does not satisfy the same deployment's formal-history
+    # consumer. Use the canonical inherited config, not another hard-coded
+    # cutoff. This path is used only by the selected source owner's worker;
+    # the receipt-only retry controller still imports no model/config runtime.
+    required_start = None
+    source_start = (paper.get("source_identity") or {}).get("start_date")
+    if config_path is not None:
+        from stockagent.config import load_config
+
+        selected = Path(config_path)
+        selected = selected if selected.is_absolute() else ROOT / selected
+        configured_start = load_config(selected).data.panel_start_date
+        if configured_start:
+            required_start = date.fromisoformat(configured_start).isoformat()
+    if source_start is not None:
+        source_start = date.fromisoformat(source_start).isoformat()
+    # Missing legacy producer identity is not proof of an earlier coverage
+    # boundary. The exact BASE/calendar preflight remains the acceptance gate.
+    scope_gap = bool(required_start and (source_start or dates[0]) > required_start)
+    if dates[-1] >= expected and not scope_gap:
         return None
     return {"status": "projection_refresh_required", "expected_completed_session": expected,
             "projection_end": dates[-1], "manifest": str(path),
+            "reason": "formal_history_scope_missing" if scope_gap else "completed_session_missing",
+            "required_start_date": required_start,
+            "projection_source_start": source_start or dates[0],
             "advisory_only": True, "model_executed": False,
             "contract": "factorized_paper_projection_lag1_v1"}
 
@@ -495,7 +523,8 @@ def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> b
     expected = ROOT / "scripts/update_tw_day_trade_factorized_live.py"
     if not _owns_factorized_source_updater(cfg):
         return True
-    state = _deferred_factorized_source_request() or _stale_factorized_projection_request()
+    source_config = getattr(cfg, "config_path", None) or None
+    state = _deferred_factorized_source_request() or _stale_factorized_projection_request(config_path=source_config)
     if state is None:
         return True
     projection_refresh = state.get("status") == "projection_refresh_required"
@@ -505,6 +534,14 @@ def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> b
               reason="isolated_source_owner_required", owner_unit=ARTIFACT_OWNER_UNIT,
               model_executed=False)
         return False
+    if _factorized_source_preparation_busy(cfg):
+        # A cold full-history producer may legitimately outlive this command's
+        # short activation budget. Do not queue another child on prepare.lock
+        # or hold every other close-cache consumer behind it. This is a wait
+        # hint only; the next pass still validates the actual committed source.
+        _emit(status=f"{action}_deferred", market=cfg.market,
+              reason="factorized_projection_in_progress", model_executed=False)
+        return False
     bot = _load_discord_bot()
     status = bot._ensure_signal_ready(cfg)
     if status.market_open or not bot._completed_session_publication_ready(status):
@@ -512,25 +549,46 @@ def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> b
               reason="accepted_official_close_required", model_executed=False)
         return False
     _emit(status=f"{action}_started", market=cfg.market,
-          owner=ARTIFACT_OWNER_UNIT, source_owner=str(expected), model_executed=False)
-    bot._run_completed_session_command(cfg, bypass_cache=True)
+          owner=ARTIFACT_OWNER_UNIT, source_owner=str(expected), model_executed=False,
+          timeout_seconds=FACTORIZED_SOURCE_RECOVERY_SECONDS)
+    recovery_cfg = replace(cfg, completed_session_timeout_seconds=FACTORIZED_SOURCE_RECOVERY_SECONDS)
+    bot._run_completed_session_command(recovery_cfg, bypass_cache=True)
     if _read_retry_json(_factorized_source_updater_receipt()).get("status") not in {"verified", "already_current"}:
         raise RuntimeError("canonical factorized source recovery has no accepted receipt")
     if projection_refresh and (not (ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/factorized_manifest.json").is_file()
-                               or _stale_factorized_projection_request() is not None):
+                               or _stale_factorized_projection_request(config_path=source_config) is not None):
         raise RuntimeError("canonical factorized source recovery still lacks the completed calendar")
     _emit(status=f"{action}_verified", market=cfg.market,
           source_owner=str(expected), model_executed=False)
     return True
 
 
-def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int]:
+def _factorized_source_preparation_busy(cfg) -> bool:
+    """Observe the canonical kernel lease, not an old lock file or process name."""
+    if not _owns_factorized_source_updater(cfg):
+        return False
+    path = _factorized_source_updater_receipt().with_name("prepare.lock")
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return False
+    with handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int, int]:
     from scripts import discord_postclose_wakeup as wakeup
+    from stockagent.live.completed_inference_cache import LoadedImplementationChanged
 
     wakeup_before = wakeup.observe(ROOT)
     discord_bot = _load_discord_bot()
     attempted = 0
     failures = 0
+    deferred = 0
     for market in markets:
         cfg = discord_bot._resolve_market(market)
         if not discord_bot._is_tw_daily_signal_market(cfg):
@@ -538,12 +596,18 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
         attempted += 1
         try:
             if not _recover_deferred_factorized_source(cfg, allow_warming=allow_source_warming):
-                failures += 1
+                deferred += 1
                 continue
             result = discord_bot._run_completed_session_signal_cache_sync(cfg)
         except TWPublicSourceUpdatePending:
             # A writer may acquire the lock just after the outer busy check.
             # Stop this source-dependent pass, not the Gateway or source owner.
+            raise
+        except LoadedImplementationChanged:
+            # This is process-wide, not one market's bad data. No later model
+            # can be admitted in this process. Let main retain a worker failure
+            # and the existing timer start fresh, without spending every
+            # market's artifact retry/backoff or relabelling loaded code.
             raise
         except Exception as exc:
             failures += 1
@@ -566,15 +630,15 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
                 panel_date=result.summary.get("panel_date"),
                 output_dir=str(result.output_dir),
             )
-    if attempted and not failures:
+    if attempted and not failures and not deferred:
         acknowledged = wakeup.acknowledge(ROOT, wakeup_before, discord_bot)
         _emit(status="postclose_wakeup_readback", acknowledged=acknowledged,
               advisory_only=True)
-    return attempted, failures
+    return attempted, failures, deferred
 
 
 def _populate_postclose_signal_caches_or_defer(
-        markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int] | None:
+        markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int, int] | None:
     try:
         return _populate_postclose_signal_caches(markets, allow_source_warming=allow_source_warming)
     except TWPublicSourceUpdatePending as exc:
@@ -623,6 +687,34 @@ def _wait_for_tw_public_refresh() -> bool:
     return True
 
 
+def _completed_session_retry_key(cfg, status, *, now: datetime) -> str | None:
+    """Resume an existing close job, never schedule a new non-session job.
+
+    The daily Gateway scheduler deliberately creates no weekend/holiday key.
+    The isolated retry owner may still finish the accepted latest close's
+    durable failed/interrupted job. Call only after the canonical fresh-data
+    and completed-session receipt gates; ordinary retry backoff still applies.
+    """
+    if (not bool(getattr(cfg, "day_trade_simulation_enabled", False))
+            or not bool(getattr(getattr(status, "data", None), "fresh", False))):
+        return None
+    bot = _load_discord_bot()
+    target = bot._completed_session_target_date(status)
+    if not target:
+        return None
+    parsed = date.fromisoformat(target)
+    if parsed.isoformat() != target or parsed > now.date():
+        return None
+    key = f"{target}:{cfg.market}:artifact_backfill"
+    with bot._artifact_backfill_status_guard():
+        job = (bot._load_artifact_backfill_status().get("jobs") or {}).get(key)
+    if (not isinstance(job, dict) or job.get("market") != cfg.market
+            or job.get("key", key) != key
+            or job.get("status") not in {"failed", "running"}):
+        return None
+    return key
+
+
 def run_once(*, signal_cache_only: bool = False) -> int:
     discord_bot = _load_discord_bot()
     discord_bot._rotate_error_log_if_needed()
@@ -666,18 +758,22 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             population = _populate_postclose_signal_caches_or_defer(markets, allow_source_warming=False)
             if population is None:
                 return 0
-            cache_attempted, cache_failures = population
+            cache_attempted, cache_failures, cache_deferred = population
+            cache_status = ("degraded" if cache_failures else
+                            "waiting_source" if cache_deferred else "complete")
             _emit(
-                status="signal_cache_complete"
-                if cache_failures == 0
-                else "signal_cache_degraded",
+                status=f"signal_cache_{cache_status}",
                 attempted=cache_attempted,
                 failures=cache_failures,
+                deferred=cache_deferred,
             )
             discord_bot._record_artifact_maintenance_run(
-                "complete" if cache_failures == 0 else "degraded",
+                cache_status,
+                reason="postclose_cache_failed" if cache_failures else
+                       "postclose_source_deferred" if cache_deferred else None,
                 attempted=cache_attempted,
                 failures=cache_failures,
+                deferred=cache_deferred,
             )
             return 0 if cache_failures == 0 else 1
 
@@ -693,15 +789,26 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     reason="postclose_signal_cache_in_progress",
                 )
                 return 0
-            if _populate_postclose_signal_caches_or_defer(markets) is None:
+            population = _populate_postclose_signal_caches_or_defer(markets)
+            if population is None:
                 return 0
+            cache_attempted, cache_failures, cache_deferred = population
 
         attempted = 0
         failures = 0
         deferred = 0
         retry_deferred = 0
+        source_deferred = 0
         for market in markets:
             cfg = discord_bot._resolve_market(market)
+            if _factorized_source_preparation_busy(cfg):
+                # Source work is not a failed inference attempt. Preserve the
+                # existing retry receipt and let independent markets proceed.
+                deferred += 1
+                source_deferred += 1
+                _emit(status="deferred", reason="factorized_projection_in_progress",
+                      market=market, model_executed=False)
+                continue
             if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
                 runtime_status = discord_bot._ensure_signal_ready_cached(cfg)
                 if (
@@ -719,6 +826,11 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     continue
             now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
             key = discord_bot._artifact_backfill_key(cfg, now)
+            if key is None and bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+                key = _completed_session_retry_key(cfg, runtime_status, now=now)
+                if key is not None:
+                    _emit(status="resuming_completed_session", market=market, key=key,
+                          new_session_job=False)
             if key is None or not discord_bot._market_has_model(cfg):
                 continue
             if not discord_bot._artifact_backfill_retry_allowed(key):
@@ -816,6 +928,12 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 output_dir=str(result.output_dir) if result is not None else None,
             )
 
+        # Close caches and full-history artifacts have separate work/receipts.
+        # A successful history pass cannot erase a real cache failure; waiting
+        # for a source is neither an inference failure nor cache completion.
+        attempted += cache_attempted
+        failures += cache_failures
+        deferred += cache_deferred
         final_status = (
             "degraded" if failures else "waiting_source" if deferred else "complete"
         )
@@ -825,10 +943,17 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             failures=failures,
             deferred=deferred,
             retry_deferred=retry_deferred,
+            source_deferred=source_deferred,
+            cache_attempted=cache_attempted,
+            cache_failures=cache_failures,
+            cache_deferred=cache_deferred,
         )
         discord_bot._record_artifact_maintenance_run(
             final_status,
-            reason="artifact_retry_deferred" if retry_deferred else None,
+            reason=("postclose_cache_failed" if cache_failures else
+                    "artifact_retry_deferred" if retry_deferred else
+                    "factorized_projection_in_progress" if source_deferred else
+                    "postclose_source_deferred" if cache_deferred else None),
             attempted=attempted,
             failures=failures,
             deferred=deferred,

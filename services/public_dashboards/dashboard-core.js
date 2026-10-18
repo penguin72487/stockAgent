@@ -754,6 +754,15 @@
     return item.slug ? `/${item.slug}/` : "/";
   }
 
+  function isOwnerView() {
+    return global.document?.querySelector?.('meta[name="stockagent-audience"]')?.getAttribute("content") === "owner";
+  }
+
+  function navigationItems() {
+    return NAV_ITEMS.filter((item) => isOwnerView()
+      || ["overview", "tw-day-trade", "tw-overnight"].includes(item.id));
+  }
+
   function mountNavigation(target) {
     if (!target || target.dataset.dashboardNavMounted === "true") return target;
     const current = global.location?.pathname?.startsWith("/tw-overnight/")
@@ -763,7 +772,7 @@
       throw new TypeError(`Unknown public dashboard id: ${current}`);
     }
     const fragment = global.document.createDocumentFragment();
-    for (const item of NAV_ITEMS) {
+    for (const item of navigationItems()) {
       const link = global.document.createElement("a");
       link.href = dashboardHref(item);
       link.textContent = item.label;
@@ -1008,7 +1017,8 @@
     DEFAULT_TIMEOUT_MS,
     PERFORMANCE_SCHEMA_VERSION,
     PERFORMANCE_HISTORY_LIMIT,
-    NAV_ITEMS,
+    NAV_ITEMS: Object.freeze(navigationItems()),
+    isOwnerView,
     byId,
     finiteNumber,
     formatNumber,

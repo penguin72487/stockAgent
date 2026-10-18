@@ -3337,21 +3337,52 @@ class TwDayTradeSimulationEngine:
         mode["exchange_fill_guaranteed"] = False
         return mode
 
+    def _update_configured_market_roster(
+        self,
+        specs: Sequence[ModeSpec],
+        *,
+        configured_markets: Sequence[str] | None,
+        errors: Mapping[str, str] | None,
+    ) -> None:
+        """Configuration membership is not proof of successful spec loading.
+
+        Retain an existing failed account and its financial state visibly;
+        never interpret a parser/checkpoint failure as an authorized retirement.
+        Execution callers still receive only the successfully resolved specs.
+        """
+        resolved = [str(spec.market) for spec in specs]
+        configured = list(resolved if configured_markets is None else configured_markets)
+        if (isinstance(configured_markets, (str, bytes))
+                or any(not isinstance(market, str) or not market.strip() for market in configured)
+                or len(configured) != len(set(configured))
+                or len(resolved) != len(set(resolved))
+                or not set(resolved).issubset(configured)):
+            raise ValueError("configured market roster must uniquely include every resolved spec")
+        unresolved = set(configured) - set(resolved)
+        failures = {market: str((errors or {}).get(market) or "configured_mode_spec_unavailable")
+                    for market in configured if market in unresolved}
+        self.state["enabled_markets"] = configured
+        self.state["configuration_errors"] = failures
+        for market, mode in (self.state.get("modes") or {}).items():
+            if not isinstance(mode, dict):
+                continue
+            mode["configured_enabled"] = market in configured
+            if market in failures:
+                mode["readiness_error"] = failures[market]
+                mode["engine_status"] = "blocked_mode_configuration"
+
     def update_readiness(
         self,
         specs: Sequence[ModeSpec],
         *,
         now: datetime | None = None,
         errors: Mapping[str, str] | None = None,
+        configured_markets: Sequence[str] | None = None,
         current_eligibility_coverage: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         observed = _now_taipei(now)
-        enabled_markets = [str(spec.market) for spec in specs]
-        self.state["enabled_markets"] = enabled_markets
-        enabled = set(enabled_markets)
-        for market, existing in (self.state.get("modes") or {}).items():
-            if isinstance(existing, dict):
-                existing["configured_enabled"] = str(market) in enabled
+        self._update_configured_market_roster(specs, configured_markets=configured_markets,
+                                             errors=errors)
         for spec in specs:
             mode = self._mode(spec)
             mode["configured_enabled"] = True
@@ -7699,6 +7730,7 @@ class TwDayTradeSimulationEngine:
         ]
         material_projection = {
             "enabled_markets": active_markets,
+            "configuration_errors": self.state.get("configuration_errors") or {},
             "modes": {
                 market: {
                     key: value
@@ -7813,6 +7845,8 @@ class TwDayTradeSimulationEngine:
         health = (
             "critical"
             if critical
+            else "blocked"
+            if self.state.get("configuration_errors")
             else "active"
             if active
             else "blocked"
@@ -7829,6 +7863,7 @@ class TwDayTradeSimulationEngine:
                 "engine_run_id": self._engine_run_id,
                 "updated_at": observed.isoformat(timespec="seconds"),
                 "health": health,
+                "configuration_errors": self.state.get("configuration_errors") or {},
                 "opening_execution_observer": {
                     "contract": "state_fsync_then_paper_target_progress_v1",
                     "progress_path": str(self.execution_latency_path),
@@ -7981,6 +8016,7 @@ class TwDayTradeSimulationEngine:
                 "simulation_only": True,
                 "production_order_possible": False,
                 "ledger_integrity_ready": not divergence_rows,
+                "configuration_errors": self.state.get("configuration_errors") or {},
                 "enabled_markets": enabled_markets,
                 "mode_count": len(mode_rows),
                 "modes": {

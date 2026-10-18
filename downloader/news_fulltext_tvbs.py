@@ -20,7 +20,23 @@ from downloader.news_fulltext_public_originals import _one, _visible
 
 TVBS_BODY_SELECTOR = ':scope > .tvbs-native-body'
 TVBS_PATH_PATTERN = '^(?:/[a-z][a-z-]*/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$'
+TVBS_V4_PATH_PATTERN = '^(?:/[a-z][a-z-]*/[1-9][0-9]*|/entertainment/music/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$'
 TVBS_HOSTS = ('news.tvbs.com.tw', 'cars.tvbs.com.tw', 'supertaste.tvbs.com.tw')
+# Current missing heads independently diagnosed on their original URLs.
+# This is a finite recovery witness, not a replay of healthy/unknown failures.
+TVBS_V3_PROVED_FAILURES = {
+    'https://news.tvbs.com.tw/local/4036762': 'article_attribution_not_verified',
+    'https://news.tvbs.com.tw/life/2417011': 'article_identity_not_verified',
+    'https://news.tvbs.com.tw/life/2414430': 'article_identity_not_verified',
+    'https://news.tvbs.com.tw/money/3230612': 'invalid_bulk_publication_clock',
+    'https://news.tvbs.com.tw/politics/2050130': 'invalid_bulk_publication_clock',
+    'https://news.tvbs.com.tw/money/4003754': 'body_not_found',
+}
+TVBS_V4_PROVED_MUSIC_URLS = ('https://news.tvbs.com.tw/entertainment/2520954',)
+_THREE_PERSON_CREDITS = {
+    'two_reporters_and_photographer': ('reporter', 'reporter', 'photographer'),
+    'reporter_responsible_and_intern_editor': ('reporter', 'responsible_editor', 'intern_editor'),
+}
 _TW = timezone(timedelta(hours=8))
 _EXTERNAL_CREDIT = re.compile(r'^(?:[（(]中央社|[（(]?(?:中央社(?:記者|／|/)|CNEWS|匯流新聞網|CTWANT|周刊王|轉載[：:]))')
 _EXTERNAL_AUTHORS = {'中央社', '中央通訊社', 'CNA', 'CNEWS', '匯流新聞網', 'CTWANT', '周刊王'}
@@ -33,7 +49,7 @@ TVBS_EXHIBITION_LAYOUTS = {
 }
 
 
-def tvbs_request_identity(url, *, requested=False):
+def tvbs_request_identity(url, *, requested=False, adapter_contract_version=1):
     """Do not remove a query or change a host to obtain another response.
 
     Old local links include HTTP and the publisher's literal `from` UI query.
@@ -46,9 +62,11 @@ def tvbs_request_identity(url, *, requested=False):
         query = parse_qsl(parts.query, keep_blank_values=True)
     except (NewsError, TypeError, ValueError):
         return None
+    pattern = TVBS_V4_PATH_PATTERN if adapter_contract_version == 4 else TVBS_PATH_PATTERN
     if (parts.scheme not in ({'http', 'https'} if requested else {'https'})
             or parts.netloc not in TVBS_HOSTS
-            or not re.fullmatch(TVBS_PATH_PATTERN, parts.path)
+            or not re.fullmatch(pattern, parts.path)
+            or parts.path.startswith('/entertainment/music/') and parts.netloc != TVBS_HOSTS[0]
             or parts.path in TVBS_EXHIBITION_LAYOUTS and parts.netloc != TVBS_HOSTS[0]
             or parts.query and (len(query) != 1 or query[0][0] != 'from' or not query[0][1])):
         return None
@@ -72,14 +90,25 @@ def _visible_text_tree(node):
             _visible(text.parent)
 
 
-def _schema(soup, page_url):
-    identity = tvbs_request_identity(page_url)
+def _schema(soup, page_url, *, adapter_contract_version=1):
+    identity = tvbs_request_identity(page_url, adapter_contract_version=adapter_contract_version)
     if identity is None:
         raise NewsError('article_identity_not_verified')
     host, path = identity
     original = 'https://' + host + path
     canonical = _one(soup, 'link[rel~="canonical"][href]')
     ogurl = _one(soup, 'meta[property="og:url"][content]')
+    if adapter_contract_version >= 3 and canonical.get('href') != original:
+        # A locally known old category can serve the same report without a
+        # redirect. Bind to the *actual* mutually agreeing canonical/OG/schema,
+        # same news host and numeric story ID; never request a guessed alias.
+        declared = tvbs_request_identity(canonical.get('href'), adapter_contract_version=adapter_contract_version)
+        if (host != TVBS_HOSTS[0] or declared is None or declared[0] != host
+                or canonical.get('href') != 'https://' + declared[0] + declared[1]
+                or path.startswith('/exhibition/') or declared[1].startswith('/exhibition/')
+                or path.rsplit('/', 1)[1] != declared[1].rsplit('/', 1)[1]):
+            raise NewsError('article_identity_not_verified')
+        original = canonical.get('href')
     if canonical.get('href') != original or ogurl.get('content') != original:
         raise NewsError('article_identity_not_verified')
     scripts = soup.select('script[type="application/ld+json"]')
@@ -140,9 +169,10 @@ def _clocks(soup, article, *, adapter_contract_version=1, host=None):
             # Retain this source anomaly, not a repaired time or historical
             # availability claim. Other hosts/order anomalies remain errors.
             same_minute = clocks['dateModified'].astimezone(_TW).strftime('%Y.%m.%d %H:%M') == clocks['datePublished'].astimezone(_TW).strftime('%Y.%m.%d %H:%M')
-            if not (adapter_contract_version == 2 and host == TVBS_HOSTS[0]
+            if not (host == TVBS_HOSTS[0] and (adapter_contract_version >= 3
+                    or adapter_contract_version == 2
                     and clocks['datePublished'] - clocks['dateModified'] == timedelta(seconds=1)
-                    and same_minute):
+                    and same_minute)):
                 raise ValueError('revision before publication')
     except (ValueError, TypeError):
         raise NewsError('invalid_bulk_publication_clock') from None
@@ -169,8 +199,8 @@ def _news(soup, article, clocks, notices, original, *, adapter_contract_version=
     roles = set()
     authors = article.get('author')
     authors = authors if isinstance(authors, list) else [authors]
-    if adapter_contract_version == 2:
-        if len(authors) not in {1, 2}:
+    if adapter_contract_version >= 2:
+        if len(authors) not in ({1, 2, 3} if adapter_contract_version >= 3 else {1, 2}):
             raise NewsError('article_attribution_not_verified')
         # Preserve the publisher's ordered reporter + responsible-editor
         # declarations, rather than dropping the editor or inventing a person.
@@ -181,22 +211,35 @@ def _news(soup, article, clocks, notices, original, *, adapter_contract_version=
             raise NewsError('article_attribution_not_verified')
         if any(len(author['name']) > 80 or re.search(r'[:：｜|]', author['name']) for author in authors):
             raise NewsError('article_attribution_not_verified')
+        if len(authors) == 3 and any('、' in author['name'] for author in authors):
+            raise NewsError('article_attribution_not_verified')
     else:
         authors = [_author(article)]
     author = authors[0]
-    role_pattern = r'(記者|編輯|編譯)' if adapter_contract_version == 2 else r'(記者|編輯)'
+    role_pattern = r'(記者|編輯|編譯)' if adapter_contract_version >= 2 else r'(記者|編輯)'
     credit_pattern = role_pattern + '：' + re.escape(_key(author['name']))
     if len(authors) == 2:
         credit_pattern += r'｜責任編輯：' + re.escape(_key(authors[1]['name']))
+    layouts = set()
     for node in labels:
         _visible_tree(node)
         text = node.get_text(' ', strip=True)
         compact = _key(text)
-        credit = re.fullmatch(credit_pattern, compact)
-        if credit:
+        credit = re.fullmatch(credit_pattern, compact) if len(authors) <= 2 else None
+        layout = None
+        if len(authors) == 3:
+            names = [_key(person['name']) for person in authors]
+            if compact == f'記者：{names[0]}、{names[1]}｜攝影：{names[2]}':
+                layout = 'two_reporters_and_photographer'
+            elif compact == f'記者：{names[0]}｜責任編輯：{names[1]}｜實習編輯：{names[2]}':
+                layout = 'reporter_responsible_and_intern_editor'
+        if credit or layout:
             counts['byline'] += 1
-            roles.add(credit[1])
-            kind = {'記者': 'native_reporter_credit', '編輯': 'native_editor_credit', '編譯': 'native_translator_credit'}[credit[1]]
+            roles.add(credit[1] if credit else '記者')
+            kind = ('native_' + layout + '_credit' if layout else
+                {'記者': 'native_reporter_credit', '編輯': 'native_editor_credit', '編譯': 'native_translator_credit'}[credit[1]])
+            if layout:
+                layouts.add(layout)
             if len(authors) == 2:
                 kind += '_with_responsible_editor'
             notices.append({'kind': kind, 'text': text})
@@ -210,7 +253,7 @@ def _news(soup, article, clocks, notices, original, *, adapter_contract_version=
             raise NewsError('invalid_bulk_publication_clock')
         counts[field] += 1
         notices.append({'kind': 'native_visible_' + field + '_minute', 'text': text})
-    if counts['byline'] not in {1, 2} or len(roles) != 1:
+    if counts['byline'] not in {1, 2} or len(roles) != 1 or len(layouts) > 1:
         raise NewsError('article_attribution_not_verified')
     if counts['datePublished'] not in {1, 2} or counts['dateModified'] != counts['datePublished']:
         raise NewsError('invalid_bulk_publication_clock')
@@ -229,7 +272,9 @@ def _news(soup, article, clocks, notices, original, *, adapter_contract_version=
                 and links[0].get('href', '').startswith('https://roundtable-tech-zh.vive.com/query?')
                 and node.get_text(' ', strip=True) in {'到VIVE科技圓桌討論，聽聽專家怎麼說', '到VIVE科技圓桌討論，聽聽專家怎麼說 >'}):
             node.decompose()
-    return heading, body, cleaned, authors if len(authors) == 2 else author, 'native_header_author_role_and_release_revision_minutes'
+    basis = ('native_header_' + next(iter(layouts)) + '_and_release_revision_minutes' if layouts
+        else 'native_header_author_role_and_release_revision_minutes')
+    return heading, body, cleaned, authors if len(authors) >= 2 else author, basis
 
 
 def _cars(soup, article, clocks, notices, original):
@@ -426,13 +471,19 @@ def _exhibition(soup, *, page_url):
 
 
 def tvbs_visible_article(soup, *, page_url, adapter_contract_version=1):
-    if adapter_contract_version not in {1, 2}:
+    if type(adapter_contract_version) is not int or adapter_contract_version not in {1, 2, 3, 4}:
         raise ValueError('reviewed_tvbs_adapter_version_required')
-    identity = tvbs_request_identity(page_url)
+    identity = tvbs_request_identity(page_url, adapter_contract_version=adapter_contract_version)
     if identity and identity[1] in TVBS_EXHIBITION_LAYOUTS:
         return _exhibition(soup, page_url=page_url)
-    article, host, original = _schema(soup, page_url)
+    article, host, original = _schema(soup, page_url, adapter_contract_version=adapter_contract_version)
     clocks, notices = _clocks(soup, article, adapter_contract_version=adapter_contract_version, host=host)
+    requested = tvbs_request_identity(page_url, adapter_contract_version=adapter_contract_version)
+    category_alias = original != 'https://' + requested[0] + requested[1]
+    if category_alias:
+        notices.append({'kind': 'native_same_story_category_canonical',
+            'response_url': page_url, 'declared_canonical': original,
+            'alternate_url_requested': False})
     adapter = dict(zip(TVBS_HOSTS, (_news, _cars, _supertaste)))[host]
     options = {'adapter_contract_version': adapter_contract_version} if host == TVBS_HOSTS[0] else {}
     heading, body, cleaned, author, basis = adapter(soup, article, clocks, notices, original, **options)
@@ -473,12 +524,27 @@ def tvbs_visible_article(soup, *, page_url, adapter_contract_version=1):
         'source_author_account': authors[0].get('url') or authors[0].get('@id'), 'author_name_invented': False}
     if len(authors) == 2:
         attribution['publisher_ordered_authors_with_responsible_editor'] = authors
+    elif len(authors) == 3:
+        layout = next(key for key in _THREE_PERSON_CREDITS if basis ==
+            'native_header_' + key + '_and_release_revision_minutes')
+        attribution['publisher_ordered_people_with_visible_roles'] = [
+            {'name': person['name'], 'role': role, 'basis': 'visible_current_report_header_credit'}
+            for person, role in zip(authors, _THREE_PERSON_CREDITS[layout])]
     anomaly = clocks['dateModified'] < clocks['datePublished']
     clock_basis = ('source_declared_aware_datetimes_match_native_release_revision_minutes' if host == TVBS_HOSTS[0]
         else 'source_declared_aware_datetimes_match_native_release_date_datetime' if host == TVBS_HOSTS[1]
         else 'source_declared_aware_datetimes_match_meta; native_visible_release_clock_not_present')
     if anomaly:
-        clock_basis += '; source_declared_revision_precedes_release_exactly_1_second_same_visible_minute; raw_clocks_preserved_not_corrected'
+        same_minute = clocks['dateModified'].replace(second=0, microsecond=0) == clocks['datePublished'].replace(second=0, microsecond=0)
+        if clocks['datePublished'] - clocks['dateModified'] == timedelta(seconds=1) and same_minute:
+            clock_basis += '; source_declared_revision_precedes_release_exactly_1_second_same_visible_minute; raw_clocks_preserved_not_corrected'
+        else:
+            clock_basis += '; independent_source_declared_revision_precedes_release; raw_clocks_preserved_not_corrected'
+            notices.append({'kind': 'source_modification_precedes_publication',
+                'declared_publication': article['datePublished'], 'declared_modification': article['dateModified'],
+                'availability_backdated_to_modification': False, 'source_reason_inferred': False})
+    if category_alias:
+        basis += '_actual_response_declares_same_story_category_canonical'
     return {'headline': title, 'author': authors, 'datePublished': article['datePublished'],
         'dateModified': article['dateModified'], 'article_identity_basis': 'canonical_OG_single_schema_visible_heading_with_native_title_anchor_' + basis + '_v1',
         'author_attribution_detail_json': json.dumps(attribution, ensure_ascii=False),
@@ -488,7 +554,23 @@ def tvbs_visible_article(soup, *, page_url, adapter_contract_version=1):
         'body_completeness': 'verified_current_whole_native_report_prose; original_paragraphs_headings_and_risk_notices_retained; captions_and_native_info_cards_recorded_separately; advertising_related_stories_and_UI_excluded'}, wrapper
 
 
-def tvbs_validation_metadata(soup, *, page_url):
+def tvbs_verified_short_prose(body, *, headline):
+    """Only after whole native identity/credit/clock/access validation.
+
+    The observed flash has direct Chinese prose in presentation-only spans.
+    Plain paragraphs are equivalent; retain every text node, not a summary.
+    Captions, headlines,
+    linked teasers, embedded media and source descriptions cannot qualify.
+    This changes no extraction or length threshold for other adapters/ABIs.
+    """
+    return any(all(child.name == 'span' for child in node.find_all(True))
+        and re.search(r'[\u3400-\u9fff]', node.get_text())
+        and _key(node.get_text()) != _key(headline)
+        and not re.match(r'^(?:▲|更多新聞[：:]|延伸閱讀[：:]|記者[：:]|圖片來源[：:])', node.get_text(strip=True))
+        for node in body.find_all('p', recursive=False))
+
+
+def tvbs_validation_metadata(soup, *, page_url, adapter_contract_version=1):
     """Bounded native failure facts; never body/credit/title retention or proof.
 
     The owner reserves its existing fixed daily budget before this function.
@@ -498,7 +580,7 @@ def tvbs_validation_metadata(soup, *, page_url):
     facts = {'contract_version': 1, 'schema_valid': False,
         'body_text_retained': False, 'raw_scope_or_article_acceptance_granted': False}
     try:
-        article, host, _ = _schema(soup, page_url)
+        article, host, _ = _schema(soup, page_url, adapter_contract_version=adapter_contract_version)
     except (NewsError, ValueError, TypeError, AttributeError, RecursionError):
         return facts
     compact_hash = lambda value: hashlib.sha256(_key(value).encode()).hexdigest() if isinstance(value, str) else None

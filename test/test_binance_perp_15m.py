@@ -460,7 +460,8 @@ def test_binance_funding_asof_never_uses_a_future_settlement() -> None:
     assert result["binance_funding_age_hours"].to_list() == [0.0, pytest.approx(1 / 60)]
 
 
-def test_targeted_quality_run_preserves_global_catalog_progress_and_receipts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("features_enabled", [False, True])
+def test_targeted_quality_run_preserves_global_catalog_progress_and_receipts(tmp_path, monkeypatch, features_enabled):
     output = tmp_path / 'candles'
     output.mkdir()
     global_names = ['symbols.csv', 'download_report.csv', 'download_summary.json',
@@ -482,9 +483,17 @@ def test_targeted_quality_run_preserves_global_catalog_progress_and_receipts(tmp
         return binance.DownloadResult('crypto_binance_usdm_perp', record.code,
             record.binance_symbol, record.market, 'skipped_up_to_date', 100, str(path / record.code))
     monkeypatch.setattr(binance, '_download_symbol', download)
+    enriched = []
+    if features_enabled:
+        pl.DataFrame({"date": ["2019-09-08 00:00:00"]}).write_parquet(output / "BTCUSDT_features.parquet")
+        def enrich(_client, selected, _output, **_kwargs):
+            enriched.extend(row.code for row in selected)
+            return [features.HistoricalFeatureResult("BTCUSDT", "BTCUSDT", "unchanged", 1,
+                    str(output / "BTCUSDT_features.parquet"), False, "{}", "{}", "{}")]
+        monkeypatch.setattr(binance, "run_historical_feature_downloads", enrich)
     monkeypatch.setattr(binance.sys, 'argv', ['collector', '--output-dir', str(output),
         '--symbols', 'BTCUSDT', '--start-date', '2019-09-08', '--end-date', '2019-09-08',
-        '--workers', '1', '--skip-historical-features'])
+        '--workers', '1'] + ([] if features_enabled else ['--skip-historical-features']))
     binance.main()
     assert seen == ['BTCUSDT']
     assert all((output / name).read_bytes() == b'preserved existing global evidence' for name in global_names)
@@ -493,6 +502,7 @@ def test_targeted_quality_run_preserves_global_catalog_progress_and_receipts(tmp
     summary = json.loads(reports[0].read_text())
     assert summary['provider_scope_is_complete'] is False
     assert summary['requested_symbol_filter'] == ['BTCUSDT']
+    assert enriched == (["BTCUSDT"] if features_enabled else [])
 
 
 def test_binance_historical_features_join_every_public_family_causally(
@@ -621,7 +631,7 @@ def test_binance_historical_features_join_every_public_family_causally(
         start_ms + 4 * features.CANDLE_INTERVAL_MS - features.SHORT_HISTORY_RETENTION_MS
     )
     assert all(
-        start >= rolling_floor - features.STATISTICS_INTERVAL_MS
+        start >= rolling_floor
         for path, start in request_starts
         if path.startswith("/futures/data/")
     )
@@ -642,6 +652,127 @@ def test_binance_start_stamped_statistics_wait_until_period_close() -> None:
         features._ms_to_date_string(start_ms + 4 * features.CANDLE_INTERVAL_MS)
     ]
     assert frame["buy"].to_list() == [12.0]
+
+
+def test_verified_statistics_survive_retention_and_only_fetch_the_increment(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    now = 1_790_000_100_000
+    now -= now % features.STATISTICS_INTERVAL_MS
+    old = now - 40 * 86400000
+    latest = now - 10 * features.CANDLE_INTERVAL_MS
+    path = tmp_path / "BTCUSDT_features.parquet"
+    frame = binance._normalize_candles([_raw_candle(ts) for ts in (old, latest)])
+    frame = frame.with_columns(
+        pl.Series("binance_taker_buy_volume", [12.0, 13.0]),
+        pl.Series("binance_basis_rate", [0.01, 0.02]),
+        pl.Series("raw_signed_feature", [-2.0, None]),
+    )
+    features._write_parquet_atomic(frame, path)
+    requests = []
+
+    def empty_fetch(_client, endpoint, _params, **kwargs):
+        requests.append((endpoint, kwargs))
+        return []
+
+    monkeypatch.setattr(features, "_fetch_forward", empty_fetch)
+    record = SimpleNamespace(code="BTCUSDT", binance_symbol="BTCUSDT", pair="BTCUSDT")
+    result = features.enrich_symbol_historical_features(
+        None, record, path, start_ms=old, end_ms=latest, observed_at_ms=now,
+    )
+    assert result.status == "updated"
+    saved = pl.read_parquet(path)
+    assert saved["binance_taker_buy_volume"].to_list() == [12.0, 13.0]
+    assert saved["binance_basis_rate"].to_list() == [0.01, 0.02]
+    assert saved["raw_signed_feature"].to_list() == [-2.0, None]
+    assert all(kwargs["start_ms"] >= latest - 6 * features.CANDLE_INTERVAL_MS
+               for endpoint, kwargs in requests
+               if endpoint in {features.BASIS_ENDPOINT, features.TAKER_RATIO_ENDPOINT})
+    assert pq.read_schema(path).metadata[features.STATISTICS_CLOCK_KEY] == features.STATISTICS_CLOCK_CONTRACT
+    # Candle-only refresh / base-tail compaction must keep the same proof.
+    binance._write_parquet_atomic(saved, path)
+    assert features.preserved_statistics_clock([path])
+    repeated = features.enrich_symbol_historical_features(
+        None, record, path, start_ms=old, end_ms=latest, observed_at_ms=now,
+    )
+    assert repeated.status == "unchanged" and repeated.changed is False
+
+
+def test_mixed_legacy_statistics_invalidate_clock_proof(tmp_path):
+    base, tail = tmp_path / "base.parquet", tmp_path / "tail.parquet"
+    frame = pl.DataFrame({"binance_taker_buy_volume": [12.0]})
+    features._write_parquet_atomic(frame, base)
+    frame.write_parquet(tail)
+    assert features.preserved_statistics_clock([base])
+    assert features.preserved_statistics_clock([base, tail]) == {}
+    # A fresh OHLC-only tail contributes no possibly misaligned statistics.
+    pl.DataFrame({"close": [123.0]}).write_parquet(tail)
+    assert features.preserved_statistics_clock([base, tail])
+
+
+def test_rolling_retention_moves_with_stage_time_instead_of_batch_start(tmp_path, monkeypatch):
+    now = 1_790_000_100_000
+    now -= now % features.STATISTICS_INTERVAL_MS
+    start = now - 40 * 86400000
+    path = tmp_path / "BTCUSDT_features.parquet"
+    binance._normalize_candles([_raw_candle(ts) for ts in (start, now)]).write_parquet(path)
+    elapsed = [0.0]
+    requests = []
+    monkeypatch.setattr(features.time, "perf_counter", lambda: elapsed[0])
+
+    def fetch(_client, endpoint, _params, **kwargs):
+        requests.append((endpoint, kwargs["start_ms"], elapsed[0]))
+        return []
+
+    def completed(_stage, _status):
+        elapsed[0] += 7200.0
+
+    monkeypatch.setattr(features, "_fetch_forward", fetch)
+    features.enrich_symbol_historical_features(
+        None, SimpleNamespace(code="BTCUSDT", binance_symbol="BTCUSDT", pair="BTCUSDT"),
+        path, start_ms=start, end_ms=now, observed_at_ms=now, stage_callback=completed,
+    )
+    for endpoint, requested_start, seconds in requests:
+        if endpoint.startswith("/futures/data/"):
+            assert requested_start >= now + seconds * 1000 - features.SHORT_HISTORY_RETENTION_MS
+
+
+@pytest.mark.parametrize("last_minute,expected_calls", [(8, 0), (9, 6)])
+def test_known_statistics_phase_skips_only_not_yet_closed_periods(
+    tmp_path, monkeypatch, last_minute, expected_calls,
+):
+    start = 1_790_000_100_000
+    start -= start % features.STATISTICS_INTERVAL_MS
+    path = tmp_path / "BTCUSDT_features.parquet"
+    frame = binance._normalize_candles([
+        _raw_candle(start + minute * features.CANDLE_INTERVAL_MS)
+        for minute in range(last_minute + 1)
+    ])
+    stages = features.FEATURE_STAGE_IDS[4:]
+    assert len(stages) == 6
+    frame = frame.with_columns([
+        pl.Series(features.FAMILY_PRIMARY_COLUMN[stage], [
+            1.0 if minute == 4 else None for minute in range(last_minute + 1)
+        ], dtype=pl.Float64) for stage in stages
+    ])
+    features._write_parquet_atomic(frame, path)
+    requests = []
+
+    def fetch(_client, endpoint, _params, **_kwargs):
+        if endpoint.startswith("/futures/data/"):
+            requests.append(endpoint)
+        return []
+
+    monkeypatch.setattr(features, "_fetch_forward", fetch)
+    result = features.enrich_symbol_historical_features(
+        None, SimpleNamespace(code="BTCUSDT", binance_symbol="BTCUSDT", pair="BTCUSDT"),
+        path, start_ms=start, end_ms=start + last_minute * features.CANDLE_INTERVAL_MS,
+        observed_at_ms=start + (last_minute + 1) * features.CANDLE_INTERVAL_MS,
+    )
+    assert result.status != "partial"
+    assert len(requests) == expected_calls
+    saved = pl.read_parquet(path)
+    for stage in stages:
+        assert saved[features.FAMILY_PRIMARY_COLUMN[stage]][4] == 1.0
 
 
 def test_binance_pipeline_progress_persists_measured_eta(tmp_path: Path) -> None:

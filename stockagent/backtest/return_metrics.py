@@ -10,7 +10,9 @@ if TYPE_CHECKING:
     import torch
 
 
-RETURN_METRICS_CONTRACT_VERSION = 2
+# Reporting version 3 corrects tied Spearman ranks. Return/accounting formulas
+# and optimizer checkpoint semantics are unchanged.
+RETURN_METRICS_CONTRACT_VERSION = 3
 # Match the existing NumPy report's finite floor for log-risk statistics.
 # Arithmetic cumulative return and drawdown still round to a total loss.
 ZERO_NAV_LOG = float(np.log(np.finfo(np.float64).tiny))

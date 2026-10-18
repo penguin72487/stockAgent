@@ -51,7 +51,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acceptance", type=Path, required=True)
     parser.add_argument("--reload", type=Path, required=True)
-    parser.add_argument("--prior-control", type=Path, required=True)
+    parser.add_argument("--prior-control", type=Path,
+                        help="legacy control; current reload receipts already bind protected service identities")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.output.exists():
@@ -91,7 +92,8 @@ def main(argv=None):
         value = value.get("finmind_status_aggregation") if isinstance(value, dict) else None
         if isinstance(value, dict):
             modes.append({key: value.get(key) for key in ("contract_version", "mode", "groups_recomputed", "total_groups")})
-    prior = json.loads(args.prior_control.read_bytes())["protected"]
+    prior = (json.loads(args.prior_control.read_bytes())["protected"] if args.prior_control
+             else control["protected_services_before"])
     protected = {unit: identity(unit) for unit in prior if unit != UNIT}
     protected_equal = all(value == prior[unit] for unit, value in protected.items())
     control_group = subprocess.run(["systemctl", "show", UNIT, "-p", "ControlGroup", "--value"],
@@ -110,7 +112,7 @@ def main(argv=None):
         except OSError:
             unreadable.append(int(pid))
     complete_query = any(query.startswith("SELECT dataset,state,COUNT(*),SUM(rows)") for query in statements)
-    reuse = any(row["mode"] in {"changed_groups", "unchanged"} for row in modes)
+    reuse = any(row["mode"] in {"changed_rows", "changed_groups", "unchanged"} for row in modes)
     stable = status_path.read_bytes() == body and identity(UNIT) == generation and code_matches(accepted)
     passed = (uncached == status and complete_query and reuse and protected_equal and stable
               and not persistent_memo_triggers and not gpu_handles and not unreadable and "torch" not in sys.modules)

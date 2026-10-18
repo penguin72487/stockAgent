@@ -25,6 +25,29 @@ def item(symbol="2330", *, current=True):
             "last_local_daily_date": "2026-10-14"}
 
 
+def test_sql_coverage_dimensions_preserve_membership_and_live_transactions(tmp_path):
+    universe = [item(), item('former', current=False)]
+    with market._open_index(tmp_path / 'index.sqlite3') as conn:
+        for kind in ('tw_tick', 'tw_minute', 'tw_minute_derived'):
+            for symbol in ('2330', 'former', 'unknown'):
+                for day in [*DAYS, date(2026, 10, 10)]:
+                    market._record(conn, kind, symbol, day, 'verified_no_trade', 2, 3)
+        phases = market._coverage_phases(conn, universe, DAYS, first_observed='2026-10-12', kind='tw_tick')
+        assert [(row['candidate_partitions'], row['receipted_partitions'], row['rows']) for row in phases] == [
+            (1, 1, 2), (4, 4, 8), (4, 4, 8)]
+        changes = conn.total_changes
+        market._coverage_phases(conn, universe, DAYS, first_observed='2026-10-12', kind='tw_tick')
+        assert conn.total_changes == changes  # Static dimensions reused; no fact/count TTL.
+        conn.execute("DELETE FROM partitions WHERE kind='tw_tick' AND symbol='2330' AND trade_date=?", (str(DAYS[-1]),))
+        assert market._coverage_phases(conn, universe, DAYS, first_observed='2026-10-12', kind='tw_tick')[0]['receipted_partitions'] == 0
+        assert conn.in_transaction
+        conn.rollback()
+        assert market._coverage_phases(conn, universe, DAYS, first_observed='2026-10-12', kind='tw_tick')[0]['receipted_partitions'] == 1
+        revised = [dict(universe[0], first_candidate_date='2026-10-13')]
+        result = market._coverage_phases(conn, revised, DAYS, first_observed='2026-10-12', kind='tw_tick')
+        assert sum(row['receipted_partitions'] for row in result) == 2
+
+
 def freeze(monkeypatch, now):
     class FrozenDateTime(datetime):
         @classmethod

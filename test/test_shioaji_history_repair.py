@@ -325,6 +325,13 @@ def test_empty_futures_alias_catalog_cannot_publish_a_vacuous_complete_sweep(tmp
 
 
 def test_continuous_batch_uses_one_login_and_then_reuses_verified_data(tmp_path,monkeypatch):
+    from stockagent.live.shioaji_storage_epoch import history_storage_observation
+    original_manifest = continuous._write_manifest
+    def protected_manifest(root, *args, **kwargs):
+        with history_storage_observation(root) as observed:
+            assert observed is None, 'final manifest was written after releasing its writer lock'
+        return original_manifest(root, *args, **kwargs)
+    monkeypatch.setattr(continuous, '_write_manifest', protected_manifest)
     day=date(2026,9,4)
     aliases=tmp_path/'aliases.csv'
     pl.DataFrame({'priority':[1,2], 'contract':['CAFR1','CDFR1']}).write_csv(aliases)

@@ -26,6 +26,8 @@ from downloader.news_fulltext_policy import NewsError, cnyes_bulk_fingerprint
 
 CONTRACT_VERSION = 1
 COMPLETE_STATES = ('list_complete', 'list_complete_by_page_ID_equivalence', 'partition_list_complete')
+REPAIR_STATES = ('waiting_page_evidence', 'inconsistent_source_snapshot')
+REPAIR_CURSOR = 'cnyes_history_incomplete_scope_cursor_v1'
 SCOPE_KEY_CACHE_SIZE = 4096
 SCOPE_KEY_CACHE_MAX_URL_CHARS = 2048
 
@@ -296,6 +298,96 @@ def schedule_original_page_check(queue, url, *, reason, evidence_sha):
     return True
 
 
+def repair_scope_pages(queue, scope, source):
+    """Repair missing/currently contradictory evidence, not completed history.
+
+    An old successful job's annual revisit is not a list-completeness proof.
+    Prefer the existing retained-envelope worker; otherwise wake only that
+    original successful page. Refusals, active/due jobs and split parents keep
+    their own schedules. Per-page evidence markers bound unchanged conflicts.
+    """
+    result = {'retained_pages_queued': 0, 'page_checks_scheduled': 0}
+    key = scope_key(scope)
+    if (not key or not source.allowed or key[0] not in source.cnyes_apis
+            or source.acquisition_mode == 'finite' or source.known_url_only):
+        return result
+    coverage = queue.db.execute('SELECT * FROM bulk_api_coverage WHERE base_url=?', (scope,)).fetchone()
+    if (not coverage or not 1 <= coverage['total_pages'] <= 30
+            or queue.db.execute('SELECT 1 FROM bulk_window_splits WHERE scope_url=?', (scope,)).fetchone()):
+        return result
+    observations = {row['page']: (row['observation_sha256'], json.loads(row['observation_json']))
+        for row in queue.db.execute('SELECT h.page,o.observation_sha256,o.observation_json '
+            'FROM cnyes_history_page_heads h JOIN cnyes_history_page_observations o '
+            'ON o.observation_sha256=h.observation_sha256 WHERE h.scope_url=? AND h.page<=?',
+            (scope, coverage['total_pages']))}
+    query = parse_qs(scope.split('?', 1)[1])
+    for page in range(1, coverage['total_pages'] + 1):
+        prior = observations.get(page)
+        if prior and (prior[1]['pagination']['total'], prior[1]['pagination']['pages'],
+                prior[1]['contract_version'], prior[1]['source_bulk_fingerprint'],
+                prior[1]['authorization_fingerprint'], prior[1]['source_day_offset_seconds']) == (
+                coverage['total_articles'], coverage['total_pages'], CONTRACT_VERSION,
+                cnyes_bulk_fingerprint(source), source.authorization_fingerprint, CNYES_QUERY_DAY_OFFSET_SECONDS):
+            continue
+        url = cnyes_url(key[0], page, start=int(query['startAt'][0]), end=int(query['endAt'][0]))
+        job = queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()
+        if (not job or job['kind'] != 'cnyes_news' or job['provider'] != source.provider
+                or job['error_code'] is not None or job['attempts'] != 0
+                or job['superseded_by_windows_json'] is not None or job['due'] <= time.time()):
+            continue
+        if not prior:
+            work = queue.db.execute('SELECT state FROM cnyes_history_retained_work WHERE request_url=?', (url,)).fetchone()
+            if work and work['state'] == 'pending':
+                continue
+            legacy = queue.db.execute('SELECT * FROM bulk_page_evidence WHERE scope_url=? AND page=?',
+                                      (scope, page)).fetchone()
+            sha = job['response_sha256']
+            if (not work and legacy and sha and job['last_checked_at_utc']
+                    and (queue.root / 'quarantine' / (sha + '.parquet')).is_file()
+                    and (queue.root / 'quarantine' / (sha + '.parquet.receipt.json')).is_file()):
+                queue.db.execute('INSERT INTO cnyes_history_retained_work '
+                    '(request_url,scope_url,page,response_sha256,expected_total,expected_ids_sha256,source_checked_at_utc) '
+                    'VALUES (?,?,?,?,?,?,?)', (url, scope, page, sha, legacy['total'], legacy['ids_sha256'],
+                                               legacy['observed_at_utc']))
+                result['retained_pages_queued'] += 1
+                continue
+        evidence = digest((scope, page, coverage['total_articles'], coverage['total_pages'],
+            CONTRACT_VERSION, cnyes_bulk_fingerprint(source), source.authorization_fingerprint,
+            prior[0] if prior else ('missing_page', job['last_checked_at_utc'], job['response_sha256'])))
+        result['page_checks_scheduled'] += schedule_original_page_check(queue, url,
+            reason='missing_current_list_page_evidence' if not prior else 'contradictory_list_page_evidence',
+            evidence_sha=evidence)
+    return result
+
+
+def repair_incomplete_scopes(queue, *, stop=None, limit=8, max_seconds=.2):
+    """Bounded, indexed restart recovery; rotate past unresolved early scopes."""
+    started, done = time.monotonic(), 0
+    result = {'scopes_checked': 0, 'retained_pages_queued': 0, 'page_checks_scheduled': 0}
+    source = queue.registry.sources.get('cnyes')
+    if (not source or not source.allowed or limit <= 0 or max_seconds <= 0
+            or stop is not None and stop.is_set()):
+        return result
+    cursor = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (REPAIR_CURSOR,)).fetchone()
+    scopes = queue.db.execute('SELECT scope_url FROM cnyes_history_scope_heads WHERE provider=? '
+        'AND evidence_contract_version=? AND source_bulk_fingerprint=? AND authorization_fingerprint=? '
+        'AND state IN (?,?) AND scope_url>? ORDER BY scope_url LIMIT ?',
+        (source.provider, CONTRACT_VERSION, cnyes_bulk_fingerprint(source), source.authorization_fingerprint,
+         *REPAIR_STATES, cursor[0] if cursor else '', limit)).fetchall()
+    with queue.db:
+        for row in scopes:
+            if time.monotonic() - started >= max_seconds or stop is not None and stop.is_set():
+                break
+            for name, count in repair_scope_pages(queue, row[0], source).items():
+                result[name] += count
+            queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (REPAIR_CURSOR, row[0]))
+            done += 1
+        if done == len(scopes) and len(scopes) < limit:
+            queue.db.execute('DELETE FROM queue_settings WHERE key=?', (REPAIR_CURSOR,))
+    result['scopes_checked'] = done
+    return result
+
+
 def share_matching_page_IDs(queue, scope, sha, info, source, stamp):
     """Reuse actual IDs/dates across equal-day queries one proven page at a time.
 
@@ -434,6 +526,8 @@ def reconcile_scope(queue, scope, source):
     if state == 'list_complete' and facts['shared_page_ID_references']:
         state = 'list_complete_by_page_ID_equivalence'
     save_proof(queue, scope, source, state, facts, members)
+    if state in REPAIR_STATES:
+        repair_scope_pages(queue, scope, source)
     reconcile_parents(queue, scope, source)
 
 
@@ -575,5 +669,8 @@ def backfill(queue, *, stop=None, limit=8, max_seconds=.2):
             queue.db.execute('UPDATE cnyes_history_retained_work SET state=?,outcome_json=? WHERE request_url=?',
                              (state, encoded(outcome), work['request_url']))
         done += 1
+    repair = repair_incomplete_scopes(queue, stop=stop, limit=limit,
+                                     max_seconds=max(0, max_seconds - (time.monotonic() - started)))
     exhausted = queue.db.execute("SELECT 1 FROM cnyes_history_retained_work WHERE state='pending' LIMIT 1").fetchone() is None
-    return {'processed': done, 'exhausted': exhausted, 'wall_seconds': time.monotonic() - started}
+    return {'processed': done, 'exhausted': exhausted, 'evidence_repair': repair,
+            'wall_seconds': time.monotonic() - started}

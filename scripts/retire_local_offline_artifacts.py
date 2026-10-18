@@ -28,10 +28,12 @@ from scripts.manage_packed_retention import _syncthing, _wait_for_convergence
 from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.artifact_maintenance import artifact_process_references, artifact_process_references_many
 from stockagent.data_sync.artifact_retirement import load_retirement_peer_names
+from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence as benchmark_evidence
 from stockagent.data_sync.cold_primary import _check_d_primary_mount
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_json, _safe_relative_path, validate_slug
 from stockagent.data_sync.legacy_artifact_archive import (
     MANUAL_WSL_CAPTURE_CONTRACT, MANUAL_WSL_SCOPES, MANUAL_OFFLINE_SIMULATION_CONTRACT,
+    reviewed_wsl_artifact_root,
     reviewed_offline_simulation_root, LegacyArchiveSpec,
     MANUAL_TRANSFER_QUARANTINE_CONTRACT, reviewed_transfer_quarantine_root,
     MANUAL_MINUTE_DERIVED_VIEW_CONTRACT, reviewed_minute_derived_view_root,
@@ -122,9 +124,10 @@ def phase(target: Path, name: str):
 
 @contextmanager
 def publication_owner(target: Path):
-    with phase(target, 'wait-for-publication-owner'):
-        with COMMON_OWNER.open('a') as owner:
+    with COMMON_OWNER.open('a') as owner:
+        with phase(target, 'wait-for-publication-owner'):
             fcntl.flock(owner, fcntl.LOCK_EX)
+        with phase(target, 'publish-under-shared-owner'):
             yield
 
 
@@ -134,6 +137,8 @@ def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | Non
     path = _safe_relative_path(relative, 'reviewed offline artifact')
     if path.parts[0] not in SCOPES or len(path.parts) < 2:
         raise SnapshotError('offline preservation requires one explicit artifact child')
+    if path.parts[0] == 'benchmarks' and not reviewed_wsl_artifact_root(relative):
+        raise SnapshotError('benchmark preservation requires one explicit case, not a suite')
     if path.parts[0] == 'live' and not reviewed_offline_simulation_root(relative):
         raise SnapshotError('canonical live ledgers are outside this cleanup')
     if path.parts[0]=='stockagent-transfer-quarantine' and not reviewed_transfer_quarantine_root(relative):
@@ -159,11 +164,17 @@ def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | Non
         blockers.append('empty-artifact')
     if time.time_ns() - newest < 12 * 3600 * 10**9:
         blockers.append('twelve-hour-stability-pending')
-    return {'relative_root': relative, 'fingerprint': tree['fingerprint'],
+    result = {'relative_root': relative, 'fingerprint': tree['fingerprint'],
             'observation_rows': tree['rows'],
             'files': tree['files'], 'logical_bytes': tree['logical_bytes'],
             'allocated_unique_file_bytes': tree['allocated_unique_file_bytes'],
             'newest_mtime_ns': newest, 'blockers': sorted(set(blockers))}
+    if path.parts[0] == 'benchmarks':
+        try:
+            result['benchmark_evidence'] = benchmark_evidence(source)
+        except (OSError, SnapshotError) as error:
+            result['blockers'] = sorted(set(result['blockers']) | {str(error)})
+    return result
 
 
 def shared_link_observation_drift(before: dict, after: dict):
@@ -269,10 +280,38 @@ def verify_for_retirement(spec, sync_root: Path, target: Path):
         'selected_workspace': str(workspace) if workspace is not None else None,
         'physical_admission_still_required': workspace is not None,
     })
-    proof = verify_cold_archive(spec, sync_root, verification_root=workspace)
-    if (proof['snapshot_id'] != resolved.manifest['snapshot_id']
-            or proof['manifest_sha256'] != resolved.manifest_sha256):
-        raise SnapshotError('fixed D release changed while selecting recovery workspace')
+    started = time.monotonic()
+    last_report = None
+    last_value = {}
+    def report(value, *, force=False):
+        nonlocal last_report, last_value
+        now = time.monotonic()
+        stage = (value.get('recovery_step'), value.get('stage'), value.get('state', 'running'))
+        completed = value.get('completed_items') == value.get('total_items') and 'total_items' in value
+        if (not force and last_report is not None and now-last_report < 5
+                and stage == (last_value.get('recovery_step'), last_value.get('stage'), last_value.get('state'))
+                and not completed):
+            return
+        record = {'dataset': spec.dataset, 'snapshot_id': resolved.manifest['snapshot_id'],
+                  'manifest_sha256': resolved.manifest_sha256, 'state': 'running',
+                  **value, 'checked_at_epoch': time.time(), 'elapsed_seconds': now-started,
+                  'acceptance_proof': False}
+        # Progress is atomic but not a durable recovery/deletion acknowledgement.
+        # Avoid an fsync per object on the already busy SSD.
+        atomic_write_json(target/'recovery-progress.json', record, durable=False)
+        print(json.dumps({'event': 'cold-recovery-progress', **record}), flush=True)
+        last_report, last_value = now, record
+    report({'stage': 'resolve-and-verify-fixed-release'}, force=True)
+    try:
+        proof = verify_cold_archive(spec, sync_root, verification_root=workspace, progress=report)
+        if (proof['snapshot_id'] != resolved.manifest['snapshot_id']
+                or proof['manifest_sha256'] != resolved.manifest_sha256):
+            raise SnapshotError('fixed D release changed while selecting recovery workspace')
+    except BaseException as error:
+        report({**last_value, 'state': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
+                'error_type': type(error).__name__}, force=True)
+        raise
+    report({'stage': 'independent-original-recovery-complete', 'state': 'verified'}, force=True)
     return proof
 
 
@@ -306,6 +345,10 @@ def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict)
                 return None
             if peer.get('ok') is not True:
                 raise SnapshotError('canonical retirement transport remains unconverged')
+            if Path(spec.relative_root).parts[0] == 'benchmarks':
+                saved = json.loads((target / 'retained-benchmark-evidence.json').read_bytes())
+                if benchmark_evidence(target / 'retained-evidence') != saved:
+                    raise SnapshotError('local benchmark evidence changed before source retirement')
             with phase(target, 'verify-and-retire-hot-source'):
                 return apply_legacy_retirement(spec,
                     expected_fingerprint=plan['plan_fingerprint'],
@@ -339,6 +382,12 @@ def finish_retirement(spec, cfg, target, retired, *, source_origin=None):
                 'cold_objects_deleted': 0, 'nas_snapshots_deleted': 0}
     if source_origin is not None:
         accepted.update(source_origin=source_origin, artifact_root=str(artifact_root))
+    if Path(spec.relative_root).parts[0] == 'benchmarks':
+        saved = json.loads((target / 'retained-benchmark-evidence.json').read_bytes())
+        if benchmark_evidence(target / 'retained-evidence') != saved:
+            raise SnapshotError('retired benchmark local evidence failed exact readback')
+        accepted.update(local_benchmark_evidence=str(target / 'retained-evidence'),
+                        local_benchmark_evidence_bytes=saved['bytes'])
     atomic_write_json(target / 'acceptance.json', accepted)
     return accepted
 
@@ -380,6 +429,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
         relative = row['relative_root']
         path = _safe_relative_path(relative, 'frozen offline artifact')
         if (len(path.parts) < 2 or path.parts[0] not in SCOPES
+                or (path.parts[0] == 'benchmarks' and not reviewed_wsl_artifact_root(relative))
                 or (path.parts[0] == 'live' and not reviewed_offline_simulation_root(relative))):
             raise SnapshotError('frozen root is outside the reviewed offline scopes')
         prefix = dataset_prefix(origin)
@@ -482,6 +532,11 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
                     'before_fingerprint':row['fingerprint'],'current_fingerprint':current['fingerprint'],
                     'changed_observations':drift,'source_bytes_verified':False,
                     'admission_only':True})
+            if path.parts[0] == 'benchmarks':
+                retained = benchmark_evidence(artifact_root / relative, destination=target / 'retained-evidence')
+                if retained != row.get('benchmark_evidence'):
+                    raise SnapshotError('completed benchmark evidence changed after inventory')
+                atomic_write_json(target / 'retained-benchmark-evidence.json', retained)
             atomic_write_json(target / 'catalog.json', {'schema_version': 1, 'authority_node_id': 'penguin',
                 'archives': [{'dataset': dataset, 'relative_root': relative, 'minimum_stable_days': 7,
                               'manual_capture_min_stable_hours': 12, 'durable_staging': False,

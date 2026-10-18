@@ -1,0 +1,11 @@
+# Retry only the two unfinished old-weight cases. The completed v2 calendar
+# baseline remains the control; its checkpoints and optimizer are untouched.
+base_spec: tw_old_fold11_refinement_20261016_v2.yaml
+output_root: artifacts/markets/tw_old_fold11_refinement_20261016_v3
+matrix:
+  include_baseline: false
+  fixed_overrides:
+    training:
+      financial_transformer:
+        # Immutable source caches only; retain model, batch, dates and loss.
+        factorized_sparse_cache_bytes: 12884901888

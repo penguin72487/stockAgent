@@ -86,6 +86,7 @@
     }
 
     function priceNoticeText(data) {
+      if (data.price_display_policy?.private_view === true) return data.price_display_policy.message || "本人私人檢視";
       const reference = data.official_price_reference;
       const rows = (reference?.quotes || []).filter((row) => row.official_daily_quote?.open != null
         || row.official_daily_quote?.close != null);
@@ -144,12 +145,14 @@
         const range = values => values.length ? `${values[0]}${values.length > 1 && values[0] !== values.at(-1) ? ` ～ ${values.at(-1)}` : ""}` : "—";
         const basis = proof.publication_basis === "owner_paper_transaction_report_v1" ? "模擬帳本成交 · 非券商成交"
           : proof.publication_basis === "owner_paper_strategy_report_v1" ? "策略設定 · 非行情／非成交"
+          : proof.publication_basis === "owner_private_view" ? "本人私人檢視 · 原始觀測／帳本價格"
           : proof.grain === "daily" ? "官方日資料 · 非分鐘／即時行情" : "已驗證可公開行情";
         return `<li><strong>${esc(proof.source || "來源未提供")}</strong><span>${esc(basis)} · ${esc([...roles].join("／"))}</span><small>資料日 ${esc(range(sortedDates))} · ${proof.grain === "daily" ? "取得" : "紀錄"} ${esc(range(sortedClocks.map(sourceClock)))}（臺北）</small></li>`;
       }).join("");
       const referenceHtml = [...references.entries()].map(([key, row]) =>
         `<li data-reference-key="${esc(key)}"><strong>${esc(row.symbol || row.benchmark_id)} ${esc(row.name || row.label || "")}</strong>${dailyReference(row)}</li>`).join("");
-      return {sourcesHtml: html || "<li>目前已載入資料尚無可公開價格來源。</li>", referencesHtml: referenceHtml,
+      return {sourcesHtml: html || (data.price_display_policy?.private_view
+        ? "<li>目前已載入資料尚無價格來源。</li>" : "<li>目前已載入資料尚無可公開價格來源。</li>"), referencesHtml: referenceHtml,
         referenceCount: references.size};
     }
 

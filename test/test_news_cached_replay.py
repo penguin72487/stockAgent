@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,7 +84,13 @@ def test_invalid_cache_proof_is_visible_and_never_promoted(cfg, tmp_path, patch)
 
 
 @pytest.mark.parametrize('payment', [1, True, None])
-def test_cached_paid_or_unproven_rows_are_not_accepted(cfg, tmp_path, payment):
+def test_cached_paid_or_unproven_rows_are_not_accepted(cfg, tmp_path, payment, monkeypatch):
+    # This tests public-body admission, not whether a 50 ms cooperative
+    # inventory slice survives scheduler/DDL latency on a loaded test host.
+    # Keep only this module's budget clock deterministic; production budgets
+    # and actual source/observation clocks remain unchanged.
+    from downloader import news_fulltext_replay as replay
+    monkeypatch.setattr(replay, 'time', SimpleNamespace(monotonic=lambda: 1.0, time=time.time))
     registry, _ = registry_http(cfg, tmp_path)
     queue = NewsQueue(tmp_path, registry)
     data = payload(ids=(1,))
@@ -92,6 +99,33 @@ def test_cached_paid_or_unproven_rows_are_not_accepted(cfg, tmp_path, payment):
         retained(queue, data)
         assert replay_cached_cnyes(queue)['accepted_heads'] == 0
         assert queue.db.execute('SELECT error_code FROM cached_bulk_replays').fetchone()[0] == 'bulk_post_not_public'
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('payment', [1, True, None])
+def test_exhausted_inventory_quantum_resumes_and_still_rejects_paid_or_unproven_rows(cfg, tmp_path, payment, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+    ticks = iter((1.0, 1.0, 1.1))  # replay start, inventory start, expired slice
+    clock = SimpleNamespace(monotonic=lambda: next(ticks, 1.1), time=time.time)
+    monkeypatch.setattr(replay, 'time', clock)
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    data = payload(ids=(1,))
+    data['items']['data'][0]['payment'] = payment
+    try:
+        retained(queue, data)
+        first = replay_cached_cnyes(queue)
+        assert first['pages_checked'] == first['accepted_heads'] == first['http_requests'] == 0
+        assert queue.db.execute('SELECT count(*) FROM cached_bulk_replays').fetchone()[0] == 0
+        assert queue._cached_cnyes_inventory_entries is not None
+        assert not hasattr(queue, '_cached_cnyes_inventory_at')
+        clock.monotonic = lambda: 1.2
+        second = replay_cached_cnyes(queue)
+        assert second['pages_checked'] == 1 and second['accepted_heads'] == second['http_requests'] == 0
+        row = queue.db.execute('SELECT state,error_code FROM cached_bulk_replays').fetchone()
+        assert tuple(row) == ('failed_validation', 'bulk_post_not_public')
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
     finally:
         queue.close()
 

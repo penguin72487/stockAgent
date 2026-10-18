@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -40,6 +41,67 @@ def file_key(row: dict) -> str:
     return row["relative"] + "@" + row["sha256"]
 
 
+def catalog_identity(content: dict, *, omit_file_signatures: bool = False) -> str:
+    """Hash the existing canonical JSON bytes without one catalog-sized buffer.
+
+    The C JSON encoder still owns escaping, numeric spelling and nested ordering.
+    Only outer record lists are framed here; temporary space is one record, not
+    all versions and files. Filesystem signatures are execution pins, not the
+    content identity, and may be omitted without copying every file descriptor.
+    """
+    if not isinstance(content, dict) or any(not isinstance(key, str) for key in content):
+        raise ValueError("catalog content requires string field names")
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), allow_nan=False)
+    digest = hashlib.sha256(b"{")
+    for index, key in enumerate(sorted(content)):
+        if index:
+            digest.update(b",")
+        digest.update(encoder.encode(key).encode("utf-8"))
+        digest.update(b":")
+        value = content[key]
+        if isinstance(value, (list, tuple)):
+            digest.update(b"[")
+            for member_index, member in enumerate(value):
+                if member_index:
+                    digest.update(b",")
+                if omit_file_signatures and key == "files":
+                    member = {k: v for k, v in member.items() if k != "signature"}
+                digest.update(encoder.encode(member).encode("utf-8"))
+            digest.update(b"]")
+        else:
+            digest.update(encoder.encode(value).encode("utf-8"))
+    digest.update(b"}")
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogManifest:
+    """Validated head binding and shared object refs, never a recovery manifest."""
+
+    dataset: str
+    snapshot_id: str
+    hlc: dict
+    publisher_node_id: str
+    source_fingerprint_sha256: str
+    references: tuple[tuple[str, str, int], ...]
+
+
+def _catalog_manifest(manifest: dict, references: dict, *, retain_objects: bool) -> _CatalogManifest:
+    compact = []
+    if retain_objects:
+        archive = manifest["archive"]
+        for ref in (archive["inventory"], *archive["objects"]):
+            key = (ref["relpath"], ref["sha256"], ref["bytes"])
+            # Invalid descriptors still reach the original later validation;
+            # they must not collide with valid int sizes or fail during pooling.
+            if type(key[0]) is str and type(key[1]) is str and type(key[2]) is int:
+                key = references.setdefault(key, key)
+            compact.append(key)
+    return _CatalogManifest(manifest["dataset"], manifest["snapshot_id"], manifest["hlc"],
+        manifest["publisher"]["node_id"], manifest["source"]["portable_fingerprint_sha256"], tuple(compact))
+
+
 def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: Path | None = None,
                     *, include_unreferenced_objects: bool = False, testing_disposition: Path | None = None) -> dict:
     """Fixed metadata inventory, with per-release missing-object diagnostics.
@@ -47,6 +109,20 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
     Missing historical objects do not erase a historical manifest or obstruct
     unrelated valid deliveries. Catalog-restricted workspaces are not scanned.
     """
+    cold = cold.absolute()
+    if cold.resolve() != cold:
+        raise SnapshotError("cold metadata root is redirected")
+    with PinnedObjectSignatures(cold) as metadata_pins:
+        result = _capture_catalog(cold, publication_catalog, history_disposition,
+            include_unreferenced_objects=include_unreferenced_objects,
+            testing_disposition=testing_disposition, metadata_pins=metadata_pins)
+        metadata_pins.recheck()
+        return result
+
+
+def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition: Path | None,
+                     *, include_unreferenced_objects: bool, testing_disposition: Path | None,
+                     metadata_pins: PinnedObjectSignatures) -> dict:
     cold = cold.absolute()
     entries = json.loads(publication_catalog.read_bytes())["datasets"]
     excluded = {r["dataset"] for r in entries if r.get("publish") is not True}
@@ -56,6 +132,10 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
     errors = []
     excluded_manifests = []
     metadata = {}
+    shared_references = {}
+    # Pass-local validation reuse only. Every original manifest is still fully
+    # read/hashed, and shared objects are independently pinned and rechecked.
+    object_validation_cache = set()
     all_referenced_objects = set()
     retained_referenced_objects = set()
     orphan_scan_blocked = False
@@ -68,11 +148,7 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
 
     def add_metadata(path: Path) -> tuple[bytes, dict]:
         relative = path.relative_to(cold).as_posix()
-        path = _regular(safe_path(cold, relative))
-        before = signature(path)
-        raw = path.read_bytes()
-        if before != signature(path):
-            raise SnapshotError("cold metadata changed during catalog capture")
+        raw, before = metadata_pins.read_metadata(relative)
         row = {"relative": relative, "sha256": hashlib.sha256(raw).hexdigest(),
                "bytes": len(raw), "signature": list(before), "role": "cold_metadata"}
         rows[relative] = row
@@ -84,7 +160,7 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
         relative = path.relative_to(cold).as_posix()
         raw, row = add_metadata(path)
         manifest = json.loads(raw)
-        _validate_manifest(manifest)
+        _validate_manifest(manifest, object_validation_cache=object_validation_cache)
         if manifest["dataset"] != path.parent.name or manifest["snapshot_id"] != path.stem:
             raise SnapshotError("retained manifest path identity differs")
         refs = [manifest["archive"]["inventory"], *manifest["archive"]["objects"]]
@@ -95,10 +171,11 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
                     "manifest_relative": relative, "manifest_sha256": row["sha256"],
                     "policy_identity_sha256": disposition["identity_sha256"], "recovery_claimed": False})
             discarded_testing_objects.update(r["relpath"] for r in refs)
-            discarded_testing_metadata[relative] = (manifest, row)
+            discarded_testing_metadata[relative] = (_catalog_manifest(
+                manifest, shared_references, retain_objects=False), row)
             return False
         retained_referenced_objects.update(r["relpath"] for r in refs)
-        metadata[relative] = (manifest, row)
+        metadata[relative] = (_catalog_manifest(manifest, shared_references, retain_objects=True), row)
         return True
 
     for path in sorted((cold / "manifests").glob("*/*.json")):
@@ -140,12 +217,12 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
             if (head["schema_version"] != PACKED_HEAD_SCHEMA_VERSION
                     or head["dataset"] != path.parent.name or head["node_id"] != path.stem
                     or ".sync-conflict-" in path.name or head["manifest_sha256"] != manifest_row["sha256"]
-                    or head["snapshot_id"] != manifest["snapshot_id"] or head["hlc"] != manifest["hlc"]
-                    or head["node_id"] != manifest["publisher"]["node_id"]):
+                    or head["snapshot_id"] != manifest.snapshot_id or head["hlc"] != manifest.hlc
+                    or head["node_id"] != manifest.publisher_node_id):
                 raise SnapshotError("current head does not match its fixed retained manifest")
             if head["manifest_relpath"] in discarded_testing_metadata:
                 continue
-            head_snapshots.add((manifest["dataset"], manifest["snapshot_id"]))
+            head_snapshots.add((manifest.dataset, manifest.snapshot_id))
             row["captured_bytes_utf8"] = raw.decode("utf-8")
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
             rows.pop(relative, None)
@@ -167,7 +244,7 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
             if (head["schema_version"] != PACKED_HEAD_SCHEMA_VERSION or head["dataset"] != dataset
                     or head["node_id"] != node or path.stem != row["sha256"]
                     or head["manifest_sha256"] != manifest_row["sha256"]
-                    or head["snapshot_id"] != manifest["snapshot_id"] or head["hlc"] != manifest["hlc"]):
+                    or head["snapshot_id"] != manifest.snapshot_id or head["hlc"] != manifest.hlc):
                 raise SnapshotError("historical head does not match its fixed manifest")
             if head["manifest_relpath"] in discarded_testing_metadata:
                 continue
@@ -176,38 +253,47 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
             errors.append({"relative": relative, "reason": type(error).__name__})
 
     missing = {}
+    object_file_keys = {}
     with PinnedObjectSignatures(cold) as pinned:
-        for relative, (manifest, manifest_row) in sorted(metadata.items()):
-            refs = [manifest["archive"]["inventory"], *manifest["archive"]["objects"]]
+        for relative in sorted(metadata):
+            manifest, manifest_row = metadata.pop(relative)
             required = [file_key(manifest_row)]
             absent = []
-            for ref in refs:
-                object_relative = ref["relpath"]
-                digest = object_descriptor(object_relative)
-                if digest != ref["sha256"] or type(ref["bytes"]) is not int or ref["bytes"] < 0:
+            for object_relative, expected_digest, expected_bytes in manifest.references:
+                key_binding = object_file_keys.get(object_relative)
+                if key_binding is None:
+                    digest = object_descriptor(object_relative)
+                    key_binding = object_file_keys[object_relative] = (
+                        digest, object_relative + "@" + digest, expected_bytes)
+                digest, key, declared_bytes = key_binding
+                if digest != expected_digest or type(expected_bytes) is not int or expected_bytes < 0:
                     raise SnapshotError("retained object descriptor differs from its manifest")
-                required.append(object_relative + "@" + digest)
+                if declared_bytes != expected_bytes:
+                    # A missing/short first object must not hide conflicting
+                    # declarations in later versions or mark valid versions bad.
+                    raise SnapshotError("retained manifests disagree on an immutable object")
+                required.append(key)
                 if object_relative in missing:
                     absent.append(object_relative)
                     continue
                 if object_relative in rows:
-                    if rows[object_relative]["sha256"] != digest or rows[object_relative]["bytes"] != ref["bytes"]:
+                    if rows[object_relative]["sha256"] != digest or rows[object_relative]["bytes"] != expected_bytes:
                         raise SnapshotError("retained manifests disagree on an immutable object")
                     continue
                 try:
                     observed = pinned.signature(object_relative)
-                    if observed[2] != ref["bytes"]:
+                    if observed[2] != expected_bytes:
                         raise SnapshotError("retained object size differs")
                     rows[object_relative] = {"relative": object_relative, "sha256": digest,
-                        "bytes": ref["bytes"], "signature": list(observed), "role": "packed_object"}
+                        "bytes": expected_bytes, "signature": list(observed), "role": "packed_object"}
                 except (OSError, SnapshotError) as error:
                     missing[object_relative] = {"relative": object_relative, "sha256": digest,
-                        "bytes": ref["bytes"], "reason": type(error).__name__}
+                        "bytes": expected_bytes, "reason": type(error).__name__}
                     absent.append(object_relative)
-            releases.append({"dataset": manifest["dataset"], "snapshot_id": manifest["snapshot_id"],
+            releases.append({"dataset": manifest.dataset, "snapshot_id": manifest.snapshot_id,
                 "manifest_sha256": manifest_row["sha256"], "manifest_relative": relative,
-                "source_fingerprint_sha256": manifest["source"]["portable_fingerprint_sha256"],
-                "current_head": (manifest["dataset"], manifest["snapshot_id"]) in head_snapshots,
+                "source_fingerprint_sha256": manifest.source_fingerprint_sha256,
+                "current_head": (manifest.dataset, manifest.snapshot_id) in head_snapshots,
                 "required_file_keys": sorted(required), "missing_objects": sorted(absent)})
         if include_unreferenced_objects and not orphan_scan_blocked:
             # Back up unique evidence in the enrolled cold object namespace;
@@ -246,8 +332,7 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
         body["discarded_testing_objects"] = sorted(discarded_testing_objects - retained_referenced_objects)
         body["testing_disposition_identity_sha256"] = disposition["identity_sha256"]
     # Filesystem signatures pin this execution, but are not content identity.
-    content = {**body, "files": [{k: v for k, v in r.items() if k != "signature"} for r in body["files"]]}
-    return {**body, "identity_sha256": identity_sha256(content),
+    return {**body, "identity_sha256": catalog_identity(body, omit_file_signatures=True),
             "observed_at_utc": datetime.now(timezone.utc).isoformat()}
 
 

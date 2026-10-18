@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from downloader.finmind_status_aggregates import (
-    AGGREGATE_SQL, FUNCTION, PREFIX, StatusConnection, task_status_aggregates,
+    AGGREGATE_SQL, ROW_FUNCTION, PREFIX, StatusConnection, task_status_aggregates,
 )
 
 
@@ -68,7 +68,7 @@ def test_all_mutations_match_exact_sql_including_replace(queue, query):
     exact(conn)
 
 
-def test_only_changed_groups_are_recomputed_and_rollback_is_safe(queue):
+def test_row_deltas_avoid_group_scans_and_rollback_is_safe(queue):
     _, conn = queue
     exact(conn)
     conn.execute("UPDATE tasks SET state='failed' WHERE dataset='B'")
@@ -82,7 +82,7 @@ def test_only_changed_groups_are_recomputed_and_rollback_is_safe(queue):
     task_status_aggregates(conn)
     conn.set_trace_callback(None)
     aggregate = [q for q in sql if "SUM(" in q]
-    assert len(aggregate) == 1 and "dataset='B' AND state='complete'" in aggregate[0]
+    assert aggregate == []
     exact(conn)
 
 
@@ -160,7 +160,7 @@ def test_empty_queue_foreign_read_only_connections_and_bad_value_errors(queue):
 def test_udf_missing_fails_write_instead_of_silently_producing_a_stale_head(queue):
     _, conn = queue
     exact(conn)
-    conn.create_function(FUNCTION, 2, None)
+    conn.create_function(ROW_FUNCTION, 10, None)
     with pytest.raises(sqlite3.OperationalError):
         conn.execute("UPDATE tasks SET rows=9 WHERE dataset='B'")
     conn.rollback()
@@ -226,6 +226,43 @@ def test_seeded_mixed_transactions_always_match_authoritative_sql(queue):
         else:
             conn.rollback()
         exact(conn)
+
+
+def test_frontier_inserts_claims_and_publication_do_not_rescan_history(queue):
+    _, conn = queue
+    exact(conn)
+    conn.executemany("INSERT INTO tasks VALUES ('A',?,'new','pending',0,0,NULL,NULL,NULL,12,NULL)",
+                     [(str(i),) for i in range(100)])
+    conn.commit()
+    for state in ('inflight', 'complete'):
+        conn.execute("UPDATE tasks SET state=?,rows=390,bytes=2000,first_data_date='2026-10-16',"
+                     "last_data_date='2026-10-16',last_attempt_at_utc='2026-10-17' WHERE partition='new'", (state,))
+        conn.commit()
+        sql = []
+        conn.set_trace_callback(sql.append)
+        result = task_status_aggregates(conn)
+        conn.set_trace_callback(None)
+        assert result == conn.execute(AGGREGATE_SQL).fetchall()
+        assert not any('SUM(' in statement for statement in sql)
+
+
+def test_upsert_ignore_abort_and_repeated_savepoint_rollback_match_sql(queue):
+    _, conn = queue
+    exact(conn)
+    conn.execute("SAVEPOINT first")
+    conn.execute("UPDATE tasks SET rows=111 WHERE dataset='B'")
+    conn.execute("SAVEPOINT second")
+    conn.execute("INSERT OR REPLACE INTO tasks(dataset,data_id,partition,state,rows,bytes) "
+                 "VALUES ('B','x','history','pending',99,7)")
+    conn.execute("ROLLBACK TO first")
+    conn.execute("UPDATE tasks SET bytes=123 WHERE dataset='B'")
+    conn.execute("RELEASE first")
+    exact(conn)
+    conn.execute("INSERT INTO tasks(dataset,data_id,partition,state,rows,bytes) "
+                 "VALUES ('B','x','history','failed',5,6) ON CONFLICT(dataset,data_id,partition) "
+                 "DO UPDATE SET rows=excluded.rows")
+    conn.commit()
+    exact(conn)
 
 
 def test_full_publication_admission_requires_complete_stable_work_and_current_module():

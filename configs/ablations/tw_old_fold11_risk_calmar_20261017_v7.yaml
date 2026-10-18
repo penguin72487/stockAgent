@@ -1,0 +1,13 @@
+# User-requested replacement of the completed standalone MDD experiment.
+# Other five objective cases retain their source-bound v6b results.
+base_spec: tw_old_fold11_risk_objectives_20261017_v6b.yaml
+output_root: artifacts/markets/tw_old_fold11_risk_calmar_20261017_v7
+matrix:
+  dimensions:
+  - name: risk_objective
+    enabled: true
+    variants:
+    - name: calmar
+      overrides:
+        training:
+          loss_type: trajectory_calmar

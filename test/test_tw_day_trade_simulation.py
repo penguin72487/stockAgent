@@ -403,6 +403,56 @@ def test_engine_publishes_one_compact_revision_after_related_state_files(
     assert heartbeat["content_revision"] == content_revision
 
 
+@pytest.mark.parametrize("overnight", [False, True])
+def test_config_error_does_not_retire_or_erase_an_existing_account(tmp_path: Path, overnight: bool) -> None:
+    from stockagent.live.tw_overnight_simulation import TwOvernightSimulationEngine
+
+    engine_type = TwOvernightSimulationEngine if overnight else TwDayTradeSimulationEngine
+    ready = _spec(tmp_path)
+    failed = replace(ready, market="failed-config", label="保留的模型")
+    engine = engine_type(tmp_path / "state")
+    roster = [ready.market, failed.market]
+    engine.update_readiness([ready, failed], now=_now(8, 59), configured_markets=roster)
+    prior = dict(engine.state["modes"][failed.market])
+    ledger_bytes = {name: (engine.state_dir / name).read_bytes()
+                    for name in ("orders.jsonl", "fills.jsonl", "events.jsonl")
+                    if (engine.state_dir / name).is_file()}
+
+    for second in (1, 2):
+        engine.update_readiness([ready], now=_now(8, 59, second), configured_markets=roster,
+                                errors={failed.market: "ValueError: invalid experiment field"})
+        mode = engine.state["modes"][failed.market]
+        assert engine.state["enabled_markets"] == roster
+        assert mode["configured_enabled"] is True
+        assert mode["readiness_error"] == "ValueError: invalid experiment field"
+        assert mode["engine_status"] == "blocked_mode_configuration"
+        unchanged = set(prior) - {"configured_enabled", "readiness_error", "engine_status"}
+        assert {key: mode[key] for key in unchanged} == {key: prior[key] for key in unchanged}
+        status = json.loads(engine.status_path.read_text())
+        assert failed.market in status["modes"]
+        assert status["health"] == "blocked"
+        assert status["configuration_errors"] == {failed.market: "ValueError: invalid experiment field"}
+        assert load_service_sync(engine.state_dir)["enabled_markets"] == roster
+
+    assert ledger_bytes == {name: (engine.state_dir / name).read_bytes() for name in ledger_bytes}
+    engine.update_readiness([ready, failed], now=_now(8, 59, 3), configured_markets=roster)
+    assert engine.state["configuration_errors"] == {}
+    assert engine.state["modes"][failed.market]["readiness_error"] is None
+    engine.update_readiness([ready], now=_now(8, 59, 4), configured_markets=[ready.market])
+    assert engine.state["modes"][failed.market]["configured_enabled"] is False
+    assert engine.state["modes"][failed.market]["initial_capital_twd"] == failed.initial_capital_twd
+
+
+@pytest.mark.parametrize("roster", [[], ["tw_day_trade_unit", "tw_day_trade_unit"], [""], "tw_day_trade_unit"])
+def test_invalid_config_roster_cannot_mutate_readiness(tmp_path: Path, roster) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    before = json.dumps(engine.state, sort_keys=True)
+    with pytest.raises(ValueError, match="configured market roster"):
+        engine.update_readiness([spec], now=_now(8, 59), configured_markets=roster)
+    assert json.dumps(engine.state, sort_keys=True) == before
+
+
 def test_idle_liveness_does_not_rewrite_or_advance_paper_ledger(tmp_path: Path, verified_dashboard_calendar) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -6051,7 +6101,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         in javascript
     )
     assert "function installEventViewActivation()" in javascript
-    assert re.search(r'src="app\.js\?v=[1-9][0-9]*"', html)
+    assert re.search(r'src="app\.js\?v=[0-9a-f]{12}"', html)
+    app_fingerprint = hashlib.sha256((root / "app.js").read_bytes()).hexdigest()[:12]
+    assert f'app.js?v={app_fingerprint}' in html
     assert re.search(r'src="chart-renderer\.js\?v=[1-9][0-9]*"', html)
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in html
     assert "decodedMinuteHistory" not in javascript
@@ -6065,7 +6117,10 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
     assert re.search(r'src="presentation\.js\?v=[1-9][0-9]*"', html)
     assert re.search(r'src="detail-components\.js\?v=[1-9][0-9]*"', html)
-    assert "let followLatestSession = true;" in javascript
+    assert "let followLatestSession = false;" in javascript
+    assert "let followPerformanceRange = true;" in javascript
+    assert 'const DEFAULT_PERFORMANCE_START_DATE = "2026-01-01";' in javascript
+    assert 'id="performance-range"' in html
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
     assert "historyRows || data.marks" not in javascript

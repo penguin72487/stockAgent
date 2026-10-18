@@ -34,7 +34,11 @@ from stockagent.data.tw_day_trade_execution import (
 )
 from stockagent.data.tw_listing_admission import regular_market_admission_contract
 from stockagent.training.loss import risk_aware_loss
-from stockagent.training.trainer import _mode_artifact_contract_for_config
+from stockagent.training.trainer import (
+    _benchmark_plot_label,
+    _benchmark_reporting_details,
+    _mode_artifact_contract_for_config,
+)
 
 
 def _tape(days: int = 1, symbols: int = 1) -> torch.Tensor:
@@ -1165,13 +1169,35 @@ def test_pretrained_22_basis_config_keeps_target_execution_loss_contract() -> No
     assert contract["execution_mode"] == "tw_day_trade"
     assert contract["frequency"] == "daily_policy_exact_minute_execution"
     assert contract["sample_order_contract"] == "strict_chronological_sessions"
+    assert _benchmark_plot_label(config) == "Benchmark (2330 buy and hold (total return))"
+    assert contract["benchmark_contract"] == (
+        "configured_symbol_adjusted_close_buy_and_hold_total_return"
+    )
     assert contract["mode_details"] == {
+        **_benchmark_reporting_details(config),
         "execution_variant": "exact_board_lot_minute_event_tape_v1",
         "minute_execution_contract_version": DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
         "regular_market_admission": regular_market_admission_contract(),
         "daily_policy_decisions_per_session": 1,
         "daily_proxy_allowed": True,
     }
+
+
+def test_daily_and_minute_reports_share_overnight_buy_hold_benchmark() -> None:
+    config = load_config(
+        "configs/deployments/"
+        "tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml"
+    )
+    for minute_root in (config.data.day_trade_minute_execution_root, None):
+        config.data.day_trade_minute_execution_root = minute_root
+        contract = _mode_artifact_contract_for_config(config)
+        details = contract["mode_details"]
+        assert details["benchmark_symbol"] == "2330"
+        assert details["benchmark_exposure"] == "continuous_1x_long_including_overnight"
+        assert details["benchmark_return_clock"] == (
+            "previous_adjusted_close_to_current_adjusted_close"
+        )
+        assert details["benchmark_rebalancing"] == "none_no_daily_open_close_round_trip"
 
 
 def test_v12_uses_corrected_tape_and_fold_matched_v11_epoch_zero() -> None:

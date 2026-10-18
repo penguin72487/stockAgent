@@ -62,7 +62,7 @@ def main():
     from playwright.sync_api import sync_playwright
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="https://penguin72487.ddnsgeek.com/tw-day-trade/")
+    parser.add_argument("--url", default="https://www.penguin72487.dpdns.org/tw-day-trade/")
     parser.add_argument("--market", required=True)
     parser.add_argument("--checkpoint-fingerprint", required=True)
     parser.add_argument("--identity-url", default="http://127.0.0.1:8766/api/status",

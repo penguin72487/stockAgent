@@ -257,3 +257,150 @@ def test_dashboard_acceptance_keeps_data_gaps_visible(
 
     assert result["local_status"]["health"] == "degraded"
     assert result["local_status"]["operational_issues"] == [{"code": "entry_no_fill"}]
+
+
+@pytest.fixture
+def prepared_history(tmp_path):
+    live, candidate = tmp_path / "live", tmp_path / "candidate"
+    live.mkdir()
+    candidate.mkdir()
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"selected checkpoint")
+    config = SimpleNamespace(checkpoint_path=str(checkpoint), current_capital=10000000,
+                             initial_capital=10000000)
+    days = [date(2026, 1, 2), date(2026, 2, 25)]
+    events = live / "events.jsonl"
+    events.write_text(json.dumps({"event": "signal_registered", "market": "target",
+        "signal_id": "original", "recorded_at": "2026-02-25T09:00:00+08:00"}) + "\n")
+    for root in (live, candidate):
+        (root / "state.json").write_text(json.dumps({"modes": {
+            "target": {"initial_capital_twd": 10000000, "positions": {}, "open_position_count": 0}}}))
+    sessions = []
+    for day, signal_id, folder in ((days[0], "counterfactual", prefix / "target"),
+                                   (days[1], "original", tmp_path / "retained")):
+        folder.mkdir()
+        summary, weights = folder / "summary.json", folder / "weights.parquet"
+        summary.write_text(json.dumps({"signal_id": signal_id,
+            "counterfactual_signal_regeneration": signal_id == "counterfactual",
+            "simulation_only": True, "production_order_possible": False,
+            "checkpoint_fingerprint": strategy_switch.short_file_fingerprint(checkpoint),
+            "replay_effective_signal_at": f"{day}T09:00:00+08:00"}))
+        weights.write_bytes(b"immutable weights")
+        sessions.append({"session_date": str(day), "modes": [{"market": "target", "signal_id": signal_id,
+            "summary_path": str(summary), "summary_sha256": strategy_switch._sha256(summary),
+            "weights_path": str(weights), "weights_sha256": strategy_switch._sha256(weights)}]})
+    receipt = {"simulation_only": True, "production_order_possible": False,
+               "missing_signal_root": str(prefix), "sessions": sessions,
+               "source_signal_ledger": {"path": str(events), "sha256": strategy_switch._sha256(events),
+                                        "replacement_signal_markets": [], "replaced_pinned_signal_keys": 0}}
+    (candidate / "rebuild_receipt.json").write_text(json.dumps(receipt))
+    return SimpleNamespace(live=live, candidate=candidate, receipt=receipt, days=days,
+                           configs={"target": config}, prefix=prefix)
+
+
+def _prepared_evidence(fixture):
+    return strategy_switch._prepared_history_evidence(
+        fixture.candidate, fixture.live, sessions=fixture.days, configs=fixture.configs, manifests=())
+
+
+def test_history_extension_retains_existing_decisions_and_marks_only_missing_prefix(prepared_history):
+    fixture = prepared_history
+    before = (fixture.live / "events.jsonl").read_bytes()
+    result = _prepared_evidence(fixture)
+    assert result["retained_decision_count"] == 1
+    assert result["counterfactual_prefix_count"] == 1
+    assert result["prefix_last_session"] == "2026-01-02"
+    assert len(result["signal_artifacts"]) == 2
+    assert (fixture.live / "events.jsonl").read_bytes() == before
+    strategy_switch._require_history_source_unchanged(fixture.live, result["source_streams"])
+    with (fixture.live / "events.jsonl").open("a") as stream:
+        stream.write("another decision\n")
+    with pytest.raises(RuntimeError, match="execution changed"):
+        strategy_switch._require_history_source_unchanged(fixture.live, result["source_streams"])
+
+
+@pytest.mark.parametrize("defect,message", [
+    ("replacement", "cannot replace"), ("source_drift", "current live decision"),
+    ("signal_id", "changed a retained signal"), ("hash", "artifact changed"),
+    ("not_counterfactual", "selected marked counterfactual"),
+    ("wrong_checkpoint", "selected marked counterfactual"),
+    ("missing_mode", "cover every official session"), ("duplicate", "invalid or duplicate"),
+    ("production_order", "simulation-only"), ("capital", "changed initial capital"),
+])
+def test_history_extension_refuses_unverified_or_replaced_history(prepared_history, defect, message):
+    fixture = prepared_history
+    row = fixture.receipt["sessions"][0]["modes"][0]
+    if defect == "replacement":
+        fixture.receipt["source_signal_ledger"]["replacement_signal_markets"] = ["target"]
+    elif defect == "source_drift":
+        fixture.receipt["source_signal_ledger"]["sha256"] = "wrong"
+    elif defect == "signal_id":
+        fixture.receipt["sessions"][1]["modes"][0]["signal_id"] = "changed"
+    elif defect == "hash":
+        row["weights_sha256"] = "wrong"
+    elif defect in {"not_counterfactual", "wrong_checkpoint"}:
+        path = Path(row["summary_path"])
+        summary = json.loads(path.read_text())
+        summary["counterfactual_signal_regeneration" if defect == "not_counterfactual" else "checkpoint_fingerprint"] = False
+        path.write_text(json.dumps(summary))
+        row["summary_sha256"] = strategy_switch._sha256(path)
+    elif defect == "missing_mode":
+        fixture.receipt["sessions"].pop()
+    elif defect == "duplicate":
+        fixture.receipt["sessions"].append(fixture.receipt["sessions"][0])
+    elif defect == "production_order":
+        fixture.receipt["production_order_possible"] = True
+    elif defect == "capital":
+        path = fixture.candidate / "state.json"
+        state = json.loads(path.read_text())
+        state["modes"]["target"]["initial_capital_twd"] = 1
+        path.write_text(json.dumps(state))
+    (fixture.candidate / "rebuild_receipt.json").write_text(json.dumps(fixture.receipt))
+    with pytest.raises(ValueError, match=message):
+        _prepared_evidence(fixture)
+
+
+def test_history_extension_reuses_candidate_without_regenerating_retained_signals(monkeypatch, prepared_history, tmp_path):
+    fixture = prepared_history
+    proof = _prepared_evidence(fixture)
+    stages = []
+    monkeypatch.setattr(strategy_switch, "_run", lambda *_a, **_k: pytest.fail("must not regenerate any decisions"))
+    result, repairs = strategy_switch._prepare_replacement_candidate(
+        SimpleNamespace(), {"operation": "extend_history", "prepared_history": proof},
+        candidate=fixture.candidate, live_dir=fixture.live, sessions=fixture.days,
+        run_dir=tmp_path, stages=stages)
+    assert result["replacement_signal_markets"] == [] and repairs == []
+    assert stages[0]["stage"] == "retain_decisions_and_accept_prepared_history"
+
+
+@pytest.mark.parametrize("clock", ["2000-01-01T00:00:00+08:00", "2999-01-01T00:00:00+08:00", "invalid", "2026-01-01T00:00:00"])
+def test_engine_sync_never_accepts_a_replay_or_stale_heartbeat(monkeypatch, tmp_path, clock):
+    from datetime import datetime
+    calls = []
+    def read(_path):
+        calls.append(_path)
+        return {"enabled_markets": ["target"], "mode_count": 1, "ledger_integrity_ready": True,
+                "heartbeat_at": clock if len(calls) == 1 else datetime.now(strategy_switch.TAIPEI).isoformat()}
+    monkeypatch.setattr(strategy_switch, "_object", read)
+    monkeypatch.setattr(strategy_switch.wall_time, "sleep", lambda _seconds: None)
+    result = strategy_switch._wait_engine_sync(tmp_path, {"target"}, timeout_seconds=1)
+    assert len(calls) == 2 and result["heartbeat_at"] != clock
+
+
+def test_discord_sync_never_accepts_a_stale_ready_receipt(monkeypatch):
+    from datetime import datetime
+    calls = []
+    def read(_path):
+        calls.append(_path)
+        return {"updated_at": "2000-01-01T00:00:00+08:00" if len(calls) == 1 else datetime.now(strategy_switch.TAIPEI).isoformat(),
+                "run_id": "new-owner", "discord_connected": True, "core_health": "ready",
+                "scheduled_day_trade_markets": ["target"], "engine_run_id": "current-engine",
+                "startup_inference_warmup": {"status": "ready", "ready_count": 1,
+                    "markets": [{"market": "target", "checkpoint_fingerprint": "exact"}]}}
+    monkeypatch.setattr(strategy_switch, "_object", read)
+    monkeypatch.setattr(strategy_switch.wall_time, "sleep", lambda _seconds: None)
+    result = strategy_switch._wait_discord_ready(expected_engine_run_id="current-engine", expected_markets={"target"},
+        target_market="target", checkpoint_fingerprint="exact", previous_run_id="old-owner", timeout_seconds=1)
+    assert len(calls) == 2 and result["run_id"] == "new-owner"

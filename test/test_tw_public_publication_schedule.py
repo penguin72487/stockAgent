@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timedelta
 import fcntl
 import hashlib
 import json
@@ -67,6 +67,85 @@ def test_0830_revalidates_after_lock_downgrade_before_audit() -> None:
     assert downgrade < revalidate < audit
 
 
+@pytest.mark.parametrize("refresh,raced", [(False, False), (True, False), (True, True)])
+def test_0830_main_read_scans_allow_inference_and_recheck_write_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh: bool, raced: bool,
+) -> None:
+    """Exercise actual flock calls, including conversion and receipt fencing."""
+    owner = run_tw_public_0830_check
+    root = tmp_path / "live"
+    root.mkdir()
+    (tmp_path / "data_tw_public").symlink_to(root)
+    config = tmp_path / "config.yaml"
+    config.touch()
+    receipt = tmp_path / "receipts/latest.json"
+    lock_path = tmp_path / ".locks/tw-public-refresh.lock"
+    (tmp_path / "eligibility.json").write_text(json.dumps({
+        "status": "ok", "trading_date": datetime.now(TAIPEI).date().isoformat()}))
+    monkeypatch.setattr(owner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(owner, "parse_args", lambda: argparse.Namespace(
+        config=config, live_root=root, receipt=receipt,
+        publication_receipt=tmp_path / "publication.json",
+        eligibility_receipt=tmp_path / "eligibility.json",
+        event_receipt=tmp_path / "events.json", audit_root=tmp_path / "audit",
+        event_settle_seconds=0, force=False))
+    monkeypatch.setattr(owner, "_session_contract", lambda *_: ("open", "fixture", ("TSE", "OTC")))
+    monkeypatch.setattr(owner, "_latest_completed_taiex_session", lambda *a, **k: "2026-10-15")
+    monkeypatch.setattr(owner, "_audit_dependency_state", lambda **k: {"sha256": "same"})
+    monkeypatch.setattr(owner, "require_exact_session_eligibility", lambda **k: {})
+    monkeypatch.setattr(owner, "_same_session_accepted", lambda *a, **k: True)
+    monkeypatch.setattr(owner, "_reuse_accepted_session", lambda **k: None)
+    monkeypatch.setattr(owner, "_publication_errors", lambda *a, **k: [])
+    monkeypatch.setattr(owner, "_wait_for_event_monitor", lambda *a, **k: ({}, [], 0.))
+    monkeypatch.setattr(owner, "_event_monitor_errors", lambda *a, **k: [])
+    monkeypatch.setattr(owner, "create_opening_revision_freeze", lambda *a, **k: {})
+    monkeypatch.setattr(owner, "_defer_opening_bulk_step", lambda *a: False)
+    monkeypatch.setattr(owner, "_reusable_audit", lambda *a, **k: ({"model_safe": True}, {}))
+    monkeypatch.setattr(owner, "_live_runtime_errors", lambda **k: [])
+    monkeypatch.setattr(owner, "_derived_data_dates", lambda *a: {})
+    scans, commands = [], []
+    labels = ("corporate_action_reference", "stock_panel", "corporate_action_entitlements", "public_features")
+
+    def status(*a, **k):
+        with lock_path.open("a+") as reader:
+            try:
+                fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                shared = True
+            except BlockingIOError:
+                shared = False
+        with lock_path.open("a+") as writer:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        scans.append(shared)
+        needs_build = refresh and not commands and (not raced or len(scans) == 1)
+        errors = {label: [] for label in labels}
+        if needs_build:
+            errors["stock_panel"] = ["fixture source mismatch"]
+        return {"current": not needs_build, "errors": errors}
+
+    def run(command, **kwargs):
+        assert scans == [True, False], "a builder needs an exclusive, revalidated revision"
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(owner, "_derived_data_status", status)
+    monkeypatch.setattr(owner.subprocess, "run", run)
+    assert owner.main() == 0
+    payload = json.loads(receipt.read_bytes())
+    assert payload["status"] == "ok"
+    if not refresh:
+        assert scans == [True, True, True]  # before, after, final; not seven scans
+        assert not commands
+    elif raced:
+        assert scans == [True, False, True, True]
+        assert not commands, "a competing accepted rebuild makes our write unnecessary"
+    else:
+        assert scans == [True, False, False, True, True]
+        assert len(commands) == 1
+    final = next(step for step in payload["steps"] if step["step"] == "freeze_final_acceptance_revision")
+    assert final["mode"] == "shared"
+
+
 def test_publication_receipt_separates_command_success_from_data_completeness() -> None:
     assert publication._download_data_status(None) == "unknown"
     assert publication._download_data_status(
@@ -98,10 +177,58 @@ def test_auto_phase_accepts_two_minute_retry() -> None:
     assert phase.name == "institutional_initial"
 
 
-def test_auto_phase_catchup_uses_full_sweep() -> None:
-    observed = datetime(2026, 8, 17, 12, 0, tzinfo=TAIPEI)
-    phase = publication.resolve_phase(observed, window_minutes=20.0)
-    assert phase.name == "preopen_all"
+@pytest.mark.parametrize("phase", publication.PUBLICATION_PHASES.values(), ids=lambda phase: phase.name)
+def test_auto_phase_never_selects_a_future_release(phase) -> None:
+    boundary = datetime.combine(date(2026, 10, 15), phase.anchor, tzinfo=TAIPEI)
+    selected = publication.resolve_phase(boundary - timedelta(microseconds=1), window_minutes=20.0)
+    assert selected is None or selected.anchor < phase.anchor
+    assert publication.resolve_phase(boundary, window_minutes=20.0) == phase
+    assert publication.resolve_phase(boundary + timedelta(seconds=120), window_minutes=20.0) == phase
+
+
+@pytest.mark.parametrize("hour,minute,second", [(12, 0, 0), (14, 30, 46), (14, 49, 59), (0, 1, 0)])
+def test_auto_phase_outside_due_window_does_not_expand_to_full_sweep(hour, minute, second) -> None:
+    observed = datetime(2026, 10, 15, hour, minute, second, tzinfo=TAIPEI)
+    assert publication.resolve_phase(observed, window_minutes=20.0) is None
+
+
+@pytest.mark.parametrize("window", [0.0, -1.0, float("nan"), float("inf")])
+def test_auto_phase_rejects_invalid_window(window: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        publication.resolve_phase(datetime(2026, 10, 15, 14, 50, tzinfo=TAIPEI), window_minutes=window)
+
+
+def test_late_coalesced_timer_records_skip_without_touching_sources_or_providers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = datetime(2026, 10, 15, 14, 30, 46, tzinfo=TAIPEI)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed.astimezone(tz) if tz is not None else observed.replace(tzinfo=None)
+
+    monkeypatch.setattr(publication, "datetime", FixedDateTime)
+    monkeypatch.setattr(publication, "parse_args", lambda: argparse.Namespace(
+        workers=8, date_workers=4, timeout=20, retries=2, auto_window_minutes=20.0,
+        phase="auto", live_root=tmp_path / "nonexistent-live-source",
+        receipt_root=tmp_path / "receipts",
+    ))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("out-of-window timer must not inspect or refresh source data")
+
+    monkeypatch.setattr(publication, "_select_specs", forbidden)
+    monkeypatch.setattr(publication, "_file_hashes", forbidden)
+    monkeypatch.setattr(publication.subprocess, "run", forbidden)
+    assert publication.main() == 0
+    receipt = json.loads((tmp_path / "receipts/auto/latest.json").read_bytes())
+    assert receipt["status"] == "skipped_outside_publication_window"
+    assert receipt["phase_selection_contract"] == "elapsed_publication_window_v2"
+    assert receipt["commands"] == []
+    assert receipt["selected_dataset_count"] == 0
+    assert receipt["content_change_observed"] is False
+    assert not (tmp_path / "nonexistent-live-source").exists()
 
 
 def test_close_command_requires_verified_publication(tmp_path: Path) -> None:
@@ -647,19 +774,20 @@ def test_0830_reuses_only_exact_dependency_audit_receipt(tmp_path: Path) -> None
     )
 
 
-def test_0830_audit_cache_invalidates_on_direct_short_rule_receipt_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("changed_member", [
+    "live/tw_short_sale_download_report.json",
+    "repo/stockagent/data/panel.py",
+    "repo/stockagent/data/panel_cache.py",
+    "repo/stockagent/data/panel_chunks.py",
+])
+def test_0830_audit_cache_invalidates_on_rule_receipt_or_shared_panel_code_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_member: str,
 ) -> None:
     repo = tmp_path / "repo"
     live = tmp_path / "live"
     config = repo / "config.yaml"
     monkeypatch.setattr(run_tw_public_0830_check, "REPO_ROOT", repo)
-    relative_files = (
-        "scripts/audit_tw_public_data_layer.py",
-        "scripts/build_tw_official_symbol_parquets.py",
-        "scripts/build_tw_public_training_features.py",
-        "stockagent/data/tw_public_features.py",
-    )
+    relative_files = run_tw_public_0830_check.AUDIT_CODE_DEPENDENCIES
     live_files = (
         "download_summary.json",
         "tw_short_sale_download_report.json",
@@ -677,9 +805,7 @@ def test_0830_audit_cache_invalidates_on_direct_short_rule_receipt_change(
     before = run_tw_public_0830_check._audit_dependency_state(
         config=config, live_root=live
     )["sha256"]
-    (live / "tw_short_sale_download_report.json").write_text(
-        "new official receipt", encoding="utf-8"
-    )
+    (tmp_path / changed_member).write_text("changed admitted dependency", encoding="utf-8")
     after = run_tw_public_0830_check._audit_dependency_state(
         config=config, live_root=live
     )["sha256"]
@@ -1108,8 +1234,12 @@ def test_exact_release_audit_writes_panel_cache_outside_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[object] = []
-    monkeypatch.setattr(public_audit, "_panel_kwargs", lambda *_: {})
-    monkeypatch.setattr(public_audit, "load_cached_panel", lambda *a, **k: pytest.fail("must not load source cache"))
+    monkeypatch.setattr(public_audit, "_panel_kwargs", lambda *_, **__: {})
+    def cached(root, **kwargs):
+        assert kwargs["panel_cache_root"] == cache
+        return None
+
+    monkeypatch.setattr(public_audit, "load_cached_panel", cached)
 
     def build(root: Path, **kwargs: object) -> object:
         calls.append((root, kwargs.get("panel_cache_root")))
@@ -1119,7 +1249,7 @@ def test_exact_release_audit_writes_panel_cache_outside_source(
     source = tmp_path / "immutable/stocks"
     cache = tmp_path / "writable-cache"
     _, origin = public_audit._load_or_build_panel(
-        object(), source, tmp_path / "immutable/features.parquet",
+        SimpleNamespace(data=SimpleNamespace(panel_cache_root="")), source, tmp_path / "immutable/features.parquet",
         build_if_missing=True, panel_cache_root=cache,
     )
     assert origin == "built"
@@ -1940,7 +2070,9 @@ def test_0830_bulk_writes_and_audit_defer_through_opening_window() -> None:
         assert check(step, datetime(2026, 9, 22, 8, 45, tzinfo=TAIPEI))
         assert check(step, datetime(2026, 9, 22, 8, 50, tzinfo=TAIPEI))
         assert check(step, datetime(2026, 9, 22, 9, 4, tzinfo=TAIPEI))
-        assert not check(step, datetime(2026, 9, 22, 9, 5, tzinfo=TAIPEI))
+        assert check(step, datetime(2026, 9, 22, 9, 5, tzinfo=TAIPEI))
+        assert check(step, datetime(2026, 9, 22, 9, 9, 59, tzinfo=TAIPEI))
+        assert not check(step, datetime(2026, 9, 22, 9, 10, tzinfo=TAIPEI))
     assert not check(
         "refresh_corporate_action_entitlements",
         datetime(2026, 9, 22, 9, 0, tzinfo=TAIPEI),

@@ -24,7 +24,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.config import ExperimentConfig, load_config
-from stockagent.data.panel import build_panel, load_cached_panel
+from stockagent.data.panel import (
+    DAY_TRADE_OPEN_GAP_FEATURE,
+    _normalize_feature_patterns,
+    _requested_raw_panel_features,
+    _resolve_external_feature_projection,
+    build_panel,
+    load_cached_panel,
+)
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.data.tw_public_features import (
@@ -3749,11 +3756,13 @@ def audit_public_feature_table(
     return raw_stats, annual_rows, findings
 
 
-def _panel_kwargs(config: ExperimentConfig, public_feature_path: Path) -> dict[str, Any]:
+def _panel_kwargs(
+    config: ExperimentConfig, public_feature_path: Path, *, resolve_projection: bool = True,
+) -> dict[str, Any]:
     use_features = bool(config.data.use_tw_public_features)
     use_rules = bool(config.data.use_tw_public_rules)
     use_public = use_features or use_rules
-    return {
+    kwargs = {
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
         "tradable_mode": config.data.tradable_mode,
@@ -3774,6 +3783,30 @@ def _panel_kwargs(config: ExperimentConfig, public_feature_path: Path) -> dict[s
         "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
+    if resolve_projection and use_features and config.data.feature_exclude:
+        # Retain lookup support for historical projected cache keys. New builds
+        # use the original key: projection now belongs to the shared builder,
+        # not a caller-specific config rewrite or a second physical generation.
+        include = _normalize_feature_patterns(config.data.feature_include, label="feature_include")
+        exclude = _normalize_feature_patterns(config.data.feature_exclude, label="feature_exclude")
+        raw = _requested_raw_panel_features(include)
+        # The canonical full builder removes this execution-context column from
+        # base selection and appends it last only on an exact opt-in. A wildcard
+        # must not make a later opening price model-visible by accident.
+        selected_names, _ = _resolve_external_feature_projection(
+            public_feature_path,
+            include_features=True,
+            raw_input_features=raw,
+            feature_include=tuple(name for name in include if name != DAY_TRADE_OPEN_GAP_FEATURE),
+            feature_exclude=exclude,
+            exclude_open_gap=True,
+        )
+        selected = list(selected_names)
+        if DAY_TRADE_OPEN_GAP_FEATURE in include and DAY_TRADE_OPEN_GAP_FEATURE not in exclude:
+            selected.append(DAY_TRADE_OPEN_GAP_FEATURE)
+        kwargs["feature_include"] = tuple(selected)
+        kwargs["feature_exclude"] = ()
+    return kwargs
 
 
 def _load_or_build_panel(
@@ -3784,16 +3817,25 @@ def _load_or_build_panel(
     build_if_missing: bool,
     panel_cache_root: Path | None = None,
 ):
+    if panel_cache_root is None and config.data.panel_cache_root:
+        panel_cache_root = Path(config.data.panel_cache_root)
+    original_kwargs = _panel_kwargs(config, public_feature_path, resolve_projection=False)
+    cache_kwargs = {"panel_cache_root": panel_cache_root} if panel_cache_root is not None else {}
+    # The readonly loader and writer must agree on the writable cache root,
+    # including exact-source audits whose inputs are immutable cold data.
+    panel = load_cached_panel(parquet_root, **original_kwargs, **cache_kwargs)
+    if panel is not None:
+        return panel, "cache"
     kwargs = _panel_kwargs(config, public_feature_path)
-    if panel_cache_root is None:
-        panel = load_cached_panel(parquet_root, **kwargs)
+    if kwargs != original_kwargs:
+        panel = load_cached_panel(parquet_root, **kwargs, **cache_kwargs)
         if panel is not None:
             return panel, "cache"
     if not build_if_missing:
         raise RuntimeError(
             "No valid panel cache exists for this exact data/config fingerprint; pass --build-panel."
         )
-    return build_panel(parquet_root, panel_cache_root=panel_cache_root, **kwargs), "built"
+    return build_panel(parquet_root, panel_cache_root=panel_cache_root, **original_kwargs), "built"
 
 
 def _empty_panel_accumulator(years: np.ndarray, feature_count: int) -> dict[str, np.ndarray]:
@@ -4506,6 +4548,15 @@ def main() -> None:
     panel_summary["source"] = panel_source
     panel_summary["parquet_root"] = str(parquet_root)
     panel_summary["public_feature_path"] = str(public_feature_path)
+    selected_build_kwargs = _panel_kwargs(config, public_feature_path)
+    panel_summary["input_projection"] = {
+        "contract": "tw_public_audit_canonical_selection_projection_v1",
+        "feature_include": list(selected_build_kwargs["feature_include"]),
+        "feature_exclude": list(selected_build_kwargs["feature_exclude"]),
+        "applies_to": "cold_build_only; existing valid canonical cache is reused first",
+        "all_execution_rule_columns_retained": bool(config.data.use_tw_public_rules),
+        "source_history_or_universe_reduced": False,
+    }
     if panel_cache_root is not None:
         panel_summary["panel_cache_root"] = str(panel_cache_root)
     findings.extend(contract_findings)

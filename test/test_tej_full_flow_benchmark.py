@@ -60,6 +60,23 @@ def test_adjacent_field_batch_preserves_source_axes_and_immutable_original_case(
     assert with_field_batch([case], None) == [case]
 
 
+def test_adjacent_field_comparator_does_not_claim_the_original_full_field_plan():
+    case={'label':'event','request':{'fields':['a','b','c','d'], 'catalog_fields':['a','b','c','d'],
+        'field_partition':{'field_range':[0,4],'plan_fingerprint':'original'},'company_labels':['one']},
+        'task':{'task_id':'a'*24,'kind':'download','expected_rows':1}}
+    compared=with_field_batch([case],case['task']['task_id'])
+    assert 'field_partition' not in compared[1]['request']
+    assert compared[1]['request']['catalog_fields']==case['request']['catalog_fields']
+    assert case['request']['field_partition']['plan_fingerprint']=='original'
+
+
+def test_script_cache_benchmark_keeps_full_lifecycle_and_identical_source():
+    source=(Path(__file__).parents[1]/'scripts/benchmark_tej_full_flow.py').read_text()
+    assert 'compare_script_cache and baseline.read_bytes() != candidate.read_bytes()' in source
+    assert "cache_script=not compare_script_cache or mode=='candidate'" in source
+    assert "'script_cache_comparison':compare_script_cache" in source
+
+
 @pytest.mark.parametrize('task_id,kind,fields', [
     ('missing', 'download', ['a', 'b']), ('a'*24, 'discover', ['a', 'b']),
     ('a'*24, 'download', ['a']), ('a'*24, 'download', None),
@@ -77,7 +94,7 @@ def test_balanced_comparison_uses_original_source_lock_and_keeps_unknown_barrier
     assert "(('baseline','candidate'),('candidate','baseline'))" in source
     assert "'production_gate_retained':True" in source
     assert "'production_receipts_modified':False" in source
-    assert "run_one(path, DesktopBridge(repo, session)" in source
+    assert "run_one(path, DesktopBridge(repo, session, cache_script=cache_script)" in source
     assert "audit(path, path/'acceptance'/task['task_id'], task_ids=[task['task_id']])" in source
     assert "con.execute(\"DELETE FROM meta WHERE key='desktop_interface_recovery_required' AND value=?\", (marker,))" in source
 

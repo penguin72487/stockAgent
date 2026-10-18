@@ -17,9 +17,10 @@ import inspect
 import csv
 import hashlib
 import random
+import weakref
 from copy import deepcopy
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
 from functools import partial, wraps
 from pathlib import Path
@@ -189,6 +190,20 @@ from stockagent.training.execution_coverage import (
     validate_training_execution_coverage,
 )
 from stockagent.training.loss import _resolve_rank_scores, get_loss_runtime_stats, risk_aware_loss
+from stockagent.training.return_adjoint import (
+    RETURN_ADJOINT_OBJECTIVES,
+    CompoundReturnAdjoint,
+    ReturnAdjointTape,
+    account_offsets,
+    return_adjoint_contract,
+    return_adjoint_weights,
+    trajectory_metric_loss,
+    task_return_gradients,
+)
+from stockagent.training.multiobjective import (
+    MULTIOBJECTIVE_OBJECTIVES, TASK_NAMES, ParameterGradientBank,
+    combine_task_gradients, surgery_spec,
+)
 from stockagent.training.lifecycle import (
     TrainingArtifactLayout,
     TrainingRunLifecycle,
@@ -212,7 +227,7 @@ from stockagent.training.runtime_configuration import (
     _env_truthy,
     _prepend_compile_toolchain_paths,
 )
-from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
+from stockagent.training.windowed import ImmutableWindowedBatchCache, WindowedSplitTensors, dataset_to_windowed_tensors
 
 _subset_panel_symbols = subset_panel_symbols
 
@@ -1892,7 +1907,9 @@ def _transfer_pretrained_feature_identity(
 ) -> dict[str, Any]:
     """Load a FinancialTransformer through a feature-name-safe adapter.
 
-    Two ABI-safe cases are supported.  For an older model without a bottleneck,
+    Exact-feature models may omit a bottleneck entirely: copy their state,
+    including persistent RMS buffers, without inventing a new projection.
+    Two expansion cases are also supported. For an older model without a bottleneck,
     the target adapter output width equals the old raw feature width and its
     rows select the old features from an expanded target ABI.  For a completed
     successor that already owns the same raw feature ABI and a learned
@@ -1908,10 +1925,12 @@ def _transfer_pretrained_feature_identity(
         if candle_encoder is None
         else getattr(candle_encoder, "continuous_feature_bottleneck", None)
     )
-    if not isinstance(adapter_module, nn.Linear):
+    if candle_encoder is None or (
+        adapter_module is not None and not isinstance(adapter_module, nn.Linear)
+    ):
         raise RuntimeError(
-            "pretrained feature identity requires a FinancialTransformer "
-            "continuous_feature_bottleneck"
+            "pretrained feature identity requires a FinancialTransformer candle "
+            "encoder with an optional linear continuous_feature_bottleneck"
         )
 
     source_features = list(initialization.source_feature_names)
@@ -1926,7 +1945,10 @@ def _transfer_pretrained_feature_identity(
         raise RuntimeError("target feature names are not unique")
     source_state = initialization.checkpoint["model_state_dict"]
     adapter_key = "candle_encoder.continuous_feature_bottleneck.weight"
-    if int(adapter_module.out_features) != len(source_features):
+    adapter_output_features = (
+        None if adapter_module is None else int(adapter_module.out_features)
+    )
+    if adapter_output_features is None or adapter_output_features != len(source_features):
         # A successor checkpoint records the raw panel feature ABI in its run
         # manifest, while its learned bottleneck can be narrower.  If source
         # and target raw feature names are exactly identical, preserving the
@@ -1935,18 +1957,25 @@ def _transfer_pretrained_feature_identity(
         # both be dimensionally impossible and silently discard that policy.
         if source_features != target_features:
             raise RuntimeError(
-                "feature adapter output width must equal the pretrained feature "
-                "count unless source and target raw feature ABIs are identical: "
-                f"adapter={adapter_module.out_features} source={len(source_features)}"
+                "without a feature expansion adapter, source and target raw "
+                "feature ABIs must be identical; otherwise adapter output width "
+                "must equal the pretrained feature count: "
+                f"adapter={adapter_output_features} source={len(source_features)}"
             )
 
         target_state = raw_model.state_dict()
         mismatches: list[str] = []
         copied_keys: list[str] = []
+        identity_initialized_keys: list[str] = []
         for key, target_value in target_state.items():
             source_value = source_state.get(key)
             source_value = _expand_pretrained_margin_amount_column(key, source_value, target_value, raw_model)
             if not torch.is_tensor(source_value):
+                if (key.startswith("risk_calibration_head.")
+                        and getattr(raw_model, "portfolio_risk_calibration", "off") in {"constant", "linear"}
+                        and bool((target_value == 0).all())):
+                    identity_initialized_keys.append(key)
+                    continue
                 mismatches.append(f"{key}:missing")
                 continue
             if tuple(source_value.shape) != tuple(target_value.shape):
@@ -2003,10 +2032,11 @@ def _transfer_pretrained_feature_identity(
                 **symbol_axis_report,
                 "feature_adapter": "exact_state_by_feature_name",
                 "target_feature_count": len(target_features),
-                "adapter_output_features": int(adapter_module.out_features),
+                "adapter_output_features": adapter_output_features,
                 "adapter_new_feature_columns_initialized_zero": 0,
                 "causal_rms_identity_compensation": False,
                 "copied_backbone_tensor_count": len(copied_keys),
+                "identity_initialized_risk_head_tensors": identity_initialized_keys,
                 "incompatible_source_tensor_count": len(mismatches),
                 "incompatible_source_tensors": mismatches,
                 "require_exact_backbone": bool(require_exact_backbone),
@@ -3161,6 +3191,8 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    if mode == "tw_day_trade":
+        payload["mode_details"] = _benchmark_reporting_details(config)
     if (mode == "tw_stock_context_futures_portfolio"
             and getattr(config.trading, "tw_futures_portfolio_capital_basis", "notional") == "initial_margin"):
         from stockagent.data.tw_futures_margin import MARGIN_AUDIT_COLUMNS, MARGIN_ACCOUNTING_CONTRACT_VERSION
@@ -3385,6 +3417,7 @@ def _mode_artifact_contract_for_config(
             "weight_snapshot_contract": "exact_filled_entry_notional_over_nav",
             "turnover_contract": "sum_exact_minute_fill_notional_over_nav",
             "mode_details": {
+                **_benchmark_reporting_details(config),
                 **({"entry_remainder_policy": entry_remainder_policy}
                    if entry_remainder_policy != "first_minute_only" else {}),
                 "execution_variant": (
@@ -3412,6 +3445,8 @@ def _mode_artifact_contract_for_config(
                         ),
                         "cash_claim_policy": "exact_dated_corporate_action_claims",
                         "legacy_tplus_cash_queue": "not_applicable",
+                        "physical_policy_replay_version": PHYSICAL_CARRY_POLICY_REPLAY_VERSION,
+                        "saved_requests_contract": "raw_model_intents_before_causal_bridge",
                     }
                     if physical_fifo
                     else {}
@@ -3731,6 +3766,15 @@ def _active_panel_short_contract_rows(
 @dataclass(slots=True)
 class TimingBreakdown:
     total_s: float = 0.0
+    return_adjoint_record_s: float = 0.0
+    return_adjoint_metric_s: float = 0.0
+    return_adjoint_replay_max_abs_error: float = 0.0
+    multiobjective_diagnostics: dict[str, float] = field(default_factory=dict)
+    resident_input_cache_hits: int = 0
+    resident_input_cache_misses: int = 0
+    resident_input_cache_bytes: int = 0
+    deferred_validation_checks: int = 0
+    deferred_validation_retries: int = 0
     fetch_s: float = 0.0
     transfer_s: float = 0.0
     batch_prepare_s: float = 0.0
@@ -3800,6 +3844,22 @@ class TimingBreakdown:
     )
 
 
+def _frozen_encoder_cache_snapshot(model: torch.nn.Module) -> dict[str, int]:
+    """Expose this rank's bounded reuse without inspecting/copying tensors."""
+    budget = int(getattr(model, "factorized_frozen_encoder_cache_bytes", 0))
+    if not budget:
+        return {}
+    owner = model.__dict__.get("_frozen_encoder_cache", {})
+    return {
+        "frozen_encoder_cache_budget_bytes": budget,
+        "frozen_encoder_cache_bytes": int(owner.get("bytes", 0)),
+        "frozen_encoder_cache_entries": len(owner.get("entries", {})),
+        "frozen_policy_cache_active": int(owner.get("policy_inputs", False)),
+        **{f"frozen_encoder_cache_{key}": int(owner.get(key, 0))
+           for key in ("hits", "misses", "evictions")},
+    }
+
+
 def _max_rank_epoch_timing(
     *, epoch_wall_s: float, train_total_s: float, device: torch.device
 ) -> dict[str, float | int]:
@@ -3820,6 +3880,32 @@ def _max_rank_epoch_timing(
         "train_total_s_max_rank": values[1],
         "timing_rank_count": world_size,
     }
+
+
+def _record_complete_epoch_timing(
+    curve_path: Path, *, epoch: int, epoch_started_at: float,
+    train_total_s: float, device: torch.device,
+) -> dict[str, float | int]:
+    """Observe the epoch after curve presentation and lifecycle bookkeeping.
+
+    A separate append-only stream avoids rewriting the curve's earlier record
+    or omitting synchronous plots from the throughput denominator. Final async
+    plot flushing still belongs to complete-fold wall time.
+    """
+    timing = _max_rank_epoch_timing(
+        epoch_wall_s=time.perf_counter() - epoch_started_at,
+        train_total_s=train_total_s, device=device)
+    payload = dict(epoch=int(epoch), schema_version=1,
+        complete_epoch_wall_s_max_rank=timing['epoch_wall_s_max_rank'],
+        complete_train_total_s_max_rank=timing['train_total_s_max_rank'],
+        timing_rank_count=timing['timing_rank_count'])
+    error = None
+    try:
+        _append_group_curve(curve_path.with_name('epoch_workflow_timing.jsonl'), payload)
+    except BaseException as exc:
+        error = exc
+    _raise_if_distributed_phase_failed(f'epoch_{epoch}_complete_timing', error)
+    return payload
 
 
 def _broadcast_epoch_eval_tensor(
@@ -3860,36 +3946,36 @@ def _broadcast_epoch_eval_timing(
     """Move timing metadata from an eval worker rank to the reporting rank."""
     if not _distributed_is_initialized() or _distributed_world_size() <= 1:
         return timing, float(elapsed_s), float(loss_s)
-    names = [name for name in TimingBreakdown.__dataclass_fields__ if name != "cuda_events"]
+    scalar_fields = {
+        name: type(item.default)
+        for name, item in TimingBreakdown.__dataclass_fields__.items()
+        if isinstance(item.default, (int, float))
+    }
+    names = list(scalar_fields)
     if _distributed_rank() == int(src):
         values = [float(getattr(timing, name)) for name in names]
-        values.extend((float(elapsed_s), float(loss_s)))
+        values.extend(
+            (float(elapsed_s), float(loss_s), float(bool(timing.multiobjective_diagnostics)))
+        )
         payload = torch.tensor(values, device=device, dtype=torch.float64)
     else:
-        payload = torch.empty((len(names) + 2,), device=device, dtype=torch.float64)
+        payload = torch.empty((len(names) + 3,), device=device, dtype=torch.float64)
     dist.broadcast(payload, src=int(src))
     values = payload.detach().cpu().tolist()
     resolved = TimingBreakdown()
-    for name, raw in zip(names, values[:-2], strict=True):
-        setattr(
-            resolved,
-            name,
-            int(raw)
-            if name
-            in {
-                "batches",
-                "optimizer_steps",
-                "gradient_norm_zero_batches",
-                "gradient_norm_observations",
-                "gradient_norm_first_zero_batch",
-                "portfolio_first_dead_batch",
-                "portfolio_first_default_row",
-                "portfolio_first_default_reason",
-                "portfolio_final_alive",
-            }
-            else float(raw),
-        )
-    return resolved, float(values[-2]), float(values[-1])
+    for name, raw in zip(names, values[:-3], strict=True):
+        setattr(resolved, name, scalar_fields[name](raw))
+    # Most evals have no multiobjective diagnostics. Keep that common case to
+    # the existing single collective; CUDA event objects always remain local.
+    if values[-1]:
+        diagnostics = [
+            dict(timing.multiobjective_diagnostics)
+            if _distributed_rank() == int(src)
+            else None
+        ]
+        dist.broadcast_object_list(diagnostics, src=int(src), device=device)
+        resolved.multiobjective_diagnostics = dict(diagnostics[0])
+    return resolved, float(values[-3]), float(values[-2])
 
 
 def _log_timing(label: str, timing: TimingBreakdown) -> None:
@@ -4128,6 +4214,32 @@ def _maybe_cudagraph_step_begin() -> None:
         marker()
     except Exception:
         return
+
+
+@torch.no_grad()
+def _own_cudagraph_parameter_gradients(model: nn.Module) -> None:
+    """Keep accumulated leaf gradients outside a replay's private outputs.
+
+    The first compiled backward may give AccumulateGrad a graph-owned output
+    directly. A subsequent marked replay invalidates that allocation even
+    though the trajectory still needs its accumulated value. Clone each newly
+    allocated gradient once; following backwards accumulate into the owned
+    buffer. Parameters that never receive credit must retain grad=None.
+    """
+    module = _unwrap_model(model)
+    if not (getattr(module, "factorized_cuda_graphs", False)
+            or getattr(module, "factorized_portfolio_cuda_graphs", False)):
+        return
+    owned = module.__dict__.setdefault("_cudagraph_owned_parameter_gradients", {})
+    for parameter in module.parameters():
+        gradient = parameter.grad
+        if gradient is None or not gradient.is_cuda:
+            continue
+        previous = owned.get(id(parameter))
+        if previous is not None and previous() is gradient:
+            continue
+        parameter.grad = gradient.detach().clone(memory_format=torch.preserve_format)
+        owned[id(parameter)] = weakref.ref(parameter.grad)
 
 
 def _detach_portfolio_state(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -4380,6 +4492,10 @@ def _loss_from_backtest_series(
         return strategy_returns.sum() * 0.0
 
     objective_norm = objective.strip().lower()
+    if objective_norm in RETURN_ADJOINT_OBJECTIVES:
+        if gamma_turnover != 0.0 or gamma_sharpe != 1.0:
+            raise ValueError("a single trajectory metric cannot include another loss")
+        return trajectory_metric_loss(valid_returns, objective_norm)
     if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
         annual_utility = _annual_log_utility_eval_value(
             risk_adjusted_log_growth(
@@ -4481,7 +4597,7 @@ def _annual_log_utility_eval_value(
 
 
 def _is_return_series_objective(objective: str) -> bool:
-    return objective.strip().lower() in {
+    return objective.strip().lower() in RETURN_ADJOINT_OBJECTIVES | {
         "sharpe",
         "sharp",
         "sharpck",
@@ -6740,6 +6856,8 @@ def _write_loss_contract_metadata(
             "optimizer_steps_per_complete_epoch": 1,
             "training_loss_comparable_to_continuous_account": not day_trade_training_annual_episodes,
         }
+    if objective in RETURN_ADJOINT_OBJECTIVES:
+        payload["return_adjoint"] = return_adjoint_contract(objective)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -7158,6 +7276,74 @@ class _EpochCurveLifecycle:
         return {}
 
 
+def _trim_cuda_epoch_cache(device: torch.device) -> dict[str, float | int]:
+    """Release only unused allocator cache at an opt-in epoch boundary.
+
+    Resident source tensors, autograd tensors and live CUDA Graph pools retain
+    their references. Avoid evicting immutable CSR rows to create headroom.
+    """
+    fraction = float(os.environ.get("STOCKAGENT_CUDA_EPOCH_CACHE_TRIM_FRACTION", "0"))
+    if fraction == 0:
+        return {}
+    if not math.isfinite(fraction) or not 0 < fraction < 1:
+        raise ValueError("CUDA epoch cache trim fraction must be zero or finite in (0, 1)")
+    if device.type != "cuda" or not torch.cuda.is_initialized():
+        return {}
+    reserved = int(torch.cuda.memory_reserved(device))
+    allocated = int(torch.cuda.memory_allocated(device))
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    elapsed, reclaimed = 0.0, 0
+    if reserved > fraction * total and reserved - allocated >= 512 * 1024**2:
+        started = time.perf_counter()
+        torch.cuda.empty_cache()
+        elapsed = time.perf_counter() - started
+        reclaimed = max(0, reserved - int(torch.cuda.memory_reserved(device)))
+    return {"cuda_epoch_cache_trim_s": elapsed,
+            "cuda_epoch_cache_trim_reclaimed_bytes": reclaimed}
+
+
+def _cuda_allocator_curve_payload() -> dict[str, int]:
+    """Opt-in process-local allocator evidence without initializing CUDA."""
+    if os.environ.get("STOCKAGENT_CUDA_ALLOCATOR_TELEMETRY", "0") != "1":
+        return {}
+    if not torch.cuda.is_initialized():
+        return {}
+    device = torch.cuda.current_device()
+    stats = torch.cuda.memory_stats(device)
+    fields = {
+        "allocated_bytes": "allocated_bytes.all.current",
+        "active_bytes": "active_bytes.all.current",
+        "reserved_bytes": "reserved_bytes.all.current",
+        "inactive_split_bytes": "inactive_split_bytes.all.current",
+        "peak_allocated_bytes": "allocated_bytes.all.peak",
+        "peak_reserved_bytes": "reserved_bytes.all.peak",
+        "num_alloc_retries": "num_alloc_retries",
+        "num_ooms": "num_ooms",
+    }
+    payload = {
+        "cuda_allocator_device": int(device),
+        "cuda_allocator_process_rank": int(dist.get_rank()) if dist.is_initialized() else 0,
+        **{f"cuda_allocator_{name}": int(stats.get(key, 0)) for name, key in fields.items()},
+    }
+    # Host pinning has its own allocator: device empty_cache does not measure
+    # or release it. Observe owned (active + cached) separately from active
+    # bytes, without synchronizing transfers or changing their lifetimes.
+    host_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
+    if callable(host_stats):
+        host = host_stats()
+        host_fields = {
+            "owned_bytes": "allocated_bytes.current",
+            "active_bytes": "active_bytes.current",
+            "peak_owned_bytes": "allocated_bytes.peak",
+            "peak_active_bytes": "active_bytes.peak",
+            "num_host_alloc": "num_host_alloc",
+            "num_host_free": "num_host_free",
+        }
+        payload.update({f"host_pinned_allocator_{name}": int(host[key])
+                        for name, key in host_fields.items() if key in host})
+    return payload
+
+
 def _timing_curve_payload(
     *,
     train_timing: TimingBreakdown,
@@ -7277,10 +7463,21 @@ def _timing_curve_payload(
     epoch_total_s = float(epoch_wall_s) if epoch_wall_s is not None else measured_total_s
     unattributed_s = max(0.0, epoch_total_s - measured_total_s)
     return {
+        **_cuda_allocator_curve_payload(),
         "train_batches": int(train_timing.batches),
         "train_optimizer_steps": int(train_timing.optimizer_steps),
         "timing_synchronized": int(bool(timing_synchronized)),
         "train_total_s": float(train_timing.total_s),
+        "train_return_adjoint_record_s": float(train_timing.return_adjoint_record_s),
+        "train_return_adjoint_metric_s": float(train_timing.return_adjoint_metric_s),
+        "train_return_adjoint_replay_max_abs_error": float(train_timing.return_adjoint_replay_max_abs_error),
+        **{f"train_multiobjective_{key}": float(value)
+           for key, value in train_timing.multiobjective_diagnostics.items()},
+        "train_resident_input_cache_hits": train_timing.resident_input_cache_hits,
+        "train_resident_input_cache_misses": train_timing.resident_input_cache_misses,
+        "train_resident_input_cache_bytes": train_timing.resident_input_cache_bytes,
+        "train_deferred_validation_checks": train_timing.deferred_validation_checks,
+        "train_deferred_validation_retries": train_timing.deferred_validation_retries,
         "train_total_ms_per_batch": _avg_ms(train_timing.total_s),
         "train_fetch_ms_per_batch": _avg_ms(train_timing.fetch_s),
         "train_transfer_ms_per_batch": _avg_ms(train_timing.transfer_s),
@@ -7647,7 +7844,9 @@ def _write_fold_complete_marker(
         "metrics": _metrics_path(fold_dir),
         "backtest": _backtest_path(fold_dir),
     }
-    if str(source) != "artifact_scope_v2_migration":
+    if str(source) == "checkpoint_inference_output_artifacts":
+        required_artifacts["checkpoint"] = _best_checkpoint_path(fold_dir)
+    elif str(source) != "artifact_scope_v2_migration":
         required_artifacts["model"] = _model_path(fold_dir)
     missing = [name for name, path in required_artifacts.items() if not path.is_file()]
     if missing:
@@ -7862,13 +8061,8 @@ def _accumulate_gradient_norm_diagnostic_(
     zero_count.add_(is_zero.to(dtype=zero_count.dtype))
     observation_count.add_(1.0)
     if first_zero_batch is not None and batch_index is not None:
-        first_zero_batch.copy_(
-            torch.where(
-                (first_zero_batch < 0.0) & is_zero,
-                first_zero_batch.new_tensor(float(batch_index)),
-                first_zero_batch,
-            )
-        )
+        first_zero_batch.masked_fill_(
+            (first_zero_batch < 0.0) & is_zero, float(batch_index))
 
 
 def _trajectory_valid_row_count(split: WindowedSplitTensors) -> int:
@@ -8142,6 +8336,96 @@ class _PanelSlabForwardWrapper(nn.Module):
         if portfolio_context:
             kwargs["portfolio_context"] = portfolio_context
         return self.model.forward_from_panel_slab(feature_slab, mask, **kwargs)
+
+
+def _configure_factorized_slab_partitions(model, config, *, compile_requested: bool) -> str:
+    """The shared eager-I/O/compiled-math transport; never a monolithic graph."""
+    model.factorized_input_compile = bool(compile_requested)
+    model.factorized_encoder_checkpoint = config.training.factorized_encoder_checkpoint
+    model.factorized_encoder_vram_safety_margin_bytes = int(
+        config.training.vram_safety_margin_gb * 1024**3
+    )
+    return ("partitioned:factorized_eager_io_compiled_math" if compile_requested
+            else "off:factorized_eager_io_and_math")
+
+
+def _prepare_inference_panel_slab_model(model, panel, config, device, *, fold_id: int):
+    """Keep host source reads outside Dynamo, preserving the trained partitions."""
+    panel_slab_model: nn.Module | None = None
+    if _model_supports_panel_slab_forward(model):
+        panel_slab_model = _PanelSlabForwardWrapper(model)
+        compile_inference_slab = bool(
+            config.training.enable_torch_compile
+            and getattr(config.training, "compile_eval_model", False)
+        )
+        if getattr(panel.features, "_stockagent_factorized_features", False):
+            if compile_inference_slab:
+                can_compile, reason = _can_enable_torch_compile(device)
+                if not can_compile:
+                    if bool(config.training.strict_no_fallback):
+                        raise RuntimeError(
+                            f"[Fold {fold_id}] factorized inference compile unavailable ({reason}); strict_no_fallback=true"
+                        )
+                    compile_inference_slab = False
+            status = _configure_factorized_slab_partitions(
+                model, config, compile_requested=compile_inference_slab,
+            )
+            print(f"[Fold {fold_id}] inference mode=windowed panel_slab_forward={status}")
+        elif compile_inference_slab:
+            can_compile, reason = _can_enable_torch_compile(device)
+            if can_compile:
+                try:
+                    compile_mode = str(
+                        getattr(
+                            config.training,
+                            "torch_compile_mode",
+                            "default",
+                        )
+                        or "default"
+                    )
+                    panel_slab_model = torch.compile(
+                        panel_slab_model,
+                        fullgraph=True,
+                        dynamic=False,
+                        options=_torch_compile_options(
+                            compile_mode,
+                            cudagraphs=False,
+                        ),
+                    )
+                    print(
+                        f"[Fold {fold_id}] inference mode=windowed "
+                        "panel_slab_forward=compiled:fullgraph:"
+                        f"cudagraphs_false ({reason})"
+                    )
+                except Exception as exc:
+                    if bool(config.training.strict_no_fallback):
+                        raise RuntimeError(
+                            f"[Fold {fold_id}] inference panel-slab "
+                            "compile failed; strict_no_fallback=true"
+                        ) from exc
+                    panel_slab_model = _PanelSlabForwardWrapper(model)
+                    print(
+                        f"[Fold {fold_id}] inference panel-slab compile "
+                        f"failed, using eager: {type(exc).__name__}: {exc}"
+                    )
+            else:
+                if bool(config.training.strict_no_fallback):
+                    raise RuntimeError(
+                        f"[Fold {fold_id}] inference compile unavailable "
+                        f"({reason}); strict_no_fallback=true"
+                    )
+                print(
+                    f"[Fold {fold_id}] inference mode=windowed "
+                    f"panel_slab_forward=eager ({reason})"
+                )
+        else:
+            print(
+                f"[Fold {fold_id}] inference mode=windowed "
+                "panel_slab_forward=eager"
+            )
+    else:
+        print(f"[Fold {fold_id}] inference mode=windowed panel_forward=fallback")
+    return panel_slab_model
 
 
 def _panel_slab_dynamic_symbol_bounds(
@@ -8802,7 +9086,19 @@ def _atomic_torch_save(payload: Mapping[str, Any], checkpoint_path: Path) -> Non
         f".{checkpoint_path.name}.{os.getpid()}.tmp"
     )
     try:
-        torch.save(dict(payload), temporary_path)
+        snapshot = dict(payload)
+        if os.environ.get("STOCKAGENT_CHECKPOINT_MANIFEST_JSON", "0") == "1":
+            from stockagent.training.checkpoint_transport import encode_checkpoint_manifest
+            snapshot = encode_checkpoint_manifest(snapshot)
+        if os.environ.get("STOCKAGENT_CHECKPOINT_CPU_PACK", "0") == "1":
+            from stockagent.training.checkpoint_transport import cpu_checkpoint_snapshot
+            # Metadata remains self-contained and torch.save owns any unusual
+            # tensor it contains; do not walk its large declarative object tree.
+            states = cpu_checkpoint_snapshot({key: value for key, value in snapshot.items()
+                                              if key != "experiment_manifest"})
+            snapshot = {key: value if key == "experiment_manifest" else states[key]
+                        for key, value in snapshot.items()}
+        torch.save(snapshot, temporary_path)
         try:
             size_bytes = temporary_path.stat().st_size
         except OSError as exc:
@@ -9011,7 +9307,7 @@ def _restore_derived_rng_streams(
     return True
 
 
-def _restore_rng_state(state: Mapping[str, Any] | None) -> bool:
+def _restore_rng_state(state: Mapping[str, Any] | None, *, rank_local: bool = False) -> bool:
     """Restore checkpoint RNGs; return False for a legacy/incomplete payload."""
     if not state:
         return False
@@ -9041,7 +9337,7 @@ def _restore_rng_state(state: Mapping[str, Any] | None) -> bool:
         state = saved_by_rank[rank]
         if state is None:
             return False
-    elif rank > 0 or world_size > 1:
+    elif not rank_local and (rank > 0 or world_size > 1):
         if rank > 0:
             print(
                 "[checkpoint] single-rank RNG checkpoint expanded to DDP; deriving "
@@ -10478,6 +10774,16 @@ def _benchmark_reporting_details(config: object) -> dict[str, str]:
     benchmark_name = str(
         getattr(getattr(config, "data", None), "benchmark_name", "")
     ).strip()
+    if mode == "tw_day_trade" and benchmark_name not in {"", "universe_average_return"}:
+        return {
+            "benchmark_name": f"{benchmark_name} buy and hold (total return)",
+            "benchmark_symbol": benchmark_name,
+            "benchmark_cost_treatment": "gross_no_fees_or_tax",
+            "benchmark_exposure": "continuous_1x_long_including_overnight",
+            "benchmark_return_clock": "previous_adjusted_close_to_current_adjusted_close",
+            "benchmark_corporate_actions": "included_once_in_source_adjusted_close",
+            "benchmark_rebalancing": "none_no_daily_open_close_round_trip",
+        }
     return {"benchmark_name": benchmark_name}
 
 
@@ -11487,7 +11793,11 @@ def _save_fold_output_artifacts(
         # optimizer or report-semantics fingerprints. No hot-loop disk writes.
         write_training_json(fold_dir / "physical_source_cache.json", dict(source_cache_snapshot))
     if mark_complete:
-        _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
+        _write_fold_complete_marker(
+            fold_dir, fold_result,
+            source=("fold_output_artifacts" if write_model_checkpoint
+                    else "checkpoint_inference_output_artifacts"),
+        )
     if print_report:
         # Console output is optional and must not invalidate completed model,
         # backtest, plot, or lifecycle artifacts when a detached terminal or
@@ -14190,6 +14500,43 @@ def _physical_source_cache_snapshot(runtime: _ExecutionRuntime) -> dict[str, Any
     )
 
 
+PHYSICAL_CARRY_POLICY_REPLAY_VERSION = 2
+
+
+@dataclass(frozen=True)
+class _PhysicalCarryReplayRows:
+    """Source calendar view; replay never materializes the feature windows."""
+
+    features: Any
+    _valid_indices_cpu: torch.Tensor
+    execution_mode: str = "tw_day_trade"
+    symbol_indices: None = None
+    sample_mask: None = None
+
+    def __len__(self) -> int:
+        return len(self._valid_indices_cpu)
+
+
+def _physical_carry_replay_policy_kwargs(owner, indices, *, suffix=""):
+    """Forward causal obligations through the same bridge as model evaluation."""
+    fields = {
+        "force_exit_mask": "force_exit_mask",
+        "unresolved_corporate_action_mask": "unresolved_corporate_action_mask",
+        "force_short_cover_mask": "force_short_cover_mask",
+        "can_short_open_open_mask": "can_short_open_open_mask",
+        "state_advance_mask": "session_advance_mask",
+        "session_month_ids": "session_month_ids",
+        "commission_rebate_payment_eligible_mask": "commission_rebate_payment_eligible_mask",
+        "cash_dividend_yield": "cash_dividend_yield",
+        "cash_dividend_payment_delay_sessions": "cash_dividend_payment_delay_sessions",
+    }
+    return {
+        keyword: value.detach().to(device="cpu").index_select(0, indices)
+        for keyword, name in fields.items()
+        if isinstance(value := getattr(owner, name + suffix, None), torch.Tensor)
+    }
+
+
 @contextmanager
 def _physical_carry_cpu_replay_threads():
     """Bound intra-op dispatch for the serial, CPU-only artifact oracle.
@@ -14221,10 +14568,9 @@ def _replay_physical_carry_split_prefix(
 ) -> BacktestResult:
     """Revalue stored model requests through the physical FIFO source.
 
-    A saved requested-weight row is already post-activation and post-causal
-    policy masks.  Replaying it with ``pre_normalized`` is therefore the only
-    valid way to recover a prefix terminal inventory; slicing the full-test
-    terminal state would leak future lots, cash and borrowing dates.
+    Saved requests are post-activation model intents, before causal policy
+    restrictions. Reuse the production bridge for those restrictions. Slicing
+    the full-test terminal state would leak future lots and borrowing dates.
     """
     source = runtime.day_trade_carry_source
     if source is None:
@@ -14250,9 +14596,10 @@ def _replay_physical_carry_split_prefix(
         # 270 minute opportunities without changing the result.
         return _prefix_backtest_result(result, count)
     device = torch.device("cpu")
-    sessions, source_count = source.batch(split, 0, count, device)
-    if source_count != count:
-        raise ValueError("physical prefix replay lost a source session")
+    runner = bind_physical_carry_backtest(
+        run_backtest_torch, source=source, split=split, start=0, end=count,
+        device=device, previous=initial_state, event_compression=False,
+    )
     valid_indices = split.valid_indices[:count].detach().to(
         device="cpu", dtype=torch.long
     )
@@ -14268,7 +14615,7 @@ def _replay_physical_carry_split_prefix(
         else split.symbol_indices.detach().to(device="cpu", dtype=torch.long)
     )
     with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
-        replay = run_backtest_torch(
+        replay = runner(
             torch.as_tensor(np.asarray(requested)[:count], dtype=torch.float64),
             selected(split.future_log_returns, "future_log_returns").to(torch.float64),
             selected(split.tradable_mask, "tradable_mask").to(torch.bool),
@@ -14324,10 +14671,13 @@ def _replay_physical_carry_split_prefix(
             day_trade_execution_volume_participation=float(
                 config.trading.max_volume_participation
             ),
-            day_trade_carry_sessions=sessions,
             initial_day_trade_carry_state=initial_state,
+            **_physical_carry_replay_policy_kwargs(split, valid_indices),
         )
-    return replay.to_numpy()
+    # The bridge executes translated requests; artifacts retain the original
+    # policy intent, matching the ordinary full evaluation archive.
+    return replace(replay.to_numpy(),
+                   requested_weights_history=np.asarray(requested)[:count].copy())
 
 
 @_physical_carry_cpu_replay_threads()
@@ -14350,10 +14700,12 @@ def _replay_physical_carry_panel_segment(
         raise ValueError("physical stitched segment differs from its source universe")
     if np.any(np.diff(rows) != 1):
         raise ValueError("physical stitched segment must own every exchange session")
-    sessions = source.rows(
-        rows.tolist(), list(range(len(source.universe))), torch.device("cpu")
-    )
     index = torch.from_numpy(rows)
+    replay_split = _PhysicalCarryReplayRows(dataset.features_t, index)
+    runner = bind_physical_carry_backtest(
+        run_backtest_torch, source=source, split=replay_split, start=0, end=len(rows),
+        device=torch.device("cpu"), previous=initial_state, event_compression=False,
+    )
 
     def selected(value: torch.Tensor | None, name: str) -> torch.Tensor:
         if value is None:
@@ -14361,7 +14713,7 @@ def _replay_physical_carry_panel_segment(
         return value.detach().to(device="cpu").index_select(0, index)
 
     with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
-        replay = run_backtest_torch(
+        replay = runner(
             torch.from_numpy(requested),
             selected(dataset.future_log_returns_t, "future_log_returns").to(torch.float64),
             selected(dataset.tradable_mask_t, "tradable_mask").to(torch.bool),
@@ -14416,10 +14768,10 @@ def _replay_physical_carry_panel_segment(
             day_trade_execution_volume_participation=float(
                 config.trading.max_volume_participation
             ),
-            day_trade_carry_sessions=sessions,
             initial_day_trade_carry_state=initial_state,
+            **_physical_carry_replay_policy_kwargs(dataset, index, suffix="_t"),
         )
-    return replay.to_numpy()
+    return replace(replay.to_numpy(), requested_weights_history=requested.copy())
 
 
 def _concatenate_physical_carry_segments(
@@ -16887,7 +17239,8 @@ def _run_eval_backtest_from_weight_buffers(
 
         backtest_finalize_start = time.perf_counter()
         if physical_source is not None:
-            physical_previous = backtest_chunk.day_trade_carry_state.detached()
+            from stockagent.backtest.tw_day_trade_graph import detached_carry_state
+            physical_previous = detached_carry_state(backtest_chunk.day_trade_carry_state)
             physical_minute_nav[start:end].copy_(backtest_chunk.minute_nav[:valid_rows])
             physical_shares[start:end].copy_(backtest_chunk.shares_history[:valid_rows])
         prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
@@ -18632,6 +18985,12 @@ def _try_load_fresh_fold_physical_deployment_segment(
     if not artifact_path.is_file():
         return None
     try:
+        contract = json.loads((fold_dir / "mode_artifact_contract.json").read_text())
+        details = contract.get("mode_details", {}) if isinstance(contract, dict) else {}
+        if not isinstance(details, dict) or details.get("physical_policy_replay_version") != (
+            PHYSICAL_CARRY_POLICY_REPLAY_VERSION
+        ):
+            raise ValueError("stored prefix uses an obsolete causal policy replay")
         dates = np.asarray(expected_dates, dtype="datetime64[D]").reshape(-1)
         symbols = [str(symbol) for symbol in expected_symbols]
         # A valid checkpoint subset/reorder is a cache-key mismatch, not a
@@ -19726,6 +20085,17 @@ def _load_completed_fold_result(
             if not isinstance(report_contract, dict) or report_contract.get(
                 "metrics_contract_version"
             ) != RETURN_METRICS_CONTRACT_VERSION:
+                return None
+            details = report_contract.get("mode_details", {})
+            if (
+                isinstance(details, dict)
+                and details.get("execution_variant")
+                == "exact_board_lot_minute_physical_fifo_v1"
+                and details.get("physical_policy_replay_version")
+                != PHYSICAL_CARRY_POLICY_REPLAY_VERSION
+            ):
+                # Only the reports are stale. The unchanged optimizer ABI
+                # remains eligible for canonical checkpoint recovery.
                 return None
             checkpoint_path = _best_checkpoint_path(fold_dir)
             if not checkpoint_path.exists():
@@ -21885,13 +22255,8 @@ def _train_epoch_windowed_tensor(
                 portfolio_prev_long_margin_debt = _detach_portfolio_state(
                     next_long_margin_debt
                 )
-            gradient_norm_stats[4].copy_(
-                torch.where(
-                    (gradient_norm_stats[4] < 0.0) & ~portfolio_prev_alive,
-                    gradient_norm_stats.new_tensor(float(step_idx)),
-                    gradient_norm_stats[4],
-                )
-            )
+            gradient_norm_stats[4].masked_fill_(
+                (gradient_norm_stats[4] < 0.0) & ~portfolio_prev_alive, float(step_idx))
             _maybe_sync_cuda(device, profile_timing)
             timing.portfolio_state_s += time.perf_counter() - state_start
         first_default_row = (aux_outputs or {}).get(
@@ -21935,6 +22300,7 @@ def _train_epoch_windowed_tensor(
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 scaler.scale(loss_for_backward).backward()
+                _own_cudagraph_parameter_gradients(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
@@ -21990,6 +22356,7 @@ def _train_epoch_windowed_tensor(
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 loss_for_backward.backward()
+                _own_cudagraph_parameter_gradients(model)
             _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
@@ -22164,7 +22531,52 @@ def _assert_immutable_ddp_buffers(model: nn.Module) -> None:
         raise RuntimeError("model buffers changed with DDP buffer broadcasts disabled")
 
 
+def _defer_annual_ledger_validation(function):
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        if os.environ.get("STOCKAGENT_DAY_TRADE_DEFER_VALIDATION", "0") != "1":
+            return function(*args, **kwargs)
+        options = signature.bind(*args, **kwargs).arguments
+        runtime = options.get("execution_runtime")
+        if (not options.get("day_trade_annual_episode_sharding")
+                or not options.get("optimizer_step_per_trajectory")
+                or runtime is None or runtime.day_trade_carry_source is None):
+            return function(*args, **kwargs)
+        if options["scaler"].is_enabled():
+            raise ValueError("deferred annual ledger validation requires unscaled BF16/FP32 gradients")
+        from stockagent.backtest.tw_day_trade_graph import (
+            DeferredLedgerValidation, DeferredLedgerValidationError)
+        rng = _capture_rng_state()
+        started = time.perf_counter()
+        gate = DeferredLedgerValidation(options["device"])
+        try:
+            with gate:
+                return function(*args, **kwargs)
+        except DeferredLedgerValidationError as error:
+            diagnosis = str(error)
+        # Leave the exception/traceback scope before retrying: a failed frame
+        # must not pin its model/source allocations while a fresh pass runs.
+        options["optimizer"].zero_grad(set_to_none=True)
+        tape = options.get("return_tape")
+        if tape is not None:
+            tape.reset_recording()
+        if not _restore_rng_state(rng, rank_local=True):
+            raise RuntimeError("cannot restore RNG for rejected ledger-pass retry")
+        warnings.warn(diagnosis + "; discarded the entire pass and retrying canonical per-batch validation",
+                      RuntimeWarning, stacklevel=2)
+        value, timing = function(*args, **kwargs)
+        timing.total_s = time.perf_counter() - started
+        timing.deferred_validation_checks += len(gate.predicates)
+        timing.deferred_validation_retries += 1
+        return value, timing
+
+    return guarded
+
+
 @_defer_trajectory_ddp_sync
+@_defer_annual_ledger_validation
 def _train_epoch_windowed_tensor_ddp(
     model: nn.Module,
     loss_fn: Callable[..., torch.Tensor],
@@ -22222,7 +22634,25 @@ def _train_epoch_windowed_tensor_ddp(
     ddp_trajectory_gradient_sync: str = "batch",
     day_trade_annual_episode_sharding: bool = False,
     day_trade_annual_episode_world_size: int = 2,
+    return_tape: ReturnAdjointTape | None = None,
+    capture_only: bool = False,
+    compound_return_adjoint: bool = False,
+    gradient_only: bool = False,
+    gradient_transform: Callable[[], None] | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
+    if (gradient_only or gradient_transform is not None) and (
+            capture_only or return_tape is None or not day_trade_annual_episode_sharding
+            or not optimizer_step_per_trajectory or log_return_weights is None
+            or scaler.is_enabled()):
+        raise ValueError("gradient surgery requires verified, unscaled annual return VJPs")
+    if gradient_only and gradient_transform is not None:
+        raise ValueError("capture a task gradient or apply its combined update, not both")
+    if (capture_only or return_tape is not None) and (
+            return_tape is None or not day_trade_annual_episode_sharding
+            or not optimizer_step_per_trajectory):
+        raise ValueError("return replay requires a tape and complete annual-account trajectory DDP")
+    if compound_return_adjoint and (capture_only or return_tape is None or log_return_weights is not None):
+        raise ValueError("compound account adjoint requires a single unweighted gradient pass")
     if _training_needs_aux(
         objective,
         direction_weight=direction_weight,
@@ -22313,6 +22743,14 @@ def _train_epoch_windowed_tensor_ddp(
             plan = cached[1]
         episode_spans = plan.spans_by_rank[rank]
         num_batches = len(episode_spans)
+    compound_adjoint = CompoundReturnAdjoint(model.parameters()) if compound_return_adjoint else None
+    replay_candidate_returns = (
+        return_tape.expected if return_tape is not None
+        and os.environ.get("STOCKAGENT_DAY_TRADE_RECORDED_RETURN_CANDIDATE", "0") == "1"
+        else None)
+    compound_account_ends = ({stop: (start, stop - start)
+                              for _, start, stop in plan.accounts_by_rank[rank]}
+                             if compound_adjoint is not None else {})
     ledger_symbol_count = (
         recurrent_symbol_count // world_size
         if symbol_sharded_ledger
@@ -22390,6 +22828,14 @@ def _train_epoch_windowed_tensor_ddp(
         )
 
     prepare_device = _windowed_prepare_device(split, device)
+    resident_batches = None
+    if (day_trade_annual_episode_sharding and use_panel_slab and device.type == "cuda"
+            and getattr(split.features, "_stockagent_factorized_features", False)):
+        resident_batches = model.__dict__.get("_annual_resident_input_batches")
+        if resident_batches is None:
+            resident_batches = ImmutableWindowedBatchCache(int(os.environ.get(
+                "STOCKAGENT_ANNUAL_BATCH_DEVICE_CACHE_BYTES", str(512 * 1024**2))))
+            model.__dict__["_annual_resident_input_batches"] = resident_batches
     physical_prefetch = (
         None
         if physical_source is None
@@ -22435,7 +22881,9 @@ def _train_epoch_windowed_tensor_ddp(
             prepared_batch=prepared_physical_batch))
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
-            batch_loss_fn = bind_return_weighted_loss(batch_loss_fn, log_return_weights, global_start, int(batch_size))
+            batch_loss_fn = bind_return_weighted_loss(
+                batch_loss_fn, log_return_weights, global_start,
+                global_end - global_start if episode_spans is not None else int(batch_size))
         if progress_label and _distributed_is_rank0():
             _progress(
                 f"{progress_label}: batch {step_idx}/{num_batches} "
@@ -22446,7 +22894,12 @@ def _train_epoch_windowed_tensor_ddp(
 
         batch_prepare_start = time.perf_counter()
         route_start = time.perf_counter()
-        if use_panel_slab:
+        resident_key = (local_start, local_end, str(device))
+        batch = resident_batches.get(split, resident_key) if resident_batches is not None else None
+        resident_hit = batch is not None
+        if resident_hit:
+            timing.prepare_panel_slab_batch_s += time.perf_counter() - route_start
+        elif use_panel_slab:
             batch = split.panel_slab_batch_by_rows(
                 local_start,
                 local_end,
@@ -22479,6 +22932,8 @@ def _train_epoch_windowed_tensor_ddp(
         h2d_start = time.perf_counter()
         move_start = time.perf_counter()
         batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        if resident_batches is not None and not resident_hit:
+            resident_batches.put(split, resident_key, batch)
         timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
         batch_x = None if use_panel_slab else batch["x"]
         batch_mask = batch["tradable_mask"]
@@ -22541,18 +22996,24 @@ def _train_epoch_windowed_tensor_ddp(
                     offset = global_start - local_start
                     local_weights = local_weights[offset:offset + global_end - global_start]
                 metadata_start = time.perf_counter()
-                global_metadata = split.batch_metadata_by_rows(
-                    global_start,
-                    global_end,
-                    device=prepare_device,
-                    non_blocking=False,
-                    prepare_timing=timing,
-                )
-                global_metadata = _move_windowed_batch_to_device(
-                    global_metadata,
-                    device,
-                    non_blocking,
-                )
+                metadata_key = ("metadata", global_start, global_end, str(device))
+                global_metadata = (resident_batches.get(split, metadata_key)
+                                   if resident_batches is not None else None)
+                if global_metadata is None:
+                    global_metadata = split.batch_metadata_by_rows(
+                        global_start,
+                        global_end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    global_metadata = _move_windowed_batch_to_device(
+                        global_metadata,
+                        device,
+                        non_blocking,
+                    )
+                    if resident_batches is not None:
+                        resident_batches.put(split, metadata_key, global_metadata)
                 timing.prepare_metadata_batch_s += (
                     time.perf_counter() - metadata_start
                 )
@@ -22588,6 +23049,13 @@ def _train_epoch_windowed_tensor_ddp(
                 ),
             )
             weights = routed["weights"]
+            if return_tape is not None:
+                return_tape.record_actions(global_start, weights)
+            if capture_only:
+                # Keep the NN's compiled training forward identical on both
+                # passes, but recording returns needs no financial backward
+                # tape. The replay still verifies every date before updating.
+                weights = weights.detach()
             future_returns = routed["future_log_returns"]
             overnight_returns = routed["overnight_log_returns"]
             tradable_mask = routed["tradable_mask"]
@@ -22655,6 +23123,8 @@ def _train_epoch_windowed_tensor_ddp(
                     "initial_weights": portfolio_prev_weights,
                     "initial_alive": portfolio_prev_alive,
                 }
+                if return_tape is not None:
+                    aux_outputs["_capture_daily_log_returns"] = True
                 if portfolio_prev_futures_carry_state is not None:
                     aux_outputs["initial_futures_carry_state"] = portfolio_prev_futures_carry_state
                 if _split_uses_recurrent_futures_equity_scale(split):
@@ -22749,6 +23219,8 @@ def _train_epoch_windowed_tensor_ddp(
                     regime_up_threshold=regime_up_threshold,
                     regime_down_threshold=regime_down_threshold,
                     symbol_sharded_ledger=symbol_sharded_ledger,
+                    **({"day_trade_replay_log_returns": replay_candidate_returns[global_start:global_end]}
+                       if replay_candidate_returns is not None else {}),
                 )
                 if physical_source is not None:
                     physical_previous = aux_outputs["_final_day_trade_carry_state"]
@@ -22854,13 +23326,8 @@ def _train_epoch_windowed_tensor_ddp(
                 portfolio_prev_long_margin_debt = _detach_portfolio_state(
                     next_long_margin_debt
                 )
-            gradient_norm_stats[4].copy_(
-                torch.where(
-                    (gradient_norm_stats[4] < 0.0) & ~portfolio_prev_alive,
-                    gradient_norm_stats.new_tensor(float(step_idx)),
-                    gradient_norm_stats[4],
-                )
-            )
+            gradient_norm_stats[4].masked_fill_(
+                (gradient_norm_stats[4] < 0.0) & ~portfolio_prev_alive, float(step_idx))
             _maybe_sync_cuda(device, profile_timing)
             timing.portfolio_state_s += time.perf_counter() - state_start
         first_default_row = (aux_outputs or {}).get(
@@ -22898,11 +23365,22 @@ def _train_epoch_windowed_tensor_ddp(
                 )
         timing.forward_s += time.perf_counter() - forward_start
 
+        if return_tape is not None:
+            return_tape.record(global_start, aux_outputs["_daily_log_returns"], sample_mask)
+        if capture_only:
+            # The record pass advances the same physical state, but retains no
+            # activation graph and never touches optimizer/scheduler clocks.
+            total_loss_t.add_(loss_for_backward.detach().float())
+            steps += 1
+            loss = loss_for_backward = model_output = local_weights = weights = routed = aux_outputs = None
+            continue
+
         backward_start = time.perf_counter()
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 scaler.scale(loss_for_backward).backward()
+                _own_cudagraph_parameter_gradients(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
@@ -22955,6 +23433,7 @@ def _train_epoch_windowed_tensor_ddp(
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 loss_for_backward.backward()
+                _own_cudagraph_parameter_gradients(model)
             _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
@@ -23020,6 +23499,13 @@ def _train_epoch_windowed_tensor_ddp(
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
+        if compound_adjoint is not None and global_end in compound_account_ends:
+            compound_start = time.perf_counter()
+            account_start, account_rows = compound_account_ends[global_end]
+            compound_adjoint.finish_account(return_tape.values[account_start:global_end].sum(), account_rows)
+            compound_s = time.perf_counter() - compound_start
+            timing.grad_s += compound_s
+            timing.backward_s += compound_s
         total_loss_t.add_(
             loss_for_backward.detach().to(dtype=torch.float32)
             if optimizer_step_per_trajectory
@@ -23032,8 +23518,15 @@ def _train_epoch_windowed_tensor_ddp(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    from stockagent.backtest.tw_day_trade_graph import finish_ledger_validation
+    timing.deferred_validation_checks = finish_ledger_validation()
     _assert_immutable_ddp_buffers(model)
-    if optimizer_step_per_trajectory and steps > 0:
+    if compound_adjoint is not None:
+        compound_adjoint.restore_epoch_gradients()
+    if return_tape is not None:
+        # All ranks check the complete replay before any optimizer can step.
+        return_tape.finish()
+    if optimizer_step_per_trajectory and steps > 0 and not capture_only:
         if ddp_trajectory_gradient_sync == "trajectory":
             sync_start = time.perf_counter()
             _synchronize_trajectory_gradients(model, allow_partial_presence=episode_spans is not None)
@@ -23041,19 +23534,26 @@ def _train_epoch_windowed_tensor_ddp(
             sync_elapsed = time.perf_counter() - sync_start
             timing.grad_s += sync_elapsed
             timing.backward_s += sync_elapsed
-        _finalize_trajectory_optimizer_step(
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            grad_clip_norm=grad_clip_norm,
-            timing=timing,
-            device=device,
-            profile_timing=profile_timing,
-            gradient_norm_stats=gradient_norm_stats,
-            lr_scheduler=lr_scheduler,
-            lr_scheduler_interval=lr_scheduler_interval,
-            batch_index=num_batches,
-        )
+        if gradient_transform is not None:
+            transform_start = time.perf_counter()
+            gradient_transform()
+            transform_s = time.perf_counter() - transform_start
+            timing.grad_s += transform_s
+            timing.backward_s += transform_s
+        if not gradient_only:
+            _finalize_trajectory_optimizer_step(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                grad_clip_norm=grad_clip_norm,
+                timing=timing,
+                device=device,
+                profile_timing=profile_timing,
+                gradient_norm_stats=gradient_norm_stats,
+                lr_scheduler=lr_scheduler,
+                lr_scheduler_interval=lr_scheduler_interval,
+                batch_index=num_batches,
+            )
     gradient_norm_stats[5].copy_(portfolio_prev_alive.to(dtype=torch.float32))
     gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
     timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
@@ -23067,6 +23567,10 @@ def _train_epoch_windowed_tensor_ddp(
     if episode_spans is not None:
         dist.all_reduce(total_loss_t, op=dist.ReduceOp.SUM)
         total_loss_t.div_(world_size)
+    if resident_batches is not None:
+        timing.resident_input_cache_hits = resident_batches.hits
+        timing.resident_input_cache_misses = resident_batches.misses
+        timing.resident_input_cache_bytes = resident_batches.bytes
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -24598,67 +25102,9 @@ def _run_inference_neural_models(
                 deepcopy(dict(checkpoint["temporal_basis_selection"])),
             )
         _load_state_dict(model, model_state_dict)
-        panel_slab_model: nn.Module | None = None
-        if _model_supports_panel_slab_forward(model):
-            panel_slab_model = _PanelSlabForwardWrapper(model)
-            compile_inference_slab = bool(
-                config.training.enable_torch_compile
-                and getattr(config.training, "compile_eval_model", False)
-            )
-            if compile_inference_slab:
-                can_compile, reason = _can_enable_torch_compile(device)
-                if can_compile:
-                    try:
-                        compile_mode = str(
-                            getattr(
-                                config.training,
-                                "torch_compile_mode",
-                                "default",
-                            )
-                            or "default"
-                        )
-                        panel_slab_model = torch.compile(
-                            panel_slab_model,
-                            fullgraph=True,
-                            dynamic=False,
-                            options=_torch_compile_options(
-                                compile_mode,
-                                cudagraphs=False,
-                            ),
-                        )
-                        print(
-                            f"[Fold {fold.fold_id}] inference mode=windowed "
-                            "panel_slab_forward=compiled:fullgraph:"
-                            f"cudagraphs_false ({reason})"
-                        )
-                    except Exception as exc:
-                        if bool(config.training.strict_no_fallback):
-                            raise RuntimeError(
-                                f"[Fold {fold.fold_id}] inference panel-slab "
-                                "compile failed; strict_no_fallback=true"
-                            ) from exc
-                        panel_slab_model = _PanelSlabForwardWrapper(model)
-                        print(
-                            f"[Fold {fold.fold_id}] inference panel-slab compile "
-                            f"failed, using eager: {type(exc).__name__}: {exc}"
-                        )
-                else:
-                    if bool(config.training.strict_no_fallback):
-                        raise RuntimeError(
-                            f"[Fold {fold.fold_id}] inference compile unavailable "
-                            f"({reason}); strict_no_fallback=true"
-                        )
-                    print(
-                        f"[Fold {fold.fold_id}] inference mode=windowed "
-                        f"panel_slab_forward=eager ({reason})"
-                    )
-            else:
-                print(
-                    f"[Fold {fold.fold_id}] inference mode=windowed "
-                    "panel_slab_forward=eager"
-                )
-        else:
-            print(f"[Fold {fold.fold_id}] inference mode=windowed panel_forward=fallback")
+        panel_slab_model = _prepare_inference_panel_slab_model(
+            model, fold_panel, config, device, fold_id=fold.fold_id,
+        )
 
         val_ds = CrossSectionalDataset(
             fold_panel,
@@ -25090,6 +25536,11 @@ def run_inference(
     output_dir: str | Path,
     deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
+    if str(config.training.model_name).strip().lower() == "classical":
+        from stockagent.training.classical import run_classical
+        return run_classical(panel, folds, config, output_dir,
+            deployment_folds=deployment_folds, inference_only=True)
+
     if _is_tree_model_name(config.training.model_name):
         return _run_inference_tree_models(
             panel,
@@ -25283,6 +25734,12 @@ def _run_training_impl(
         resume=bool(resume),
     )
 
+    if str(config.training.model_name).strip().lower() == "classical":
+        from stockagent.training.classical import run_classical
+        return run_classical(panel, fold_list_for_run, config, output_dir,
+            resume=resume, deployment_folds=deployment_fold_list_for_run,
+            lifecycle=lifecycle)
+
     if _is_tree_model_name(config.training.model_name):
         return _run_training_tree_models(
             panel,
@@ -25297,6 +25754,11 @@ def _run_training_impl(
     deployment_folds = deployment_fold_list_for_run
 
     loss_objective = _normalize_risk_objective(config.training.loss_type)
+    # Whole-account metrics supply dL/dr to the canonical per-block log-return
+    # VJP. Their actual validation/test objective remains loss_objective.
+    physical_loss_objective = (
+        "log_utility" if loss_objective in RETURN_ADJOINT_OBJECTIVES else loss_objective
+    )
     factor_loss_kwargs = _factor_loss_kwargs(config)
     portfolio_autoencoder_loss_kwargs = _portfolio_autoencoder_loss_kwargs(config)
     loss_portfolio_activation = _training_loss_portfolio_activation(config)
@@ -25567,6 +26029,13 @@ def _run_training_impl(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     experiment_manifest = _checkpoint_manifest(panel, config)
+    checkpoint_save_manifest = experiment_manifest
+    if os.environ.get("STOCKAGENT_CHECKPOINT_MANIFEST_JSON", "0") == "1":
+        from stockagent.training.checkpoint_transport import encode_checkpoint_manifest
+        # This completed manifest belongs to this training invocation. Keep its
+        # immutable storage form separate from the canonical compatibility view.
+        checkpoint_save_manifest = encode_checkpoint_manifest(
+            {"experiment_manifest": experiment_manifest})["experiment_manifest"]
     if lifecycle is not None:
         lifecycle.update_manifest(
             dataset_fingerprint=str(
@@ -26532,6 +27001,7 @@ def _run_training_impl(
             curve_trim_error: BaseException | None = None
             try:
                 curve_lifecycle.prepare_resume(start_epoch)
+                _trim_group_curve(group_curve_path.with_name('epoch_workflow_timing.jsonl'), start_epoch)
             except BaseException as exc:
                 curve_trim_error = exc
             _raise_if_distributed_phase_failed(
@@ -26673,10 +27143,9 @@ def _run_training_impl(
             # The canonical model compiles its shared effective-kernel,
             # individual encoder and market/head partitions instead of trying
             # to capture filesystem reads in a monolithic fullgraph wrapper.
-            model.factorized_input_compile=model_compile_requested
-            model.factorized_encoder_checkpoint=config.training.factorized_encoder_checkpoint
-            model.factorized_encoder_vram_safety_margin_bytes=int(
-                config.training.vram_safety_margin_gb * 1024**3)
+            factorized_compile_status = _configure_factorized_slab_partitions(
+                model, config, compile_requested=model_compile_requested,
+            )
             if model_compile_requested:
                 import torch._functorch.config as factorized_aot_config
                 if not hasattr(factorized_aot_config,"backward_pass_autocast"):
@@ -26686,7 +27155,7 @@ def _run_training_impl(
                 factorized_aot_config.backward_pass_autocast="off"
                 print(f"[Train {train_years}] factorized AOT backward autocast=off (forward/loss AMP retained)")
             should_enable_compile=False
-            model_compile_status=("partitioned:factorized_eager_io_compiled_math" if model_compile_requested else "off:factorized_eager_io_and_math")
+            model_compile_status = factorized_compile_status
             panel_slab_compile_status=model_compile_status
             eval_model_compile_status=model_compile_status
         model_compile_probe_status = "not_run"
@@ -27400,7 +27869,7 @@ def _run_training_impl(
                 "gamma_cvar_budget": config.evaluation.gamma_cvar_budget,
                 "gamma_drawdown_budget": config.evaluation.gamma_drawdown_budget,
                 "gamma_turnover_budget": config.evaluation.gamma_turnover_budget,
-                "objective": loss_objective,
+                "objective": physical_loss_objective,
                 "rank_ic_weight": config.training.multitask_loss.rank_ic_weight,
                 "return_rank_ic_weight": config.training.multitask_loss.return_rank_ic_weight,
                 "direction_weight": config.training.multitask_loss.direction_weight,
@@ -27969,7 +28438,7 @@ def _run_training_impl(
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
-                        experiment_manifest=experiment_manifest,
+                        experiment_manifest=checkpoint_save_manifest,
                         extra_payload={
                             "pretrained_initialization": deepcopy(
                                 pretrained_initialization_report
@@ -28075,7 +28544,7 @@ def _run_training_impl(
                                 model=model,
                                 optimizer=optimizer,
                                 scaler=scaler,
-                                experiment_manifest=experiment_manifest,
+                                experiment_manifest=checkpoint_save_manifest,
                                 extra_payload={
                                     "pretrained_initialization": deepcopy(
                                         pretrained_initialization_report
@@ -28195,7 +28664,7 @@ def _run_training_impl(
                             model=model,
                             optimizer=optimizer,
                             scaler=scaler,
-                            experiment_manifest=experiment_manifest,
+                            experiment_manifest=checkpoint_save_manifest,
                             extra_payload={
                                 "pretrained_initialization": deepcopy(
                                     pretrained_initialization_report
@@ -28236,11 +28705,121 @@ def _run_training_impl(
                 epoch_zero_error,
             )
 
-        def _run_one_train_epoch(train_model: nn.Module, *, log_return_weights=None) -> tuple[torch.Tensor, TimingBreakdown]:
+        def _run_one_train_epoch(
+            train_model: nn.Module, *, log_return_weights=None,
+            return_tape: ReturnAdjointTape | None = None,
+            capture_only: bool = False,
+            apply_return_adjoint: bool = False,
+            gradient_only: bool = False,
+            gradient_transform: Callable[[], None] | None = None,
+        ) -> tuple[torch.Tensor, TimingBreakdown]:
+            if (loss_objective in RETURN_ADJOINT_OBJECTIVES
+                    and return_tape is None and log_return_weights is None):
+                if not ddp_enabled or train_windowed is None:
+                    raise RuntimeError("complete-account return adjoints require annual windowed DDP")
+                whole_start = time.perf_counter()
+                rows = _trajectory_valid_row_count(train_windowed)
+                if loss_objective == "trajectory_return":
+                    recorded = ReturnAdjointTape.create(rows, device)
+                    _, timing = _run_one_train_epoch(train_model, return_tape=recorded)
+                    metric_start = time.perf_counter()
+                    plan = train_model.__dict__["_annual_episode_plan"][1]
+                    offsets = account_offsets(plan.accounts_by_rank, rows)
+                    value = trajectory_metric_loss(recorded.values, loss_objective, offsets)
+                    timing.return_adjoint_metric_s = time.perf_counter() - metric_start
+                    timing.total_s = time.perf_counter() - whole_start
+                    return value, timing
+                rng_state = _capture_rng_state()
+                recorded = ReturnAdjointTape.create(rows, device)
+                _, record_timing = _run_one_train_epoch(
+                    train_model, return_tape=recorded, capture_only=True)
+                metric_start = time.perf_counter()
+                plan = train_model.__dict__["_annual_episode_plan"][1]
+                offsets = account_offsets(plan.accounts_by_rank, rows)
+                if loss_objective in MULTIOBJECTIVE_OBJECTIVES:
+                    values, task_gradients = task_return_gradients(recorded.values, offsets)
+                    method, space = surgery_spec(loss_objective)
+                    diagnostics = {f"loss_{name}": float(value)
+                                   for name, value in zip(TASK_NAMES, values, strict=True)}
+                    diagnostics["parameter_space"] = float(space == "parameter")
+                    bank = ParameterGradientBank(model.parameters()) if space == "parameter" else None
+                    if bank is None:
+                        row_gradient, geometry = combine_task_gradients(
+                            task_gradients, method, seed=config.training.seed, step=int(epoch))
+                        diagnostics.update(geometry)
+                        replay_gradients = row_gradient.unsqueeze(0)
+                    else:
+                        replay_gradients = task_gradients
+                    metric_s = time.perf_counter() - metric_start
+                    passes = [record_timing]
+                    maximum_error = 0.
+
+                    def combine_parameter_gradients():
+                        diagnostics.update(bank.combine(method, seed=config.training.seed, step=int(epoch)))
+
+                    for task_index, row_gradient in enumerate(replay_gradients):
+                        if not _restore_rng_state(rng_state, rank_local=True):
+                            raise RuntimeError("multiobjective replay could not restore its rank-local RNG")
+                        final = task_index == len(replay_gradients) - 1
+                        replay = ReturnAdjointTape.create(rows, device, expected=recorded.values,
+                                                         expected_actions=recorded.actions)
+                        _, timing = _run_one_train_epoch(
+                            train_model, log_return_weights=row_gradient * (-rows / 252.),
+                            return_tape=replay, apply_return_adjoint=final,
+                            gradient_only=not final,
+                            gradient_transform=combine_parameter_gradients if final and bank is not None else None)
+                        maximum_error = max(maximum_error, replay.maximum_replay_error)
+                        if bank is not None and not final:
+                            bank.record()
+                        if not final:
+                            passes.append(timing)
+                    if bank is not None:
+                        diagnostics.update(bank.observe_update())
+                    diagnostics["vjp_passes"] = float(len(replay_gradients))
+                    timing.multiobjective_diagnostics = diagnostics
+                    # Preserve final combined-gradient diagnostics and sum the
+                    # actual work of every pass, never the dummy optimizer clock.
+                    for previous in passes:
+                        for name in TimingBreakdown.__dataclass_fields__:
+                            if name.endswith("_s"):
+                                setattr(timing, name, getattr(timing, name) + getattr(previous, name))
+                        timing.cuda_events.extend(previous.cuda_events)
+                        timing.batches += previous.batches
+                        timing.deferred_validation_checks += previous.deferred_validation_checks
+                        timing.deferred_validation_retries += previous.deferred_validation_retries
+                    timing.return_adjoint_record_s = record_timing.total_s
+                    timing.return_adjoint_metric_s = metric_s
+                    timing.return_adjoint_replay_max_abs_error = maximum_error
+                    timing.total_s = time.perf_counter() - whole_start
+                    return values[1], timing
+                value, row_weights = return_adjoint_weights(recorded.values, loss_objective, offsets)
+                if not _restore_rng_state(rng_state, rank_local=True):
+                    raise RuntimeError("return-adjoint replay could not restore its rank-local RNG")
+                metric_s = time.perf_counter() - metric_start
+                replay = ReturnAdjointTape.create(rows, device, expected=recorded.values,
+                                                 expected_actions=recorded.actions)
+                _, timing = _run_one_train_epoch(
+                    train_model, log_return_weights=row_weights, return_tape=replay,
+                    apply_return_adjoint=True)
+                # Preserve gradient diagnostics from the real update. Time and
+                # batch work include BOTH passes, including queued CUDA events.
+                for name in TimingBreakdown.__dataclass_fields__:
+                    if name.endswith("_s"):
+                        setattr(timing, name, getattr(timing, name) + getattr(record_timing, name))
+                timing.cuda_events.extend(record_timing.cuda_events)
+                timing.batches += record_timing.batches
+                timing.deferred_validation_checks += record_timing.deferred_validation_checks
+                timing.deferred_validation_retries += record_timing.deferred_validation_retries
+                timing.return_adjoint_record_s = record_timing.total_s
+                timing.return_adjoint_metric_s = metric_s
+                timing.return_adjoint_replay_max_abs_error = replay.maximum_replay_error
+                timing.total_s = time.perf_counter() - whole_start
+                return value, timing
             # The risk VJP traverses the same account and DDP batches with a
             # zero-step stateless optimizer. It never updates Adam or its clock.
-            active_optimizer = optimizer if log_return_weights is None else torch.optim.SGD(model.parameters(), lr=0.)
-            active_scheduler = scheduler if log_return_weights is None else None
+            actual_update = log_return_weights is None or apply_return_adjoint
+            active_optimizer = optimizer if actual_update or gradient_only else torch.optim.SGD(model.parameters(), lr=0.)
+            active_scheduler = scheduler if actual_update else None
             if config.training.day_trade_annual_episode_sharding and not ddp_enabled:
                 raise RuntimeError("annual episode sharding requires the canonical multi-rank DDP executor")
             if train_windowed is not None:
@@ -28254,11 +28833,16 @@ def _run_training_impl(
                         ddp_trajectory_gradient_sync=config.training.ddp_trajectory_gradient_sync,
                         day_trade_annual_episode_sharding=config.training.day_trade_annual_episode_sharding,
                         day_trade_annual_episode_world_size=config.training.day_trade_annual_episode_world_size,
+                        return_tape=return_tape,
+                        capture_only=capture_only,
+                        gradient_only=gradient_only,
+                        gradient_transform=gradient_transform,
+                        compound_return_adjoint=loss_objective == "trajectory_return" and return_tape is not None,
                         batch_size=train_batch_size,
                         device=device,
                         amp_dtype=amp_dtype,
                         non_blocking=non_blocking,
-                        objective=loss_objective,
+                        objective=physical_loss_objective,
                         grad_clip_norm=config.training.grad_clip_norm,
                         long_only=config.trading.long_only,
                         buy_fee_rate=config.trading.buy_fee_rate,
@@ -28718,6 +29302,7 @@ def _run_training_impl(
 
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
+            epoch_cache_payload = _trim_cuda_epoch_cache(device)
             epoch_compile_before = _dynamo_compile_counter_snapshot()
             last_epoch = epoch
             if lifecycle is not None:
@@ -28878,6 +29463,7 @@ def _run_training_impl(
                 curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
+                        **epoch_cache_payload,
                         **_max_rank_epoch_timing(
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             train_total_s=train_timing.total_s,
@@ -28897,6 +29483,7 @@ def _run_training_impl(
                         "improved": None,
                         **policy_step_payload,
                         **_cuda_graph_capture_snapshot(config),
+                        **_frozen_encoder_cache_snapshot(model),
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -28960,6 +29547,9 @@ def _run_training_impl(
                             "epoch_total_s": time.perf_counter() - epoch_start,
                         },
                     )
+                if record_epoch_curve:
+                    _record_complete_epoch_timing(group_curve_path, epoch=epoch,
+                        epoch_started_at=epoch_start, train_total_s=train_timing.total_s, device=device)
                 continue
 
             val_losses: list[float] = []
@@ -29068,7 +29658,7 @@ def _run_training_impl(
                                         model=model,
                                         optimizer=optimizer,
                                         scaler=scaler,
-                                        experiment_manifest=experiment_manifest,
+                                        experiment_manifest=checkpoint_save_manifest,
                                         check_finite=config.training.checkpoint_finite_check,
                                     )
                                 except BaseException as exc:
@@ -29362,7 +29952,7 @@ def _run_training_impl(
                                 model=model,
                                 optimizer=optimizer,
                                 scaler=scaler,
-                                experiment_manifest=experiment_manifest,
+                                experiment_manifest=checkpoint_save_manifest,
                                 check_finite=config.training.checkpoint_finite_check,
                             )
                             if bool(getattr(config.training, "save_best_val_artifacts", False)):
@@ -29428,7 +30018,7 @@ def _run_training_impl(
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
-                        experiment_manifest=experiment_manifest,
+                        experiment_manifest=checkpoint_save_manifest,
                         effective_train_batch_size=train_batch_size,
                         scheduler=scheduler,
                         no_improve_epochs=no_improve_epochs,
@@ -29543,6 +30133,7 @@ def _run_training_impl(
                 curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
+                        **epoch_cache_payload,
                         **_max_rank_epoch_timing(
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             train_total_s=train_timing.total_s,
@@ -29562,6 +30153,7 @@ def _run_training_impl(
                         "improved": bool(any_fold_improved),
                         **policy_step_payload,
                         **_cuda_graph_capture_snapshot(config),
+                        **_frozen_encoder_cache_snapshot(model),
                         "dynamo_unique_graphs_total": int(
                             epoch_compile_after["unique_graphs"]
                         ),
@@ -29636,6 +30228,9 @@ def _run_training_impl(
                         },
                     )
 
+                if record_epoch_curve:
+                    _record_complete_epoch_timing(group_curve_path, epoch=epoch,
+                        epoch_started_at=epoch_start, train_total_s=train_timing.total_s, device=device)
                 if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
                     print(
                         f"[Train {train_years}] early stop at epoch {epoch}: "
@@ -29671,7 +30266,7 @@ def _run_training_impl(
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
-                experiment_manifest=experiment_manifest,
+                experiment_manifest=checkpoint_save_manifest,
                 effective_train_batch_size=train_batch_size,
                 scheduler=scheduler,
                 no_improve_epochs=no_improve_epochs,

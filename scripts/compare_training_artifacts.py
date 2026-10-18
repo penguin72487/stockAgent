@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json  # noqa: E402
 from stockagent.training.checkpoint_contract import _stable_fingerprint  # noqa: E402
 from stockagent.training.lifecycle import validate_completed_training_artifacts  # noqa: E402
+from stockagent.training.runtime import load_checkpoint  # noqa: E402
 
 EPOCH_SEMANTIC_FIELDS = (
     "epoch", "train_loss", "val_mean", "test_mean", "lr", "best_val_loss",
@@ -163,7 +164,7 @@ def compare_runs(
     paths.extend(f"fold_{fold:02d}/{name}" for fold in folds
                  for name in ("checkpoint_best.pt", "model.pt"))
     for name in paths:
-        values = [torch.load(root/name, map_location="cpu", weights_only=True) for root in roots]
+        values = [load_checkpoint(root/name) for root in roots]
         changed, admitted = checkpoint_differences(
             *values, path=name,
             allow_runtime_profile_differences=allow_runtime_profile_differences,

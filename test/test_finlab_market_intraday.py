@@ -65,6 +65,7 @@ def test_batch_eta_includes_quota_before_acquire_not_just_source_fetch(tmp_path,
     monkeypatch.setattr(module, "credential_available", lambda: True)
     monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {"supplemental_allowed": True})
     monkeypatch.setattr(module, "quota_room_mb", quota)
+    monkeypatch.setattr(module, "load_policy", lambda: module.QuotaPolicy(quota_sample_interval_seconds=0))
     monkeypatch.setattr(module, "derive_partition", lambda *a, **kw: {
         "status": "derived_no_regular_trades", "rows": 0, "parquet_size_bytes": 0})
     module.sync_market(output, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
@@ -527,6 +528,61 @@ def test_older_minute_probes_are_bounded_per_cycle_without_retry_starvation(tmp_
     assert cursor["older_retry_attempts"] <= 4
     assert len(calls) <= 16
     assert set(calls) - previous  # retries cannot monopolize the discovery budget
+
+
+@pytest.mark.parametrize("kind", ["tw_minute", "tw_tick"])
+def test_parallel_older_retries_share_discovery_budget_before_dispatch(tmp_path, monkeypatch, kind):
+    from multiprocessing.pool import ThreadPool
+    from scripts import download_finlab_market_intraday as module
+    from scripts import download_finlab_intraday as intraday
+    from scripts.download_finlab_intraday import record_failed_partition
+
+    public, output = tmp_path / "public", tmp_path / "finlab"
+    public.mkdir()
+    _fixture(public)
+    floor = date(2026, 9, 24)
+    days = [date(2026, 8, 19) + timedelta(days=i) for i in range(37)]
+    pl.DataFrame({"date": list(map(str, days))}).write_parquet(public / "twse_market_index.parquet")
+    db = _open_index(output / "intraday/market_index.sqlite3")
+    _record(db, kind, "2330", floor, "downloaded_unverified_for_pit", 1, 1)
+    db.close()
+    monkeypatch.setattr(module, "credential_available", lambda: True)
+    monkeypatch.setattr(module, "_general_work_admission", lambda *a, **kw: {"supplemental_allowed": True})
+    monkeypatch.setattr(module, "quota_room_mb", lambda: (1000, 5000))
+    monkeypatch.setattr(module, "_minute_pool", lambda workers, **kw: ThreadPool(workers))
+    monkeypatch.setattr(module, "_available_receipt", lambda root, kind, symbol, day:
+                        {"status": "verified_no_trade"} if day >= floor else None)
+    calls = []
+    clock = [datetime.now(UTC)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
+
+    monkeypatch.setattr(intraday, "datetime", Clock)
+
+    def unavailable(root, key, target_days, *, now):
+        assert len(target_days) == 1  # Unknown history must not become a 31-day retry.
+        day = target_days[0]
+        calls.append((key, day))
+        failure = record_failed_partition(root, key, day, DataError("not_ready: partition unpublished"))
+        return {"outcomes": [{"trade_date": str(day), "failure": failure}], "sdk_calls": 1,
+                "fallback_calls": 0, "source_seconds": 0.0, "persist_seconds": 0.0}
+
+    kwargs = dict(start=days[0], end=floor, limit=64, reserve_mb=50, minimum_free_gb=0,
+                  kind=kind, workers=4, queue_depth=4, range_fetch=unavailable)
+    now = clock[0]
+    assert sync_market(output, public, now=now, **kwargs)["attempted_this_run"] == 16
+    previous = set(calls)
+    calls.clear()
+    clock[0] = now + timedelta(days=1)
+    sync_market(output, public, now=clock[0], **kwargs)
+    cursor = json.loads((output / f"intraday/{'minute' if kind == 'tw_minute' else 'market'}_cursor.json").read_text())
+    assert cursor["older_retry_attempts"] <= 4
+    assert cursor["older_probe_attempts"] <= 16 and len(calls) <= 16
+    assert len(set(calls) & previous) <= 4
+    assert set(calls) - previous
 
 
 def test_official_current_snapshot_does_not_relabel_former_symbol_as_current(tmp_path):

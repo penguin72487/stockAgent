@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -854,13 +855,75 @@ def _build_panel_kwargs(config) -> dict:
     }
 
 
-def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
+def _day_trade_physical_source_path(config, *, mode: str):
+    """Localize inference inputs without rewriting the trained data schema."""
+    override = getattr(config.data, "day_trade_inference_public_feature_path", None)
+    if override and (mode != "infer"
+            or str(config.trading.execution_mode) != "tw_day_trade"
+            or not config.trading.tw_day_trade_unlimited_margin_conversion):
+        raise ValueError("day_trade_inference_public_feature_path is for physical-FIFO inference only; training/resume is forbidden")
+    return (override or config.data.day_trade_physical_public_feature_path
+            or config.data.tw_public_feature_path)
+
+
+@contextmanager
+def _panel_input_read_guard(config, *, mode: str):
+    """One source generation through panel, tape and physical preparation.
+
+    Release before model inference/evaluation. A real producer defers the
+    reader nonblockingly; immutable sources retain their normal hash checks.
+    """
+    physical_path = _day_trade_physical_source_path(config, mode=mode)
+    with ExitStack() as sources:
+        if mode == "infer" and str(config.trading.execution_mode) == "tw_day_trade":
+            from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
+
+            roots = [Path(config.data.parquet_root)]
+            if config.trading.tw_day_trade_unlimited_margin_conversion:
+                physical_parent = Path(physical_path).resolve().parent
+                if physical_parent.parent != roots[0].resolve().parent:
+                    roots.append(physical_parent)
+            # A stable lock order also covers research panels using a separate
+            # physical archive, without creating another producer/lock owner.
+            lease_error = None
+            try:
+                for root in sorted(set(roots), key=str):
+                    sources.enter_context(live_tw_public_source_read_guard(root))
+            except Exception as exc:
+                lease_error = exc
+            if _distributed_ready() and _distributed_world_size() > 1:
+                _raise_if_distributed_phase_failed("inference_public_source_read_guard", lease_error)
+            elif lease_error is not None:
+                raise lease_error
+        yield physical_path
+
+
+def _build_panel_rank_coordinated(build_panel, config, active_strategy: str, *, inference: bool = False):
     kwargs = _build_panel_kwargs(config)
     def attach_features(panel):
         manifest = getattr(config.data, "factorized_feature_manifest", "")
         if manifest:
             if str(config.trading.execution_mode) != "tw_day_trade":
                 raise ValueError("factorized lag-one research features require tw_day_trade")
+            manifest = Path(manifest).resolve(strict=True)
+            if inference:
+                projection = json.loads(manifest.read_text())
+                receipt = projection.get("paper_inference")
+                if receipt is not None:
+                    if (not isinstance(receipt, dict)
+                            or receipt.get("contract") != "factorized_paper_projection_lag1_v1"
+                            or receipt.get("status") != "verified"
+                            or receipt.get("raw_source_publication") is not False):
+                        raise ValueError("factorized paper inference projection receipt is missing")
+                    # A live source may add securities after training. Apply
+                    # the same ordered model-universe projection as live/prep
+                    # before attachment, not after its strict axis check. Do
+                    # not use the live-tail date adapter for full inference.
+                    if projection.get("dates") != [str(day)[:10] for day in panel.dates]:
+                        raise ValueError("factorized full inference requires the complete executable calendar")
+                    from stockagent.training.checkpoint_contract import subset_panel_symbols
+
+                    panel = subset_panel_symbols(panel, projection["symbols"], allow_missing_masked=True)
             from stockagent.data.factorized_panel import attach_factorized_features
             panel = attach_factorized_features(panel, manifest,
                 transfer_mode=config.data.factorized_transfer_mode,
@@ -1660,6 +1723,9 @@ def main() -> None:
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    mode = args.mode if args.mode is not None else config.runner.mode
+    # Fail before cold restores, large panel allocation or a trainer launch.
+    _day_trade_physical_source_path(config, mode=mode)
     if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
         from stockagent.data.tw_futures_margin import validate_margin_rule_source
         try:
@@ -1962,7 +2028,6 @@ def main() -> None:
         cuda_available=bool(torch.cuda.is_available()),
         cuda_device_count=int(torch.cuda.device_count()),
     )
-    mode = args.mode if args.mode is not None else config.runner.mode
     resume = args.resume if args.resume is not None else config.runner.resume
     if args.retrain_completed_folds is not None:
         os.environ["STOCKAGENT_RETRAIN_COMPLETED_FOLDS"] = "1" if bool(args.retrain_completed_folds) else "0"
@@ -2006,279 +2071,277 @@ def main() -> None:
     ):
         return
 
-    panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
-    if (str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio"
-            and config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"):
-        from stockagent.data.panel import slice_panel_end
-        from stockagent.data.tw_futures_benchmark import (
-            tx_front_benchmark_source_end, resolve_tx_benchmark_path,
-        )
-
-        panel = slice_panel_end(
-            panel,
-            tx_front_benchmark_source_end(resolve_tx_benchmark_path(config.trading)),
-        )
-    if str(config.trading.execution_mode) == "tw_futures_portfolio_day":
-        from stockagent.data.tw_futures_portfolio_daily import (
-            attach_futures_portfolio_daily,
-        )
-
-        panel = attach_futures_portfolio_daily(
-            panel,
-            config.trading.tw_futures_portfolio_data_path,
-            fee_per_side_twd_by_group={
-                "large": config.trading.tw_futures_portfolio_fee_large_twd,
-                "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
-                "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
-                "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
-            },
-        )
-    if str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio":
-        from stockagent.data.tw_stock_context_futures_portfolio import (
-            attach_stock_context_futures_portfolio_daily,
-        )
-
-        panel = attach_stock_context_futures_portfolio_daily(
-            panel,
-            config.trading.tw_futures_portfolio_data_path,
-            fee_per_side_twd_by_group={
-                "large": config.trading.tw_futures_portfolio_fee_large_twd,
-                "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
-                "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
-                "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
-            },
-            integer_contracts=bool(
-                config.trading.tw_futures_portfolio_integer_contracts
-            ),
-            current_open_feature=bool(
-                config.data.tw_futures_current_open_feature
-            ),
-            denomination_context_basis=config.data.tw_futures_denomination_context_basis,
-            futures_slot_count=config.data.tw_futures_portfolio_slot_count,
-            margin_rules_path=(config.trading.tw_futures_portfolio_margin_rules_path
-                               if config.trading.tw_futures_portfolio_capital_basis == 'initial_margin' else None),
-            valuation_research_contract=config.trading.tw_futures_portfolio_valuation_research_contract,
-            require_prior_capacity=config.data.tw_futures_require_prior_capacity,
-            carry_valuation_max_abs_simple_return=float(
-                config.data.tw_futures_carry_valuation_max_abs_simple_return
-            ),
-            expiry_settlement_valuation=bool(
-                config.data.tw_futures_expiry_settlement_valuation
-            ),
-            final_settlement_path=(
-                config.trading.tw_futures_portfolio_final_settlement_path
-            ),
-            integer_fee_per_contract_per_side_twd=float(
-                config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
-            ),
-            max_volume_participation=float(
-                config.trading.max_volume_participation
-            ),
-            benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
-            benchmark_data_path=config.trading.tw_futures_portfolio_benchmark_data_path,
-        )
-        if config.trading.tw_futures_portfolio_holding_policy == "intraday":
-            from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
-            panel = attach_all_futures_intraday(
-                panel, config.trading.tw_futures_portfolio_minute_data_path,
-                participation=config.trading.max_volume_participation,
+    with _panel_input_read_guard(config, mode=mode) as physical_public_feature_path:
+        panel = _build_panel_rank_coordinated(build_panel, config, active_strategy, inference=mode == "infer")
+        if (str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio"
+                and config.trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross"):
+            from stockagent.data.panel import slice_panel_end
+            from stockagent.data.tw_futures_benchmark import (
+                tx_front_benchmark_source_end, resolve_tx_benchmark_path,
             )
-        if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
-            from stockagent.data.tw_futures_margin import attach_futures_margin_rules
-            panel = attach_futures_margin_rules(
-                panel, config.trading.tw_futures_portfolio_margin_rules_path,
-                broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
-                liquidation_ratio=config.trading.tw_futures_portfolio_margin_liquidation_ratio,
-                participation=config.trading.max_volume_participation,
-                benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
-                include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
-                include_account_policy_observations=config.training.financial_transformer.futures_causal_account_policy,
-                account_policy_lookback=config.training.lookback,
-            )
-        if (
-            _distributed_rank() == 0
-            and config.data.tw_futures_expiry_settlement_valuation
-        ):
-            futures_daily = panel.stock_context_futures_portfolio_daily
-            if futures_daily is None:
-                raise RuntimeError("all-futures expiry sidecar was not attached")
-            print(
-                "[all-futures expiry] official_final_settlement="
-                f"{futures_daily.expiry_final_settlement_path} "
-                "quarantined_incomplete_physical_contracts="
-                f"{futures_daily.expiry_settlement_quarantined_physical_contracts}",
-                flush=True,
-            )
-    if str(config.trading.execution_mode) in {
-        "tw_stock_futures_day_trade",
-        "tw_stock_futures_day_trade_0900",
-        "tw_stock_futures_day_trade_0900_integer",
-        "tw_stock_futures_day_trade_0845_minute",
-    }:
-        from stockagent.data.tw_stock_futures_day_trade import (
-            attach_stock_futures_day_trade_daily,
-        )
 
-        panel = attach_stock_futures_day_trade_daily(
-            panel,
-            config.trading.tw_stock_futures_day_trade_data_path,
-            fee_per_contract_per_side_twd=(
-                config.trading.tw_stock_futures_day_trade_fee_twd
-            ),
-            entry_price_source=(
-                config.trading.tw_stock_futures_day_trade_0900_entry_source
-                if str(config.trading.execution_mode)
-                in {
-                    "tw_stock_futures_day_trade_0900",
-                    "tw_stock_futures_day_trade_0900_integer",
-                }
-                else "daily_session_open"
-            ),
-            entry_0900_data_path=(
-                config.trading.tw_stock_futures_day_trade_0900_data_path
-                if str(config.trading.execution_mode)
-                == "tw_stock_futures_day_trade_0900"
-                and str(
-                    config.trading.tw_stock_futures_day_trade_0900_entry_source
-                ).strip().lower()
-                == "post_0900_trade_sidecar"
-                else None
-            ),
-            integer_contracts=(
-                str(config.trading.execution_mode)
-                in {"tw_stock_futures_day_trade_0900_integer", "tw_stock_futures_day_trade_0845_minute"}
-            ),
-            minute_data_path=(
-                config.trading.tw_stock_futures_day_trade_minute_data_path
-                if config.trading.execution_mode == "tw_stock_futures_day_trade_0845_minute"
-                else None
-            ),
-            max_volume_participation=(
-                config.trading.max_volume_participation
-            ),
-            minute_capacity_rounding=config.trading.tw_stock_futures_day_trade_minute_capacity_rounding,
-            daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
-            quarantine_dates=config.trading.tw_stock_futures_day_trade_quarantine_dates,
-            quarantine_contract_days=config.trading.tw_stock_futures_day_trade_quarantine_contract_days,
-            residual_policy=config.trading.tw_stock_futures_day_trade_residual_policy,
-            carry_evidence_path=config.trading.tw_stock_futures_day_trade_carry_evidence_path,
-            corporate_action_path=config.trading.tw_stock_futures_day_trade_corporate_action_path,
-            corporate_transition_path=config.trading.tw_stock_futures_day_trade_corporate_transition_path,
-            quarantined_carry_policy=config.trading.tw_stock_futures_day_trade_quarantined_carry_policy,
-            final_settlement_path=config.trading.tw_futures_portfolio_final_settlement_path,
-        )
-        if config.trading.tw_stock_futures_day_trade_residual_policy == "carry" and _distributed_rank() == 0:
-            from downloader.artifact_io import atomic_write_json
-            atomic_write_json(Path(output_dir) / "futures_carry_physical_contracts.json",
-                              panel.stock_futures_day_trade_daily.carry_metadata)
-    if (
-        str(config.trading.execution_mode) == "tw_day_trade"
-        and config.data.day_trade_minute_execution_root is not None
-    ):
-        from stockagent.data.tw_day_trade_execution import (
-            load_tw_day_trade_execution_tape,
-        )
+            panel = slice_panel_end(
+                panel,
+                tx_front_benchmark_source_end(resolve_tx_benchmark_path(config.trading)),
+            )
+        if str(config.trading.execution_mode) == "tw_futures_portfolio_day":
+            from stockagent.data.tw_futures_portfolio_daily import (
+                attach_futures_portfolio_daily,
+            )
 
-        if panel.open_prices is None:
-            raise RuntimeError(
-                "daily minute-execution loss requires official panel open prices"
+            panel = attach_futures_portfolio_daily(
+                panel,
+                config.trading.tw_futures_portfolio_data_path,
+                fee_per_side_twd_by_group={
+                    "large": config.trading.tw_futures_portfolio_fee_large_twd,
+                    "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
+                    "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
+                    "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
+                },
             )
-        if panel.daily_volumes is None:
-            raise RuntimeError(
-                "hybrid daily/minute execution loss requires daily share volume "
-                "for the pre-minute-data uniform-minute 50% participation cap"
+        if str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio":
+            from stockagent.data.tw_stock_context_futures_portfolio import (
+                attach_stock_context_futures_portfolio_daily,
             )
-        def _load_execution_tape():
-            return load_tw_day_trade_execution_tape(
-                config.data.day_trade_minute_execution_root,
-                panel_dates=panel.dates,
-                panel_symbols=panel.symbols,
-                official_open_prices=panel.open_prices,
-                official_close_prices=panel.close_prices,
-                daily_volume_shares=panel.daily_volumes,
-                cache_dir=config.data.day_trade_minute_execution_cache_dir,
-                allow_daily_proxy=(
-                    config.data.day_trade_minute_execution_allow_daily_proxy
+
+            panel = attach_stock_context_futures_portfolio_daily(
+                panel,
+                config.trading.tw_futures_portfolio_data_path,
+                fee_per_side_twd_by_group={
+                    "large": config.trading.tw_futures_portfolio_fee_large_twd,
+                    "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
+                    "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
+                    "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
+                },
+                integer_contracts=bool(
+                    config.trading.tw_futures_portfolio_integer_contracts
                 ),
-                daily_proxy_price_policy=config.data.day_trade_minute_execution_daily_proxy_price_policy,
-                policy=config.data.day_trade_minute_execution_policy,
+                current_open_feature=bool(
+                    config.data.tw_futures_current_open_feature
+                ),
+                denomination_context_basis=config.data.tw_futures_denomination_context_basis,
+                futures_slot_count=config.data.tw_futures_portfolio_slot_count,
+                margin_rules_path=(config.trading.tw_futures_portfolio_margin_rules_path
+                                   if config.trading.tw_futures_portfolio_capital_basis == 'initial_margin' else None),
+                valuation_research_contract=config.trading.tw_futures_portfolio_valuation_research_contract,
+                require_prior_capacity=config.data.tw_futures_require_prior_capacity,
+                carry_valuation_max_abs_simple_return=float(
+                    config.data.tw_futures_carry_valuation_max_abs_simple_return
+                ),
+                expiry_settlement_valuation=bool(
+                    config.data.tw_futures_expiry_settlement_valuation
+                ),
+                final_settlement_path=(
+                    config.trading.tw_futures_portfolio_final_settlement_path
+                ),
+                integer_fee_per_contract_per_side_twd=float(
+                    config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
+                ),
+                max_volume_participation=float(
+                    config.trading.max_volume_participation
+                ),
+                benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
+                benchmark_data_path=config.trading.tw_futures_portfolio_benchmark_data_path,
+            )
+            if config.trading.tw_futures_portfolio_holding_policy == "intraday":
+                from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
+                panel = attach_all_futures_intraday(
+                    panel, config.trading.tw_futures_portfolio_minute_data_path,
+                    participation=config.trading.max_volume_participation,
+                )
+            if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
+                from stockagent.data.tw_futures_margin import attach_futures_margin_rules
+                panel = attach_futures_margin_rules(
+                    panel, config.trading.tw_futures_portfolio_margin_rules_path,
+                    broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
+                    liquidation_ratio=config.trading.tw_futures_portfolio_margin_liquidation_ratio,
+                    participation=config.trading.max_volume_participation,
+                    benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
+                    include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
+                    include_account_policy_observations=config.training.financial_transformer.futures_causal_account_policy,
+                    account_policy_lookback=config.training.lookback,
+                )
+            if (
+                _distributed_rank() == 0
+                and config.data.tw_futures_expiry_settlement_valuation
+            ):
+                futures_daily = panel.stock_context_futures_portfolio_daily
+                if futures_daily is None:
+                    raise RuntimeError("all-futures expiry sidecar was not attached")
+                print(
+                    "[all-futures expiry] official_final_settlement="
+                    f"{futures_daily.expiry_final_settlement_path} "
+                    "quarantined_incomplete_physical_contracts="
+                    f"{futures_daily.expiry_settlement_quarantined_physical_contracts}",
+                    flush=True,
+                )
+        if str(config.trading.execution_mode) in {
+            "tw_stock_futures_day_trade",
+            "tw_stock_futures_day_trade_0900",
+            "tw_stock_futures_day_trade_0900_integer",
+            "tw_stock_futures_day_trade_0845_minute",
+        }:
+            from stockagent.data.tw_stock_futures_day_trade import (
+                attach_stock_futures_day_trade_daily,
             )
 
-        if _distributed_ready() and _distributed_world_size() > 1:
-            tape_error = None
-            if _distributed_rank() == 0:
-                try:
-                    panel.day_trade_minute_execution = _load_execution_tape()
-                except Exception as exc:
-                    tape_error = exc
-            _raise_if_distributed_phase_failed(
-                "rank0_day_trade_execution_tape", tape_error
+            panel = attach_stock_futures_day_trade_daily(
+                panel,
+                config.trading.tw_stock_futures_day_trade_data_path,
+                fee_per_contract_per_side_twd=(
+                    config.trading.tw_stock_futures_day_trade_fee_twd
+                ),
+                entry_price_source=(
+                    config.trading.tw_stock_futures_day_trade_0900_entry_source
+                    if str(config.trading.execution_mode)
+                    in {
+                        "tw_stock_futures_day_trade_0900",
+                        "tw_stock_futures_day_trade_0900_integer",
+                    }
+                    else "daily_session_open"
+                ),
+                entry_0900_data_path=(
+                    config.trading.tw_stock_futures_day_trade_0900_data_path
+                    if str(config.trading.execution_mode)
+                    == "tw_stock_futures_day_trade_0900"
+                    and str(
+                        config.trading.tw_stock_futures_day_trade_0900_entry_source
+                    ).strip().lower()
+                    == "post_0900_trade_sidecar"
+                    else None
+                ),
+                integer_contracts=(
+                    str(config.trading.execution_mode)
+                    in {"tw_stock_futures_day_trade_0900_integer", "tw_stock_futures_day_trade_0845_minute"}
+                ),
+                minute_data_path=(
+                    config.trading.tw_stock_futures_day_trade_minute_data_path
+                    if config.trading.execution_mode == "tw_stock_futures_day_trade_0845_minute"
+                    else None
+                ),
+                max_volume_participation=(
+                    config.trading.max_volume_participation
+                ),
+                minute_capacity_rounding=config.trading.tw_stock_futures_day_trade_minute_capacity_rounding,
+                daily_proxy_before=config.trading.tw_stock_futures_day_trade_daily_proxy_before,
+                quarantine_dates=config.trading.tw_stock_futures_day_trade_quarantine_dates,
+                quarantine_contract_days=config.trading.tw_stock_futures_day_trade_quarantine_contract_days,
+                residual_policy=config.trading.tw_stock_futures_day_trade_residual_policy,
+                carry_evidence_path=config.trading.tw_stock_futures_day_trade_carry_evidence_path,
+                corporate_action_path=config.trading.tw_stock_futures_day_trade_corporate_action_path,
+                corporate_transition_path=config.trading.tw_stock_futures_day_trade_corporate_transition_path,
+                quarantined_carry_policy=config.trading.tw_stock_futures_day_trade_quarantined_carry_policy,
+                final_settlement_path=config.trading.tw_futures_portfolio_final_settlement_path,
             )
-            if _distributed_rank() != 0:
-                try:
-                    panel.day_trade_minute_execution = _load_execution_tape()
-                except Exception as exc:
-                    tape_error = exc
-            _raise_if_distributed_phase_failed(
-                "worker_day_trade_execution_tape", tape_error
-            )
-        else:
-            panel.day_trade_minute_execution = _load_execution_tape()
-        if config.trading.tw_day_trade_unlimited_margin_conversion:
-            from stockagent.data.tw_day_trade_carry_source import (
-                build_prepared_day_trade_carry_source,
+            if config.trading.tw_stock_futures_day_trade_residual_policy == "carry" and _distributed_rank() == 0:
+                from downloader.artifact_io import atomic_write_json
+                atomic_write_json(Path(output_dir) / "futures_carry_physical_contracts.json",
+                                  panel.stock_futures_day_trade_daily.carry_metadata)
+        if (
+            str(config.trading.execution_mode) == "tw_day_trade"
+            and config.data.day_trade_minute_execution_root is not None
+        ):
+            from stockagent.data.tw_day_trade_execution import (
+                load_tw_day_trade_execution_tape,
             )
 
-            def _load_physical_source():
-                return build_prepared_day_trade_carry_source(
-                    panel=panel,
-                    minute_root=config.data.day_trade_minute_execution_root,
-                    public_feature_path=(
-                        config.data.day_trade_physical_public_feature_path
-                        or config.data.tw_public_feature_path
-                    ),
+            if panel.open_prices is None:
+                raise RuntimeError(
+                    "daily minute-execution loss requires official panel open prices"
+                )
+            if panel.daily_volumes is None:
+                raise RuntimeError(
+                    "hybrid daily/minute execution loss requires daily share volume "
+                    "for the pre-minute-data uniform-minute 50% participation cap"
+                )
+            def _load_execution_tape():
+                return load_tw_day_trade_execution_tape(
+                    config.data.day_trade_minute_execution_root,
+                    panel_dates=panel.dates,
+                    panel_symbols=panel.symbols,
+                    official_open_prices=panel.open_prices,
+                    official_close_prices=panel.close_prices,
+                    daily_volume_shares=panel.daily_volumes,
                     cache_dir=config.data.day_trade_minute_execution_cache_dir,
                     allow_daily_proxy=(
                         config.data.day_trade_minute_execution_allow_daily_proxy
                     ),
-                    daily_proxy_price_policy=(
-                        config.data.day_trade_minute_execution_daily_proxy_price_policy
-                    ),
-                    corporate_action_mode=config.trading.tw_corporate_action_mode,
-                    subscription_right_policy=(
-                        config.trading.tw_day_trade_subscription_right_policy
-                    ),
-                    entry_remainder_policy=config.trading.tw_day_trade_entry_remainder_policy,
-                    terminal_liquidation_unlimited_capacity=(
-                        config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
-                    ),
-                    sparse_event_slots=(
-                        config.training.day_trade_sparse_event_slots
-                        if config.training.day_trade_sparse_events
-                        else None
-                    ),
+                    daily_proxy_price_policy=config.data.day_trade_minute_execution_daily_proxy_price_policy,
+                    policy=config.data.day_trade_minute_execution_policy,
                 )
 
             if _distributed_ready() and _distributed_world_size() > 1:
-                source_error = None
+                tape_error = None
                 if _distributed_rank() == 0:
                     try:
-                        panel.day_trade_carry_source = _load_physical_source()
+                        panel.day_trade_minute_execution = _load_execution_tape()
                     except Exception as exc:
-                        source_error = exc
+                        tape_error = exc
                 _raise_if_distributed_phase_failed(
-                    "rank0_day_trade_physical_source", source_error
+                    "rank0_day_trade_execution_tape", tape_error
                 )
                 if _distributed_rank() != 0:
                     try:
-                        panel.day_trade_carry_source = _load_physical_source()
+                        panel.day_trade_minute_execution = _load_execution_tape()
                     except Exception as exc:
-                        source_error = exc
+                        tape_error = exc
                 _raise_if_distributed_phase_failed(
-                    "worker_day_trade_physical_source", source_error
+                    "worker_day_trade_execution_tape", tape_error
                 )
             else:
-                panel.day_trade_carry_source = _load_physical_source()
+                panel.day_trade_minute_execution = _load_execution_tape()
+            if config.trading.tw_day_trade_unlimited_margin_conversion:
+                from stockagent.data.tw_day_trade_carry_source import (
+                    build_prepared_day_trade_carry_source,
+                )
+
+                def _load_physical_source():
+                    return build_prepared_day_trade_carry_source(
+                        panel=panel,
+                        minute_root=config.data.day_trade_minute_execution_root,
+                        public_feature_path=physical_public_feature_path,
+                        cache_dir=config.data.day_trade_minute_execution_cache_dir,
+                        allow_daily_proxy=(
+                            config.data.day_trade_minute_execution_allow_daily_proxy
+                        ),
+                        daily_proxy_price_policy=(
+                            config.data.day_trade_minute_execution_daily_proxy_price_policy
+                        ),
+                        corporate_action_mode=config.trading.tw_corporate_action_mode,
+                        subscription_right_policy=(
+                            config.trading.tw_day_trade_subscription_right_policy
+                        ),
+                        entry_remainder_policy=config.trading.tw_day_trade_entry_remainder_policy,
+                        terminal_liquidation_unlimited_capacity=(
+                            config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
+                        ),
+                        sparse_event_slots=(
+                            config.training.day_trade_sparse_event_slots
+                            if config.training.day_trade_sparse_events
+                            else None
+                        ),
+                    )
+
+                if _distributed_ready() and _distributed_world_size() > 1:
+                    source_error = None
+                    if _distributed_rank() == 0:
+                        try:
+                            panel.day_trade_carry_source = _load_physical_source()
+                        except Exception as exc:
+                            source_error = exc
+                    _raise_if_distributed_phase_failed(
+                        "rank0_day_trade_physical_source", source_error
+                    )
+                    if _distributed_rank() != 0:
+                        try:
+                            panel.day_trade_carry_source = _load_physical_source()
+                        except Exception as exc:
+                            source_error = exc
+                    _raise_if_distributed_phase_failed(
+                        "worker_day_trade_physical_source", source_error
+                    )
+                else:
+                    panel.day_trade_carry_source = _load_physical_source()
     if str(config.trading.execution_mode) in {
         "tw_index_futures_day",
         "tw_index_derivatives_day",

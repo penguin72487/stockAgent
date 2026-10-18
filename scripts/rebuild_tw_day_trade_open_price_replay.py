@@ -35,6 +35,7 @@ import math
 from pathlib import Path
 import re
 import sys
+import time as time_module
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -82,6 +83,10 @@ from stockagent.data.tw_security import classify_tw_stock_or_etf  # noqa: E402
 from stockagent.live.benchmark_history_projection import (  # noqa: E402
     write_benchmark_projection,
 )
+from stockagent.live.minute_source_paths import (  # noqa: E402
+    DEFAULT_LOCAL_MINUTE_ROOTS as DEFAULT_MINUTE_DATA_ROOTS,
+)
+from stockagent.live.signal_artifacts import read_execution_weight_rows  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -91,12 +96,6 @@ DEFAULT_TWSE_DAILY_OHLCV_PATH = Path(
 )
 DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
     "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
-)
-DEFAULT_MINUTE_DATA_ROOTS = (
-    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
-    Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
-    Path("data_tw_minute/research_dataset"),
-    Path("data_tw_minute/shioaji_1m"),
 )
 MINUTE_VOLUME_PARTICIPATION = 0.50
 HISTORICAL_KBAR_FILL_CONTRACT = (
@@ -221,7 +220,10 @@ def _latest_valid_signal(
         summary_path = Path(str(pinned_artifact["summary_path"]))
         weights_path = Path(str(pinned_artifact["weights_path"]))
         if (not preferred_signal_id or not summary_path.is_absolute()
-                or weights_path != summary_path.with_name("target_weights.parquet")):
+                or weights_path not in {
+                    summary_path.with_name("target_weights.parquet"),
+                    summary_path.with_name("execution_weights.json"),
+                }):
             raise ValueError("invalid pinned signal artifact identity")
         for key, path in (("summary", summary_path), ("weights", weights_path)):
             if _sha256(path) != pinned_artifact[f"{key}_sha256"]:
@@ -265,7 +267,19 @@ def _latest_valid_signal(
             )
         else:
             counterfactual_contract_valid = False
-        weights_path = summary_path.with_name("target_weights.parquet")
+        weights_path = (Path(pinned_artifact["weights_path"]) if pinned_artifact is not None
+                        else summary_path.with_name("target_weights.parquet"))
+        if pinned_artifact is None and not weights_path.is_file():
+            execution_path = summary_path.with_name("execution_weights.json")
+            declared = summary.get("execution_weights_path")
+            if declared and execution_path.is_file():
+                if Path(str(declared)).resolve() != execution_path.resolve():
+                    raise ValueError(f"execution weights escaped signal directory: {summary_path}")
+                weights_path = execution_path
+        if weights_path.name == "execution_weights.json":
+            declared = summary.get("execution_weights_path")
+            if not declared or Path(str(declared)).resolve() != weights_path.resolve():
+                raise ValueError(f"execution weights escaped signal directory: {summary_path}")
         if (
             (preferred_signal_id and summary.get("signal_id") != preferred_signal_id)
             or str(summary.get("market") or "")
@@ -287,7 +301,15 @@ def _latest_valid_signal(
     generated_at, summary_path, weights_path, summary = max(
         ranked, key=lambda item: item[0]
     )
-    rows = pl.read_parquet(weights_path).to_dicts()
+    if weights_path.name == "execution_weights.json":
+        rows = read_execution_weight_rows(
+            weights_path, market=str(spec.signal_market or spec.market),
+            signal_id=str(summary.get("signal_id") or ""),
+        )
+        if summary.get("symbol_count") is not None and len(rows) != int(summary["symbol_count"]):
+            raise ValueError(f"execution weights row count differs from published signal: {weights_path}")
+    else:
+        rows = pl.read_parquet(weights_path).to_dicts()
     if pinned_artifact is not None:
         for key, path in (("summary", summary_path), ("weights", weights_path)):
             if _sha256(path) != pinned_artifact[f"{key}_sha256"]:
@@ -301,9 +323,78 @@ def _latest_valid_signal(
     return generated_at, summary_path, weights_path, summary, rows
 
 
+def _accepted_repair_signal_lineage(
+    source_ledger_dir: Path, manifests: tuple[Path, ...],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Resolve only explicitly supplied, applied and byte-pinned paper repairs.
+
+    A later registration by itself is not a replacement authority. Preserve the
+    original decisions for v2 (which repaired execution only); v1 explicitly
+    regenerated a lost signal and therefore owns its own decision artifact.
+    """
+    contracts = {
+        "never_filled_missing_open_append_only_minute_repair_v1",
+        "never_filled_original_signal_append_only_minute_repair_v2",
+    }
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for manifest_path in manifests:
+        manifest_path = manifest_path.resolve(strict=True)
+        raw = manifest_path.read_bytes()
+        receipt = json.loads(raw)
+        contract = receipt.get("contract")
+        if (contract not in contracts or receipt.get("status") != "applied"
+                or receipt.get("simulation_only") is not True
+                or receipt.get("production_order_possible") is not False
+                or receipt.get("original_journals_retained") is not True
+                or Path(str(receipt.get("live_dir") or "")).resolve() != source_ledger_dir.resolve()):
+            raise ValueError(f"not an applied repair for this source ledger: {manifest_path}")
+        pins: dict[Path, str] = {}
+        for pin in receipt.get("source_pins") or ():
+            path = Path(str(pin["path"])).resolve(strict=True)
+            digest = str(pin["sha256"])
+            if path in pins and pins[path] != digest:
+                raise ValueError(f"conflicting repair source pins: {path}")
+            pins[path] = digest
+        applied = {str(row["session_date"]): str(row["signal_id"])
+                   for row in receipt.get("applied_sessions") or ()}
+        for session in receipt.get("sessions") or ():
+            day = date.fromisoformat(str(session["session_date"])).isoformat()
+            market = str(receipt.get("market") or "")
+            original = session["original"]
+            original_id = str(original["signal_id"])
+            repaired_id = applied.get(day, "")
+            preserve = contract.endswith("_v2")
+            if (not market or not repaired_id or repaired_id == original_id
+                    or (preserve and (receipt.get("preserve_original_signal") is not True
+                        or original.get("original_weights_preserved") is not True
+                        or not repaired_id.startswith(original_id + ":minute-repair:")))):
+                raise ValueError(f"incomplete applied repair identity: {manifest_path}: {day}")
+            summary_path = Path(session["summary_path"]).resolve(strict=True)
+            weights_path = summary_path.with_name("target_weights.parquet")
+            for path in (Path(original["summary_path"]).resolve(strict=True),
+                         Path(original["weights_path"]).resolve(strict=True), summary_path, weights_path):
+                if path not in pins or _sha256(path) != pins[path]:
+                    raise ValueError(f"accepted repair source hash changed or absent: {path}")
+            canonical_id = original_id if preserve else repaired_id
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if summary.get("signal_id") != canonical_id:
+                raise ValueError(f"repair decision artifact identity differs: {summary_path}")
+            key = (day, market)
+            proof = {"contract": contract, "original_signal_id": original_id,
+                     "repair_signal_id": repaired_id, "canonical_signal_id": canonical_id,
+                     "manifest_path": str(manifest_path), "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+                     "summary_path": str(summary_path), "summary_sha256": pins[summary_path],
+                     "weights_path": str(weights_path), "weights_sha256": pins[weights_path]}
+            if key in result and result[key] != proof:
+                raise ValueError(f"conflicting applied repair receipts: {key}")
+            result[key] = proof
+    return result
+
+
 def _source_ledger_signal_artifacts(
     source_ledger_dir: Path,
     signal_ids: Mapping[tuple[str, str], str],
+    *, accepted_repair_manifests: tuple[Path, ...] = (),
 ) -> dict[tuple[str, str], dict[str, str]]:
     """Resolve accepted artifact bytes, not a same-named regeneration.
 
@@ -349,15 +440,52 @@ def _source_ledger_signal_artifacts(
             raise ValueError(f"conflicting accepted signal artifacts: {key}")
         artifacts[key] = proof
 
-    receipts = [source_ledger_dir / "rebuild_receipt.json"]
-    receipts.extend(sorted((source_ledger_dir / "account_receipts").glob("*/rebuild_receipt.json")))
-    for path in receipts:
-        if not path.is_file():
-            continue
+    for (day, market), proof in _accepted_repair_signal_lineage(
+        source_ledger_dir, accepted_repair_manifests
+    ).items():
+        accept(day, {**proof, "market": market, "signal_id": proof["canonical_signal_id"]})
+    from stockagent.live.day_trade_addition import CONTRACT as ADDITION_CONTRACT, evidence_path
+
+    visited: set[Path] = set()
+    active: set[Path] = set()
+
+    def read_receipt(path: Path, owner: Path) -> None:
+        path = path.resolve(strict=True)
+        if path in active:
+            raise ValueError(f"cyclic accepted signal receipt: {path}")
+        if path in visited:
+            return
+        active.add(path)
         receipt = json.loads(path.read_text(encoding="utf-8"))
+        if receipt.get("contract") == ADDITION_CONTRACT:
+            if (receipt.get("simulation_only") is not True
+                    or receipt.get("production_order_possible") is not False
+                    or receipt.get("old_signal_pins_and_executions_unchanged") is not True):
+                raise ValueError(f"invalid additive signal receipt: {path}")
+            prior = evidence_path(owner, receipt["prior_rebuild_receipt"])
+            component = evidence_path(owner, receipt["new_mode_component"])
+            component_receipt = evidence_path(component, "rebuild_receipt.json")
+            if json.loads(component_receipt.read_text(encoding="utf-8")).get("contract") == ADDITION_CONTRACT:
+                raise ValueError("an addition component must be an independent replay")
+            read_receipt(prior, owner)
+            read_receipt(component_receipt, component)
+            # The retained account snapshot can pin a more recent session than
+            # its last historical rebuild; never substitute today's live copy.
+            if receipt.get("prior_state"):
+                prior_state = json.loads(evidence_path(owner, receipt["prior_state"]).read_text(encoding="utf-8"))
+                for market, row in prior_state.get("modes", {}).items():
+                    accept(str(row.get("session_date") or ""), {**row, "market": market})
         for session in receipt.get("sessions", []):
             for row in session.get("modes", []):
                 accept(str(session["session_date"]), row)
+        active.remove(path)
+        visited.add(path)
+
+    receipts = [source_ledger_dir / "rebuild_receipt.json"]
+    receipts.extend(sorted((source_ledger_dir / "account_receipts").glob("*/rebuild_receipt.json")))
+    for path in receipts:
+        if path.is_file():
+            read_receipt(path, source_ledger_dir)
     state_path = source_ledger_dir / "state.json"
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -371,11 +499,15 @@ def _source_ledger_signal_ids(
     *,
     start_date: date,
     end_date: date,
+    accepted_repair_manifests: tuple[Path, ...] = (),
 ) -> tuple[dict[tuple[str, str], str], dict[str, Any]]:
     path = source_ledger_dir / "events.jsonl"
     if not path.is_file():
         raise FileNotFoundError(path)
     resolved: dict[tuple[str, str], str] = {}
+    lineage = _accepted_repair_signal_lineage(source_ledger_dir, accepted_repair_manifests)
+    observed: dict[tuple[str, str], set[str]] = defaultdict(set)
+    accepted_repairs = {}
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
@@ -393,16 +525,32 @@ def _source_ledger_signal_ids(
             if not market or not signal_id:
                 raise ValueError(f"{path}:{line_number}: signal identity is incomplete")
             key = (session_date.isoformat(), market)
+            observed[key].add(signal_id)
+            repair = lineage.get(key)
+            if repair is not None:
+                if signal_id not in (repair["original_signal_id"], repair["repair_signal_id"]):
+                    raise ValueError(f"{path}:{line_number}: unapproved source signal id for {key}")
+                if signal_id == repair["repair_signal_id"] and (
+                        row.get("simulation_replay") is not True or row.get("replay_basis") != repair["contract"]):
+                    raise ValueError(f"{path}:{line_number}: registration does not match applied repair for {key}")
+                resolved[key] = repair["canonical_signal_id"]
+                accepted_repairs[key] = repair
+                continue
             previous = resolved.get(key)
             if previous is not None and previous != signal_id:
                 raise ValueError(
                     f"{path}:{line_number}: conflicting source signal ids for {key}"
                 )
             resolved[key] = signal_id
+    for key, repair in accepted_repairs.items():
+        if observed[key] != {repair["original_signal_id"], repair["repair_signal_id"]}:
+            raise ValueError(f"applied repair is not committed in source registrations: {key}")
     return resolved, {
         "path": str(path.resolve()),
         "sha256": _sha256(path),
         "signal_registrations": len(resolved),
+        "accepted_repair_lineage": [{"session_date": key[0], "market": key[1], **proof}
+                                    for key, proof in sorted(accepted_repairs.items())],
     }
 
 
@@ -410,6 +558,61 @@ def _validate_replay_policy_summary(spec: ModeSpec, day: date, summary: Mapping[
     if (spec.uses_realistic_execution
             and summary.get("day_trade_policy_mask_contract") != "exact_session_eligibility_before_forward_v1"):
         raise RuntimeError(f"{day}/{spec.market}: regenerate isolated signals with exact-session policy mask before v3 replay")
+
+
+def _retained_or_missing_signal_spec(spec: ModeSpec, day: date, *,
+                                     source_signal_ids: Mapping[tuple[str, str], str],
+                                     missing_signal_root: Path | None) -> ModeSpec:
+    """Supplement genuinely absent decisions, never replace a retained ID."""
+    if missing_signal_root is not None and (day.isoformat(), spec.market) not in source_signal_ids:
+        return replace(spec, live_output_dir=missing_signal_root.resolve() / spec.market)
+    return spec
+
+
+def _preflight_replay_signals(
+    specs: list[ModeSpec], sessions: set[date], *,
+    source_signal_ids: Mapping[tuple[str, str], str],
+    source_signal_artifacts: Mapping[tuple[str, str], Mapping[str, str]],
+    missing_signal_root: Path | None,
+) -> dict[str, Any]:
+    """Validate the entire selected decision set before any minute replay.
+
+    Freeze discovered artifacts too: the replay must not pick a later same-ID
+    generation after preflight. Prices and fills still require their own gates.
+    """
+    proofs, failures = [], []
+    for day in sorted(sessions):
+        for spec in specs:
+            key = (day.isoformat(), spec.market)
+            try:
+                _, summary_path, weights_path, summary, _ = _latest_valid_signal(
+                    _retained_or_missing_signal_spec(spec, day,
+                        source_signal_ids=source_signal_ids, missing_signal_root=missing_signal_root),
+                    day, preferred_signal_id=source_signal_ids.get(key),
+                    pinned_artifact=source_signal_artifacts.get(key))
+                _validate_replay_policy_summary(spec, day, summary)
+                signal_id = str(summary.get("signal_id") or "")
+                if not signal_id:
+                    raise ValueError("selected signal has no identity")
+                proof = {"session_date": key[0], "market": key[1], "signal_id": signal_id,
+                         "summary_path": str(summary_path.resolve()), "summary_sha256": _sha256(summary_path),
+                         "weights_path": str(weights_path.resolve()), "weights_sha256": _sha256(weights_path)}
+                if summary.get("counterfactual_signal_regeneration"):
+                    provenance = summary["counterfactual_open_provenance"]
+                    input_path = Path(provenance["input_path"]).resolve(strict=True)
+                    digest = _sha256(input_path)
+                    if digest != provenance["input_sha256"]:
+                        raise ValueError(f"selected signal open input hash changed: {input_path}")
+                    proof.update(open_input_path=str(input_path), open_input_sha256=digest)
+                proofs.append(proof)
+            except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                failures.append({"session_date": key[0], "market": key[1],
+                                 "error_type": type(exc).__name__, "error": str(exc)})
+    return {"contract": "exact_selected_signal_preflight_v1", "simulation_only": True,
+            "production_order_possible": False, "status": "rejected" if failures else "accepted_sources_only",
+            "expected_signals": len(sessions) * len(specs), "accepted_signals": len(proofs),
+            "artifacts": proofs, "failures": failures,
+            "execution_or_minute_coverage_accepted": False}
 
 
 def _resolve_source_signal_pins(
@@ -1940,6 +2143,15 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _classify_missing_intraday_paths(missing_symbols: set[str], *,
+                                     held_symbols: set[str],
+                                     official_no_trade_carries: set[str]) -> dict[str, list[str]]:
+    """Missing inventory marks block; never-filled targets remain visibly unfilled."""
+    unresolved = missing_symbols - official_no_trade_carries
+    return {"missing_held_symbols": sorted(unresolved & held_symbols),
+            "unavailable_unopened_entry_symbols": sorted(unresolved - held_symbols)}
+
+
 def _minute_bar_rows(
     roots: tuple[Path, ...],
     *,
@@ -1960,6 +2172,11 @@ def _minute_bar_rows(
         nonlocal unresolved, zero_volume_rows, unverified_volume_rows
         if not frame.height:
             return
+        source_text = str(source.resolve())
+        # A partition repeats its path for every minute. Resolve each distinct
+        # provenance path once per frame, not once per observation; recheck the
+        # mappings before committing the frame so redirects are still rejected.
+        resolved_sources: dict[str, Path] = {source_text: Path(source_text)}
         schema = set(frame.columns)
         volume_expr = (
             pl.col("volume_shares").cast(pl.Float64, strict=False)
@@ -1988,11 +2205,11 @@ def _minute_bar_rows(
             (
                 pl.col("_source_path")
                 if "_source_path" in schema
-                else pl.lit(str(source.resolve()))
+                else pl.lit(source_text)
             ).alias("_source_path"),
         )
         accepted_symbols: set[str] = set()
-        accepted_sources: dict[str, str] = {}
+        accepted_sources: dict[str, Path] = {}
         for row in normalized.iter_rows(named=True):
             symbol = str(row.get("symbol") or "")
             stamp = row.get("ts")
@@ -2038,11 +2255,12 @@ def _minute_bar_rows(
                 continue
             amount = _finite(row.get("Amount"))
             vwap = amount / volume if amount is not None and volume > 0.0 else close
-            row_source = Path(
-                str(row.get("_source_path") or source.resolve())
-            ).resolve()
+            raw_source = str(row.get("_source_path") or source_text)
+            row_source = resolved_sources.get(raw_source)
+            if row_source is None:
+                row_source = resolved_sources[raw_source] = Path(raw_source).resolve()
             selected_source = accepted_sources.get(symbol)
-            if selected_source is not None and Path(selected_source) != row_source:
+            if selected_source is not None and selected_source != row_source:
                 # Overlapping chunks are not merged. One symbol/session must
                 # have one deterministic source so an independent verifier can
                 # reproduce both prints and explicit no-print minutes.
@@ -2056,17 +2274,15 @@ def _minute_bar_rows(
                 "volume_shares": volume,
             }
             accepted_symbols.add(symbol)
-            accepted_sources.setdefault(symbol, str(row_source))
+            accepted_sources.setdefault(symbol, row_source)
+        if any(Path(raw).resolve() != path for raw, path in resolved_sources.items()):
+            raise ValueError("minute source path redirected during frame read")
         if accepted_symbols:
-            source_files_used.update(
-                Path(path).resolve() for path in accepted_sources.values()
-            )
+            source_files_used.update(accepted_sources.values())
             for symbol, path in accepted_sources.items():
-                source_symbols[Path(path).resolve()].add(symbol)
-            for key in set(accepted_sources.values()):
-                source_counts[key] = source_counts.get(key, 0) + sum(
-                    value == key for value in accepted_sources.values()
-                )
+                source_symbols[path].add(symbol)
+                key = str(path)
+                source_counts[key] = source_counts.get(key, 0) + 1
             unresolved -= accepted_symbols
 
     for root in roots:
@@ -2170,19 +2386,15 @@ def _local_first_minute_session_opens(
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Resolve only the first positive-volume right-labelled 09:01 Open."""
 
-    bars, receipt = _minute_bar_rows(
-        roots,
+    books, receipt = _local_0901_vwap_rows(
+        minute_roots=roots,
         trading_date=trading_date,
-        symbols=symbols,
+        symbols=sorted(symbols),
     )
-    first_minute = datetime.combine(
-        trading_date, time(9, 1), tzinfo=TAIPEI
-    ).isoformat(timespec="minutes")
     opens = {
-        symbol: float(row["open"])
-        for symbol, rows_by_minute in bars.items()
-        if (row := rows_by_minute.get(first_minute)) is not None
-        and _finite(row.get("open")) is not None
+        symbol: opening
+        for symbol, book in books.items()
+        if (opening := _finite(book.get("session_open_price_0900"))) is not None
     }
     return opens, {
         **receipt,
@@ -2670,17 +2882,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replay only this pinned market ID into an isolated state root; repeatable.",
     )
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="Validate all selected signal artifacts without building a paper ledger.")
+    parser.add_argument("--preflight-output", type=Path,
+                        help="Optional durable source-only preflight receipt, outside the live ledger.")
     parser.add_argument("--terminal-close-unlimited", action="store_true",
                         help="User-authorized paper close at official 13:30 price; no capacity or broker-fill claim.")
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--signal-root", type=Path, help="Isolated candidate signals, with one subdirectory per stable market ID.")
+    parser.add_argument("--missing-signal-root", type=Path,
+                        help="Supplement only absent source-ledger session IDs from isolated per-market counterfactual signals; retained decisions and artifact pins are unchanged.")
+    parser.add_argument("--supplemental-price-limit-dir", type=Path,
+                        help="Receipt-backed historical limits only when the canonical dated file is absent.")
     parser.add_argument(
         "--single-market-signal-dir",
         type=Path,
         help="Exact isolated signal directory when --only-market selects one mode.",
     )
     parser.add_argument("--local-only", action="store_true", help="Audit retained minute evidence without broker login or historical quota use.")
+    parser.add_argument("--accepted-repair-manifest", action="append", type=Path, default=[],
+                        help="Explicit applied, source-pinned repair receipt resolving original/repaired registrations; never choose the newest signal implicitly.")
     parser.add_argument(
         "--price-limit-dir",
         type=Path,
@@ -2876,6 +3098,10 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
+    if args.missing_signal_root is not None and (
+            args.source_ledger_dir is None or args.signal_root is not None
+            or args.single_market_signal_dir is not None):
+        raise ValueError("--missing-signal-root requires --source-ledger-dir and cannot replace signal roots")
     if args.historical_full_fill_0901 and (
         args.include_current_open_session or end >= datetime.now(TAIPEI).date()
     ):
@@ -3008,7 +3234,6 @@ def main() -> None:
         args.tw_public_dir.resolve(),
         official_sessions=set(official_sessions),
     )
-    engine = TwDayTradeSimulationEngine(state_dir)
     source_signal_ids: dict[tuple[str, str], str] = {}
     source_signal_artifacts: dict[tuple[str, str], dict[str, str]] = {}
     source_ledger_provenance: dict[str, Any] | None = None
@@ -3017,6 +3242,7 @@ def main() -> None:
             args.source_ledger_dir.resolve(),
             start_date=start,
             end_date=end,
+            accepted_repair_manifests=tuple(args.accepted_repair_manifest),
         )
         expected_signal_keys = {
             (day.isoformat(), spec.market)
@@ -3051,6 +3277,7 @@ def main() -> None:
                 args.source_ledger_dir.resolve(),
                 {key: value for key, value in source_signal_ids.items()
                  if key in expected_signal_keys},
+                accepted_repair_manifests=tuple(args.accepted_repair_manifest),
             )
             for (session, market), proof in source_signal_artifacts.items():
                 _validate_replay_policy_summary(
@@ -3067,6 +3294,23 @@ def main() -> None:
             "--allow-unpinned-market and --replace-signal-market require "
             "--source-ledger-dir"
         )
+    preflight = _preflight_replay_signals(
+        specs, set(official_sessions), source_signal_ids=source_signal_ids,
+        source_signal_artifacts=source_signal_artifacts, missing_signal_root=args.missing_signal_root)
+    preflight_output = (args.preflight_output.resolve() if args.preflight_output else
+                        None if args.preflight_only else state_dir / "signal_preflight.json")
+    if preflight_output is not None:
+        if args.source_ledger_dir is not None and preflight_output.is_relative_to(args.source_ledger_dir.resolve()):
+            raise ValueError("preflight output must not write into the source ledger")
+        _atomic_json(preflight_output, preflight)
+    print(json.dumps({key: value for key, value in preflight.items() if key != "artifacts"}, ensure_ascii=False), flush=True)
+    if preflight["failures"]:
+        raise ValueError(f"signal preflight rejected {len(preflight['failures'])} artifacts")
+    if args.preflight_only:
+        return
+    preflight_artifacts = {(row["session_date"], row["market"]): row for row in preflight["artifacts"]}
+    source_signal_artifacts = {**source_signal_artifacts, **preflight_artifacts}
+    engine = TwDayTradeSimulationEngine(state_dir)
     prior_paper_fills: dict[tuple[str, str, str], dict[str, Any]] = {}
     prior_paper_fill_provenance: dict[str, Any] | None = None
     if args.historical_full_fill_0901:
@@ -3143,6 +3387,7 @@ def main() -> None:
     receipt: dict[str, Any] = {
         "schema_version": 3,
         "created_at": current.isoformat(timespec="seconds"),
+        "producer_code_sha256": _sha256(Path(__file__).resolve()),
         "simulation_only": True,
         "production_order_possible": False,
         "prior_paper_fill_provenance": prior_paper_fill_provenance,
@@ -3239,7 +3484,11 @@ def main() -> None:
             "source_signal_time": "retained separately for provenance",
         },
         "state_dir": str(state_dir),
+        "missing_signal_root": str(args.missing_signal_root.resolve()) if args.missing_signal_root else None,
+        "supplemental_price_limit_dir": str(args.supplemental_price_limit_dir.resolve()) if args.supplemental_price_limit_dir else None,
         "source_signal_ledger": source_ledger_provenance,
+        "signal_preflight": {"path": str(preflight_output), "sha256": _sha256(preflight_output),
+                             "accepted_signals": preflight["accepted_signals"]},
         "retained_benchmark_state": benchmark_state_provenance,
         "retained_benchmark_history": benchmark_history_provenance,
         "official_daily_aggregate_sources": {
@@ -3284,8 +3533,11 @@ def main() -> None:
             day += timedelta(days=1)
             continue
         limit_path = (args.price_limit_dir / f"{day.isoformat()}.parquet").resolve()
+        if not limit_path.is_file() and args.supplemental_price_limit_dir is not None:
+            limit_path = (args.supplemental_price_limit_dir / f"{day.isoformat()}.parquet").resolve()
         if not limit_path.is_file():
             raise FileNotFoundError(limit_path)
+        session_started = time_module.perf_counter()
         limits = _load_price_limits(limit_path)
         session_receipt: dict[str, Any] = {
             "session_date": day.isoformat(),
@@ -3297,11 +3549,12 @@ def main() -> None:
         }
         selected = {
             spec.market: _latest_valid_signal(
-                spec,
+                _retained_or_missing_signal_spec(spec, day, source_signal_ids=source_signal_ids,
+                                                missing_signal_root=args.missing_signal_root),
                 day,
                 preferred_signal_id=source_signal_ids.get(
                     (day.isoformat(), spec.market)
-                ),
+                ) or preflight_artifacts[(day.isoformat(), spec.market)]["signal_id"],
                 pinned_artifact=source_signal_artifacts.get((day.isoformat(), spec.market)),
             )
             for spec in specs
@@ -3949,7 +4202,7 @@ def main() -> None:
                 raise RuntimeError(f"replay entry failed closed: {day} {spec.market}: {result}")
 
         if should_close and args.replay_intraday_kbars:
-            position_symbols = {
+            held_symbols = {
                 str(position.get("symbol") or "")
                 for market in specs_by_market
                 for position in (
@@ -3958,6 +4211,7 @@ def main() -> None:
                 ).values()
                 if int(position.get("signed_shares") or 0) != 0
             }
+            position_symbols = set(held_symbols)
             position_symbols.update(
                 str(symbol)
                 for market in specs_by_market
@@ -3975,7 +4229,7 @@ def main() -> None:
             )
             no_trade_carries = {
                 symbol for symbol in minute_coverage["missing_symbols"]
-                if symbol in official_no_trade_symbols and all(
+                if symbol in held_symbols and symbol in official_no_trade_symbols and all(
                     str(p.get("entry_at") or "")[:10] < day.isoformat()
                     and p.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT
                     for market in specs_by_market
@@ -3983,12 +4237,20 @@ def main() -> None:
                     if p.get("symbol") == symbol and int(p.get("signed_shares") or 0)
                 )
             }
-            unresolved_paths = set(minute_coverage["missing_symbols"]) - no_trade_carries
+            missing_paths = _classify_missing_intraday_paths(set(minute_coverage["missing_symbols"]),
+                held_symbols=held_symbols, official_no_trade_carries=no_trade_carries)
+            minute_coverage.update(missing_paths)
             minute_coverage["official_no_trade_carried_symbols"] = sorted(no_trade_carries)
-            if unresolved_paths:
+            if missing_paths["missing_held_symbols"]:
+                session_receipt["intraday_replay"] = minute_coverage
+                session_receipt["close"] = {"status": "blocked_missing_held_minute_path"}
+                receipt["failure"] = {"session_date": day.isoformat(),
+                                      "missing_held_symbols": missing_paths["missing_held_symbols"]}
+                receipt["sessions"].append(session_receipt)
+                _atomic_json(state_dir / "rebuild_receipt.json", receipt)
                 raise RuntimeError(
                     f"missing retained minute path for {day}: "
-                    f"{sorted(unresolved_paths)[:30]}"
+                    f"{missing_paths['missing_held_symbols'][:30]}"
                 )
             session_receipt["intraday_replay"] = {
                 **minute_coverage,
@@ -4139,6 +4401,11 @@ def main() -> None:
         # A failed later day must retain its completed-prefix audit. Never
         # restart a failed replay by pretending an unresolved carry is flat.
         _atomic_json(state_dir / "rebuild_receipt.json", receipt)
+        print(json.dumps({"event": "replay_session_complete", "session_date": day.isoformat(),
+            "completed_sessions": len(receipt["sessions"]), "expected_sessions": len(official_sessions),
+            "modes": len(specs), "close_status": session_receipt["close"]["status"],
+            "rebuild_wall_ms": round((time_module.perf_counter() - session_started) * 1000, 3),
+            "not_live_execution_latency": True}), flush=True)
         day += timedelta(days=1)
 
     _atomic_json(state_dir / "rebuild_receipt.json", receipt)

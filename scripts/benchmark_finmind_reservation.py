@@ -19,30 +19,15 @@ from unittest.mock import patch
 
 from downloader import download_finmind_complement as worker
 from downloader import finmind_scheduling as scheduling
-from downloader import finmind_runtime, finmind_history_order
+from downloader import finmind_runtime, finmind_history_order, finmind_corrections
 from downloader.artifact_io import atomic_write_json
 from scripts.benchmark_finmind_status import AGGREGATE_SQL, claim_release, digest, file_sha
-
-RELEASE_RESERVE_INDEX = "idx_finmind_release_reserve_covering"
-RELEASE_RESERVE_COLUMNS = ("priority", "state", "next_attempt_at_utc", "dataset", "kind",
-                           "data_id", "error_code", "rows")
-RELEASE_RESERVE_PREDICATE = "priority=0 AND kind!='derived'"
-
-
-def ensure_release_reserve_index(connection: sqlite3.Connection) -> None:
-    """Experimental physical projection on private fixtures only, never native."""
-    connection.execute(f"CREATE INDEX IF NOT EXISTS {RELEASE_RESERVE_INDEX} "
-                       f"ON tasks({','.join(RELEASE_RESERVE_COLUMNS)}) WHERE {RELEASE_RESERVE_PREDICATE}")
-
-
-def release_reserve_index(connection: sqlite3.Connection) -> str:
-    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
-                             (RELEASE_RESERVE_INDEX,)).fetchone()
-    expected = (f"CREATE INDEX {RELEASE_RESERVE_INDEX} "
-                f"ON tasks({','.join(RELEASE_RESERVE_COLUMNS)}) WHERE {RELEASE_RESERVE_PREDICATE}")
-    if not row or not isinstance(row[0], str) or row[0].split() != expected.split():
-        return ""
-    return f" INDEXED BY {RELEASE_RESERVE_INDEX}"
+from downloader.finmind_queue_indexes import (
+    RELEASE_RESERVE_INDEX, RELEASE_RESERVE_COLUMNS, RELEASE_RESERVE_PREDICATE,
+    ensure_release_reserve_index, release_reserve_index,
+    US_PUBLICATION_INDEX, US_PUBLICATION_PREDICATE, ensure_us_publication_index,
+    PERIODIC_INDEX, PERIODIC_PREDICATE, ensure_periodic_index,
+)
 
 
 def guarded_planner():
@@ -127,6 +112,12 @@ def main(argv=None):
                         help="also measure the same indexed fixture with automatic query planning")
     parser.add_argument("--prepared-from", type=Path,
                         help="reuse the retained private fixture bound to this earlier parity receipt")
+    parser.add_argument('--include-us-publication-recheck', action='store_true',
+                        help='include the complete early-session repair query, preserving its original threshold')
+    parser.add_argument('--include-periodic-preparation', action='store_true',
+                        help='also compare the original full-queue periodic selection with its canonical indexed query')
+    parser.add_argument('--include-correction-candidates', action='store_true',
+                        help='compare the original whole-dataset correction scan with necessary SQL bounds')
     args = parser.parse_args(argv)
     if (args.fixture.exists() != bool(args.prepared_from)) or args.output.exists():
         parser.error("new fixture/output required; retained measurements are never overwritten")
@@ -153,7 +144,7 @@ def main(argv=None):
                   Path(__file__).resolve().parents[1] / "downloader/finmind_queue_indexes.py",
                   *(Path(module.__file__) for module in (worker.supplemental, worker.retry_cohorts,
                     worker.retry_policy, worker.object_pipeline, worker.json_pipeline,
-                    finmind_runtime, finmind_history_order)))
+                    finmind_runtime, finmind_history_order, finmind_corrections)))
     code_before = {str(path.resolve()): file_sha(path) for path in code_files}
     status = scheduling._read_metadata(source / "complement/status.json")
     current_ids = worker._snapshot_ids(source / "complement", "TaiwanStockInfo", "stock_id")
@@ -186,6 +177,15 @@ def main(argv=None):
                                                      "sha256_before_setup": file_sha(path)}
     context = {"fixed_clock": now.isoformat(), "current_stock_ids": current_ids,
                "official_delisted_ids": sorted(delisted_ids), "captured_live_status": status}
+    correction_requests = []
+    if args.include_correction_candidates:
+        plan, plan_sha = finmind_corrections._load_plan(source / 'complement', 'complement')
+        correction_requests = [request for request in finmind_corrections._expanded_requests(plan)
+                               if request['owner'] == 'complement']
+        if not correction_requests:
+            raise ValueError('nonempty_real_correction_plan_required')
+        context['correction_plan_sha256'] = plan_sha
+        context['correction_requests'] = correction_requests
     atomic_write_json(args.fixture / f"{args.output.stem}-context.json", context)
     connections = {}
     with ExitStack() as stack:
@@ -200,6 +200,10 @@ def main(argv=None):
                 # Source queues remain untouched. A future recheck reconstructs
                 # only this candidate's absent/present physical index surface.
                 connection.execute(f"DROP INDEX IF EXISTS {RELEASE_RESERVE_INDEX}")
+                if args.include_us_publication_recheck:
+                    connection.execute(f"DROP INDEX IF EXISTS {US_PUBLICATION_INDEX}")
+                if args.include_periodic_preparation:
+                    connection.execute(f"DROP INDEX IF EXISTS {PERIODIC_INDEX}")
                 connection.execute("PRAGMA journal_mode=WAL").fetchall()
                 # Match the native pipeline's claim table setup without
                 # recovering/removing another work item's existing claim.
@@ -214,6 +218,10 @@ def main(argv=None):
                     allocated = connection.execute("PRAGMA page_count").fetchone()[0] - connection.execute("PRAGMA freelist_count").fetchone()[0]
                     started, cpu = time.perf_counter(), time.process_time()
                     ensure_release_reserve_index(connection)
+                    if args.include_us_publication_recheck:
+                        ensure_us_publication_index(connection)
+                    if args.include_periodic_preparation:
+                        ensure_periodic_index(connection)
                     finmind_runtime.optimize_queue(connection)
                     connection.commit()
                     setup[owner] = {"wall_seconds": time.perf_counter() - started,
@@ -223,6 +231,12 @@ def main(argv=None):
                                       * connection.execute("PRAGMA page_size").fetchone()[0],
                                     "indexed_rows": connection.execute("SELECT count(*) FROM tasks WHERE "
                                                      + RELEASE_RESERVE_PREDICATE).fetchone()[0]}
+                    if args.include_us_publication_recheck:
+                        setup[owner]['publication_indexed_rows'] = connection.execute(
+                            'SELECT COUNT(*) FROM tasks WHERE ' + US_PUBLICATION_PREDICATE).fetchone()[0]
+                    if args.include_periodic_preparation:
+                        setup[owner]['periodic_indexed_rows'] = connection.execute(
+                            'SELECT COUNT(*) FROM tasks WHERE ' + PERIODIC_PREDICATE).fetchone()[0]
         old = connections["baseline"]["complement"]
         task_groups = {
             "history": [worker.Task(*row) for row in old.execute(
@@ -256,17 +270,75 @@ def main(argv=None):
                 reservation_wall, reservation_cpu = time.perf_counter() - wall, time.process_time() - cpu
                 connection = connections["candidate" if name == "automatic" else name]["complement"]
                 changes = connection.total_changes
+                publication_rows = None
+                publication_seconds = None
+                periodic_rows = None
+                periodic_seconds = None
+                correction_rows = None
+                correction_seconds = None
+                if args.include_us_publication_recheck:
+                    source = worker.supplemental.SOURCES['USStockPriceMinute']
+                    publication_started = time.perf_counter()
+                    if name == 'baseline':
+                        publication_rows = connection.execute(
+                            "SELECT data_id,partition FROM tasks WHERE dataset=? AND state='complete' AND rows>0 "
+                            'AND julianday(last_attempt_at_utc)<julianday(partition)+1+(?-8)/24.0+?/1440.0',
+                            ('USStockPriceMinute', source.release_hour, source.release_minute)).fetchall()
+                    else:
+                        publication_rows = worker.supplemental.unfinalized_us_observations(
+                            connection, 'USStockPriceMinute', source)
+                    publication_rows.sort()
+                    publication_seconds = time.perf_counter() - publication_started
+                if args.include_periodic_preparation:
+                    periodic_started = time.perf_counter()
+                    if name == 'baseline':
+                        periodic_rows = connection.execute(
+                            'SELECT dataset,data_id,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc '
+                            "FROM tasks WHERE state IN ('complete','observed_empty') "
+                            "AND (kind='snapshot' OR (kind='year' AND partition=?))",
+                            (str(now.astimezone(scheduling.TAIPEI).year),)).fetchall()
+                    else:
+                        periodic_rows = worker._periodic_refresh_tasks(connection, now.astimezone(scheduling.TAIPEI).year)
+                    periodic_rows.sort()
+                    periodic_seconds = time.perf_counter() - periodic_started
+                if args.include_correction_candidates:
+                    correction_started = time.perf_counter()
+                    correction_rows = []
+                    for request in correction_requests:
+                        if name == 'baseline':
+                            cursor = connection.execute('SELECT * FROM tasks WHERE dataset=?', (request['dataset'],))
+                            columns = [column[0] for column in cursor.description]
+                            tasks = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                            matched = [task for task in tasks if finmind_corrections._matches(task, request, now)]
+                        else:
+                            matched = finmind_corrections._matching_tasks(connection, request, now)
+                        matched.sort(key=lambda task: (task['dataset'], task['data_id'], task['partition']))
+                        correction_rows.append(matched)
+                    correction_seconds = time.perf_counter() - correction_started
                 result = worker._status(connection, variant_paths[name] / "complement", state="running",
                     last=status.get("last_task"), delegated=frozenset(status.get("delegated_to_sponsor", ())))
                 elapsed, used = time.perf_counter() - wall, time.process_time() - cpu
-                parity = digest({"reservation": reservation, "status": result})
+                complete = {"reservation": reservation, "status": result}
+                if publication_rows is not None:
+                    complete['publication_rechecks'] = publication_rows
+                if periodic_rows is not None:
+                    complete['periodic_refreshes'] = periodic_rows
+                if correction_rows is not None:
+                    complete['correction_candidates'] = correction_rows
+                parity = digest(complete)
                 reference = reference or parity
                 if parity != reference or connection.total_changes != changes or reservation["queue_errors"]:
                     raise ValueError("full_control_output_or_readonly_contract_changed")
                 atomic_write_json(args.fixture / f"{args.output.stem}-{name}-output-{repeat}-{len(trials)}.json",
-                                  {"reservation": reservation, "status": result})
+                                  complete)
                 trials.append({"variant": name, "repeat": repeat, "wall_seconds": elapsed, "cpu_seconds": used,
                     "reservation_wall_seconds": reservation_wall, "reservation_cpu_seconds": reservation_cpu,
+                    "publication_recheck_seconds": publication_seconds,
+                    "publication_recheck_rows": len(publication_rows) if publication_rows is not None else None,
+                    "periodic_preparation_seconds": periodic_seconds,
+                    "periodic_refresh_rows": len(periodic_rows) if periodic_rows is not None else None,
+                    "correction_candidate_seconds": correction_seconds,
+                    "correction_candidate_rows": sum(map(len, correction_rows)) if correction_rows is not None else None,
                     "whole_output_sha256": parity, "queue_changes": connection.total_changes - changes})
             for name in (("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")):
                 for group, tasks in task_groups.items():
@@ -275,6 +347,12 @@ def main(argv=None):
         if code_before != {str(path.resolve()): file_sha(path) for path in code_files}:
             raise ValueError("code_changed_during_measurement")
         keys = ("wall_seconds", "cpu_seconds", "reservation_wall_seconds", "reservation_cpu_seconds")
+        if args.include_us_publication_recheck:
+            keys += ('publication_recheck_seconds',)
+        if args.include_periodic_preparation:
+            keys += ('periodic_preparation_seconds',)
+        if args.include_correction_candidates:
+            keys += ('correction_candidate_seconds',)
         medians = {name: {key: statistics.median(row[key] for row in trials if row["variant"] == name)
                          for key in keys} for name in variants}
         plans = {name: {owner: [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + AGGREGATE_SQL)]
@@ -289,6 +367,9 @@ def main(argv=None):
             "whole_output_sha256": reference,
             "control_wall_improvement_observed": medians["candidate"]["wall_seconds"] < medians["baseline"]["wall_seconds"],
             "source_workflow_unchanged": True}
+        report['includes_us_publication_recheck'] = args.include_us_publication_recheck
+        report['includes_periodic_preparation'] = args.include_periodic_preparation
+        report['includes_correction_candidates'] = args.include_correction_candidates
         report["prepared_from"] = str(args.prepared_from.resolve()) if args.prepared_from else None
         report["captured_context"] = str((args.fixture / f"{args.output.stem}-context.json").resolve())
         atomic_write_json(args.output, report)

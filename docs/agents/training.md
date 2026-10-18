@@ -26,6 +26,15 @@ worker before launch. Scope and commands: [Vast training rescue](../vast_trainin
   ordered symbols are authoritative; `symbol_position` is only a capacity hint
   and `daily_weights` is a legacy fallback. A model/data symbol-contract
   disagreement must fail closed.
+- Checkpoints may opt into the self-contained
+  `stockagent_checkpoint_manifest_json_v1` storage envelope. The canonical
+  `stockagent.training.runtime.load_checkpoint` verifies its SHA256 and restores
+  the original manifest before compatibility, rescue, inference or audit use;
+  native older manifests remain supported. Do not interpret an encoded
+  `experiment_manifest` directly from `torch.load`. The optional bounded CPU
+  transport preserves tensor values, aliases, dtypes and optimizer/RNG state;
+  atomic publication, fsync and safe CPU readback still apply. See
+  [the measured checkpoint investigation](../training_quality_diagnosis_2026-10-15.md).
 - An exact optimizer resume must restore persistent input-normalization buffers
   from the checkpoint together with model weights. Same-feature pretrained
   transfer may intentionally retain source RMS scales; never overwrite those
@@ -33,6 +42,12 @@ worker before launch. Scope and commands: [Vast training rescue](../vast_trainin
   effective scales separately. A historical resumed ablation with changed RMS
   is a confounded trajectory, not a clean architecture-only comparison. See
   `docs/tw_day_trade_v8_ofat_analysis_2026-09-23.md`.
+- Exact-feature FinancialTransformer transfer also supports a source and target
+  without a continuous-feature bottleneck. Require identical ordered feature
+  names and compatible state, and copy persistent RMS with the learned weights;
+  do not insert a wide identity adapter solely to satisfy a loader. Guard the
+  target exact account at epoch zero and rebuild the optimizer. See
+  [the fold11 refinement study](../training_quality_diagnosis_2026-10-15.md).
 - `day_trade_training_annual_episodes` and `day_trade_sub_lot_recovery` are
   opt-in research training contracts, each requiring a new artifact root and
   checkpoint fingerprint. Annual accounts reset only at the configured annual

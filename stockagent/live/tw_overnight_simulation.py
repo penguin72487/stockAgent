@@ -328,13 +328,11 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         *,
         now: datetime | None = None,
         errors: Mapping[str, str] | None = None,
+        configured_markets: Sequence[str] | None = None,
     ) -> None:
         observed = _now_taipei(now)
-        self.state["enabled_markets"] = [str(spec.market) for spec in specs]
-        enabled = set(self.state["enabled_markets"])
-        for market, existing in (self.state.get("modes") or {}).items():
-            if isinstance(existing, dict):
-                existing["configured_enabled"] = str(market) in enabled
+        self._update_configured_market_roster(specs, configured_markets=configured_markets,
+                                             errors=errors)
         for spec in specs:
             mode = self._mode(spec)
             mode["configured_enabled"] = True
@@ -1224,7 +1222,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
             "critical"
             if any(value.startswith("critical") for value in statuses)
             else "blocked"
-            if any(value.startswith("blocked") for value in statuses)
+            if self.state.get("configuration_errors") or any(value.startswith("blocked") for value in statuses)
             else "active"
             if any(
                 value in {

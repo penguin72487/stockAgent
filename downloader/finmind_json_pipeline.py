@@ -13,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -20,9 +21,11 @@ import uuid
 import pyarrow as pa
 import requests
 from downloader.common import RateLimitWaitCancelled
+from downloader.artifact_io import atomic_write_json
 
 CONFIG = Path(__file__).resolve().parents[1] / 'configs/finmind_json_pipeline.json'
-CONTRACT_VERSION = 5
+CONTRACT_VERSION = 12  # Stable WAL lifetime and real HTTP counting require fresh capacity.
+LOCAL_PREFLIGHT_ERRORS = frozenset({'local_traffic_busy', 'local_traffic_unavailable'})
 
 
 def settings(path=CONFIG, *, max_requests_per_cycle=None):
@@ -45,10 +48,11 @@ def settings(path=CONFIG, *, max_requests_per_cycle=None):
 
 class Sessions:
     """One keep-alive session per executor thread; close after executor drain."""
-    def __init__(self):
+    def __init__(self, *, traffic_root=None):
         self.local = threading.local()
         self.sessions = []
         self.lock = threading.Lock()
+        self.traffic_root, self.traffic_anchor = traffic_root, None
 
     def get(self):
         if not hasattr(self.local, 'session'):
@@ -58,11 +62,33 @@ class Sessions:
         return self.local.session
 
     def __enter__(self):
+        if self.traffic_root is not None:
+            path = (self.traffic_root / 'request_traffic.sqlite3').resolve()
+            if path.is_file():
+                try:
+                    # Keep this existing WAL open while requests run. Repeated
+                    # last-close checkpoints can race new writers/readers even
+                    # after the per-process write gate. No read transaction,
+                    # new ledger, row mutation or relaxed fsync is introduced.
+                    self.traffic_anchor = sqlite3.connect(path.as_uri()+'?mode=rw', uri=True, timeout=5)
+                    self.traffic_anchor.execute('PRAGMA query_only=ON')
+                    self.traffic_anchor.execute('SELECT 1 FROM requests LIMIT 1').fetchone()
+                except sqlite3.Error:
+                    if self.traffic_anchor is not None:
+                        self.traffic_anchor.close()
+                        self.traffic_anchor = None
+                    # Optional lifetime optimization, never an accounting grant.
+                    # The request's canonical durable preflight remains required.
         return self
 
     def __exit__(self, *args):
-        for session in self.sessions:
-            session.close()
+        try:
+            for session in self.sessions:
+                session.close()
+        finally:
+            if self.traffic_anchor is not None:
+                self.traffic_anchor.close()
+                self.traffic_anchor = None
 
 
 def recover_claims(connection):
@@ -182,7 +208,8 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
     workers = min(config['download_workers'], config['max_buffered_response_bytes'] // worker.BULK_MAX_RESPONSE_BYTES)
     started = time.monotonic()
     jobs = {}
-    attempts = accepted = nonempty = rows_total = failures = cancelled = 0
+    attempts = accepted = nonempty = rows_total = failures = cancelled = preflight_holds = 0
+    failure_codes = {}
     stop = threading.Event()
     cancellable = _CancellableLimiter(limiter, stop)
     last = pause = None
@@ -210,17 +237,17 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
             available = 0
         while not pause and available > 0 and attempts < limit and len(jobs) < workers:
             candidate = initial or worker._next_task(connection, stamp, delegated=delegated,
-                                                      datasets=datasets, advance_cursor=True, incremental_only=due)
+                                                      datasets=datasets, incremental_only=due)
             initial = None
             if not due and candidate is None and worker._refill_current_history(connection, root, stamp,
                                                                     delegated=delegated, datasets=datasets):
                 candidate = worker._next_task(connection, stamp, delegated=delegated,
-                                               datasets=datasets, advance_cursor=True)
+                                               datasets=datasets)
             # The canonical selector is still the authority for preemptions,
             # nine-stage ordering, repair and cooled/terminal states.
             if candidate is None or candidate.dataset != current.dataset or not supported(connection, candidate):
                 break
-            _claim(connection, candidate)
+            _claim(connection, candidate, advance_cursor=True)
             try:
                 future = executor.submit(_fetch, sessions, cancellable, root, candidate, token,
                                          stamp.astimezone(worker.TAIPEI).date())
@@ -242,7 +269,10 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                 context = correction_context(connection, task)
                 receipt = worker._store(root, task, rows, worker._now(), request_metadata=metadata,
                                         **({'correction': context} if context else {}))
-                worker._save_result(connection, task, receipt, worker._now())
+                # The result and claim release below commit together. Keep
+                # durable source/receipt publication and recovery unchanged,
+                # without two back-to-back queue fsyncs for one finalization.
+                worker._save_result(connection, task, receipt, worker._now(), commit=False)
                 accepted += 1
                 nonempty += int(receipt['rows'] > 0)
                 rows_total += receipt['rows']
@@ -255,27 +285,48 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                 cancelled += 1
             except (worker.SourceError, OSError, ValueError, pa.ArrowException) as exception:
                 error = worker._publication_error(exception)
-                worker._save_failure(connection, task, error, worker._now())
+                worker._save_failure(connection, task, error, worker._now(), commit=False)
                 failures += 1
+                failure_codes[error.code] = failure_codes.get(error.code, 0) + 1
+                if error.code in LOCAL_PREFLIGHT_ERRORS:
+                    preflight_holds += 1  # The durable ledger failed before HTTP.
                 last = {'dataset': task.dataset, 'data_id': task.data_id, 'partition': task.partition,
                         'status': 'failed', 'error_code': error.code,
                         'observed_at_utc': worker._iso(worker._now())}
-                if error.code in {'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'}:
+                if error.code in {'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'} | LOCAL_PREFLIGHT_ERRORS:
                     pause = error.code
                     stop.set()
             finally:
                 _release(connection, task)
+            # Refill one vacated slot before publishing another completed
+            # response. A completion burst must not drain every socket behind
+            # synchronous publication. Unconsumed futures remain in jobs, so
+            # the same byte bound includes all retained response bodies.
+            break
         if time.monotonic() >= next_heartbeat:
             heartbeat(next(iter(jobs.values()), None), last)
             next_heartbeat = time.monotonic() + worker.STATUS_INTERVAL_SECONDS
     elapsed = time.monotonic() - started
-    if accepted == attempts and accepted >= 2 and not failures and not cancelled:
+    calibratable = accepted == attempts and accepted >= 2 and not failures and not cancelled
+    # A batch without an ETA sample still needs observable real outcomes. Do
+    # not turn cancellation, failure or an incomplete cycle into capacity.
+    atomic_write_json(root / 'json_pipeline_last.json', {
+        'contract_version': CONTRACT_VERSION, 'observed_at_utc': datetime.now(UTC).isoformat(),
+        'configuration_sha256': config['configuration_sha256'], 'dataset': current.dataset,
+        'download_workers': workers, 'claimed_attempts': attempts, 'cancelled_before_request': cancelled,
+        'calls': attempts-cancelled-preflight_holds, 'accepted_requests': accepted, 'nonempty_requests': nonempty,
+        'local_preflight_holds': preflight_holds,
+        'rows': rows_total, 'failed_tasks': failures, 'state': pause, 'elapsed_seconds': elapsed,
+        'failure_codes': failure_codes,
+        'batch_capacity_candidate': calibratable, 'whole_cycle_cost_verified': False,
+    })
+    if calibratable:
         connection.execute('INSERT INTO finmind_json_pipeline_samples '
                            '(dataset,requests,seconds,rows,nonempty_requests,configuration_sha256,observed_at_utc) '
                            'VALUES (?,?,?,?,?,?,?)', (current.dataset, accepted, elapsed, rows_total, nonempty,
                            config['configuration_sha256'], datetime.now(UTC).isoformat()))
         connection.commit()
-    return {'calls': attempts - cancelled, 'last': last, 'state': pause, 'seconds': elapsed,
+    return {'calls': attempts - cancelled - preflight_holds, 'last': last, 'state': pause, 'seconds': elapsed,
             'accepted_requests': accepted, 'nonempty_requests': nonempty, 'failed_tasks': failures}
 
 

@@ -11,6 +11,91 @@ from downloader import download_finmind_complement as worker
 from scripts import reload_finmind_at_idle as reload
 
 
+def preparation_threads(*extra):
+    return [{'thread_name': 'MainThread', 'frames': [
+        {'name': '_populate', 'filename': '/repo/downloader/download_finmind_complement.py'},
+        {'name': 'run_once', 'filename': '/repo/downloader/download_finmind_complement.py'},
+        *({'name': name} for name in extra)]}]
+
+
+def test_preparation_stack_is_not_an_idle_flag_or_live_batch():
+    assert reload.preparation_stack(preparation_threads())
+    assert not reload.preparation_stack([])
+    assert not reload.preparation_stack(preparation_threads('run_batch'))
+    assert not reload.preparation_stack(preparation_threads() + [
+        {'thread_name': 'fetch', 'frames': [{'name': '_request_independent'}]}])
+    foreign = preparation_threads()
+    foreign[0]['frames'][1]['filename'] = '/foreign.py'
+    assert not reload.preparation_stack(foreign)
+
+
+def test_preparation_guard_rechecks_frozen_claims_and_always_thaws(tmp_path, monkeypatch):
+    import sqlite3
+    root = tmp_path
+    (root / 'status.json').write_text(json.dumps({'last_task': {'rows': 390}}))
+    with sqlite3.connect(root / 'queue.sqlite3') as conn:
+        conn.execute('CREATE TABLE finmind_object_prefetch_claims(id)')
+        conn.execute('CREATE TABLE complement_year_batch_claims(id)')
+    calls = []
+    monkeypatch.setattr(reload, '_preparation_pid', lambda: 123)
+    monkeypatch.setattr(reload, '_stacks', lambda _: preparation_threads())
+    monkeypatch.setattr(reload, 'identity', lambda _: {'InvocationID': 'one'})
+    monkeypatch.setattr(reload.subprocess, 'run', lambda args, **kw: calls.append(args))
+    with pytest.raises(RuntimeError, match='fixture'):
+        with reload.preparation_boundary(root, {'InvocationID': 'one'}) as proof:
+            assert proof['mode'] == 'frozen_drained_preparation'
+            assert set(proof['claims'].values()) == {0}
+            raise RuntimeError('fixture')
+    assert [args[1] for args in calls] == ['freeze', 'thaw']
+    with sqlite3.connect(root / 'queue.sqlite3') as conn:
+        conn.execute('INSERT INTO finmind_object_prefetch_claims VALUES (1)')
+    calls.clear()
+    with reload.preparation_boundary(root, {'InvocationID': 'one'}) as proof:
+        assert proof is None
+        assert [args[1] for args in calls] == ['freeze', 'thaw']
+
+
+def test_failed_freeze_is_still_thawed(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(reload, '_preparation_pid', lambda: 123)
+    monkeypatch.setattr(reload, '_stacks', lambda _: preparation_threads())
+    def run(args, **kw):
+        calls.append(args[1])
+        if args[1] == 'freeze':
+            raise subprocess.TimeoutExpired(args, 5)
+    monkeypatch.setattr(reload.subprocess, 'run', run)
+    with pytest.raises(subprocess.TimeoutExpired):
+        with reload.preparation_boundary(tmp_path, {}):
+            pytest.fail('No proof on freeze failure')
+    assert calls == ['freeze', 'thaw']
+
+
+def test_frozen_termination_pins_process_and_queues_signal_before_thaw(tmp_path, monkeypatch):
+    import signal
+    calls = []
+    monkeypatch.setattr(reload, '_pidfd_open', lambda pid: calls.append(('pin', pid)) or 99)
+    monkeypatch.setattr(reload.os, 'close', lambda fd: calls.append(('close', fd)))
+    monkeypatch.setattr(reload, '_pidfd_signal', lambda fd, sig: calls.append(('signal', fd, sig)))
+    monkeypatch.setattr(reload.subprocess, 'run', lambda args, **kw: calls.append(('systemctl', args[1])))
+    monkeypatch.setattr(Path, 'read_text', lambda *_a, **_kw: 'SigIgn:\t0\nSigCgt:\t2\n')
+    proof = {'mode': 'frozen_drained_preparation', 'pid': 123, 'claims': {'object': 0, 'year': 0}}
+    reload.terminate_frozen_preparation(proof)
+    assert calls == [('pin', 123), ('signal', 99, signal.SIGTERM), ('close', 99), ('systemctl', 'thaw')]
+    monkeypatch.setattr(Path, 'read_text', lambda *_a, **_kw: 'SigIgn:\t0\nSigCgt:\t4000\n')
+    calls.clear()
+    with pytest.raises(ValueError, match='nondefault_sigterm'):
+        reload.terminate_frozen_preparation(proof)
+    assert calls == [('pin', 123), ('close', 99)]
+
+
+def test_pidfd_native_or_libc_binding_checks_own_process_without_signalling():
+    descriptor = reload._pidfd_open(os.getpid())
+    try:
+        reload._pidfd_signal(descriptor, 0)  # Existence/permission check only.
+    finally:
+        os.close(descriptor)
+
+
 def test_direct_cli_help_works_outside_repository_without_pythonpath(tmp_path):
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)

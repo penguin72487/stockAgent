@@ -7,6 +7,7 @@ execution; complete diagnostic histories are rebuilt at the public boundary.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import fields, replace
 import os
 import threading
@@ -15,12 +16,108 @@ import warnings
 import torch
 from torch import Tensor
 
-EXPLICIT_CARRY_GRAPH_ABI = "canonical_terminal_flat_buffered_bounded_adjoint_v2"
+EXPLICIT_CARRY_GRAPH_ABI = "canonical_terminal_flat_cumulative_fill_transport_v6"
+_VALIDATION_GATE = ContextVar('annual_ledger_validation_gate', default=None)
+_CURRENT_VALIDATION_GATE = object()
+
+
+class DeferredLedgerValidationError(RuntimeError):
+    """Discard all speculative work before an optimizer update; retry canonically."""
+
+
+class DeferredLedgerValidation:
+    """Collect device predicates, then agree across ranks before any update."""
+
+    def __init__(self, device):
+        self.device, self.predicates, self.labels = torch.device(device), [], []
+        self.stream = (torch.cuda.current_stream(self.device)
+                       if self.device.type == 'cuda' else None)
+        self.events = []
+        self.records_lock = threading.Lock()
+        self.finished = False
+
+    def __enter__(self):
+        if _VALIDATION_GATE.get() is not None:
+            raise RuntimeError('ledger validation gates cannot be nested')
+        self.token = _VALIDATION_GATE.set(self)
+        return self
+
+    def __exit__(self, *error):
+        _VALIDATION_GATE.reset(self.token)
+        if not error[0] and not self.finished:
+            raise RuntimeError('deferred ledger validation was never observed before update')
+
+    def record(self, predicate, label):
+        if self.finished:
+            raise RuntimeError('cannot append ledger checks after the update gate')
+        value = predicate.detach().to(device=self.device, dtype=torch.bool)
+        if value.numel() != 1:
+            value = value.all()
+        # Snapshot on the PRODUCER stream before a later graph replay can
+        # overwrite its predicate buffer. The final gate waits on this event;
+        # merely moving the clone to another stream would introduce a race.
+        snapshot = value.reshape(()).clone()
+        event = None
+        if self.stream is not None and self.stream != torch.cuda.current_stream(self.device):
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+        with self.records_lock:
+            self.predicates.append(snapshot)
+            self.labels.append(label)
+            if event is not None:
+                self.events.append(event)
+
+    def finish(self):
+        if self.stream is not None and self.stream != torch.cuda.current_stream(self.device):
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        for event in self.events:
+            torch.cuda.current_stream(self.device).wait_event(event)
+        values = (torch.stack(self.predicates) if self.predicates
+                  else torch.ones(1, device=self.device, dtype=torch.bool))
+        failed = (~values.all()).to(torch.int32)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+        self.finished = True
+        if bool(failed):
+            labels = [label for label, passed in zip(self.labels, values.cpu().tolist()) if not passed]
+            raise DeferredLedgerValidationError(f'ledger pass rejected before update; local={labels}; peer failure also requires canonical retry')
+
+
+def current_ledger_validation_gate():
+    return _VALIDATION_GATE.get()
+
+
+def ledger_predicate(predicate, label, *, gate=_CURRENT_VALIDATION_GATE):
+    if gate is _CURRENT_VALIDATION_GATE:
+        gate = _VALIDATION_GATE.get()
+    if gate is None:
+        return bool(predicate)
+    gate.record(predicate, label)
+    return True
+
+
+def ledger_validation_is_deferred():
+    return _VALIDATION_GATE.get() is not None
+
+
+def finish_ledger_validation():
+    gate = _VALIDATION_GATE.get()
+    if gate is None:
+        return 0
+    gate.finish()
+    return len(gate.predicates)
 _ENGINES = OrderedDict()
 _LOCK = threading.RLock()
 _STATS = dict(constructors=0, forward_replays=0, backward_replays=0,
               accepted_blocks=0, certificate_fallbacks=0, tape_constructors=0,
-              saved_tape_backwards=0, recomputed_backwards=0)
+              saved_tape_backwards=0, recomputed_backwards=0,
+              packed_field_copy_replays=0, packed_field_copy_fallbacks=0,
+              sparse_forward_replays=0, sparse_backward_replays=0,
+              sparse_bucketed_forward_replays=0, sparse_forward_event_cells=0,
+              parallel_adjoint_replays=0, parallel_adjoint_fallbacks=0)
+_STATS.update(parallel_flat_forward_replays=0, parallel_flat_forward_fallbacks=0)
+_STATS.update(recorded_return_candidate_replays=0, recorded_return_candidate_fallbacks=0,
+              parallel_flat_deferred_certificates=0, canonical_fallback_prewarms=0)
 # These outputs carry an action/NAV Jacobian. Minute histories intentionally
 # retain the selected require_minute_nav_grad=False contract.
 _DIFFERENTIABLE = (0, 1, 8, 9, 14)
@@ -35,9 +132,119 @@ def explicit_carry_graph_contract():
     if adjoint not in ('recompute','saved'):
         raise ValueError('ledger graph adjoint must be recompute or saved')
     result = dict(version=EXPLICIT_CARRY_GRAPH_ABI,adjoint=adjoint)
+    from stockagent.backtest.tw_inventory_scan import POSITIVE_PREFIX_ABI
+    result['positive_prefix'] = POSITIVE_PREFIX_ABI
+    parallel = os.environ.get('STOCKAGENT_DAY_TRADE_PARALLEL_ADJOINT', '0')
+    prewarm = os.environ.get('STOCKAGENT_DAY_TRADE_PREWARM_CANONICAL_FALLBACK', '0')
+    if prewarm not in ('0', '1'):
+        raise ValueError('canonical fallback prewarm must be 0 or 1')
+    recorded = os.environ.get('STOCKAGENT_DAY_TRADE_RECORDED_RETURN_CANDIDATE', '0')
+    deferred_parallel = os.environ.get('STOCKAGENT_DAY_TRADE_DEFER_PARALLEL_FORWARD_CERTIFICATE', '0')
+    if recorded not in ('0', '1') or deferred_parallel not in ('0', '1'):
+        raise ValueError('recorded candidates and parallel certificate deferral must be 0 or 1')
+    if parallel not in ('0', '1', '2'):
+        raise ValueError('parallel day adjoint must be 0, 1 or 2')
+    if parallel != '0' and prewarm == '1':
+        result['canonical_fallback_warmup'] = 'forward_and_vjp_before_parallel_replay_v1'
+    if parallel == '1':
+        result['parallel_state_adjoint'] = 'canonical_serial_forward_parallel_day_vjp_affine_prefix_v1'
+    elif parallel == '2':
+        rows = int(os.environ.get('STOCKAGENT_DAY_TRADE_GRAPH_BLOCK_ROWS', '16'))
+        if rows <= 0 or rows > 64 or rows & (rows-1):
+            raise ValueError('parallel graph rows must be a power of two up to 64')
+        result['parallel_state_adjoint'] = 'canonical_parallel_flat_funding_certificate_affine_v2'
+        result['parallel_forward_iterations'] = 4
+        result['parallel_forward_candidate'] = 'canonical_pnl_only_day_maps_v1'
+        result['parallel_funding_certificate'] = 'unfunded_target_and_funded_quantities_interval_v1'
+        result['parallel_financial_interval'] = 'solvency_and_unclamped_log_return_interval_v1'
+        result['parallel_map_block_rows'] = rows
+        result['parallel_financial_tolerance_twd'] = 1e-6
+        result['parallel_funding_interval_twd'] = rows*1e-6
+        if recorded == '1':
+            result['parallel_replay_candidate'] = 'recorded_daily_log_returns_full_funding_certificate_v1'
+        if deferred_parallel == '1':
+            result['parallel_forward_validation'] = 'whole_pass_explicit_gate_before_update_v1'
     if os.environ.get('STOCKAGENT_DAY_TRADE_GRAPH_FUSED_STEP', '0') == '1':
         result['step'] = 'canonical_whole_session_compiled_v1'
+    if os.environ.get('STOCKAGENT_DAY_TRADE_DEFER_VALIDATION', '0') == '1':
+        result['validation'] = 'whole_pass_explicit_stream_owned_gate_rank_agreement_canonical_retry_v2'
+    from stockagent.backtest.tw_inventory_scan import inventory_prefix_contract
+    prefix = inventory_prefix_contract()
+    if prefix is not None:
+        result['prefix_sum'] = prefix
+    from stockagent.backtest.tw_day_trade_graph_transport import packed_session_copy_contract
+    transport = packed_session_copy_contract()
+    if transport is not None:
+        result['packed_session_copy'] = transport
+    if os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_EVENTS', '0').lower() not in ('0', 'false', 'off', 'no'):
+        result['sparse_session_step'] = 'canonical_csr_liquidity_full_pending_adjoint_v1'
+        if os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_COMPACT_TRANSPORT', '0') == '1':
+            result['sparse_session_transport'] = 'packed_events_fixed_device_capacity_v1'
+            if os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') == '1':
+                result['sparse_session_transport'] = 'power_of_two_packet_device_capacity_buckets_v1'
+                result['sparse_engine_cache'] = 'eight_shape_banks_pending_tapes_keep_evicted_owners_v1'
+        elif os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') == '1':
+            raise ValueError('sparse capacity buckets require compact sparse transport')
     return result
+
+
+def _copy_session_field_(destination, values, *, combined=None):
+    """Copy consecutive row views once, retaining exact fallback and tail data."""
+    first = values[0]
+    count = len(values)
+    if combined is not None:
+        # Native cat is preferable for padded/strided planes. The source
+        # owner proves row identity once per block, not per day and field.
+        if combined.is_contiguous():
+            destination[:count].copy_(combined)
+            if count < destination.size(0):
+                destination[count:].copy_(values[-1])
+        else:
+            padded = (*values, *((values[-1],) * (destination.size(0) - count)))
+            torch.stack(padded, out=destination)
+        return
+    offset = first.storage_offset()
+    step = values[1].storage_offset() - offset if count > 1 else 0
+    storage = first.untyped_storage().data_ptr()
+    consecutive = step >= 0 and all(
+        value.device == first.device and value.dtype == first.dtype
+        and value.shape == first.shape and value.stride() == first.stride()
+        and value.untyped_storage().data_ptr() == storage
+        and value.storage_offset() == offset + index * step
+        for index, value in enumerate(values))
+    if consecutive:
+        combined = first.as_strided((count, *first.shape), (step, *first.stride()), offset)
+        destination[:count].copy_(combined)
+        if count < destination.size(0):
+            destination[count:].copy_(values[-1])
+    else:
+        padded = (*values, *((values[-1],) * (destination.size(0) - count)))
+        torch.stack(padded, out=destination)
+
+
+def _inventory_row_token(state):
+    values = (state.inventory.cohorts, state.inventory.claims)
+    if any(torch.is_inference(value) for value in values):
+        return None
+    return tuple((id(value), value._version) for value in values)
+
+
+def detached_carry_state(state, *, device=None):
+    """Drop certified inert rows only at an explicitly detached BPTT boundary.
+
+    The public graph result retains the complete canonical inventory history.
+    Its successful financial certificate already proves these rows carry no
+    shares, entry cost, locked shares or claim amounts. Re-scanning and sorting
+    the same rows before the next block adds synchronization but no information.
+    Tensor mutation invalidates the certificate and uses ordinary detachment.
+    """
+    token = _inventory_row_token(state)
+    certificate = getattr(state, '_graph_empty_inventory_rows', None)
+    if (token is not None and certificate is not None and certificate[0] == token
+            and (certificate[1] is None or certificate[1] is _VALIDATION_GATE.get())):
+        state = replace(state, inventory=replace(state.inventory,
+            cohorts=state.inventory.cohorts[:0], claims=state.inventory.claims[:0]))
+    return state.detached(device=device)
 
 
 class _Program:
@@ -100,7 +307,7 @@ class _Program:
             torch.where(active, after.alive, state.alive), self.capital)
         return next_state, history, (~active | proof)
 
-    def __call__(self, values):
+    def __call__(self, values, *, record_states=False):
         from stockagent.backtest.tw_day_trade_carry import DayTradeCarryState
         w, enter, buy, sell, normal, rebate = values[:6]
         pnl, cost, cursor, decision, observed, failed, nav, alive, days, active = values[6:16]
@@ -108,8 +315,15 @@ class _Program:
             action_cursor=cursor, decision_day=decision, observed_day=observed, failed=failed),
             nav, alive, self.capital)
         history = [[] for _ in range(8)]
+        trace = [[] for _ in range(8)] if record_states else None
         proof = torch.ones((), dtype=torch.bool, device=w.device)
         for row in range(self.rows):
+            if record_states:
+                for target, value in zip(trace, (state.inventory.realized_net_pnl,
+                        state.inventory.carry_cost, state.inventory.action_cursor,
+                        state.inventory.decision_day, state.inventory.observed_day,
+                        state.inventory.failed, state.last_nav, state.alive)):
+                    target.append(value)
             session = self.session_type(day=days[row], **self.session_defaults, **{
                 name: tensor[row] for name, tensor in zip(self.names, values[16:])})
             with warnings.catch_warnings():
@@ -125,16 +339,17 @@ class _Program:
         claim = h[7]
         h[7] = torch.stack((claim[..., 0], claim[..., 1],
             torch.where(claim[..., 1] <= state.inventory.observed_day, 1, claim[..., 2])), dim=-1)
-        return (*h, state.inventory.realized_net_pnl, state.inventory.carry_cost,
+        result = (*h, state.inventory.realized_net_pnl, state.inventory.carry_cost,
             state.inventory.action_cursor, state.inventory.decision_day,
             state.inventory.observed_day, state.inventory.failed,
             state.last_nav, state.alive, proof)
+        return (result, tuple(torch.stack(v) for v in trace)) if record_states else result
 
 
 class _Engine:
     """One forward pool and one recompute+VJP pool, independent of dates."""
     @torch.inference_mode(False)
-    def __init__(self, program, example):
+    def __init__(self, program, example, *, capture=True):
         self.program = program
         self.inputs = tuple(v.detach().clone().contiguous() for v in example)
         self.grad_inputs = (0, 6, 7, 12)
@@ -143,17 +358,19 @@ class _Engine:
         self.device = example[0].device
         self.stream = torch.cuda.Stream(device=self.device)
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(self.stream), torch.no_grad():
-            for _ in range(2):
+        if capture:
+            with torch.cuda.stream(self.stream), torch.no_grad():
+                for _ in range(2):
+                    self.outputs = program(self.inputs)
+            self.stream.synchronize()
+            self.forward = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.forward, stream=self.stream), torch.no_grad():
                 self.outputs = program(self.inputs)
-        self.stream.synchronize()
-        self.forward = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.forward, stream=self.stream), torch.no_grad():
-            self.outputs = program(self.inputs)
-        self.stream.synchronize()
+            self.stream.synchronize()
         self.backward = None
         self.vjp = None
         self.tapes = []
+        self.calendars = OrderedDict()
         self.last_stream = torch.cuda.current_stream(self.device)
         _STATS['constructors'] += 1
 
@@ -185,11 +402,38 @@ class _Engine:
             # 0*NaN can leak through its masked VJP. Synthetic inactive ordinals
             # are internal scheduling only; no row or calendar is published.
             calendar += [calendar[-1] + i + 1 for i in range(self.program.rows - count)]
-            self.inputs[14].copy_(torch.tensor(calendar, dtype=torch.float64, device='cpu'))
+            calendar_key = tuple(calendar)
+            cached_calendar = self.calendars.get(calendar_key)
+            if cached_calendar is None:
+                cached_calendar = torch.tensor(calendar, dtype=torch.float64, device=self.device)
+                self.calendars[calendar_key] = cached_calendar
+                while len(self.calendars) > 256:
+                    self.calendars.popitem(last=False)
+            else:
+                self.calendars.move_to_end(calendar_key)
+            self.inputs[14].copy_(cached_calendar)
             self.inputs[15][:count].fill_(True);self.inputs[15][count:].fill_(False)
-            padded = (*sessions, *((sessions[-1],) * (self.program.rows - count)))
+            packed = getattr(sessions[0], '_transport_fields', None)
+            row = getattr(sessions[0], '_transport_row', -1)
+            if packed is not None and not all(
+                    getattr(session, '_transport_fields', None) is packed
+                    and getattr(session, '_transport_row', None) == row + index
+                    for index, session in enumerate(sessions)):
+                packed = None
+            from stockagent.backtest.tw_day_trade_graph_transport import (
+                packed_session_copy_contract, copy_packed_session_fields_)
+            if packed is not None and packed_session_copy_contract() is not None:
+                copied = copy_packed_session_fields_(self.inputs[16:],
+                    tuple(packed[name] for name in self.program.names),
+                    source_row=row, rows=count,
+                    cache=self.__dict__.setdefault('_packed_field_copy_tables', OrderedDict()))
+                if copied:
+                    _STATS['packed_field_copy_replays'] += 1
+                    return
+                _STATS['packed_field_copy_fallbacks'] += 1
             for name, destination in zip(self.program.names, self.inputs[16:]):
-                torch.stack(tuple(getattr(s, name) for s in padded), out=destination)
+                _copy_session_field_(destination, tuple(getattr(s, name) for s in sessions),
+                    combined=None if packed is None else packed[name][row:row+count])
 
     @torch.inference_mode(False)
     def prepare_backward(self):
@@ -289,6 +533,11 @@ class _RecomputedLedger(torch.autograd.Function):
         tape=ctx.lease.tape if ctx.lease is not None else engine
         tape.forward.replay()
         _STATS['forward_replays'] += 1
+        if sessions[0].uses_sparse_events:
+            _STATS['sparse_forward_replays'] += 1
+            _STATS['sparse_forward_event_cells'] += sessions[0].exit_prices.numel()*len(sessions)
+            if os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') == '1':
+                _STATS['sparse_bucketed_forward_replays'] += 1
         result = tuple(v.clone() for v in tape.outputs)
         ctx.mark_non_differentiable(*(v for i, v in enumerate(result) if i not in _DIFFERENTIABLE))
         ctx.set_materialize_grads(False)
@@ -315,6 +564,8 @@ class _RecomputedLedger(torch.autograd.Function):
                     else:destination.copy_(g)
             tape.backward.replay()
             _STATS['backward_replays'] += 1
+            if ctx.sessions[0].uses_sparse_events:
+                _STATS['sparse_backward_replays'] += 1
             gradients = tuple(None if g is None else g.clone() for g in tape.grad_outputs)
             if ctx.lease is not None:ctx.lease.release()
         count = len(ctx.sessions)
@@ -323,7 +574,8 @@ class _RecomputedLedger(torch.autograd.Function):
 
 def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
         day_sell_fee_rate, normal_sell_fee_rate, rebate_rate, initial_capital,
-        initial_state=None, event_compression=False, require_minute_nav_grad=False):
+        initial_state=None, event_compression=False, require_minute_nav_grad=False,
+        replay_log_returns=None):
     from stockagent.backtest.tw_day_trade_carry import (
         DayTradeCarryResult, DayTradeCarryState, _compact_detached_carry_state)
     # Inference still returns the complete minute curve. A caller requesting
@@ -336,6 +588,9 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
         raise ValueError('ledger graph actions/permissions/source rows must agree')
     if any(a.day >= b.day for a, b in zip(sessions, sessions[1:])):
         raise ValueError('ledger graph sessions must be chronological')
+    if any(s.uses_sparse_events for s in sessions) and (
+            not event_compression or not all(s.uses_sparse_events for s in sessions)):
+        return None
     # This custom adjoint owns actions and recurrent money only. Preserve the
     # canonical Jacobian for callers learning fees or source observations, and
     # do not reuse a graph with a different fee buffer shape/dtype/device.
@@ -347,6 +602,9 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
     if any(value.requires_grad for session in sessions for field in fields(session)
            if isinstance(value := getattr(session, field.name), Tensor)):
         return None
+    if (os.environ.get('STOCKAGENT_DAY_TRADE_PARALLEL_ADJOINT', '0') == '2'
+            and any(session.entry_path is not None for session in sessions)):
+        return None
     state = initial_state or DayTradeCarryState.empty(weights.shape[1], initial_capital, weights.device)
     if sessions[0].day <= state.last_session_day:
         raise ValueError('ledger graph cannot repeat a committed day')
@@ -354,7 +612,7 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
     state = _compact_detached_carry_state(state)
     if state.inventory.cohorts.numel() or state.inventory.claims.numel():
         return None
-    if not bool(valid.detach().cpu()):
+    if not ledger_predicate(valid, 'graph_continuing_account_state'):
         return None
     for session in sessions:
         session.validate_shape(weights.shape[1], weights.device)
@@ -365,6 +623,8 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
         return None
     histories = [[] for _ in range(8)]
     proofs = []
+    contract = explicit_carry_graph_contract()
+    parallel = contract.get('parallel_state_adjoint')
     for begin in range(0, len(sessions), rows):
         block = sessions[begin:begin+rows];count=len(block)
         template = block[0]
@@ -373,6 +633,10 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
             return None
         key = (os.environ.get('STOCKAGENT_BACKTEST_COMPILE','1'),
                os.environ.get('STOCKAGENT_DAY_TRADE_GRAPH_FUSED_STEP','0'),
+               parallel, contract.get('parallel_replay_candidate'),
+               contract.get('canonical_fallback_warmup'),
+               contract.get('prefix_sum'),
+               contract.get('packed_session_copy', {}).get('version'),
                weights.device, weights.dtype, can_enter.dtype, weights.shape[1], rows,
                float(initial_capital), bool(event_compression), presence,
                tuple((name, tuple(getattr(template,name).shape), getattr(template,name).dtype)
@@ -388,14 +652,38 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
                     torch.tensor([s.day for s in block]+[block[-1].day+i+1 for i in range(rows-count)], device=weights.device,dtype=torch.float64),
                     torch.arange(rows,device=weights.device)<count,
                     *(torch.stack(tuple(getattr(s,name) for s in (*block,*((block[-1],)*(rows-count))))) for name in program.names))
-                engine = _Engine(program, example)
+                if parallel:
+                    from stockagent.backtest.tw_day_trade_parallel import (
+                        ParallelDayAdjointEngine, ParallelFlatForwardEngine)
+                    engine_type = (ParallelFlatForwardEngine if
+                        os.environ.get('STOCKAGENT_DAY_TRADE_PARALLEL_ADJOINT', '0') == '2'
+                        else ParallelDayAdjointEngine)
+                    engine = engine_type(program, example)
+                else:
+                    engine = _Engine(program, example)
                 _ENGINES[key] = engine
-                # Saved autograd contexts own engines evicted from this lookup.
-                while len(_ENGINES)>2:_ENGINES.popitem(last=False)
             else:
                 _ENGINES.move_to_end(key)
+            # Sparse packet capacities span a few powers of two. Keeping
+            # only two banks would recapture common shapes every epoch.
+            # Pending autograd contexts retain any evicted engine and tapes.
+            limit = (8 if template.uses_sparse_events and
+                os.environ.get('STOCKAGENT_DAY_TRADE_SPARSE_CAPACITY_BUCKETS', '0') == '1' else 2)
+            while len(_ENGINES)>limit:_ENGINES.popitem(last=False)
             engine.enter_stream()
-            result = _RecomputedLedger.apply(engine, block, can_enter[begin:begin+count], fees, state,
+            if parallel:
+                from stockagent.backtest.tw_day_trade_parallel import (
+                    ParallelDayLedger, ParallelFlatLedger)
+                operation = (ParallelFlatLedger if
+                    os.environ.get('STOCKAGENT_DAY_TRADE_PARALLEL_ADJOINT', '0') == '2'
+                    else ParallelDayLedger)
+            else:
+                operation = _RecomputedLedger
+            if os.environ.get('STOCKAGENT_DAY_TRADE_PARALLEL_ADJOINT', '0') == '2':
+                engine.set_return_candidate(
+                    replay_log_returns[begin:begin+count]
+                    if replay_log_returns is not None and contract.get('parallel_replay_candidate') else None)
+            result = operation.apply(engine, block, can_enter[begin:begin+count], fees, state,
                 weights[begin:begin+count], state.inventory.realized_net_pnl,
                 state.inventory.carry_cost, state.last_nav)
         for destination,value in zip(histories,result[:8]):destination.append(value[:count])
@@ -403,7 +691,7 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
         state = DayTradeCarryState(replace(state.inventory, realized_net_pnl=result[8],carry_cost=result[9],
             action_cursor=result[10],decision_day=result[11],observed_day=result[12],failed=result[13]),
             result[14],result[15],initial_capital,block[-1].day)
-    if not bool(torch.stack(proofs).all().detach().cpu()):
+    if not ledger_predicate(torch.stack(proofs).all(), 'graph_terminal_flat_financial_certificate'):
         _STATS['certificate_fallbacks'] += 1
         return None
     h = [torch.cat(v) for v in histories]
@@ -411,5 +699,10 @@ def run_flat_graph_sessions(weights, sessions, *, can_enter, buy_fee_rate,
     h[7] = torch.stack((claims[..., 0], claims[..., 1],
         torch.where(claims[..., 1] <= state.inventory.observed_day, 1, claims[..., 2])), dim=-1)
     state = replace(state, inventory=replace(state.inventory,cohorts=h[6],claims=h[7]))
+    token = _inventory_row_token(state)
+    if token is not None:
+        # Assigned only after every active session's canonical financial proof
+        # was observed above. The full result tensors remain unchanged.
+        object.__setattr__(state, '_graph_empty_inventory_rows', (token, _VALIDATION_GATE.get()))
     _STATS['accepted_blocks'] += 1
     return DayTradeCarryResult(*h[:6],state)

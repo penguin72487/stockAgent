@@ -26,6 +26,13 @@ PENGUIN_DAY_TRADE_MARKETS = (
 
 @pytest.mark.parametrize("at,deadline,active,expected", [
     ("18:00", "2026-10-13T18:10:00+08:00", None, True),
+    ("01:00", "2026-10-13T01:10:00+08:00", None, True),
+    ("06:59", "2026-10-13T07:09:00+08:00", None, True),
+    ("07:00", "2026-10-13T07:10:00+08:00", None, False),
+    ("08:10", "2026-10-13T08:20:00+08:00", None, False),
+    ("01:00", "2026-10-13T01:16:00+08:00", None, False),
+    ("01:00", "2026-10-13T00:59:00+08:00", None, False),
+    ("01:00", "2026-10-13T01:10:00+08:00", 1., False),
     ("09:00", "2026-10-13T09:10:00+08:00", None, False),
     ("13:30", "2026-10-13T13:40:00+08:00", None, False),
     ("18:00", "2026-10-13T17:59:00+08:00", None, False),
@@ -1112,7 +1119,7 @@ def test_event_driven_postclose_service_never_runs_formal_history(
     monkeypatch.setattr(
         runner,
         "_populate_postclose_signal_caches",
-        lambda markets, **_kwargs: calls.append(tuple(markets)) or (1, 0),
+        lambda markets, **_kwargs: calls.append(tuple(markets)) or (1, 0, 0),
     )
     monkeypatch.setattr(
         runner.discord_bot,
@@ -1201,7 +1208,7 @@ def test_artifact_maintenance_rechecks_public_writer_between_markets(
         ),
     )
     monkeypatch.setattr(
-        runner, "_populate_postclose_signal_caches", lambda _markets, **_kwargs: (0, 0)
+        runner, "_populate_postclose_signal_caches", lambda _markets, **_kwargs: (0, 0, 0)
     )
     monkeypatch.setattr(
         runner.discord_bot, "_artifact_backfill_key", lambda *_args: "key"

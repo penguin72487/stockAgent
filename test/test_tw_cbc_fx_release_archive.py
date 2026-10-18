@@ -330,6 +330,47 @@ def test_fetch_retries_transient_redirect_without_following_it(
     assert limiter.deferrals == 1
 
 
+@pytest.mark.parametrize("recovers", [True, False])
+def test_fetch_retries_http_200_origin_outage_but_never_promotes_error_page(monkeypatch, recovers):
+    bad = b"<title>Error</title>This web server can't be reached"
+    good = b"<html>official listing</html>"
+    calls = []
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append(url)
+            result = requests.Response()
+            result.status_code = 200
+            result.url = url
+            result._content = good if recovers and len(calls) == 2 else bad
+            result._content_consumed = True
+            return result
+
+    class Limiter:
+        def __init__(self):
+            self.waits = 0
+            self.deferrals = []
+
+        def wait(self):
+            self.waits += 1
+
+        def defer(self, delay):
+            self.deferrals.append(delay)
+
+    monkeypatch.setattr(archive, "_session", Session)
+    limiter = Limiter()
+    url = archive.LIST_URL.format(page=1)
+    if recovers:
+        assert archive._fetch(url, limiter) == good
+        assert len(calls) == limiter.waits == 2
+    else:
+        with pytest.raises(archive.SourceUpstreamUnavailable):
+            archive._fetch(url, limiter)
+        assert len(calls) == limiter.waits == 5
+    assert len(limiter.deferrals) == len(calls) - 1
+    assert set(calls) == {url}
+
+
 def test_fetch_rejects_persistent_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

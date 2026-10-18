@@ -348,6 +348,7 @@ def _stat_ca_bundle() -> str:
 
 def _fetch(url: str, limiter: SharedRateLimiter, *, max_bytes: int) -> bytes:
     current = url
+    redirect_chain = {current}
     last_response: str | None = None
     for attempt in range(5):
         parsed = urlparse(current)
@@ -365,7 +366,11 @@ def _fetch(url: str, limiter: SharedRateLimiter, *, max_bytes: int) -> bytes:
                     )
                 if response.status_code in {301, 302, 303, 307, 308}:
                     last_response = f"HTTP {response.status_code} redirect from {current}"
-                    current = urljoin(current, response.headers.get("Location", ""))
+                    target = urljoin(current, response.headers.get("Location", ""))
+                    if target in redirect_chain:
+                        raise RuntimeError(f"official release redirect cycle: {target}")
+                    redirect_chain.add(target)
+                    current = target
                     continue
                 if response.status_code in {429, 500, 502, 503, 504}:
                     last_response = f"HTTP {response.status_code} from {current}"
@@ -396,6 +401,12 @@ def _fetch(url: str, limiter: SharedRateLimiter, *, max_bytes: int) -> bytes:
                     raise ValueError(f"empty release body: {current}")
                 return body
         except requests.RequestException as exc:
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                # Transient statuses above have their own shared cooldown.
+                # A permanent missing/invalid article cannot improve by
+                # spending the same request five times within seconds.
+                if exc.response.status_code not in {429, 500, 502, 503, 504}:
+                    raise
             last_response = f"{type(exc).__name__}: {exc}"
             if attempt == 4:
                 raise

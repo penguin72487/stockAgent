@@ -145,3 +145,40 @@ def test_early_us_observation_is_retained_and_final_session_recheck_is_scheduled
                                 'pending', 100, 'early.json', '2026-10-03T00:00:00+00:00')
         assert conn.execute('SELECT state,rows,receipt_path FROM tasks WHERE dataset=? AND data_id=? AND partition=?',
                             (US, 'MSFT', '2026-10-02')).fetchone() == ('complete', 390, 'final.json')
+
+
+@pytest.mark.parametrize('hour,minute', [(0, 0), (8, 0), (23, 59)])
+def test_early_observation_partial_index_matches_original_publication_expression(tmp_path, hour, minute):
+    from downloader.finmind_queue_indexes import (US_PUBLICATION_INDEX, ensure_us_publication_index,
+                                                 us_publication_index)
+    source = replace(supplemental.SOURCES[US], release_hour=hour, release_minute=minute)
+    attempts = [None, 'invalid', '2020-01-01T00:00:00+00:00',
+                '2026-10-02T15:59:59.999999+00:00', '2026-10-02T16:00:00+00:00',
+                '2026-10-02T23:59:59.999999+00:00', '2026-10-03T00:00:00+00:00',
+                '2026-10-03T15:59:00+00:00', '2026-10-04T00:00:00+00:00',
+                '2026-10-18T00:00:00+00:00']
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        conn.executemany('INSERT INTO tasks(dataset,data_id,partition,kind,priority,state,rows,last_attempt_at_utc) '
+                         "VALUES (?,?,?,'id_day',8,'complete',1,?)",
+                         [(US, str(i), '2026-10-02', stamp) for i, stamp in enumerate(attempts)])
+        conn.commit()
+        original = conn.execute("SELECT data_id,partition FROM tasks WHERE dataset=? AND state='complete' AND rows>0 "
+            'AND julianday(last_attempt_at_utc)<julianday(partition)+1+(?-8)/24.0+?/1440.0',
+            (US, hour, minute)).fetchall()
+        before = conn.execute('SELECT * FROM tasks ORDER BY data_id').fetchall()
+        changes = conn.total_changes
+        statements = []
+        conn.set_trace_callback(statements.append)
+        assert sorted(supplemental.unfinalized_us_observations(conn, US, source)) == sorted(original)
+        query = next(sql for sql in statements if sql.startswith('SELECT data_id,partition FROM tasks'))
+        assert any(US_PUBLICATION_INDEX in row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query))
+        assert us_publication_index(conn) == f' INDEXED BY {US_PUBLICATION_INDEX}'
+        ensure_us_publication_index(conn)
+        assert conn.total_changes == changes
+        conn.execute(f'DROP INDEX {US_PUBLICATION_INDEX}')
+        assert us_publication_index(conn) == ''
+        assert sorted(supplemental.unfinalized_us_observations(conn, US, source)) == sorted(original)
+        conn.execute(f'CREATE INDEX {US_PUBLICATION_INDEX} ON tasks(dataset)')
+        assert us_publication_index(conn) == ''
+        assert sorted(supplemental.unfinalized_us_observations(conn, US, source)) == sorted(original)
+        assert conn.execute('SELECT * FROM tasks ORDER BY data_id').fetchall() == before

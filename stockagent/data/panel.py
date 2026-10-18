@@ -1221,6 +1221,47 @@ def _load_corporate_action_reference(
     )
 
 
+def _resolve_external_feature_projection(
+    path: Path | None,
+    *,
+    include_features: bool,
+    raw_input_features: bool,
+    feature_include: tuple[str, ...],
+    feature_exclude: tuple[str, ...],
+    exclude_open_gap: bool = False,
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None]:
+    """Resolve once against the complete schema, before decoding any payload.
+
+    Exact selected names carry the admitted order into assembly; passing the
+    original exclusion patterns after projection would incorrectly reject
+    columns that have already been excluded. Rules never participate in model
+    feature selection and remain independently controlled by the reader.
+    This changes neither the caller's config nor its existing cache identity.
+    """
+    if path is None:
+        return None, None
+    if pq is None:
+        raise RuntimeError("external TW public features require pyarrow")
+    columns = pq.read_schema(path).names
+    missing = {"date", "symbol"} - set(columns)
+    if missing:
+        raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
+    external_names = (
+        [name for name in columns if name not in {"date", "symbol"} and not name.startswith("_")]
+        if include_features else []
+    )
+    effective_exclude = feature_exclude
+    if exclude_open_gap or DAY_TRADE_OPEN_GAP_FEATURE not in feature_include:
+        effective_exclude = (*effective_exclude, DAY_TRADE_OPEN_GAP_FEATURE)
+    _, _, external_indices, _, selected_names = _resolve_panel_feature_indices(
+        [*BASE_PANEL_FEATURE_COLUMNS, *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ())],
+        external_names,
+        feature_include=feature_include,
+        feature_exclude=effective_exclude,
+    )
+    return tuple(selected_names), tuple(external_names[index] for index in external_indices)
+
+
 def _load_external_feature_arrays(
     path: Path,
     *,
@@ -1408,9 +1449,9 @@ def _load_external_feature_arrays(
         raise RuntimeError("external feature date/symbol arrays are misaligned")
 
     market_key = str(market_symbol).strip().upper()
-    market_mask = all_symbols == market_key
-    market_dates = all_dates[market_mask]
-    market_values = all_feature_values[market_mask]
+    market_dates, market_values, by_symbol = _partition_external_symbol_arrays(
+        all_symbols, all_dates, all_feature_values, market_key=market_key,
+    )
 
     rule_dates, all_rule_values = _external_frame_to_arrays(
         rule_frame,
@@ -1420,9 +1461,9 @@ def _load_external_feature_arrays(
     rule_symbols = rule_frame["symbol"].to_numpy()
     if rule_dates.size != rule_symbols.size:
         raise RuntimeError("external rule date/symbol arrays are misaligned")
-    rule_market_mask = rule_symbols == market_key
-    market_rule_dates = rule_dates[rule_market_mask]
-    market_rule_values = all_rule_values[rule_market_mask]
+    market_rule_dates, market_rule_values, by_symbol_rules = _partition_external_symbol_arrays(
+        rule_symbols, rule_dates, all_rule_values, market_key=market_key,
+    )
 
     official_session_dates = np.empty((0,), dtype="datetime64[ns]")
     official_idx = (
@@ -1434,36 +1475,6 @@ def _load_external_feature_arrays(
         traded = np.nan_to_num(market_rule_values[:, official_idx], nan=0.0) > 0.0
         if bool(traded.any()):
             official_session_dates = np.unique(market_rule_dates[traded])
-
-    stock_mask = ~market_mask
-    stock_symbols = all_symbols[stock_mask]
-    stock_dates = all_dates[stock_mask]
-    stock_feature_values = all_feature_values[stock_mask]
-    by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    if stock_symbols.size:
-        boundaries = np.flatnonzero(stock_symbols[1:] != stock_symbols[:-1]) + 1
-        starts = np.concatenate((np.array([0]), boundaries))
-        stops = np.concatenate((boundaries, np.array([stock_symbols.size])))
-        for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
-            key = str(stock_symbols[start]).upper()
-            dates = stock_dates[start:stop]
-            by_symbol[key] = (dates, stock_feature_values[start:stop])
-
-    rule_stock_mask = ~rule_market_mask
-    stock_rule_symbols = rule_symbols[rule_stock_mask]
-    stock_rule_dates = rule_dates[rule_stock_mask]
-    stock_rule_values = all_rule_values[rule_stock_mask]
-    if stock_rule_symbols.size:
-        boundaries = np.flatnonzero(stock_rule_symbols[1:] != stock_rule_symbols[:-1]) + 1
-        starts = np.concatenate((np.array([0]), boundaries))
-        stops = np.concatenate((boundaries, np.array([stock_rule_symbols.size])))
-        for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
-            key = str(stock_rule_symbols[start]).upper()
-            by_symbol_rules[key] = (
-                stock_rule_dates[start:stop],
-                stock_rule_values[start:stop],
-            )
 
     print(
         f"[panel] external features loaded path={path} "
@@ -1479,6 +1490,37 @@ def _load_external_feature_arrays(
         by_symbol_rules=by_symbol_rules,
         official_session_dates=official_session_dates,
     )
+
+
+def _partition_external_symbol_arrays(
+    symbols: np.ndarray,
+    dates: np.ndarray,
+    values: np.ndarray,
+    *,
+    market_key: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """Share sorted source buffers; never copy the entire stock subset first."""
+    if symbols.size != dates.size or values.ndim != 2 or values.shape[0] != dates.size:
+        raise RuntimeError("external symbol/date/value arrays are misaligned")
+    market_dates, market_values = dates[:0], values[:0]
+    by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if not symbols.size:
+        return market_dates, market_values, by_symbol
+    boundaries = np.flatnonzero(symbols[1:] != symbols[:-1]) + 1
+    starts = np.concatenate((np.array([0]), boundaries))
+    stops = np.concatenate((boundaries, np.array([symbols.size])))
+    seen: set[str] = set()
+    for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
+        key = str(symbols[start]).upper()
+        if key in seen:
+            raise RuntimeError("external symbol rows are not contiguous after normalization")
+        seen.add(key)
+        payload = dates[start:stop], values[start:stop]
+        if key == market_key:
+            market_dates, market_values = payload
+        else:
+            by_symbol[key] = payload
+    return market_dates, market_values, by_symbol
 
 
 def _external_frame_to_arrays(
@@ -4109,42 +4151,13 @@ def build_tail_panel(
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
     )
-    selected_panel_feature_names: tuple[str, ...] | None = None
-    selected_external_feature_names: tuple[str, ...] | None = None
-    if external_feature_path is not None:
-        external_schema_columns = list(pq.read_schema(external_feature_path).names)
-        all_external_feature_names = (
-            [
-                name
-                for name in external_schema_columns
-                if name not in {"date", "symbol"}
-                and not str(name).startswith("_")
-            ]
-            if external_include_features
-            else []
-        )
-        effective_feature_exclude = tuple(feature_exclude_patterns)
-        if DAY_TRADE_OPEN_GAP_FEATURE not in feature_include_patterns:
-            effective_feature_exclude = (
-                *effective_feature_exclude,
-                DAY_TRADE_OPEN_GAP_FEATURE,
-            )
-        (
-            _base_indices,
-            _base_destinations,
-            external_indices,
-            _external_destinations,
-            resolved_feature_names,
-        ) = _resolve_panel_feature_indices(
-            [*BASE_PANEL_FEATURE_COLUMNS, *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ())],
-            all_external_feature_names,
-            feature_include=feature_include_patterns,
-            feature_exclude=effective_feature_exclude,
-        )
-        selected_panel_feature_names = tuple(resolved_feature_names)
-        selected_external_feature_names = tuple(
-            all_external_feature_names[index] for index in external_indices
-        )
+    selected_panel_feature_names, selected_external_feature_names = _resolve_external_feature_projection(
+        external_feature_path,
+        include_features=external_include_features,
+        raw_input_features=raw_input_features,
+        feature_include=feature_include_patterns,
+        feature_exclude=feature_exclude_patterns,
+    )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
@@ -4343,9 +4356,15 @@ def load_cached_panel(
     feature_availability_indicators: Any = None,
     feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
+    panel_cache_root: str | Path | None = None,
 ) -> PanelData | None:
     del panel_load_workers
     parquet_root = Path(parquet_root).resolve()
+    cache_root = (
+        Path(panel_cache_root).resolve()
+        if panel_cache_root is not None and str(panel_cache_root).strip()
+        else parquet_root
+    )
     external_feature_path = _resolve_external_data_path(
         external_feature_path,
         include_features=external_include_features,
@@ -4478,7 +4497,7 @@ def load_cached_panel(
                 ]
             )
     source_hash = _compute_source_hash(source_paths)
-    panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
+    panel = _load_valid_panel_cache(cache_root, source_paths, backend_key, source_hash)
     if panel is not None:
         if include_day_trade_open_gap:
             panel = _append_configured_day_trade_open_gap_feature(
@@ -5999,6 +6018,16 @@ def build_panel(
         _print_feature_overview(panel)
         return panel
 
+    # A valid original-key cache remains the first choice. Only a miss resolves
+    # the complete source schema; no caller needs a second projected cache key.
+    selected_panel_feature_names, selected_external_feature_names = _resolve_external_feature_projection(
+        external_feature_path,
+        include_features=external_include_features,
+        raw_input_features=raw_input_features,
+        feature_include=base_feature_include_patterns,
+        feature_exclude=feature_exclude_patterns,
+        exclude_open_gap=True,
+    )
     print(
         f"[panel] building from {len(parquet_paths)} parquet files "
         f"(backend={selected_backend}, workers={panel_load_workers})..."
@@ -6054,28 +6083,6 @@ def build_panel(
             "[panel] pruned per-symbol rows before dense materialization "
             f"for panel_start_date={normalized_panel_start_date}"
         )
-    selected_external_feature_names: tuple[str, ...] | None = None
-    if (
-        external_feature_path is not None
-        and external_include_features
-        and base_feature_include_patterns
-        and not feature_exclude_patterns
-    ):
-        # Project only explicitly selected public feature columns before
-        # reading the multi-million-row table. Keep all rule columns: masks,
-        # eligibility, and action guards are independent of model inputs.
-        external_names = [
-            name for name in pq.read_schema(external_feature_path).names
-            if name not in {"date", "symbol"} and not name.startswith("_")
-        ]
-        _, _, selected_external_indices, _, _ = _resolve_panel_feature_indices(
-            [*BASE_PANEL_FEATURE_COLUMNS, *(RAW_PANEL_FEATURE_COLUMNS if raw_input_features else ())],
-            external_names,
-            feature_include=base_feature_include_patterns,
-        )
-        selected_external_feature_names = tuple(
-            external_names[index] for index in selected_external_indices
-        )
     external_started = time_module.perf_counter()
     external_features = (
         _load_external_feature_arrays(
@@ -6094,8 +6101,12 @@ def build_panel(
         valid_arrays,
         benchmark_name=benchmark_name,
         external_features=external_features,
-        feature_include=base_feature_include_patterns,
-        feature_exclude=feature_exclude_patterns,
+        feature_include=(
+            selected_panel_feature_names
+            if selected_panel_feature_names is not None
+            else base_feature_include_patterns
+        ),
+        feature_exclude=() if selected_panel_feature_names is not None else feature_exclude_patterns,
         raw_input_features=raw_input_features,
         feature_availability_indicators=availability_patterns,
     )

@@ -208,8 +208,9 @@ public static class TejBridgeNative {
         return SendMessageTimeoutW(new IntPtr(root),0,IntPtr.Zero,IntPtr.Zero,3,1000,out result)!=IntPtr.Zero;
     }
     public static string[] Items(long h,bool combo) {
-        long n=Message(h,combo?0x146u:0x18Bu,0,0);
-        if(n<0||n>150000)throw new Exception("Catalog axis exceeds reviewed bound");
+        long rawCount=Message(h,combo?0x146u:0x18Bu,0,0);
+        long n=SignedControlResult(rawCount);
+        if(n<0||n>150000)throw new Exception("Catalog axis exceeds reviewed bound: count="+n+", raw="+rawCount+", combo="+combo);
         string[] items=new string[n];
         for(int i=0;i<n;i++) {
             long len=Message(h,combo?0x149u:0x18Au,i,0);
@@ -508,14 +509,18 @@ public static class TejBridgeNative {
         if(count<1||count>150000)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list count out of bounds");
         return count;
     }
-    private static int ExactListIndexCore(long control,string label,long count) {
+    private static int ExactListIndexCore(long control,string label,long count,bool allowAbsent=false) {
         IntPtr h=new IntPtr(control),result;
         if(String.IsNullOrEmpty(label)||label.Length>4096)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label bound differs");
         if(count<1||count>150000||WriteText(h,0x1A2u,new IntPtr(-1),label,2,10000,out result)==IntPtr.Zero)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list lookup unresolved");
         long first=SignedControlResult(result.ToInt64()),index=first;int exact=-1;
-        if(index<0||index>=count)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label absent");
+        if(index<0) {
+            if(allowAbsent&&index==-1)return -1;
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label absent");
+        }
+        if(index>=count)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list index out of bounds");
         // LB_FINDSTRINGEXACT is case-insensitive too. Visit only equivalent
         // names, compare Unicode Ordinal and reject duplicate exact labels.
         for(long scanned=0;scanned<count;scanned++) {
@@ -542,23 +547,34 @@ public static class TejBridgeNative {
     public static int ExactListIndex(long root,long control,string label) {
         return ExactListIndexCore(control,label,VerifyLookupList(root,control));
     }
+    public static int[] LastAbsentLabelPositions=new int[0];
+    public static long LastLookupListCount=-1;
     public static int[] ExactListIndices(long root,long control,string[] labels,int expectedPid,string title) {
         // Read-only batch: one before/after modal/owner check, not an EnumWindows
         // traversal for EVERY name. No selection authorization is cached; the
         // action path independently checks the live identity/state per item.
+        LastAbsentLabelPositions=new int[0];LastLookupListCount=-1;
         AssertControlScope(root,control,expectedPid,title);
         long count=VerifyLookupList(root,control);
         if(labels==null||labels.Length<1||labels.Length>2000)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: lookup batch bound differs");
         var seen=new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
         var indices=new int[labels.Length];
+        var absent=new System.Collections.Generic.List<int>();
         for(int i=0;i<labels.Length;i++) {
             if(!seen.Add(labels[i]))throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: duplicate requested label");
-            indices[i]=ExactListIndexCore(control,labels[i],count);
+            indices[i]=ExactListIndexCore(control,labels[i],count,true);
+            if(indices[i]<0)absent.Add(i);
         }
         AssertControlScope(root,control,expectedPid,title);
         if(VerifyLookupList(root,control)!=count)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: list changed during batch lookup");
+        if(absent.Count!=0) {
+            // Publish only after the COMPLETE read-only batch and its owner,
+            // modal and count fences. Never guess a renamed label or select it.
+            LastAbsentLabelPositions=absent.ToArray();LastLookupListCount=count;
+            throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label absent; complete batch verified");
+        }
         return indices;
     }
     public static void SelectListBatch(long root,long parent,long source,long target,long button,
@@ -994,6 +1010,33 @@ public static class TejBridgeNative {
     private static int lastScanned=-1,lastTotal=-1;
     [DllImport("kernel32.dll",EntryPoint="MoveFileExW",CharSet=CharSet.Unicode,SetLastError=true)]
     private static extern bool MoveProgressFile(string existing,string destination,uint flags);
+    public static void WriteArtifact(string path,string text) {
+        // Source actions are NEVER retried here. Retry only local publication;
+        // a canceled UNC write must not truncate a visible stage/response.
+        for(int attempt=0;;attempt++) {
+            string temporary=path+"."+Guid.NewGuid().ToString("N")+".tmp";
+            try {
+                using(var stream=new System.IO.FileStream(temporary,System.IO.FileMode.CreateNew,
+                        System.IO.FileAccess.Write,System.IO.FileShare.None,65536)) {
+                    using(var writer=new System.IO.StreamWriter(stream,new UTF8Encoding(false),65536,true)) {
+                        writer.Write(text);writer.Flush();
+                    }
+                    stream.Flush(true);
+                }
+                // File.Replace is unsupported on WSL UNC. Flush the complete
+                // sibling first, then atomically publish without a truncation.
+                if(!MoveProgressFile(temporary,path,1u))throw new System.IO.IOException(
+                    "Atomic TEJ artifact publication failed",new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()));
+                return;
+            }catch(System.IO.IOException) {
+                if(attempt>=2)throw;
+                System.Threading.Thread.Sleep(attempt==0?25:100);
+            }finally {
+                try{if(System.IO.File.Exists(temporary))System.IO.File.Delete(temporary);}
+                catch(System.IO.IOException){}catch(UnauthorizedAccessException){}
+            }
+        }
+    }
     public static void WriteProgress(string path,string task,string attempt,string stage,int scanned,int total) {
         // Display-only, bounded metadata. No values, HWND, account or private
         // exception strings; no UI calls and no query-deadline renewal.
@@ -1266,6 +1309,7 @@ function Write-DownloadProgress([string]$stage) {
         [IO.Path]::GetFileNameWithoutExtension($Output),$stage,-1,-1)
 }
 $scopeClock=[Diagnostics.Stopwatch]::StartNew();$scopeLast=0.0;$scopeTimings=@{}
+$companyMembershipProof=$null
 $initializationSeconds=$bridgeClock.Elapsed.TotalSeconds
 $flowTimings=@{initialization_compile_seconds=$initializationSeconds}
 function Write-FlowTiming {
@@ -1277,7 +1321,7 @@ function Write-FlowTiming {
             native_helper_cache=$nativeCache;
             windows_bridge_seconds=$bridgeClock.Elapsed.TotalSeconds;
             windows_cpu_seconds=[Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds}
-        [IO.File]::WriteAllText(($Output+'.flow.json'),($flow|ConvertTo-Json -Depth 4 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.flow.json'),($flow|ConvertTo-Json -Depth 4 -Compress))
     } catch {} # A telemetry failure must not repeat or invalidate the query.
 }
 function Stamp-ScopeTiming([string]$name) {
@@ -1366,7 +1410,7 @@ try {
                    process_name=$process.ProcessName;process_private_bytes=$process.PrivateMemorySize64;
                    process_working_set_bytes=$process.WorkingSet64;query_thread_state=$threadState;
                    data_query_repeated=$false;notice_acknowledged=$false;credentials_read=$false}
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 5 -Compress))
         Write-Output 'Owned notices inspected; nothing acknowledged';exit
     }
     if($requestDoc.action -eq 'ack_preview_column_limit') {
@@ -1390,7 +1434,7 @@ try {
         $payload=@{contract_version=4;provider='tej_smart_wizard';action='ack_preview_column_limit';task_id=$requestDoc.task_id;
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;observed_at_utc=[DateTime]::UtcNow.ToString('o');
             error_code='vendor_preview_30_column_limit';source_query_rejected=$true;data_query_repeated=$false;credentials_read=$false}
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 3 -Compress))
         Write-Output 'Exact Preview column-limit rejection acknowledged; no new query';exit
     }
     if($requestDoc.action -eq 'ack_source_memory_error') {
@@ -1417,7 +1461,7 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             observed_at_utc=[DateTime]::UtcNow.ToString('o');data_query_repeated=$false;
             error_code=$requestDoc.error_code;source_axes_require_revalidation=$true;credentials_read=$false}
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 3 -Compress))
         Write-Output 'Exact source allocation error acknowledged; no new data query';exit
     }
     if($requestDoc.action -eq 'ack_excel_error') {
@@ -1455,7 +1499,7 @@ try {
         if([TejBridgeNative]::IsWindow([IntPtr]$dialogs[0].Current.NativeWindowHandle)){throw 'Known failure acknowledgement did not close the exact dialog'}
         $payload=@{contract_version=4;provider='tej_smart_wizard';action='ack_excel_error';task_id=$requestDoc.task_id;
             observed_at_utc=[DateTime]::UtcNow.ToString('o');data_query_repeated=$false;error_code='vendor_excel_com_initialization_failed';credentials_read=$false}
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 3 -Compress))
         Write-Output 'Known Excel runtime failure acknowledged; no new data query';exit
     }
     function Find-QueryGroup([string]$name) {
@@ -1635,7 +1679,7 @@ try {
             root_enabled=[TejBridgeNative]::IsWindowEnabled([IntPtr]$ExpectedWindow);
             vendor_notices_absent=([TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0);
             market_data_query_submitted=$false;source_binding_changed=$false;credentials_read=$false}
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 5 -Compress))
         Write-Output 'Source selector metadata inspected; no binding event or query';exit
     }
     if($requestDoc.action -eq 'repair_source_binding'){Prepare-SourceBinding}
@@ -1776,7 +1820,7 @@ try {
             $payload.date_input_foreground_unchanged=([TejBridgeNative]::GetForegroundWindow().ToInt64() -eq $dateForegroundBefore)
             $payload.date_input_started_in_background=($dateForegroundBefore -ne $ExpectedWindow)
         }
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 6 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 6 -Compress))
         Write-Output 'Failed metadata context settled; no new query or scope adoption';exit
     }
     function Sector-Control($group) {
@@ -1862,7 +1906,7 @@ try {
             $found.Add($candidate)
         }
         if($found.Count -ne 1) {
-            [IO.File]::WriteAllText(($Output+'.preview-scope.json'),($diagnostic.ToArray()|ConvertTo-Json -Depth 4 -Compress),[Text.UTF8Encoding]::new($false))
+            [TejBridgeNative]::WriteArtifact(($Output+'.preview-scope.json'),($diagnostic.ToArray()|ConvertTo-Json -Depth 4 -Compress))
         }
         return $found.ToArray()
     }
@@ -1970,7 +2014,7 @@ try {
                 observed_at_utc=[DateTime]::UtcNow.ToString('o');handle=$h;owner=$owner;
                 class=$dialog.Current.ClassName;controls=$captions;
                 notice_acknowledged=$false;data_query_repeated=$false;credentials_read=$false}
-            [IO.File]::WriteAllText(($Output+'.notice.json'),($noticeProof|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+            [TejBridgeNative]::WriteArtifact(($Output+'.notice.json'),($noticeProof|ConvertTo-Json -Depth 5 -Compress))
             throw 'Unrecognized vendor dialog; permission/quota/errors are never dismissed automatically'
         }
         $ok=@($children|Where-Object {$_.Current.ClassName -ceq 'Button' -and $_.Current.Name -ceq 'OK'})
@@ -2055,7 +2099,7 @@ try {
             }
             $payload=Capture-Preview $grids[0]
         }
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 8 -Compress))
         Write-Output 'Exact existing response reconciled; no new data query';exit
     }
     # A failed previous table can disable its company/date widgets while the
@@ -2185,7 +2229,7 @@ try {
                 @{name=$_.Current.Name;handle=$_.Current.NativeWindowHandle;
                   accessible_state=[TejBridgeNative]::AccessibleState($_.Current.NativeWindowHandle)}
             });credentials_read=$false}
-        [IO.File]::WriteAllText($Output,($payload|ConvertTo-Json -Depth 4 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 4 -Compress))
         Write-Output 'Scoped controls inspected; no market-data request';exit
     }
     if($sectorFilterApplicable) {
@@ -2210,8 +2254,30 @@ try {
         # per-item lookup is needed for a list we will select in its entirety.
         # A count alone NEVER certifies scope; SameItems below remains mandatory.
         if($requestDoc.company_labels.Count -ne $availableCompanyCount) {
-            $companyIndices=[TejBridgeNative]::ExactListIndices($ExpectedWindow,$companyLists[2].Current.NativeWindowHandle,
-                [string[]]$requestDoc.company_labels,$TejProcessId,$ExpectedTitle)
+            try {
+                $companyIndices=[TejBridgeNative]::ExactListIndices($ExpectedWindow,$companyLists[2].Current.NativeWindowHandle,
+                    [string[]]$requestDoc.company_labels,$TejProcessId,$ExpectedTitle)
+            } catch {
+                if([TejBridgeNative]::LastAbsentLabelPositions.Length -gt 0 -and
+                   [TejBridgeNative]::LastLookupListCount -eq $availableCompanyCount) {
+                    Verify-SourceSelectors
+                    foreach($pair in @(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))) {
+                        if([TejBridgeNative]::SelectedComboText($ExpectedWindow,(Control $source $pair[0] '*COMBOBOX*')) -cne $pair[1]) {
+                            throw 'LOCAL_SELECTION_BEFORE_QUERY: company membership source changed; no partition proof'
+                        }
+                    }
+                    $membership=@{contract='exact_current_company_membership_v1';task_id=$requestDoc.task_id;
+                        query_attempt_id=$requestDoc.query_attempt_id;requested_count=$requestDoc.company_labels.Count;
+                        available_count=$availableCompanyCount;absent_positions=@([TejBridgeNative]::LastAbsentLabelPositions);
+                        prepared_request_sha256=(Get-FileHash -LiteralPath $Request).Hash.ToLowerInvariant();
+                        observed_at_utc=[DateTime]::UtcNow.ToString('o');market_data_query_submitted=$false;
+                        complete_lookup_verified=$true;source_binding_verified=$true;source_list_count_stable=$true}
+                    $membershipPath=$Output+'.company-membership.json'
+                    [TejBridgeNative]::WriteArtifact($membershipPath,($membership|ConvertTo-Json -Depth 4 -Compress))
+                    $companyMembershipProof=(Get-FileHash -LiteralPath $membershipPath).Hash.ToLowerInvariant()
+                }
+                throw
+            }
         }
     } else {$availableCompanies=Items $companyLists[2].Current.NativeWindowHandle}
     Stamp-ScopeTiming 'company_universe_and_lookup'
@@ -2365,7 +2431,7 @@ try {
         $stage.preview_foreground_required=$false
         $stage.date_input_requires_foreground=$false
         $stage.global_keyboard_input_sent=$false
-        [IO.File]::WriteAllText(($Output+'.stage.json'),($stage|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.stage.json'),($stage|ConvertTo-Json -Depth 5 -Compress))
         # Mark BEFORE submission: a crash during the default action remains
         # unknown, never be classified as safe to submit again.
         $querySubmissionPossible=$true
@@ -2381,7 +2447,7 @@ try {
             if($null -ne $empty) {
                 $flowTimings.query_and_response_seconds=$queryClock.Elapsed.TotalSeconds
                 $saveClock=[Diagnostics.Stopwatch]::StartNew()
-                [IO.File]::WriteAllText($Output,($empty|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+                [TejBridgeNative]::WriteArtifact($Output,($empty|ConvertTo-Json -Depth 5 -Compress))
                 Write-DownloadProgress 'response_saved'
                 $flowTimings.serialize_and_save_seconds=$saveClock.Elapsed.TotalSeconds
                 $flowTimings.full_readback_seconds=0.0
@@ -2418,7 +2484,7 @@ try {
     if($requestDoc.action -in @('plan','recover_plan','resume_plan_empty_fields')){$flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds}
     $saveClock=[Diagnostics.Stopwatch]::StartNew()
     $json=$payload|ConvertTo-Json -Depth 8 -Compress
-    [IO.File]::WriteAllText($Output,$json,[Text.UTF8Encoding]::new($false))
+    [TejBridgeNative]::WriteArtifact($Output,$json)
     Write-DownloadProgress 'response_saved'
     $flowTimings.serialize_and_save_seconds=$saveClock.Elapsed.TotalSeconds
     Write-FlowTiming
@@ -2436,7 +2502,13 @@ try {
             error_code=$(if($_.Exception.ToString().Contains('SOURCE_BINDING_BEFORE_QUERY:')){
                 'local_source_binding_failed_before_preview'}else{'local_query_preparation_failed_before_preview'});
             observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        # A failed UNC publication must not erase a pre-Preview negative
+        # attestation. The admitted Python owner validates the exact attempt,
+        # code hash, clock and scope before persisting it from Linux instead.
+        $outcome.transport_contract='exact_prepreview_negative_proof_transport_v1'
+        $outcome.bridge_script_sha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant()
+        [Console]::Error.WriteLine('STOCKAGENT_TEJ_UNSENT_V1:'+($outcome|ConvertTo-Json -Depth 3 -Compress))
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        $_.Exception.ToString().Contains('SOURCE_KEY_LAYOUT_BEFORE_QUERY:')) {
@@ -2444,7 +2516,7 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;action='download';
             market_data_query_submission_possible=$false;error_code='source_key_layout_failed_before_preview';
             source_key_mode=$sourceKeyMode;observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     if($requestDoc.action -eq 'plan' -and -not $querySubmissionPossible) {
         # A metadata plan has no data Preview/Export path. Its failure can be
@@ -2453,7 +2525,7 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             action='plan';market_data_query_submission_possible=$false;
             error_code='metadata_preparation_failed_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        $_.Exception.ToString().Contains('DESKTOP_CONTEXT_BEFORE_QUERY:')) {
@@ -2461,7 +2533,7 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             action='download';market_data_query_submission_possible=$false;
             error_code='desktop_context_unavailable_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        $_.Exception.ToString().Contains('DATE_INPUT_BEFORE_QUERY:')) {
@@ -2471,7 +2543,7 @@ try {
             error_code=$(if($_.Exception.ToString().Contains('Foreground unavailable; no input sent') -or
                            $_.Exception.ToString().Contains('DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:')){
                 'desktop_foreground_unavailable_before_preview'}else{'local_date_input_failed_before_preview'});observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        $_.Exception.ToString().Contains('LOCAL_SELECTION_BEFORE_QUERY:') -and [TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0) {
@@ -2479,7 +2551,8 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             action='download';market_data_query_submission_possible=$false;
             error_code='local_list_selection_failed_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        if($null -ne $companyMembershipProof){$outcome.company_membership_sha256=$companyMembershipProof}
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        $_.Exception.ToString().Contains('QUERY_ACTIVATION_BEFORE_QUERY:') -and [TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0) {
@@ -2487,10 +2560,15 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             action='download';market_data_query_submission_possible=$false;
             error_code='local_query_activation_failed_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [IO.File]::WriteAllText(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))
+        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     throw
 } finally {
+    # Failed preparation is real elapsed work too. Optional timing is NEVER
+    # negative source evidence, submission permission or a deadline renewal.
+    $flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds
+    $flowTimings.scope_stages=$scopeTimings
+    Write-FlowTiming
     foreach($comObject in @($range,$sheet,$book,$excel)) {
         if($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)){[void][Runtime.InteropServices.Marshal]::ReleaseComObject($comObject)}
     }

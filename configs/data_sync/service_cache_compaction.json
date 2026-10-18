@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "contract": "physical_minute_session_sharing_v1",
+  "cache_roots": [
+    "artifacts/cache/tw_minute_paper_parity_09bedd96a2f68c39"
+  ]
+}

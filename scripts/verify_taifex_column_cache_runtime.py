@@ -7,6 +7,7 @@ service, logs into a provider, imports CUDA or changes a source/ledger.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -27,6 +28,7 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json
 from scripts.verify_taifex_web_recovery import fetch_json, validate_history_clock
 from stockagent.live import taifex_history_column_cache as cache
+from stockagent.live import taifex_history_segments as segments
 from stockagent.live import taifex_history_selection as selection
 from stockagent.live import taifex_volatility_dashboard as dashboard
 
@@ -37,6 +39,54 @@ LAUNCHER = ROOT / "scripts/run_shioaji_taifex_dashboard.sh"
 ALLOCATOR_CONTRACT = "taifex_complete_curve_allocator_idle_comparison_v1"
 ALLOCATOR_CONF = "muzzy_decay_ms:1000"
 SOURCE_PROOF_CONTRACT = "taifex_complete_curve_source_proof_memo_comparison_v1"
+BASE_DELTA_CONTRACT = "taifex_complete_seven_curve_base_delta_comparison_v1"
+
+
+def base_delta_acceptance(value, required, measurement):
+    required.update((str(Path(segments.__file__).resolve()),
+                     str(ROOT / "scripts/benchmark_taifex_history_segments.py"),
+                     str(ROOT / "scripts/benchmark_taifex_history_selection.py")))
+    trials = value["trials"]
+    order = ["baseline", "candidate", "candidate", "baseline"] * 2
+    control = value["independent_control"]
+    independent = metadata(control["path"])
+    expected = independent["trials"][0]["output_sha256"]
+    seed = value["seed"]
+    if len(trials) != len(order):
+        return False, value["fixture"]
+    metrics = ("wall_seconds", "cpu_seconds", "rss_peak_bytes", "parquet_written_bytes",
+               "warm_wall_seconds", "warm_cpu_seconds")
+    measured = {variant: {metric: statistics.median(row[metric] for row in trials
+        if row.get("variant") == variant) for metric in metrics} for variant in ("baseline", "candidate")}
+    totals = {variant: {metric: statistics.median(row[metric] + row["warm_" + metric]
+        for row in trials if row.get("variant") == variant) for metric in ("wall_seconds", "cpu_seconds")}
+        for variant in ("baseline", "candidate")}
+    improvement = (
+        value.get("source_unchanged") is True and value.get("balanced_abba") is True
+        and value.get("model_forward_calls") == 0
+        and sha(control["path"]) == control["sha256"]
+        and independent.get("exact_output_parity") is True
+        and Path(independent["fixture"]).resolve() == Path(value["fixture"]).resolve()
+        and seed["fixture"] == value["fixture"] and seed["source_sha256"] == value["source_sha256"]
+        and sha(Path(measurement).parent / "original_column_cache.py") == seed["original_code_sha256"]
+        and measured == value["medians"] and set(expected) == set(dashboard.HISTORY_RANGE_SECONDS)
+        and all(row.get("variant") == variant and row.get("threads") == 4
+            and row.get("allocator_conf", "").endswith(ALLOCATOR_CONF) and row.get("output_sha256") == expected
+            and row.get("warm_exact_output_parity") is True
+            and row.get("warm_parquet_written_bytes") == 0 and row.get("warm_sink_calls") == 0
+            and row.get("provider_calls") == 0 and row.get("model_forward_calls") == 0
+            and row.get("production_writes") is False
+            and len(row.get("ranges", [])) == len(expected)
+            and {item["range"] for item in row["ranges"]} == set(expected)
+            and all(item["rows"] > 0 and item["json_bytes"] > 0 for item in row["ranges"])
+            for row, variant in zip(trials, order, strict=True))
+        and measured["candidate"]["parquet_written_bytes"] < .05 * measured["baseline"]["parquet_written_bytes"]
+        and measured["candidate"]["cpu_seconds"] <= 1.05 * measured["baseline"]["cpu_seconds"]
+        and measured["candidate"]["wall_seconds"] <= 1.05 * measured["baseline"]["wall_seconds"]
+        and all(totals["candidate"][metric] <= 1.05 * totals["baseline"][metric]
+                for metric in ("wall_seconds", "cpu_seconds"))
+    )
+    return improvement, value["fixture"]
 
 
 def source_proof_acceptance(value, required):
@@ -205,6 +255,11 @@ def accepted_code(path):
         fixture_path = value["fixture"]
     elif value.get("contract") == SOURCE_PROOF_CONTRACT:
         improvement, fixture_path = source_proof_acceptance(value, required)
+    elif value.get("contract") == BASE_DELTA_CONTRACT:
+        try:
+            improvement, fixture_path = base_delta_acceptance(value, required, path)
+        except (KeyError, TypeError, IndexError, ValueError) as error:
+            raise ValueError("current_code_not_bound_to_accepted_measurement") from error
     else:
         raise ValueError("current_code_not_bound_to_accepted_measurement")
     if (not value.get("exact_output_parity") or not value.get("code_stable") or not improvement
@@ -291,6 +346,94 @@ def cache_readback(root):
     return rows
 
 
+def segmented_cache_readback(root):
+    """Independent full source/payload proof, not a native-writer claim."""
+    import fcntl
+
+    paths = [SOURCE / "marks.jsonl"] + [row["mark_path"] for row in dashboard._history_backfill_receipts(SOURCE)]
+    rows = []
+    for source in paths:
+        source = source.resolve(strict=True)
+        if source.stat().st_size < cache.MIN_SOURCE_BYTES:
+            continue
+        key = hashlib.sha256(str(source).encode()).hexdigest()
+        legacy = root / "history-columns-v1"
+        receipt = legacy / f"{key}.segments-v2/receipt.json"
+        lock_fd = cache._open_regular(legacy / f"{key}.lock")
+        source_fd = None
+        parts = []
+        try:
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError("column_query_lease_still_busy")
+                    time.sleep(.02)
+            value = segments._load_manifest(receipt, source, dashboard._HISTORY_POLARS_SCHEMA)
+            if not value or value["rows"] <= 0:
+                raise ValueError("unverified_segment_manifest")
+            source_fd = cache._open_regular(source)
+            generation = cache._generation(os.fstat(source_fd))
+            if (list(generation) != value["source_generation"]
+                    or cache._prefix_digest(source_fd, generation[2]) != value["source_sha256"]):
+                raise ValueError("segment_source_generation_or_sha_mismatch")
+            segments._fence(source, source_fd, generation)
+            parts = segments._pin_parts(receipt.parent, value["parts"])
+            payloads = [{"path": str(receipt.parent / part["name"]), "sha256": part["sha256"],
+                         "device": os.fstat(fd).st_dev, "inode": os.fstat(fd).st_ino,
+                         "bytes": os.fstat(fd).st_size}
+                        for part, fd in zip(value["parts"], parts, strict=True)]
+            rows.append({"path": str(receipt), "rows": value["rows"], "layout": "base_delta_v2",
+                         "payload_bytes": sum(part["bytes"] for part in payloads), "payloads": payloads,
+                         "source_generation": list(generation), "source_sha256": value["source_sha256"],
+                         "receipt_mtime_ns": receipt.stat().st_mtime_ns})
+        finally:
+            for fd in parts:
+                os.close(fd)
+            if source_fd is not None:
+                os.close(source_fd)
+            os.close(lock_fd)
+    if not rows:
+        raise ValueError("no_verified_segment_cache")
+    return rows
+
+
+def observe_segmented_apis(owner, columns):
+    """Observe this native PID actually pinning the exact immutable objects.
+
+    Closed sources must NOT be rewritten just to manufacture a fresh receipt.
+    This proves reader adoption, not a naturally occurring new-source update.
+    """
+    expected = {(part["device"], part["inode"]) for row in columns for part in row["payloads"]}
+    if not expected:
+        raise ValueError("no_verified_segment_objects_to_observe")
+    observed = set()
+    directory = Path(f"/proc/{int(owner['MainPID'])}/fd")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(observe_apis)
+        deadline = time.monotonic() + 30
+        while True:
+            for path in directory.iterdir():
+                try:
+                    info = path.stat()
+                except OSError:
+                    continue
+                identity = info.st_dev, info.st_ino
+                if identity in expected:
+                    observed.add(identity)
+            if pending.done() and (observed == expected or time.monotonic() >= deadline):
+                break
+            time.sleep(.01)
+        result = pending.result()
+    if observed != expected:
+        raise ValueError("native_pid_did_not_pin_all_verified_segment_objects")
+    return {**result, "native_payload_inodes": [list(item) for item in sorted(observed)],
+            "native_new_source_update_observed": False}
+
+
 def observe_apis():
     """Physical deployment and strict source readiness are separate proofs.
 
@@ -373,6 +516,7 @@ def main(argv=None):
         baseline_data_diagnostic(args.acceptance, args.output)
         return
     hashes = accepted_code(args.acceptance)
+    segmented = str(ROOT / "scripts/benchmark_taifex_history_segments.py") in hashes
     owner = identity(UNIT)
     protected = {unit: identity(unit) for unit in PROTECTED}
     root, enabled = owner_environment(owner)
@@ -380,9 +524,11 @@ def main(argv=None):
               "owner": owner, "protected": protected, "code_sha256": hashes, "launcher_sha256": sha(LAUNCHER),
               "cache_root": str(root), "provider_calls": 0, "gpu_calls": 0, "source_mutations": False,
               "service_restart_requested": False, "column_env_enabled": enabled}
+    if segmented:
+        result["verifier_sha256"] = sha(Path(__file__))
     try:
         if args.baseline is None:
-            if (str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
+            if (segmented or str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
                     or str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes):
                 result.update(prewarm_polars_threads=pl.thread_pool_size(),
                               prewarm_allocator_conf=os.environ.get("_RJEM_MALLOC_CONF", ""))
@@ -390,6 +536,8 @@ def main(argv=None):
                         or not result["prewarm_allocator_conf"].endswith(ALLOCATOR_CONF)):
                     raise ValueError("prewarm_has_not_loaded_measured_allocator")
             os.environ[cache.CACHE_ENV], os.environ[cache.ENABLE_ENV] = str(root), "1"
+            if segmented:
+                os.environ[segments.LAYOUT_ENV] = "base_delta_v2"
             began, cpu = time.perf_counter(), time.process_time()
             curve = dashboard.build_dashboard_history_snapshot(state_dir=SOURCE, now=datetime.now(timezone.utc), range_key="1d")
             result.update(state="isolated_prewarm_verified", wall_seconds=time.perf_counter()-began,
@@ -402,7 +550,9 @@ def main(argv=None):
                     or baseline["cache_root"] != str(root) or baseline["protected"] != protected
                     or owner["InvocationID"] == baseline["owner"]["InvocationID"]):
                 raise ValueError("runtime_not_bound_to_prewarm_and_protected_owners")
-            allocator = (str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
+            if segmented and baseline.get("verifier_sha256") != result["verifier_sha256"]:
+                raise ValueError("runtime_verifier_changed_since_prewarm")
+            allocator = (segmented or str(ROOT / "scripts/benchmark_taifex_allocator_idle.py") in hashes
                          or str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes)
             if allocator or str(ROOT / "scripts/benchmark_taifex_curve_threads.py") in hashes:
                 result["owner_polars_max_threads"] = owner_polars_limit(owner)
@@ -414,19 +564,28 @@ def main(argv=None):
                         or baseline.get("prewarm_polars_threads") != 4
                         or not baseline.get("prewarm_allocator_conf", "").endswith(ALLOCATOR_CONF)):
                     raise ValueError("display_owner_has_not_loaded_measured_allocator")
-            result["api"] = observe_apis()
-            result["state"] = "deployed_physical_cache_verified"
-        result["columns"] = cache_readback(root)
-        if args.baseline and not any(
+            if segmented:
+                values = Path(f"/proc/{int(owner['MainPID'])}/environ").read_bytes().split(b"\0")
+                if f"{segments.LAYOUT_ENV}=base_delta_v2".encode() not in values:
+                    raise ValueError("display_owner_has_not_loaded_base_delta_layout")
+                result["columns"] = segmented_cache_readback(root)
+                result["api"] = observe_segmented_apis(owner, result["columns"])
+                result["state"] = "deployed_base_delta_reader_verified"
+            else:
+                result["api"] = observe_apis()
+                result["state"] = "deployed_physical_cache_verified"
+        if "columns" not in result:
+            result["columns"] = segmented_cache_readback(root) if segmented else cache_readback(root)
+        if args.baseline and not segmented and not any(
                 row["receipt_mtime_ns"] > baseline["columns"][index]["receipt_mtime_ns"]
                 for index, row in enumerate(result["columns"])):
             raise ValueError("new_owner_has_not_proved_a_column_refresh_yet")
-        if args.baseline and str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes:
+        if args.baseline and (segmented or str(ROOT / "scripts/benchmark_taifex_source_proof_memo.py") in hashes):
             # An old owner can refresh between prewarm and restart. Such a
             # receipt is not proof that the new process has rebuilt a source.
             start_ns = owner_start_wall_ns(owner)
             result["owner_start_wall_ns"] = start_ns
-            if not any(row["receipt_mtime_ns"] > start_ns for row in result["columns"]):
+            if not segmented and not any(row["receipt_mtime_ns"] > start_ns for row in result["columns"]):
                 raise ValueError("no_column_refresh_after_actual_new_owner_start")
             if any(Path(path).stat().st_mtime_ns > start_ns for path in hashes):
                 raise ValueError("benchmark_code_newer_than_display_owner")

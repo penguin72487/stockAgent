@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -31,11 +31,24 @@ from downloader.news_fulltext_robots import (MAX_ROBOTS_ORIGINS_PER_PROVIDER, ne
 
 
 @dataclass(frozen=True)
+class RedirectHop:
+    """Actual source response, not an inferred permalink or fetched body."""
+    from_url: str
+    status: int
+    location: str
+    to_url: str
+    observed_at_utc: str
+    response_sha256: str
+    response_bytes: int
+
+
+@dataclass(frozen=True)
 class Response:
     url: str
     status: int
     headers: dict[str, str]
     body: bytes
+    redirects: tuple[RedirectHop, ...] = ()
 
 
 ACCESS_DIAGNOSTIC_HEADERS = frozenset({
@@ -769,17 +782,27 @@ class NewsHTTP:
             self.robots_parsers[origin] = (cache["checked_at"], parser)
             return parser
 
-    def get(self, url: str, *, headers: dict | None = None, follow_redirects: bool = True, metadata_feed=None) -> Response:
+    def get(self, url: str, *, headers: dict | None = None, follow_redirects: bool = True,
+            metadata_feed=None, conditional_url: str | None = None) -> Response:
         """Check every requested origin; optionally inspect a redirect only.
 
         Link diagnosis may read a public redirect's location without following
         it into another publisher. It keeps the same robots, pacing, DNS and
         refusal checks and grants no permission to fetch the destination.
+        Explicitly bound cache validators are sent only at their original
+        representation URL, reached through the actual checked redirect chain.
+        Other headers never follow redirects; the default behavior is unchanged.
         """
         if type(follow_redirects) is not bool:
             raise ValueError("follow_redirects must be a boolean")
         url = normalize_url(url)
+        bound_url = normalize_url(conditional_url) if conditional_url is not None else None
+        validators = {key: value for key, value in (headers or {}).items()
+                      if key.lower() in {'if-none-match', 'if-modified-since'}} if bound_url else {}
+        initial_headers = {key: value for key, value in (headers or {}).items()
+                           if key.lower() not in {'if-none-match', 'if-modified-since'}} if bound_url else headers
         provider = self._require(url, metadata_feed).provider
+        redirects = []
         for _ in range(6):
             # Check source rights and robots at every hop, not after auto-follow.
             if self._require(url, metadata_feed).provider != provider:
@@ -800,12 +823,18 @@ class NewsHTTP:
                 raise
             if not parser.can_fetch(url, self.config["user_agent"].split("/", 1)[0]):
                 raise NewsError("robots_disallowed")
-            response = self._raw(url, headers, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
+            request_headers = ({**(initial_headers or {}), **(validators if url == bound_url else {})}
+                               if bound_url else headers)
+            response = self._raw(url, request_headers, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
             if response.status not in {301, 302, 303, 307, 308} or not follow_redirects:
-                return response
+                return replace(response, redirects=tuple(redirects)) if redirects else response
             location = response.headers.get("location")
             if not location:
                 raise NewsError("invalid_redirect")
-            url = normalize_url(urljoin(url, location))
+            target = normalize_url(urljoin(url, location))
+            redirects.append(RedirectHop(url, response.status, location, target,
+                datetime.now(timezone.utc).isoformat(), hashlib.sha256(response.body).hexdigest(), len(response.body)))
+            url = target
             headers = None  # Conditional identifiers belong to the original URL.
+            initial_headers = None
         raise NewsError("redirect_loop")

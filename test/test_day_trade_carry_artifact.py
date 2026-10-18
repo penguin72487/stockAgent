@@ -13,7 +13,7 @@ from stockagent.training.day_trade_carry_artifact import DayTradeCarryArtifactCo
 from stockagent.training.trainer import (
     _atomic_numpy_archive_save, _load_backtest_artifact, _save_backtest_artifact,
     _prefix_backtest_result, _save_settlement_audit_artifacts,
-    _slice_backtest_rows,
+    _slice_backtest_rows, _try_load_fresh_fold_physical_deployment_segment,
 )
 from test_tw_day_trade_carry import DAY, assert_state, canonical_kwargs, session, v
 
@@ -31,6 +31,29 @@ def simulate(weights, sessions, initial=None):
 
 def dates(sessions):
     return np.array([date.fromordinal(s.day) for s in sessions], dtype="datetime64[D]")
+
+
+@pytest.mark.parametrize("replay_version", [None, 1, 2])
+def test_fresh_deployment_reuse_requires_current_causal_bridge(tmp_path, replay_version):
+    sessions = [session()]
+    result = simulate([.21], sessions)
+    _save_backtest_artifact(
+        tmp_path / "deployment_test_backtest.npz", result, dates(sessions),
+        day_trade_carry_context=CONTEXT,
+    )
+    (tmp_path / "deployment_test_symbols.json").write_text(json.dumps(list(CONTEXT.universe)))
+    details = {} if replay_version is None else {"physical_policy_replay_version": replay_version}
+    (tmp_path / "mode_artifact_contract.json").write_text(json.dumps({"mode_details": details}))
+    actual = _try_load_fresh_fold_physical_deployment_segment(
+        tmp_path, expected_dates=dates(sessions), expected_symbols=CONTEXT.universe,
+        expected_requests=result.requested_weights_history, release_id=CONTEXT.release_id,
+        initial_capital=CONTEXT.initial_capital,
+    )
+    if replay_version == 2:
+        assert actual is not None
+        np.testing.assert_array_equal(actual.minute_nav, result.minute_nav)
+    else:
+        assert actual is None
 
 
 @pytest.mark.parametrize("compression", ["none", "compressed"])

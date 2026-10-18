@@ -7,7 +7,7 @@ from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue
 from scripts.verify_news_recent_batches import verify_recent_batches
 from scripts.audit_news_runtime import (baseline_progress_requirements, has_dispatchable_missing_body_work,
-    heartbeat_clock, completion_owner_check, frontier_snapshot_counts)
+    active_request_scope_pauses, source_readiness_snapshot, heartbeat_clock, completion_owner_check, frontier_snapshot_counts)
 from scripts.audit_news_selected_articles import audit as audit_selected
 from scripts.benchmark_cnyes_acquisition import verify_batches
 from types import SimpleNamespace
@@ -191,6 +191,141 @@ def test_runtime_readiness_excludes_uninitialized_finite_cohort(config, tmp_path
         assert not has_dispatchable_missing_body_work(queue.db, source, queue.owner, 100)
     finally:
         queue.close()
+
+
+@pytest.mark.parametrize('host_pause,origin_pause,second_url,expected', [
+    ({'publisher.test': 101}, {}, None, False),
+    ({'publisher.test': 100}, {}, None, True),
+    ({}, {'https://publisher.test': 101}, None, False),
+    ({}, {'https://publisher.test': 100}, None, True),
+    ({}, {'http://publisher.test': 101}, None, True),
+    ({}, {'https://publisher.test': 101}, 'http://publisher.test/b', True),
+    ({'publisher.test': 101}, {}, 'https://other.test/b', True),
+])
+def test_runtime_readiness_uses_actual_expiring_scope_filters_without_provider_wide_suppression(
+        config, tmp_path, host_pause, origin_pause, second_url, expected):
+    config['providers'][0]['domains'].append('other.test')
+    registry = PolicyRegistry(config, base=tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        queue.add_articles([{'url': 'https://publisher.test/a'}] +
+                           ([{'url': second_url}] if second_url else []))
+        with queue.db:
+            queue.db.execute("UPDATE articles SET due=0")
+        before = tuple(tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY url'))
+        scopes = active_request_scope_pauses({'temporarily_paused_gateway_hosts': host_pause,
+            'temporarily_paused_robots_origins': origin_pause}, 100)
+        ready = has_dispatchable_missing_body_work(queue.db, registry.sources['publisher'], queue.owner, 100,
+            excluded_hosts=tuple(scopes['active_gateway_hosts']), excluded_origins=tuple(scopes['active_robots_origins']))
+        assert ready is expected
+        assert tuple(tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY url')) == before
+        baseline = {'observed_at_utc': '2026-10-15T00:00:00+00:00', 'providers': {'publisher': {
+            'enabled': True, 'missing_body_work': len(before), 'has_dispatchable_missing_body_work': ready,
+            'request_scope_readiness': {**scopes, 'has_unfiltered_due_work': True}}}}
+        proof = baseline_progress_requirements(baseline)
+        assert proof['required_provider_ids'] == (['publisher'] if expected else [])
+        if not expected:
+            assert proof['excluded_provider_reasons']['publisher'] == (
+                'due_missing_bodies_wait_for_request_scope_policy; backlog_not_complete')
+    finally:
+        queue.close()
+
+
+def test_active_current_owner_lease_remains_required_when_its_origin_is_later_paused(config, tmp_path):
+    from dataclasses import replace
+    registry = PolicyRegistry(config, base=tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        queue.add_articles([{'url': 'https://publisher.test/a'}])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='inflight',lease_owner=?,lease_until=101", (queue.owner,))
+        source = registry.sources['publisher']
+        assert has_dispatchable_missing_body_work(queue.db, source, queue.owner, 100,
+            excluded_origins=('https://publisher.test',))
+        assert not has_dispatchable_missing_body_work(queue.db, source, 'old-owner', 100,
+            excluded_origins=('https://publisher.test',))
+        assert not has_dispatchable_missing_body_work(queue.db, replace(source, allowed=False), queue.owner, 100)
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('pauses', [None, [], {'publisher.test': True}, {'publisher.test': float('nan')},
+                                  {'publisher.test': float('inf')}, {'publisher.test': '101'}])
+def test_runtime_scope_pause_rejects_malformed_telemetry_not_silently_green(pauses):
+    with pytest.raises(ValueError, match='invalid_request_scope_pause_snapshot'):
+        active_request_scope_pauses({'temporarily_paused_gateway_hosts': pauses}, 100)
+
+
+def test_runtime_scope_pause_reuses_canonical_exact_origin_validation():
+    with pytest.raises(ValueError, match='bounded_exact_excluded_origins_required'):
+        active_request_scope_pauses({'temporarily_paused_robots_origins': {'https://publisher.test/path': 101}}, 100)
+
+
+@pytest.mark.parametrize('kind', ['gateway', 'origin'])
+@pytest.mark.parametrize('second_url,lease,expected', [
+    (None, False, False), ('https://other.test/b', False, True),
+    ('http://publisher.test/b', False, True), (None, True, True)])
+def test_pause_expiry_between_metric_and_database_clocks_is_not_a_policy_success(
+        config, tmp_path, kind, second_url, lease, expected):
+    from datetime import datetime, timedelta, timezone
+    config['providers'][0]['domains'].append('other.test')
+    registry = PolicyRegistry(config, base=tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    metric = datetime(2026, 10, 18, 8, 30, 2, tzinfo=timezone.utc)
+    observed, expired = metric + timedelta(seconds=10), (metric + timedelta(seconds=5)).timestamp()
+    control = {'temporarily_paused_gateway_hosts': {'publisher.test': expired}} if kind == 'gateway' else {
+        'temporarily_paused_robots_origins': {'https://publisher.test': expired}}
+    try:
+        queue.add_articles([{'url': 'https://publisher.test/a'}] + ([{'url': second_url}] if second_url else []))
+        with queue.db:
+            queue.db.execute('UPDATE articles SET due=0')
+            if lease:
+                queue.db.execute("UPDATE articles SET state='inflight',lease_owner=?,lease_until=?",
+                    (queue.owner, (observed + timedelta(seconds=10)).timestamp()))
+        before = queue.db.total_changes
+        ready, details = source_readiness_snapshot(queue.db, registry.sources['publisher'], queue.owner, control,
+            queue_observed_at_utc=observed.isoformat(), metric_snapshot_at_utc=metric.isoformat())
+        # Gateway isolation excludes both schemes; an exact HTTPS origin does not.
+        if kind == 'gateway' and second_url == 'http://publisher.test/b': expected = False
+        assert ready is expected and details['has_unfiltered_due_work']
+        assert details['pause_evaluated_at_utc'] == metric.isoformat()
+        assert any(details['expired_after_metric_snapshot'].values())
+        assert not details['permission_after_snapshot_inferred'] and queue.db.total_changes == before
+        baseline = {'observed_at_utc': observed.isoformat(), 'providers': {'publisher': {
+            'enabled': True, 'missing_body_work': 1, 'has_dispatchable_missing_body_work': ready,
+            'request_scope_readiness': details}}}
+        assert baseline_progress_requirements(baseline)['required_provider_ids'] == (['publisher'] if expected else [])
+    finally:
+        queue.close()
+
+
+def test_a_later_snapshot_must_witness_gate_expiry_before_ready_work_is_required(config, tmp_path):
+    from datetime import datetime, timedelta, timezone
+    registry = PolicyRegistry(config, base=tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        queue.add_articles([{'url': 'https://publisher.test/a'}])
+        clock = datetime(2026, 10, 18, 8, 30, 12, tzinfo=timezone.utc)
+        control = {'temporarily_paused_robots_origins': {'https://publisher.test': (clock - timedelta(seconds=5)).timestamp()}}
+        ready, details = source_readiness_snapshot(queue.db, registry.sources['publisher'], queue.owner, control,
+            queue_observed_at_utc=clock.isoformat(), metric_snapshot_at_utc=clock.isoformat())
+        assert ready and not any(details['active_robots_origins'])
+        # A subsequent failure in this genuinely ready window stays required;
+        # no end-of-window circuit or error is used to erase the requirement.
+        baseline = {'observed_at_utc': clock.isoformat(), 'providers': {'publisher': {
+            'enabled': True, 'missing_body_work': 1, 'has_dispatchable_missing_body_work': ready,
+            'request_scope_readiness': details}}}
+        assert baseline_progress_requirements(baseline)['required_provider_ids'] == ['publisher']
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('queue_clock,metric_clock', [
+    ('2026-10-18T08:30:12', '2026-10-18T08:30:02+00:00'),
+    ('2026-10-18T08:30:12+00:00', '2026-10-18T08:30:02')])
+def test_readiness_does_not_silently_mix_naive_clocks(queue_clock, metric_clock):
+    with pytest.raises(ValueError, match='timezone_aware_readiness_clocks_required'):
+        source_readiness_snapshot(None, None, None, {}, queue_observed_at_utc=queue_clock, metric_snapshot_at_utc=metric_clock)
 
 
 @pytest.mark.parametrize('age,fresh', [(-6, False), (-5, True), (0, True), (45, True), (46, False), (120, False)])

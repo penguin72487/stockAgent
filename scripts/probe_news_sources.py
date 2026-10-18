@@ -59,6 +59,7 @@ FAILURE_PROBE_CODES = (
     'body_not_found', 'article_attribution_not_verified',
     'article_title_not_verified', 'article_identity_not_verified',
     'invalid_bulk_publication_clock', 'article_rights_or_scope_excluded',
+    'article_license_not_verified',
 )
 
 
@@ -366,6 +367,14 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                 if source.provider == 'cnyes':
                     from scripts.inspect_cnyes_news import cnyes_html_structure
                     item['cnyes_structure'] = cnyes_html_structure(soup, source, page_url=response.url)
+                if source.provider == 'ettoday':
+                    from downloader.news_fulltext_ettoday import ettoday_validation_metadata
+                    item['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=response.url,
+                        adapter_contract_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]),
+                        allow_house='house.ettoday.net' in source.reviewed_article_subsites)
+                if source.required_license_url_prefix:
+                    from downloader.news_fulltext_diagnostics import article_license_validation_metadata
+                    item['native_article_license_validation'] = article_license_validation_metadata(soup, source)
                 item["containers"] = {s: [{"characters": len(n.get_text(' ', strip=True)), "tag": n.name,
                                           "classes": n.get('class')} for n in soup.select(s)] for s in source.selectors}
                 if source.provider in {"cnews", "cmmedia"}:
@@ -506,10 +515,8 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                     item["publisher_declared_articles"] = item["publisher_declared_articles"][:8]
                     if source.provider == 'tvbs':
                         from downloader.news_fulltext_tvbs import tvbs_validation_metadata
-                        item['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=response.url)
-                    if source.provider == 'ettoday':
-                        from downloader.news_fulltext_ettoday import ettoday_validation_metadata
-                        item['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=response.url)
+                        item['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=response.url,
+                            adapter_contract_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]))
                     if source.provider in {"voa_chinese", "voa_cantonese"}:
                         declarations = item["publisher_declared_articles"]
                         declaration = declarations[0] if len(declarations) == 1 else {}

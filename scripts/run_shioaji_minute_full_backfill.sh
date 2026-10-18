@@ -13,6 +13,7 @@ set -a
 source "$ENV_FILE"
 set +a
 source scripts/runtime_env.sh
+ensure_enrolled_wsl_identity "$REPO_ROOT"
 
 RUN_ROOT="${SHIOAJI_MINUTE_RUN_ROOT:-artifacts/data_repair/shioaji_minute_full}"
 LOG_FILE="$RUN_ROOT/run.log"

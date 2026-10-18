@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+from stockagent.data.news_worker_lifecycle import read_news_worker_lifecycle
 from stockagent.data.news_source_catalog import (
     configuration_paths, load_news_configuration, load_source_review_ledger,
     planning_review_path, source_role, classify_news_outcomes,
@@ -460,6 +461,9 @@ def news_snapshot_revision(repo_root: Path) -> str:
     """Cheap generation identity; no persistent cache or queue access."""
     parts = []
     paths = [repo_root / "data_news_fulltext/status.json", repo_root / "configs/news_fulltext.json"]
+    lifecycle_path = repo_root / 'data_news_fulltext/owner_lifecycle.json'
+    if lifecycle_path.is_file():
+        paths.append(lifecycle_path)
     cna_path = repo_root / "configs/news/cna_authorized_api.json"
     if cna_path.is_file():
         paths.append(cna_path)
@@ -556,9 +560,23 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     source_activity = raw_activity if isinstance(raw_activity, str) and raw_activity in _ACTIVITIES else "unavailable"
     activity = _ACTIVITIES.get(source_activity, "unavailable")
     valid = type(status.get("contract_version")) is int and status["contract_version"] == 1
+    lifecycle = read_news_worker_lifecycle(repo_root / 'data_news_fulltext',
+        snapshot_owner_id=status.get('owner_id'), snapshot_at=observed, now=now)
+    initializing = False
+    lifecycle_stopped = False
+    if lifecycle.get('available') and (lifecycle['snapshot_owner_matches'] or lifecycle['supersedes_snapshot']):
+        lifecycle_stopped = not lifecycle['process_alive'] or lifecycle['state'] in {'closed', 'failed'}
+        initializing = not lifecycle_stopped and (not lifecycle['snapshot_owner_matches']
+            or lifecycle['state'] == 'initializing')
+        if initializing:
+            activity = 'initializing' if lifecycle['age_seconds'] <= MAX_AGE_SECONDS else 'initializing_stale'
+        elif lifecycle_stopped and activity not in {'stopped', 'waiting_restart'}:
+            activity = 'stopped'
     live = valid and fresh and activity in {"running", "idle", "waiting", "inventorying"}
     health = ("unavailable" if not status else "invalid" if not valid else "stale" if not fresh
               else "stopped" if activity == "stopped" else activity)
+    if initializing or lifecycle_stopped:
+        health = activity
     configured: dict[str, Mapping[str, Any]] = {}
     for source in config.get("providers", []) if isinstance(config.get("providers"), list) else []:
         source = _object(source)
@@ -567,11 +585,13 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             configured[identifier] = source
     raw_providers = _object(status.get("providers")) if valid else {}
     original_inventory, original_sources = _original_sources(status if valid else {}, raw_providers)
-    metrics = _object(status.get("performance")) if valid else {}
+    # Persisted article counts are reusable. Previous-process timings, requests
+    # and capacity windows are not observations of the initializing new owner.
+    metrics = _object(status.get("performance")) if valid and not initializing else {}
     metric_providers = _object(metrics.get("providers"))
     elapsed = _number(metrics.get("owner_elapsed_seconds"))
     cooldowns = _object(status.get("provider_next_attempt_utc"))
-    capacity = _object(status.get("http_capacity")) if valid and fresh else {}
+    capacity = _object(status.get("http_capacity")) if valid and fresh and not initializing else {}
     runtime_controls = _object(capacity.get("providers"))
     calibration = _object(_object(capacity.get("calibration")).get("providers"))
     calibration_version = _object(capacity.get('calibration')).get('measurement_contract_version')
@@ -681,7 +701,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             finish = (observed + timedelta(seconds=eta)).isoformat()
             if ready and observed + timedelta(seconds=eta) <= now:
                 eta = finish = None  # Old projection elapsed without proof of completion.
-        state = ("unavailable" if not valid else "not_enabled" if not enabled else
+        state = (activity if initializing and enabled else "unavailable" if not valid else "not_enabled" if not enabled else
                  "stale" if not fresh else activity if not live else
                  "cooldown" if cooling else
                  ("attention" if metadata_feed['feeds_with_errors'] else "metadata_polling")
@@ -853,6 +873,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                       'publisher_requests': 0}
     return {
         "schema_version": 1, "nonbody_source_outcome_progress_contract_version": 1,
+        "worker_lifecycle_projection_contract_version": 1,
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         "outcome_progress": outcome_progress,
         "provider_stored_body_counter_contract_version": 1 if stored_counter_supported else None,
@@ -868,10 +889,13 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         "observed_at_utc": observed.isoformat() if observed else None,
         "status_age_seconds": max(0.0, age) if age is not None else None,
         "snapshot_consistent": consistency,
-        "worker": {"activity": activity, "source_activity": source_activity, "fresh": fresh, "owner_elapsed_seconds": elapsed,
-                   "owner_cpu_seconds": _number(metrics.get("owner_cpu_seconds")),
-                   "requests": sum(requests) if requests and all(value is not None for value in requests) else None,
-                   "response_bytes": _count(status.get("http_response_bytes_this_run")) if valid else None},
+        "worker": {"activity": activity, "source_activity": source_activity,
+                   "fresh": fresh and not initializing and not lifecycle_stopped,
+                   "lifecycle": lifecycle,
+                   "owner_elapsed_seconds": lifecycle['elapsed_seconds'] if initializing else elapsed,
+                   "owner_cpu_seconds": None if initializing else _number(metrics.get("owner_cpu_seconds")),
+                   "requests": sum(requests) if not initializing and requests and all(value is not None for value in requests) else None,
+                   "response_bytes": _count(status.get("http_response_bytes_this_run")) if valid and not initializing else None},
         "acquisition": {"known_urls": known, "stored_body_articles": stored,
                         "complete_state_urls": counts.get("complete", 0) if valid else None,
                         "remaining_urls": sum(source["remaining_urls"] or 0 for source in providers if source["enabled"]) if valid else None,

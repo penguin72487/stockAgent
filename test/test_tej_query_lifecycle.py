@@ -52,6 +52,47 @@ def test_interface_barrier_blocks_before_claiming_task_or_any_desktop_call(reset
         assert con.execute('SELECT COUNT(*) FROM traffic').fetchone()[0]==0
 
 
+def test_lifecycle_uses_current_birth_pinned_interactive_relay(reset_scope,monkeypatch):
+    from subprocess import CompletedProcess
+    from downloader.tej_query_lifecycle import _execute_phase
+    monkeypatch.setattr('downloader.tej_history.DesktopBridge.windows_path',staticmethod(lambda p:str(p)))
+    root,task,session=reset_scope
+    with closing(connect(root)) as con,con:
+        con.execute("INSERT OR REPLACE INTO meta VALUES('runtime_policy',?)",
+                    (json.dumps({'desktop_startup':{'enabled':True}}),))
+    output=root/'raw'/'phase.json';atomic_write_json(output,{'fixture':True})
+    calls=[]
+    monkeypatch.setattr('downloader.tej_startup.interactive_transport',lambda root:{
+        'windows_session_id':7,'interop_socket':'/run/WSL/123_interop'})
+    def run(argv,**options):
+        calls.append((argv,options));return CompletedProcess(argv,0,b'',b'')
+    monkeypatch.setattr('downloader.tej_query_lifecycle.subprocess.run',run)
+    from downloader.tej_history import DesktopBridge
+    bridge=DesktopBridge(Path(__file__).resolve().parents[1],session)
+    assert _execute_phase(bridge,root,'inspect-addin',output)=={'fixture':True}
+    argv,options=calls[0]
+    assert options['env']['WSL_INTEROP']=='/run/WSL/123_interop'
+    assert argv[-1].startswith('if([Diagnostics.Process]::GetCurrentProcess().SessionId -ne 7){exit 77};')
+    assert argv[-1].index('SessionId')<argv[-1].index('Copy-Item')
+
+
+def test_lifecycle_without_verified_interactive_relay_never_launches(reset_scope,monkeypatch):
+    from downloader.tej_query_lifecycle import _execute_phase
+    from downloader.tej_history import DesktopBridge
+    monkeypatch.setattr(DesktopBridge,'windows_path',staticmethod(lambda p:str(p)))
+    root,task,session=reset_scope
+    with closing(connect(root)) as con,con:
+        con.execute("INSERT OR REPLACE INTO meta VALUES('runtime_policy',?)",
+                    (json.dumps({'desktop_startup':{'enabled':True}}),))
+    def unavailable(root):raise ValueError('interactive relay unverified')
+    monkeypatch.setattr('downloader.tej_startup.interactive_transport',unavailable)
+    monkeypatch.setattr('downloader.tej_query_lifecycle.subprocess.run',
+                        lambda *a,**k:pytest.fail('No verified desktop means no lifecycle launch'))
+    with pytest.raises(ValueError,match='relay unverified'):
+        _execute_phase(DesktopBridge(Path(__file__).resolve().parents[1],session),root,
+                       'inspect-addin',root/'raw'/'phase.json')
+
+
 @pytest.mark.parametrize('mutation',['source_binding_stable','vendor_notices_absent','market_data_query_submitted','source_axes_adopted'])
 def test_bad_interface_proof_preserves_barrier(reset_scope,mutation):
     root,task,session=reset_scope;mark_interface_barrier(root,reason='fixture')

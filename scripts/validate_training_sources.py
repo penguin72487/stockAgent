@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -76,27 +77,81 @@ def verify_unchanged(entry, proof, *, repo_root=ROOT):
         raise SnapshotError('validated source identity changed before publication')
 
 
+def _validator_dependencies(kind):
+    """Hash implementations without importing their numerical dependencies."""
+    names = ['scripts/validate_training_sources.py', 'scripts/runtime_env.sh',
+             'stockagent/data_sync/source_validation.py',
+             'stockagent/data_sync/minute_catalog_validation.py']
+    if kind == 'stock_minute_source':
+        names.extend(['downloader/download_shioaji_tw_minute_kbars.py',
+                      'scripts/shioaji_minute_backfill_state.py',
+                      'downloader/stock_volume_units.py'])
+    elif kind == 'stock_minute_dataset':
+        names.extend(['scripts/audit_shioaji_tw_minute_dataset.py',
+            'scripts/build_shioaji_tw_minute_dataset.py',
+            'stockagent/data/tw_price_rules.py',
+            'stockagent/data/tw_exchange_price_classification.py',
+            'downloader/stock_volume_units.py', 'downloader/download_tw_public_data.py'])
+    else:
+        raise SnapshotError(f'unknown source validation gate: {kind}')
+    return [ROOT / name for name in names]
+
+
+def _semantic_audit(entry, repo_root, state):
+    """Run the original auditors, never a reduced storage-role substitute."""
+    root, gate = _root(entry, repo_root), entry['validation_gate']
+    if gate['kind'] == 'stock_minute_source':
+        result = audit_stock_minute_source(root, state / 'files.sqlite3')
+        result['terminal_catalog'] = validate_stock_minute_catalog(root, state / 'catalog.sqlite3')
+        return result
+    if gate['kind'] != 'stock_minute_dataset':
+        raise SnapshotError(f"unknown source validation gate: {gate['kind']}")
+    raw = Path(gate['calendar_root'])
+    calendar = raw if raw.is_absolute() else repo_root / raw
+    audit_path = state / 'semantic_audit.json'
+    try:
+        subprocess.run([sys.executable, str(ROOT / 'scripts/audit_shioaji_tw_minute_dataset.py'),
+            '--dataset-root', str(root), '--all-partitions', '--calendar-root', str(calendar),
+            '--verification-cache', str(state / 'files.sqlite3'), '--output', str(audit_path)],
+            check=True, cwd=repo_root, stdout=sys.stderr)
+    except subprocess.CalledProcessError as exc:
+        raise SnapshotError(f'source semantic validation failed: {entry["dataset"]}') from exc
+    return verify_minute_release_receipt(root, audit_path)
+
+
+def _audit_with_runtime(entry, repo_root, state):
+    if all(importlib.util.find_spec(name) is not None for name in ('numpy', 'polars')):
+        return _semantic_audit(entry, repo_root, state)
+    # The locked storage role deliberately excludes acquisition/ML packages.
+    # Only its fixed semantic auditor uses the existing native data runtime;
+    # the storage process keeps its own runtime, source lock and before/after
+    # identity guards. No dependency installation, provider call or training.
+    environment = dict(os.environ)
+    for name in ('PYTHON_BIN', 'FINTECH_ENV_PATH'):
+        environment.pop(name, None)
+    command = ['bash', '-c', 'source "$1/scripts/runtime_env.sh"; '
+        'run_fintech_python "$1/scripts/validate_training_sources.py" '
+        '--audit-entry-stdin --repo-root "$2"', 'source-semantic-audit', str(ROOT), str(repo_root)]
+    try:
+        completed = subprocess.run(command, input=json.dumps(entry), text=True,
+            stdout=subprocess.PIPE, check=True, cwd=repo_root, env=environment)
+    except subprocess.CalledProcessError as exc:
+        raise SnapshotError(f'canonical data-runtime semantic audit failed: {entry["dataset"]}; '
+                            f'exit={exc.returncode}; source remains unaccepted') from exc
+    # Audit progress goes to stderr in the fixed child; stdout is one result.
+    value = json.loads(completed.stdout)
+    if (not isinstance(value, dict) or value.get('contract') != 'source_semantic_audit_result_v1'
+            or value.get('dataset') != entry['dataset'] or not isinstance(value.get('result'), dict)):
+        raise SnapshotError('semantic auditor returned an unrelated or incomplete result')
+    return value['result']
+
+
 def validate_catalog_source(entry, *, repo_root=ROOT):
     gate = entry['validation_gate']
-    root = _root(entry, repo_root)
     before = _identity(entry, repo_root)
     state = repo_root / 'artifacts/operations/source_validation' / entry['dataset']
     state.mkdir(parents=True, exist_ok=True)
-    dependencies = [Path(__file__), Path(sys.modules[audit_stock_minute_source.__module__].__file__),
-                    Path(sys.modules[validate_stock_minute_catalog.__module__].__file__)]
-    if gate['kind'] == 'stock_minute_source':
-        from downloader import download_shioaji_tw_minute_kbars as collector
-        dependencies.append(Path(collector.__file__))
-    else:
-        from scripts import audit_shioaji_tw_minute_dataset as auditor
-        from scripts import build_shioaji_tw_minute_dataset as builder
-        from stockagent.data import tw_price_rules, tw_exchange_price_classification
-        from downloader import stock_volume_units
-        from downloader import download_tw_public_data
-        dependencies.extend(Path(module.__file__) for module in (
-            auditor, builder, tw_price_rules, tw_exchange_price_classification, stock_volume_units,
-            download_tw_public_data))
-    validator_sha = validator_identity(*dependencies)
+    validator_sha = validator_identity(*_validator_dependencies(gate['kind']))
     latest = state/'latest.json'
     if latest.is_file():
         previous = read_object(latest)
@@ -107,23 +162,7 @@ def validate_catalog_source(entry, *, repo_root=ROOT):
             # shortcut; publisher still checks cold content and its inventory.
             verify_unchanged(entry, previous, repo_root=repo_root)
             return previous
-    if gate['kind'] == 'stock_minute_source':
-        result = audit_stock_minute_source(root, state / 'files.sqlite3')
-        result['terminal_catalog'] = validate_stock_minute_catalog(root, state/'catalog.sqlite3')
-    elif gate['kind'] == 'stock_minute_dataset':
-        raw = Path(gate['calendar_root'])
-        calendar = raw if raw.is_absolute() else repo_root / raw
-        audit_path = state / 'semantic_audit.json'
-        try:
-            subprocess.run([sys.executable, str(repo_root / 'scripts/audit_shioaji_tw_minute_dataset.py'),
-                '--dataset-root', str(root), '--all-partitions', '--calendar-root', str(calendar),
-                '--verification-cache', str(state / 'files.sqlite3'), '--output', str(audit_path)],
-                check=True, cwd=repo_root)
-        except subprocess.CalledProcessError as exc:
-            raise SnapshotError(f'source semantic validation failed: {entry["dataset"]}') from exc
-        result = verify_minute_release_receipt(root, audit_path)
-    else:
-        raise SnapshotError(f"unknown source validation gate: {gate['kind']}")
+    result = _audit_with_runtime(entry, repo_root, state)
     proof = {'contract': 'catalog_source_semantic_validation_v1', 'identity': before,
              'validator_sha256': validator_sha, 'gate': gate,
              'dataset': entry['dataset'], 'result': result}
@@ -134,9 +173,23 @@ def validate_catalog_source(entry, *, repo_root=ROOT):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('dataset')
+    parser.add_argument('dataset', nargs='?')
+    parser.add_argument('--audit-entry-stdin', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--repo-root', type=Path, default=ROOT, help=argparse.SUPPRESS)
     parser.add_argument('--catalog', type=Path, default=ROOT/'configs/data_sync/packed_datasets.json')
     args = parser.parse_args()
+    if args.audit_entry_stdin:
+        from contextlib import redirect_stdout
+        entry = json.load(sys.stdin)
+        state = args.repo_root / 'artifacts/operations/source_validation' / entry['dataset']
+        state.mkdir(parents=True, exist_ok=True)
+        with redirect_stdout(sys.stderr):
+            result = _semantic_audit(entry, args.repo_root, state)
+        print(json.dumps({'contract': 'source_semantic_audit_result_v1',
+                          'dataset': entry['dataset'], 'result': result}))
+        return
+    if not args.dataset:
+        parser.error('dataset is required')
     entries = json.loads(args.catalog.read_text())['datasets']
     entry = next(x for x in entries if x['dataset'] == args.dataset)
     result = validate_catalog_source(entry)

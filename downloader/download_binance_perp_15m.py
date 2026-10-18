@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -39,6 +39,8 @@ from artifact_io import (  # noqa: E402
 )
 from candle_frame_buffer import CandleFrameBuffer  # noqa: E402
 from candle_columns import numeric_candle_page  # noqa: E402
+from http_transport import RETRYABLE_NETWORK_ERRORS  # noqa: E402
+from http_pool import pooled_urlopen as urlopen  # noqa: E402
 from quality_priority import collect_with_quality_priority, prioritize_records  # noqa: E402
 from dataset_lock import (  # noqa: E402
     DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -49,6 +51,7 @@ from binance_historical_features import (  # noqa: E402
     FEATURE_STAGE_IDS,
     feature_run_summary_path,
     feature_catalog_payload,
+    preserved_statistics_clock,
     result_rows as historical_feature_result_rows,
     run_historical_feature_downloads,
     stage_latency_summary,
@@ -517,7 +520,11 @@ def _read_parquet(path: Path) -> pl.DataFrame:
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
-    atomic_write_parquet(path, frame, compression="snappy", write_statistics=True)
+    # Candle merges retain feature values. Preserve their clock proof only if
+    # every contributing base/tail source agrees; mixed legacy tails migrate.
+    metadata = preserved_statistics_clock([path, hot_tail_path(path)])
+    table = frame.to_arrow().replace_schema_metadata(metadata or None)
+    atomic_write_parquet(path, table, compression="snappy", write_statistics=True)
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -776,23 +783,23 @@ class BinanceClient:
                     payload = json.load(response)
                 if isinstance(payload, dict) and int(payload.get("code", 0)) < 0:
                     code = int(payload["code"])
-                    if code in {-1003, -1008} and attempt < self.max_retries:
+                    if code in {-1003, -1008}:
                         self._defer_retry(limiter, attempt, headers=response_headers)
-                        continue
+                        if attempt < self.max_retries:
+                            continue
                     raise RuntimeError(
                         f"Binance API error code={code} msg={payload.get('msg')}"
                     )
                 return payload
             except HTTPError as exc:
                 last_error = exc
-                if (
-                    exc.code in {418, 429, 500, 502, 503, 504}
-                    and attempt < self.max_retries
-                ):
+                if exc.code in {418, 429, 500, 502, 503, 504}:
                     self._defer_retry(limiter, attempt, headers=exc.headers)
-                    continue
+                    if attempt < self.max_retries:
+                        exc.close()
+                        continue
                 raise
-            except URLError as exc:
+            except RETRYABLE_NETWORK_ERRORS as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(limiter, attempt)
@@ -1255,8 +1262,6 @@ def _run_locked_download(
         limit=None if args.symbols else args.limit,
     )
     if args.symbols:
-        if not args.skip_historical_features:
-            raise ValueError('--symbols quality repair requires --skip-historical-features')
         wanted = {_safe_symbol(value) for value in args.symbols}
         symbols = [row for row in symbols if row.binance_symbol in wanted]
         missing = wanted - {row.binance_symbol for row in symbols}
@@ -1368,7 +1373,7 @@ def _run_locked_download(
             end_ms=end_ms,
             workers=args.feature_workers or args.workers,
             tail_only=args.tail_only,
-            observed_at_ms=observed_at_ms,
+            observed_at_ms=max(observed_at_ms, int(time.time() * 1000)),
             stage_progress_callback=lambda code, stage, status: (
                 pipeline_progress.update(stage, status, item=code)
             ),

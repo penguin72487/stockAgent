@@ -49,6 +49,39 @@ services/public_dashboards/dashboard-core.js
 
 新增欄位時，應先在資料建置層定義語意，再加入公開 allowlist，最後才渲染。前端不得從名稱猜測單位、時區、成交狀態或資料完整性。
 
+### 網站檢視權限（2026-10-18）
+
+身分驗證由既有入口負責，網站授權與資料投影由唯讀 reader 負責：
+
+| 入口／已驗證身分 | 可見頁面 | 報價投影 |
+|---|---|---|
+| Cloudflare 公開入口、visitor／special VPN 身分 | 總覽、台股當沖、隔日沖 | 原 `public_quote_display.json` 政策 |
+| 實體本人 LAN、角色為 owner 的既有 WireGuard 金鑰 | 全部已註冊面板 | 原始觀測與帳本價格的私人檢視 |
+
+公開網址不會因訪客自行提供 `X-WireGuard-Role`、轉送標頭、query 或瀏覽器儲存值而升權。
+Caddy 以真實 socket 來源及路由器既有金鑰／位址角色對應，選擇公開或本人 loopback
+reader。正式 launcher 的兩個 listener 分別為 `127.0.0.1:8770`、`127.0.0.1:8771`；
+它們在同一程序內共用匿名流量觀測器，但保有獨立的回應 cache、single-flight 與靜態投影。
+本人 listener 拒絕非 loopback 綁定，並且不新增公網／VPN 連接埠轉送。
+
+`dashboard_access.py` 在頁面、API、靜態資源 dispatch 之前執行授權。公開首頁 HTML
+在傳輸前移除私人卡片，公開 overview 只讀兩個台股策略摘要，不讀取或傳回供應商配額、
+來源清冊與流量摘要。所有導覽依伺服器注入的 audience metadata 呈現；metadata 只控制
+畫面，不是後端授權依據。`/api/access` 可唯讀確認當前 reader 的能力。
+
+本人價格以 sanitizer 的明確 `private_prices` 參數決定，不能由資料 payload 的旗標開啟；
+不以官方日價替換原始分鐘／估值／帳本值、不補缺值、不改動模擬／反事實標籤或交易資料。
+密鑰、帳號與內部識別的現有 redaction、GET／HEAD 唯讀邊界仍保留。私人檢視不是對
+公開行情轉載授權的判斷，公開政策配置與來源證據保持原樣。
+
+JSON／HTML 的 ETag 綁定 audience；本人回應為 `private, no-store`，公開動態回應
+為 `no-store`。不同 listener 的 cache 不可交換，也不能讓本人 validator 驗證公開回應。
+共用 JavaScript URL 必須更新版本，避免舊的 immutable 導覽保留私人頁面入口。
+
+權限／偽造身分／價格／快取驗收：`test/test_dashboard_access.py`；原 gateway、公開報價、
+共用導覽與明細 renderer 的回歸仍須保留。部署只更新唯讀面板與平滑載入 Caddy，
+不得重新啟動交易、報價、Discord、WireGuard 或路由器。
+
 ## 不可破壞的正確性契約
 
 - 缺資料必須顯示為缺口、等待、過期或部分完成；不得插值或用其他價格冒充。

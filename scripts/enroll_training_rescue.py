@@ -25,6 +25,7 @@ node=pathlib.Path(sys.argv[1]); output=pathlib.Path(sys.argv[2]); config=pathlib
 release=json.loads(receipt.read_bytes()); source=receipt.parent/'build-source'
 sys.path.insert(0,str(source))
 from stockagent.runtime_identity import runtime_identity,validate_runtime_lock,verify_source_release,verify_release_bundles
+from stockagent.training.runtime import load_checkpoint
 manifest=json.loads((output/'run_manifest.json').read_bytes())
 saved_source=manifest['runtime_provenance']['source_release']
 proof=verify_source_release(receipt,source); verify_release_bundles(receipt)
@@ -46,7 +47,7 @@ else:
         assert set(z.namelist())==set(prep_release['source_bundle']['files'])
         assert all(hashlib.sha256(z.read(n)).hexdigest()==h for n,h in prep_release['source_bundle']['files'].items())
 assert release['code']['files']['stockagent/data/factorized_panel_projection.py']==feature['builder_sha256']
-checkpoints=[torch.load(p,map_location='cpu',weights_only=True) for p in output.glob('train_*/checkpoint_last.pt')]
+checkpoints=[load_checkpoint(p) for p in output.glob('train_*/checkpoint_last.pt')]
 assert checkpoints, 'no committed optimizer checkpoint'
 worlds={p['rng_state'].get('world_size',1) for p in checkpoints}; batches={p['effective_train_batch_size'] for p in checkpoints}
 assert len(worlds)==len(batches)==1
@@ -78,7 +79,7 @@ assert old['python']==runtime['python'] and all(old['packages'].get(k)==runtime[
 print(json.dumps({'source_root':str(source),'source_receipt':str(receipt),'output_root':str(output),'config_file':str(config),
     'runtime_prefix':sys.prefix,'runtime_lock':runtime,'historical_runtime_differences':differences,'train_argv':argv,'bootstrap_files':files,
     'world_size':next(iter(worlds)),'global_batch':next(iter(batches)),
-    'checkpoint_manifests':{p.relative_to(output).as_posix():__import__('stockagent.runtime_identity',fromlist=['identity_sha256']).identity_sha256(torch.load(p,map_location='cpu',weights_only=True)['experiment_manifest']) for p in output.glob('train_*/checkpoint_last.pt')},
+    'checkpoint_manifests':{p.relative_to(output).as_posix():__import__('stockagent.runtime_identity',fromlist=['identity_sha256']).identity_sha256(load_checkpoint(p)['experiment_manifest']) for p in output.glob('train_*/checkpoint_last.pt')},
     'data':{k:data[k] for k in ['parquet_root','day_trade_minute_execution_root','day_trade_physical_public_feature_path','panel_cache_root','day_trade_minute_execution_cache_dir']},
     'parent_prepared':str(parent),'value_prepared':str(prepared),'source_release':proof,
     'preparation_source_root':str(prep_source),'preparation_receipt':str(prep_receipt),'preparation_base_config':str(base_config),

@@ -14,11 +14,13 @@ import errno
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 from downloader.finmind_runtime import wait_for_next_cycle
 from downloader.finmind_updates import received_rows, record_success, record_failure, free_task, set_next_check
@@ -56,6 +58,17 @@ SCHEMA_VERSION = 1
 SESSION_GRID_CONTRACT_VERSION = 2
 SESSION_GRAINS = frozenset({"1m", "15s", "10s", "5s"})
 TRAFFIC_BUSY_TIMEOUT_SECONDS = 5.0
+_TRAFFIC_WRITE_LOCK = threading.Lock()
+
+
+def _reset_traffic_write_lock() -> None:
+    # A child must not inherit a lock held by a parent thread at fork time.
+    global _TRAFFIC_WRITE_LOCK
+    _TRAFFIC_WRITE_LOCK = threading.Lock()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_traffic_write_lock)
 
 
 class ProviderError(RuntimeError):
@@ -188,14 +201,32 @@ def _record_request_start(root: Path, dataset: str) -> None:
     FULL synchronization retains the pre-request durability boundary. A failed
     claim is recoverable local work, never permission for an uncounted request.
     """
-    path = root / "request_traffic.sqlite3"
+    # SQLite has one writer even with many HTTP workers. Queue locally before
+    # opening connections instead of making all threads race journal/schema
+    # setup and the same write lock. Other processes still use SQLite locking.
+    started = time.monotonic()
+    if not _TRAFFIC_WRITE_LOCK.acquire(timeout=TRAFFIC_BUSY_TIMEOUT_SECONDS):
+        raise ProviderError('local_traffic_busy', retry_after=15)
     try:
-        with closing(sqlite3.connect(path, timeout=TRAFFIC_BUSY_TIMEOUT_SECONDS)) as connection:
+        _write_request_start(root, dataset, timeout=max(
+            0.0, TRAFFIC_BUSY_TIMEOUT_SECONDS - (time.monotonic() - started)))
+    finally:
+        _TRAFFIC_WRITE_LOCK.release()
+
+
+def _write_request_start(root: Path, dataset: str, *, timeout: float) -> None:
+    """One closed, FULL-synchronized connection; called inside the local gate."""
+    path = root / "request_traffic.sqlite3"
+    stage = 'connect'
+    try:
+        with closing(sqlite3.connect(path, timeout=timeout)) as connection:
+            stage = 'journal_mode'
             mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if mode != 'wal':
                 raise ProviderError('local_traffic_unavailable', retry_after=60)
             connection.execute("PRAGMA synchronous=FULL")
             with connection:
+                stage = 'schema'
                 connection.execute(
                     "CREATE TABLE IF NOT EXISTS requests ("
                     "started_at_utc TEXT NOT NULL, dataset TEXT NOT NULL)"
@@ -204,12 +235,17 @@ def _record_request_start(root: Path, dataset: str) -> None:
                     "CREATE INDEX IF NOT EXISTS idx_finmind_requests_started "
                     "ON requests(started_at_utc)"
                 )
+                stage = 'insert'
                 connection.execute(
                     "INSERT INTO requests (started_at_utc, dataset) VALUES (?, ?)",
                     (_iso(_utc_now()), dataset),
                 )
+                stage = 'commit'
+            stage = 'close'
     except sqlite3.Error as error:
         busy = getattr(error, 'sqlite_errorcode', 0) & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        logging.getLogger(__name__).warning('finmind_traffic_preflight_failed stage=%s sqlite_name=%s',
+                                           stage, getattr(error, 'sqlite_errorname', 'unknown'))
         raise ProviderError('local_traffic_busy' if busy else 'local_traffic_unavailable',
                             retry_after=15 if busy else 60) from None
 

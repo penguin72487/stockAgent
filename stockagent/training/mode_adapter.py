@@ -119,6 +119,7 @@ _MODE_SPECS: Final[tuple[TrainingModeSpec, ...]] = (
         recurrent_state_scope="cross_session_t_plus_2_account",
         terminal_policy="flat_each_session_with_settlement_state",
         split_ownership="year_expanding_walk_forward",
+        benchmark_contract="configured_symbol_adjusted_close_buy_and_hold_total_return",
     ),
     TrainingModeSpec(
         execution_mode="tw_overnight",

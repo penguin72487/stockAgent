@@ -14,12 +14,13 @@ from types import SimpleNamespace
 import pytest
 
 from downloader import download_binance_perp_15m as binance
+from downloader import download_bybit_perp_daily as bybit
 from downloader import download_okx_perp_daily as okx
 
 
 fcntl = pytest.importorskip("fcntl")
 locks = sys.modules[binance.exclusive_dataset_lock.__module__]
-COLLECTORS = (binance, okx)
+COLLECTORS = (binance, okx, bybit)
 
 
 @contextmanager
@@ -175,7 +176,7 @@ def test_collector_timeout_cannot_enter_work_or_replace_source_evidence(
         pytest.fail("timeout must not instantiate a client or enter source work")
 
     monkeypatch.setattr(collector, "_run_locked_download", forbidden)
-    monkeypatch.setattr(collector, "BinanceClient" if collector is binance else "OkxClient", forbidden)
+    monkeypatch.setattr(collector, {binance: "BinanceClient", okx: "OkxClient", bybit: "BybitClient"}[collector], forbidden)
     monkeypatch.setattr(sys, "argv", [
         "collector", "--output-dir", str(tmp_path), "--lock-timeout-seconds", "0.04",
     ])

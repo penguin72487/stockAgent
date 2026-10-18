@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 from pathlib import Path
+import resource
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -32,8 +35,10 @@ def main() -> int:
     args = parser.parse_args()
     lock = ROOT / "artifacts/data_locks/tw_public_research_all_2014_v3.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
+    started, cpu_started = time.monotonic(), time.process_time()
     with lock.open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait_seconds = time.monotonic() - started
         summary = build_all_research_features(
             wide_path=args.wide_path,
             official_path=args.official_path,
@@ -46,6 +51,14 @@ def main() -> int:
         f"reused={str(summary['reused']).lower()} output={summary['output_path']}",
         flush=True,
     )
+    print(json.dumps({"event": "tw_public_research_all_complete", "rows": summary["rows"],
+                      "reused": summary["reused"], "build_strategy": summary.get("build_strategy"),
+                      "peak_join_partition_rows": summary.get("peak_join_partition_rows"),
+                      "complete_wall_seconds": time.monotonic() - started,
+                      "lock_wait_seconds": lock_wait_seconds,
+                      "cpu_seconds": time.process_time() - cpu_started,
+                      "process_max_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                      "output_sha256": summary["output_sha256"]}), flush=True)
     return 0
 
 

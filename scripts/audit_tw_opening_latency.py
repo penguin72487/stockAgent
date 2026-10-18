@@ -7,9 +7,12 @@ ledger, or broker order. Its midday/hot-cache timing is NOT a 09:00 latency.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
+import fcntl
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -20,9 +23,209 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from services.discord_bot import bot
-from stockagent.live import signal_engine
-from stockagent.live.tw_day_trade_simulation import _atomic_json
+from downloader.artifact_io import atomic_write_json
+
+
+def _atomic_json(path, payload):
+    atomic_write_json(path, payload, durable=True)
+
+
+def quote_session_phase(observed_at: datetime) -> str:
+    """Taipei regular session; this is a clock label, not a trading-day proof."""
+    if observed_at.tzinfo is None:
+        raise ValueError("quote phase requires an aware clock")
+    local = observed_at.astimezone(ZoneInfo("Asia/Taipei"))
+    seconds = local.hour * 3600 + local.minute * 60 + local.second
+    return ("preopen" if seconds < 9 * 3600 else "opening" if seconds < 9 * 3600 + 60
+            else "intraday" if seconds < 13 * 3600 + 30 * 60 else "postclose")
+
+
+def provider_phase_latency(events, symbols, session_start):
+    """Per-request full-axis proof; never time a shrinking delta as a full sweep.
+
+    Source monotonic spans and journal wall clocks are kept separate. Repeated
+    prices need per-job coverage events, not deduplicated session observations.
+    Old owners are explicitly unmeasured, not zero-latency successes.
+    """
+    requested_count = len(symbols)
+    scope_hash = hashlib.sha256("\n".join(sorted(symbols)).encode()).hexdigest()
+    ordered_hash = hashlib.sha256("\n".join(symbols).encode()).hexdigest()
+    jobs = {}
+    for elapsed, row in sorted(events, key=lambda item: item[0]):
+        if not row.get("job_id"):
+            continue
+        key = (row["provider"], row.get("owner_pid"), row["job_id"])
+        job = jobs.setdefault(key, {"provider": key[0], "owner_pid": key[1], "job_id": key[2],
+            "started_after_open_ms": None, "phase": "unverified", "state": "running",
+            "full_scope_verified": False, "requested_count": None,
+            "first_valid_open_ms": None, "positive_coverage_ms": {}, "resolved_coverage_ms": {},
+            "source_total_ms": None, "source_and_persistence_ms": None,
+            "coverage_evidence": "missing_per_job_coverage_not_zero"})
+        if row["event"] == "started":
+            job.update(started_after_open_ms=round(elapsed, 3),
+                phase=quote_session_phase(session_start + timedelta(milliseconds=elapsed)),
+                requested_count=row.get("requested_count"),
+                worker_queue_ms=row.get("worker_queue_ms"),
+                full_scope_verified=(row.get("requested_count") == requested_count and (
+                    row.get("requested_scope_sha256") == scope_hash or
+                    row.get("requested_symbols_sha256") == ordered_hash)))
+        elif row["event"] == "coverage_progress":
+            count = row.get("requested_count")
+            positive, no_print, responses = (row.get(field) for field in (
+                "valid_open_count", "observed_no_print_count", "response_count"))
+            duration = row.get("elapsed_ms")
+            if (not isinstance(count, int) or count != job["requested_count"]
+                    or any(not isinstance(value, int) or not 0 <= value <= count
+                           for value in (positive, no_print, responses))
+                    or positive + no_print > responses
+                    or not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration < 0
+                    or row.get("measurement_clock") != "provider_job_perf_counter_v1"):
+                job["coverage_evidence"] = "invalid_per_job_coverage"
+                continue
+            job.update(coverage_evidence="per_job_validated_counts_monotonic_v1",
+                valid_open_count=positive, observed_no_print_count=no_print,
+                response_count=responses, unknown_count=count - positive - no_print)
+            if positive and job["first_valid_open_ms"] is None:
+                job["first_valid_open_ms"] = duration
+            for fraction in (.5, .9, .95, .99, 1.):
+                if positive >= math.ceil(count * fraction):
+                    job["positive_coverage_ms"].setdefault(str(fraction), duration)
+                if positive + no_print >= math.ceil(count * fraction):
+                    job["resolved_coverage_ms"].setdefault(str(fraction), duration)
+        elif row["event"] == "finished":
+            job.update(state=row.get("state", "unverified"), source_total_ms=row.get("last_total_ms"),
+                       source_and_persistence_ms=row.get("source_and_persistence_ms"),
+                       error_type=row.get("error_type"), http_status=row.get("http_status"))
+            # Legacy counts are useful final observations, not first/full clocks.
+            job.setdefault("valid_open_count", row.get("valid_open_count"))
+    groups = {}
+    for job in jobs.values():
+        group = groups.setdefault(job["phase"], {}).setdefault(job["provider"], {
+            "job_count": 0, "failed_or_degraded_jobs": 0, "full_scope_jobs": 0,
+            "full_positive_observed_jobs": 0, "full_resolved_observed_jobs": 0,
+            "source_duration_samples_ms": [], "jobs": []})
+        group["job_count"] += 1
+        group["failed_or_degraded_jobs"] += job["state"] in {"failed", "degraded"}
+        group["full_scope_jobs"] += job["full_scope_verified"]
+        group["full_positive_observed_jobs"] += job["full_scope_verified"] and "1.0" in job["positive_coverage_ms"]
+        group["full_resolved_observed_jobs"] += job["full_scope_verified"] and "1.0" in job["resolved_coverage_ms"]
+        duration = job["source_total_ms"]
+        if isinstance(duration, (int, float)) and math.isfinite(duration) and duration >= 0:
+            group["source_duration_samples_ms"].append(duration)  # include failures/timeouts
+        group["jobs"].append(job)
+    for providers in groups.values():
+        for group in providers.values():
+            durations = sorted(group.pop("source_duration_samples_ms"))
+            group["source_duration_percentiles_ms"] = {str(p): durations[max(0, math.ceil(len(durations) * p) - 1)]
+                if durations else None for p in (.5, .95, .99)}
+            group["duration_sample_count_including_failures"] = len(durations)
+    return {"contract": "quote_phase_full_scope_per_job_latency_v1", "requested_count": requested_count,
+        "requested_scope_sha256": scope_hash, "phases": groups,
+        "boundary": "validated_opening_fields_not_fresh_executable_book_or_broker_fill",
+        "full_positive_requires_every_symbol_to_have_a_genuine_open": True}
+
+
+def _provider_latency_summary(events, requested, start):
+    """First valid and full requested scope are different, source-local clocks.
+
+    Old model-gap events are only lower bounds on a vendor's full response.
+    Never credit another vendor's prices to FinMind or label missing rows as
+    untraded. Retain failures and absent/old/trial/invalid-price reasons.
+    """
+    providers = {}
+    for elapsed, row in sorted(events, key=lambda item: item[0]):
+        name = row["provider"]
+        p = providers.setdefault(name, {"valid": set(), "no_print": set(), "first_request_ms": None,
+            "first_valid_open_ms": None, "first_full_validated_payload_ms": None,
+            "first_retained_payload_received_ms": None, "first_retained_validated_open_ms": None,
+            "response_job_count": 0, "request_job_count": 0, "failed_jobs": 0,
+            "full_scope_snapshot_count": 0, "retained_http_request_count": 0,
+            "snapshot_ids": set(),
+            "coverage_milestones": [], "jobs_first_30s": [],
+            "thresholds": {fraction: None for fraction in (.5, .9, .95, .99, 1.)}})
+        event = row["event"]
+        if event == "started":
+            p["request_job_count"] += 1
+            if p["first_request_ms"] is None:
+                p["first_request_ms"] = round(elapsed, 3)
+        elif event == "finished":
+            p["response_job_count"] += 1
+            p["failed_jobs"] += row.get("state") in {"failed", "degraded"}
+            if (row.get("transport_timing", {}).get("http_request_to_failure_ms") is not None
+                    and not row["transport_timing"].get("provider_failure_reused")):
+                p["retained_http_request_count"] += 1
+            if elapsed <= 30000:
+                p["jobs_first_30s"].append({"finished_after_open_ms": round(elapsed, 3),
+                    **{key: row.get(key) for key in ("job_id", "owner_pid", "requested_count",
+                        "state", "valid_open_count", "worker_queue_ms", "last_total_ms")},
+                    "transport_timing": row.get("transport_timing", {})})
+        before = len(p["valid"])
+        if event == "observations_delta":
+            for obs in row.get("observations", []):
+                symbol, state = obs["symbol"], obs["state"]
+                if symbol not in requested:
+                    continue
+                if state == "valid_open":
+                    p["valid"].add(symbol)
+                    p["no_print"].discard(symbol)
+                elif state == "observed_no_first_print" and symbol not in p["valid"]:
+                    p["no_print"].add(symbol)
+        elif event == "provider_snapshot":
+            coverage = row["coverage"]
+            if coverage.get("contract") != "finmind_unfiltered_market_snapshot_coverage_v1":
+                continue
+            if coverage["snapshot_id"] in p["snapshot_ids"]:
+                continue
+            p["snapshot_ids"].add(coverage["snapshot_id"])
+            valid = requested.intersection(coverage["valid_open_symbols"])
+            p["full_scope_snapshot_count"] += 1
+            p["retained_http_request_count"] += 1
+            received_ms = round((datetime.fromisoformat(coverage["received_at_taipei"]) - start).total_seconds() * 1000, 3)
+            if p["first_retained_payload_received_ms"] is None:
+                p["first_retained_payload_received_ms"] = received_ms
+            p["valid"].update(valid)
+            p["no_print"].difference_update(valid)
+            rejected = {reason: sorted(requested.intersection(symbols) - valid)
+                        for reason, symbols in coverage["rejected_symbols"].items()}
+            returned = valid.union(*(set(symbols) for symbols in rejected.values()))
+            rejected["absent_from_payload"] = sorted(requested - returned)
+            p["latest_full_scope_snapshot"] = {
+                "snapshot_id": coverage["snapshot_id"], "observed_after_open_ms": round(elapsed, 3),
+                "received_at_taipei": coverage["received_at_taipei"],
+                "validated_at_taipei": coverage["validated_at_taipei"],
+                "valid_open_count": len(valid), "missing_count": len(requested - valid),
+                "rejected_counts": {reason: len(symbols) for reason, symbols in rejected.items()},
+                "missing_symbols_by_reason": rejected}
+            # Retain the original provider parse clock separately from journal
+            # observation/durability. A source clock is NOT a fill clock.
+            validated = datetime.fromisoformat(coverage["validated_at_taipei"])
+            if validated.tzinfo is not None and validated >= start:
+                validated_ms = round((validated - start).total_seconds() * 1000, 3)
+                if valid and p["first_retained_validated_open_ms"] is None:
+                    p["first_retained_validated_open_ms"] = validated_ms
+                if len(valid) == len(requested) and p["first_full_validated_payload_ms"] is None:
+                    p["first_full_validated_payload_ms"] = validated_ms
+        count = len(p["valid"])
+        if count > before:
+            p["coverage_milestones"].append({"observed_after_open_ms": round(elapsed, 3), "valid_open_count": count})
+        if count and p["first_valid_open_ms"] is None:
+            p["first_valid_open_ms"] = round(elapsed, 3)
+        for fraction, at in p["thresholds"].items():
+            if at is None and count >= math.ceil(len(requested) * fraction):
+                p["thresholds"][fraction] = round(elapsed, 3)
+    for p in providers.values():
+        del p["snapshot_ids"]
+        p["valid_open_count"] = len(p.pop("valid"))
+        p["observed_no_print_count"] = len(p.pop("no_print"))
+        p["unknown_count"] = len(requested) - p["valid_open_count"] - p["observed_no_print_count"]
+        p["scope_evidence"] = "full_market_payload" if p["full_scope_snapshot_count"] else "consumer_deltas_only_lower_bound"
+        p["first_full_positive_scope_observed_ms"] = p["thresholds"][1.]
+        p["thresholds"] = [{"coverage_fraction": fraction, "required_count": math.ceil(len(requested) * fraction),
+            "first_observed_ms": at} for fraction, at in p["thresholds"].items()]
+    return {"contract": "source_local_opening_first_valid_and_full_scope_latency_v1",
+        "requested_count": len(requested), "full_scope_requires_positive_same_session_opens": True,
+        "boundary": "validated_source_observations_not_model_quorum_durable_publication_or_fills",
+        "providers": providers}
 
 
 def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str]) -> dict:
@@ -36,9 +239,9 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
     requested = set(symbols)
     if not requested or len(requested) != len(symbols):
         raise ValueError("opening coverage audit requires a nonempty unique scope")
-    cutoffs = (100, 250, 500, 1000, 2000, 5000, 10000, 20000, 30000)
+    cutoffs = (100, 250, 500, 1000, 2000, 5000, 10000, 11000, 20000, 30000)
     states = {cutoff: {} for cutoff in cutoffs}
-    failures, malformed, known_providers, legacy_events = {}, 0, set(), []
+    failures, malformed, known_providers, legacy_events, provider_events = {}, 0, set(), [], []
     if not path.exists():
         return {"state": "unavailable", "path": str(path), "requested_count": len(symbols)}
     with path.open() as handle:
@@ -58,7 +261,47 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                 provider = row["provider"]
                 if not isinstance(provider, str) or not provider:
                     raise ValueError("invalid provider")
-                if provider != "merged" and row.get("event") in {"started", "finished", "observations_delta"}:
+                if provider != "merged" and elapsed >= 0 and row.get("event") in {
+                        "started", "finished", "observations_delta", "provider_snapshot", "coverage_progress"}:
+                    compact = {key: row.get(key) for key in ("provider", "event", "job_id", "owner_pid",
+                        "requested_count", "state", "valid_open_count", "worker_queue_ms", "last_total_ms",
+                        "requested_symbols_sha256", "requested_scope_sha256", "elapsed_ms", "measurement_clock",
+                        "observed_no_print_count", "response_count", "source_and_persistence_ms", "error_type", "http_status")}
+                    if row["event"] == "observations_delta":
+                        compact["observations"] = [{"symbol": obs["symbol"], "state": obs["state"]}
+                            for obs in row.get("observations", [])]
+                    elif row["event"] == "provider_snapshot":
+                        coverage = row["coverage"]
+                        if (not isinstance(coverage, dict)
+                                or coverage.get("contract") != "finmind_unfiltered_market_snapshot_coverage_v1"
+                                or not isinstance(coverage.get("valid_open_symbols"), list)
+                                or not isinstance(coverage.get("rejected_symbols"), dict)):
+                            raise ValueError("invalid full-market source coverage")
+                        lists = [coverage["valid_open_symbols"], *coverage["rejected_symbols"].values()]
+                        if (not isinstance(coverage.get("snapshot_id"), str) or not coverage["snapshot_id"]
+                                or any(not isinstance(items, list) or any(not isinstance(symbol, str) for symbol in items)
+                                       for items in lists)):
+                            raise ValueError("invalid full-market source symbols/identity")
+                        receipt_clocks = []
+                        for field in ("received_at_taipei", "validated_at_taipei"):
+                            stamp = datetime.fromisoformat(coverage[field])
+                            if stamp.tzinfo is None or not start <= stamp <= at:
+                                raise ValueError("invalid full-market source receipt clock")
+                            receipt_clocks.append(stamp)
+                        if receipt_clocks[0] > receipt_clocks[1]:
+                            raise ValueError("full-market validation predates receipt")
+                        compact["coverage"] = coverage
+                    transport = row.get("transport_timing") or {}
+                    if not isinstance(transport, dict):
+                        raise ValueError("invalid provider transport timings")
+                    compact["transport_timing"] = {key: value for key, value in transport.items()
+                        if key.startswith(("http_", "json_", "full_market_", "provider_response_", "provider_owner_"))
+                        or key in {"body_bytes", "provider_payload_rows", "mis_failed_request_count", "provider_failure_reused",
+                            "mis_failure_phase_counts", "mis_dispatch_stopped", "mis_dispatch_stop_reason", "mis_dispatch_policy",
+                            "mis_deferred_channel_count", "mis_request_count", "mis_http_workers",
+                            "mis_http_error_statuses", "mis_error_chain_types"}}
+                    provider_events.append((elapsed, compact))
+                if provider != "merged" and row.get("event") in {"started", "finished", "observations_delta", "provider_snapshot"}:
                     known_providers.add(provider)
                 if (row.get("event") == "first_batch" and 0 <= elapsed <= max(cutoffs)
                         and not isinstance(row.get("observation_quality"), dict)):
@@ -69,13 +312,15 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                         "response_count", "valid_open_count")})
                 if row.get("event") == "finished" and row.get("state") in {"failed", "degraded"}:
                     failures[provider] = failures.get(provider, 0) + 1
-                if row.get("event") != "observations_delta" or elapsed < 0:
+                if row.get("event") not in {"observations_delta", "provider_snapshot"} or elapsed < 0:
                     continue
+                observations = (row.get("observations", []) if row["event"] == "observations_delta" else
+                    [{"symbol": symbol, "state": "valid_open"} for symbol in row["coverage"]["valid_open_symbols"]])
                 for cutoff in cutoffs:
                     if elapsed > cutoff:
                         continue
                     source_states = states[cutoff].setdefault(provider, {"valid": set(), "no_print": set()})
-                    for observation in row.get("observations", []):
+                    for observation in observations:
                         symbol, state = observation["symbol"], observation["state"]
                         if symbol not in requested:
                             continue
@@ -106,7 +351,9 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
         "measurement_boundary": "source_validation_event_clock_not_durable_quorum_or_broker_fill",
         "malformed_lines": malformed, "legacy_aggregate_events": legacy_events,
         "per_symbol_schema_usable": not legacy_events and not malformed,
-        "failed_or_degraded_jobs": failures, "milestones": milestones}
+        "failed_or_degraded_jobs": failures, "milestones": milestones,
+        "provider_latency": _provider_latency_summary(provider_events, requested, start),
+        "provider_phase_latency": provider_phase_latency(provider_events, symbols, start)}
 
 
 def opening_publication_slo(session_date: str, attempts: dict, expected_markets: list[str]) -> dict:
@@ -155,7 +402,7 @@ def opening_publication_slo(session_date: str, attempts: dict, expected_markets:
     all_published_ms = max(latencies) if complete else None
     stages = [{"target_ms": target, "passed": complete and all_published_ms <= target,
                "state": "incomplete" if not complete else "passed" if all_published_ms <= target else "missed"}
-              for target in (30000, 20000, 10000, 5000, 1000)]
+              for target in (30000, 20000, 11000, 10000, 5000, 1000)]
     return {
         "contract": "all_enabled_mode_immutable_publication_stages_v1",
         "measurement_boundary": "09:00_gate_to_all_mode_durable_execution_pointers_not_broker_fills",
@@ -168,15 +415,242 @@ def opening_publication_slo(session_date: str, attempts: dict, expected_markets:
     }
 
 
+def read_attempts(path: Path, session_date: str) -> tuple[dict, int]:
+    """Stream retained native facts; missing/corrupt evidence never means fast."""
+    attempts, malformed = {}, 0
+    try:
+        with path.open() as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("not an attempt")
+                    if row.get("session_date") != session_date:
+                        continue
+                    market = row["market"]
+                    stats = attempts.setdefault(market, {"attempt_count": 0, "failed_count": 0,
+                        "first": row, "last": row, "ready": []})
+                    stats["attempt_count"] += 1
+                    stats["failed_count"] += int(row["status"] == "failed")
+                    stats["last"] = row
+                    if row["status"] == "ready":
+                        stats["ready"].append(row)
+                except (KeyError, TypeError, ValueError):
+                    malformed += 1
+    except FileNotFoundError:
+        return {}, 0
+    return attempts, malformed
+
+
+def deadline_assessment(report: dict, target_ms: int) -> dict:
+    """Evaluate real event clocks AS OF the deadline, never replay event time."""
+    from stockagent.live.opening_execution_latency import opening_execution_slo
+
+    gate = datetime.fromisoformat(report["session_date"] + "T09:00:00+08:00")
+    execution = opening_execution_slo(report["session_date"], report["opening_publication_slo"],
+        report["engine_modes"], report["execution_samples"],
+        observed_at=gate + timedelta(milliseconds=target_ms))
+    publication = report["opening_publication_slo"]
+    pub_pass = next(row["passed"] for row in publication["stages"] if row["target_ms"] == target_ms)
+    fill_pass = next(row["passed"] for row in execution["stages"] if row["target_ms"] == target_ms)
+    trustworthy = not report["evidence_errors"] and report["scope_matches_preopen"]
+    source = next((row for row in report.get("source_coverage_milestones", {}).get("milestones", [])
+                   if row["after_open_ms"] == target_ms), None)
+    return {"contract": "daily_opening_original_clock_deadline_v1",
+        "session_date": report["session_date"], "target_ms": target_ms,
+        "observed_at": report["observed_at"], "expected_markets": report["expected_markets"],
+        "scope_matches_preopen": report["scope_matches_preopen"],
+        "passed": bool(trustworthy and pub_pass and fill_pass),
+        "state": "passed" if trustworthy and pub_pass and fill_pass else "missed_or_unverified",
+        "evidence_errors": report["evidence_errors"],
+        "publication": publication, "execution": execution, "source_at_deadline": source,
+        "simulation_only": True, "broker_fill_claim": False,
+        "measurement_boundary": "native_durable_publication_and_full_paper_targets_not_replay_or_hot_probe"}
+
+
+def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output_root: Path,
+                observed_at: datetime | None = None) -> dict:
+    """Independent read-only observer; no Discord/Torch/provider initialization.
+
+    Preopen freezes the current configured mode roster. Later observations
+    cannot silently reduce it, erase a missed deadline, or turn late repair
+    into live success. The timer also runs after close and after a late boot.
+    """
+    from stockagent.live.market_config import load_market_configs
+    from stockagent.live.market_status import verified_tw_stock_session_day
+
+    now = observed_at or datetime.now(ZoneInfo("Asia/Taipei"))
+    if now.tzinfo is None or now.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat() != session_date:
+        raise ValueError("daily observer requires the actual current Taipei date/clock")
+    root = output_root / session_date
+    root.mkdir(parents=True, exist_ok=True)
+    configs = load_market_configs(markets_dir)
+    overrides_path = ROOT / "artifacts/discord_bot/state.json"
+    errors = []
+    try:
+        overrides = json.loads(overrides_path.read_text())["markets"] if overrides_path.exists() else {}
+        if not isinstance(overrides, dict):
+            raise ValueError("invalid market overrides")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        overrides = {}
+        errors.append("market_overrides_" + type(exc).__name__)
+    for name in configs:
+        if name in overrides and not isinstance(overrides[name], dict):
+            errors.append("invalid_market_override:" + name)
+            overrides[name] = {}
+    enabled = sorted(name for name, cfg in configs.items() if cfg.day_trade_simulation_enabled
+        and overrides.get(name, {}).get("enabled", cfg.enabled))
+    if not enabled:
+        raise ValueError("daily observer requires a nonempty configured mode roster")
+    calendars = {name: verified_tw_stock_session_day(now.date(), configs[name].holidays,
+        parquet_root=Path(configs[name].day_trade_rule_data_dir or "data_tw_public")) for name in enabled}
+    gate = datetime.fromisoformat(session_date + "T09:00:00+08:00")
+    scope = {"contract": "daily_opening_configured_mode_scope_v1", "session_date": session_date,
+        "observed_at": now.isoformat(), "markets": enabled, "captured_before_open": now < gate}
+    scope_path = root / "scope.json"
+    if not scope_path.exists():
+        _atomic_json(scope_path, scope)
+    try:
+        frozen_scope = json.loads(scope_path.read_text())
+        markets = frozen_scope["markets"]
+        if (not isinstance(markets, list) or not markets
+                or any(not isinstance(name, str) or not name for name in markets)
+                or len(set(markets)) != len(markets)):
+            raise ValueError("invalid frozen mode roster")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        # Preserve the corrupt original for diagnosis. This observation uses
+        # the full CURRENT scope but cannot acquire a preopen attestation.
+        errors.append("preopen_scope_" + type(exc).__name__)
+        frozen_scope = {"markets": enabled, "captured_before_open": False}
+    expected = frozen_scope["markets"]
+    try:
+        captured = datetime.fromisoformat(frozen_scope["observed_at"])
+        preopen_clock_valid = (captured.tzinfo is not None and captured < gate
+            and captured.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat() == session_date)
+    except (KeyError, TypeError, ValueError):
+        preopen_clock_valid = False
+    report = {"schema_version": 1, "session_date": session_date, "observed_at": now.isoformat(),
+        "contract": "daily_native_opening_latency_audit_v1", "expected_markets": expected,
+        "scope_matches_preopen": bool(frozen_scope.get("captured_before_open") is True and preopen_clock_valid
+            and frozen_scope.get("contract") == scope["contract"]
+            and frozen_scope.get("session_date") == session_date and expected == enabled),
+        "scope_receipt": str(scope_path), "calendars": calendars, "evidence_errors": errors,
+        "simulation_only": True, "provider_requests": 0, "signal_published": False,
+        "ledger_modified": False, "service_restarts": False, "broker_fill_claim": False}
+    # Keep the real owner's preparation evidence before the next day/restart
+    # overwrites its latest status. This is context, not a substitute for the
+    # original publication/fill clocks or an additional historical SLO gate.
+    try:
+        owner = json.loads((ROOT / "artifacts/discord_bot/service_status.json").read_text())
+        updated = datetime.fromisoformat(owner["updated_at"])
+        if updated.tzinfo is None:
+            raise ValueError("owner clock has no timezone")
+        warm = owner.get("startup_inference_warmup") or {}
+        owner_read_at = datetime.now(ZoneInfo("Asia/Taipei")) if observed_at is None else now
+        report["owner_context"] = {"state": "observed", "updated_at": owner["updated_at"],
+            "observed_at": owner_read_at.isoformat(),
+            "age_seconds": round((owner_read_at - updated).total_seconds(), 3), "run_id": owner["run_id"],
+            "discord_connected": owner.get("discord_connected"), "core_health": owner.get("core_health"),
+            "live_implementation_admission": owner.get("live_implementation_admission"),
+            "startup_inference_warmup": warm,
+            "same_owner_resident_warmup_declared": bool(warm.get("run_id") == owner["run_id"]
+                and warm.get("status") == "ready" and warm.get("model_cache_resident_ready") is True
+                and warm.get("ready_count") == warm.get("market_count") == len(expected)
+                and {row["market"] for row in warm.get("markets", []) if row.get("status") == "ready"} == set(expected))}
+    except (OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
+        report["owner_context"] = {"state": "unavailable", "error_type": type(exc).__name__}
+    # A closed calendar is not a failed trading-day opening. Unknown evidence
+    # is still visible and may not suppress a future missed deadline.
+    if not all(row[0] for row in calendars.values()):
+        report["state"] = "calendar_closed_or_unverified"
+    elif now < gate:
+        report["state"] = "armed" if report["scope_matches_preopen"] and not errors else "scope_unverified"
+    else:
+        attempts, malformed = read_attempts(state_dir / "opening_signal_latency.jsonl", session_date)
+        if malformed:
+            errors.append(f"malformed_attempt_rows:{malformed}")
+        report["opening_publication_slo"] = opening_publication_slo(session_date, attempts, expected)
+        try:
+            native = json.loads((state_dir / "status.json").read_text())
+            report["engine_modes"] = native["modes"]
+            if not isinstance(report["engine_modes"], dict):
+                raise ValueError("invalid engine modes")
+            report["execution_samples"] = []
+            with (state_dir / "execution_latency.jsonl").open() as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                        if isinstance(row, dict) and row.get("session_date") == session_date:
+                            report["execution_samples"].append(row)
+                    except ValueError:
+                        errors.append("malformed_execution_row")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            errors.append("engine_evidence_" + type(exc).__name__)
+            report.setdefault("engine_modes", {})
+            report.setdefault("execution_samples", [])
+        snapshot_root = Path(os.getenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT") or "artifacts/live/tw_opening_snapshots")
+        receipt_path = snapshot_root / (session_date + ".json")
+        try:
+            receipt_bytes = receipt_path.read_bytes()
+            receipt = json.loads(receipt_bytes)
+            report["source_coverage_milestones"] = opening_coverage_milestones(
+                receipt_path.with_suffix(".acquisition.jsonl"), session_date, receipt["requested_symbols"])
+            report["source_coverage_milestones"]["universe_receipt_sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            report["source_coverage_milestones"] = {"state": "unavailable", "error_type": type(exc).__name__}
+        report["mode_timings"] = {market: {"attempt_count": stats["attempt_count"],
+            "failed_count": stats["failed_count"],
+            "first_failure": {key: stats["first"].get(key) for key in ("error_type", "failure_stage", "recorded_at")},
+            "ready": [{key: row.get(key) for key in ("run_id", "signal_id", "signal_ready_at", "artifact_published_at",
+                "stages", "input_preparation_stages_ms", "price_receipt_timing")} for row in stats["ready"]]}
+            for market, stats in attempts.items()}
+        report["deadlines"] = [deadline_assessment(report, target)
+            for target in (1000, 5000, 10000, 11000, 20000, 30000)
+            if now >= gate + timedelta(milliseconds=target)]
+        for deadline in report["deadlines"]:
+            path = root / f"first_assessment_{deadline['target_ms']}ms.json"
+            if not path.exists():
+                _atomic_json(path, deadline)
+        report["state"] = next((row["state"] for row in report["deadlines"] if row["target_ms"] == 11000), "observing")
+        # Progress rows stay in the existing executor journal, not duplicated
+        # into every durable observer snapshot.
+        del report["execution_samples"], report["engine_modes"]
+    _atomic_json(root / "latest.json", report)
+    with (output_root / "daily.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({key: report[key] for key in ("session_date", "observed_at", "state", "expected_markets")}) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-date", default=datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat())
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--daily", action="store_true", help="Independent native journal observer: no Discord/Torch, inference, providers, orders or restarts")
     parser.add_argument("--infer", action="store_true")
     parser.add_argument("--runtime", action="store_true", help="Attach current owners, Gateway, execution and source-repair receipts; no mutations")
     parser.add_argument("--ledger-fingerprints", action="store_true", help="Explicit deep reload audit with --runtime: stream-hash large immutable ledgers; normal health reads do not scan them")
     parser.add_argument("--rounds", type=int, default=2)
     args = parser.parse_args()
+    if args.daily:
+        if args.infer or args.runtime or args.ledger_fingerprints:
+            parser.error("daily observer is strictly journal-only")
+        from dotenv import load_dotenv
+        load_dotenv(ROOT / "services/discord_bot/.env", override=False)
+        state_dir = Path(os.getenv("TW_DAY_TRADE_STATE_DIR") or "artifacts/live/tw_day_trade_simulation")
+        output_root = args.output or state_dir / "opening_audits"
+        output_root.mkdir(parents=True, exist_ok=True)
+        with (output_root / ".observer.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            report = daily_audit(session_date=args.session_date, state_dir=state_dir,
+                markets_dir=Path(os.getenv("STOCKAGENT_MARKETS_DIR") or "services/discord_bot/markets"), output_root=output_root)
+        print(json.dumps({key: report[key] for key in ("session_date", "state", "expected_markets", "provider_requests", "ledger_modified")}))
+        return 0
+    if args.output is None:
+        parser.error("--output is required outside --daily")
+    from services.discord_bot import bot
+    from stockagent.live import signal_engine
     if args.ledger_fingerprints and not args.runtime:
         parser.error("--ledger-fingerprints requires --runtime")
     if not 1 <= args.rounds <= 10:

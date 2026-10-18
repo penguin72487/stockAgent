@@ -47,6 +47,11 @@ from stockagent.live.dashboard_updates import (
     metadata_signature,
 )  # noqa: E402
 from stockagent.live.public_daily_quotes import OfficialDailyQuoteSource  # noqa: E402
+from stockagent.live.dashboard_access import (  # noqa: E402
+    access_description,
+    permitted_path,
+    project_html,
+)
 from stockagent.live.public_quote_display import public_quote_display_policy  # noqa: E402
 from stockagent.live.benchmark_history_projection import (  # noqa: E402
     projection_head_path as benchmark_projection_head_path,
@@ -174,6 +179,7 @@ _TRAFFIC_HISTORY_RANGES: Final[dict[str, tuple[int, int]]] = {
 _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
     {
         "/api/overview",
+        "/api/access",
         "/taifex/api/status",
         "/taifex/api/history",
         "/tw-day-trade/api/status",
@@ -1640,7 +1646,15 @@ class PublicDashboardServer(ThreadingHTTPServer):
         tw_upstream: str,
         overnight_static_root: Path | None = None,
         traffic_history_root: Path | None = None,
+        audience: str = "public",
+        traffic_observer: PublicTrafficObserver | None = None,
     ) -> None:
+        if audience not in {"public", "owner"}:
+            raise ValueError("unknown dashboard audience")
+        if audience == "owner" and address[0] not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("owner dashboard listener must be loopback-only")
+        self.audience = audience
+        self.is_owner = audience == "owner"
         super().__init__(address, PublicDashboardHandler)
         self.public_static_root = Path(public_static_root)
         self.taifex_static_root = Path(taifex_static_root)
@@ -1658,7 +1672,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.public_quote_source = OfficialDailyQuoteSource(self.repo_root / "data_tw_public")
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
-        self.traffic_observer = PublicTrafficObserver(
+        self._owns_traffic_observer = traffic_observer is None
+        self.traffic_observer = traffic_observer or PublicTrafficObserver(
             history_root=traffic_history_root
         )
         self.request_metrics = threading.local()
@@ -1733,7 +1748,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self.update_hub.close()
-        self.traffic_observer.close()
+        if self._owns_traffic_observer:
+            self.traffic_observer.close()
         super().server_close()
 
     def _cache_observation(self, kind: str) -> None:
@@ -1794,8 +1810,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
             if cached is not None and cached.signature == signature:
                 self._cache_observation("static_hit")
                 return cached.response
+        body = target.read_bytes()
+        if content_type.startswith("text/html"):
+            body = project_html(body, owner=self.is_owner)
         response = _prepared(
-            target.read_bytes(),
+            body,
             content_type=content_type,
             cache_control=cache_control,
         )
@@ -2036,7 +2055,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
             payload = json.loads(raw)
             if not isinstance(payload, Mapping):
                 raise ValueError("upstream JSON root is not an object")
-            public_payload = sanitizer(payload)
+            public_payload = (sanitizer(payload, private_prices=self.is_owner)
+                              if sanitizer in {sanitize_taifex_status, sanitize_taifex_history}
+                              else sanitizer(payload))
             encoded = (
                 json.dumps(
                     public_payload,
@@ -2164,7 +2185,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     # Completed-session position snapshots and immutable
                     # benchmark history already enumerate the public selector.
                     include_ledger_session_dates=False,
-                ), quote_source=self.public_quote_source,
+                ), quote_source=self.public_quote_source, private_prices=self.is_owner,
             )
             service_sync = dict(payload.get("service_sync") or {})
             service_sync["revision_token"] = revision_token
@@ -2271,7 +2292,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                         # response. Keeping the decoded graph too doubles the
                         # largest dashboard allocation without reducing latency.
                         use_memory_cache=False,
-                    )
+                    ), private_prices=self.is_owner,
                 ),
             )
 
@@ -2339,7 +2360,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     include_ledger_session_dates=False,
                     discord_markets_field="overnight_markets",
                     discord_engine_revision_field="overnight_engine_state_revision",
-                ), quote_source=self.public_quote_source,
+                ), quote_source=self.public_quote_source, private_prices=self.is_owner,
             )
             payload["product"] = "tw_overnight"
             payload["model_adapter_notice"] = (
@@ -2433,7 +2454,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     resolution=resolution,
                     history_encoding=history_encoding,
                     use_memory_cache=False,
-                )
+                ), private_prices=self.is_owner,
             ),
         )
 
@@ -2802,6 +2823,29 @@ class PublicDashboardServer(ThreadingHTTPServer):
         return self._measured_build(build)
 
     def public_overview(self) -> Mapping[str, Any]:
+        if not self.is_owner:
+            # Do not read private provider inventories/quotas just to discard
+            # them. Public visitors need only these two strategy summaries.
+            sources = {
+                "tw": self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                "overnight": self.repo_root / "artifacts/live/tw_overnight_simulation",
+            }
+            result: dict[str, Any] = {"schema_version": 1, "generated_at_utc": datetime.now(UTC).isoformat(),
+                                      "access": access_description(owner=False)}
+            failed = []
+            for name, directory in sources.items():
+                try:
+                    kwargs = ({"opening_gate_path": directory / "preopen_readiness.json"}
+                              if name == "overnight" else {})
+                    summary = build_compact_tw_overview_status(directory, **kwargs)
+                    result[name] = build_public_overview({}, summary, {}, overnight=summary)[
+                        "tw" if name == "tw" else "overnight"]
+                except Exception:
+                    result[name] = {"health": "unavailable", "source_age_seconds": None,
+                                    "modes": None, "open_positions": None}
+                    failed.append(name)
+            result["unavailable_sources"] = failed
+            return result
         unavailable_sources: list[str] = []
 
         def read_source(
@@ -2926,6 +2970,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
             )
 
     def prewarm_default_views(self) -> None:
+        if not self.is_owner:
+            self.prewarm_overview()
+            return
         """Warm every first-view cache without delaying the listener."""
 
         def taifex_history_builder() -> PreparedResponse:
@@ -3101,6 +3148,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "web-share=()",
         )
         self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
+        self.send_header("X-StockAgent-Audience", self.server.audience)
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; "
@@ -3149,12 +3197,19 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         use_gzip = encoding == "gzip"
         body = response.gzip_body if use_gzip else response.body
         etag = response.gzip_etag if use_gzip else response.etag
+        sensitive = response.content_type.startswith(("application/json", "text/html"))
+        cache_control = response.cache_control
+        if sensitive:
+            # A retained owner validator must never validate a public response
+            # after the same browser moves between LAN/VPN identities.
+            etag = f'"{self.server.audience}-{etag.strip(chr(34))}"'
+            cache_control = "private, no-store" if self.server.is_owner else "no-store"
         if status == HTTPStatus.OK and _etag_matches(
             self.headers.get("If-None-Match"), etag
         ):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("ETag", etag)
-            self.send_header("Cache-Control", response.cache_control)
+            self.send_header("Cache-Control", cache_control)
             self.send_header("Vary", "Accept-Encoding")
             self._security_headers()
             self.end_headers()
@@ -3162,7 +3217,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", response.content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", response.cache_control)
+        self.send_header("Cache-Control", cache_control)
         self.send_header("ETag", etag)
         self.send_header("Vary", "Accept-Encoding")
         if use_gzip:
@@ -3672,6 +3727,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
     def _api_response(self, path: str, raw_query: str) -> PreparedResponse:
         if raw_query and path in _PUBLIC_API_ROUTES and path not in _QUERY_API_ROUTES:
             raise InvalidPublicRequest("endpoint does not accept query fields")
+        if path == "/api/access":
+            return _prepared((json.dumps(access_description(owner=self.server.is_owner)) + "\n").encode(),
+                             content_type="application/json; charset=utf-8", cache_control="no-store")
         if path == "/api/overview":
             return self.server.cached_local_json(
                 cache_key="public-overview",
@@ -3756,7 +3814,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    ), quote_source=self.server.public_quote_source,
+                    ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
                 ),
             )
         if path == "/tw-day-trade/api/positions":
@@ -3779,7 +3837,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    ), quote_source=self.server.public_quote_source,
+                    ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
                 ),
             )
         if path == "/tw-day-trade/api/events":
@@ -3808,7 +3866,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=symbol,
                         offset=offset,
                         limit=limit,
-                    ), quote_source=self.server.public_quote_source,
+                    ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
                 ),
             )
         if path == "/tw-overnight/api/status":
@@ -3863,7 +3921,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    ), quote_source=self.server.public_quote_source,
+                    ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
                 ),
             )
         if path == "/tw-overnight/api/positions":
@@ -3886,7 +3944,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
-                    ), quote_source=self.server.public_quote_source,
+                    ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
                 ),
             )
         if path == "/tw-overnight/api/events":
@@ -3908,7 +3966,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0]),
-                    ), quote_source=self.server.public_quote_source,
+                    ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
                 ),
             )
         if path == "/shioaji/api/status":
@@ -4122,6 +4180,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         path = parsed.path
+        if not permitted_path(path, owner=self.server.is_owner):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"}, head_only=head_only)
+            return
         if path in {
             "/taifex",
             "/tw-day-trade",
@@ -4311,6 +4372,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8770)
+    parser.add_argument("--owner-port", type=int, default=0,
+                        help="optional separate loopback-only owner listener; never selected by HTTP identity headers")
     parser.add_argument(
         "--public-static-root",
         type=Path,
@@ -4382,8 +4445,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not 1 <= int(args.port) <= 65_535:
         raise ValueError("port must be between 1 and 65535")
-    server = PublicDashboardServer(
-        (str(args.host), int(args.port)),
+    if args.owner_port and (not 1 <= args.owner_port <= 65_535 or args.owner_port == args.port):
+        raise ValueError("owner port must be valid and distinct")
+    server_options = dict(
         public_static_root=Path(args.public_static_root),
         taifex_static_root=Path(args.taifex_static_root),
         tw_static_root=Path(args.tw_static_root),
@@ -4401,11 +4465,20 @@ def main(argv: list[str] | None = None) -> int:
         tw_upstream=str(args.tw_upstream),
         traffic_history_root=Path(args.traffic_history_root),
     )
+    server = PublicDashboardServer((str(args.host), int(args.port)), **server_options)
+    owner_server = None
+    if args.owner_port:
+        owner_server = PublicDashboardServer(("127.0.0.1", args.owner_port), **server_options,
+                                              audience="owner", traffic_observer=server.traffic_observer)
+        threading.Thread(target=owner_server.serve_forever, name="owner-dashboard-listener", daemon=True).start()
     threading.Thread(
         target=server.prewarm_default_views,
         name="public-default-views-prewarm",
         daemon=True,
     ).start()
+    if owner_server is not None:
+        threading.Thread(target=owner_server.prewarm_default_views,
+                         name="owner-default-views-prewarm", daemon=True).start()
     print(
         f"[public-dashboards] listening=http://{args.host}:{args.port} "
         "upstreams=localhost-only",
@@ -4416,6 +4489,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if owner_server is not None:
+            owner_server.shutdown()
+            owner_server.server_close()
         server.server_close()
     return 0
 

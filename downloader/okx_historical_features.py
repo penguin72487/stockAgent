@@ -11,7 +11,7 @@ import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -22,9 +22,13 @@ from tqdm import tqdm
 
 try:
     from .feature_stage_timing import feature_run_summary_path, stage_latency_summary
+    from .feature_overlay import (feature_coverage, latest_non_null_ms as _latest_non_null_ms,
+                                  overlay_feature_frame as _overlay_feature_frame)
     from .ohlcv_hot_tail import hot_tail_path
 except ImportError:  # direct execution/import from downloader/
     from feature_stage_timing import feature_run_summary_path, stage_latency_summary
+    from feature_overlay import (feature_coverage, latest_non_null_ms as _latest_non_null_ms,
+                                 overlay_feature_frame as _overlay_feature_frame)
     from ohlcv_hot_tail import hot_tail_path
 
 
@@ -42,7 +46,7 @@ INDEX_PRICE_PAGE_LIMIT = 100
 # Keep one full page away from the moving recent-endpoint retention edge.
 INDEX_PRICE_RETENTION_MARGIN_ENTRIES = INDEX_PRICE_PAGE_LIMIT
 FEATURE_ACQUISITION_CONTRACT = {
-    "version": 3,
+    "version": 5,
     "feature_schema_version": FEATURE_SCHEMA_VERSION,
     "observation_contract": "completed_1m_prices_native_5m_statistics_causal_funding_v1",
     "index_price": {
@@ -56,6 +60,12 @@ FEATURE_ACQUISITION_CONTRACT = {
     },
     "pagination_validation": "typed_rows_valid_timestamps_strict_cursor_progress_v1",
     "oversized_page_policy": "one_exact_request_retry_then_reject_without_truncation_v1",
+    "funding_archive": {
+        "endpoint": "/api/v5/public/market-data-history", "module": "3",
+        "date_aggregation": "monthly", "max_distinct_months_per_query": 10,
+        "timestamp_timezone": "UTC+08:00", "bounds": "inclusive",
+        "interval_repair": "preserve_proven_initial_event_unknown_interval_repair_other_nulls_v1",
+    },
 }
 FUNDING_RATE_HISTORY_ENDPOINT = "/api/v5/public/funding-rate-history"
 MARKET_DATA_HISTORY_ENDPOINT = "/api/v5/public/market-data-history"
@@ -513,22 +523,6 @@ def _datetime_ms_expr(column: str) -> pl.Expr:
     )
 
 
-def _latest_non_null_ms(
-    frame: pl.DataFrame,
-    column: str,
-    fallback_start_ms: int,
-) -> int:
-    if column not in frame.columns or "date" not in frame.columns:
-        return fallback_start_ms
-    available = frame.filter(pl.col(column).is_not_null())
-    if available.is_empty():
-        return fallback_start_ms
-    latest = available.select(_datetime_ms_expr("date").max()).item()
-    if latest is None:
-        return fallback_start_ms
-    return max(fallback_start_ms, int(latest) - CANDLE_INTERVAL_MS)
-
-
 def _history_page(
     client: OkxHistoricalClient,
     path: str,
@@ -786,17 +780,22 @@ def _normalize_rubik_rows(
 def _add_months(value: datetime, months: int) -> datetime:
     month_index = value.year * 12 + (value.month - 1) + months
     year, zero_based_month = divmod(month_index, 12)
-    return datetime(year, zero_based_month + 1, 1, tzinfo=timezone.utc)
+    return datetime(year, zero_based_month + 1, 1, tzinfo=value.tzinfo)
 
 
 def _monthly_query_ranges(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
-    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
-    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
-    cursor = datetime(start_dt.year, start_dt.month, 1, tzinfo=timezone.utc)
+    if start_ms > end_ms:
+        return []
+    # Module 3 parses dates in UTC+8 and counts both boundary months. Twenty
+    # months (or ten months plus the next first day) returns HTTP 400/50077.
+    archive_timezone = timezone(timedelta(hours=8))
+    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=archive_timezone)
+    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=archive_timezone)
+    cursor = datetime(start_dt.year, start_dt.month, 1, tzinfo=archive_timezone)
     ranges: list[tuple[int, int]] = []
     while cursor <= end_dt:
-        next_cursor = _add_months(cursor, 20)
-        chunk_end = min(end_dt, next_cursor)
+        next_cursor = _add_months(cursor, 10)
+        chunk_end = min(end_dt, next_cursor - timedelta(milliseconds=1))
         ranges.append(
             (int(cursor.timestamp() * 1000), int(chunk_end.timestamp() * 1000))
         )
@@ -997,32 +996,6 @@ def _materialize_funding_asof(
     )
 
 
-def _overlay_feature_frame(
-    base: pl.DataFrame,
-    fresh: pl.DataFrame,
-    columns: tuple[str, ...],
-) -> pl.DataFrame:
-    if fresh.is_empty():
-        return base
-    fresh_columns = [column for column in columns if column in fresh.columns]
-    if not fresh_columns:
-        return base
-    renamed = fresh.select(["date", *fresh_columns]).rename(
-        {column: f"__fresh_{column}" for column in fresh_columns}
-    )
-    joined = base.join(renamed, on="date", how="left")
-    expressions: list[pl.Expr] = []
-    for column in fresh_columns:
-        incoming = pl.col(f"__fresh_{column}")
-        if column in joined.columns:
-            expressions.append(pl.coalesce([incoming, pl.col(column)]).alias(column))
-        else:
-            expressions.append(incoming.alias(column))
-    return joined.with_columns(expressions).drop(
-        [f"__fresh_{column}" for column in fresh_columns]
-    )
-
-
 def _ensure_raw_columns(frame: pl.DataFrame) -> pl.DataFrame:
     missing = [
         pl.lit(None, dtype=pl.Float64).alias(column)
@@ -1169,18 +1142,51 @@ def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
 
 
 def _coverage_summary(frame: pl.DataFrame) -> dict[str, Any]:
-    coverage: dict[str, Any] = {}
-    for family, column in FAMILY_PRIMARY_COLUMN.items():
-        if column not in frame.columns:
-            coverage[family] = {"rows": 0, "start": None, "end": None}
-            continue
-        selected = frame.filter(pl.col(column).is_not_null())
-        coverage[family] = {
-            "rows": selected.height,
-            "start": selected["date"].min() if not selected.is_empty() else None,
-            "end": selected["date"].max() if not selected.is_empty() else None,
-        }
-    return coverage
+    return feature_coverage(frame, FAMILY_PRIMARY_COLUMN)
+
+
+def _funding_history_start(frame: pl.DataFrame, fallback_ms: int) -> int:
+    """Rewind real metadata holes, not a first event's unknowable predecessor.
+
+    The interval is a difference of two *observed* settlement times. A carried
+    first settlement can legitimately have hundreds of null-interval rows;
+    those are one structural null, not hundreds of missing observations.
+    Existing age values must independently identify that same earliest event.
+    Missing/invalid age, mixed known/null metadata or any later event still
+    uses the original repair rule. This changes no raw values and certifies
+    neither archive completeness nor the existence of a preceding settlement.
+    """
+    start = _latest_non_null_ms(frame, "okx_funding_realized_rate", fallback_ms)
+    required = {"okx_funding_realized_rate", "okx_funding_interval_hours"}
+    if not required.issubset(frame.columns):
+        return start
+    selected = frame.select(
+        _datetime_ms_expr("date").alias("_date_ms"),
+        pl.col("okx_funding_realized_rate").alias("_rate"),
+        pl.col("okx_funding_interval_hours").alias("_interval"),
+        (pl.col("okx_funding_age_hours").cast(pl.Float64, strict=False)
+         if "okx_funding_age_hours" in frame.columns else pl.lit(None, dtype=pl.Float64)).alias("_age"),
+    )
+    # Round only the inverse-derived clock used for classification. Provider
+    # ages/rates/intervals remain byte-for-byte unchanged in the output frame.
+    selected = selected.with_columns(
+        pl.when((pl.col("_age") >= 0) & pl.col("_age").is_finite())
+        .then(pl.col("_date_ms") + CANDLE_INTERVAL_MS
+              - (pl.col("_age") * 3_600_000).round(0).cast(pl.Int64, strict=False))
+        .otherwise(None).alias("_event_ms")
+    )
+    missing = pl.col("_rate").is_not_null() & pl.col("_interval").is_null()
+    first_event = selected.select(pl.col("_event_ms").filter(pl.col("_rate").is_not_null()).min()).item()
+    if first_event is not None:
+        same_first_event = pl.col("_event_ms") == int(first_event)
+        first_has_interval = selected.select(
+            (same_first_event & pl.col("_interval").is_not_null()).any()
+        ).item()
+        if not first_has_interval:
+            proven_initial = same_first_event & pl.col("_rate").cast(pl.Float64, strict=False).is_finite()
+            missing &= ~proven_initial.fill_null(False)
+    earliest = selected.select(pl.col("_date_ms").filter(missing).min()).item()
+    return min(start, int(earliest)) if earliest is not None else start
 
 
 def enrich_symbol_historical_features(
@@ -1288,23 +1294,7 @@ def enrich_symbol_historical_features(
 
     def funding_stage() -> None:
         nonlocal frame
-        feature_start = _latest_non_null_ms(
-            frame, "okx_funding_realized_rate", dataset_start_ms
-        )
-        if {
-            "okx_funding_realized_rate",
-            "okx_funding_interval_hours",
-        }.issubset(frame.columns):
-            incomplete = frame.filter(
-                pl.col("okx_funding_realized_rate").is_not_null()
-                & pl.col("okx_funding_interval_hours").is_null()
-            )
-            if not incomplete.is_empty():
-                earliest_incomplete = incomplete.select(
-                    _datetime_ms_expr("date").min()
-                ).item()
-                if earliest_incomplete is not None:
-                    feature_start = min(feature_start, int(earliest_incomplete))
+        feature_start = _funding_history_start(frame, dataset_start_ms)
         # Pull the preceding settlements as causal context. Without this
         # lookback, the first event inside a requested window has no observable
         # prior interval and early bars cannot inherit the latest settled rate.

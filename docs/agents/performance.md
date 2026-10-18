@@ -198,7 +198,12 @@ Rules:
   post-close capacity shifts by exactly one observed dataset session, and all
   missing evidence fails closed without forward fill.
 
-- Use `epoch_curve.jsonl` when optimizing epoch-level speed.
+- Use `epoch_curve.jsonl` together with `epoch_workflow_timing.jsonl` when
+  optimizing epoch-level speed. The latter's
+  `complete_epoch_wall_s_max_rank` is recorded after curve plotting and
+  lifecycle updates on all ranks. Historical `epoch_wall_s_max_rank` can stop
+  before plotting; label its scope explicitly. Final asynchronous plot flush,
+  startup and final replay remain covered by complete-fold wall time.
 - Break down "other" time before optimizing blindly.
 - Initialize/mask Numba's parallel pool before setting the resolved per-rank
   Torch thread count. On a shared OpenMP runtime, Numba's first parallel panel

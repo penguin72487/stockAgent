@@ -1,0 +1,48 @@
+# Six fresh-random policies. Completed v9 / four-task MGDA are retained controls.
+# The v2 allocator keeps its exact forward and uses the analytic entmax VJP.
+base_spec: tw_scratch_strategy_20261017_v9.yaml
+output_root: artifacts/markets/tw_scratch_autonomous_20261018_v1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: autonomy
+      enabled: true
+      variants:
+        - name: entmax_vjp_log
+          overrides:
+            training:
+              loss_type: log_utility
+              financial_transformer:
+                portfolio_output_mode: score_entmax_scale_separated_cash_v2
+        - name: entmax_vjp_mgda
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: score_entmax_scale_separated_cash_v2
+        - name: independent_heads_log
+          overrides:
+            training:
+              loss_type: log_utility
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash
+        - name: independent_heads_mgda
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash
+        - name: encoded_history_heads_log
+          overrides:
+            training:
+              loss_type: log_utility
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash
+                temporal_query_mode: full_then_last
+        - name: encoded_history_heads_mgda
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+              financial_transformer:
+                portfolio_output_mode: decoupled_entmax_cash
+                temporal_query_mode: full_then_last

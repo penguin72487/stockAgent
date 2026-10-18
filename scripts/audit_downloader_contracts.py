@@ -5,10 +5,19 @@ import ast
 import csv
 import json
 import re
+import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    # Direct CLI execution starts with scripts/, unlike `python -m scripts...`.
+    # Resolve the shared service parser without requiring a caller PYTHONPATH.
+    sys.path.insert(0, str(ROOT))
 
 
 URL_RE = re.compile(r"https?://[^\s\"')]+")
@@ -73,6 +82,7 @@ class AuditRow:
     credential_env_vars: str
     contract_grade: str
     static_flags: str
+    referenced_by_services: str = ""
 
 
 def _kind(path: Path, source: str) -> str:
@@ -87,6 +97,8 @@ def _kind(path: Path, source: str) -> str:
         return "downloader"
     if name.startswith("build_") or name.startswith("backfill_"):
         return "builder_or_backfill"
+    if name.startswith(("refresh_", "run_", "process_")):
+        return "orchestrator"
     return "support"
 
 
@@ -203,9 +215,97 @@ def discover_python_entrypoints(root: Path) -> list[Path]:
 
     paths = set((root / "downloader").glob("*.py"))
     scripts_dir = root / "scripts"
-    for pattern in ("download_*.py", "fetch_*.py", "watch_*.py"):
+    for pattern in ("download_*.py", "fetch_*.py", "watch_*.py", "refresh_*.py",
+                    "backfill_*.py", "process_*.py", "run_*.py"):
         paths.update(scripts_dir.glob(pattern))
     return sorted(path for path in paths if path.name != "__init__.py")
+
+
+def script_references(source: str, root: Path, paths: Iterable[Path], *,
+                      source_path: Path | None = None) -> set[str]:
+    """Static references, not proof that every branch ran or loaded this code.
+
+    Emit known repository paths only, never ExecStart arguments, env values,
+    URLs or credentials. Shell wrappers often use SCRIPT_DIR plus a basename.
+    """
+    candidates = {path.relative_to(root).as_posix() for path in paths}
+    names = set(re.findall(r"[A-Za-z0-9_-]+\.(?:py|sh)\b", source))
+    modules = set(re.findall(r"\b(?:downloader|scripts)\.[A-Za-z0-9_.]+", source))
+    module_paths = {module.replace(".", "/") + ".py" for module in modules}
+    if source_path is not None and source_path.suffix == ".py":
+        tree = ast.parse(source, filename=str(source_path))
+        parts = source_path.relative_to(root).with_suffix("").parts
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            package = list(parts[:-node.level]) if node.level else []
+            package.extend(node.module.split(".") if node.module else [])
+            module_paths.add("/".join(package) + ".py")
+            module_paths.update("/".join([*package, alias.name]) + ".py"
+                                for alias in node.names)
+    return {name for name in candidates if Path(name).name in names or name in module_paths}
+
+
+def runtime_schedule_snapshot(root: Path, paths: list[Path]) -> tuple[dict, dict[str, set[str]]]:
+    """Read installed production owners/timers in two bounded systemctl queries.
+
+    No API calls, service starts or environment/command-line exports. A failed
+    read is explicit, not an empty snapshot presented as healthy scheduling.
+    """
+    from scripts.audit_service_latency_coverage import _unit_blocks
+
+    listed = subprocess.run(
+        ["systemctl", "list-unit-files", "stockagent-*.service", "stockagent-*.timer",
+         "--no-legend", "--no-pager"],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    unit_names = sorted({line.split()[0] for line in listed.stdout.splitlines()
+                         if line.split() and "@." not in line.split()[0]
+                         and not line.split()[0].startswith("stockagent-agent-")
+                         and re.fullmatch(r"stockagent-[A-Za-z0-9@_.:-]+\.(?:service|timer)", line.split()[0])})
+    if not unit_names:
+        raise RuntimeError("systemd returned no installed StockAgent units")
+    properties = (
+        "Id", "LoadState", "ActiveState", "SubState", "Result", "MainPID",
+        "InvocationID", "ExecMainStartTimestamp", "ExecMainExitTimestamp", "ExecMainStatus",
+        "Triggers", "TriggeredBy", "UnitFileState", "TimersMonotonic", "TimersCalendar",
+        "LastTriggerUSec", "NextElapseUSecRealtime", "ExecStart",
+    )
+    shown = subprocess.run(
+        ["systemctl", "show", *unit_names, "--all", "--no-pager", "--property=" + ",".join(properties)],
+        capture_output=True, text=True, timeout=20, check=True,
+    )
+    units = {**_unit_blocks(shown.stdout, suffix=".service"),
+             **_unit_blocks(shown.stdout, suffix=".timer")}
+    shells = sorted(set((root / "scripts").glob("run_*.sh")) |
+                    set((root / "scripts").glob("*runner*.sh")) |
+                    set((root / "downloader").glob("*.sh")))
+    all_paths = sorted(set(paths) | set(shells))
+    graph = {path.relative_to(root).as_posix(): script_references(
+        path.read_text(encoding="utf-8"), root, all_paths, source_path=path) for path in all_paths}
+    by_file: dict[str, set[str]] = {}
+    for unit, values in units.items():
+        roots = script_references(values.pop("ExecStart", ""), root, all_paths)
+        visited: set[str] = set()
+        pending = list(roots)
+        while pending:
+            path = pending.pop()
+            if path in visited:
+                continue
+            visited.add(path)
+            pending.extend(graph.get(path, set()) - visited)
+        values["repository_entrypoints"] = sorted(roots)
+        values["static_referenced_files"] = sorted(visited)
+        if unit.endswith(".service"):
+            for path in visited:
+                by_file.setdefault(path, set()).add(unit)
+    return {
+        "scope": ("installed StockAgent production units (transient engineering runs excluded); "
+                  "repo-local static reference closure, not loaded-code proof"),
+        "units": units,
+        "failed_services": sorted(unit for unit, value in units.items()
+                                  if unit.endswith(".service") and value.get("ActiveState") == "failed"),
+    }, by_file
 
 
 def _write_csv(rows: Iterable[AuditRow], path: Path) -> None:
@@ -231,6 +331,8 @@ def main() -> None:
     )
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--output-dir", default="artifacts/downloader_review/latest")
+    parser.add_argument("--include-runtime", action="store_true",
+                        help="Join installed systemd owners/timers without contacting providers")
     args = parser.parse_args()
 
     root = Path(args.repo_root).resolve()
@@ -242,6 +344,11 @@ def main() -> None:
     )
     paths = discover_python_entrypoints(root)
     rows = [_audit_file(path, root, daily_runner=daily_runner) for path in paths]
+    runtime = None
+    if args.include_runtime:
+        runtime, references = runtime_schedule_snapshot(root, paths)
+        for row in rows:
+            row.referenced_by_services = " | ".join(sorted(references.get(row.file, ())))
     output_dir = (root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "downloader_inventory.csv"
@@ -250,8 +357,7 @@ def main() -> None:
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "scope": (
-            "downloader/*.py + scripts/download_*.py + scripts/fetch_*.py + "
-            "scripts/watch_*.py"
+            "downloader/*.py plus scripts/{download,fetch,watch,refresh,backfill,process,run}_*.py"
         ),
         "file_count": len(rows),
         "networked_file_count": sum(row.networked for row in rows),
@@ -259,10 +365,19 @@ def main() -> None:
         "scheduled_networked_file_count": sum(
             row.networked and row.scheduled_by_daily_runner for row in rows
         ),
+        "service_referenced_networked_file_count": sum(
+            row.networked and bool(row.referenced_by_services) for row in rows
+        ) if runtime is not None else None,
+        "schedule_count_interpretation": (
+            "scheduled_networked_file_count counts literal daily-runner references only; "
+            "service_referenced_networked_file_count joins installed service reference closure, "
+            "not executed branches or independent collectors"
+        ),
         "contract_visible_file_count": sum(
             row.contract_grade == "contract_visible" for row in rows
         ),
         "warning": "Static flags require manual review and are not correctness verdicts.",
+        "runtime_schedule": runtime,
         "rows": [asdict(row) for row in rows],
     }
     temporary = json_path.with_name(f".{json_path.name}.tmp")

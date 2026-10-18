@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import polars as pl
 
+from stockagent.data.panel_cache import load_panel_cache_array
 from stockagent.data.tw_listing_admission import regular_market_admission_mask
 
 
@@ -1208,6 +1209,10 @@ def _load_minute_daily_feature_context(
             )
         return path
 
+    def read_array(name: str) -> np.ndarray:
+        array_path(name)  # Retain the minute context's required-file checks.
+        return load_panel_cache_array(cache_root, metadata["arrays"][name], mmap_mode="r")
+
     symbols_path = (cache_root / str(metadata.get("symbols_file", ""))).resolve()
     feature_names_path = (
         cache_root / str(metadata.get("feature_names_file", ""))
@@ -1322,7 +1327,7 @@ def _load_minute_daily_feature_context(
         else None
     )
 
-    panel_dates = np.load(array_path("dates"), mmap_mode="r").astype("datetime64[D]")
+    panel_dates = read_array("dates").astype("datetime64[D]")
     if panel_dates.ndim != 1 or panel_dates.size < 2:
         raise RuntimeError("tw_minute daily-context panel dates are malformed")
     if not bool(np.all(panel_dates[1:] > panel_dates[:-1])):
@@ -1341,8 +1346,8 @@ def _load_minute_daily_feature_context(
     )
     current_session_indices[exact] = insertion[exact]
 
-    panel_returns = np.load(array_path("returns_1d"), mmap_mode="r")
-    panel_close_prices = np.load(array_path("close_prices"), mmap_mode="r")
+    panel_returns = read_array("returns_1d")
+    panel_close_prices = read_array("close_prices")
     expected_panel_shape = (int(panel_dates.size), int(panel_symbols.size))
     if panel_returns.shape != expected_panel_shape:
         raise RuntimeError("tw_minute daily-context returns_1d shape is malformed")
@@ -1435,9 +1440,9 @@ def _load_minute_daily_feature_context(
     ).hexdigest()
     return MinuteDailyFeatureContext(
         feature_names=requested,
-        panel_features=np.load(array_path("features"), mmap_mode="r"),
-        panel_open_prices=np.load(array_path("open_prices"), mmap_mode="r"),
-        panel_close_prices=np.load(array_path("close_prices"), mmap_mode="r"),
+        panel_features=read_array("features"),
+        panel_open_prices=read_array("open_prices"),
+        panel_close_prices=panel_close_prices,
         panel_symbol_indices=panel_symbol_indices.astype(np.int64, copy=False),
         selected_feature_indices=selected_feature_indices,
         selected_output_indices=selected_output_indices,

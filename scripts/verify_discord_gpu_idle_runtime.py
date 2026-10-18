@@ -20,12 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from downloader.artifact_io import atomic_write_json  # noqa: E402
-from scripts import verify_completed_session_cache as cache  # noqa: E402
 from scripts.audit_service_latency_coverage import gpu_snapshot  # noqa: E402
 from scripts.verify_public_feature_index_runtime import identity, sha  # noqa: E402
 from stockagent.live.tw_day_trade_service_sync import load_service_sync  # noqa: E402
 
-BOT = cache.discord_bot
 UNIT = "stockagent-discord-bot.service"
 PROTECTED = (
     "stockagent-tw-day-trade-simulation.service", "stockagent-shioaji-taifex-bidask.service",
@@ -37,6 +35,13 @@ CODE = (Path(__file__), ROOT / "services/discord_bot/bot.py", ROOT / "stockagent
         Path("/etc/systemd/system") / UNIT)
 
 
+def verification_cache():
+    # A journal-only query needs no inference imports or code admission. Load
+    # those dependencies only for the checks that actually inspect artifacts.
+    from scripts import verify_completed_session_cache
+    return verify_completed_session_cache
+
+
 def owner():
     value = identity(UNIT)
     if value.get("ActiveState") != "active" or not value.get("InvocationID") or int(value.get("MainPID", 0)) <= 0:
@@ -45,6 +50,7 @@ def owner():
 
 
 def status_for_owner():
+    BOT = verification_cache().discord_bot
     value = json.loads(BOT._discord_service_status_path().read_bytes())
     observed = datetime.fromisoformat(value["updated_at"])
     if not 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= 5:
@@ -61,6 +67,7 @@ def status_for_owner():
 
 
 def pending_work(status):
+    BOT = verification_cache().discord_bot
     interactive = status["interactive_signal_jobs"]
     if interactive["running_count"] or interactive["active_count"]:
         raise ValueError("interactive_signal_work_active")
@@ -89,6 +96,7 @@ def gpu_handles(process):
 
 
 def engine_acknowledgements(status, expected_markets):
+    BOT = verification_cache().discord_bot
     engine = load_service_sync(BOT._day_trade_state_dir())
     names = set(expected_markets)
     if not isinstance(engine, dict) or set(status["scheduled_day_trade_markets"]) != names:
@@ -107,22 +115,34 @@ def engine_acknowledgements(status, expected_markets):
 
 
 def command_sync_since_restart():
-    result = subprocess.run(
-        ["journalctl", "-u", UNIT, "--invocation=0", "--output=cat", "--no-pager", "-n", "100"],
-        capture_output=True, text=True, check=True, timeout=5,
-    )
-    text = result.stdout
-    return {"commands_sync_or_deferred_observed": bool(re.search(r"^synced \d+ global app commands ", text, re.M))
-            or "global app command sync deferred; local signal scheduler remains active " in text,
-            "watchdog_or_fatal_observed": any(marker in text for marker in (
-        "action=exit_for_systemd_restart", "Fatal Python error", "Watchdog timeout",
-    )), "new_warm_ready_log_observed": "[startup-warm] status=ready" in text}
+    invocation = identity(UNIT).get("InvocationID")
+    if not isinstance(invocation, str) or re.fullmatch(r"[0-9a-f]{32}", invocation) is None:
+        raise ValueError("journal_owner_invocation_unknown")
+    # Filter inside journald, then bound each result independently. Ordinary
+    # progress cannot push startup success OR an earlier fatal out of a tail.
+    patterns = {
+        "commands_sync_or_deferred_observed": r"^synced [0-9]+ global app commands |global app command sync deferred; local signal scheduler remains active ",
+        "watchdog_or_fatal_observed": r"action=exit_for_systemd_restart|Fatal Python error|Watchdog timeout",
+        "new_warm_ready_log_observed": r"\[startup-warm\] status=ready",
+    }
+    observed = {}
+    for name, pattern in patterns.items():
+        result = subprocess.run(
+            ["journalctl", "-u", UNIT, f"--invocation={invocation}", "--output=cat", "--no-pager",
+             "-n", "1", "--grep", pattern], capture_output=True, text=True, check=False, timeout=5)
+        # journalctl returns 1 with empty stderr for a proven no-match.
+        if result.returncode not in (0, 1) or result.stderr or len(result.stdout) > 1024**2:
+            raise ValueError("current_invocation_journal_unavailable")
+        observed[name] = bool(re.search(pattern, result.stdout, re.M))
+    return observed
 
 
 def current_code_admission() -> dict:
+    cache = verification_cache()
     return {"contract": "live_implementation_process_admission_v1",
             "code_sha256": cache.forward_cache.identity_digest(
                 {"code": cache.forward_cache.loaded_implementation_identity()}),
+            "entrypoint_sha256": sha(ROOT / "services/discord_bot/bot.py"),
             "requires_fresh_process_on_change": True}
 
 
@@ -135,6 +155,8 @@ def verify(benchmarks: Path | None, controls: Path | None, control=None, *,
         raise ValueError("code admission and independent numerical acceptance are separate modes")
     if control is not None and control.get("contract") != contract:
         raise ValueError("discord_idle_control_contract_mismatch")
+    cache = verification_cache()
+    BOT = cache.discord_bot
     current = owner()
     protected = {unit: identity(unit) for unit in PROTECTED}
     proofs = {str(path): sha(path) for path in CODE}

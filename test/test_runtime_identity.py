@@ -7,8 +7,48 @@ import subprocess
 import pytest
 
 from stockagent.runtime_identity import (
-    identity_sha256, source_identity, validate_runtime_lock, verify_source_release,
+    enrolled_wsl_distribution, identity_sha256, source_identity, validate_runtime_lock, verify_source_release,
 )
+
+
+@pytest.mark.parametrize("name", ["Ubuntu-26.04", "registered-node"])
+def test_unattended_wsl_identity_uses_valid_owned_enrollment(tmp_path, name):
+    import json
+    (tmp_path / "configs").mkdir()
+    path = tmp_path / "configs/training_rescue.json"
+    path.write_text(json.dumps({"contract": "stockagent.training_rescue.v1", "schema_version": 1,
+                                "windows_distribution": name}))
+    assert enrolled_wsl_distribution(tmp_path, environ={}) == name
+    assert enrolled_wsl_distribution(tmp_path, environ={"WSL_DISTRO_NAME": "explicit-node"}) == "explicit-node"
+    path.chmod(0o666)
+    with pytest.raises(ValueError, match="ownership/mode"):
+        enrolled_wsl_distribution(tmp_path, environ={})
+
+
+@pytest.mark.parametrize("change", ["missing", "symlink", "contract", "injection", "empty", "parent_symlink"])
+def test_wsl_identity_never_guesses_or_accepts_untrusted_enrollment(tmp_path, change):
+    import json
+    (tmp_path / "configs").mkdir()
+    value = {"contract": "stockagent.training_rescue.v1", "schema_version": 1,
+             "windows_distribution": "registered-node"}
+    path = tmp_path / "configs/training_rescue.json"
+    if change == "contract":
+        value["contract"] = "other"
+    if change in {"injection", "empty"}:
+        value["windows_distribution"] = "bad;command" if change == "injection" else ""
+    if change == "symlink":
+        target = tmp_path / "outside.json"
+        target.write_text(json.dumps(value))
+        path.symlink_to(target)
+    elif change == "parent_symlink":
+        (tmp_path / "configs").rmdir()
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "configs").symlink_to(tmp_path / "outside", target_is_directory=True)
+        path.write_text(json.dumps(value))
+    elif change != "missing":
+        path.write_text(json.dumps(value))
+    with pytest.raises((ValueError, OSError)):
+        enrolled_wsl_distribution(tmp_path, environ={})
 
 
 def _lock():

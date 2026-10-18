@@ -218,6 +218,55 @@ def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_pat
     assert result["series"]["TaiwanStockInfo"]["complete"] == 1
 
 
+@pytest.mark.parametrize("keep_prepared,verified,remaining", [(True, True, 100), (False, True, 100),
+                                                          (True, False, 100), (True, True, 0)])
+def test_short_cross_lane_preemption_reuses_prepared_owner_without_reseeding(
+        tmp_path, monkeypatch, keep_prepared, verified, remaining):
+    from types import SimpleNamespace
+    from downloader import finmind_integrity
+
+    now = datetime(2026, 10, 17, 8, tzinfo=UTC)
+    monkeypatch.setenv("FINMIND_TOKEN", "test-only")
+    monkeypatch.setattr(complement, "load_env_file", lambda *_a, **_kw: None)
+    monkeypatch.setattr(complement, "_now", lambda: now)
+    monkeypatch.setattr(complement, "verified_account", lambda *_a: {"tier": "Free", "official_requests_per_hour": 600})
+    monkeypatch.setattr(complement, "rate_limiter", lambda *_a: object())
+    monkeypatch.setattr(complement.shutil, "disk_usage", lambda *_a: SimpleNamespace(free=10**12))
+    ready, prepared, audited, fetched, waits = [True], [], [], [], []
+
+    def populate(conn, *_a, **_kw):
+        prepared.append(id(conn))
+        complement._add_tasks(conn, [("TaiwanStockDelisting", "", "2025", "year", 4)])
+
+    monkeypatch.setattr(complement, "_populate", populate)
+    monkeypatch.setattr(finmind_integrity, "audit_completed_batch", lambda conn, *_a: audited.append(id(conn)))
+    monkeypatch.setattr(complement, "incremental_reservation", lambda *_a: {"reserve_requests": int(ready[0])})
+    monkeypatch.setattr(complement, "backfill_budget", lambda *_a, **_kw: {
+        "allowed": not ready[0], "priority_wait": ready[0], "schedule_verified": verified,
+        "remaining": remaining, "reserve": int(ready[0])})
+    monkeypatch.setattr(complement, "_claim_bulk_years", lambda *_a, **_kw: None)
+
+    def request(*_a, **_kw):
+        assert not ready[0]  # No historical API call while a release owns priority.
+        fetched.append(True)
+        return [{"date": "2025-07-01", "stock_id": "1234"}]
+
+    monkeypatch.setattr(complement, "_request", request)
+
+    def wait(root, status, seconds, **kw):
+        assert not fetched and status["active_task"] is None
+        assert seconds == 60 and kw["wake_if"]() is False
+        waits.append(status["state"])
+        ready[0] = False
+
+    monkeypatch.setattr(complement, "wait_for_next_cycle", wait)
+    result = complement.run_once(tmp_path, max_requests=1, keep_prepared_on_priority_wait=keep_prepared)
+    should_reuse = keep_prepared and verified and remaining > 1
+    assert result["state"] == ("batch_complete" if should_reuse else "incremental_reserve")
+    assert len(fetched) == len(waits) == int(should_reuse)
+    assert len(prepared) == len(audited) == 1 and prepared == audited
+
+
 def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_path, monkeypatch) -> None:
     from types import SimpleNamespace
     from downloader import finmind_integrity

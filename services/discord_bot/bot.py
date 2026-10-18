@@ -3273,6 +3273,7 @@ class StockAgentBot(discord.Client):
         self._postclose_fast_completed_keys: set[str] = set()
         self._postclose_fast_cache: dict[str, Any] = {}
         self._postclose_fast_cache_inflight: dict[str, asyncio.Task[Any]] = {}
+        self._postclose_fast_cache_batches = 0
         self._postclose_fast_quote_refresh_keys: set[str] = set()
         self._postclose_fast_retry_after: dict[str, float] = {}
         self._postclose_fast_state_date: str | None = None
@@ -3956,7 +3957,12 @@ def _deployment_warmup_window_open() -> bool:
             return False
         now = datetime.now(ZoneInfo("Asia/Taipei"))
         remaining = (deadline-now).total_seconds()
-        return (0 < remaining <= 15*60 and now.hour*60+now.minute >= 13*60+40
+        minutes = now.hour * 60 + now.minute
+        # A bounded, explicitly requested deployment check is also safe after
+        # midnight. Keep the entire earliest supported prewarm/opening region
+        # fenced; the ordinary session clock and active attempts retain priority.
+        offhours = minutes < 7 * 60 or minutes >= 13 * 60 + 40
+        return (0 < remaining <= 15*60 and offhours
                 and bot._opening_attempt_started_monotonic is None)
     except (TypeError, ValueError):
         return False
@@ -4035,6 +4041,13 @@ def _startup_gpu_protection_start_minutes(cfg: LiveMarketConfig) -> float:
 def _offhours_gpu_cache_release_allowed() -> bool:
     """Protect prewarm/live work, not an arbitrary 17:00 wall-clock cutoff."""
 
+    if bot._postclose_fast_cache_batches or any(
+        not task.done() for task in tuple(bot._postclose_fast_cache_inflight.values())
+    ):
+        # A model mutex protects one forward, not the gaps between a closing
+        # batch's modes. A timed-out caller can also leave its shielded producer
+        # running. Protect actual work only, never the whole retry window.
+        return False
     if _deployment_warmup_window_open():
         return False
     for market in _scheduled_markets():
@@ -4094,6 +4107,9 @@ def _release_offhours_gpu_cache_sync() -> bool:
     if not _MODEL_INFERENCE_LOCK.acquire(blocking=False):
         return False
     try:
+        # A closing batch may have started after the first eligibility check.
+        if not _offhours_gpu_cache_release_allowed():
+            return False
         return _release_live_cuda_cache_owned()
     finally:
         _MODEL_INFERENCE_LOCK.release()
@@ -6738,8 +6754,8 @@ async def _postclose_fast_result(
         cache_state = "generated"
         task = bot._postclose_fast_cache_inflight.get(key)
         if task is None or task.done():
-            task = asyncio.create_task(
-                _generate_postclose_fast_signal(
+            async def generate_and_cache() -> Any:
+                value = await _generate_postclose_fast_signal(
                     cfg,
                     status,
                     context,
@@ -6749,7 +6765,15 @@ async def _postclose_fast_result(
                     include_unconstrained_raw_scores=include_unconstrained_raw_scores,
                     debug=debug,
                 )
-            )
+                # The producer owns publication: wait_for(shield(...)) may
+                # outlive every caller. Do not discard that completed forward
+                # and run it again on the next scheduler poll. Retain only CPU
+                # result rows, and never repopulate a pruned prior session.
+                if bot._postclose_fast_state_date == str(context["session_date"]):
+                    bot._postclose_fast_cache[key] = _clone_live_signal_result(value)
+                return value
+
+            task = asyncio.create_task(generate_and_cache())
             bot._postclose_fast_cache_inflight[key] = task
 
             def clear_inflight(done: asyncio.Task[Any], *, cache_key: str = key) -> None:
@@ -6761,7 +6785,6 @@ async def _postclose_fast_result(
             asyncio.shield(task),
             timeout=_postclose_fast_timeout_seconds(),
         )
-        bot._postclose_fast_cache[key] = _clone_live_signal_result(cached)
     result = _clone_live_signal_result(cached)
     _mark_postclose_fast_preview(
         cfg,
@@ -11402,6 +11425,15 @@ async def postclose_fast_cache() -> None:
 
     markets = _postclose_fast_markets()
     _set_scheduler_poll_seconds(postclose_fast_cache, _postclose_scheduler_poll_seconds(markets))
+    bot._postclose_fast_cache_batches += 1
+    try:
+        await _populate_postclose_fast_caches(markets)
+    finally:
+        bot._postclose_fast_cache_batches -= 1
+
+
+async def _populate_postclose_fast_caches(markets: list[str]) -> None:
+    """One serial batch shares prearmed models; idle/retry gaps retain no lease."""
     for market in markets:
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))

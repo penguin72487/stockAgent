@@ -820,6 +820,16 @@ def test_day_trade_benchmark_uses_same_session_buy_and_hold_window() -> None:
     np.testing.assert_allclose(dataset.benchmark_t.numpy(), expected)
     assert dataset[0]["benchmark"].item() == pytest.approx(float(expected[2]))
     assert dataset[0]["benchmark"].item() == pytest.approx(0.02)
+    # Changing the daily opening move must not change a continuously held
+    # adjusted-close comparator, which includes the overnight return.
+    panel.intraday_returns[:] = -0.25
+    changed_open = CrossSectionalDataset(
+        panel, np.arange(panel.num_dates), lookback=2, execution_mode="tw_day_trade"
+    )
+    np.testing.assert_array_equal(changed_open.benchmark_t.numpy(), expected)
+    assert np.expm1(expected[2:].astype(np.float64).sum()) == pytest.approx(
+        np.exp(0.02 + 0.03 + 0.04 + 0.05) - 1.0
+    )
 
 
 @pytest.mark.parametrize(

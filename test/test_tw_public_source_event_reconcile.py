@@ -34,6 +34,15 @@ def queue(state, *, reason="derived_source_content_changed", observed=NOW):
 
 def drain(state, root, monkeypatch, *, observed=NOW, status="ok"):
     calls = []
+    # Completion-based retry must use the same controlled clock as the
+    # injected observation. Otherwise a morning test run schedules its retry
+    # before the postclose window and fails for the host's time of day.
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed.astimezone(tz) if tz else observed.replace(tzinfo=None)
+
+    monkeypatch.setattr(events, "datetime", Clock)
     monkeypatch.setattr(events, "_latest_completed_taiex_session", lambda *_a, **_kw: "2026-10-14")
 
     def finalizer(request, **kwargs):

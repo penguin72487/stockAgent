@@ -562,7 +562,8 @@ def test_scoped_plan_recovery_only_accepts_unresolved_discovery(registry,respons
         recover_desktop_response(root,download['task_id'],Preparation(),response=response)
 
 
-@pytest.mark.parametrize('mutation', [None,'task_id','table','provider','action','submission_possible','error_code','absent'])
+@pytest.mark.parametrize('mutation', [None,'task_id','table','provider','action','submission_possible','error_code',
+    'absent','json_list','json_null','json_scalar'])
 def test_bridge_safe_retry_requires_exact_private_prequery_proof(registry,monkeypatch,mutation):
     from types import SimpleNamespace
     import downloader.tej_history as collector
@@ -583,6 +584,9 @@ def test_bridge_safe_retry_requires_exact_private_prequery_proof(registry,monkey
                  'error_code':'local_date_input_failed_before_preview'}
         if mutation == 'submission_possible':proof['market_data_query_submission_possible'] = True
         elif mutation in {'task_id','table','provider','action','error_code'}:proof[mutation] = 'wrong'
+        elif mutation == 'json_list':proof = []
+        elif mutation == 'json_null':proof = None
+        elif mutation == 'json_scalar':proof = 7
         if mutation != 'absent':atomic_write_json(output.with_suffix('.json.outcome.json'),proof)
         return SimpleNamespace(returncode=1,stderr=b'SECRET private diagnostic',stdout=b'')
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',fail)
@@ -593,6 +597,58 @@ def test_bridge_safe_retry_requires_exact_private_prequery_proof(registry,monkey
     if mutation is not None:assert not isinstance(caught.value,BeforeDataQueryError)
     diagnostic = next((root/'diagnostics').glob('*.txt'))
     assert diagnostic.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize('mutation', [None, 'hash', 'task', 'attempt', 'table', 'contract', 'clock',
+    'submission_possible', 'stage', 'duplicate', 'invalid_json', 'no_proof',
+    'json_list', 'json_null', 'json_scalar'])
+def test_unc_failure_can_persist_only_exact_prepreview_transport_proof(registry, monkeypatch, mutation):
+    from types import SimpleNamespace
+    from datetime import UTC, datetime, timedelta
+    from downloader.tej_history import NEGATIVE_STDERR_PREFIX, NEGATIVE_STDERR_CONTRACT
+    _, root, _, _ = registry
+    run_one(root, FakeBridge())
+    with closing(connect(root)) as con:
+        task = dict(con.execute("SELECT * FROM tasks WHERE kind='download'").fetchone())
+    monkeypatch.setattr(DesktopBridge, 'windows_path', staticmethod(str))
+    def fail(command, **kwargs):
+        prepared = kwargs['request']
+        wire = json.loads(prepared.read_text())
+        manifest = json.loads((root/'launches'/(prepared.stem+'.bridge.json')).read_text())
+        proof = {**{k: wire[k] for k in ('task_id','query_attempt_id','type','smart_id','table')},
+            'contract_version':4, 'provider':'tej_smart_wizard', 'action':'download',
+            'transport_contract':NEGATIVE_STDERR_CONTRACT,
+            'bridge_script_sha256':manifest['bridge_script_sha256'],
+            'market_data_query_submission_possible':False,
+            'error_code':'local_query_preparation_failed_before_preview',
+            'observed_at_utc':datetime.now(UTC).isoformat()}
+        if mutation == 'hash': proof['bridge_script_sha256'] = '0'*64
+        elif mutation == 'task': proof['task_id'] = '0'*24
+        elif mutation == 'attempt': proof['query_attempt_id'] = '0'*24+'-'+'0'*32
+        elif mutation == 'table': proof['table'] = 'other'
+        elif mutation == 'contract': proof['transport_contract'] = 'unreviewed'
+        elif mutation == 'clock': proof['observed_at_utc'] = (datetime.now(UTC)-timedelta(minutes=1)).isoformat()
+        elif mutation == 'submission_possible': proof['market_data_query_submission_possible'] = True
+        elif mutation == 'stage': atomic_write_json(root/'raw'/(prepared.name+'.stage.json'), {'stage':'retained'})
+        text = NEGATIVE_STDERR_PREFIX+json.dumps(proof)+'\n'
+        if mutation == 'duplicate': text += text
+        elif mutation == 'invalid_json': text = NEGATIVE_STDERR_PREFIX+'{\n'
+        elif mutation == 'no_proof': text = 'UNC publication failed\n'
+        elif mutation == 'json_list': text = NEGATIVE_STDERR_PREFIX+'[]\n'
+        elif mutation == 'json_null': text = NEGATIVE_STDERR_PREFIX+'null\n'
+        elif mutation == 'json_scalar': text = NEGATIVE_STDERR_PREFIX+'7\n'
+        return SimpleNamespace(returncode=1, stderr=text.encode())
+    monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows', fail)
+    bridge = DesktopBridge(Path(__file__).resolve().parents[1],
+        dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='fixture',ExpectedWorkbook='fixture',ExpectedExcelWindow=3))
+    with pytest.raises(RuntimeError) as caught:
+        bridge.execute(root, task)
+    assert isinstance(caught.value, BeforeDataQueryError) is (mutation is None)
+    with closing(connect(root)) as con:
+        attempt = dict(con.execute('SELECT * FROM desktop_attempts').fetchone())
+    assert attempt['state'] == ('proven_not_submitted' if mutation is None else 'unknown_outcome')
+    assert not (root/attempt['raw_path']).exists()
+    assert Path(root/attempt['raw_path']).with_suffix('.json.outcome.json').exists() is (mutation is None)
 
 
 @pytest.mark.parametrize('mutation',[None,'request','diagnostic','script','callsite','stage','readback','retry_limit'])
@@ -647,21 +703,30 @@ def test_legacy_foreground_recovery_requires_original_proof_and_never_submits(re
             assert row['actual_rows'] is None and row['safe_prequery_retries']==(2 if mutation=='retry_limit' else 1)
 
 
-def test_bridge_timeout_never_exposes_command_or_retries(registry,monkeypatch):
+@pytest.mark.parametrize('action,deadline',[
+    ('plan',900),('inspect_notices',120),('inspect_source_binding',120),
+    ('inspect_query_runtime',120),('confirm_metadata_error_cleared',120),('ack_source_memory_error',30)])
+def test_bridge_timeout_never_exposes_command_or_retries(registry,monkeypatch,action,deadline):
     import subprocess
     import downloader.tej_history as collector
     _, root, _, _ = registry
     with closing(connect(root)) as con:
         task = dict(con.execute('SELECT * FROM tasks').fetchone())
+    request=task_request(root,task);request['action']=action
+    task['request_json']=json.dumps(request)
     monkeypatch.setattr(DesktopBridge,'windows_path',staticmethod(lambda path:str(path)))
+    calls=[]
     def timeout(*args,**kwargs):
-        raise subprocess.TimeoutExpired('SECRET command',900,stderr=b'private vendor path')
+        calls.append(kwargs['timeout'])
+        raise subprocess.TimeoutExpired('SECRET command',deadline,stderr=b'private vendor path')
     monkeypatch.setattr('downloader.tej_windows_transport.run_guarded_windows',timeout)
     session = dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='test',ExpectedWorkbook='Book2',ExpectedExcelWindow=3)
     with pytest.raises(RuntimeError,match='requires_recovery') as caught:
         DesktopBridge(Path(__file__).resolve().parents[1],session).execute(root,task)
     assert 'SECRET' not in str(caught.value)
     assert caught.value.__suppress_context__
+    assert calls==[deadline]
+    assert DesktopBridge.deadline_seconds('download')==900
 
 
 def test_proven_list_selection_retry_is_bounded_not_an_unknown_preview(registry):

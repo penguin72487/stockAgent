@@ -9,7 +9,7 @@ import {fileURLToPath} from "node:url";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const auditScript = path.join(scriptDir, "audit_public_dashboards_browser.mjs");
 const port = String(process.argv[2] || "9222");
-const baseUrl = String(process.argv[3] || "https://penguin72487.ddnsgeek.com");
+const baseUrl = String(process.argv[3] || "https://www.penguin72487.dpdns.org");
 const outputRoot = String(process.argv[4] || "/tmp/stockagent-dashboard-responsive-audit");
 const requestedPages = String(process.argv[5] || "");
 

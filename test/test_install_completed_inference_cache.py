@@ -22,6 +22,59 @@ def test_qualification_requires_real_new_forward_then_complete_warm_hit():
                                       panel_date="2026-10-14") == "complete-new-key"
 
 
+@pytest.mark.parametrize("damage", [None, "no-full-model", "no-projection", "wrong-profile"])
+def test_projection_installation_requires_full_model_and_complete_signal_oracles(damage):
+    record = qualified_record()
+    for row in record["full_forward_controls"]:
+        row.update(whole_output_bitwise_equal=False,
+                   projection_contract=installation.signal_engine._COMPLETED_SIGNAL_PROJECTION,
+                   complete_signal_projection_bitwise_equal=True,
+                   full_model_output_bitwise_equal=True if row["model_calls"] else None)
+    if damage == "no-full-model":
+        record["full_forward_controls"][0]["full_model_output_bitwise_equal"] = None
+    elif damage == "no-projection":
+        record["full_forward_controls"][1]["complete_signal_projection_bitwise_equal"] = False
+    elif damage == "wrong-profile":
+        record["full_forward_controls"][1]["projection_contract"] = "unknown_profile"
+    if damage:
+        with pytest.raises(ValueError):
+            installation.qualification(record, market="market", panel_date="2026-10-14")
+    else:
+        assert installation.qualification(record, market="market", panel_date="2026-10-14")
+
+
+@pytest.mark.parametrize("damage", [None, "default", "retained", "inventory", "extra-oracle", "policy"])
+def test_metadata_only_installation_requires_separate_full_and_lean_model_oracles(damage):
+    record = qualified_record()
+    for row in record["full_forward_controls"]:
+        first = row["model_calls"] == 1
+        row.update(whole_output_bitwise_equal=False,
+                   projection_contract=installation.signal_engine._COMPLETED_SIGNAL_PROJECTION,
+                   complete_signal_projection_bitwise_equal=True,
+                   full_model_output_bitwise_equal=None,
+                   candle_aux_policy=installation.signal_engine._COMPLETED_CANDLE_AUX_POLICY,
+                   oracle_model_calls=int(first),
+                   full_default_model_output_bitwise_equal=True if first else None,
+                   non_candle_output_bitwise_equal=True if first else None,
+                   omitted_candle_fields=["candle_embedding"] if first else [])
+    first, second = record["full_forward_controls"]
+    if damage == "default":
+        first["full_default_model_output_bitwise_equal"] = None
+    elif damage == "retained":
+        first["non_candle_output_bitwise_equal"] = None
+    elif damage == "inventory":
+        first["omitted_candle_fields"] = []
+    elif damage == "extra-oracle":
+        second["oracle_model_calls"] = 1
+    elif damage == "policy":
+        second["candle_aux_policy"] = "unknown"
+    if damage:
+        with pytest.raises(ValueError):
+            installation.qualification(record, market="market", panel_date="2026-10-14")
+    else:
+        assert installation.qualification(record, market="market", panel_date="2026-10-14")
+
+
 @pytest.mark.parametrize("field,value", [
     ("contract", "completed_forward_identity_observer_v1"), ("market", "other"),
     ("panel_date", "2026-10-13"), ("exact_output_parity", False),

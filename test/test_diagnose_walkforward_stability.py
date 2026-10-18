@@ -27,6 +27,22 @@ def test_parse_run_and_folds() -> None:
     assert _parse_folds("23,24,23,25") == [23, 24, 25]
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_checkpoint_diagnosis_keeps_native_and_compact_manifest_semantics(tmp_path, compact):
+    import torch
+    from scripts.diagnose_walkforward_stability import diagnose_checkpoint
+    from stockagent.training.checkpoint_transport import encode_checkpoint_manifest
+    payload = {"epoch": 7, "model_state_dict": {"weight": torch.ones(2, 3)},
+               "experiment_manifest": {"contracts": {"training": {
+                   "batching": {"batch_size_train": 128}}}}}
+    path = tmp_path / "checkpoint_best.pt"
+    torch.save(encode_checkpoint_manifest(payload) if compact else payload, path)
+    assert diagnose_checkpoint(path) == {
+        "checkpoint_best_epoch": 7, "batch_size_train": 128,
+        "model_state_parameter_count": 6,
+    }
+
+
 def test_diagnose_weights_reports_effective_positions(tmp_path) -> None:
     path = tmp_path / "daily_weights.parquet"
     pq.write_table(

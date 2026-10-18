@@ -24,8 +24,11 @@ def main() -> int:
         type=Path,
         default=REPO_ROOT / "artifacts/live/shioaji_storage/summary.json",
     )
+    parser.add_argument('--force-full-scan', action='store_true',
+                        help='Reconcile out-of-protocol/manual source edits without trusting cached epochs.')
     args = parser.parse_args()
-    payload = write_shioaji_storage_snapshot(args.repo_root, args.output)
+    payload = write_shioaji_storage_snapshot(args.repo_root, args.output,
+                                            force_full_scan=args.force_full_scan)
     summary = payload["summary"]
     print(
         json.dumps(

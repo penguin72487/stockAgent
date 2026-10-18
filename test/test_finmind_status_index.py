@@ -6,6 +6,10 @@ import pytest
 
 from downloader import download_finmind_complement as worker
 from downloader.finmind_queue_indexes import STATUS_COLUMNS, STATUS_INDEX, dispatch_indexes, ensure_status_index
+from downloader.finmind_queue_indexes import (
+    RELEASE_RESERVE_INDEX, RELEASE_RESERVE_COLUMNS, ensure_release_reserve_index, release_reserve_index,
+    PERIODIC_INDEX, PERIODIC_COLUMNS, ensure_periodic_index, periodic_index,
+)
 from scripts.benchmark_finmind_status import AGGREGATE_SQL, claim_release, main
 
 
@@ -25,6 +29,49 @@ def test_index_is_idempotent_and_changes_no_rows_or_triggers(tmp_path):
         assert tuple(row[2] for row in columns) == STATUS_COLUMNS
         assert any("COVERING INDEX " + STATUS_INDEX in row[3]
                    for row in connection.execute("EXPLAIN QUERY PLAN " + AGGREGATE_SQL))
+
+
+def test_release_projection_is_exact_read_only_hint_and_legacy_safe(tmp_path):
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        before = conn.total_changes
+        ensure_release_reserve_index(conn)
+        assert release_reserve_index(conn) == f' INDEXED BY {RELEASE_RESERVE_INDEX}'
+        assert tuple(row[2] for row in conn.execute(f'PRAGMA index_info({RELEASE_RESERVE_INDEX})')) == RELEASE_RESERVE_COLUMNS
+        assert conn.total_changes == before
+        conn.execute(f'DROP INDEX {RELEASE_RESERVE_INDEX}')
+        assert release_reserve_index(conn) == ''
+        conn.execute(f'CREATE INDEX {RELEASE_RESERVE_INDEX} ON tasks(priority)')
+        assert release_reserve_index(conn) == ''  # Same name is not the contract.
+
+
+def test_periodic_cohort_preserves_exact_selection_and_legacy_fallback(tmp_path):
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        for kind in ('year', 'snapshot', 'id_day', 'derived'):
+            for state in ('complete', 'observed_empty', 'failed', 'pending', 'retry_exhausted'):
+                for year in ('2013', '2014', '2026', '2027', 'latest'):
+                    conn.execute('INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) VALUES (?,?,?,?,?,?)',
+                                 (kind, state, year, kind, 3, state))
+        original = ('SELECT dataset,data_id,partition,kind,state,last_attempt_at_utc,next_attempt_at_utc '
+                    "FROM tasks WHERE state IN ('complete','observed_empty') "
+                    "AND (kind='snapshot' OR (kind='year' AND partition=?))")
+        expected = sorted(conn.execute(original, ('2026',)).fetchall())
+        changes = conn.total_changes
+        ensure_periodic_index(conn)
+        assert periodic_index(conn) == f' INDEXED BY {PERIODIC_INDEX}'
+        assert tuple(row[2] for row in conn.execute(f'PRAGMA index_info({PERIODIC_INDEX})')) == PERIODIC_COLUMNS
+        statements = []
+        conn.set_trace_callback(statements.append)
+        assert sorted(worker._periodic_refresh_tasks(conn, 2026)) == expected
+        conn.set_trace_callback(None)
+        query = next(sql for sql in statements if sql.startswith('SELECT dataset,data_id,partition'))
+        assert any(PERIODIC_INDEX in row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query))
+        assert conn.total_changes == changes
+        conn.execute(f'DROP INDEX {PERIODIC_INDEX}')
+        assert periodic_index(conn) == ''
+        assert sorted(worker._periodic_refresh_tasks(conn, 2026)) == expected
+        conn.execute(f'CREATE INDEX {PERIODIC_INDEX} ON tasks(dataset)')
+        assert periodic_index(conn) == ''
+        assert sorted(worker._periodic_refresh_tasks(conn, 2026)) == expected
 
 
 def test_full_status_preserves_states_retained_values_extrema_and_nulls(tmp_path, monkeypatch):

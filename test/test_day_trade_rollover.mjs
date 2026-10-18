@@ -4,7 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
-function harness({overnight = false} = {}) {
+function harness({overnight = false, latestOnly = true} = {}) {
   const nodes = new Map();
   const timers = new Map();
   let timerId = 0;
@@ -16,10 +16,13 @@ function harness({overnight = false} = {}) {
     IS_OVERNIGHT: overnight, $, performance: {now: () => 0}, document: {hidden: false},
     window: {setTimeout: (fn, ms) => { timers.set(++timerId, {fn, ms}); return timerId; }, clearTimeout: (id) => timers.delete(id)},
     setHtml: () => {}, esc: String, strategyLabel: (row) => row.label,
+    renderPriceSources: () => {},
     Date, Map, Set, AbortController, console,
   });
   function $(id) { return byId(id); }
   vm.runInContext(app.slice(app.indexOf("let snapshot = null;"), app.indexOf("try {\n  const storedHiddenSeries")), context);
+  vm.runInContext(app.match(/^const DEFAULT_PERFORMANCE_START_DATE = .*;$/m)[0], context);
+  if (latestOnly) vm.runInContext("followLatestSession = true; followPerformanceRange = false", context);
   vm.runInContext(app.slice(app.indexOf("function selectedMode()"), app.indexOf("function chartWindowLabel()")), context);
   vm.runInContext(app.slice(app.indexOf("function validateDetailPage"), app.indexOf("function healthPresentation")), context);
   vm.runInContext(app.slice(app.indexOf("function syncFilters(data)"), app.indexOf("function renderModes(data)")), context);
@@ -27,6 +30,74 @@ function harness({overnight = false} = {}) {
   const data = (day) => ({session_date: day, available_session_dates: [day, "2026-09-08"], modes: []});
   return {context, run, byId, timers, data};
 }
+
+test("default performance starts at 2026-01-01 and follows new sessions without fabricating earlier data", () => {
+  for (const overnight of [false, true]) {
+    const {context, run, byId, data} = harness({overnight, latestOnly: false});
+    context.data = data("2026-10-16"); run("syncFilters(data)");
+    assert.equal(byId("detail-start-date").value, "2026-01-01");
+    assert.equal(byId("detail-start-date").min, "2026-01-01");
+    assert.equal(byId("detail-end-date").value, "2026-10-16");
+    assert.equal(run("selectedDate()"), "2026-10-16");
+    assert.equal(run("availableDetailDates.length"), 2);
+    context.data = data("2026-10-19"); run("syncFilters(data)");
+    assert.equal(byId("detail-start-date").value, "2026-01-01");
+    assert.equal(byId("detail-end-date").value, "2026-10-19");
+    run("followPerformanceRange = false");
+    byId("detail-start-date").value = "2026-09-08";
+    byId("detail-end-date").value = "2026-10-16";
+    context.data = data("2026-10-20"); run("syncFilters(data)");
+    assert.equal(byId("detail-start-date").value, "2026-09-08");
+    assert.equal(byId("detail-end-date").value, "2026-10-16");
+  }
+});
+
+test("default performance also keeps the server-clock rollover observer", () => {
+  const {context, run, timers} = harness({latestOnly: false});
+  let refreshed = 0;
+  context.refresh = () => { refreshed++; };
+  context.sync = {generated_at_utc: "2026-10-19T00:29:59Z", session_clock: {next_rollover_at: "2026-10-19T08:30:00+08:00"}};
+  run("scheduleSessionRollover(sync)");
+  assert.equal([...timers.values()][0].ms, 1000);
+  [...timers.values()][0].fn();
+  assert.equal(refreshed, 1);
+});
+
+test("year-to-date reuses full history but preserves requested boundaries and observed points", async () => {
+  const {context, run, data} = harness({latestOnly: false});
+  context.data = data("2026-10-16"); run("syncFilters(data)");
+  const requested = [];
+  const payload = {history_encoding: "minute_columns_v2", start_date: null, end_date: null,
+    minute_axis: ["2026-09-08T09:01:00+08:00"], history: [], range_summary: [], returned_points: 1,
+    minute_series: [{series_id: "mode", minute_indexes: [0], return_pct: [0],
+      cumulative_return_pct: [12], quality_flags: [0]}]};
+  Object.assign(context, {
+    HISTORY_CLIENT_CACHE_MAX_ENTRIES: 3, URLSearchParams,
+    renderChart: () => {},
+    chartRequestKey: () => run("detailRangeKey()"),
+    chartHistoryMatchesSelection: () => false,
+    fetchMinuteHistory: async (url) => { requested.push(url); return {ok: true}; },
+    Dashboard: {readJsonResponse: async () => payload},
+    decodeChartHistory: (value) => value,
+    applyChartHistory: (value) => { context.observed = value; },
+  });
+  run(app.slice(app.indexOf("function validateMinuteHistory("), app.indexOf("function applyChartHistory(")));
+  run(app.slice(app.indexOf("async function loadChartHistory({"), app.indexOf("function renderPriceSources(")));
+  await run("loadChartHistory()");
+  const query = new URL(requested[0], "https://example.test/").searchParams;
+  assert.equal(query.get("start_date"), null);
+  assert.equal(query.get("end_date"), null);
+  assert.equal(context.observed.start_date, "2026-01-01");
+  assert.equal(context.observed.end_date, "2026-10-16");
+  assert.deepEqual(context.observed.minute_axis, payload.minute_axis);
+  assert.equal(context.observed.returned_points, 1);
+  assert.deepEqual(context.observed.minute_series[0].cumulative_return_pct, [12]);
+
+  run("followPerformanceRange = false");
+  context.$("detail-start-date").value = "2026-10-01";
+  await run("loadChartHistory()");
+  assert.equal(new URL(requested.at(-1), "https://example.test/").searchParams.get("start_date"), "2026-10-01");
+});
 
 test("automatic day follows status, manual history stays pinned", () => {
   const {context, run, byId, data} = harness();

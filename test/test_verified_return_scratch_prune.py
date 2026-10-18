@@ -10,6 +10,118 @@ from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec, publ
 
 
 @pytest.fixture
+def private_validation_copy(tmp_path, monkeypatch):
+    import hashlib
+    import shutil
+    state = tmp_path/'incident'
+    state.mkdir()
+    cohort = 'a'*64
+    monkeypatch.setattr(cleanup, 'PRIVATE_BACKUP_STATE', state)
+    monkeypatch.setattr(cleanup, 'PRIVATE_BACKUP_COHORT', cohort)
+    monkeypatch.setattr(cleanup, 'process_references_many', lambda paths: [])
+    target = state/('independent-D-recovery-'+cohort)
+    target.mkdir()
+    source_files, source_bytes, primary_manifest = 0, 0, None
+    for group in ('recovery-package', 'final-code-delta'):
+        source = state/group
+        source.mkdir()
+        payload = b'complete sealed original, never retired here'
+        (source/'payload.bin').write_bytes(payload)
+        manifest = json.dumps({'files': [{'relative': 'payload.bin', 'bytes': len(payload),
+                                          'sha256': hashlib.sha256(payload).hexdigest()}]}).encode()
+        (source/'capture-files.json').write_bytes(manifest)
+        digest = hashlib.sha256(manifest).hexdigest()
+        (source/'SOURCE-CAPTURE.READY').write_text(digest)
+        if group == 'recovery-package':
+            primary_manifest = digest
+        source_files += 3
+        source_bytes += sum(p.stat().st_size for p in source.iterdir())
+        shutil.copytree(source, target/group)
+    (state/'final-acceptance.json').write_text(json.dumps({
+        'contract': 'stockagent.vast_pre_stop_acceptance.v1',
+        'private_cohort_identity_sha256': cohort, 'penguin_original_recovery_verified': True,
+        'D_original_recovery_verified': True, 'source_files': source_files, 'source_bytes': source_bytes}))
+    (state/'D-recovery-acceptance.json').write_text(json.dumps({
+        'state': 'independent_D_recovery_verified', 'original_content_verified': True,
+        'restore': str(target), 'source_verification': {'capture_manifest_sha256': primary_manifest}}))
+    return state, target
+
+
+def test_private_validation_prune_keeps_original_packages_and_receipts(private_validation_copy, tmp_path):
+    state, target = private_validation_copy
+    plan = cleanup.private_validation_plan(state)
+    receipt = tmp_path/'receipts'
+    receipt.mkdir()
+    result = cleanup.apply_private_validation_duplicate(state, plan, receipt)
+    assert result['pruned'] and result['reclaimed_allocated_file_bytes'] > 0
+    assert not target.exists()
+    assert (state/'recovery-package/payload.bin').read_bytes() == b'complete sealed original, never retired here'
+    assert (state/'final-code-delta/payload.bin').is_file()
+    assert (state/'D-recovery-acceptance.json').is_file()
+    assert result['retained_originals_deleted'] == result['cold_objects_deleted'] == result['nas_snapshots_deleted'] == 0
+
+
+@pytest.mark.parametrize('problem', ['unknown-file', 'unknown-directory', 'changed-copy', 'changed-original',
+                                    'shared-copy', 'referenced', 'wrong-acceptance', 'redirected-acceptance'])
+def test_private_validation_duplicate_rejects_ambiguous_or_unique_data(private_validation_copy, tmp_path, monkeypatch, problem):
+    state, target = private_validation_copy
+    if problem == 'unknown-file':
+        (target/'unknown').write_bytes(b'unique diagnostic')
+    elif problem == 'unknown-directory':
+        (target/'unknown-empty').mkdir()
+    elif problem == 'changed-copy':
+        (target/'recovery-package/payload.bin').write_bytes(b'unique revision')
+    elif problem == 'changed-original':
+        (state/'recovery-package/payload.bin').write_bytes(b'current revision')
+    elif problem == 'shared-copy':
+        os.link(target/'recovery-package/payload.bin', tmp_path/'outside')
+    elif problem == 'referenced':
+        monkeypatch.setattr(cleanup, 'process_references_many', lambda paths: ['pid:fd:in-use'])
+    elif problem == 'wrong-acceptance':
+        (state/'D-recovery-acceptance.json').write_text('{}')
+    else:
+        control = state/'D-recovery-acceptance.json'
+        outside = tmp_path/'outside-acceptance'
+        control.rename(outside)
+        control.symlink_to(outside)
+    with pytest.raises((SnapshotError, ValueError)):
+        cleanup.private_validation_plan(state)
+    assert target.is_dir() and (state/'recovery-package/payload.bin').is_file()
+
+
+def test_private_validation_apply_rechecks_retained_original(private_validation_copy, tmp_path):
+    state, target = private_validation_copy
+    plan = cleanup.private_validation_plan(state)
+    (state/'final-code-delta/payload.bin').write_bytes(b'changed after dry run')
+    receipt = tmp_path/'receipts'
+    receipt.mkdir()
+    with pytest.raises(SnapshotError):
+        cleanup.apply_private_validation_duplicate(state, plan, receipt)
+    assert target.exists()
+
+
+def test_private_validation_keeps_quarantine_when_original_changes_after_rename(private_validation_copy, tmp_path, monkeypatch):
+    state, target = private_validation_copy
+    plan = cleanup.private_validation_plan(state)
+    check = cleanup.safe_tree
+
+    def changed_after_rename(path):
+        result = check(path)
+        if '.verified-prune-' in path.name:
+            (state/'recovery-package/payload.bin').write_bytes(b'new source generation')
+        return result
+
+    monkeypatch.setattr(cleanup, 'safe_tree', changed_after_rename)
+    receipt = tmp_path/'receipts'
+    receipt.mkdir()
+    with pytest.raises(SnapshotError, match='original changed after quarantine'):
+        cleanup.apply_private_validation_duplicate(state, plan, receipt)
+    quarantine, = state.glob(target.name+'.verified-prune-*')
+    assert (quarantine/'recovery-package/payload.bin').is_file()
+    assert json.loads((receipt/'private-backup-validation.journal.json').read_text())['state'] == 'quarantined'
+
+
+@pytest.fixture
 def saved(tmp_path, monkeypatch):
     cohort=tmp_path/'cohort'
     dataset='legacy-scratch-test'

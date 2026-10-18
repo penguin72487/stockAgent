@@ -153,6 +153,10 @@ def test_candidate_metadata_names_the_physical_fifo_account_not_legacy_tplus():
         'exact_board_lot_minute_physical_fifo_v1'
     )
     assert contract['mode_details']['legacy_tplus_cash_queue'] == 'not_applicable'
+    assert contract['mode_details']['physical_policy_replay_version'] == 2
+    assert contract['mode_details']['saved_requests_contract'] == (
+        'raw_model_intents_before_causal_bridge'
+    )
 
 
 def test_candidate_console_label_names_the_physical_fifo_account():

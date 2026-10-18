@@ -36,6 +36,8 @@ METADATA_RECOVERY_CONTRACT = "verified_metadata_only_isolation_v1"
 BATCH_SCHEDULER_CONTRACT = "phase_preserving_discovery_download_interleave_v1"
 PREVIEW_SUBMISSION_CONTRACT = 'owned_msaa_default_action_once_no_foreground_result_transition_v2'
 DESKTOP_INPUT_CONTRACT = 'owned_edit_messages_acknowledged_date_model_no_foreground_v6'
+NEGATIVE_STDERR_PREFIX = 'STOCKAGENT_TEJ_UNSENT_V1:'
+NEGATIVE_STDERR_CONTRACT = 'exact_prepreview_negative_proof_transport_v1'
 PREQUERY_FAILURES = {
     'desktop_transport_unavailable_before_preview':'desktop_unavailable',
     'desktop_foreground_unavailable_before_preview':'desktop_unavailable',
@@ -921,8 +923,22 @@ def ingest_export(root: Path, task: dict, payload: dict, output: Path) -> dict:
 
 class DesktopBridge:
     """Call the reviewed script without relaxing Windows execution policy."""
-    def __init__(self, repo: Path, session: dict):
+    def __init__(self, repo: Path, session: dict, *, cache_script: bool = True):
+        if type(cache_script) is not bool:
+            raise ValueError('Explicit code-only script cache mode required')
         self.repo, self.session = repo, session
+        self.cache_script = cache_script
+
+    @staticmethod
+    def deadline_seconds(action: str) -> int:
+        # Includes fresh-process, hash/compile/load and Excel admission. A
+        # measured 43 s fingerprint wait must not exhaust a 30 s READ-ONLY
+        # recovery budget before inspection starts. Source mutations keep
+        # their original finite deadlines; no heartbeat extends any attempt.
+        if action in {'inspect_notices','inspect_source_binding','inspect_query_runtime',
+                      'confirm_metadata_error_cleared'}:
+            return 120
+        return 30 if action == 'ack_source_memory_error' else 900
 
     @staticmethod
     def quote(value: str) -> str:
@@ -931,6 +947,29 @@ class DesktopBridge:
     @staticmethod
     def windows_path(path: Path) -> str:
         return subprocess.check_output(["wslpath", "-w", str(path.resolve())], text=True).strip()
+
+    @staticmethod
+    def bound_script_release(root: Path, name: str, request: Path) -> tuple[Path,str]:
+        """Read an existing exact attempt/code binding; never create evidence."""
+        manifest_path=root/'launches'/(name+'.bridge.json')
+        if manifest_path.is_symlink() or not manifest_path.is_file() or manifest_path.stat().st_size>4096:
+            raise ValueError('Invalid immutable bridge attempt manifest')
+        old=json.loads(manifest_path.read_text())
+        if not isinstance(old,dict):
+            raise ValueError('Immutable bridge manifest must be an object')
+        digest=old.get('bridge_script_sha256','')
+        if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest):
+            raise ValueError('Invalid immutable bridge digest')
+        release=root/'bridge_releases'/(digest+'.ps1')
+        if (old.get('contract')!='immutable_bridge_release_bound_to_prepared_request_v1'
+                or old.get('attempt_id')!=name
+                or old.get('request_sha256')!=hashlib.sha256(request.read_bytes()).hexdigest()
+                or old.get('request_path')!=str(request.relative_to(root))
+                or old.get('bridge_release_path')!=str(release.relative_to(root))
+                or release.is_symlink() or not release.is_file() or release.stat().st_size>256*1024
+                or hashlib.sha256(release.read_bytes()).hexdigest()!=digest):
+            raise ValueError('Existing immutable bridge release differs; never overwrite')
+        return release,digest
 
     def script_release(self, root: Path, name: str, request: Path) -> tuple[Path,str]:
         """Pin one immutable code object, not two reads of a changing checkout.
@@ -941,20 +980,7 @@ class DesktopBridge:
         manifest_path=root/'launches'/(name+'.bridge.json')
         request_digest=hashlib.sha256(request.read_bytes()).hexdigest()
         if manifest_path.exists():
-            if manifest_path.is_symlink() or manifest_path.stat().st_size>4096:
-                raise ValueError('Invalid immutable bridge attempt manifest')
-            old=json.loads(manifest_path.read_text())
-            digest=old.get('bridge_script_sha256','')
-            release=root/'bridge_releases'/(digest+'.ps1')
-            if (old.get('contract')!='immutable_bridge_release_bound_to_prepared_request_v1'
-                    or old.get('attempt_id')!=name or old.get('request_sha256')!=request_digest
-                    or old.get('request_path')!=str(request.relative_to(root))
-                    or not re.fullmatch(r'[0-9a-f]{64}',digest)
-                    or old.get('bridge_release_path')!=str(release.relative_to(root))
-                    or release.is_symlink() or not release.is_file() or release.stat().st_size>256*1024
-                    or hashlib.sha256(release.read_bytes()).hexdigest()!=digest):
-                raise ValueError('Existing immutable bridge release differs; never overwrite')
-            return release,digest
+            return self.bound_script_release(root,name,request)
         source=self.repo/'scripts/tej_smart_wizard_bridge.ps1'
         with source.open('rb') as stream:
             code=stream.read(256*1024+1)
@@ -1018,18 +1044,40 @@ class DesktopBridge:
             'action':wire_request.get('action'),'market_data_query_submission_possible':False,
             'error_code':'local_query_preparation_failed_before_preview','bridge_invoked':False,
             'preparation_stage':'staging_bridge_script','bridge_script_sha256':script_digest},ensure_ascii=False)
-        command = ("$ErrorActionPreference='Stop';$bridgeEntered=$false;try{$s=" + source + ";"
-                   "$d=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('StockAgent\\TEJSmartWizard\\worker-'+[Guid]::NewGuid().ToString('N'));"
-                   "[void](New-Item -ItemType Directory -Path $d);$p=Join-Path $d 'bridge.ps1';Copy-Item -LiteralPath $s -Destination $p;"
+        # Reuse CODE only, never mutable UI/native state. The uncached branch
+        # is retained solely as the explicitly selected performance comparator.
+        # Fresh hash + parse admission still precede EVERY invocation.
+        if self.cache_script:
+            staging = (
+                   "$d=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "+
+                   self.quote('StockAgent\\TEJSmartWizard\\bridge-cache\\'+script_digest)+";"
+                   "[void][IO.Directory]::CreateDirectory($d);"
+                   "if(([IO.File]::GetAttributes($d) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Bridge cache directory redirects ownership'};"
+                   "$p=Join-Path $d 'bridge.ps1';"
+                   "if(Test-Path -LiteralPath $p){$info=Get-Item -LiteralPath $p;"
+                   "if(($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $info.PSIsContainer){throw 'Bridge cache file redirects ownership'};"
+                   "if($info.Length -lt 1 -or $info.Length -gt 262144 -or (Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant() -cne "+self.quote(script_digest)+"){"
+                   "[IO.File]::Move($p,($p+'.retained-'+[Guid]::NewGuid().ToString('N')))}};"
+                   "if(-not (Test-Path -LiteralPath $p)){$temporary=$p+'.'+[Guid]::NewGuid().ToString('N')+'.tmp';"
+                   "Copy-Item -LiteralPath $s -Destination $temporary;"
+                   "if((Get-FileHash -LiteralPath $temporary).Hash.ToLowerInvariant() -cne "+self.quote(script_digest)+"){throw 'Script copy mismatch'};"
+                   "[IO.File]::Move($temporary,$p)};")
+        else:
+            staging = ("$d=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "
+                "('StockAgent\\TEJSmartWizard\\worker-'+[Guid]::NewGuid().ToString('N'));"
+                "[void](New-Item -ItemType Directory -Path $d);$p=Join-Path $d 'bridge.ps1';"
+                "Copy-Item -LiteralPath $s -Destination $p;")
+        command = ("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$bridgeEntered=$false;try{$s=" + source + ";"+staging+
                    "if((Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant() -cne "+self.quote(script_digest)+"){throw 'Script copy mismatch'};"
                    "$tokens=$null;$parseErrors=$null;[void][Management.Automation.Language.Parser]::ParseFile($p,[ref]$tokens,[ref]$parseErrors);"
                    "if($parseErrors.Count -ne 0){throw 'Pinned bridge syntax invalid; no invocation'};"
                    f"$bridgeEntered=$true;& $p {args} -Request {self.quote(self.windows_path(request))} -Output {self.quote(self.windows_path(output))}}}"
                    "catch{if(-not $bridgeEntered){$proof="+self.quote(preentry_proof)+"|ConvertFrom-Json;"
                    "$proof|Add-Member -NotePropertyName observed_at_utc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'));"
-                   "[IO.File]::WriteAllText("+self.quote(self.windows_path(output.with_suffix('.json.outcome.json')))+
-                   ",($proof|ConvertTo-Json -Depth 3 -Compress),[Text.UTF8Encoding]::new($false))};"
+                   "$proof|Add-Member -NotePropertyName transport_contract -NotePropertyValue "+self.quote(NEGATIVE_STDERR_CONTRACT)+";"
+                   "[Console]::Error.WriteLine("+self.quote(NEGATIVE_STDERR_PREFIX)+"+($proof|ConvertTo-Json -Depth 3 -Compress))};"
                    "[Console]::Error.WriteLine($_.Exception.Message);[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1}")
+        launch_clock = datetime.now(UTC)
         started = time.monotonic()
         try:
             from downloader.tej_windows_transport import UnpermittedWindowsLaunch, run_guarded_windows
@@ -1067,9 +1115,7 @@ class DesktopBridge:
                                 # deadline killed valid large readbacks after
                                 # the single Preview was already submitted.
                                 # Still finite; a timeout never resends it.
-                                timeout=30 if wire_request.get('action') in {
-                                    'inspect_notices','inspect_source_binding','inspect_query_runtime',
-                                    'confirm_metadata_error_cleared','ack_source_memory_error'} else 900)
+                                timeout=self.deadline_seconds(wire_request.get('action')))
         except UnpermittedWindowsLaunch as exc:
             from downloader.tej_windows_transport import validate_unpermitted
             validate_unpermitted(root, request, exc.evidence)
@@ -1105,9 +1151,35 @@ class DesktopBridge:
             atomic_write_bytes(diagnostic, result.stderr[:32768])
             diagnostic.chmod(0o600)
             outcome_path = output.with_suffix(output.suffix + ".outcome.json")
+            # If Windows cannot publish across UNC, retain its exact negative
+            # attestation through the already-admitted process transport and
+            # publish from Linux. Never infer an unsent query from an IO error.
+            if (wire_request.get('action') == 'download' and not output.exists()
+                    and not output.with_suffix('.json.stage.json').exists() and not outcome_path.exists()):
+                try:
+                    lines = result.stderr[:32768].decode('utf-8-sig').splitlines()
+                    proofs = [line[len(NEGATIVE_STDERR_PREFIX):] for line in lines
+                              if line.startswith(NEGATIVE_STDERR_PREFIX)]
+                    proof = json.loads(proofs[0]) if len(proofs) == 1 and len(proofs[0]) <= 4096 else {}
+                    if (isinstance(proof,dict) and proof.get('transport_contract') == NEGATIVE_STDERR_CONTRACT
+                            and proof.get('bridge_script_sha256') == script_digest
+                            and proof.get('contract_version') == CONTRACT_VERSION
+                            and proof.get('provider') == 'tej_smart_wizard'
+                            and proof.get('task_id') == task['task_id'] and proof.get('query_attempt_id') == name
+                            and proof.get('action') == 'download'
+                            and proof.get('market_data_query_submission_possible') is False
+                            and proof.get('error_code') in PREQUERY_FAILURES
+                            and all(proof.get(k) == wire_request.get(k) for k in ('type','smart_id','table'))):
+                        from downloader.tej_operation_clock import source_operation_clock
+                        source_operation_clock(proof.get('observed_at_utc'),launch_clock,datetime.now(UTC))
+                        atomic_write_json(outcome_path,proof,durable=True)
+                except (ValueError,KeyError,TypeError,OSError):
+                    pass  # Missing/invalid/late proof remains unknown.
             if outcome_path.is_file() and outcome_path.stat().st_size <= 4096:
                 try:
                     outcome = json.loads(outcome_path.read_text(encoding="utf-8-sig"))
+                    if not isinstance(outcome,dict):
+                        raise ValueError('Negative source outcome must be an object')
                     expected = wire_request
                     negative_artifact=(not output.exists() and not output.with_suffix('.json.stage.json').exists())
                     if (expected.get('action')=='download' and outcome.get('action')=='download'

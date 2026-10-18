@@ -79,6 +79,8 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
             raise ValueError('status_database_owner_mismatch')
         view = NewsQueue.__new__(NewsQueue)
         view.root, view.db, view.registry, view.owner = root, db, registry, owner[0]
+        if 'acceptance_receipt_io' in published:
+            view.acceptance_receipt_io = deepcopy(published['acceptance_receipt_io'])
         view.metrics = SimpleNamespace(snapshot=lambda: deepcopy(published['performance']),
                                        measure=lambda *args, **kwargs: nullcontext())
         view.http_capacity_snapshot = lambda: deepcopy(published['http_capacity'])

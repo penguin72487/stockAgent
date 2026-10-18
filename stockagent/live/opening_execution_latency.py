@@ -200,4 +200,4 @@ def opening_execution_slo(session_date, publication, current_modes, samples, *, 
             "all_modes_complete_from_open_ms": all_ms,
             "stages": [{"target_ms": target, "passed": bool(complete and all_ms <= target),
                         "state": "incomplete" if not complete else "passed" if all_ms <= target else "missed"}
-                       for target in (30000, 20000, 10000, 5000, 1000)], "modes": modes}
+                       for target in (30000, 20000, 11000, 10000, 5000, 1000)], "modes": modes}

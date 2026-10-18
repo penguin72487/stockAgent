@@ -1500,6 +1500,31 @@ def test_inference_manifest_skips_expensive_content_hash_but_preserves_model_sch
     assert inference["fingerprints"]["model"] == full["fingerprints"]["model"]
 
 
+def test_inference_physical_source_localization_preserves_trained_schema_but_is_recorded(tmp_path):
+    from stockagent.training.checkpoint_contract import _configuration_fingerprint_snapshot
+
+    panel = _day_trade_minute_panel()
+    config = load_config("configs/markets/tw_day_trade_1m_realistic.yaml")
+    config.data.day_trade_physical_public_feature_path = "frozen/features/daily.parquet"
+    original = _checkpoint_manifest(panel, config, include_data_content=False)
+    assert "day_trade_inference_public_feature_path" not in _configuration_fingerprint_snapshot(config)["data"]
+    config.data.day_trade_inference_public_feature_path = "current/features/daily.parquet"
+    localized = _checkpoint_manifest(panel, config, include_data_content=False)
+    assert localized["fingerprints"]["data_schema"] == original["fingerprints"]["data_schema"]
+    assert localized["fingerprints"]["model"] == original["fingerprints"]["model"]
+    assert localized["configuration_fingerprint"] != original["configuration_fingerprint"]
+    assert _configuration_fingerprint_snapshot(config)["data"]["day_trade_inference_public_feature_path"] == "current/features/daily.parquet"
+    assert localized["contracts"]["data"]["preprocessing"]["day_trade_physical_public_feature_path"] == "frozen/features/daily.parquet"
+    _validate_checkpoint_manifest({"experiment_manifest": original}, localized,
+        checkpoint_path=tmp_path / "original.pt", scope="inference")
+    # Changing the original trained binding is still a real schema mismatch.
+    config.data.day_trade_physical_public_feature_path = "unrelated/features/daily.parquet"
+    incompatible = _checkpoint_manifest(panel, config, include_data_content=False)
+    with pytest.raises(RuntimeError, match="data_schema"):
+        _validate_checkpoint_manifest({"experiment_manifest": original}, incompatible,
+            checkpoint_path=tmp_path / "original.pt", scope="inference")
+
+
 def test_disabled_daily_context_is_backward_compatible_but_enabled_branch_is_not() -> None:
     panel = _panel()
     config = load_config("configs/deployments/tw_day_trade.yaml")
@@ -2111,6 +2136,17 @@ def test_score_entmax_global_cash_has_a_distinct_versioned_model_contract() -> N
     assert separated_manifest["contracts"]["model"]["model"]["portfolio_output_contract"] == (
         "score_entmax_scale_separated_cash_v1"
     )
+
+    for output, abi in (
+        ("score_entmax_scale_separated_cash_v2", "score_entmax_scale_separated_cash_implicit_vjp_v2"),
+        ("decoupled_entmax_cash", "independent_selection_direction_cash_entmax_v1"),
+        ("decoupled_entmax_cash_v2", "independent_selection_direction_unit_l1_cash_entmax_v2"),
+    ):
+        candidate = copy.deepcopy(baseline)
+        candidate.training.financial_transformer.portfolio_output_mode = output
+        candidate_manifest = _checkpoint_manifest(panel, candidate)
+        assert candidate_manifest["fingerprints"]["model"] != separated_manifest["fingerprints"]["model"]
+        assert candidate_manifest["contracts"]["model"]["model"]["portfolio_output_contract"] == abi
 
     bounded = copy.deepcopy(baseline)
     bounded.training.financial_transformer.portfolio_output_mode = (

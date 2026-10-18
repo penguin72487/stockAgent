@@ -17,6 +17,84 @@ from stockagent.data.panel_cache import (
 )
 
 
+def _namespace_test_panel():
+    mask = np.ones((2, 1), dtype=bool)
+    return PanelData(
+        dates=np.arange(2).astype("datetime64[D]"), symbols=["AAA"], feature_names=["f"],
+        features=np.asarray([[[1.0]], [[2.0]]], dtype=np.float32),
+        returns_1d=np.zeros((2, 1), dtype=np.float32), tradable_mask=mask,
+        can_buy_mask=mask.copy(), can_sell_mask=mask.copy(), alive_mask=mask.copy(),
+        benchmark_returns=np.zeros(2, dtype=np.float32), close_prices=np.ones((2, 1), dtype=np.float32),
+    )
+
+
+def test_private_generation_batches_namespace_not_payload_durability(tmp_path, monkeypatch):
+    synced_files, barriers = [], []
+    fsync, sync_directory, write_json = os.fsync, panel_cache._fsync_directory, panel_cache._write_json
+
+    def file_sync(fd):
+        synced_files.append(os.readlink(f"/proc/self/fd/{fd}"))
+        return fsync(fd)
+
+    def directory_sync(path, **options):
+        barriers.append((path, options.get("required", False)))
+        return sync_directory(path, **options)
+
+    def publish(path, payload, **options):
+        if path.parent.name == "variants":
+            generation = path.parent.parent / "generations" / payload["generation"]
+            assert (generation, True) in barriers
+            assert (generation.parent, True) in barriers
+            assert (generation.parent.parent, True) in barriers
+            assert (generation.parent.parent.parent, True) in barriers
+            assert sum(generation == item and required for item, required in barriers) == 1
+            # Every freshly written NPY still has its original data fsync.
+            assert len([name for name in synced_files if str(generation) in name and ".npy." in name]) == payload["storage_build"]["written_arrays"]
+        return write_json(path, payload, **options)
+
+    monkeypatch.setattr(os, "fsync", file_sync)
+    monkeypatch.setattr(panel_cache, "_fsync_directory", directory_sync)
+    monkeypatch.setattr(panel_cache, "_write_json", publish)
+    panel_cache.save_panel_cache_v2(tmp_path, _namespace_test_panel(), source_hash="s", backend_key="b", version=123)
+    assert panel_cache.load_panel_cache_v2(tmp_path)["features"].tobytes() == _namespace_test_panel().features.tobytes()
+
+
+@pytest.mark.parametrize("failed_stage", ["generation", "generations", "cache", "root"])
+def test_required_generation_namespace_sync_failure_keeps_old_commit(tmp_path, monkeypatch, failed_stage):
+    panel = _namespace_test_panel()
+    panel_cache.save_panel_cache_v2(tmp_path, panel, source_hash="old", backend_key="b", version=123)
+    cache = panel_cache.panel_cache_v2_dir(tmp_path)
+    old_meta = (cache / "meta.json").read_bytes()
+    old_generation = panel_cache.read_panel_cache_v2_meta(tmp_path)["generation"]
+    original = panel_cache._fsync_directory
+
+    def fail(path, **options):
+        stage = ("generation" if path.parent.name == "generations" else
+                 "generations" if path == cache / "generations" else
+                 "cache" if path == cache else "root" if path == tmp_path else None)
+        if options.get("required") and stage == failed_stage:
+            raise OSError("required private generation durability failure")
+        return original(path, **options)
+
+    monkeypatch.setattr(panel_cache, "_fsync_directory", fail)
+    panel.features = np.zeros_like(panel.features)
+    with pytest.raises(OSError, match="durability failure"):
+        panel_cache.save_panel_cache_v2(tmp_path, panel, source_hash="new", backend_key="b", version=123)
+    assert (cache / "meta.json").read_bytes() == old_meta
+    assert {path.name for path in (cache / "generations").iterdir()} == {old_generation}
+    assert panel_cache.load_panel_cache_v2(tmp_path)["features"].tobytes() == _namespace_test_panel().features.tobytes()
+
+
+def test_required_directory_sync_propagates_visibility_failure(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("cannot open commit directory")
+
+    monkeypatch.setattr(os, "open", fail)
+    panel_cache._fsync_directory(tmp_path)
+    with pytest.raises(OSError, match="commit directory"):
+        panel_cache._fsync_directory(tmp_path, required=True)
+
+
 def test_panel_cache_v2_round_trips_memmap_payload(tmp_path) -> None:
     source = tmp_path / "AAA_features.parquet"
     source.write_bytes(b"parquet-placeholder")
@@ -323,10 +401,10 @@ def test_failed_cache_refresh_keeps_previous_generation_readable(
 
     original_save_array = panel_cache._save_array
 
-    def fail_during_second_array(cache_dir, name, array):
+    def fail_during_second_array(cache_dir, name, array, **options):
         if name == "returns_1d":
             raise OSError("simulated interrupted cache rebuild")
-        return original_save_array(cache_dir, name, array)
+        return original_save_array(cache_dir, name, array, **options)
 
     monkeypatch.setattr(panel_cache, "_save_array", fail_during_second_array)
     panel.features = np.asarray([[[9.0]], [[9.0]]], dtype=np.float32)
@@ -428,8 +506,9 @@ def test_cache_writer_lock_serializes_two_writers(tmp_path, monkeypatch) -> None
         source_hash,
         backend_key,
         version,
+        chunk_storage=True,
     ):
-        del panel_like, backend_key, version
+        del panel_like, backend_key, version, chunk_storage
         call_order.append(source_hash)
         if source_hash == "writer-a":
             first_entered.set()

@@ -7,11 +7,13 @@ explicit operator command, not an installed poller or a second queue owner.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime, timedelta
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -47,6 +49,79 @@ def identity(unit):
     result = subprocess.run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "InvocationID", "-p", "MainPID"],
                             capture_output=True, text=True, check=True, timeout=5)
     return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def preparation_stack(threads):
+    """Only owner preparation outside a live batch; never infer from stale UI."""
+    main = next((row for row in threads if row.get('thread_name') == 'MainThread'), None)
+    if main is None:
+        return False
+    frames = main.get('frames', [])
+    owner = any(frame.get('name') == 'run_once' and
+                str(frame.get('filename', '')).endswith('/downloader/download_finmind_complement.py')
+                for frame in frames)
+    names = {frame.get('name') for frame in frames}
+    prohibited = {'run_batch', '_fetch', '_request_independent', '_request', '_store', '_save_result'}
+    return bool(owner and names.intersection({'_populate', 'audit_completed_batch', '_status'})
+                and not any(frame.get('name') in prohibited
+                            for thread in threads for frame in thread.get('frames', [])))
+
+
+def _preparation_pid():
+    group = subprocess.run(['systemctl', 'show', UNIT, '-p', 'ControlGroup', '--value'],
+                           capture_output=True, text=True, check=True, timeout=5).stdout.strip()
+    if not group.startswith('/') or group == '/':
+        return None
+    pids = (Path('/sys/fs/cgroup') / group.lstrip('/') / 'cgroup.procs').read_text().split()
+    for value in pids:
+        args = (Path('/proc') / value / 'cmdline').read_bytes().split(b'\0')
+        if b'-m' in args and args[args.index(b'-m') + 1] == b'downloader.download_finmind_complement':
+            return int(value)
+    return None
+
+
+def _stacks(pid):
+    result = subprocess.run(['py-spy', 'dump', '--pid', str(pid), '--json', '--nonblocking'],
+                            capture_output=True, text=True, check=True, timeout=5)
+    # py-spy never requests locals, bodies, tokens or HTTP URLs.
+    return json.loads(result.stdout)
+
+
+@contextmanager
+def preparation_boundary(root, before):
+    """Freeze only a passively observed preparation window, then re-prove it.
+
+    Covers every process in this one unit. No restart unless both claim tables
+    are empty and a fresh frozen stack has no request/publication in progress.
+    Every failure/exception thaws it. No assumption that systemd accepts a
+    restart job while frozen (the installed systemd may reject that job).
+    """
+    pid = _preparation_pid()
+    if pid is None or not preparation_stack(_stacks(pid)):
+        yield None
+        return
+    frozen = False
+    try:
+        frozen = True
+        subprocess.run(['systemctl', 'freeze', UNIT], check=True, timeout=5)
+        proof = None
+        if identity(UNIT) == before and _preparation_pid() == pid and preparation_stack(_stacks(pid)):
+            with closing(sqlite3.connect((root / 'queue.sqlite3').resolve().as_uri() + '?mode=ro',
+                                         uri=True, timeout=.2)) as conn:
+                tables = ('finmind_object_prefetch_claims', 'complement_year_batch_claims')
+                claims = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in tables}
+            if not any(claims.values()):
+                status = metadata(root / 'status.json')
+                proof = {'mode': 'frozen_drained_preparation', 'pid': pid, 'claims': claims,
+                         'last_task': status.get('last_task'),
+                         'cycle_observed_at_utc': status.get('observed_at_utc')}
+        if proof is None:
+            subprocess.run(['systemctl', 'thaw', UNIT], check=True, timeout=5)
+            frozen = False
+        yield proof
+    finally:
+        if frozen:
+            subprocess.run(['systemctl', 'thaw', UNIT], check=True, timeout=5)
 
 
 def idle_proof(root, now):
@@ -100,6 +175,58 @@ def prior_files(root, last):
             for path in paths if path.stat().st_size <= 8 * 1024**2]
 
 
+def terminate_frozen_preparation(proof):
+    """Queue default SIGTERM before thaw: no dispatch gap between proof/stop.
+
+    Only the verified Python owner, not a broad PID/process match. A pidfd pins
+    its kernel generation. Reject custom/ignored TERM handlers; the default
+    disposition terminates before more user code can issue another request.
+    The normal systemd restart remains responsible for starting the new owner.
+    """
+    if proof.get('mode') != 'frozen_drained_preparation' or any(proof.get('claims', {'unknown': 1}).values()):
+        raise ValueError('termination_requires_frozen_drained_preparation')
+    pid = proof['pid']
+    with_pid = _pidfd_open(pid)
+    try:
+        status = dict(line.split(':', 1) for line in (Path('/proc') / str(pid) / 'status').read_text().splitlines()
+                      if ':' in line)
+        bit = 1 << (signal.SIGTERM - 1)
+        if int(status['SigIgn'], 16) & bit or int(status['SigCgt'], 16) & bit:
+            raise ValueError('preparation_owner_has_nondefault_sigterm')
+        _pidfd_signal(with_pid, signal.SIGTERM)
+    finally:
+        os.close(with_pid)
+    subprocess.run(['systemctl', 'thaw', UNIT], check=True, timeout=5)
+
+
+def _pidfd_call(name, arguments, types):
+    # Some packaged CPython builds omit these optional Python bindings while
+    # the installed Linux/glibc provides the public pidfd APIs. No raw syscall
+    # number or architecture assumption; missing APIs fail closed.
+    import ctypes
+    function = getattr(ctypes.CDLL(None, use_errno=True), name)
+    function.argtypes, function.restype = types, ctypes.c_int
+    result = function(*arguments)
+    if result < 0:
+        raise OSError(ctypes.get_errno(), 'pidfd operation failed')
+    return result
+
+
+def _pidfd_open(pid):
+    if hasattr(os, 'pidfd_open'):
+        return os.pidfd_open(pid)
+    import ctypes
+    return _pidfd_call('pidfd_open', (pid, 0), (ctypes.c_int, ctypes.c_uint))
+
+
+def _pidfd_signal(fd, sig):
+    if hasattr(signal, 'pidfd_send_signal'):
+        return signal.pidfd_send_signal(fd, sig)
+    import ctypes
+    return _pidfd_call('pidfd_send_signal', (fd, sig, None, 0),
+                       (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint))
+
+
 def code_matches(accepted):
     hashes = accepted.get("code_sha256", {})
     required = {str(REPO / "downloader/download_finmind_complement.py"),
@@ -125,12 +252,14 @@ def accepted_local_measurement(accepted):
                     == ["baseline", "candidate", "candidate", "baseline"])
 
 
-def main(argv=None):
+def _main(argv, resources):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acceptance", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wait-seconds", type=int, default=300)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument('--allow-preparation-boundary', action='store_true',
+                        help='Also permit a frozen, zero-claim preparation boundary; never interrupts an HTTP batch')
     args = parser.parse_args(argv)
     if args.output.exists() or not 0 <= args.wait_seconds <= 600:
         parser.error("new output required; bounded wait must be 0..600 seconds")
@@ -151,7 +280,12 @@ def main(argv=None):
     while True:
         try:
             proof = idle_proof(ROOT, datetime.now(UTC))
-        except (OSError, ValueError, KeyError, sqlite3.Error):
+            if proof is None and args.apply and args.allow_preparation_boundary:
+                with ExitStack() as attempt:
+                    proof = attempt.enter_context(preparation_boundary(ROOT, before))
+                    if proof:
+                        resources.enter_context(attempt.pop_all())
+        except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             proof = None
         if proof or time.monotonic() >= end or not args.apply:
             break
@@ -168,15 +302,18 @@ def main(argv=None):
     report["sampled_prior_files"] = samples
     # The short batch-complete sleep is non-reactive. Check the exact same
     # service generation and remaining deadline immediately before dispatch.
+    frozen = proof.get('mode') == 'frozen_drained_preparation'
     if (identity(UNIT) != before or not code_matches(accepted)
-            or idle_proof(ROOT, datetime.now(UTC)) != proof
-            or datetime.fromisoformat(proof["deadline"]) - datetime.now(UTC) < timedelta(seconds=1)):
+            or not frozen and (idle_proof(ROOT, datetime.now(UTC)) != proof
+                or datetime.fromisoformat(proof["deadline"]) - datetime.now(UTC) < timedelta(seconds=1))):
         report["state"] = "deferred_generation_or_deadline_changed"
         atomic_write_json(args.output, report)
         return 0
     stamp = datetime.now(UTC)
     report.update(state="restart_requested", restart_requested=True, restart_at_utc=stamp.isoformat())
     atomic_write_json(args.output, report)  # Retain action evidence even if interrupted.
+    if frozen:
+        terminate_frozen_preparation(proof)
     subprocess.run(["systemctl", "restart", UNIT], check=True, timeout=30)
     until = time.monotonic() + 90
     while time.monotonic() < until:
@@ -205,6 +342,11 @@ def main(argv=None):
     atomic_write_json(args.output, report)
     print(json.dumps({key: report[key] for key in ("state", "restart_requested", "protected_service_identities_unchanged")}))
     return 0 if report["state"] == "canonical_owner_schema_and_status_verified" else 1
+
+
+def main(argv=None):
+    with ExitStack() as resources:
+        return _main(argv, resources)
 
 
 if __name__ == "__main__":

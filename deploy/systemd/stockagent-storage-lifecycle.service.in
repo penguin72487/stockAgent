@@ -14,8 +14,10 @@ RestartSec=5
 TimeoutStopSec=90s
 UMask=0077
 CPUQuota=150%
-MemoryHigh=768M
-MemoryMax=1536M
+# Whole-catalog first baselines can inventory millions of tiny source files.
+# This is a ceiling, not a reservation; normal ACK/control activities stay small.
+MemoryHigh=6G
+MemoryMax=8G
 Nice=10
 TasksMax=128
 Environment=PYTHONDONTWRITEBYTECODE=1

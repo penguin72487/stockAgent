@@ -47,6 +47,130 @@ def sql_text(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _canonical_row_digest(rows):
+    """Hash exactly the original canonical JSON list, one complete row at a time."""
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True,
+                               separators=(',', ':'), allow_nan=False)
+    digest = hashlib.sha256(b'[')
+    count = 0
+    for row in rows:
+        if count:
+            digest.update(b',')
+        digest.update(encoder.encode(row).encode('utf-8'))
+        count += 1
+    digest.update(b']')
+    return count, digest.hexdigest()
+
+
+def _query_rows(connection, batch_rows=16):
+    while rows := connection.fetchmany(batch_rows):
+        yield from rows
+
+
+def _metadata_rows(connection, *, maximum_bytes=64*1024**2, maximum_rows=2048):
+    """Bound each full-payload sort; preserve the original full-row SQL order.
+
+    Keys are small and unique under the canonical append-only ingestion. If an
+    older/invalid registry has duplicate, NULL or invalid keys, retain its exact
+    ORDER BY ALL behavior, not a deduplicated or partially observed digest.
+    Callers retain the catalog publication lock across all pages; a restored
+    private registry has no writer. This does not relax snapshot ownership.
+    """
+    if maximum_bytes <= 0 or maximum_rows <= 0:
+        raise ValueError('metadata pages require positive bounds')
+    connection.execute('SELECT * FROM lake.source_metadata LIMIT 0')
+    columns = [row[0] for row in connection.description]
+    if columns[:2] != ['relative', 'sha256'] or 'bytes' not in columns:
+        yield from _query_rows(connection.execute('SELECT * FROM lake.source_metadata ORDER BY ALL'))
+        return
+    keys = connection.execute('SELECT relative,sha256,bytes FROM lake.source_metadata '
+                              'ORDER BY relative,sha256,bytes').fetchall()
+    if (any(not isinstance(r[0], str) or not isinstance(r[1], str)
+            or type(r[2]) is not int or r[2] < 0 for r in keys)
+            or len({r[:2] for r in keys}) != len(keys)):
+        yield from _query_rows(connection.execute('SELECT * FROM lake.source_metadata ORDER BY ALL'))
+        return
+    index = 0
+    while index < len(keys):
+        end, size = index, 0
+        while end < len(keys) and end-index < maximum_rows:
+            if end > index and size + keys[end][2] > maximum_bytes:
+                break
+            size += keys[end][2]
+            end += 1
+        first, last = keys[index], keys[end-1]
+        # Explicit lexical predicates avoid DuckDB's unsupported STRUCT
+        # BETWEEN rewrite. Simple relative bounds permit zone-map pruning.
+        query = ('SELECT * FROM lake.source_metadata WHERE relative>=? AND relative<=? '
+                 'AND (relative>? OR (relative=? AND sha256>=?)) '
+                 'AND (relative<? OR (relative=? AND sha256<=?)) ORDER BY ALL')
+        connection.execute(query, [first[0], last[0], first[0], *first[:2], last[0], *last[:2]])
+        observed = 0
+        for row in _query_rows(connection):
+            observed += 1
+            yield row
+        if observed != end-index:
+            raise ValueError('metadata page membership changed during digest')
+        index = end
+
+
+def _registered_table_digest(connection, table):
+    if table not in {'dataset_releases', 'source_objects', 'catalog_captures', 'source_metadata'}:
+        raise ValueError('unexpected lakehouse registry table')
+    rows = (_metadata_rows(connection) if table == 'source_metadata' else
+            _query_rows(connection.execute('SELECT * FROM lake.' + table + ' ORDER BY ALL')))
+    return _canonical_row_digest(rows)[1]
+
+
+def _metadata_value(c, row):
+    raw = (row['captured_bytes_utf8'].encode() if 'captured_bytes_utf8' in row else
+           (Path(c['cold_root']) / row['relative']).read_bytes())
+    if len(raw) != row['bytes'] or hashlib.sha256(raw).hexdigest() != row['sha256']:
+        raise ValueError('source metadata changed after catalog capture')
+    return {'relative': row['relative'], 'sha256': row['sha256'],
+            'bytes': row['bytes'], 'content_utf8': raw.decode('utf-8')}
+
+
+def _new_metadata_descriptors(c, files, registered_keys):
+    """Validate every captured value, but retain only new small descriptors.
+
+    Known content is still read, hashed and UTF-8 validated before any registry
+    transaction. A new value is revalidated by the bounded Arrow reader when
+    consumed; a late change must abort the transaction, not commit partial data.
+    Captured mutable heads retain their original, already pinned bytes.
+    """
+    incoming = []
+    for row in files:
+        if row['role'] == 'cold_metadata':
+            _metadata_value(c, row)
+            if (row['relative'], row['sha256']) not in registered_keys:
+                incoming.append(row)
+    return incoming
+
+
+def _metadata_arrow_reader(c, incoming, *, maximum_bytes=16*1024**2, maximum_rows=1024):
+    import pyarrow as pa
+    if maximum_bytes <= 0 or maximum_rows <= 0:
+        raise ValueError('metadata ingestion requires positive batch bounds')
+    schema = pa.schema([('relative', pa.string()), ('sha256', pa.string()),
+                        ('bytes', pa.int64()), ('content_utf8', pa.string())])
+
+    def batches():
+        rows, size = [], 0
+        for descriptor in incoming:
+            if rows and (size+descriptor['bytes'] > maximum_bytes or len(rows) >= maximum_rows):
+                batch = pa.RecordBatch.from_pylist(rows, schema=schema)
+                rows, size = [], 0
+                yield batch
+                del batch
+            rows.append(_metadata_value(c, descriptor))
+            size += descriptor['bytes']
+        if rows:
+            yield pa.RecordBatch.from_pylist(rows, schema=schema)
+
+    return pa.RecordBatchReader.from_batches(schema, batches())
+
+
 def connect(c: dict, *, database=None, data_root=None, read_only=False):
     import duckdb
     con = duckdb.connect()
@@ -81,20 +205,34 @@ def provision_extensions(c: dict):
     atomic_write_json(Path(c["state_root"]) / "extension-lock.json", {"extensions": rows, "files": files})
 
 
-def notify_transport(c: dict, subpaths=()):
+def notify_transport(c: dict, subpaths=(), *, control_backup_identity=None):
     from scripts.configure_artifact_ingress_syncthing import credentials, request
-    state = Path(c["state_root"]) / "pending-transport-scan.json"
+    if control_backup_identity is None:
+        state = Path(c["state_root"]) / "pending-transport-scan.json"
+        allowed = None
+    else:
+        if not isinstance(control_backup_identity, str) or not re.fullmatch(r'[0-9a-f]{64}', control_backup_identity):
+            raise ValueError('control backup scan requires its exact envelope identity')
+        state = Path(c['state_root']) / 'control-backup-scans' / (control_backup_identity + '.json')
+        allowed = {'tools/dispatch', 'batch-' + control_backup_identity}
+        if subpaths:
+            raise ValueError('control backup scan cannot select arbitrary subpaths')
     paths = set(subpaths)
     if state.exists():
         previous = json.loads(state.read_bytes())
+        if allowed is not None and previous.get('state') == 'scan_requested':
+            return previous
         if previous.get("state") == "retry_scan":
             paths.update(previous.get("paths", ("lakehouse",)))
+    if allowed is not None and not paths:
+        paths.update(allowed)
     if not paths:
         return
     from stockagent.data_sync.immutable_replication import safe
     for path in paths:
         safe(Path(c["transport_root"]).parent, path)
-        if path != "lakehouse" and not re.fullmatch(r"lakehouse/lake-[0-9a-f]{64}", path):
+        if (path not in allowed if allowed is not None else
+                path != "lakehouse" and not re.fullmatch(r"lakehouse/lake-[0-9a-f]{64}", path)):
             raise ValueError("transport scan is outside its fixed delivery scope")
     pending = {"state": "retry_scan", "paths": sorted(paths), "observed_at_utc": datetime.now(timezone.utc).isoformat()}
     atomic_write_json(state, pending)
@@ -104,8 +242,9 @@ def notify_transport(c: dict, subpaths=()):
             raise ValueError("lake source transport identity differs")
         folder = "stockagent-backup-ingress-lab203"
         if request(base, key, "/rest/db/status", {"folder": folder}, timeout=5).get("state") == "scanning":
-            atomic_write_json(state, {**pending, "reason": "existing_scan_in_progress"})
-            return
+            waiting = {**pending, "reason": "existing_scan_in_progress"}
+            atomic_write_json(state, waiting)
+            return waiting
         for path in sorted(paths):
             request(base, key, "/rest/db/scan", {"folder": folder, "sub": path}, method="POST", timeout=30)
             paths.remove(path)
@@ -113,6 +252,17 @@ def notify_transport(c: dict, subpaths=()):
         atomic_write_json(state, {"state": "scan_requested", "paths": [], "observed_at_utc": datetime.now(timezone.utc).isoformat()})
     except Exception as error:
         atomic_write_json(state, {**pending, "paths": sorted(paths), "error_type": type(error).__name__})
+    return json.loads(state.read_bytes())
+
+
+def _source_metadata_signature(paths, include_orphans):
+    """One complete stat observation per path and per verification pass."""
+    entries = []
+    for path in paths:
+        observed = path.stat()
+        entries.append((str(path), observed.st_ino, observed.st_size,
+                        observed.st_mtime_ns, observed.st_ctime_ns))
+    return identity_sha256([include_orphans, entries])
 
 
 def register(c: dict) -> dict:
@@ -135,7 +285,7 @@ def register(c: dict) -> dict:
         include_orphans = c.get("include_unreferenced_cold_objects", False)
         if type(include_orphans) is not bool:
             raise ValueError("unreferenced source inclusion must be an explicit boolean")
-        source_signature = lambda: identity_sha256([include_orphans, [(str(p), p.stat().st_ino, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in paths]])
+        source_signature = lambda: _source_metadata_signature(paths, include_orphans)
         token = source_signature()
         cache = state / "catalog-input-signature.json"
         status_path = state / "catalog-status.json"
@@ -176,16 +326,9 @@ def register(c: dict) -> dict:
             con.execute("CREATE TABLE IF NOT EXISTS lake.catalog_captures (capture_sha256 VARCHAR, observed_at_utc VARCHAR, release_count BIGINT, available_bytes BIGINT)")
             con.execute("CREATE TABLE IF NOT EXISTS lake.source_metadata (relative VARCHAR, sha256 VARCHAR, bytes BIGINT, content_utf8 VARCHAR)")
             captured = con.execute("SELECT count(*) FROM lake.catalog_captures WHERE capture_sha256=?", [catalog["identity_sha256"]]).fetchone()[0]
-            metadata = []
-            for row in catalog['files']:
-                if row['role'] != 'cold_metadata':
-                    continue
-                raw = row['captured_bytes_utf8'].encode() if 'captured_bytes_utf8' in row else (Path(c['cold_root']) / row['relative']).read_bytes()
-                if len(raw) != row['bytes'] or hashlib.sha256(raw).hexdigest() != row['sha256']:
-                    raise ValueError('source metadata changed after catalog capture')
-                metadata.append({'relative': row['relative'], 'sha256': row['sha256'], 'bytes': row['bytes'], 'content_utf8': raw.decode('utf-8')})
-            con.register('incoming_metadata', pa.Table.from_pylist(metadata))
-            missing_metadata = con.execute("SELECT count(*) FROM incoming_metadata i WHERE NOT EXISTS (SELECT 1 FROM lake.source_metadata o WHERE o.relative=i.relative AND o.sha256=i.sha256)").fetchone()[0]
+            registered_keys = set(con.execute('SELECT relative,sha256 FROM lake.source_metadata').fetchall())
+            metadata = _new_metadata_descriptors(c, catalog['files'], registered_keys)
+            missing_metadata = len(metadata)
             changed = not captured or bool(missing_metadata)
             if changed:
                 releases = [{"dataset": r["dataset"], "source_snapshot_id": r["snapshot_id"], "manifest_sha256": r["manifest_sha256"],
@@ -195,6 +338,7 @@ def register(c: dict) -> dict:
                 objects = [{k: r[k] for k in ("relative", "sha256", "bytes", "role")} for r in catalog["files"]]
                 con.register("incoming_releases", pa.Table.from_pylist(releases))
                 con.register("incoming_objects", pa.Table.from_pylist(objects))
+                con.register('incoming_metadata', _metadata_arrow_reader(c, metadata))
                 con.execute("BEGIN")
                 con.execute("DELETE FROM lake.dataset_releases")
                 con.execute("INSERT INTO lake.dataset_releases SELECT * FROM incoming_releases")
@@ -256,7 +400,7 @@ def export(c: dict, expected_snapshot: int) -> dict:
             base_tables = {'dataset_releases', 'source_objects', 'catalog_captures'}
             if not base_tables <= tables or tables - (base_tables | {'source_metadata'}):
                 raise ValueError('unexpected lakehouse registry schema')
-            row_hashes = {table: identity_sha256(con.execute("SELECT * FROM lake." + table + " ORDER BY ALL").fetchall())
+            row_hashes = {table: _registered_table_digest(con, table)
                           for table in sorted(tables)}
         finally:
             con.close()
@@ -659,12 +803,16 @@ def stage_source_wave(c: dict) -> dict:
                   "transport_cache_reclaimed_bytes": sum(r.get('transport_retirement',{}).get('reclaimed_bytes',0) for r in ledger['deliveries'].values()
                                                           if r.get('transport_retirement',{}).get('state') == 'retired')}
         if policy['decouple_nas_acceptance'] or len(pending) < policy['maximum_pending_deliveries']:
-            already_nas = set()
-            if policy['prioritize_uncovered_nas']:
-                already_nas = restic_keys(read_ledger(Path(policy['restic_state_root']) / 'ledger.json'))
+            # NAS priority only orders new candidates; published objects can
+            # never be chosen again. Filter them before loading the potentially
+            # large Restic ledger or sorting the full committed registry. A
+            # pending copy journal/redelivery is resumed below independently.
             published = {key for row in ledger['deliveries'].values() for key in row['file_keys']}
-            eligible = sorted(rows, key=lambda row: (row[0] + '@' + row[1] in already_nas, row[2], row[0], row[1]))
-            unpublished = [row for row in eligible if row[0] + '@' + row[1] not in published]
+            unpublished = [row for row in rows if row[0] + '@' + row[1] not in published]
+            already_nas = set()
+            if unpublished and policy['prioritize_uncovered_nas']:
+                already_nas = restic_keys(read_ledger(Path(policy['restic_state_root']) / 'ledger.json'))
+            eligible = sorted(unpublished, key=lambda row: (row[0] + '@' + row[1] in already_nas, row[2], row[0], row[1]))
             room = (policy['maximum_retained_transport_bytes'] - retained_bytes if policy['decouple_nas_acceptance']
                     else policy['maximum_pending_bytes'] - pending_bytes)
             result.update(publication_capacity_room_bytes=room,
@@ -674,8 +822,6 @@ def stage_source_wave(c: dict) -> dict:
             chosen = []
             size = 0
             for row in eligible:
-                if row[0] + "@" + row[1] in published:
-                    continue
                 if len(chosen) >= policy['maximum_wave_files']:
                     break
                 if size + row[2] > limit:
@@ -845,7 +991,7 @@ def restore_lake_delivery(root: Path, scratch: Path, *, extensions: Path, pg_bin
             path = "ducklake:postgres:dbname=" + options["dbname"] + " host=" + options["host"] + " port=" + str(options["port"]) + " user=" + options["user"]
             con.execute("ATTACH " + sql_text(path) + " AS lake (DATA_PATH " + sql_text(root / "data") + ", OVERRIDE_DATA_PATH true, DATA_INLINING_ROW_LIMIT 0)")
             snapshot = con.execute("SELECT max(snapshot_id) FROM ducklake_snapshots('lake')").fetchone()[0]
-            actual = {table: identity_sha256(con.execute("SELECT * FROM lake." + table + " ORDER BY ALL").fetchall())
+            actual = {table: _registered_table_digest(con, table)
                       for table in expected["table_row_sha256"]}
             if actual != expected["table_row_sha256"] or snapshot != expected["snapshot_id"]:
                 raise ValueError("restored native DuckLake version/rows differ")

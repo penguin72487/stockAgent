@@ -507,7 +507,7 @@ def materialize_reviewed_supplements(queue, urls, *, lease_seconds):
                 or observed > approved or approved > datetime.now(timezone.utc)):
             raise ValueError("retained supplement authorization or observation clock invalid")
         response = Response(raw["final_url"], 200, {k.lower(): v for k, v in headers.items()}, raw["raw_response_body"])
-        if (source.embedded_article_layout == "ftv_visible_article_v1" and urlsplit(response.url).hostname != "www.ftvnews.com.tw"
+        if (source.embedded_article_layout in {"ftv_visible_article_v1", "ftv_visible_article_v2", "ftv_visible_article_v3", "ftv_visible_article_v4", "ftv_visible_article_v5", "ftv_visible_article_v6", "ftv_visible_article_v7"} and urlsplit(response.url).hostname != "www.ftvnews.com.tw"
                 or source.embedded_article_layout == "macau_visible_news_v1" and response.url != url):
             raise ValueError("retained supplement needs independent original resolution evidence")
         parse_started = time.monotonic()

@@ -169,7 +169,10 @@ def _reclaimable_file_bytes(*trees: Path) -> int:
     return sum(allocated for links, allocated, removed in inodes.values() if links == removed)
 
 
-def _assert_unlink_gates(plan: Mapping[str, Any], quarantine: Path, **options: Any) -> dict[str, Any]:
+def _assert_unlink_gates(
+    plan: Mapping[str, Any], quarantine: Path, *,
+    _process_scope_root: Path | None = None, **options: Any,
+) -> dict[str, Any]:
     """Refresh usage and transport after the potentially long rename audit.
 
     Failure leaves the exact hot bytes in quarantine for review, never unlinks
@@ -179,7 +182,14 @@ def _assert_unlink_gates(plan: Mapping[str, Any], quarantine: Path, **options: A
 
     source = Path(plan["source"])
     artifact_root = Path(options["artifact_root"])
-    refs = artifact_process_references(source, artifact_root)
+    # A reviewed legacy profile may have a narrower ancestor-consumer domain
+    # than its physical capture root. Keep that domain identical before and
+    # after rename; never narrow the exact source/hot/quarantine FD/mmap scans.
+    process_scope = (artifact_root if _process_scope_root is None else _process_scope_root).resolve()
+    if (not process_scope.is_relative_to(artifact_root.resolve())
+            or process_scope not in source.resolve().parents):
+        raise SnapshotError("retirement process scope is outside its source ancestry")
+    refs = artifact_process_references(source, process_scope)
     for path in (Path(plan["hot_tree"]), quarantine):
         refs.extend(process_references(path))
     if refs:

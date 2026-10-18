@@ -111,6 +111,44 @@ Use the section for the service being changed. Operational acceptance requires f
   current model/entrypoint identities, same-run complete warmup, engine ACK and
   preserved ledger prefixes; a connected Gateway alone is insufficient. See
   [the 2026-10-15 continuation](../tw_opening_latency_stages_2026-10-14.md#discord-與完整特徵共享續修2026-10-15).
+- Explicit `--discord-only --code-admission-only` recovery separates fresh
+  loaded-code/Gateway/ACK acceptance from GPU readiness. Only complete same-run
+  per-mode `LoadedImplementationChanged` rejections may recover a degraded
+  preflight; unknown errors, active work, paper/ledger and opening guards remain.
+  Report `accepted_code_admission_only`, never warm-ready by implication, and
+  leave warmup/eviction to the native preparation clock. Plan/apply and final
+  post-prefix checks use the existing bounded coherent ACK reader, not retained
+  snapshots past heartbeat TTL. Journal proof binds one invocation and filters
+  startup, fatal and warm-ready separately before taking bounded results; a
+  successful marker or fatal must not disappear behind ordinary progress logs.
+- Inference code identity follows the transitive repository imports of the
+  canonical inference/cache entrypoints, including lazy imports, package
+  initializers and literal dynamic imports. Do not fingerprint entire data or
+  model directories: unrelated news development is not a model-admission gate.
+  Cache parsed syntax/closure only with consumed-file generations and import
+  candidate membership checks; adding/deleting an imported module must still
+  invalidate admission. Real dependency changes retain the fresh-owner rule;
+  never clear/rebind an old owner's admission to bypass it. See the
+  [scoped-dependency repair and native acceptance](../tw_opening_latency_stages_2026-10-14.md#discord-相依範圍修正與今日訊號恢復2026-10-16).
+- Healthy FinMind opening retries have a bounded wake clock inside the shared
+  fan-in, not behind slow MIS/broker completion or the scheduler's next pass.
+  Keep shared snapshot single-flight, request-start cadence, accepted facts,
+  unresolved deltas and provider error/quota backoff. The native daily opening
+  audit is an independent no-network, journal-only observer: freeze the enabled
+  mode roster before open, retain real owner preparation context and original
+  publication/full-target commit clocks, and never overwrite the first deadline
+  assessment with replay or late repair. Missing scope/evidence remains unverified;
+  a successful audit process is not a passed trading SLO. Scoped installation
+  uses `scripts/install_discord_bot_service.sh --opening-audit-only` without
+  restarting market owners. See [daily evidence and measured limits](../tw_opening_latency_stages_2026-10-14.md#11秒日常驗收與獨立-finmind-喚醒2026-10-16).
+- FinMind connection reuse and decoded full-market views are source-owned, not
+  worker-thread/model-owned. Fence date/open gate/PID/credential rotation and
+  preserve original receipt clocks on reuse. Retain full-payload coverage and
+  missing reasons independently of shrinking model gaps; consumer-delta events
+  only establish lower bounds. Measure response headers/body, validation,
+  source-local first valid/full coverage and durable model input separately;
+  cached data, missing rows and HTTP success are not fresh market-wide evidence.
+  See [source forensics and paired measurements](../tw_opening_latency_stages_2026-10-14.md#finmind-首筆全量測速與449檔根因2026-10-16).
 
 ## TW Day-Trade Engine Responsiveness
 
@@ -133,6 +171,14 @@ Use the section for the service being changed. Operational acceptance requires f
   Observed absence uses the existing zero-gap feature sentinel, never a fabricated
   price. Positive-open completeness remains a separate, truthfully incomplete metric.
   Preserve accepted opens and retry unknown inputs through the shared source owner.
+  Full-market snapshot endpoints are single-flight across model deltas. FinMind
+  uses a bounded one-second request-start cadence only in the first eleven
+  opening seconds, then ten seconds; its approximate data refresh interval is
+  not a client rate limit or a fill SLA. Valid old-date responses remain a data
+  wait, while transport/permission/quota backoff and all source-clock checks
+  remain intact. Read-only 08:30 acceptance and its final revision fence use
+  shared leases; escalate and revalidate only for real source mutations. See
+  [the 11-second investigation](../tw_opening_latency_stages_2026-10-14.md#finmind-開盤補查與-11-秒目標2026-10-16).
   A mode's retry must not starve source repair between actual inference attempts.
   After publishing the immutable original model weights once, an unpriced target
   remains a per-symbol unsized `waiting_source` order, not a discarded cash target
@@ -218,6 +264,14 @@ Use the section for the service being changed. Operational acceptance requires f
   geometry are identical; on a short history, quarter/year/all need one full
   scan, not three. Warmup 503/timeout observations remain visible and are retried
   without a page reload. They are not accepted as data completion or zero latency.
+  The read-only physical projection may use role-local `base_delta_v2`: reuse a
+  fully verified v1 inode, keep an immutable base plus a small delta, and compact
+  at the declared source-tail bound. Changed sources still require complete
+  retained-prefix SHA and generation fences; preserve the canonical parser and
+  query/accounting/schema. Pinned payloads and the original source lease span
+  the query. Never rewrite closed sources merely to create a fresh deployment
+  receipt: native reader adoption and a natural new-source update are separate
+  proofs. See [measured rollout](../penguin_service_storage_layout_2026-10-15.md#1016-0520-續修taifex-曲線投影重用固定歷史與小型增量).
 - Verify paper repair with `scripts/verify_taifex_web_recovery.py`: supply the
   verified `--backup-dir`, original `--capture-id`, output directory and local /
   public `--url` values. It checks preserved ledger prefixes, official source

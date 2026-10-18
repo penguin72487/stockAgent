@@ -413,6 +413,8 @@ def status_projection_replay(root, registry, output_parent, repetitions=7):
         owner = dict(db.execute('SELECT key,value FROM queue_settings'))['current_owner_id']
         q = NewsQueue.__new__(NewsQueue)  # No constructor, migration, owner or lock.
         q.db, q.owner, q.registry = db, owner, registry
+        if 'acceptance_receipt_io' in snapshot:
+            q.acceptance_receipt_io = snapshot['acceptance_receipt_io']
         q.metrics = SimpleNamespace(snapshot=lambda: snapshot['performance'],
                                     measure=lambda *args, **kwargs: nullcontext())
         q.http_capacity_snapshot = lambda: snapshot.get('http_capacity')

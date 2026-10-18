@@ -198,15 +198,49 @@ def test_native_copy_is_exclusive_flushes_and_verifies_exact_source():
 
 @pytest.mark.parametrize('damage', ['source_change', 'wrong_size'])
 def test_native_hash_batch_cannot_accept_mutation_or_truncated_member(tmp_path, monkeypatch, damage):
+    from stockagent.data_sync import cold_primary
     paths = [tmp_path / str(i) for i in range(2)]
     for p in paths:p.write_bytes(b'original exact bytes')
-    monkeypatch.setattr(native, '_configuration', lambda p, **k: k)
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda root: None)
+    monkeypatch.setattr(native, '_configuration_on_checked_mount', lambda p, **k: k)
     def batch(configs):
         if damage == 'source_change':paths[1].write_bytes(b'mutated bytes')
         return [{'bytes': c['expected_bytes'] - (damage == 'wrong_size'), 'sha256': 'a' * 64} for c in configs]
     monkeypatch.setattr(native, '_batch', batch)
     with pytest.raises(SnapshotError, match='changed'):
         native.hash_many(paths)
+
+
+@pytest.mark.parametrize('failure', [None, 'before', 'after'])
+def test_native_hash_batch_checks_authority_before_and_after_not_per_member(tmp_path, monkeypatch, failure):
+    from stockagent.data_sync import cold_primary
+    paths = [tmp_path/str(i) for i in range(16)]
+    for path in paths:
+        path.write_bytes(b'exact immutable member')
+    events = []
+    def guard(root):
+        assert root == Path('/srv/stockagent-packed')
+        events.append('guard')
+        if failure == ('before' if len(events) == 1 else 'after'):
+            raise SnapshotError('enrolled authority unavailable')
+    def config(path, **options):
+        events.append('member')
+        return options
+    def batch(configs):
+        events.append('batch')
+        return [{'bytes': c['expected_bytes'], 'sha256': 'a'*64} for c in configs]
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', guard)
+    monkeypatch.setattr(native, '_configuration_on_checked_mount', config)
+    monkeypatch.setattr(native, '_batch', batch)
+    if failure:
+        with pytest.raises(SnapshotError, match='authority unavailable'):
+            native.hash_many(paths)
+        if failure == 'before':
+            assert events == ['guard']
+    else:
+        assert native.hash_many(paths) == {path: 'a'*64 for path in paths}
+        assert events == ['guard']+['member']*16+['batch', 'guard']
+    assert all(path.read_bytes() == b'exact immutable member' for path in paths)
 
 
 def test_native_copy_batch_failure_keeps_every_partial(tmp_path, monkeypatch):

@@ -219,6 +219,46 @@ def test_day_trade_live_window_can_use_only_fresh_latest_quote_rows() -> None:
     assert window[-1, 1, 1] == 0.0
 
 
+def test_confirmed_no_first_print_uses_previous_close_only_for_model_not_open_or_fill():
+    stamp = int(datetime.fromisoformat("2026-10-16T09:00:00.100+08:00").timestamp() * 1000)
+    panel = PanelData(
+        dates=np.array(["2026-10-15"], dtype="datetime64[D]"),
+        symbols=["OPEN", "NO_PRINT", "UNKNOWN"],
+        feature_names=["base", "next_session_open_gap_logret"],
+        features=np.zeros((1, 3, 2), dtype=np.float32),
+        returns_1d=np.zeros((1, 3), dtype=np.float32),
+        tradable_mask=np.ones((1, 3), dtype=bool), alive_mask=np.ones((1, 3), dtype=bool),
+        benchmark_returns=np.zeros(1, dtype=np.float32),
+        close_prices=np.array([[100., 50., 80.]], dtype=np.float32))
+    snapshot = PriceSnapshot(prices=np.array([102., 50., 80.]),
+        source="opening:shared_opening_snapshot", timestamp="2026-10-16T09:00:00.100+08:00",
+        open_prices=np.array([101., np.nan, np.nan]), available_mask=np.array([True, True, False]),
+        timestamps_ms=np.full(3, stamp), exchange_timestamps_ms=np.array([stamp, stamp, 0]),
+        no_open_print_timestamps_ms=np.array([0, stamp, 0]))
+    window, _, _, live, observed = _day_trade_live_model_window(panel, panel_idx=0, lookback=1,
+        price_snapshot=snapshot, resolved_asof="2026-10-16 09:00:00", source_timezone="Asia/Taipei")
+    assert live and observed.tolist() == [True, False, False]
+    assert window[-1, 1, 1] == np.log(50. / 50.) == 0.
+    assert window[-1, 0, 1] == pytest.approx(np.log(101. / 100.))
+    assert np.isnan(snapshot.open_prices[1:]).all()
+    proof = signal_engine.tw_session_no_open_print_mask(snapshot, session_date="2026-10-16")
+    assert proof.tolist() == [False, True, False]
+    args = dict(live_session=True, active=3, opens=1, responses=2, no_prints=int(proof.sum()),
+                model_observation="session_open")
+    signal_engine._require_day_trade_opening_coverage(required=2, **args)
+    with pytest.raises(signal_engine.TWOpeningInputCoveragePending):
+        signal_engine._require_day_trade_opening_coverage(required=3, **args)
+    # A subsequent genuine first print replaces the provisional zero gap on
+    # the next inference; the stale absence marker cannot override an open.
+    snapshot.open_prices[1] = 52.
+    next_window, _, _, _, next_observed = _day_trade_live_model_window(panel,
+        panel_idx=0, lookback=1, price_snapshot=snapshot,
+        resolved_asof="2026-10-16 09:00:00", source_timezone="Asia/Taipei")
+    assert next_observed.tolist() == [True, True, False]
+    assert next_window[-1, 1, 1] == pytest.approx(np.log(52. / 50.))
+    assert not signal_engine.tw_session_no_open_print_mask(snapshot, session_date="2026-10-16")[1]
+
+
 def test_day_trade_quote_coverage_does_not_require_every_symbol_to_trade() -> None:
     snapshot = PriceSnapshot(
         prices=np.array([101.0, 50.5]),

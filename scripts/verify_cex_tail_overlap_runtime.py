@@ -103,6 +103,52 @@ def validate_code(comparison: Path) -> dict:
             "functions_sha256": functions, "live_matches_complete_prototype": True}
 
 
+def validate_normalization_code(comparison: Path) -> dict:
+    """Bind the complete merged-value benchmark to only the intended AST edit."""
+    receipt = json.loads(comparison.read_text())
+    rows = receipt.get("measurements", [])
+    if (receipt.get("contract") != "complete_cex_stored_tail_merge_normalization_v3"
+            or receipt.get("value_digest_format") != "typed_validity_and_exact_valid_value_bits_v1"
+            or receipt.get("state") != "accepted_output_parity"
+            or receipt.get("provider_calls") != 0 or receipt.get("source_writes") != 0
+            or receipt.get("binance_normalizer_unchanged") is not True
+            or [row.get("variant") for row in rows] != ["reference", "candidate", "candidate", "reference"]
+            or any(row.get("output_sha256") != receipt.get("output_sha256") for row in rows)
+            or not float(receipt.get("workflow_speedup", 0)) > 1):
+        raise ValueError("complete accepted, beneficial merged-value benchmark required")
+    hashes = receipt.get("code_sha256", {})
+    helper = ROOT / "downloader/ohlcv_hot_tail.py"
+    benchmark = ROOT / "scripts/benchmark_cex_tail_overlap.py"
+    references = {p: [Path(path) for path in hashes if Path(path).name == f"reference_{p}.py"] for p in MODULES}
+    if any(len(paths) != 1 for paths in references.values()):
+        raise ValueError("one original module per provider required")
+    expected = {str(helper), str(benchmark), *(str(paths[0]) for paths in references.values())}
+    if set(hashes) != expected or any(sha(Path(path)) != value for path, value in hashes.items()):
+        raise ValueError("exact benchmark/oracle/helper generation required")
+    current = {str(helper): sha(helper)}
+    functions = {}
+    prefix = ast.parse("reused = canonical_date_frame(frame)\nif reused is not None:\n    return reused\n").body
+    for provider, module in MODULES.items():
+        original = ast.parse(references[provider][0].read_text())
+        if provider != "binance":
+            imports = [node for node in original.body if isinstance(node, ast.ImportFrom) and node.module == "ohlcv_hot_tail"]
+            normalizers = [node for node in original.body if isinstance(node, ast.FunctionDef) and node.name == "_normalize_date_frame"]
+            if (len(imports) != 1 or len(normalizers) != 1
+                    or any(alias.name == "canonical_date_frame" for alias in imports[0].names)
+                    or not isinstance(normalizers[0].body[0], ast.If)):
+                raise ValueError("unexpected original normalizer shape")
+            imports[0].names.insert(0, ast.alias(name="canonical_date_frame"))
+            normalizers[0].body[1:1] = prefix
+        path = Path(module.__file__).resolve()
+        if ast.dump(original) != ast.dump(ast.parse(path.read_text())):
+            raise ValueError("collector differs beyond exact canonical-date reuse")
+        current[str(path)] = sha(path)
+        functions[provider] = digest(inspect.getsource(module._normalize_date_frame))
+    return {"benchmark_receipt_sha256": sha(comparison), "code_sha256": current,
+            "functions_sha256": functions, "live_matches_complete_prototype": True,
+            "binance_repair_unchanged": True, "changed_providers": ["bybit", "okx"]}
+
+
 def native_owners(unit: dict, code_not_before: float) -> dict:
     if unit["ActiveState"] != "activating" or not unit["ControlGroup"] or not int(unit["MainPID"]):
         return {}
@@ -133,31 +179,36 @@ def native_owners(unit: dict, code_not_before: float) -> dict:
     return owners
 
 
-def helper_samples(body: dict) -> int:
+def helper_samples(body: dict, helper_name: str = "tail_newer_summary") -> int:
     frames = body.get("shared", {}).get("frames", [])
-    matches = {i for i, frame in enumerate(frames) if frame.get("name") == "tail_newer_summary"
+    matches = {i for i, frame in enumerate(frames) if frame.get("name") == helper_name
                and frame.get("file") == str(ROOT / "downloader/ohlcv_hot_tail.py")}
     return sum(bool(matches.intersection(stack)) for profile in body.get("profiles", [])
                for stack in profile.get("samples", []))
 
 
-def verify(comparison: Path, output: Path, *, wait_seconds: float = 180) -> dict:
+def verify(comparison: Path, output: Path, *, wait_seconds: float = 180, normalization: bool = False) -> dict:
     if output.exists() or output.is_symlink() or not output.resolve().is_relative_to(ROOT / "artifacts/operations"):
         raise ValueError("fresh private operational receipt required")
     if not 0 <= wait_seconds <= 180:
         raise ValueError("bounded wait required")
-    admission = validate_code(comparison)
+    validator = validate_normalization_code if normalization else validate_code
+    admission = validator(comparison)
+    required = ("bybit", "okx") if normalization else tuple(MODULES)
+    helper_name = "canonical_date_frame" if normalization else "tail_newer_summary"
     code_not_before = max(Path(path).stat().st_mtime for path in admission["code_sha256"])
     protected = {unit: unit_identity(unit) for unit in PROTECTED}
     deadline = time.monotonic() + wait_seconds
     while True:
         unit = unit_identity(UNIT)
         owners = native_owners(unit, code_not_before)
-        if len(owners) == 3 or time.monotonic() >= deadline:
+        if all(provider in owners for provider in required) or time.monotonic() >= deadline:
             break
         time.sleep(2)  # Independent diagnostic process; no collector work is blocked.
     rows = []
-    if len(owners) == 3:
+    observed_owners = owners
+    owners = {p: owners[p] for p in required if p in owners}
+    if len(owners) == len(required):
         print(json.dumps({"stage": "native_before", "unit": unit, "owners": owners}), flush=True)
 
         def profile(item):
@@ -170,21 +221,25 @@ def verify(comparison: Path, output: Path, *, wait_seconds: float = 180) -> dict
                                     text=True, capture_output=True)
             body = json.loads(path.read_text()) if path.exists() else {}
             return {"provider": provider, "owner": owner, "profiler_exit": result.returncode,
-                    "helper_samples": helper_samples(body), "profile": str(path), "log": result.stdout + result.stderr}
+                    "helper_samples": helper_samples(body, helper_name), "profile": str(path), "log": result.stdout + result.stderr}
 
         with ThreadPoolExecutor(max_workers=3) as pool:
             rows = list(pool.map(profile, owners.items()))
-    same = unit_identity(UNIT) == unit and native_owners(unit, code_not_before) == owners
-    if (admission != validate_code(comparison)
+    after_owners = native_owners(unit, code_not_before)
+    same = unit_identity(UNIT) == unit and {p: after_owners.get(p) for p in owners} == owners
+    if (admission != validator(comparison)
             or protected != {unit: unit_identity(unit) for unit in PROTECTED}):
         raise ValueError("code or protected native owner changed during acceptance")
-    accepted = len(rows) == 3 and same and all(row["profiler_exit"] == 0 and row["helper_samples"] > 0 for row in rows)
+    accepted = len(rows) == len(required) and same and all(row["profiler_exit"] == 0 and row["helper_samples"] > 0 for row in rows)
     torch_module = sys.modules.get("torch")
     cuda_initialized = bool(torch_module is not None and torch_module.cuda.is_initialized())
-    receipt = {"contract": "three_cex_native_tail_helper_execution_v1",
+    receipt = {"contract": ("cex_native_canonical_date_reuse_execution_v1" if normalization
+                            else "three_cex_native_tail_helper_execution_v1"),
                "state": "accepted_native_helper_execution" if accepted else "awaiting_native_helper_execution",
                "observed_at_utc": datetime.now(UTC).isoformat(), **admission,
                "unit": unit, "native_owners": owners, "same_native_owners": same, "rows": rows,
+               "required_providers": list(required), "observed_all_native_owners": observed_owners,
+               "sampled_helper": helper_name,
                "protected_owners_unchanged": True, "provider_calls": 0, "source_writes": 0,
                "services_restarted": False, "cuda_initialized": cuda_initialized,
                "all_history_complete_claim": False, "native_lifecycle_complete_claim": False}
@@ -197,8 +252,9 @@ def main() -> int:
     parser.add_argument("--comparison", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wait-seconds", type=float, default=180)
+    parser.add_argument("--normalization", action="store_true", help="Admit exact Bybit/OKX canonical-date reuse; Binance remains unchanged.")
     args = parser.parse_args()
-    receipt = verify(args.comparison.resolve(), args.output.absolute(), wait_seconds=args.wait_seconds)
+    receipt = verify(args.comparison.resolve(), args.output.absolute(), wait_seconds=args.wait_seconds, normalization=args.normalization)
     print(json.dumps({"state": receipt["state"], "same_native_owners": receipt["same_native_owners"],
                       "rows": [{k: row[k] for k in ("provider", "profiler_exit", "helper_samples")} for row in receipt["rows"]]}))
     return 0 if receipt["state"] == "accepted_native_helper_execution" else 75

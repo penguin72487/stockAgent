@@ -17,6 +17,16 @@ from stockagent.live.quote_provider import PriceSnapshot
 
 @pytest.fixture(autouse=True)
 def isolated_receipt(monkeypatch, tmp_path):
+    # Recovery is an intraday contract. Running its tests before 09:00 must
+    # not depend on the operator's wall clock or relax the production guard.
+    fixed = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=9, minute=30, second=0, microsecond=0)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+    monkeypatch.setitem(globals(), "datetime", Clock)
+    monkeypatch.setattr(quotes, "datetime", Clock)
+    monkeypatch.setattr(acquisition, "datetime", Clock)
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts"))
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_NO_OPEN_RETRY_SECONDS", "0")
     monkeypatch.setattr(quotes, "_TW_MIS_OPENING_CACHE_KEY", None)

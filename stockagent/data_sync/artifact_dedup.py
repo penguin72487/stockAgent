@@ -179,34 +179,45 @@ def _iter_files(
     completed_roots: tuple[tuple[str, ...], ...] | None,
     blocked_roots: tuple[tuple[str, ...], ...],
 ) -> Iterable[ArtifactFile]:
+    if completed_roots is not None and not completed_roots:
+        return
+    completed = set(completed_roots or ())
+    blocked = set(blocked_roots)
+    # A branch without a complete owner or a complete descendant cannot yield
+    # eligible files. Keep prefixes so a complete child of a blocked parent
+    # remains reachable, preserving the existing most-specific-marker rule.
+    complete_prefixes = {
+        candidate[:depth]
+        for candidate in completed
+        for depth in range(len(candidate) + 1)
+    }
+
+    def owned(parts: tuple[str, ...]) -> bool:
+        for depth in range(len(parts), -1, -1):
+            prefix = parts[:depth]
+            if prefix in blocked:
+                return False
+            if prefix in completed:
+                return True
+        return False
+
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
         directory_path = Path(directory)
+        relative_directory = directory_path.relative_to(root).parts
         if directory_path == root:
             dirnames[:] = sorted(name for name in dirnames if name not in excluded_top)
         else:
             dirnames.sort()
+        if completed_roots is not None:
+            dirnames[:] = [
+                name for name in dirnames
+                if relative_directory + (name,) in complete_prefixes
+                or owned(relative_directory + (name,))
+            ]
+            if not owned(relative_directory):
+                continue
         for name in sorted(filenames):
             path = directory_path / name
-            relative_parts = path.relative_to(root).parts
-            if completed_roots is not None:
-                completed_depth = max(
-                    (
-                        len(candidate)
-                        for candidate in completed_roots
-                        if relative_parts[: len(candidate)] == candidate
-                    ),
-                    default=-1,
-                )
-                blocked_depth = max(
-                    (
-                        len(candidate)
-                        for candidate in blocked_roots
-                        if relative_parts[: len(candidate)] == candidate
-                    ),
-                    default=-1,
-                )
-                if completed_depth < 0 or blocked_depth >= completed_depth:
-                    continue
             if path.suffix.lower() in excluded_suffixes:
                 continue
             try:
@@ -224,22 +235,63 @@ def _iter_files(
 
 def _artifact_completion_roots(
     root: Path,
+    *,
+    excluded_top: frozenset[str] = DEFAULT_EXCLUDED_TOP,
 ) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
     """Return complete and mutable run roots from lifecycle progress envelopes."""
 
     completed: list[tuple[str, ...]] = []
     blocked: list[tuple[str, ...]] = []
-    for directory, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames.sort()
-        if "progress.json" not in filenames:
+    root_name = os.fspath(root)
+    pending = [root_name]
+    while pending:
+        directory = pending.pop()
+        if directory != root_name and os.path.islink(directory):
+            continue
+        children: list[str] = []
+        has_marker = False
+        try:
+            # Only directory topology and one possible marker matter here.
+            # Retain the fresh islink guard before descent, but do not build a
+            # filename list or parse a Path for every unowned cache/shard
+            # directory. No persistent topology index or content/hash reuse is
+            # needed; all nested markers stay fresh on every audit.
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_directory = False
+                    if is_directory:
+                        if directory != root_name or entry.name not in excluded_top:
+                            children.append(entry.path)
+                    elif entry.name == "progress.json":
+                        # Match os.walk's filename classification for a marker
+                        # symlink to a directory: never read/descend that link.
+                        try:
+                            has_marker = not entry.is_dir()
+                        except OSError:
+                            has_marker = True
+        except OSError:
+            continue  # Same unreadable/disappeared-directory behavior as walk.
+        pending.extend(sorted(children, reverse=True))
+        if not has_marker:
             continue
         path = Path(directory) / "progress.json"
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             payload = {}
         relative = Path(directory).relative_to(root).parts
-        if payload.get("state") == "complete" and payload.get("phase") == "complete":
+        # Other producers also write progress.json (including array envelopes).
+        # Only a lifecycle object can certify its own subtree as immutable; an
+        # unreadable or differently shaped marker must block that subtree, not
+        # abort unrelated completed runs or inherit their parent's permission.
+        if (
+            isinstance(payload, dict)
+            and payload.get("state") == "complete"
+            and payload.get("phase") == "complete"
+        ):
             completed.append(relative)
         else:
             blocked.append(relative)
@@ -324,7 +376,9 @@ def find_duplicate_groups(
     completed_roots: tuple[tuple[str, ...], ...] | None = None
     blocked_roots: tuple[tuple[str, ...], ...] = ()
     if require_complete_marker:
-        completed_roots, blocked_roots = _artifact_completion_roots(root)
+        completed_roots, blocked_roots = _artifact_completion_roots(
+            root, excluded_top=excluded_top
+        )
     files = list(
         _iter_files(
             root,

@@ -10,6 +10,7 @@ with workflow.unsafe.imports_passed_through():
     from stockagent.control.lakehouse import configuration, register, export, acceptance, catalog_enrollment, stage_source_wave, retire_accepted_transport
     from downloader.artifact_io import atomic_write_json
     from pathlib import Path
+    from stockagent.data_sync.dataset_migration import advance_catalog_versions
 
 
 @contextmanager
@@ -66,6 +67,34 @@ def stage_source_replication() -> dict:
     activity.heartbeat("enrolling immutable source-object wave")
     with activity_lease():
         return stage_source_wave(configuration())
+
+
+@activity.defn
+def advance_dataset_versions() -> dict:
+    activity.heartbeat("resuming catalog-backed incremental dataset versions")
+    with activity_lease():
+        return advance_catalog_versions(Path(__file__).resolve().parents[2], configuration())
+
+
+@workflow.defn
+class DatasetVersionLifecycle:
+    def __init__(self):
+        self.phase = {"state": "created"}
+
+    @workflow.query
+    def status(self) -> dict:
+        return self.phase
+
+    @workflow.run
+    async def run(self, request: dict) -> None:
+        retry = RetryPolicy(initial_interval=timedelta(seconds=10), maximum_interval=timedelta(minutes=2))
+        for _ in range(60):
+            self.phase = await workflow.execute_activity(advance_dataset_versions,
+                start_to_close_timeout=timedelta(hours=24), heartbeat_timeout=timedelta(seconds=60),
+                retry_policy=retry)
+            await workflow.sleep(timedelta(minutes=10) if self.phase["state"] == "waiting_next_daily_cycle"
+                                 else timedelta(seconds=30))
+        workflow.continue_as_new({})
 
 
 @workflow.defn

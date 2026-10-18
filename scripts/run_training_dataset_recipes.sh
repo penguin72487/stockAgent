@@ -39,4 +39,9 @@ fi
 run_fintech_python -m scripts.publish_data_releases publish training-dataset-recipes \
   --sync-root "$recipe_sync_root" --source-lock-fd 8 "${recipe_notification[@]}"
 }
-stockagent_recipe_main "$@"
+# Keep termination in the same parsed command as the long-running function;
+# no top-level read may resume at the old EOF after an in-place rollout.
+{
+  stockagent_recipe_main "$@"
+  exit "$?"
+}

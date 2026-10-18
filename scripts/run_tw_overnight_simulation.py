@@ -311,7 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         ):
             specs, configs, errors = _mode_specs(_repo_path(args.markets_dir))
             watcher.configure([spec.live_output_dir for spec in specs])
-            engine.update_readiness(specs, now=observed, errors=errors)
+            engine.update_readiness(specs, now=observed, errors=errors,
+                                    configured_markets=list(configs))
             last_reload = monotonic
             last_readiness = monotonic
             last_liveness = monotonic
@@ -323,7 +324,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 notify_systemd(f"STATUS={_service_status_text(engine, observed)}")
         elif monotonic - last_readiness >= readiness_interval:
-            engine.update_readiness(specs, now=observed)
+            engine.update_readiness(specs, now=observed, errors=errors,
+                                    configured_markets=list(configs))
             notify_systemd(f"STATUS={_service_status_text(engine, observed)}")
             last_readiness = monotonic
             last_liveness = monotonic

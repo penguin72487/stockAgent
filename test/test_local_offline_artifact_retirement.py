@@ -46,6 +46,147 @@ def test_manual_offline_capture_preserves_unique_bytes_and_cannot_run_automatica
     assert (source / 'unique-result.bin').read_bytes() == b'unique offline research output'
 
 
+def _completed_benchmark(source):
+    fixture = {'contract': 'private_native_test_v1', 'state': 'private_workload_prepared'}
+    accepted = {'contract': fixture['contract'], 'state': 'accepted_bounded_comparison',
+                'trials': [{'state': 'completed_trial'}]}
+    (source / 'fixture.json').write_text(json.dumps(fixture))
+    (source / 'abba-receipt.json').write_text(json.dumps(accepted))
+    for path in source.glob('*.json'):
+        old = time.time() - 2 * 86400
+        os.utime(path, (old, old))
+
+
+def test_one_explicit_completed_benchmark_case_uses_existing_exact_archive_owner(tmp_path):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, row, catalog = example(tmp_path)
+    relative = 'benchmarks/service-suite/completed-case'
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    _completed_benchmark(target)
+    row['relative_root'] = relative
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    with pytest.raises(SnapshotError, match='explicit manual capture'):
+        source_plan(target, spec)
+    observed = cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+    assert not observed['blockers']
+    local = tmp_path / 'retirement/retained-evidence'
+    evidence = cleanup.benchmark_evidence(target, destination=local)
+    assert evidence == observed['benchmark_evidence'] == cleanup.benchmark_evidence(local)
+    assert {path.name for path in local.iterdir()} == {'fixture.json', 'abba-receipt.json'}
+    assert (target / 'unique-result.bin').read_bytes() == b'unique offline research output'
+    packed = tmp_path / 'packed'
+    published = publish_archive(spec, root, packed, repo_root=root.parent, manual_capture=True)
+    proof = verify_cold_archive(spec, packed)
+    assert proof['decoded_originals_verified'] and proof['snapshot_id'] == published['snapshot_id']
+    assert proof['files'] == 3 and target.is_dir()  # Publication never implies deletion.
+
+
+@pytest.mark.parametrize('problem', ['missing', 'failed', 'unfinished', 'foreign_contract', 'contract_type'])
+def test_shared_capture_owner_also_rejects_unfinished_benchmarks_without_outer_cli(tmp_path, problem):
+    root, source, row, catalog = example(tmp_path)
+    target = root / 'benchmarks/suite/case'
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    _completed_benchmark(target)
+    row['relative_root'] = 'benchmarks/suite/case'
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    receipt = target / 'abba-receipt.json'
+    if problem == 'missing':
+        receipt.unlink()
+    else:
+        value = json.loads(receipt.read_bytes())
+        if problem == 'failed':
+            value['state'] = 'failed'
+        elif problem == 'unfinished':
+            value['trials'][0]['state'] = 'running'
+        elif problem == 'foreign_contract':
+            value['contract'] = 'foreign'
+        else:
+            value['contract'] = {'contract': 'not-a-string'}
+        receipt.write_text(json.dumps(value))
+    with pytest.raises(SnapshotError, match='completed producer'):
+        source_plan(target, spec, manual_capture=True)
+    assert (target / 'unique-result.bin').is_file()
+
+
+def test_publication_wait_phase_ends_before_commit_runs_under_the_existing_owner(tmp_path, monkeypatch):
+    import fcntl
+    from scripts import retire_local_offline_artifacts as cleanup
+    target = tmp_path / 'receipts'
+    target.mkdir()
+    owner = tmp_path / 'existing-common-owner.lock'
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', owner)
+    with cleanup.publication_owner(target):
+        value = json.loads((target / 'phase.json').read_bytes())
+        assert value['phase'] == 'publish-under-shared-owner' and value['state'] == 'running'
+        with owner.open('a') as competing:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    value = json.loads((target / 'phase.json').read_bytes())
+    assert value['phase'] == 'publish-under-shared-owner' and value['state'] == 'completed'
+
+
+@pytest.mark.parametrize('relative', ['benchmarks', 'benchmarks/service-suite',
+    'benchmarks/service-suite/completed-case/nested', 'data_tw_public/source'])
+def test_manual_benchmark_scope_cannot_expand_to_a_whole_suite_or_data_root(tmp_path, relative):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, _, row, catalog = example(tmp_path)
+    row['relative_root'] = relative
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    with pytest.raises(SnapshotError):
+        load_legacy_specs(catalog)
+    with pytest.raises(SnapshotError):
+        cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+
+
+@pytest.mark.parametrize('problem', ['missing', 'failed', 'wrong_contract', 'unfinished', 'oversized',
+                                    'symlink', 'fifo', 'redirected_destination', 'redirected_member', 'duplicate_json'])
+def test_benchmark_evidence_preserves_unknown_or_unfinished_work_without_deletion(tmp_path, problem):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, _, _ = example(tmp_path)
+    _completed_benchmark(source)
+    receipt = source / 'abba-receipt.json'
+    destination = tmp_path / 'retained'
+    original = (source / 'unique-result.bin').read_bytes()
+    if problem == 'missing':
+        receipt.unlink()
+    elif problem in {'failed', 'wrong_contract', 'unfinished'}:
+        value = json.loads(receipt.read_bytes())
+        if problem == 'failed':
+            value['state'] = 'failed'
+        elif problem == 'wrong_contract':
+            value['contract'] = 'foreign'
+        else:
+            value['trials'][0]['state'] = 'running'
+        receipt.write_text(json.dumps(value))
+    elif problem == 'duplicate_json':
+        receipt.write_text('{"state":"failed","state":"accepted_hidden"}')
+    elif problem == 'oversized':
+        with receipt.open('wb') as handle:
+            handle.truncate(8 * 1024**2 + 1)
+    elif problem == 'symlink':
+        retained = source / 'receipt.original'
+        receipt.rename(retained)
+        receipt.symlink_to(retained)
+    elif problem == 'fifo':
+        receipt.unlink()
+        os.mkfifo(receipt)
+    elif problem == 'redirected_destination':
+        outside = tmp_path / 'outside'
+        outside.mkdir()
+        destination.symlink_to(outside, target_is_directory=True)
+    else:
+        destination.mkdir()
+        (destination / 'abba-receipt.json').symlink_to(receipt)
+    with pytest.raises((SnapshotError, OSError)):
+        cleanup.benchmark_evidence(source, destination=destination)
+    assert (source / 'unique-result.bin').read_bytes() == original
+
+
 def test_retired_transport_preserves_original_namespace_and_has_a_distinct_physical_role(tmp_path):
     from scripts.retire_local_offline_artifacts import source_layout,dataset_prefix,TRANSFER_QUARANTINE_ORIGIN
     root,source,row,catalog=example(tmp_path)
@@ -112,9 +253,13 @@ def test_retired_minute_view_cannot_include_current_raw_or_arbitrary_data_roots(
 
 
 @pytest.mark.parametrize('reference,protected', [('workspace', False), ('data-scope', True), ('selected-view', True)])
-def test_minute_view_process_domain_keeps_real_data_ancestors_not_generic_workspace(tmp_path, reference, protected):
+def test_minute_view_process_domain_keeps_real_data_ancestors_not_generic_workspace(tmp_path, monkeypatch, reference, protected):
     import subprocess
     import sys
+    from datetime import datetime, timezone
+    import stockagent.data_sync.artifact_retirement as common
+    import stockagent.data_sync.legacy_artifact_retirement as retirement
+    import stockagent.data_sync.remote_legacy_return as remote
     from stockagent.data_sync.legacy_artifact_archive import legacy_process_scope
     from stockagent.data_sync.artifact_maintenance import artifact_process_references
     root, original, row, catalog = example(tmp_path)
@@ -133,6 +278,26 @@ def test_minute_view_process_domain_keeps_real_data_ancestors_not_generic_worksp
         assert scope == source.parent
         refs = artifact_process_references(source, scope)
         assert any(f'pid={child.pid}:' in ref for ref in refs) is protected
+        # The same domain must survive rename and interrupted-transaction
+        # resume. Generic workspace parents do not become data consumers.
+        quarantine = tmp_path/'quarantine'
+        quarantine.mkdir()
+        source.rename(quarantine/'source')
+        plan = {'source': str(source), 'hot_tree': str(tmp_path/'hot/view'),
+                'snapshot_id': 'fixed-release'}
+        options = {'artifact_root': root.parent, 'repo_root': root.parent,
+                   'materialized_root': tmp_path/'materialized', 'hot_root': tmp_path/'hot',
+                   'bridge_inactive': True, 'peer_proof': {'ok': True,
+                       'checked_at': datetime.now(timezone.utc).isoformat(), 'peers': []}}
+        monkeypatch.setattr(common, 'artifact_service_references', lambda paths, *args:
+                            {str(path): [] for path in paths})
+        monkeypatch.setattr(remote, 'active_configuration_references', lambda *args: [])
+        if protected:
+            with pytest.raises(SnapshotError, match='post-rename process references'):
+                retirement._assert_legacy_unlink_gates(spec, plan, quarantine, **options)
+        else:
+            assert retirement._assert_legacy_unlink_gates(spec, plan, quarantine, **options)['ok']
+        assert (quarantine/'source/unique-result.bin').is_file()
     finally:
         child.terminate()
         child.wait(timeout=5)
@@ -152,6 +317,46 @@ def test_minute_view_named_cli_selection_uses_only_fixed_paths_without_source_ar
     assert cleanup.main()==0
     assert seen==[(['data_tw_minute/research_dataset_developing_v5'],
                    {'hot_mirror':False,'transfer_quarantine':False,'minute_derived_view':True})]
+
+
+@pytest.mark.parametrize('reference', ['fd', 'mmap', 'cwd'])
+def test_minute_view_final_gate_still_protects_real_quarantine_users(tmp_path, reference):
+    import select
+    import subprocess
+    import sys
+    from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec
+    from stockagent.data_sync.legacy_artifact_retirement import _assert_legacy_unlink_gates
+    repo = tmp_path/'repo'
+    relative = 'data_tw_minute/research_dataset_developing_v5'
+    source = repo/relative
+    source.mkdir(parents=True)
+    (source/'original.bin').write_bytes(b'exact preserved original')
+    quarantine = tmp_path/'quarantine'
+    quarantine.mkdir()
+    source.rename(quarantine/'source')
+    spec = LegacyArchiveSpec('legacy-minute', relative, 7, tmp_path/'stage',
+                             capture_contract=MANUAL_MINUTE_DERIVED_VIEW_CONTRACT)
+    code = ('import mmap, os, sys, time; '
+            'kind, name = sys.argv[1:]; '
+            'handle = open(name, "rb") if kind != "cwd" else None; '
+            'mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) if kind == "mmap" else None; '
+            'handle.close() if kind == "mmap" else None; '
+            'os.chdir(os.path.dirname(name)) if kind == "cwd" else None; '
+            'print("ready", flush=True); time.sleep(30)')
+    child = subprocess.Popen([sys.executable, '-c', code, reference,
+                              str(quarantine/'source/original.bin')], stdout=subprocess.PIPE)
+    try:
+        assert select.select([child.stdout], [], [], 5)[0], 'reference holder did not become ready'
+        assert child.stdout.readline() == b'ready\n'
+        plan = {'source': str(source), 'hot_tree': str(tmp_path/'hot'/relative),
+                'snapshot_id': 'fixed-release'}
+        with pytest.raises(SnapshotError, match='post-rename process references'):
+            _assert_legacy_unlink_gates(spec, plan, quarantine, artifact_root=repo)
+        assert (quarantine/'source/original.bin').read_bytes() == b'exact preserved original'
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+        child.stdout.close()
 
 
 @pytest.mark.parametrize('changed', [False, True])
@@ -463,6 +668,37 @@ def test_recovery_scratch_selection_keeps_exact_decode_and_physical_capacity_gat
         assert admitted[0][1]>32*1024**3
     assert source.is_dir()
     assert not list(target.glob('verification-scratch/stockagent-legacy-verify-*'))
+    progress = json.loads((target / 'recovery-progress.json').read_bytes())
+    assert progress['snapshot_id'] == published['snapshot_id']
+    assert progress['manifest_sha256'] == published['manifest_sha256']
+    assert progress['acceptance_proof'] is False
+    assert progress['state'] == ('verified' if ram_available else 'failed')
+    assert not (target / 'retirement.json').exists()
+
+
+def test_recovery_interrupt_keeps_partial_telemetry_and_never_accepts_retirement(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed = tmp_path / 'packed'
+    published = publish_archive(spec, root, packed, repo_root=root.parent, manual_capture=True)
+    target = tmp_path / 'receipts'
+    target.mkdir()
+    monkeypatch.setattr(cleanup.shutil, 'disk_usage', lambda path: SimpleNamespace(free=64*1024**3))
+    def interrupted(spec, cold, *, verification_root, progress):
+        progress({'stage': 'hash-cold-blobs', 'recovery_step': 'fetch-encoded-archive',
+                  'completed_items': 5, 'total_items': 10, 'completed_bytes': 1024, 'total_bytes': 2048})
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(cleanup, 'verify_cold_archive', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        cleanup.verify_for_retirement(spec, packed, target)
+    progress = json.loads((target / 'recovery-progress.json').read_bytes())
+    assert progress['state'] == 'interrupted' and progress['error_type'] == 'KeyboardInterrupt'
+    assert progress['completed_items'] == 5 and progress['completed_bytes'] == 1024
+    assert progress['snapshot_id'] == published['snapshot_id']
+    assert progress['acceptance_proof'] is False
+    assert source.is_dir() and not (target / 'retirement.json').exists()
 
 
 def test_inventory_drift_only_admits_removed_hardlinks(tmp_path,monkeypatch):

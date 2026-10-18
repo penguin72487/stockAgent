@@ -116,6 +116,26 @@ def test_minute_eta_does_not_mix_authorization_or_queue_or_prefetch_settings():
         assert result["data_batches"] == 0 and result["seconds_per_acquired_partition"] is None
 
 
+def test_current_tick_policy_withholds_old_single_day_capacity_before_first_range_batch():
+    from dataclasses import replace
+    from stockagent.data.finlab_quota_policy import QuotaPolicy
+    from stockagent.live.finlab_dashboard import _intraday_configuration
+
+    policy = QuotaPolicy(tick_workers=8, tick_queue_depth=4, tick_authorization_slots=8,
+                         tick_range_calendar_days=7)
+    current = _intraday_configuration(policy, "tw_tick")
+    old = _intraday_configuration(replace(policy, tick_range_calendar_days=1), "tw_tick")
+    start = NOW - timedelta(hours=2)
+    prior = [{**batch(start + timedelta(seconds=200*i)), **old, "kind": "tw_tick",
+              "quota_policy": {"configuration_fingerprint": old["configuration_fingerprint"]}} for i in range(2)]
+    assert measured_capacity(prior, now=NOW, configuration=old)["data_batches"] == 2
+    result = measured_capacity(prior, now=NOW, configuration=current)
+    assert result["data_batches"] == 0 and result["seconds_per_acquired_partition"] is None
+    assert current["processing_engine"] == "rolling_range_process_pool"
+    assert current["range_calendar_days"] == 7 and current["authorization_slots"] == 8
+    assert current["download_threads"] == 1
+
+
 def test_tick_eta_waits_for_general_debt_even_after_minutes_are_cleared():
     market, kwargs = inputs()
     market.update(acquisition_mode="minute_first_tick_residual", minute_priority={"tick_residual_allowed": True},

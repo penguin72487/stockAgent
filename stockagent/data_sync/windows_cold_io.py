@@ -10,6 +10,7 @@ import base64
 from contextlib import contextmanager
 import hashlib
 import json
+import os
 import re
 from pathlib import Path, PureWindowsPath
 import stat
@@ -29,6 +30,34 @@ ALIASES = (
     (Path('/srv/stockagent-d-volume/stockagent-backup-ingress-lab203'), 'stockagent-backup-ingress-lab203'),
     (Path('/srv/stockagent-d-volume/stockagent-immutable-lake'), 'stockagent-immutable-lake'),
 )
+
+
+def admit_workspace(path: Path, required_bytes: int) -> dict:
+    """Admit native SSD scratch using real backing capacity, without ML imports.
+
+    Shared with the completed-return owner. The old public entrypoint delegates
+    here so native byte readers do not import model/training lifecycle modules.
+    """
+    path = path.absolute()
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise SnapshotError("returned artifact path is redirected")
+    if not path.is_dir():
+        raise SnapshotError("training return workspace must already exist")
+    result = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", str(path)],
+                            capture_output=True, text=True, check=True, timeout=10)
+    filesystem = result.stdout.strip()
+    if filesystem not in {"ext4", "xfs", "btrfs", "zfs"}:
+        raise SnapshotError("authority mutable return state needs a native local filesystem")
+    fs = os.statvfs(path)
+    free = fs.f_bavail * fs.f_frsize
+    if "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower():
+        from stockagent.data_sync.recovery_queue import physical_free_bytes
+        config = {"windows_distribution": os.environ.get("WSL_DISTRO_NAME", ""),
+                  "powershell": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"}
+        free = min(free, physical_free_bytes(config))
+    if free < required_bytes:
+        raise SnapshotError("training return workspace lacks real physical free space")
+    return {"filesystem": filesystem, "physical_free_bytes": free, "required_bytes": required_bytes}
 
 
 def retryable_interop_startup(stderr: bytes) -> bool:
@@ -76,13 +105,22 @@ def windows_path(path):
     return None
 
 
-def _configuration(path, *, mode, offset=0, prefix_sha256=None, reserve_bytes=32 * 1024**3,
-                   source=None, expected_sha256=None, expected_bytes=None):
-    native = windows_path(path)
-    if native is None:
+def _configuration(path, **options):
+    if windows_path(path) is None:
         raise SnapshotError('Windows binary I/O requires fixed D cold path')
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     _check_d_primary_mount(Path('/srv/stockagent-packed'))
+    return _configuration_on_checked_mount(path, **options)
+
+
+def _configuration_on_checked_mount(
+    path, *, mode, offset=0, prefix_sha256=None, reserve_bytes=32 * 1024**3,
+    source=None, expected_sha256=None, expected_bytes=None,
+):
+    """Build an exact member config inside a freshly guarded native operation."""
+    native = windows_path(path)
+    if native is None:
+        raise SnapshotError('Windows binary I/O requires fixed D cold path')
     if native.startswith('D:\\stockagent-backup-ingress-lab203\\'):
         from stockagent.data_sync.packed_backup import mounted_volume
         physical = Path('/srv/stockagent-d-volume/stockagent-backup-ingress-lab203')
@@ -202,12 +240,21 @@ def hash_many(paths):
     paths = [Path(p) for p in paths]
     if not 1 <= len(paths) <= 16 or len(set(paths)) != len(paths):
         raise SnapshotError('Native hash batch members are repeated or unbounded')
+    from stockagent.data_sync.cold_primary import _check_d_primary_mount
+    # No persistent/TTL mount cache: each bounded batch has fresh before/after
+    # authority guards. All member path, full SHA and signature checks remain.
+    # Re-running the shell/Python mount checker for every member dominated
+    # small-object recovery despite the already batched Windows process.
+    _check_d_primary_mount(Path('/srv/stockagent-packed'))
     signatures = [p.lstat() for p in paths]
     if any(not stat.S_ISREG(s.st_mode) for s in signatures):
         raise SnapshotError('Native batch hash needs regular exact members')
-    configs = [_configuration(p, mode='hash', expected_bytes=s.st_size) for p, s in zip(paths, signatures, strict=True)]
+    configs = [_configuration_on_checked_mount(p, mode='hash', expected_bytes=s.st_size)
+               for p, s in zip(paths, signatures, strict=True)]
+    proofs = _batch(configs)
+    _check_d_primary_mount(Path('/srv/stockagent-packed'))
     result = {}
-    for path, before, proof in zip(paths, signatures, _batch(configs), strict=True):
+    for path, before, proof in zip(paths, signatures, proofs, strict=True):
         if (not _stable(before, path.lstat()) or proof.get('bytes') != before.st_size
                 or not isinstance(proof.get('sha256'), str) or not re.fullmatch('[0-9a-f]{64}', proof['sha256'])):
             raise SnapshotError('Native batch full hash changed an exact member')

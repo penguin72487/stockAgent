@@ -61,9 +61,13 @@ def main(argv=None):
     ids = worker._snapshot_ids(root, "TaiwanStockInfo", "stock_id")
     delisted = worker._official_delisted_ids(root)
     delegated = frozenset(status.get("delegated_to_sponsor", ()))
-    code_paths = [Path(__file__), Path(worker.__file__),
+    code_paths = [Path(__file__), Path(worker.__file__), Path("downloader/download_finmind_free.py"),
                   Path("downloader/finmind_status_aggregates.py"), Path("downloader/finmind_queue_indexes.py"),
-                  Path("downloader/finmind_updates.py"), Path("downloader/artifact_io.py")]
+                  Path("downloader/finmind_updates.py"), Path("downloader/artifact_io.py"),
+                  Path("downloader/finmind_supplemental.py"), Path("downloader/finmind_scheduling.py"),
+                  Path("downloader/finmind_json_pipeline.py"), Path("downloader/finmind_object_pipeline.py"),
+                  Path("downloader/finmind_corrections.py"),
+                  Path("configs/finmind_json_pipeline.json")]
     code_before = {str(p.resolve()): file_sha(p) for p in code_paths}
     prior = json.loads(args.prepared_from.read_bytes()) if args.prepared_from else None
     if prior and (prior.get("state") != "measurement_complete" or not prior.get("exact_output_parity")

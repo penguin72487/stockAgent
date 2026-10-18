@@ -125,6 +125,22 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def rename_without_overwrite(source: Path, destination: Path) -> None:
+    """Linux atomic no-replace, without a crash window holding two hardlinks.
+
+    Callers own/validate both paths and fsync the containing directory. An
+    unsupported filesystem/syscall fails closed, never falls back to replace.
+    """
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renameat2
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1):
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), str(destination))
+
+
 def atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644, durable: bool = True) -> None:
     if type(durable) is not bool:
         raise ValueError('durable must be an explicit boolean')

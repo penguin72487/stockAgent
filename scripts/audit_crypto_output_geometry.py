@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData
+from stockagent.data.panel_cache import load_panel_cache_array
 from stockagent.data_sync.desync_snapshots import atomic_write_json
 from stockagent.models.factory import build_model
 from stockagent.models.temporal_basis_fit import temporal_basis_overrides_from_state_dict
@@ -93,7 +94,7 @@ cache = Path(cfg.data.panel_cache_root) / "panel_cache_v2"
 meta = json.loads((cache / "meta.json").read_text())
 names = json.loads((cache / meta["feature_names_file"]).read_text())
 symbols = json.loads((cache / meta["symbols_file"]).read_text())
-arrays = {key: np.load(cache / value["file"], mmap_mode="r") for key, value in meta["arrays"].items()}
+arrays = {key: load_panel_cache_array(cache, value, mmap_mode="r") for key, value in meta["arrays"].items()}
 dates = arrays["dates"].astype("datetime64[D]")
 def sha(path):
     h = hashlib.sha256()

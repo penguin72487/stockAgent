@@ -190,6 +190,8 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(cstpm_cfg.d_model)
     if model_name in {"temporal_tabular_resnet", "temporal_resnet", "temporal_tabresnet"}:
         return int(config.training.temporal_tabular_resnet.hidden_dim)
+    if model_name == "classical":
+        return 128
     if model_name in {"lightgbm", "lgbm"}:
         return 128
     if model_name in {"xgboost", "xgb"}:
@@ -736,6 +738,8 @@ def build_model(
             temporal_basis_fp32_contraction=fin_cfg.temporal_basis_fp32_contraction,
             temporal_blocks_fp32=fin_cfg.temporal_blocks_fp32,
             portfolio_blocks_fp32=fin_cfg.portfolio_blocks_fp32,
+            portfolio_risk_calibration=fin_cfg.portfolio_risk_calibration,
+            factorized_frozen_encoder_cache_bytes=fin_cfg.factorized_frozen_encoder_cache_bytes,
             candle_projection_fp32=fin_cfg.candle_projection_fp32,
             factorized_compact_projection=fin_cfg.factorized_compact_projection,
             factorized_sparse_projection=fin_cfg.factorized_sparse_projection,
@@ -882,6 +886,15 @@ def build_model(
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
             candidate_top_m=cstpm_cfg.candidate_k,
             portfolio_top_k=cstpm_cfg.trade_k,
+        )
+
+    if model_name == "classical":
+        from stockagent.models.classical import CrossSectionalClassical
+        return CrossSectionalClassical(
+            lookback=lookback, num_features=num_features, num_symbols=num_symbols,
+            long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
+            kind=config.training.classical.kind,
         )
 
     if model_name in {"lightgbm", "lgbm"}:

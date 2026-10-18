@@ -71,7 +71,7 @@ def test_metrics_keep_fp64_and_the_existing_missing_value_policy(helper):
 
 
 def test_reporting_contract_records_the_normalization_version():
-    assert canonical_mode_artifact_contract("tw_cash")["metrics_contract_version"] == RETURN_METRICS_CONTRACT_VERSION == 2
+    assert canonical_mode_artifact_contract("tw_cash")["metrics_contract_version"] == RETURN_METRICS_CONTRACT_VERSION == 3
 
 
 def test_resume_does_not_reuse_metrics_without_current_reporting_contract(tmp_path, monkeypatch):
@@ -84,7 +84,7 @@ def test_resume_does_not_reuse_metrics_without_current_reporting_contract(tmp_pa
     checkpoint_reads = []
     monkeypatch.setattr(trainer, "_load_checkpoint", lambda path: checkpoint_reads.append(path) or {})
     monkeypatch.setattr(trainer, "_validate_checkpoint_manifest", lambda *_args, **_kwargs: None)
-    for version in (None, 1, "2"):
+    for version in (None, 1, 2, "3"):
         (fold_dir / "mode_artifact_contract.json").write_text(json.dumps({"metrics_contract_version": version}))
         assert trainer._load_completed_fold_result(tmp_path, 1, expected_manifest={}) is None
     assert checkpoint_reads == []

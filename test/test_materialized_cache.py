@@ -4,7 +4,10 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from stockagent.data_sync import materialized_cache as materialized_cache_module
+from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.materialized_cache import (
     evict_materialized_snapshots,
     materialized_cache_status,
@@ -139,6 +142,28 @@ def test_expired_gc_removes_only_hot_copy_and_can_refetch(tmp_path: Path) -> Non
         sync_root, hot_root, "prices", now_ns=BASE_NS + 19 * DAY_NS
     )
     assert Path(renewed["target"]).is_dir()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_incomplete_reference_scan_retains_expired_payload_lease_and_link(tmp_path, monkeypatch, dry_run):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot_root, "prices", ttl_days=7,
+                                      now_ns=BASE_NS + 10 * DAY_NS)
+    lease_path = hot_root / ".cache-state/leases/prices" / f"{snapshot_id}.json"
+    before = lease_path.read_bytes()
+    target = Path(lease["target"])
+
+    def incomplete(*args, **kwargs):
+        raise SnapshotError("incomplete process-reference scan: injected permission error")
+
+    monkeypatch.setattr(materialized_cache_module, "process_references", incomplete)
+    with pytest.raises(SnapshotError, match="incomplete process-reference scan"):
+        evict_materialized_snapshots(sync_root, hot_root, dry_run=dry_run,
+                                     now_ns=BASE_NS + 18 * DAY_NS)
+    assert lease_path.read_bytes() == before
+    assert (target / "prices.csv").read_text() == "first"
+    assert (hot_root / "current/prices").resolve(strict=True) == target
 
 
 def test_edge_gc_requires_valid_external_cold_proof_for_missing_payload(

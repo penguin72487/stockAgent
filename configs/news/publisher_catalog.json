@@ -122,7 +122,8 @@
       "parallelism": 1,
       "capacity_max_parallelism": 2,
       "html_parser": "lxml",
-      "embedded_article_layout": "ettoday_visible_article_v2",
+      "embedded_article_layout": "ettoday_visible_article_v28",
+      "reviewed_article_subsites": ["house.ettoday.net"],
       "article_path_pattern": "^(?:/news/[1-9][0-9]*|/news/[0-9]{8}/[1-9][0-9]*[.]htm)$",
       "article_selectors": [":scope > .story[itemprop=\"articleBody\"]"],
       "exclude_selectors": [],
@@ -132,11 +133,11 @@
       "review_url": "https://member.ettoday.net/clause_copyright.php7",
       "authorization": {
         "kind": "personal_research",
-        "reviewed_on": "2026-10-15",
+        "reviewed_on": "2026-10-18",
         "evidence_url": "https://member.ettoday.net/clause_copyright.php7",
         "additional_evidence_urls": ["https://member.ettoday.net/clause_member.php7", "https://events.ettoday.net/about-ettoday/index.htm"],
         "automated_access_review": "no_explicit_prohibition_identified",
-        "scope": "User-requested unchanged private personal-reading capture of exact locally known public original own-reporter reports and later literal locally observed URLs on finance.ettoday.net and www.ettoday.net, under the limited primary personal/noncommercial reasonable-use notice and intellectual-property law. Bind current canonical/OG/microdata/headline, native reporter signature and whole visible story to source pubdate/lastmod and visible release minute. Preserve source clock precision, native malformed datetime/schema syntax evidence, captions, bylines and rights notices separately. No invented ID, date, author, neighboring story or summary promoted to prose. Other branded hosts, issuer/wire/third-party reports, paid/member text, media binaries and unverified historical layouts remain explicit review work, not accepted originals or permanent absence. No site/feed/API discovery, public body distribution, automatic training injection or remote training grant; not a blanket archive/third-party license or legal fair-use verdict. REP, 403/429/451, Retry-After, refusal/circuit history and shared diagnostics budgets remain binding."
+        "scope": "User-requested unchanged private personal-reading capture of exact locally known public original own-reporter reports and later literal locally observed URLs on finance.ettoday.net and www.ettoday.net, plus the independently reviewed native house.ettoday.net article scope enabled by reviewed_article_subsites, under the limited primary personal/noncommercial reasonable-use notice and intellectual-property law. Bind current canonical/OG/microdata/headline, native reporter signature and whole visible story to source pubdate/lastmod and visible release minute. Preserve source clock precision, native malformed datetime/schema syntax evidence, captions, bylines and rights notices separately. No invented ID, date, author, neighboring story or summary promoted to prose. Unreviewed branded hosts including ESG/forum, issuer/wire/third-party reports, paid/member text, media binaries and unverified historical layouts remain explicit review work, not accepted originals or permanent absence. No site/feed/API discovery, public body distribution, automatic training injection or remote training grant; not a blanket archive/third-party license or legal fair-use verdict. REP, 403/429/451, Retry-After, refusal/circuit history and shared diagnostics budgets remain binding. Source-proved organizational-desk extension v26 is limited to the existing reviewed house.ettoday.net route: accept literal native signatures 房產中心／綜合報導 and 財經中心／台北報導 only when the unique current article schema declares the exact ETtoday publisher Organization as author and native article identity, complete visible story, publication/revision clocks and rights notice agree. Retain the desk as Organization/newsroom, never promote a schema creator account to a person/reporter. This source-declared attribution is not an inference of independent editorial authorship, third-party ownership clearance, a blanket archive licence or a training grant. The existing private known-URL, personal/noncommercial and refusal restrictions remain unchanged; other desks, third-party or issuer/wire declarations still require separate source review."
       },
       "acquisition_mode": "continuous",
       "private_known_url_scope": "personal_noncommercial_originals_v1",
@@ -180,7 +181,7 @@
       "acquisition_mode": "continuous",
       "private_known_url_scope": "personal_noncommercial_originals_v1",
       "capacity_max_parallelism": 2,
-      "embedded_article_layout": "ftnn_visible_article_v1",
+      "embedded_article_layout": "ftnn_visible_article_v6",
       "article_path_pattern": "^/news/[1-9][0-9]*$",
       "exclude_selectors": [],
       "title_selector": "h1",
@@ -251,7 +252,7 @@
     {"id":"gbimonthly","name":"環球生技月刊","domains":["gbimonthly.com"],"article_selectors":[".entry-content","[itemprop=articleBody]"],"review_url":"https://news.gbimonthly.com/tw/about/index.php?num=39", "note":"Bounded live review 2026-10-09: canonical NewsHTTP rejected robots response as robots_not_plain_rules before sending an article request. Keep disabled; no implicit Allow, host change or cooldown clearing. Body adapter remains unverified."},
     {"id":"ftvnews","name":"民視新聞","domains":["www.ftvnews.com.tw","finance.ftvnews.com.tw","sport.ftvnews.com.tw","health.ftvnews.com.tw"],"enabled":true,"acquisition_mode":"continuous","private_known_url_scope":"personal_noncommercial_originals_v1",
       "authorization":{"kind":"personal_research","evidence_url":"https://www.ftvnews.com.tw/news/detail/2026317W0044","additional_evidence_urls":["https://www.ftvnews.com.tw/privacy","https://www.ftvnews.com.tw/robots.txt","https://www.ftvnews.com.tw/news/detail/2019624F02M1","https://finance.ftvnews.com.tw/news/detail/2026A02W0627","https://www.ftvnews.com.tw/news/detail/2026A02W0627"],"scope":"User-requested private personal-reading capture of locally known public original FTV newsroom articles and later locally observed URLs. Preserve actual reporters, source copyright, article identity and publication/revision clocks. Exclude syndicated/third-party work, media, paid/member bodies, redistribution and automatic training export. A public subsite may resolve only its actually declared matching original permalink before an independent original-page check; never after an access refusal. No guessed IDs, generated aliases or site-wide discovery. Original frozen membership and receipts remain immutable historical evidence, not a limit on the latest user-requested known-URL scope. Personal purpose is not a publisher license or a legal fair-use determination.","reviewed_on":"2026-10-14","automated_access_review":"no_explicit_prohibition_identified","rights_restrictions":"Publisher retains copyright; no blanket archive/reuse/model-training grant or numeric source quota inferred. This bounded private scope is not a legal fair-use verdict. Robots/refusals remain binding on both representations; no generated aliases, guessed IDs, source search, proxy or identity change."},
-      "article_path_pattern":"^/news/detail/[A-Za-z0-9]+/?$","embedded_article_layout":"ftv_visible_article_v1",
+      "article_path_pattern":"^/news/detail/[A-Za-z0-9]+/?$","embedded_article_layout":"ftv_visible_article_v7",
       "article_selectors":["#contentarea[itemprop=articleBody]"],"title_selector":"h1",
       "require_configured_container":true,"require_author_attribution":true,"author_selectors":["[itemprop=author]"],
       "capacity_max_parallelism":2,"allow_reviewed_supplements":true,"review_url":"https://www.ftvnews.com.tw/privacy",
@@ -280,8 +281,8 @@
       ],
       "exclude_selectors": [],
       "title_selector": "h1",
-      "article_path_pattern": "^(?:/[a-z][a-z-]*/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$",
-      "embedded_article_layout": "tvbs_visible_article_v2",
+      "article_path_pattern": "^(?:/[a-z][a-z-]*/[1-9][0-9]*|/entertainment/music/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$",
+      "embedded_article_layout": "tvbs_visible_article_v4",
       "acquisition_mode": "continuous",
       "private_known_url_scope": "personal_noncommercial_originals_v1",
       "review_url": "https://www.tvbs.com.tw/policies/copyright",
@@ -558,6 +559,28 @@
       "review_url": "https://www.coolloud.org.tw/node/4524",
       "adapter_verification": "actual_node93414_own_work_raw_canonical_og_shortlink_reporter_clock_and_notice_20261015",
       "note": "Reviewed known-URL-only original-text growth under the unchanged coolloud_visible_original_v1 adapter and verified linked source copyright notice. Native identity, staff authorship, exact source clocks and body/license acceptance are unchanged; unknown or external works remain distinct outcomes. No discovery endpoints or completed-body rescans. Preserve the original eight-URL cohort, all source deadlines and consumed diagnostic budgets. Source Crawl-delay10 remains binding; no alternate host, guessed HTTPS rewrite, identity/route workaround, frequency ramp or numeric maximum claim."
+    },
+    {
+      "id": "mnews", "name": "鏡新聞／已核對自製文字報導",
+      "domains": ["www.mnews.tw"], "enabled": true,
+      "acquisition_mode": "continuous", "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "interval_seconds": 2, "parallelism": 1, "capacity_max_parallelism": 2,
+      "html_parser": "lxml", "embedded_article_layout": "mnews_visible_article_v1",
+      "article_path_pattern": "^/story/[0-9]{8}(?:nm|sot)[0-9]+$",
+      "article_selectors": [":scope > [class^=\"article-brief_briefWrapper__\"] > article, :scope > [class^=\"story_contentWrapper__\"] > article"],
+      "exclude_selectors": [], "title_selector": "h1",
+      "require_configured_container": true, "require_author_attribution": true,
+      "feeds": [], "sitemaps": [], "wordpress_apis": [], "fulltext_feeds": [],
+      "authorization": {
+        "kind": "personal_research", "reviewed_on": "2026-10-15",
+        "evidence_url": "https://www.mnews.tw/story/webauthorization",
+        "additional_evidence_urls": ["https://www.mnews.tw/story/privacy", "https://www.mnews.tw/", "https://www.mnews.tw/story/20260725nm005", "https://www.mnews.tw/story/20251205nm014", "https://www.mnews.tw/story/20260227nm013", "https://www.mnews.tw/story/20260512sot1841001"],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Literal locally known public own Mirror TV nm/sot originals for private unchanged personal noncommercial reading only. The reviewed primary home/privacy/content-cooperation pages identify the publisher and no explicit automation prohibition was identified there; not a CC, bulk archive, third-party, redistribution, training or fair-use grant. Verify canonical/OG/breadcrumb/current schema, native own reporter brand, and separately preserved source-aware release/revision seconds and visible minutes. Both native lead and continuation are required for a written report. A verified video-only continuation is a nontext outcome, not full text or a named publisher-reporter. No external/mm syndicated bodies, guessed IDs, media requests, feeds/index/API discovery, login/paid content, public body endpoint or automatic training export. Actual REP and refusals remain binding."
+      },
+      "review_url": "https://www.mnews.tw/story/webauthorization",
+      "adapter_verification": "three_actual_own_written_originals_and_one_video_lead_native_identity_reporter_brand_release_revision_full_body_both_parsers_verified_20261015",
+      "note": "Known local URLs only, not all publisher history. Initial182 heads contain155 external plus27 story paths; only4 nm written candidates and1 sot video candidate match this reviewed route family. Keep177 other literal URLs and their missing-source/review reasons; never mark them absent, downloaded or permanently irrecoverable from a route mismatch. Later literal known own nm/sot URLs use the same shared incremental owner/queue/HTTP/receipts, with no site enumeration. Initial2-second cadence and bounded slots are local settings, not an official or measured maximum; REP/source cooldowns, CNYES priority and all existing providers remain unchanged. No training export or public article text."
     }
   ]
 }

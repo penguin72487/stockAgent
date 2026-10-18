@@ -98,3 +98,54 @@ def test_fresh_output_guard_prevents_overwriting_evidence(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="fresh private"):
         verifier.verify(tmp_path / "unused", output, wait_seconds=0)
     assert output.read_text() == "original evidence"
+
+
+def test_canonical_normalization_admission_samples_only_changed_providers(tmp_path, monkeypatch):
+    owners = {provider: {"pid": 10 + i, "start_ticks": str(i)} for i, provider in enumerate(verifier.MODULES)}
+    output = fixture(tmp_path, monkeypatch, owners=owners)
+    monkeypatch.setattr(verifier, "validate_normalization_code", verifier.validate_code)
+    calls = 0
+
+    def current(*args):
+        nonlocal calls
+        calls += 1
+        return owners if calls == 1 else {p: owners[p] for p in ("bybit", "okx")}
+
+    monkeypatch.setattr(verifier, "native_owners", current)
+
+    def sample(command, **kwargs):
+        body = profile_body()
+        body["shared"]["frames"][0]["name"] = "canonical_date_frame"
+        atomic_write_json(command[-1], body, durable=True)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(verifier.subprocess, "run", sample)
+    result = verifier.verify(tmp_path / "unused", output, wait_seconds=0, normalization=True)
+    assert result["state"] == "accepted_native_helper_execution"
+    assert result["sampled_helper"] == "canonical_date_frame"
+    assert result["required_providers"] == ["bybit", "okx"]
+    assert {row["provider"] for row in result["rows"]} == {"bybit", "okx"}
+    assert not result["services_restarted"]
+
+
+def test_previous_overlap_frames_do_not_prove_new_normalizer_execution(tmp_path, monkeypatch):
+    owners = {p: {"pid": 10 + i, "start_ticks": str(i)} for i, p in enumerate(("bybit", "okx"))}
+    output = fixture(tmp_path, monkeypatch, owners=owners)
+    monkeypatch.setattr(verifier, "validate_normalization_code", verifier.validate_code)
+
+    def sample(command, **kwargs):
+        atomic_write_json(command[-1], profile_body(), durable=True)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(verifier.subprocess, "run", sample)
+    result = verifier.verify(tmp_path / "unused", output, wait_seconds=0, normalization=True)
+    assert result["state"] == "awaiting_native_helper_execution"
+    assert all(row["helper_samples"] == 0 for row in result["rows"])
+
+
+def test_normalizer_admission_rejects_wrong_or_incomplete_benchmark(tmp_path):
+    receipt = tmp_path / "not-complete.json"
+    atomic_write_json(receipt, {"contract": "complete_cex_stored_tail_merge_normalization_v3",
+                                "state": "accepted_output_parity", "workflow_speedup": 10})
+    with pytest.raises(ValueError, match="complete accepted"):
+        verifier.validate_normalization_code(receipt)

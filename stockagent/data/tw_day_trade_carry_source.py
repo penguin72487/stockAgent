@@ -2048,6 +2048,24 @@ def build_prepared_day_trade_carry_source(
                     no_regular_execution.sum()
                 ),
             }
+            from stockagent.data_sync.physical_cache_reuse import (
+                CONTRACT as incremental_contract,
+                COUNT_NAMES as session_count_names,
+                PhysicalSessionReuse,
+                restore_diagnostics,
+                session_diagnostics,
+                session_input_key,
+            )
+            reuse = PhysicalSessionReuse(cache_root.parent, cache_root, len(symbols))
+            session_builds: dict[str, dict[str, Any]] = {}
+            session_context = {
+                "abi": PHYSICAL_SOURCE_CACHE_ABI,
+                "schedule_abi": PAPER_MINUTE_SCHEDULE_ABI,
+                "symbols": list(symbols), "security_types": security_types.tolist(),
+                "entry_remainder_policy": entry_remainder_policy,
+                "daily_proxy_price_policy": daily_proxy_price_policy,
+                "board_lot_shares": BOARD_LOT_SHARES,
+            }
             total_minute_sessions = int((dates >= first_minute).sum())
             minute_sessions_built = 0
             for row, day in enumerate(dates):
@@ -2084,11 +2102,9 @@ def build_prepared_day_trade_carry_source(
                     continue
                 day_text = np.datetime_as_string(day, unit="D")
                 partition = minute_partitions.get(day)
-                if partition is None:
-                    dense = np.full((len(symbols), 270, 6), np.nan, dtype=np.float64)
-                    dense[..., 5] = 0.0
-                    minute_total = np.zeros(len(symbols), dtype=np.float64)
-                else:
+                # A reusable projection does not waive source acceptance: keep
+                # the complete original partition SHA check before the lookup.
+                if partition is not None:
                     partition_path, expected_sha256 = partition
                     if not partition_path.is_file():
                         raise FileNotFoundError(
@@ -2100,6 +2116,32 @@ def build_prepared_day_trade_carry_source(
                             "physical minute partition differs from its manifest: "
                             f"date={day_text} expected={expected_sha256} actual={actual_sha256}"
                         )
+                output = cache_root / f"session-{day_text}.npz"
+                input_key = session_input_key(
+                    {**session_context, "date": day_text,
+                     "partition_sha256": None if partition is None else partition[1]},
+                    opens=opens[row], closes=closes[row], volumes=volumes[row],
+                    lower=lower[row], upper=upper[row], opening_marks=opening_marks[row],
+                    open_on_grid=open_on_grid[row], close_on_grid=close_on_grid[row],
+                    no_regular_execution=no_regular_execution[row],
+                )
+                reused = reuse.reuse_input(input_key, output)
+                if reused is not None:
+                    gaps[row], valuation_known[row], increments = restore_diagnostics(
+                        reused["build"]["diagnostics"], len(symbols)
+                    )
+                    for name, number in increments.items():
+                        mode_counts[name] += number
+                    files[output.name] = reused["file"]
+                    session_builds[output.name] = reused["build"]
+                    minute_sessions_built += 1
+                    continue
+                before_counts = dict(mode_counts)
+                if partition is None:
+                    dense = np.full((len(symbols), 270, 6), np.nan, dtype=np.float64)
+                    dense[..., 5] = 0.0
+                    minute_total = np.zeros(len(symbols), dtype=np.float64)
+                else:
                     dense, minute_total = _dense_bars(partition_path, symbols)
                 official_volume_valid = (
                     np.isfinite(volumes[row]) & (volumes[row] >= 0)
@@ -2210,9 +2252,7 @@ def build_prepared_day_trade_carry_source(
                 mark_flat = np.flatnonzero(np.isfinite(mark_view)).astype(
                     np.int32, copy=False
                 )
-                output = cache_root / f"session-{day_text}.npz"
-                _atomic_npz(
-                    output,
+                payload = dict(
                     exit_flat=exit_flat,
                     exit_price=exit_view[exit_flat].astype(np.float64, copy=False),
                     exit_capacity=path_array[..., 2:4].reshape(-1)[exit_flat].astype(
@@ -2223,8 +2263,15 @@ def build_prepared_day_trade_carry_source(
                     entry=entry_array,
                     **({"entry_path": entry_path, "stop_hits": stop_hits} if sweep_entries else {}),
                 )
-                files[output.name] = {
-                    "bytes": output.stat().st_size, "sha256": _sha256(output)
+                files[output.name] = reuse.write(output, payload)
+                if _sha256(output) != files[output.name]["sha256"]:
+                    raise RuntimeError("incremental physical payload readback differs")
+                session_builds[output.name] = {
+                    "input_key": input_key,
+                    "diagnostics": session_diagnostics(
+                        gaps[row], valuation_known[row],
+                        {name: mode_counts[name] - before_counts[name] for name in session_count_names},
+                    ),
                 }
                 minute_sessions_built += 1
                 if minute_sessions_built % 100 == 0:
@@ -2308,6 +2355,9 @@ def build_prepared_day_trade_carry_source(
                 },
                 "minute_volume_reconciliation": "regular_session_positive_volume_must_not_exceed_official_whole_day_volume_else_daily_proxy",
                 "session_encoding": "sorted_flat_sparse_exit_mark_and_exact_inventory_uncompressed_npz",
+                "storage_contract": incremental_contract,
+                "session_builds": session_builds,
+                "storage_build": reuse.statistics(),
                 "corporate_action_policy": {
                     "policy_target": "avoid_all_announced_actions_before_event",
                     "residual_cash_entitlement": "receipt_verified_exact_amount_and_payment_date",

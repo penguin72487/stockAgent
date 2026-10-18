@@ -70,6 +70,36 @@ def _memory(*, peak: float = 0.5, headroom: float = 16.0) -> dict:
     }
 
 
+@pytest.mark.parametrize('objective,loss,accepted', [
+    ('trajectory_mdd', 0., True), ('trajectory_mdd', .01, False),
+    ('trajectory_return', 0., False), ('log_utility', 0., False),
+])
+def test_zero_gradient_is_accepted_only_at_the_pure_mdd_zero_optimum(objective, loss, accepted):
+    row = _epoch(3, wall=4., train=3., grad=0.)
+    row.update(train_loss=loss, train_zero_grad_batches=1)
+    score = benchmark._score_curve([row], skip_epochs=2, minimum_steady_epochs=1,
+        train_rows=90, global_batch_size=32, memory=_memory(), max_peak_fraction=.98,
+        min_headroom_gib=.5, objective=objective)
+    assert score['ok'] is accepted
+
+
+@pytest.mark.parametrize('certified', [False, True])
+def test_zero_mgda_direction_requires_its_four_task_and_kkt_evidence(certified):
+    row = _epoch(3, wall=4., train=3., grad=0.)
+    row.update(train_zero_grad_batches=1, train_batches=15,
+               train_multiobjective_combined_norm=0.)
+    if certified:
+        row['train_multiobjective_mgda_kkt_margin'] = 0.
+        row.update({f'train_multiobjective_loss_{name}': 0.
+                    for name in ['sharpe', 'log_return', 'sortino', 'mdd']})
+    score = benchmark._score_curve([row], skip_epochs=2, minimum_steady_epochs=1,
+        train_rows=90, global_batch_size=32, memory=_memory(), max_peak_fraction=.98,
+        min_headroom_gib=.5, objective='trajectory_mgda_parameter', model_forward_passes=5)
+    assert score['ok'] is certified
+    if certified:
+        assert score['train_batches'] == 15
+
+
 def test_frozen_project_root_owns_config_resolution(tmp_path, monkeypatch) -> None:
     @dataclass
     class Config:
@@ -160,6 +190,20 @@ def test_source_contract_fails_closed_on_another_executor() -> None:
         benchmark._validate_source_contract(config)
 
 
+@pytest.mark.parametrize("objective", ["trajectory_sharpe", "trajectory_return", "trajectory_sortino", "trajectory_mdd"])
+def test_single_metric_source_contract_keeps_selected_loss_and_annual_ownership(objective):
+    config = {
+        "data": {}, "trading": {"execution_mode": "tw_day_trade", "frequency": "daily"},
+        "training": {"model_name": "financial_transformer", "loss_type": objective,
+                     "day_trade_annual_episode_sharding": True,
+                     "day_trade_training_annual_episodes": True,
+                     "day_trade_optimizer_step_per_trajectory": True}}
+    assert benchmark._validate_source_contract(config)["training.loss_type"] == objective
+    config["training"]["day_trade_annual_episode_sharding"] = False
+    with pytest.raises(ValueError, match="annual physical"):
+        benchmark._validate_source_contract(config)
+
+
 def test_source_contract_accepts_only_strict_minute_executable_pairing() -> None:
     config = {
         "data": {
@@ -244,6 +288,19 @@ def test_score_curve_uses_real_rows_and_complete_epoch_median() -> None:
     assert score["median_epoch_wall_s"] == pytest.approx(5.0)
     assert score["complete_epoch_real_rows_per_s"] == pytest.approx(289 / 5)
     assert score["padding_fraction"] == pytest.approx((384 - 289) / 384)
+
+
+def test_two_pass_score_counts_both_passes_without_inflating_effective_training_rows():
+    rows = [_epoch(3, wall=5., train=4.), _epoch(4, wall=5., train=4.)]
+    for row in rows:
+        row["train_batches"] = 6
+    options = dict(skip_epochs=2, minimum_steady_epochs=2, train_rows=289,
+                   global_batch_size=128, memory=_memory(), max_peak_fraction=.9, min_headroom_gib=3.)
+    assert not benchmark._score_curve(rows, **options)["ok"]
+    score = benchmark._score_curve(rows, model_forward_passes=2, **options)
+    assert score["ok"] and score["train_batches"] == 6
+    assert score["model_forward_slots"] == 768 and score["padded_slots"] == 384
+    assert score["complete_epoch_real_rows_per_s"] == pytest.approx(289 / 5)
 
 
 @pytest.mark.parametrize(

@@ -71,6 +71,35 @@ def _install(conn, root, task, **kw):
     return receipt, path
 
 
+@pytest.mark.parametrize('scope, identifiers', [('dates', None), ('dates', ['2330']),
+                                              ('snapshot', ['2330']), ('dates', ['UNUSED'] * 901)])
+def test_sql_candidate_reduction_matches_unfiltered_date_and_identifier_semantics(scope, identifiers):
+    conn = _conn()
+    for index, (kind, partition) in enumerate([
+        ('day', '2024-10-02'), ('id_day', '2024-10-01'), ('id_day', '2024-10-03'),
+        ('two_day', '2024-10-01'), ('year', '2024'), ('year', '2024-01-01'),
+        ('month', '2024-10-01'), ('id_month', '2024-10-01'), ('id_history', 'history'),
+        ('derived', 'history'), ('derived', '2024-10-02'), ('derived', '2024-10-03'),
+        ('snapshot', 'latest'), ('day', 'malformed'), ('year', 'bad-year'),
+    ]):
+        for identifier in ('2330', '2317'):
+            _task(conn, partition, kind=kind, data_id=f'{identifier}-{index}')
+    # Exact, empty-market and legacy NULL identifiers remain distinguishable.
+    _task(conn, '2024-10-02', data_id='2330', kind='id_day')
+    _task(conn, '2024-10-02', data_id='', kind='day')
+    _task(conn, '2024-10-02', data_id=None, kind='id_day')
+    request = _request(data_ids=identifiers)
+    if scope == 'snapshot':
+        request['scope_kind'] = 'snapshot'
+    cursor = conn.execute('SELECT * FROM tasks WHERE dataset=?', (DATASET,))
+    columns = [item[0] for item in cursor.description]
+    baseline = [dict(zip(columns, row)) for row in cursor]
+    baseline = [row for row in baseline if c._matches(row, request, NOW)]
+    candidate = c._matching_tasks(conn, request, NOW)
+    key = lambda row: (row['kind'], str(row['data_id']), row['partition'])
+    assert sorted(candidate, key=key) == sorted(baseline, key=key)
+
+
 def test_only_existing_exact_owner_overlap_promoted_and_audited_idempotently(tmp_path):
     root = tmp_path / 'sponsor'
     conn = _conn()

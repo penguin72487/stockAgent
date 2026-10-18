@@ -491,6 +491,38 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
     assert audit["public_only_contract_unavailable_symbols"] == 1
     assert audit["daily_chunk_receipts"] == (0 if local_only else 1)
     assert audit["storage_frequency"] == "daily"
+    # Unchanged inputs/output are SHA-checked but do not rebuild Python rows or
+    # rewrite the feature files. The same strict audit remains mandatory.
+    original_merge = dataset_builder.merge_symbol_frames
+    identities = {symbol: (output_root / f"{symbol}_features.parquet").stat().st_mtime_ns
+                  for symbol in ("2330", "9999")}
+    with monkeypatch.context() as context:
+        def unexpected_merge(*_args, **_kwargs):
+            raise AssertionError("unchanged symbol was merged again")
+        context.setattr(dataset_builder, "merge_symbol_frames", unexpected_merge)
+        dataset_builder.main()
+    warm = json.loads((output_root / "shioaji_dataset_summary.json").read_text())
+    assert warm["incremental_build"]["reused_symbols"] == 2
+    assert all((output_root / f"{symbol}_features.parquet").stat().st_mtime_ns == timestamp
+               for symbol, timestamp in identities.items())
+    changed = _base_frame().with_columns(pl.Series("raw_signed_feature", [-2, 0, None, 3]))
+    changed.write_parquet(base_root / "2330_features.parquet")
+    dataset_builder.main()
+    repaired = json.loads((output_root / "shioaji_dataset_summary.json").read_text())
+    assert repaired["incremental_build"] == {
+        "contract": "shioaji-hybrid-exact-reuse-v1", "reused_symbols": 1, "built_symbols": 1,
+    }
+    assert pl.read_parquet(output_root / "2330_features.parquet")["raw_signed_feature"].to_list() == [-2, 0, None, 3]
+    assert dataset_builder.merge_symbol_frames is original_merge
+    # Output tampering cannot reuse a valid-input cache entry, even at the same
+    # row count/dates. Rebuild only the changed output from the source oracle.
+    output_path = output_root / "2330_features.parquet"
+    good_output = pl.read_parquet(output_path)
+    good_output.with_columns(pl.lit(999.0).alias("close")).write_parquet(output_path)
+    dataset_builder.main()
+    assert pl.read_parquet(output_path).equals(good_output)
+    repaired = json.loads((output_root / "shioaji_dataset_summary.json").read_text())
+    assert repaired["incremental_build"]["built_symbols"] == 1
     if local_only:
         assert audit["non_session_admission_verified"] is True
         assert audit["source_minute_chunk_receipts"] == 1
@@ -518,3 +550,48 @@ def test_hybrid_dataset_builder_writes_separate_receipt_backed_root(
             verify_chunk_checksums=False,
         )
     assert not (shioaji_root / "raw").exists()
+@pytest.mark.parametrize("values", [
+    ([], []), ([1.0], []), ([None], [None]), ([float("nan")], [float("nan")]),
+    ([float("inf")], [float("inf")]), ([float("-inf")], [float("-inf")]),
+    ([float("inf")], [float("-inf")]), ([float("inf")], [1e300]),
+    ([0.0], [-0.0]), ([1e-320], [0.0]), ([1.0], [1.00000001]),
+    ([" 1.0 "], [1.0]), (["invalid"], [1.0]), ([True], [1.0]),
+    ([2**63 - 1], [float(2**63 - 1)]),
+])
+@pytest.mark.parametrize("repeat", [1, 300])
+def test_columnar_quote_comparison_preserves_scalar_coercion_and_missingness(values, repeat):
+    from scripts import audit_tw_shioaji_dataset as auditor
+    left, right = (pl.Series(items * repeat, strict=False) for items in values)
+    assert auditor._allclose(left, right) == auditor._allclose_reference(left, right)
+
+
+def test_columnar_quote_comparison_matches_math_isclose_at_float_boundaries():
+    import math
+    import random
+    from scripts import audit_tw_shioaji_dataset as auditor
+    pairs = []
+    rng = random.Random(20261018)
+    for _ in range(500):
+        left = rng.uniform(-1e9, 1e9)
+        right = left + max(abs(left) * 1e-12, 1e-9)
+        pairs.extend((left, value) for value in (
+            right, math.nextafter(right, math.inf), math.nextafter(right, -math.inf)))
+    pairs.extend((0.0, value) for value in (
+        1e-9, math.nextafter(1e-9, math.inf), math.nextafter(1e-9, -math.inf)))
+    valid = [(a, b) for a, b in pairs if math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-9)]
+    assert auditor._allclose(pl.Series([a for a, _ in valid]), pl.Series([b for _, b in valid]))
+    for a, b in pairs:
+        assert auditor._allclose(pl.Series([a]), pl.Series([b])) == math.isclose(
+            a, b, rel_tol=1e-12, abs_tol=1e-9)
+    for a, b in pairs[::100]:
+        assert auditor._allclose(pl.Series([a] * 300), pl.Series([b] * 300)) == math.isclose(
+            a, b, rel_tol=1e-12, abs_tol=1e-9)
+
+
+def test_vector_quote_comparison_rejects_single_invalid_value_and_handles_chunks():
+    from scripts import audit_tw_shioaji_dataset as auditor
+    left = pl.Series([1.0] * 300)
+    for bad in (2.0, None, float("nan"), float("inf")):
+        right = pl.concat([pl.Series([1.0] * 150), pl.Series([bad]), pl.Series([1.0] * 149)], rechunk=False)
+        assert not auditor._allclose(left, right)
+    assert auditor._allclose(left, pl.concat([left[:100], left[100:]], rechunk=False))

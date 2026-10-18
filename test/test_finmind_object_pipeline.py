@@ -130,6 +130,27 @@ def test_restart_restores_only_claimed_inflight_not_successes_or_exhausted(runti
                               (task.dataset, task.partition)).fetchone()[0] == 'complete'
 
 
+def test_recovery_seeks_only_exact_claim_keys_and_preserves_unclaimed_inflight(runtime):
+    root, connection = runtime
+    tasks = [worker.Task(*row) for row in connection.execute(
+        'SELECT dataset,data_id,partition,kind,priority,state FROM tasks ORDER BY dataset,partition')]
+    pipeline._claim(connection, tasks[0])
+    connection.execute("UPDATE tasks SET state='inflight' WHERE dataset=? AND data_id=? AND partition=?",
+                       (tasks[1].dataset, tasks[1].data_id, tasks[1].partition))
+    before = connection.execute('SELECT * FROM tasks ORDER BY dataset,data_id,partition').fetchall()
+    statements = []
+    connection.set_trace_callback(statements.append)
+    pipeline.recover_claims(connection)
+    connection.set_trace_callback(None)
+    query = next(sql for sql in statements if sql.startswith('UPDATE tasks SET state='))
+    plan = [row[3] for row in connection.execute('EXPLAIN QUERY PLAN ' + query)]
+    assert any('SEARCH tasks USING INDEX sqlite_autoindex_tasks_1' in item for item in plan)
+    after = connection.execute('SELECT * FROM tasks ORDER BY dataset,data_id,partition').fetchall()
+    changed = [(a, b) for a, b in zip(before, after) if a != b]
+    assert len(changed) == 1 and changed[0][0][5] == 'inflight' and changed[0][1][5] == tasks[0].state
+    assert connection.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+
+
 @pytest.mark.parametrize('field,value', [('download_workers', True), ('derivation_workers', 99), ('arrow_threads', 0), ('max_batch_requests', 33)])
 def test_configuration_rejects_unbounded_or_boolean_counts(tmp_path, field, value):
     config = {**pipeline.settings(), field: value, 'schema_version': 1}

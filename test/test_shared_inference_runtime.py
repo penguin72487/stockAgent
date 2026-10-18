@@ -86,6 +86,22 @@ def test_shared_runtime_preserves_model_only_empty_row_visibility() -> None:
     assert weights.shape == (2, 4)
 
 
+def test_candle_diagnostic_selection_is_optional_per_call_and_unsupported_models_keep_full_aux():
+    class Selective(_AuxModel):
+        def forward(self, x, mask, *, return_aux=False, materialize_candle_aux=True):
+            self.seen_materialization = materialize_candle_aux
+            return super().forward(x, mask, return_aux=return_aux)
+
+    x, mask = torch.ones(1, 2, 1), torch.ones(1, 2, dtype=torch.bool)
+    model = Selective()
+    call_model(model, x, mask, return_aux=True, materialize_candle_aux=False)
+    assert model.seen_materialization is False
+    call_model(model, x, mask, return_aux=True)
+    assert model.seen_materialization is True
+    legacy = call_model(_AuxModel(), x, mask, return_aux=True, materialize_candle_aux=False)
+    assert legacy.keys() == {"weights", "score_logits"}
+
+
 def test_shared_runtime_loads_nested_wrapper_state_strictly() -> None:
     source = nn.Linear(3, 2)
     target = nn.Linear(3, 2)

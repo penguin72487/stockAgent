@@ -353,7 +353,7 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
     """
     from downloader.tej_desktop_attempts import (AUTHORIZED_REPLAY_CONTRACT,
         authorized_replay_policy, authorized_replay_window, query_stage,
-        retry_unknown_download, unstaged_interop_diagnostic)
+        retry_unknown_download, unstaged_interop_diagnostic, interrupted_stage_write_proof)
     from downloader.tej_history import SOURCE_SCOPE_CONTRACT, task_request
     import re
     policy = authorized_replay_policy(config)
@@ -413,7 +413,7 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
         if raw.exists():
             raise ValueError('Saved original result must be reconciled, never replayed')
         request = task_request(root, task)
-        interop = script_prepare = orphan_loss = False
+        interop = script_prepare = orphan_loss = interrupted_write = False
         from downloader.tej_startup import orphan_desktop_loss_proof
         try:
             orphan_desktop_loss_proof(root, task, request, prepared)
@@ -423,8 +423,12 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
         if orphan_loss:
             pass  # Original owner was independently proven lost, not unsent.
         elif raw.with_suffix('.json.stage.json').exists():
-            query_stage(root, task, request, prepared)
-            if recover_retained_desktop_response(root, bridge, config, before_authorized_replay=True):
+            try:
+                query_stage(root, task, request, prepared)
+            except (ValueError, OSError, TypeError, KeyError):
+                interrupted_stage_write_proof(root, task, request, prepared)
+                interrupted_write = True
+            if not interrupted_write and recover_retained_desktop_response(root, bridge, config, before_authorized_replay=True):
                 status.update(state='original_response_recovered', performed=False, failures=0,
                               next_check_at_utc=None, observed_at_utc=datetime.now(UTC).isoformat())
                 atomic_write_json(path, status)
@@ -439,6 +443,7 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
         result = retry_unknown_download(root, task['task_id'], bridge, prepared,
             allow_unstaged_interop=interop, allow_unstaged_script_preparation=script_prepare,
             allow_orphaned_desktop_loss=orphan_loss,
+            allow_interrupted_stage_write=interrupted_write,
             standing_authorization=policy)
         status.update(state=result['state'], performed=True, failures=0,
                       authorization_id=result['authorization_id'], next_check_at_utc=None,

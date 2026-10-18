@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import requests
 
+from stockagent import private_json
 from stockagent.live.shioaji_traffic_ledger import (
     QUERY_OBSERVATION_CONTRACT,
     record_avoided_query,
@@ -67,6 +68,9 @@ _TW_LIMIT_PREPARE_LOCK = threading.Lock()
 _TW_LIMIT_CACHE_KEY: str | None = None
 _TW_LIMIT_CACHE: dict[str, tuple[float | None, float | None, float | None]] = {}
 _TW_MIS_BOOTSTRAP_LOCK = threading.Lock()
+# Serialize optional warmup separately: an eight-second network probe must
+# never hold the state lock needed by every real quote worker.
+_TW_MIS_PREWARM_LOCK = threading.Lock()
 _TW_MIS_BOOTSTRAP_COOKIES: dict[str, str] = {}
 _TW_MIS_BOOTSTRAP_AT = 0.0
 # A bounded process-wide pool retains per-worker HTTP keep-alive connections.
@@ -79,10 +83,20 @@ _TW_MIS_HTTP_LOCAL = threading.local()
 _TW_MIS_INFLIGHT_LOCK = threading.Lock()
 _TW_MIS_INFLIGHT: dict[tuple[Any, ...], list[tuple[tuple[str, ...], Future]]] = {}
 _TW_MIS_OPENING_LOCK = threading.RLock()
+# Only writers serialize on this lock. Provider merges/cache-only reads never
+# wait for JSON encoding, file fsync or directory fsync.
+_TW_MIS_OPENING_PERSIST_LOCK = threading.Lock()
 _TW_MIS_OPENING_CACHE_KEY: tuple[str, str] | None = None
 _TW_MIS_OPENING_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _TW_MIS_OPENING_DIRTY = False
+_TW_MIS_OPENING_REVISION = 0
 _TW_MIS_OPENING_REQUESTED: set[str] = set()
+# Row dictionaries are copy-on-write in the canonical cache. Memoize their
+# immutable numeric projection, not freshness or a consumer's fallback array.
+# The key also fences tests/owner replacement of the cache object itself.
+_TW_MIS_OPENING_ROW_VIEWS_KEY: tuple[Any, ...] | None = None
+_TW_MIS_OPENING_ROW_VIEWS: dict[str, tuple[Mapping[str, Any], tuple[Any, ...]]] = {}
+_TW_MIS_OPENING_COLUMNS: OrderedDict[tuple[str, ...], _OpeningColumns] = OrderedDict()
 _TW_MIS_SESSION_LOCK = threading.Lock()
 _TW_MIS_SESSION_CACHE_KEY: str | None = None
 _TW_MIS_SESSION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -760,20 +774,29 @@ def load_local_stock_0901_vwaps(
     error_counts: dict[str, int] = {}
     invalid_volume_unit_rows = 0
 
+    def local_timestamp(dtype: Any) -> Any:
+        stamp = pl.col("ts")
+        if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None:
+            stamp = stamp.dt.convert_time_zone("Asia/Taipei").dt.replace_time_zone(None)
+        return stamp.cast(pl.Datetime("ns"))
+
     def accept(frame: Any, source: Path) -> None:
         nonlocal invalid_volume_unit_rows
         if not frame.height:
             return
         names = set(frame.columns)
+        if not {"ts", "minutes_from_open"} & names:
+            error_counts["missing_minute_clock"] = error_counts.get("missing_minute_clock", 0) + 1
+            return
         if "minutes_from_open" in names:
             frame = frame.filter(pl.col("minutes_from_open") == 1)
-        elif "ts" in names:
-            frame = frame.with_columns(pl.col("ts").cast(pl.Datetime("ns"))).filter(
+        if "ts" in names:
+            frame = frame.with_columns(local_timestamp(frame.schema["ts"])).filter(
                 (pl.col("ts").dt.hour() == 9) & (pl.col("ts").dt.minute() == 1)
             )
         if "date" in frame.columns:
             frame = frame.filter(pl.col("date").cast(pl.Date) == trading_date)
-        elif "ts" in frame.columns:
+        if "ts" in frame.columns:
             frame = frame.filter(pl.col("ts").dt.date() == trading_date)
         for row in frame.iter_rows(named=True):
             symbol = str(row.get("symbol") or "")
@@ -809,8 +832,23 @@ def load_local_stock_0901_vwaps(
                 )
                 if volume_unit_valid else None
             )
+            # The bar's actual first print is a separate sizing observation,
+            # never its VWAP/Close. A padded zero-volume minute cannot prove
+            # that the session opened, even if it carries a positive price.
+            opening = _float_or_none(row.get("Open"))
+            low, high = _float_or_none(row.get("Low")), _float_or_none(row.get("High"))
+            if (not volume_unit_valid or not volume_shares or volume_shares <= 0
+                    or opening is None
+                    or (low is not None and opening < low)
+                    or (high is not None and opening > high)):
+                opening = None
             resolved[symbol] = {
                 "symbol": symbol,
+                "session_open_price_0900": opening,
+                "session_open_price_source": (
+                    f"local_minute_parquet_0901_first_print_open:{row_source.resolve()}"
+                    if opening is not None else None
+                ),
                 "execution_price_0901": float(price),
                 "valuation_price_0901": (
                     close if observed_volume is not None and observed_volume > 0.0 else None
@@ -853,17 +891,17 @@ def load_local_stock_0901_vwaps(
                 boundaries = path.stem.split("_")
                 if len(boundaries) == 2 and boundaries[0] <= day_text <= boundaries[1]:
                     chunk_paths.append(path)
-        schema_groups: dict[tuple[str, ...], list[Path]] = {}
+        schema_groups: dict[tuple[tuple[str, Any], ...], list[Path]] = {}
         for path in chunk_paths:
             try:
                 schema_groups.setdefault(
-                    tuple(pl.read_parquet_schema(path).names()), []
+                    tuple(pl.read_parquet_schema(path).items()), []
                 ).append(path)
             except Exception as exc:
                 key = type(exc).__name__
                 error_counts[key] = error_counts.get(key, 0) + 1
         for schema_tuple, paths in schema_groups.items():
-            schema = set(schema_tuple)
+            schema = dict(schema_tuple)
             if "symbol" not in schema or "ts" not in schema:
                 error_counts["missing_symbol_or_timestamp"] = (
                     error_counts.get("missing_symbol_or_timestamp", 0) + len(paths)
@@ -872,13 +910,15 @@ def load_local_stock_0901_vwaps(
             columns = [
                 name
                 for name in (
-                    "symbol", "date", "ts", "Amount", "Volume",
-                    "volume_shares", "contract_unit", "Low", "High", "Close",
+                    "symbol", "date", "ts", "minutes_from_open", "Amount", "Volume",
+                    "volume_shares", "contract_unit", "Open", "Low", "High", "Close",
+                    "source_volume_unit_valid",
                 )
                 if name in schema
             ]
             try:
                 lazy = pl.scan_parquet(sorted(paths), include_file_paths="_source_path")
+                lazy = lazy.with_columns(local_timestamp(schema["ts"]))
                 if "date" in schema:
                     lazy = lazy.filter(pl.col("date").cast(pl.Date) == trading_date)
                 else:
@@ -898,19 +938,21 @@ def load_local_stock_0901_vwaps(
         partition = root / f"trade_date={day_text}" / "data.parquet"
         if unresolved and partition.is_file():
             try:
-                schema = pl.scan_parquet(partition).collect_schema().names()
+                schema = pl.scan_parquet(partition).collect_schema()
                 columns = [
                     name
                     for name in (
                         "symbol", "date", "ts", "minutes_from_open", "Amount",
                         "Volume", "volume_shares", "contract_unit", "Low", "High",
-                        "Close", "source_volume_unit_valid",
+                        "Open", "Close", "source_volume_unit_valid",
                     )
                     if name in schema
                 ]
                 lazy = pl.scan_parquet(partition).filter(
                     pl.col("symbol").is_in(sorted(unresolved))
                 )
+                if "ts" in schema:
+                    lazy = lazy.with_columns(local_timestamp(schema["ts"]))
                 if "minutes_from_open" in schema:
                     lazy = lazy.filter(pl.col("minutes_from_open") == 1)
                 elif "ts" in schema:
@@ -929,6 +971,9 @@ def load_local_stock_0901_vwaps(
         "unresolved_symbols": len(requested - set(resolved)),
         "source_counts": source_counts,
         "price_method_counts": price_method_counts,
+        "resolved_session_open_symbols": sum(
+            row["session_open_price_0900"] is not None for row in resolved.values()
+        ),
         "error_counts": error_counts,
         "invalid_volume_unit_rows": invalid_volume_unit_rows,
         "additional_shioaji_requests": 0,
@@ -2601,6 +2646,8 @@ def serve_shared_day_trade_quote_requests(
         except Exception as exc:
             response["error"] = f"{type(exc).__name__}: {exc}"
         response["broker_timing"] = {
+            "server_pid": os.getpid(),
+            "server_receiver_thread": threading.current_thread().name,
             "server_received_at_utc": server_received.isoformat(),
             "server_response_ready_at_utc": datetime.now(timezone.utc).isoformat(),
             "server_request_queue_ms": (
@@ -3613,6 +3660,8 @@ def load_prices_csv(
 
 
 def _float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
     try:
         if type(value) in (float, int, np.float64):
             # Native Snapshot numbers need neither formatting nor reparsing.
@@ -3634,7 +3683,7 @@ def _float_or_none(value: object) -> float | None:
 
 def _quantity_or_none(value: object) -> float | None:
     """Preserve a published zero quantity; unknown and zero are not aliases."""
-    if isinstance(value, (bool, np.bool_)):
+    if value is None or isinstance(value, (bool, np.bool_)):
         return None
     try:
         parsed = float(value) if type(value) in (float, int, np.float64) else float(str(value).strip().replace(",", ""))
@@ -3644,7 +3693,38 @@ def _quantity_or_none(value: object) -> float | None:
 
 
 def _snapshot_field_or_none(field: str, value: object) -> float | None:
+    if value is None:
+        return None
     return _quantity_or_none(value) if field in {"volumes", "bid_volumes", "ask_volumes"} else _float_or_none(value)
+
+
+def _decode_quote_response(response, body):
+    """Decode valid UTF-8 bytes natively; retain Requests' legacy fallbacks.
+
+    Keep declared non-UTF8 charsets, BOMs, arbitrary integers and malformed
+    byte replacement semantics. This changes neither canonical wire encoding
+    nor validation; invalid native inputs use the original response decoder.
+    """
+    encoding = (getattr(response, "encoding", None) or "utf-8").lower().replace("_", "-")
+    if isinstance(body, bytes) and encoding in {"utf8", "utf-8", "utf-8-sig"}:
+        try:
+            return private_json.loads(body)
+        except (ValueError, UnicodeError):
+            pass
+    return response.json()
+
+
+def _opening_numeric_column(field: str, values: np.ndarray) -> list[float | None]:
+    """Same scalar normalization, once per native float64 column.
+
+    Other dtypes keep the original parser: notably float32's short-string
+    semantics, bool quantities, Decimal and provider-specific text wrappers.
+    """
+    if values.ndim == 1 and values.dtype == np.dtype(np.float64):
+        valid = np.isfinite(values) & (values >= 0. if field in {
+            "volumes", "bid_volumes", "ask_volumes"} else values > 0.)
+        return [value if accepted else None for value, accepted in zip(values.tolist(), valid.tolist())]
+    return [_snapshot_field_or_none(field, value) for value in values]
 
 
 def _tw_mis_limit_price(value: object, *, lower: bool) -> float | None:
@@ -3723,7 +3803,7 @@ def _tw_mis_opening_receipt_path(session_date: str) -> Path:
 def _opening_receipt_scope_fingerprint(path: str, mtime_ns: int, size: int) -> str | None:
     """Decode receipt metadata once per atomic file generation, not per quote."""
     del mtime_ns, size
-    return json.loads(Path(path).read_text()).get("official_trading_universe", {}).get("fingerprint")
+    return private_json.loads(Path(path).read_bytes()).get("official_trading_universe", {}).get("fingerprint")
 
 
 @lru_cache(maxsize=32)
@@ -3788,6 +3868,80 @@ def _opening_row_has_open(row: Mapping[str, Any], session_date: str) -> bool:
     # v2 receipts were written after the source router's exchange-time check.
     stamp = int(row.get("open_timestamp_ms") or row.get("timestamp_ms") or 0)
     return price is not None and price > 0.0 and _same_taipei_open_timestamp(stamp, session_date)
+
+
+def _opening_row_view(symbol: str, row: Mapping[str, Any], session_date: str) -> tuple[Any, ...]:
+    """Called under the cache lock; source rows are replaced, never mutated.
+
+    Validation runs once per actual row revision. A changing source/time/conflict
+    produces a new row identity; TTL and no-print age are still checked on EVERY
+    consumer read. Source dictionaries/receipts and public ABI remain unchanged.
+    """
+    previous = _TW_MIS_OPENING_ROW_VIEWS.get(symbol)
+    if previous is not None and previous[0] is row:
+        return previous[1]
+    view = (tuple(row.get(field) for field in _PRICE_SNAPSHOT_ARRAY_FIELDS),
+        _opening_row_has_open(row, session_date), bool(row.get("available")),
+        float(row["price"]) if row.get("price") is not None else None,
+        int(row.get("timestamp_ms") or 0),
+        int(row.get("open_timestamp_ms") or row.get("exchange_timestamp_ms") or 0),
+        int(row.get("no_open_print_observed_ms") or 0),
+        str(row.get("open_source") or row.get("source") or "twse_tpex:mis"))
+    _TW_MIS_OPENING_ROW_VIEWS[symbol] = (row, view)
+    return view
+
+
+class _OpeningColumns:
+    """Bounded derived view, never a second source or a cached TTL decision.
+
+    Canonical rows are copy-on-write. Only changed row identities need decoding;
+    unchanged partial-batch wakes only check pointers and copy numeric columns.
+    Columns remain private, and every read rechecks freshness before detaching
+    its arrays. Retaining the row tuple also prevents Python id reuse.
+    """
+
+    def __init__(self, size: int):
+        self.slots = [None] * size
+        self.present = np.zeros(size, dtype=bool)
+        self.immutable = np.zeros(size, dtype=bool)
+        self.available = np.zeros(size, dtype=bool)
+        self.has_price = np.zeros(size, dtype=bool)
+        self.prices = np.full(size, np.nan)
+        self.stored_at = np.zeros(size)
+        self.timestamps = np.zeros((3, size), dtype=np.int64)
+        self.fields = np.full((len(_PRICE_SNAPSHOT_ARRAY_FIELDS), size), np.nan)
+        self.sources = [""] * size
+        self.observed_sources: set[str] = set()
+
+    def refresh(self, symbols: tuple[str, ...], session_date: str) -> None:
+        changed = False
+        for idx, symbol in enumerate(symbols):
+            cached = _TW_MIS_OPENING_CACHE.get(symbol)
+            if cached is self.slots[idx]:
+                continue
+            self.slots[idx] = cached
+            changed = True
+            self.present[idx] = cached is not None
+            if cached is None:
+                # A removed row cannot inherit the prior generation's values.
+                self.immutable[idx] = self.available[idx] = self.has_price[idx] = False
+                self.prices[idx] = np.nan
+                self.stored_at[idx] = 0.
+                self.timestamps[:, idx] = 0
+                self.fields[:, idx] = np.nan
+                self.sources[idx] = ""
+                continue
+            stored_at, row = cached
+            view = _opening_row_view(symbol, row, session_date)
+            self.stored_at[idx] = stored_at
+            self.immutable[idx], self.available[idx] = view[1:3]
+            self.has_price[idx] = view[3] is not None
+            self.prices[idx] = view[3] if self.has_price[idx] else np.nan
+            self.timestamps[:, idx] = view[4:7]
+            self.fields[:, idx] = view[0]
+            self.sources[idx] = view[7]
+        if changed:
+            self.observed_sources = {source for source in self.sources if source}
 
 
 def _tw_mis_no_open_print_mask(snapshot: PriceSnapshot, session_date: str) -> np.ndarray:
@@ -3888,13 +4042,16 @@ def tw_opening_observation_diagnostics(
         "states": {str(label): int(count) for label, count in zip(labels, counts)},
         "boundary": "decoded_source_observation_not_broker_fill",
     }
-    rows = [{
-        "symbol": symbol, "state": str(states[i]), "source": snapshot.source,
-        "open_price": float(opens[i]) if np.isfinite(opens[i]) else None,
-        "available": bool(available[i]), "market_timestamp_ms": int(market[i]),
-        "received_timestamp_ms": int(receipt[i]),
-        "simtrade": None if flags[i] == -1 else bool(flags[i]),
-    } for i, symbol in enumerate(symbols)]
+    # Bulk conversion avoids seven numpy scalar boxes per symbol and a scalar
+    # isfinite call for every observation. Values, precision and unknown flags
+    # remain exactly the same; the complete requested axis is still retained.
+    rows = [{"symbol": symbol, "state": state, "source": snapshot.source,
+        "open_price": opening if finite else None, "available": present,
+        "market_timestamp_ms": stamp, "received_timestamp_ms": received,
+        "simtrade": None if flag == -1 else bool(flag)}
+        for symbol, state, opening, finite, present, stamp, received, flag in zip(
+            symbols, states.tolist(), opens.tolist(), np.isfinite(opens).tolist(),
+            available.tolist(), market.tolist(), receipt.tolist(), flags.tolist())]
     return summary, rows
 
 
@@ -3903,7 +4060,7 @@ def _load_tw_mis_opening_receipt(
 ) -> dict[str, tuple[float, dict[str, Any]]]:
     path = _tw_mis_opening_receipt_path(session_date)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = private_json.loads(path.read_bytes())
     except (OSError, UnicodeError, ValueError):
         return {}
     if (
@@ -4020,7 +4177,7 @@ def _persist_tw_mis_opening_receipt(
     previous = {}
     try:
         previous_bytes = path.read_bytes()
-        previous = json.loads(previous_bytes)
+        previous = private_json.loads(previous_bytes)
         if previous.get("session_date") == session_date and previous.get("parquet_root") == parquet_root:
             requested.update(previous.get("requested_symbols") or previous.get("rows") or ())
     except (OSError, UnicodeError, ValueError, AttributeError, TypeError):
@@ -4061,7 +4218,7 @@ def _persist_tw_mis_opening_receipt(
     # quorum release, using the canonical writer rather than a second protocol.
     from downloader.artifact_io import atomic_write_bytes
     atomic_write_bytes(path, (json.dumps(payload, ensure_ascii=False,
-        sort_keys=True, allow_nan=False) + "\n").encode("utf-8"), durable=True)
+        sort_keys=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8"), durable=True)
     return path
 
 
@@ -4116,11 +4273,17 @@ def seed_tw_opening_snapshot_cache(
     source_text = str(snapshot.source or "official_opening_observation")
     valid_opens = tw_session_open_observed_mask(snapshot, session_date=date_text)
     source_no_print = _tw_mis_no_open_print_mask(snapshot, date_text)
+    # Validate/box each numeric column in bulk before the short merge lock.
+    # The canonical per-row conflict and first-observation rules stay below.
+    normalized = {field: _opening_numeric_column(field, values)
+                  for field, values in snapshot_arrays.items()}
+    normalized_prices = _opening_numeric_column("price", np.asarray(snapshot.prices))
     stored_at = time.monotonic()
     accepted = 0
     with _TW_MIS_OPENING_LOCK:
         global _TW_MIS_OPENING_CACHE_KEY
         global _TW_MIS_OPENING_DIRTY
+        global _TW_MIS_OPENING_REVISION
         # A late callback may not roll the process cache back to yesterday.
         if date_text != datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat():
             return {"session_date": date_text, "accepted_count": 0, "cached_count": 0, "source": source_text}
@@ -4129,6 +4292,7 @@ def seed_tw_opening_snapshot_cache(
             _TW_MIS_OPENING_REQUESTED.clear()
             _TW_MIS_OPENING_CACHE_KEY = cache_key
             _TW_MIS_OPENING_DIRTY = False
+            _TW_MIS_OPENING_REVISION += 1
             _TW_MIS_OPENING_CACHE.update(
                 _load_tw_mis_opening_receipt(
                     parquet_root=cache_key[0],
@@ -4149,19 +4313,15 @@ def seed_tw_opening_snapshot_cache(
             row.update(
                 {
                     "available": True,
-                    "price": _float_or_none(snapshot.prices[idx]),
+                    "price": normalized_prices[idx],
                     "timestamp_ms": timestamp_ms,
                     "source": source_text,
                     "exchange_timestamp_ms": int(exchange_timestamps_ms[idx]),
                 }
             )
             for field in _PRICE_SNAPSHOT_ARRAY_FIELDS:
-                values = snapshot_arrays.get(field)
-                value = (
-                    _snapshot_field_or_none(field, values[idx])
-                    if values is not None
-                    else None
-                )
+                values = normalized.get(field)
+                value = values[idx] if values is not None else None
                 if field == "open_prices":
                     # An accepted opening fact survives later failures, stale
                     # snapshots and TTL expiry. Missing is not a replacement.
@@ -4191,13 +4351,15 @@ def seed_tw_opening_snapshot_cache(
             if existing is None or row != existing[1]:
                 _TW_MIS_OPENING_CACHE[symbol] = (stored_at, row)
                 _TW_MIS_OPENING_DIRTY = True
+                _TW_MIS_OPENING_REVISION += 1
             accepted += 1
         if not set(requested).issubset(_TW_MIS_OPENING_REQUESTED):
             _TW_MIS_OPENING_REQUESTED.update(requested)
             _TW_MIS_OPENING_DIRTY = True
-        if persist:
-            persist_tw_opening_snapshot_cache(parquet_root=cache_key[0], session_date=date_text, requested_symbols=requested)
+            _TW_MIS_OPENING_REVISION += 1
         cached_count = len(_TW_MIS_OPENING_CACHE)
+    if persist:
+        persist_tw_opening_snapshot_cache(parquet_root=cache_key[0], session_date=date_text, requested_symbols=requested)
     return {
         "session_date": date_text,
         "accepted_count": accepted,
@@ -4209,26 +4371,79 @@ def seed_tw_opening_snapshot_cache(
 def persist_tw_opening_snapshot_cache(
     *, parquet_root: str | Path, session_date: str,
     requested_symbols: list[str] | None = None,
+    timings: dict[str, Any] | None = None,
 ) -> Path | None:
-    """One durable flush at quorum/final completion, not per arriving chunk."""
+    """Durably flush a frozen input set, without blocking independent merges.
+
+    Rows are copy-on-write under the cache lock. One writer freezes their map
+    and scope, then releases that lock before encoding/fsync. Later arrivals
+    remain dirty; this writer may acknowledge only its own revision. Callers
+    still wait for the durable barrier before releasing their observed quorum,
+    but a continuously updating feed cannot make that barrier chase the tail.
+    """
     global _TW_MIS_OPENING_DIRTY
-    with _TW_MIS_OPENING_LOCK:
-        if _TW_MIS_OPENING_CACHE_KEY != (str(Path(parquet_root).resolve()), session_date):
-            return None
-        if not _TW_MIS_OPENING_DIRTY:
-            path = _tw_mis_opening_receipt_path(session_date)
+    started = time.perf_counter()
+    cache_key = (str(Path(parquet_root).resolve()), session_date)
+    queued = time.perf_counter()
+    with _TW_MIS_OPENING_PERSIST_LOCK:
+        writer_acquired = time.perf_counter()
+        with _TW_MIS_OPENING_LOCK:
+            if _TW_MIS_OPENING_CACHE_KEY != cache_key:
+                return None
+            # Keep the actual generation object as well as its value: a
+            # root A -> B -> A transition may not acknowledge the old writer.
+            generation = _TW_MIS_OPENING_CACHE_KEY
+            revision = _TW_MIS_OPENING_REVISION
+            must_write = _TW_MIS_OPENING_DIRTY
+            rows = dict(_TW_MIS_OPENING_CACHE)
+            requested = sorted(_TW_MIS_OPENING_REQUESTED | set(requested_symbols or ()))
+        captured = time.perf_counter()
+        result = _tw_mis_opening_receipt_path(session_date)
+        if not must_write:
             from stockagent.data.tw_current_trading_universe import official_scope_required, load_current_universe
-            if not official_scope_required(parquet_root):
-                return path
-            authority = load_current_universe(session_date)
-            try:
-                info = path.stat()
-                if _opening_receipt_scope_fingerprint(str(path.resolve()), info.st_mtime_ns, info.st_size) == authority["fingerprint"]:
-                    return path
-            except (OSError, ValueError):
-                pass
-        result = _persist_tw_mis_opening_receipt(parquet_root=str(Path(parquet_root).resolve()), session_date=session_date, rows=_TW_MIS_OPENING_CACHE, requested_symbols=sorted(_TW_MIS_OPENING_REQUESTED | set(requested_symbols or ())))
-        _TW_MIS_OPENING_DIRTY = False
+            if official_scope_required(parquet_root):
+                authority = load_current_universe(session_date)
+                must_write = True
+                try:
+                    info = result.stat()
+                    must_write = _opening_receipt_scope_fingerprint(str(result.resolve()), info.st_mtime_ns, info.st_size) != authority["fingerprint"]
+                except (OSError, ValueError):
+                    pass
+        write_started = time.perf_counter()
+        if must_write:
+            # Scope-only writes can start from a clean cache. Rename may make
+            # the new fingerprint visible before directory fsync fails; keep
+            # a retry barrier even when the next scope check already matches.
+            with _TW_MIS_OPENING_LOCK:
+                if _TW_MIS_OPENING_CACHE_KEY is not generation:
+                    raise RuntimeError("opening cache generation changed during persistence")
+                _TW_MIS_OPENING_DIRTY = True
+            result = _persist_tw_mis_opening_receipt(parquet_root=cache_key[0], session_date=session_date,
+                                                  rows=rows, requested_symbols=requested)
+        write_finished = time.perf_counter()
+        with _TW_MIS_OPENING_LOCK:
+            if (_TW_MIS_OPENING_CACHE_KEY is not generation
+                    or datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat() != session_date):
+                raise RuntimeError("opening cache generation changed during persistence")
+            if must_write and _TW_MIS_OPENING_REVISION == revision:
+                _TW_MIS_OPENING_DIRTY = False
+            newer_input_pending = _TW_MIS_OPENING_REVISION != revision
+        finished = time.perf_counter()
+        if timings is not None:
+            timings.update({
+                "contract": "captured_opening_input_revision_durable_flush_v1",
+                "total_ms": round((finished - started) * 1000, 3),
+                "writer_queue_ms": round((writer_acquired - queued) * 1000, 3),
+                "snapshot_capture_ms": round((captured - writer_acquired) * 1000, 3),
+                "scope_check_ms": round((write_started - captured) * 1000, 3),
+                "durable_write_ms": round((write_finished - write_started) * 1000, 3) if must_write else 0.0,
+                "commit_ack_ms": round((finished - write_finished) * 1000, 3),
+                "captured_revision": revision,
+                "captured_row_count": len(rows),
+                "requested_symbol_count": len(requested),
+                "receipt_written": must_write,
+                "newer_input_pending": newer_input_pending,
+            })
         return result
 
 
@@ -4268,13 +4483,12 @@ def repair_tw_opening_snapshot_receipt(
     }
     if official_scope is not None:
         # A scope-only correction also needs publication when every open is
-        # already present; retain the prior receipt as immutable evidence.
-        with _TW_MIS_OPENING_LOCK:
-            if _TW_MIS_OPENING_CACHE_KEY == (root, session_date):
-                persist_tw_opening_snapshot_cache(parquet_root=root, session_date=session_date, requested_symbols=requested)
-            else:
-                _persist_tw_mis_opening_receipt(parquet_root=root, session_date=session_date,
-                                              rows=rows, requested_symbols=requested)
+        # already present. Use the same merge/flush owner, including its writer
+        # lock; direct writes could overwrite a newer provider's durable facts.
+        seed_tw_opening_snapshot_cache(requested, PriceSnapshot(
+            prices=np.full(len(requested), np.nan), source="opening_request_scope",
+            available_mask=np.zeros(len(requested), dtype=bool)),
+            parquet_root=root, session_date=session_date)
     started = time.perf_counter()
     source_timing = {}
     if missing:
@@ -4284,6 +4498,7 @@ def repair_tw_opening_snapshot_receipt(
             missing, fallback, parquet_root=root, providers=configured_opening_providers(root), minimum_coverage=1,
             cache_reader=lambda: fetch_tw_mis_opening_snapshot(missing, fallback, parquet_root=root, allow_network=False),
             resolve_no_prints=False, force_refresh=True,
+            poll_opening_snapshots=True,
         )
         source_timing = refreshed.transport_timing or {}
         rows = _load_tw_mis_opening_receipt(parquet_root=root, session_date=session_date)
@@ -4324,20 +4539,23 @@ def warm_tw_mis_quote_client(
     global _TW_MIS_BOOTSTRAP_COOKIES
     started = time.perf_counter()
     now_monotonic = time.monotonic()
-    with _TW_MIS_BOOTSTRAP_LOCK:
-        cache_hit = bool(
-            not force
-            and _TW_MIS_BOOTSTRAP_AT > 0.0
-            and now_monotonic - _TW_MIS_BOOTSTRAP_AT <= 7200.0
-        )
+    with _TW_MIS_PREWARM_LOCK:
+        with _TW_MIS_BOOTSTRAP_LOCK:
+            cache_hit = bool(
+                not force
+                and _TW_MIS_BOOTSTRAP_AT > 0.0
+                and now_monotonic - _TW_MIS_BOOTSTRAP_AT <= 7200.0
+            )
         if not cache_hit:
             # A failed forced probe invalidates the earlier transport proof.
             # Empty HTTP-200 responses cannot renew two hours of readiness.
-            _TW_MIS_BOOTSTRAP_AT = 0.0
-            _TW_MIS_BOOTSTRAP_COOKIES = {}
+            with _TW_MIS_BOOTSTRAP_LOCK:
+                _TW_MIS_BOOTSTRAP_AT = 0.0
+                _TW_MIS_BOOTSTRAP_COOKIES = {}
             session = requests.Session()
             session.headers.update(_YAHOO_HEADERS)
             frontend_http_status: int | None = None
+            frontend = None
             try:
                 frontend = session.get(
                     "https://mis.twse.com.tw/stock/index.jsp",
@@ -4349,6 +4567,11 @@ def warm_tw_mis_quote_client(
                 # The browser page is not the data plane.  Preserve its status
                 # for diagnostics and continue to the authoritative API probe.
                 pass
+            finally:
+                close = getattr(frontend, "close", None)
+                if close is not None:
+                    close()
+            response = None
             try:
                 response = session.get(
                     "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
@@ -4373,17 +4596,21 @@ def warm_tw_mis_quote_client(
                 if not any(isinstance(row, dict) and str(row.get("c")) == "2330"
                            for row in payload["msgArray"]):
                     raise RuntimeError("TWSE MIS quote API returned no requested probe row")
-                _TW_MIS_BOOTSTRAP_COOKIES = requests.utils.dict_from_cookiejar(
-                    session.cookies
-                )
-                _TW_MIS_BOOTSTRAP_AT = time.monotonic()
+                cookies = requests.utils.dict_from_cookiejar(session.cookies)
+                with _TW_MIS_BOOTSTRAP_LOCK:
+                    _TW_MIS_BOOTSTRAP_COOKIES = cookies
+                    _TW_MIS_BOOTSTRAP_AT = time.monotonic()
             finally:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
                 close = getattr(session, "close", None)
                 if close is not None:
                     close()
         else:
             frontend_http_status = None
-        cookie_count = len(_TW_MIS_BOOTSTRAP_COOKIES)
+        with _TW_MIS_BOOTSTRAP_LOCK:
+            cookie_count = len(_TW_MIS_BOOTSTRAP_COOKIES)
     return {
         "ready": True,
         "cache_hit": cache_hit,
@@ -4571,6 +4798,7 @@ def _fetch_tw_mis_last_prices(
     request_observations: list[dict[str, Any]] = []
     stop_dispatch = threading.Event()
     consecutive_endpoint_failures = 0
+    dispatch_stop_reason: str | None = None
     submitted_indices: set[int] = set()
     max_parallel = (
         int(max_parallel_requests)
@@ -4630,6 +4858,7 @@ def _fetch_tw_mis_last_prices(
 
     def fetch_chunk(
         items: list[tuple[int, str]],
+        enqueued_at: float | None = None,
     ) -> list[
         tuple[
             int,
@@ -4648,7 +4877,7 @@ def _fetch_tw_mis_last_prices(
             float | None,
         ]
     ]:
-        nonlocal consecutive_endpoint_failures
+        nonlocal consecutive_endpoint_failures, dispatch_stop_reason
         if not items:
             return []
         ex_ch = "|".join(ex for _, ex in items)
@@ -4657,8 +4886,15 @@ def _fetch_tw_mis_last_prices(
             code_to_indices.setdefault(str(symbols[idx]), []).append(idx)
         request_started = time.perf_counter()
         response = None
+        phase = "session_prepare"
+        spans = {"worker_queue_ms": round((request_started - enqueued_at) * 1000, 3)
+                 if enqueued_at is not None else None}
         try:
-            response = session().get(
+            client = session()
+            http_started = time.perf_counter()
+            spans["session_prepare_ms"] = round((http_started - request_started) * 1000, 3)
+            phase = "connect_tls_or_response_headers"
+            response = client.get(
                 "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
                 params={
                     "ex_ch": ex_ch,
@@ -4671,9 +4907,21 @@ def _fetch_tw_mis_last_prices(
                     **_YAHOO_HEADERS,
                 },
                 timeout=request_timeout,
+                stream=True,
             )
+            headers_received = time.perf_counter()
+            spans["http_headers_ms"] = round((headers_received - http_started) * 1000, 3)
+            phase = "http_status"
             response.raise_for_status()
-            payload = response.json()
+            phase = "body_read"
+            body = getattr(response, "content", None)
+            body_received = time.perf_counter()
+            spans["body_read_ms"] = round((body_received - headers_received) * 1000, 3)
+            spans["body_bytes"] = len(body) if isinstance(body, bytes) else None
+            phase = "json_decode"
+            payload = _decode_quote_response(response, body)
+            spans["json_decode_ms"] = round((time.perf_counter() - body_received) * 1000, 3)
+            phase = "schema_validation"
             if not isinstance(payload, dict) or not isinstance(payload.get("msgArray"), list):
                 raise ValueError("MIS response schema is unavailable")
             if payload.get("rtcode") not in (None, "0000"):
@@ -4690,7 +4938,8 @@ def _fetch_tw_mis_last_prices(
                 if close is not None:
                     close()
             error_types = _tw_mis_transport_error_types(exc)
-            failure = {"error_type": type(exc).__name__, "error_chain_types": error_types}
+            failure = {"error_type": type(exc).__name__, "error_chain_types": error_types,
+                       "failure_phase": phase, **spans}
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status is None:
                 status = getattr(response, "status_code", None)
@@ -4699,7 +4948,8 @@ def _fetch_tw_mis_last_prices(
             with chunk_failure_lock:
                 chunk_failures.append(failure)
                 endpoint_unavailable = bool(
-                    {"RemoteDisconnected", "NameResolutionError", "SSLError", "ConnectTimeout"}
+                    {"RemoteDisconnected", "NameResolutionError", "SSLError", "ConnectTimeout",
+                     "ReadTimeout", "ReadTimeoutError"}
                     .intersection(error_types) or status in {502, 503}
                 )
                 consecutive_endpoint_failures = (
@@ -4710,6 +4960,9 @@ def _fetch_tw_mis_last_prices(
                     # Do not dispatch the rest of a sweep into a refused source;
                     # the existing source owner retries its unresolved delta.
                     stop_dispatch.set()
+                    if dispatch_stop_reason is None:
+                        dispatch_stop_reason = ("source_http_refusal" if status in {401, 402, 403, 429}
+                            else "consecutive_transport_failures")
                 request_observations.append({
                     "channel_count": len(items),
                     "response_row_count": 0,
@@ -4717,6 +4970,13 @@ def _fetch_tw_mis_last_prices(
                     **failure,
                 })
             return []
+        finally:
+            # Streaming separates headers/body failure evidence. Always release
+            # this response; a body timeout must not strand a pooled socket.
+            if response is not None:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
         elapsed = getattr(response, "elapsed", None)
         headers_ms = (
             round(elapsed.total_seconds() * 1000, 3)
@@ -4730,6 +4990,7 @@ def _fetch_tw_mis_last_prices(
                 "elapsed_ms": round((time.perf_counter() - request_started) * 1000, 3),
                 "headers_ms": headers_ms,
                 "http_status": getattr(response, "status_code", None),
+                **spans,
             })
         rows: list[
             tuple[
@@ -4815,18 +5076,55 @@ def _fetch_tw_mis_last_prices(
         ]
     ] = [[] for _ in chunks]
     chunk_received_ms = [0 for _ in chunks]
+    progress_batch_count = 0
+
+    def publish_ready(batches: list[tuple[list, int]]) -> None:
+        """Coalesce only ALREADY completed disjoint batches, never wait.
+
+        A network cohort can complete together while the prior callback is
+        validating/fsyncing. Publishing those ready rows once avoids repeated
+        full-market wakes and journal barriers without dropping evidence or
+        deferring a fast response behind an unfinished request. Keep each row's
+        own receipt and market clocks. Conflicting channels are split below.
+        """
+        nonlocal progress_batch_count
+        if not batches or on_progress is None:
+            return
+        indices = list(dict.fromkeys(row[0] for rows, _received in batches for row in rows))
+        positions = {value: i for i, value in enumerate(indices)}
+        partial_prices = prices[indices].copy()
+        partial_fields = {name: np.full(len(indices), np.nan) for name in _PRICE_SNAPSHOT_ARRAY_FIELDS}
+        market_ms = np.zeros(len(indices), dtype=np.int64)
+        received_ms = np.zeros(len(indices), dtype=np.int64)
+        for rows, received in batches:
+            for row in rows:
+                local = positions[row[0]]
+                partial_prices[local] = row[1]
+                market_ms[local] = int(row[2] or 0)
+                received_ms[local] = received
+                for name, value in zip(partial_fields, row[3:]):
+                    if value is not None:
+                        partial_fields[name][local] = value
+        on_progress([symbols[i] for i in indices], PriceSnapshot(
+            prices=partial_prices, source="twse_tpex:mis", available_mask=np.ones(len(indices), dtype=bool),
+            available_count=len(indices), requested_count=len(indices), timestamps_ms=received_ms,
+            exchange_timestamps_ms=market_ms, **partial_fields,
+        ))
+        progress_batch_count += 1
+
     def fetch_indices(indices: list[int]) -> None:
         # Bound each caller's outstanding work as well as total network
         # concurrency. Workers return rows; they never mutate the result after
         # it has been handed to an inference caller.
-        remaining = iter(indices)
+        remaining = deque(indices)
         pending = {}
         for _ in range(min(workers, len(indices))):
-            index = next(remaining)
+            index = remaining.popleft()
             submitted_indices.add(index)
-            pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index])] = index
+            pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index], time.perf_counter())] = index
         while pending:
             completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            ready, ready_indices = [], set()
             for future in completed:
                 index = pending.pop(future)
                 rows = future.result()
@@ -4834,26 +5132,26 @@ def _fetch_tw_mis_last_prices(
                     chunk_results[index] = rows
                     chunk_received_ms[index] = int(time.time() * 1000)
                     if on_progress is not None:
-                        indices = list(dict.fromkeys(row[0] for row in rows))
-                        positions = {value: i for i, value in enumerate(indices)}
-                        partial_prices = prices[indices].copy()
-                        partial_fields = {name: np.full(len(indices), np.nan) for name in ("open_prices", "high_prices", "low_prices", "volumes", "upper_limit_prices", "lower_limit_prices", "bid_prices", "ask_prices", "bid_volumes", "ask_volumes", "reference_prices")}
-                        market_ms = np.zeros(len(indices), dtype=np.int64)
-                        for row in rows:
-                            local = positions[row[0]]
-                            partial_prices[local] = row[1]
-                            market_ms[local] = int(row[2] or 0)
-                            for name, value in zip(partial_fields, row[3:]):
-                                if value is not None:
-                                    partial_fields[name][local] = value
-                        on_progress([symbols[i] for i in indices], PriceSnapshot(
-                            prices=partial_prices, source="twse_tpex:mis", available_mask=np.ones(len(indices), dtype=bool), available_count=len(indices), requested_count=len(indices),
-                            timestamps_ms=np.full(len(indices), chunk_received_ms[index], dtype=np.int64), exchange_timestamps_ms=market_ms, **partial_fields,
-                        ))
-                next_index = next(remaining, None)
-                if next_index is not None and not stop_dispatch.is_set():
-                    submitted_indices.add(next_index)
-                    pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[next_index])] = next_index
+                        row_indices = {row[0] for row in rows}
+                        if ready_indices.intersection(row_indices):
+                            # Unknown venue mappings may probe both channels.
+                            # Preserve their original callback/first-open order
+                            # and both conflicting observations, not last-wins.
+                            publish_ready(ready)
+                            ready, ready_indices = [], set()
+                        ready.append((rows, chunk_received_ms[index]))
+                        ready_indices.update(row_indices)
+            publish_ready(ready)
+            # A failing endpoint must not refill a second timeout wave while
+            # the rest of its first cohort is still pending. Drain that work;
+            # probe serially only if necessary to establish the existing four-
+            # failure threshold. Any healthy reply restores full concurrency.
+            with chunk_failure_lock:
+                budget = 1 if consecutive_endpoint_failures else workers
+            while remaining and len(pending) < budget and not stop_dispatch.is_set():
+                next_index = remaining.popleft()
+                submitted_indices.add(next_index)
+                pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[next_index], time.perf_counter())] = next_index
 
     fetch_indices(list(range(len(chunks))))
     first_pass_ms = (time.perf_counter() - fetch_started) * 1000.0
@@ -4944,6 +5242,8 @@ def _fetch_tw_mis_last_prices(
             "mis_total_ms": round((time.perf_counter() - fetch_started) * 1000.0, 3),
             "mis_retry_rounds": retry_rounds,
             "mis_failed_request_count": len(chunk_failures),
+            "mis_failure_phase_counts": {phase: sum(item["failure_phase"] == phase for item in chunk_failures)
+                                         for phase in sorted({item["failure_phase"] for item in chunk_failures})},
             "mis_failure_types": sorted({item["error_type"] for item in chunk_failures}),
             "mis_http_error_statuses": sorted({item["http_status"] for item in chunk_failures if "http_status" in item}),
             "mis_http_workers": workers,
@@ -4954,8 +5254,12 @@ def _fetch_tw_mis_last_prices(
             "mis_effective_chunk_size": chunk_len,
             "mis_batch_policy": "deadline_compatible_channels_v1",
             "mis_request_count": len(request_observations),
+            "mis_progress_batch_count": progress_batch_count,
+            "mis_progress_policy": "already_ready_disjoint_cohorts_no_extra_wait_v1",
             "mis_requests": request_observations,
             "mis_dispatch_stopped": stop_dispatch.is_set(),
+            "mis_dispatch_policy": "healthy_parallel_transport_failure_drain_then_probe_v1",
+            "mis_dispatch_stop_reason": dispatch_stop_reason,
             "mis_deferred_channel_count": sum(len(items) for i, items in enumerate(chunks)
                                               if i not in submitted_indices),
             "mis_error_chain_types": sorted({name for item in chunk_failures
@@ -4963,6 +5267,7 @@ def _fetch_tw_mis_last_prices(
         },
         timestamp=timestamp,
         available_count=int(filled.sum()),
+        requested_count=len(symbols),
         available_mask=filled,
         open_prices=open_prices,
         high_prices=high_prices,
@@ -5000,7 +5305,7 @@ def fetch_tw_mis_opening_snapshot(
     performs a cache/receipt-only probe for the latency-critical source router.
     """
 
-    global _TW_MIS_OPENING_CACHE_KEY, _TW_MIS_OPENING_DIRTY
+    global _TW_MIS_OPENING_CACHE_KEY, _TW_MIS_OPENING_DIRTY, _TW_MIS_OPENING_REVISION
     requested = [str(symbol).strip() for symbol in symbols]
     fallback = np.asarray(fallback_prices, dtype=np.float64)
     if len(requested) != len(fallback):
@@ -5022,6 +5327,7 @@ def fetch_tw_mis_opening_snapshot(
             _TW_MIS_OPENING_REQUESTED.clear()
             _TW_MIS_OPENING_CACHE_KEY = cache_key
             _TW_MIS_OPENING_DIRTY = False
+            _TW_MIS_OPENING_REVISION += 1
             _TW_MIS_OPENING_CACHE.update(
                 _load_tw_mis_opening_receipt(
                     parquet_root=cache_key[0],
@@ -5030,7 +5336,7 @@ def fetch_tw_mis_opening_snapshot(
             )
         now_monotonic = time.monotonic()
         missing_indices: list[int] = []
-        for idx, symbol in enumerate(requested):
+        for idx, symbol in enumerate(requested) if allow_network else ():
             cached = _TW_MIS_OPENING_CACHE.get(symbol)
             if cached is not None and _opening_row_has_open(cached[1], session_date):
                 continue
@@ -5071,40 +5377,37 @@ def fetch_tw_mis_opening_snapshot(
     with _TW_MIS_OPENING_LOCK:
         if _TW_MIS_OPENING_CACHE_KEY != cache_key:
             raise RuntimeError("opening cache generation changed during acquisition")
+        global _TW_MIS_OPENING_ROW_VIEWS_KEY
+        view_key = (cache_key, id(_TW_MIS_OPENING_CACHE))
+        if _TW_MIS_OPENING_ROW_VIEWS_KEY != view_key:
+            _TW_MIS_OPENING_ROW_VIEWS.clear()
+            _TW_MIS_OPENING_COLUMNS.clear()
+            _TW_MIS_OPENING_ROW_VIEWS_KEY = view_key
         size = len(requested)
-        prices = fallback.copy()
-        available = np.zeros((size,), dtype=bool)
-        timestamps_ms = np.zeros((size,), dtype=np.int64)
-        open_timestamps_ms = np.zeros((size,), dtype=np.int64)
-        no_open_print_timestamps_ms = np.zeros((size,), dtype=np.int64)
-        arrays = {
-            field: np.full((size,), np.nan, dtype=np.float64)
-            for field in _PRICE_SNAPSHOT_ARRAY_FIELDS
-        }
+        axis = tuple(requested)
+        columns = _TW_MIS_OPENING_COLUMNS.get(axis)
+        if columns is None:
+            columns = _TW_MIS_OPENING_COLUMNS[axis] = _OpeningColumns(size)
+            # Five modes plus full-market readers, without unbounded consumer
+            # axes retaining old source dictionaries in a long-lived process.
+            if len(_TW_MIS_OPENING_COLUMNS) > 8:
+                _TW_MIS_OPENING_COLUMNS.popitem(last=False)
+        else:
+            _TW_MIS_OPENING_COLUMNS.move_to_end(axis)
+        columns.refresh(axis, session_date)
         assembled_at = time.monotonic()
-        for idx, symbol in enumerate(requested):
-            cached = _TW_MIS_OPENING_CACHE.get(symbol)
-            if cached is None:
-                continue
-            if not _opening_row_has_open(cached[1], session_date) and assembled_at - cached[0] > ttl:
-                continue
-            row = cached[1]
-            available[idx] = bool(row.get("available"))
-            price = row.get("price")
-            if price is not None:
-                prices[idx] = float(price)
-            timestamps_ms[idx] = int(row.get("timestamp_ms") or 0)
-            open_timestamps_ms[idx] = int(row.get("open_timestamp_ms") or row.get("exchange_timestamp_ms") or 0)
-            no_open_print_timestamps_ms[idx] = int(row.get("no_open_print_observed_ms") or 0)
-            for field, target in arrays.items():
-                value = row.get(field)
-                if value is not None:
-                    target[idx] = float(value)
-        observed_sources = {
-            str(cached[1].get("open_source") or cached[1].get("source") or "twse_tpex:mis")
-            for symbol in requested
-            if (cached := _TW_MIS_OPENING_CACHE.get(symbol)) is not None
-        }
+        keep = columns.present & (columns.immutable | (assembled_at - columns.stored_at <= ttl))
+        if not allow_network:
+            cache_hits = int(np.count_nonzero(columns.present & (columns.immutable | (
+                (now_monotonic - columns.stored_at <= ttl) & (not force_missing_retry)
+                & (now_monotonic - columns.stored_at <= no_open_retry_seconds)))))
+        prices = np.where(keep & columns.has_price, columns.prices, fallback)
+        available = keep & columns.available
+        stamps = np.where(keep[None, :], columns.timestamps, 0)
+        timestamps_ms, open_timestamps_ms, no_open_print_timestamps_ms = stamps
+        fields = np.where(keep[None, :], columns.fields, np.nan)
+        arrays = dict(zip(_PRICE_SNAPSHOT_ARRAY_FIELDS, fields))
+        observed_sources = columns.observed_sources
         conflict_count = sum(len(row.get("opening_conflicts") or ()) for _at, row in _TW_MIS_OPENING_CACHE.values())
 
     latest_ms = int(timestamps_ms.max(initial=0))

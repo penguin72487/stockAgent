@@ -36,6 +36,7 @@ from downloader.stream_shioaji_taifex_bidask import (
     select_option_strip,
 )
 from scripts.audit_shioaji_taifex_bidask_capture import (
+    capture_book_metrics,
     strategy_hedge_tail_gap_seconds,
 )
 from stockagent.live.taifex_strategy_state import (
@@ -360,6 +361,96 @@ def test_taifex_audit_caps_expiring_hedge_at_official_1330() -> None:
         }
     )
     assert strategy_hedge_tail_gap_seconds(manifest, books) == pytest.approx(6.0)
+
+
+@pytest.mark.parametrize("with_worker", [False, True])
+@pytest.mark.parametrize("length", [1, 2, 101, 1000])
+def test_streaming_capture_metrics_match_full_eager_population(tmp_path, monkeypatch, with_worker, length):
+    """Keep nearest-quantile ties, NULL simtrade and full valid population."""
+    receive = [1_800_000_000_000_000_000 + i * 1000001 for i in range(length)]
+    books = pl.DataFrame({
+        "code": ["TX" if i % 2 else "TXO" for i in range(length)],
+        "worker_index": [i % 2 for i in range(length)],
+        "receive_ts_ns": receive,
+        "exchange_ts_ns": [v - ((i % 17) - 2) * 1000003 for i, v in enumerate(receive)],
+        "simtrade": [True if i % 9 == 1 else None if i % 7 == 2 else False for i in range(length)],
+        "bid_price_1": [0. if i % 13 == 3 else 100. for i in range(length)],
+        "ask_price_1": [99. if i % 11 == 4 else 101. for i in range(length)],
+        "bid_volume_1": [0 if i % 5 == 2 else 1 for i in range(length)],
+        "ask_volume_1": [0 if i % 3 == 1 else 2 for i in range(length)],
+        # Unused deep-book payload must not cross the Python collect boundary.
+        "unused_deep_book": ["0123456789" * 100 for _ in range(length)],
+    })
+    if not with_worker:
+        books = books.drop("worker_index")
+    path = tmp_path / "books.parquet"
+    books.write_parquet(path, row_group_size=13)
+    valid = books.filter(
+        (~pl.col("simtrade").fill_null(False)) & (pl.col("bid_price_1") > 0.)
+        & (pl.col("ask_price_1") >= pl.col("bid_price_1"))
+        & (pl.col("bid_volume_1") > 0) & (pl.col("ask_volume_1") > 0)
+    )
+    transport = (valid["receive_ts_ns"] - valid["exchange_ts_ns"]).cast(pl.Float64) / 1e6
+    expected = {
+        "contracts": books["code"].n_unique(), "book_rows": length,
+        "valid_book_rows": valid.height, "valid_book_fraction": valid.height / length,
+        "transport_delay_ms_p50": float(transport.quantile(.5, "nearest")),
+        "transport_delay_ms_p99": float(transport.quantile(.99, "nearest")),
+        "receive_ts_min_ns": int(valid["receive_ts_ns"].min()),
+        "receive_ts_max_ns": int(valid["receive_ts_ns"].max()),
+        "strategy_hedge_tail_gap_seconds": None,
+    }
+    collected = []
+    original = pl.LazyFrame.collect
+    manifests = [{"contract_metadata": [{"code": code} for code in books["code"].unique()]}]
+
+    def collect_projected(query, *args, **kwargs):
+        frame = original(query, *args, **kwargs)
+        assert "unused_deep_book" not in frame.columns
+        # Small eager Series operations internally use LazyFrame.collect too.
+        if kwargs.get("engine") == "streaming":
+            collected.append((frame.height, frame.width))
+        return frame
+
+    monkeypatch.setattr(pl.LazyFrame, "collect", collect_projected)
+    assert capture_book_metrics(manifests, pl.scan_parquet(path)) == expected
+    assert len(collected) == 2 and all(height <= 2 and width <= 5 for height, width in collected)
+
+
+def test_streaming_capture_metrics_reject_missing_contracts_without_fabrication():
+    books = pl.DataFrame({"code": ["TX"], "receive_ts_ns": [10]})
+    with pytest.raises(RuntimeError, match=r"captured books miss subscribed contracts: \['TXO'\]"):
+        capture_book_metrics([{"contract_metadata": [{"code": "TXO"}]}], books.lazy())
+
+
+def test_streaming_capture_metrics_reject_all_invalid_books():
+    books = pl.DataFrame({"code": ["TX"], "receive_ts_ns": [10], "exchange_ts_ns": [1],
+                          "simtrade": [True], "bid_price_1": [100.], "ask_price_1": [101.],
+                          "bid_volume_1": [1], "ask_volume_1": [1]})
+    with pytest.raises(RuntimeError, match="capture has no valid non-crossed best BidAsk"):
+        capture_book_metrics([{"contract_metadata": [{"code": "TX"}]}], books.lazy())
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_streaming_capture_metrics_preserve_worker_hedge_tail_gate(stale):
+    from scripts.audit_shioaji_taifex_bidask_capture import BIDASK_STALE_TIMEOUT_SECONDS
+    finish = datetime.fromisoformat("2026-10-15T05:45:05+00:00")
+    gap = BIDASK_STALE_TIMEOUT_SECONDS + (1 if stale else 0)
+    receive = int((finish.timestamp() - gap) * 1e9)
+    books = pl.DataFrame({"worker_index": [0, 1, 0], "code": ["TX", "TX", "TX"],
+        "receive_ts_ns": [receive, int(finish.timestamp() * 1e9), receive - 1000000000],
+        "exchange_ts_ns": [receive - 1, int(finish.timestamp() * 1e9), receive - 1000000001],
+        "simtrade": [False] * 3, "bid_price_1": [100.] * 3, "ask_price_1": [101.] * 3,
+        "bid_volume_1": [1] * 3, "ask_volume_1": [1] * 3})
+    manifest = {"worker_index": 0, "capture_session": "day", "strategy_simulation": {"enabled": True},
+        "selection": {"resolved_hedge_future_code": "TX"},
+        "contract_metadata": [{"code": "TX", "last_trading_date": "2026-10-21"}],
+        "finished_at_utc": finish.isoformat()}
+    if stale:
+        with pytest.raises(RuntimeError, match="strategy hedge BidAsk stream ended before capture close"):
+            capture_book_metrics([manifest], books.lazy())
+    else:
+        assert capture_book_metrics([manifest], books.lazy())["strategy_hedge_tail_gap_seconds"] == gap
 
 
 class Payload:

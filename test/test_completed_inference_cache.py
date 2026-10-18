@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import os
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -15,6 +16,163 @@ import torch
 from stockagent.live import completed_inference_cache as cache
 from stockagent.live import signal_engine
 from stockagent.config import DataConfig, load_config
+
+
+def _dependency_fixture(tmp_path):
+    package = tmp_path / "app"
+    package.mkdir()
+    sources = {
+        "__init__.py": "from . import initialization\n",
+        "initialization.py": "INITIALIZED = True\n",
+        "entry.py": "from app import child\ndef lazy():\n    from .branch import helper\n",
+        "child.py": "from .branch import helper\n",
+        "branch/__init__.py": "from . import initialization\n",
+        "branch/initialization.py": "INITIALIZED = True\n",
+        "branch/helper.py": "from .. import child\nVALUE = 1\n",
+        # This file cannot even be parsed. Directory-wide collection would
+        # incorrectly make a separate unfinished subsystem an admission gate.
+        "news.py": "an unrelated unfinished news implementation ???\n",
+    }
+    for name, source in sources.items():
+        path = package / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    roots = (package / "entry.py",)
+    return package, lambda: cache._implementation_identity_from_roots(tmp_path, roots)
+
+
+def test_inference_identity_follows_transitive_lazy_relative_and_package_imports(tmp_path):
+    package, identity = _dependency_fixture(tmp_path)
+    paths = {Path(row["path"]).relative_to(package).as_posix() for row in identity()}
+    assert paths == {"__init__.py", "initialization.py", "entry.py", "child.py",
+                     "branch/__init__.py", "branch/initialization.py", "branch/helper.py"}
+
+
+def test_unconsumed_news_edits_additions_and_removal_do_not_invalidate_loaded_owner(tmp_path, monkeypatch):
+    import json
+
+    package, identity = _dependency_fixture(tmp_path)
+    before = identity()
+    monkeypatch.setattr(cache, "implementation_identity", identity)
+    monkeypatch.setattr(cache, "_admitted_implementation_json", lambda: json.dumps(before))
+    (package / "news.py").write_text("still unrelated and not valid Python !!!\n")
+    (package / "news_quality.py").write_text("unfinished ???\n")
+    assert cache.loaded_implementation_identity() == before
+    (package / "news.py").unlink()
+    assert cache.loaded_implementation_identity() == before
+
+
+@pytest.mark.parametrize("dependency", ["child.py", "branch/helper.py", "branch/initialization.py"])
+def test_real_dependency_change_requires_fresh_owner_even_with_restored_mtime(tmp_path, monkeypatch, dependency):
+    import json
+
+    package, identity = _dependency_fixture(tmp_path)
+    before = identity()
+    monkeypatch.setattr(cache, "implementation_identity", identity)
+    monkeypatch.setattr(cache, "_admitted_implementation_json", lambda: json.dumps(before))
+    target = package / dependency
+    original = target.stat()
+    target.write_text(target.read_text() + "CHANGED = True\n")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    with pytest.raises(cache.LoadedImplementationChanged):
+        cache.loaded_implementation_identity()
+    assert cache._admitted_implementation_json() == json.dumps(before)
+
+
+def test_dependency_membership_is_not_cached_after_adding_or_removing_imported_child(tmp_path):
+    package, identity = _dependency_fixture(tmp_path)
+    before = identity()
+    (package / "entry.py").write_text("try:\n    from app import optional\nexcept ImportError:\n    pass\n")
+    absent = identity()
+    (package / "optional.py").write_text("VALUE = 7\n")
+    added = identity()
+    assert before != absent != added
+    assert str(package / "optional.py") in {row["path"] for row in added}
+    (package / "optional.py").unlink()
+    assert identity() == absent
+
+
+def test_cached_graph_detects_later_namespace_package_without_initializer(tmp_path):
+    entry = tmp_path / "entry.py"
+    entry.write_text("try:\n    from later.branch import child\nexcept ImportError:\n    pass\n")
+    roots = (entry,)
+    before = cache._implementation_identity_from_roots(tmp_path, roots)
+    branch = tmp_path / "later/branch"
+    branch.mkdir(parents=True)
+    (branch / "child.py").write_text("VALUE = 1\n")
+    after = cache._implementation_identity_from_roots(tmp_path, roots)
+    assert before != after
+    assert str(branch / "child.py") in {row["path"] for row in after}
+
+
+def test_cached_identity_rows_are_not_mutable_by_consumers(tmp_path):
+    _package, identity = _dependency_fixture(tmp_path)
+    before = identity()
+    changed = identity()
+    changed[0]["generation"][0] = -1
+    changed[0]["sha256"] = "not the admitted hash"
+    changed.pop()
+    assert identity() == before
+
+
+def test_dependency_syntax_cache_reuses_only_unchanged_consumed_sources(tmp_path, monkeypatch):
+    package, identity = _dependency_fixture(tmp_path)
+    parse = cache.ast.parse
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(kwargs["filename"])
+        return parse(*args, **kwargs)
+    monkeypatch.setattr(cache.ast, "parse", counted)
+    identity()
+    assert len(calls) == 7
+    identity()
+    assert len(calls) == 7
+    (package / "news.py").write_text("not parsed ???\n")
+    identity()
+    assert len(calls) == 7
+    (package / "branch/helper.py").write_text("from .. import child\nVALUE = 2\n")
+    identity()
+    assert len(calls) == 8
+
+
+def test_inference_identity_refuses_code_racing_dependency_discovery(tmp_path, monkeypatch):
+    package, identity = _dependency_fixture(tmp_path)
+    original = cache._repository_imports
+    def racing(path, sha):
+        imports = original(path, sha)
+        if path.name == "helper.py":
+            path.write_text("VALUE = 2\n")
+        return imports
+    monkeypatch.setattr(cache, "_repository_imports", racing)
+    with pytest.raises(cache.LoadedImplementationChanged):
+        identity()
+
+
+@pytest.mark.parametrize("source", [
+    "import importlib\nimportlib.import_module('app.child')\n",
+    "__import__('app.child')\n",
+    "from importlib import import_module as load\nload('app.child')\n",
+])
+def test_literal_dynamic_loader_retains_declared_dependency_identity(tmp_path, source):
+    package, _identity = _dependency_fixture(tmp_path)
+    path = package / "entry.py"
+    path.write_text(source)
+    paths = {row["path"] for row in cache._implementation_identity_from_roots(tmp_path, (path,))}
+    assert str(package / "child.py") in paths
+    assert str(package / "branch/helper.py") in paths
+
+
+def test_canonical_inference_closure_excludes_news_and_retains_financial_dependencies():
+    repo = Path(cache.__file__).resolve().parents[2]
+    paths = {Path(row["path"]).relative_to(repo).as_posix()
+             for row in cache.implementation_identity()}
+    assert not any("news" in path for path in paths)
+    assert {"stockagent/live/signal_engine.py", "stockagent/config.py",
+            "stockagent/models/factory.py", "stockagent/models/financial_transformer.py",
+            "stockagent/data/panel.py", "stockagent/data/tw_price_rules.py",
+            "stockagent/data/factorized_panel.py", "stockagent/backtest/simulator.py",
+            "stockagent/training/runtime.py", "stockagent/training/inference_contract.py",
+            "stockagent/data_sync/immutable_cache_files.py"} <= paths
 
 
 def _bits(tensor):
@@ -48,12 +206,157 @@ def test_safe_none_result_and_tuple_identity_can_be_reused(tmp_path):
     assert value is None and receipt["state"] == "disk_hit"
 
 
+@pytest.mark.parametrize("kind", ["tuple", "dict", "tensor"])
+def test_completed_signal_projection_keeps_consumed_values_and_source_inventory(tmp_path, kind):
+    weights = torch.tensor([[0., -0., float("nan"), 1.]], dtype=torch.float64)
+    aux = {key: weights.clone() for key in signal_engine._COMPLETED_SIGNAL_AUX_KEYS}
+    # An unconsumed diagnostic must never reach the CPU copy/serializer. The
+    # ordinary model output remains intact; this is a service projection only.
+    aux["temporal_basis_input_features"] = object()
+    raw_scores = weights.to(torch.bfloat16)
+    output = ((weights, raw_scores, aux) if kind == "tuple" else
+              {"weights": weights, **aux} if kind == "dict" else weights)
+    original_weights, original_aux = signal_engine.extract_weights_and_aux(output)
+    expected_score, expected_source = signal_engine._raw_score_tensor_from_model_output(
+        output, original_aux)
+    projection = signal_engine._completed_signal_projection(output)
+    projected_weights, projected_aux = signal_engine.extract_weights_and_aux(projection["output"])
+    assert projected_weights is original_weights  # No staging copy before the cache owns it.
+    if original_aux is not None:
+        assert projection["source_aux_fields"] == sorted(original_aux)
+        assert "temporal_basis_input_features" not in projected_aux
+        assert "temporal_basis_input_features" in original_aux
+        for key in signal_engine._COMPLETED_SIGNAL_AUX_KEYS:
+            assert projected_aux[key] is original_aux[key]
+    else:
+        assert projected_aux is None and projection["source_aux_fields"] == []
+    loaded, _ = cache.cached_forward(tmp_path, {"output_profile": projection["contract"]},
+                                    lambda: projection)
+    assert _bits(signal_engine.extract_weights_and_aux(loaded["output"])[0]) == _bits(weights)
+    score, source = signal_engine._raw_score_tensor_from_model_output(
+        loaded["output"], signal_engine.extract_weights_and_aux(loaded["output"])[1])
+    assert source == expected_source
+    assert (score is None and expected_score is None) or _bits(score) == _bits(expected_score)
+
+
+def test_completed_signal_projection_retains_tuple_fallback_score_without_aux():
+    weights, scores = torch.tensor([[1.]]), torch.tensor([[-0.]], dtype=torch.bfloat16)
+    projection = signal_engine._completed_signal_projection((weights, scores))
+    projected = projection["output"]
+    projected_weights, aux = signal_engine.extract_weights_and_aux(projected)
+    raw, source = signal_engine._raw_score_tensor_from_model_output(projected, aux)
+    assert projected_weights is weights and raw is scores and source == "scores"
+    assert aux is None and projection["source_aux_fields"] == []
+
+
+def test_every_live_aux_value_consumer_is_in_completed_signal_projection():
+    """A new live consumer requires an intentional profile/version review."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(signal_engine))
+    consumed = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "aux"
+                and node.args and isinstance(node.args[0], ast.Constant)):
+            consumed.add(node.args[0].value)
+        if (isinstance(node.func, ast.Name) and node.func.id == "_aux_scalar_by_symbol"
+                and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)):
+            consumed.add(node.args[1].value)
+    score_reader = ast.parse(inspect.getsource(signal_engine._raw_score_tensor_from_model_output))
+    for node in ast.walk(score_reader):
+        if (isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                and node.target.id == "key" and isinstance(node.iter, ast.Tuple)):
+            consumed.update(item.value for item in node.iter.elts if isinstance(item, ast.Constant))
+    assert consumed <= signal_engine._COMPLETED_SIGNAL_AUX_KEYS
+
+
+def test_different_inputs_still_compute_but_identical_outputs_share_payload(tmp_path, monkeypatch):
+    import json
+
+    calls = []
+    def compute():
+        calls.append(True)
+        return {"weights": torch.tensor([0., -0., float("nan"), 2.], dtype=torch.float64)}
+    first_identity, second_identity = {"input": "old"}, {"input": "new"}
+    _, first = cache.cached_forward(tmp_path, first_identity, compute)
+    written = []
+    original = cache.atomic_write_bytes
+    def record(path, *args, **kwargs):
+        written.append(path.suffix)
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(cache, "atomic_write_bytes", record)
+    _, second = cache.cached_forward(tmp_path, second_identity, compute)
+    a, b = (tmp_path / f"{receipt['key']}.forward" for receipt in (first, second))
+    assert calls == [True, True]  # Storage equality does not waive changed-input compute.
+    assert second["state"] == "computed" and second["storage_build"]["reused_payload"]
+    assert second["storage_build"]["avoided_payload_bytes"] == a.stat().st_size
+    assert os.path.samefile(a, b) and a.stat().st_mode & 0o222 == 0
+    assert ".forward" not in written
+    record = json.loads(b.with_suffix(".receipt.json").read_bytes())
+    assert record["identity"] == second_identity and record["key"] != first["key"]
+    a.unlink()  # Each key owns a link; retiring its donor cannot break it.
+    loaded, _ = cache.cached_forward(tmp_path, second_identity, lambda: pytest.fail("compute"))
+    before = _bits(loaded["weights"])
+    loaded["weights"].fill_(7.)
+    loaded, _ = cache.cached_forward(tmp_path, second_identity, lambda: pytest.fail("compute"))
+    assert _bits(loaded["weights"]) == before
+
+
+@pytest.mark.parametrize("damage", ["writable", "busy", "receipt", "payload"])
+def test_unsupported_forward_donor_is_a_miss_not_a_changed_authority(tmp_path, damage):
+    from contextlib import nullcontext
+    import json
+
+    _, first = cache.cached_forward(tmp_path, {"input": "a"}, lambda: torch.tensor([3.]))
+    source = tmp_path / f"{first['key']}.forward"
+    lease = nullcontext()
+    if damage == "writable":
+        source.chmod(0o600)
+    elif damage == "busy":
+        lease = cache._singleflight(source.with_suffix(".lock"))
+    elif damage == "receipt":
+        receipt_path = source.with_suffix(".receipt.json")
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["identity"] = {"wrong": "input"}
+        receipt_path.write_text(json.dumps(receipt))
+    else:
+        content = bytearray(source.read_bytes())
+        content[-1] ^= 1
+        source.write_bytes(content)
+    before = source.read_bytes()
+    with lease:
+        result, second = cache.cached_forward(tmp_path, {"input": "b"}, lambda: torch.tensor([3.]))
+    assert result.tolist() == [3.] and not second["storage_build"]["reused_payload"]
+    assert not os.path.samefile(source, tmp_path / f"{second['key']}.forward")
+    assert source.read_bytes() == before
+
+
 def test_incomplete_payload_receipt_commit_is_repaired(tmp_path):
     identity = {"input": "crash"}
     cache.cached_forward(tmp_path, identity, lambda: torch.tensor([1.]))
     (tmp_path / f"{cache.identity_digest(identity)}.receipt.json").unlink()
     value, receipt = cache.cached_forward(tmp_path, identity, lambda: torch.tensor([2.]))
     assert receipt["repaired_invalid_cache"] and value.tolist() == [2.]
+
+
+def test_inputs_are_revalidated_after_content_lookup_before_receipt_commit(tmp_path, monkeypatch):
+    changed = []
+    def donor_lookup(*args, **kwargs):
+        changed.append(True)
+        return False
+    def validate():
+        if changed:
+            raise RuntimeError("inputs changed during storage lookup")
+    monkeypatch.setattr(cache, "_reuse_payload", donor_lookup)
+    with pytest.raises(RuntimeError, match="during storage"):
+        cache.cached_forward(tmp_path, {"input": "a"}, lambda: torch.tensor([1.]),
+                             validate_before_commit=validate)
+    assert not list(tmp_path.glob("*.receipt.json"))
+    assert not list(tmp_path.glob("*.forward"))
 
 
 @pytest.mark.parametrize("damage", [b"[]", b'{"payload_bytes":0}', b""])
@@ -360,6 +663,36 @@ def test_source_metadata_revision_rebuilds_summary_but_does_not_duplicate_identi
     assert receipt["accepted_source_generation"] == "newly-accepted-source"
 
 
+def test_output_projection_version_is_part_of_the_canonical_forward_key(tmp_path, monkeypatch):
+    import json
+
+    kwargs, calls = _toy_forward(tmp_path, monkeypatch)
+    _, _, _, first = signal_engine._live_forward_outputs(**kwargs)
+    root = tmp_path / "cache"
+    identity = json.loads((root / f"{first['key']}.receipt.json").read_text())["identity"]
+    assert identity["output_profile"] == signal_engine._COMPLETED_SIGNAL_PROJECTION
+    assert first["output_projection"]["source_aux_fields"] == []
+    monkeypatch.setattr(signal_engine, "_COMPLETED_SIGNAL_PROJECTION", "next_explicit_signal_abi")
+    _, _, _, second = signal_engine._live_forward_outputs(**kwargs)
+    assert first["key"] != second["key"] and len(calls) == 2
+    assert (root / f"{first['key']}.forward").exists()  # No in-place legacy migration.
+
+
+def test_candle_policy_has_its_own_key_and_only_completed_sessions_request_omission(tmp_path, monkeypatch):
+    kwargs, _ = _toy_forward(tmp_path, monkeypatch)
+    original, choices = signal_engine.call_model, []
+    def observe(*args, **options):
+        choices.append(options["materialize_candle_aux"])
+        return original(*args, **options)
+    monkeypatch.setattr(signal_engine, "call_model", observe)
+    _, _, _, first = signal_engine._live_forward_outputs(**kwargs)
+    monkeypatch.setattr(signal_engine, "_COMPLETED_CANDLE_AUX_POLICY", "next_explicit_diagnostic_policy")
+    _, _, _, second = signal_engine._live_forward_outputs(**kwargs)
+    assert first["key"] != second["key"]
+    signal_engine._live_forward_outputs(**{**kwargs, "completed_cache": False})
+    assert choices == [False, False, None]
+
+
 def test_deployment_racing_forward_cannot_publish_old_result_under_new_identity(tmp_path, monkeypatch):
     kwargs, _ = _toy_forward(tmp_path, monkeypatch)
     original = signal_engine.call_model
@@ -379,8 +712,9 @@ def test_live_forward_bypasses_persistent_cache(tmp_path, monkeypatch):
     kwargs, calls = _toy_forward(tmp_path, monkeypatch)
     kwargs["completed_cache"] = False
     for _ in range(2):
-        _, _, _, receipt = signal_engine._live_forward_outputs(**kwargs)
+        output, _, _, receipt = signal_engine._live_forward_outputs(**kwargs)
         assert receipt is None
+        assert output[1]["aux"].dtype == torch.bfloat16  # Ordinary/live model ABI is unchanged.
     assert len(calls) == 2 and not (tmp_path / "cache").exists()
 
 

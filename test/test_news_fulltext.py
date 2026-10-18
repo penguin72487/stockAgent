@@ -504,19 +504,21 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     if ftnn.allowed:
         assert ftnn.known_url_only and ftnn.acquisition_mode == 'continuous'
         assert ftnn.domains == ('ftnn.com.tw',)
-        assert ftnn.embedded_article_layout == 'ftnn_visible_article_v1'
+        assert ftnn.embedded_article_layout in {'ftnn_visible_article_v1', 'ftnn_visible_article_v2', 'ftnn_visible_article_v3', 'ftnn_visible_article_v4', 'ftnn_visible_article_v5', 'ftnn_visible_article_v6'}
         assert ftnn.authorization['kind'] == 'personal_research'
         assert ftnn.authorization['evidence_url'] == 'https://www.ftnn.com.tw/copyright'
         assert ftnn.selectors == (':scope > .news-body',)
         assert not ftnn.feeds and not ftnn.sitemaps
         expected.add('ftnn')
-    # TVBS joins only through its tested three-layout/private native contract.
+    # TVBS joins only through its reviewed native/private recipe and route ABI.
     tvbs = registry.sources['tvbs']
     if tvbs.allowed:
+        from downloader.news_fulltext_tvbs import TVBS_PATH_PATTERN, TVBS_V4_PATH_PATTERN
         assert tvbs.known_url_only and tvbs.acquisition_mode == 'continuous'
         assert tvbs.domains == ('news.tvbs.com.tw', 'cars.tvbs.com.tw', 'supertaste.tvbs.com.tw')
-        assert tvbs.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}
-        assert tvbs.article_path_pattern == '^(?:/[a-z][a-z-]*/[1-9][0-9]*|/exhibition/ai-trends-2026/article_(?:1|3)-3[.]html)$'
+        assert tvbs.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2', 'tvbs_visible_article_v3', 'tvbs_visible_article_v4'}
+        assert tvbs.article_path_pattern == (TVBS_V4_PATH_PATTERN
+            if tvbs.embedded_article_layout == 'tvbs_visible_article_v4' else TVBS_PATH_PATTERN)
         assert tvbs.authorization['kind'] == 'personal_research'
         assert tvbs.authorization['evidence_url'] == 'https://www.tvbs.com.tw/policies/copyright'
         assert tvbs.selectors == (':scope > .tvbs-native-body',)
@@ -529,7 +531,8 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         from downloader.news_fulltext_ettoday import ETTODAY_BODY_SELECTOR, ETTODAY_PATH_PATTERN
         assert ettoday.known_url_only and ettoday.acquisition_mode == 'continuous'
         assert ettoday.domains == ('ettoday.net',)
-        assert ettoday.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}
+        from downloader.news_fulltext_policy import ETTODAY_LAYOUT_VERSIONS
+        assert ettoday.embedded_article_layout in ETTODAY_LAYOUT_VERSIONS
         assert ettoday.article_path_pattern == ETTODAY_PATH_PATTERN
         assert ettoday.authorization['kind'] == 'personal_research'
         assert ettoday.authorization['evidence_url'] == 'https://member.ettoday.net/clause_copyright.php7'
@@ -537,6 +540,19 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         assert ettoday.require_configured_container and ettoday.require_author_attribution
         assert not ettoday.feeds and not ettoday.sitemaps and not ettoday.wordpress_apis and not ettoday.fulltext_feeds
         expected.add('ettoday')
+    mnews = registry.sources.get('mnews')
+    if mnews is not None and mnews.allowed:
+        from downloader.news_fulltext_mnews import MNEWS_BODY_SELECTOR, MNEWS_PATH_PATTERN
+        assert mnews.known_url_only and mnews.acquisition_mode == 'continuous'
+        assert mnews.domains == ('www.mnews.tw',)
+        assert mnews.embedded_article_layout == 'mnews_visible_article_v1'
+        assert mnews.article_path_pattern == MNEWS_PATH_PATTERN
+        assert mnews.selectors == (MNEWS_BODY_SELECTOR,)
+        assert mnews.authorization['kind'] == 'personal_research'
+        assert mnews.authorization['evidence_url'] == 'https://www.mnews.tw/story/webauthorization'
+        assert mnews.require_configured_container and mnews.require_author_attribution
+        assert not mnews.feeds and not mnews.sitemaps and not mnews.wordpress_apis and not mnews.fulltext_feeds
+        expected.add('mnews')
     assert {p.provider for p in registry.sources.values() if p.allowed} == expected
     events = registry.sources['eventsinfocus']
     assert events.acquisition_mode == 'finite'

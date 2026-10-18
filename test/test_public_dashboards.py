@@ -419,6 +419,53 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
         )
 
 
+@pytest.mark.parametrize("surface", ["signals", "positions", "status_positions", "status_modes"])
+def test_counterfactual_origin_survives_public_projection_without_private_ids(surface):
+    source_row = {
+        "signal_id": "tw_day_trade-counterfactual-official-open-2026-01-02",
+        "session_date": "2026-01-02", "symbol": "2330",
+        "counterfactual_open_replay": True,
+        "source_signal_path": "/private/summary.json", "api_key": "must-not-publish",
+    }
+    payload = {"simulation_only": True, "production_order_possible": False}
+    if surface == "signals":
+        payload["rows"] = [{**source_row, "position": dict(source_row)}]
+        sanitizer, collection = sanitize_tw_signals, "rows"
+    elif surface == "positions":
+        payload["rows"] = [dict(source_row)]
+        sanitizer, collection = sanitize_tw_positions, "rows"
+    else:
+        collection = "positions" if surface == "status_positions" else "modes"
+        payload[collection] = [dict(source_row)]
+        sanitizer = sanitize_tw_status
+    original = json.dumps(payload, sort_keys=True)
+    public = sanitizer(payload)
+    row = public[collection][0]
+    assert row["replay_signal_origin"] == "current_model_counterfactual"
+    if surface == "signals":
+        assert row["position"]["replay_signal_origin"] == "current_model_counterfactual"
+    assert not {"signal_id", "source_signal_path", "api_key"} & _keys(public)
+    assert "must-not-publish" not in json.dumps(public)
+    assert json.dumps(payload, sort_keys=True) == original
+
+
+@pytest.mark.parametrize("overrides", [
+    {"signal_id": "retained-original-signal"},
+    {"signal_id": "tw_day_trade-counterfactual-official-open-2026-01-05"},
+    {"counterfactual_open_replay": False},
+    {"counterfactual_open_replay": None},
+    {"signal_id": None},
+])
+def test_public_counterfactual_origin_does_not_relabel_retained_or_mismatched_signals(overrides):
+    row = {"signal_id": "tw_day_trade-counterfactual-official-open-2026-01-02",
+           "session_date": "2026-01-02", "counterfactual_open_replay": True, **overrides}
+    payload = {"simulation_only": True, "production_order_possible": False, "rows": [row]}
+    for sanitizer in (sanitize_tw_signals, sanitize_tw_positions):
+        public_row = sanitizer(payload)["rows"][0]
+        assert "replay_signal_origin" not in public_row
+        assert "signal_id" not in public_row
+
+
 def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
     public = sanitize_tw_signals({
         "simulation_only": True,
@@ -686,7 +733,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
     assert 'src="dashboard-core.js?v=15"' in html
-    assert 'src="public.js?v=15"' in html
+    assert 'src="public.js?v=16"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
@@ -1202,7 +1249,7 @@ def test_public_pages_have_valid_accessible_static_shells() -> None:
         assert skip_target.group(1) in ids
 
 
-def _test_server() -> PublicDashboardServer:
+def _test_server(*, audience: str = "owner") -> PublicDashboardServer:
     root = Path(__file__).resolve().parents[1]
     return PublicDashboardServer(
         ("127.0.0.1", 0),
@@ -1216,6 +1263,7 @@ def _test_server() -> PublicDashboardServer:
         repo_root=root,
         taifex_upstream="http://127.0.0.1:1",
         tw_upstream="http://127.0.0.1:1",
+        audience=audience,
     )
 
 

@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import polars as pl
 
 from downloader.shioaji_daily_calendar import (
@@ -240,6 +241,35 @@ def _audit_daily_chunks(
 
 
 def _allclose(left: pl.Series, right: pl.Series) -> bool:
+    if len(left) != len(right):
+        return False
+    if len(left) >= 256 and all(series.dtype.is_integer() or series.dtype.is_float() or series.dtype == pl.Boolean
+           for series in (left, right)):
+        # Mirror math.isclose's two relative comparisons in FP64. Inf only
+        # matches identical Inf; NaN and null never match, even themselves.
+        # Casting other dtypes can differ from Python float(), so they retain
+        # the scalar oracle below rather than broadening accepted sources.
+        if left.null_count() or right.null_count():
+            return False
+        # A full-market ABBA rejected eager Polars Series arithmetic here:
+        # many small dispatches cost more than the scalar oracle. NumPy views
+        # keep this bounded numeric reduction native; short columns stay scalar.
+        a, b = left.cast(pl.Float64).to_numpy(), right.cast(pl.Float64).to_numpy()
+        with np.errstate(invalid="ignore", over="ignore"):
+            difference = np.abs(b - a)
+            close = ((a == b) & ~np.isnan(a)) | (
+                np.isfinite(a) & np.isfinite(b) & (
+                    (difference <= np.abs(b * 1e-12))
+                    | (difference <= np.abs(a * 1e-12))
+                    | (difference <= 1e-9)
+                )
+            )
+        return bool(np.all(close))
+    return _allclose_reference(left, right)
+
+
+def _allclose_reference(left: pl.Series, right: pl.Series) -> bool:
+    """Original scalar compatibility oracle, including Python float coercion."""
     if len(left) != len(right):
         return False
     for a, b in zip(left, right, strict=True):

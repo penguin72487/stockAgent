@@ -156,6 +156,18 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _read_epoch_curve(path: Path) -> list[dict[str, Any]]:
+    rows = _read_jsonl(path)
+    sidecar = path.with_name('epoch_workflow_timing.jsonl')
+    if sidecar.is_file():
+        complete = _read_jsonl(sidecar)
+        by_epoch = {int(row['epoch']): row for row in complete}
+        if len(by_epoch) != len(complete):
+            raise ValueError(f'duplicate complete-epoch timing in {sidecar}')
+        rows = [{**row, **by_epoch.get(int(row['epoch']), {})} for row in rows]
+    return rows
+
+
 def _single_epoch_curve(run_dir: Path) -> Path:
     curves = sorted(run_dir.rglob("epoch_curve.jsonl"))
     if len(curves) != 1:
@@ -266,6 +278,8 @@ def _score_curve(
     world_size: int = 1,
     annual_ownership: dict[str, Any] | None = None,
     require_explicit_carry_graph: bool = False,
+    model_forward_passes: int = 1,
+    objective: str = "log_utility",
 ) -> dict[str, Any]:
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
@@ -279,7 +293,10 @@ def _score_curve(
     # predates the generic executor's MAX-rank names; neither is rank-local.
     max_rank = any("epoch_wall_s_max_rank" in row for row in steady)
     trajectory_max_rank = any("epoch_max_rank_s" in row for row in steady)
-    if max_rank:
+    complete_max_rank = any('complete_epoch_wall_s_max_rank' in row for row in steady)
+    if complete_max_rank:
+        epoch_wall_key, train_wall_key = 'complete_epoch_wall_s_max_rank', 'complete_train_total_s_max_rank'
+    elif max_rank:
         epoch_wall_key, train_wall_key = "epoch_wall_s_max_rank", "train_total_s_max_rank"
     elif trajectory_max_rank:
         epoch_wall_key, train_wall_key = "epoch_max_rank_s", "train_max_rank_s"
@@ -294,10 +311,22 @@ def _score_curve(
             value = _finite_float(row.get(key))
             if value is None or (key in (epoch_wall_key, train_wall_key) and value <= 0):
                 reasons.append(f"epoch {epoch} has invalid {key}={row.get(key)!r}")
-        if int(row.get("train_zero_grad_batches", 0) or 0) != 0:
+        # Pure MDD has a valid zero-loss/zero-gradient cash optimum. Report it
+        # as such instead of diagnosing a broken gradient or adding return.
+        zero_mdd_optimum = objective == "trajectory_mdd" and _finite_float(row.get("train_loss")) == 0.
+        from stockagent.training.multiobjective import MULTIOBJECTIVE_OBJECTIVES
+        zero_surgery_direction = (objective in MULTIOBJECTIVE_OBJECTIVES
+            and _finite_float(row.get("train_multiobjective_combined_norm")) == 0.
+            and all(_finite_float(row.get(f"train_multiobjective_loss_{name}")) is not None
+                    for name in ("sharpe", "log_return", "sortino", "mdd"))
+            and ("mgda" not in objective or
+                 (_finite_float(row.get("train_multiobjective_mgda_kkt_margin")) is not None
+                  and float(row["train_multiobjective_mgda_kkt_margin"]) >= -1e-9)))
+        zero_direction_allowed = zero_mdd_optimum or zero_surgery_direction
+        if int(row.get("train_zero_grad_batches", 0) or 0) != 0 and not zero_direction_allowed:
             reasons.append(f"epoch {epoch} contains zero-gradient optimizer batches")
         grad_norm = _finite_float(row.get("train_grad_norm_before_clip_mean"))
-        if grad_norm is None or grad_norm <= 0:
+        if grad_norm is None or grad_norm < 0 or (grad_norm == 0 and not zero_direction_allowed):
             reasons.append(f"epoch {epoch} has non-positive/non-finite gradient norm")
         if int(row.get("dynamo_unique_graphs_epoch_delta", 0) or 0) != 0:
             reasons.append(f"epoch {epoch} compiled a new Dynamo graph after warmup")
@@ -354,8 +383,11 @@ def _score_curve(
                 train_rows=train_rows, global_batch_rows=global_batch_size, world_size=world_size)
         except (ValueError, TypeError, KeyError) as exc:
             return {"ok": False, "reasons": [str(exc)], "memory": memory}
-    expected_batches = (ownership_validation["reporting_rank_batches"] if ownership_validation
+    if model_forward_passes not in {1, 2, 5}:
+        raise ValueError("benchmark supports one physical, two return-space, or five parameter-space passes")
+    batches_per_pass = (ownership_validation["reporting_rank_batches"] if ownership_validation
                         else math.ceil(train_rows / global_batch_size))
+    expected_batches = batches_per_pass * model_forward_passes
     if any(value != expected_batches for value in train_batches):
         return {
             "ok": False,
@@ -370,7 +402,7 @@ def _score_curve(
     median_epoch_wall = _median(epoch_wall)
     median_train_wall = _median(train_wall)
     padded_slots = (ownership_validation["padded_slots"] if ownership_validation
-                    else expected_batches * global_batch_size)
+                    else batches_per_pass * global_batch_size)
     return {
         "ok": True,
         "steady_epochs": [int(row.get("epoch", 0) or 0) for row in steady],
@@ -378,11 +410,14 @@ def _score_curve(
         "global_batch_size": global_batch_size,
         "local_batch_size": None,
         "train_batches": expected_batches,
+        "model_forward_passes": model_forward_passes,
+        "model_forward_slots": padded_slots * model_forward_passes,
         "padded_slots": padded_slots,
         "padding_fraction": (padded_slots - train_rows) / padded_slots,
         "annual_ownership_validation": ownership_validation,
         "median_epoch_wall_s": median_epoch_wall,
-        "timing_scope": "maximum_rank" if max_rank or trajectory_max_rank else "legacy_reporting_rank",
+        "timing_scope": "maximum_rank" if complete_max_rank or max_rank or trajectory_max_rank else "legacy_reporting_rank",
+        "complete_epoch_timing_observed": complete_max_rank,
         "epoch_wall_field": epoch_wall_key,
         "epoch_wall_mad_s": _median_absolute_deviation(epoch_wall),
         "median_train_wall_s": median_train_wall,
@@ -576,10 +611,19 @@ def _validate_source_contract(
         raise ValueError(
             "source config must contain data, training, and trading mappings"
         )
+    from stockagent.training.return_adjoint import RETURN_ADJOINT_OBJECTIVES
+    selected_objective = str(training.get("loss_type", "")).strip().lower()
+    if selected_objective in RETURN_ADJOINT_OBJECTIVES and (
+            expected_execution_mode != "tw_day_trade"
+            or not training.get("day_trade_annual_episode_sharding")
+            or not training.get("day_trade_training_annual_episodes")
+            or not training.get("day_trade_optimizer_step_per_trajectory")):
+        raise ValueError("single-metric benchmark requires complete annual physical trajectory ownership")
     expected = {
         "trading.execution_mode": expected_execution_mode,
         "trading.frequency": "daily",
-        "training.loss_type": "log_utility",
+        "training.loss_type": (selected_objective
+                               if selected_objective in RETURN_ADJOINT_OBJECTIVES else "log_utility"),
     }
     actual = {
         "trading.execution_mode": trading.get("execution_mode"),
@@ -821,12 +865,19 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 raise ValueError(f"incomplete fold lifecycle: {conformance.missing}, {conformance.invalid}")
             result["lifecycle_ok"] = True
             curve_path = _single_epoch_curve(run_dir)
-            rows = _read_jsonl(curve_path)
+            rows = _read_epoch_curve(curve_path)
             train_rows = _parse_train_rows(log_path)
             memory = _gpu_memory_summary(gpu_path, gpu_indices=args.gpu_indices)
             annual_ownership = None
             if base.get("training", {}).get("day_trade_annual_episode_sharding", False):
                 annual_ownership = json.loads((curve_path.parent / "annual_episode_ownership.json").read_text())
+            from stockagent.training.return_adjoint import RETURN_ADJOINT_OBJECTIVES, return_adjoint_contract
+            objective = base.get("training", {}).get("loss_type")
+            passes = 1
+            if objective in RETURN_ADJOINT_OBJECTIVES:
+                contract = return_adjoint_contract(objective)
+                passes = contract.get("model_forward_passes",
+                    1 if contract.get("engine") == "single_pass_account_compound_gradient_rescale_v1" else 2)
             score = _score_curve(
                 rows,
                 skip_epochs=args.skip_epochs,
@@ -841,6 +892,8 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 ),
                 world_size=args.world_size,
                 annual_ownership=annual_ownership,
+                model_forward_passes=passes,
+                objective=objective,
                 require_explicit_carry_graph=(
                     env.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0") == "1"
                 ),

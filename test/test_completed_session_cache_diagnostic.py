@@ -9,6 +9,13 @@ import pytest
 from scripts import verify_completed_session_cache as observer
 
 
+@pytest.fixture(autouse=True)
+def fresh_cpu_observer(monkeypatch):
+    # Unit-level cold-process context; genuine fresh-process verification is a
+    # separate operational check and the production CUDA guard is unchanged.
+    monkeypatch.setattr(observer.torch.cuda, "is_initialized", lambda: False)
+
+
 @pytest.mark.parametrize("boundary", ["source_lease", "loaded_code"])
 def test_diagnostic_persists_admission_rejections_without_reading_or_computing(
     tmp_path, monkeypatch, boundary,

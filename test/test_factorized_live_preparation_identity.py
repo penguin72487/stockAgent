@@ -4,7 +4,7 @@ import json
 import pytest
 
 from scripts.prepare_tw_day_trade_factorized_live import (
-    _native_context_identity, _verify_preparation_inputs,
+    _fixed_seed_event_paths, _native_context_identity, _verify_preparation_inputs,
 )
 from stockagent.data.factorized_panel import file_sha256
 
@@ -46,3 +46,47 @@ def test_publication_context_cannot_escape_original_root(tmp_path):
     manifest["source_repairs"]["publication_lower_bounds"] = "../other.parquet"
     with pytest.raises(ValueError, match="escaped"):
         _native_context_identity(native, manifest)
+
+
+def test_reuse_implementation_is_fenced_before_publication_including_cache_hits(tmp_path, monkeypatch):
+    from scripts import prepare_tw_day_trade_factorized_live as owner
+    native, manifest, config, identity = context(tmp_path)
+    identity["storage_implementation"] = owner.storage_implementation_identity()
+    _verify_preparation_inputs(config, native, manifest, identity)
+    monkeypatch.setattr(owner, "storage_implementation_identity", lambda: {"changed": "dependency"})
+    with pytest.raises(ValueError, match="context changed"):
+        _verify_preparation_inputs(config, native, manifest, identity)
+
+
+@pytest.mark.parametrize("layout", ["annual_events", "flattened"])
+def test_fixed_seed_supports_original_and_verified_bounded_layouts(tmp_path, layout):
+    root = tmp_path / "parent"
+    root.mkdir()
+    member = root / "annual_events/2013.parquet" if layout == "annual_events" else root / "2013.parquet"
+    member.parent.mkdir(exist_ok=True)
+    member.write_bytes(b"unchanged original seed")
+    manifest = {"annual_events": [{"path": "annual_events/2013.parquet", "sha256": file_sha256(member)}]}
+    assert _fixed_seed_event_paths(root / "manifest.json", manifest, {2013}) == [member]
+
+
+@pytest.mark.parametrize("fault", ["missing", "changed", "duplicate", "escaping", "incomplete"])
+def test_fixed_seed_fails_closed_without_altering_sources(tmp_path, fault):
+    root = tmp_path / "parent"
+    root.mkdir()
+    member = root / "2013.parquet"
+    member.write_bytes(b"original source")
+    proof = {"path": "annual_events/2013.parquet", "sha256": file_sha256(member)}
+    manifest = {"annual_events": [proof]}
+    years = {2013}
+    if fault == "missing":
+        member.unlink()
+    elif fault == "changed":
+        member.write_bytes(b"different source")
+    elif fault == "duplicate":
+        manifest["annual_events"].append(dict(proof))
+    elif fault == "escaping":
+        proof["path"] = "../2013.parquet"
+    else:
+        years.add(2014)
+    with pytest.raises(ValueError):
+        _fixed_seed_event_paths(root / "manifest.json", manifest, years)

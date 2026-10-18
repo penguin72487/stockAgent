@@ -133,11 +133,31 @@ def _require_simulation_only(payload: Mapping[str, Any]) -> None:
         raise UnsafePublicDashboardPayload("production_order_possible must be false")
 
 
+def _public_replay_signal_origin(row: Mapping[str, Any]) -> str | None:
+    """Disclose retrospective generation without publishing private signal IDs."""
+    if row.get("counterfactual_open_replay") is not True:
+        return None
+    match = re.fullmatch(r".+-counterfactual-official-open-(\d{4}-\d{2}-\d{2})",
+                         str(row.get("signal_id") or ""))
+    if match and match.group(1) == str(row.get("session_date") or "")[:10]:
+        return "current_model_counterfactual"
+    return None
+
+
+def _public_projected_row(row: Mapping[str, Any], allowed_fields: set[str]) -> dict[str, Any]:
+    output = {str(field): value for field, value in row.items() if str(field) in allowed_fields}
+    origin = _public_replay_signal_origin(row)
+    if origin is not None:
+        output["replay_signal_origin"] = origin
+    return output
+
+
 def _scrub_public_value(
     value: Any, *, quote_source: OfficialDailyQuoteSource | None = None,
     session_date: str | None = None,
     record_kind: str | None = None,
     record_collections: Mapping[str, str] | None = None,
+    private_prices: bool = False,
 ) -> Any:
     """Strip private identifiers and unlicensed prices without mutating inputs."""
 
@@ -146,6 +166,9 @@ def _scrub_public_value(
         if quote_source is not None:
             value = quote_source.enrich(value, session_date=session_date)
         output: dict[str, Any] = {}
+        origin = _public_replay_signal_origin(value)
+        if origin is not None:
+            output["replay_signal_origin"] = origin
         withheld: list[str] = []
         withheld_reasons: dict[str, str] = {}
         visible: dict[str, Any] = {}
@@ -161,6 +184,12 @@ def _scrub_public_value(
             # Publication is independent of the collector/model/ledger. A
             # provider's API access or an upstream boolean is not a grant.
             if is_quote_price_field(key):
+                if private_prices:
+                    output[key] = _scrub_public_value(item, private_prices=True)
+                    if output[key] is not None:
+                        visible[key] = {"source": "本人私人檢視", "price_role": key,
+                                        "publication_basis": "owner_private_view"}
+                    continue
                 permitted = quote_policy.observation(value, key, item)
                 if permitted is None and record_kind is not None:
                     permitted = quote_policy.strategy_report_price(
@@ -185,10 +214,11 @@ def _scrub_public_value(
                 session_date=session_date,
                 record_kind=((record_collections or {}).get(key)
                              or ("paper_position" if record_kind == "paper_signal" and key == "position" else None)),
+                private_prices=private_prices,
             )
         if withheld or visible:
             output["public_price_display"] = {
-                "contract": PUBLIC_QUOTE_DISPLAY_CONTRACT,
+                "contract": "owner_private_quote_display_v1" if private_prices else PUBLIC_QUOTE_DISPLAY_CONTRACT,
                 "withheld_fields": withheld,
                 "withheld_reasons": withheld_reasons,
                 "visible_fields": visible,
@@ -202,7 +232,7 @@ def _scrub_public_value(
         return output
     if isinstance(value, list):
         return [_scrub_public_value(item, quote_source=quote_source, session_date=session_date,
-                                   record_kind=record_kind) for item in value]
+                                   record_kind=record_kind, private_prices=private_prices) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
@@ -220,11 +250,7 @@ def _project_rows(
     if not isinstance(rows, list):
         return
     payload[key] = [
-        {
-            str(field): value
-            for field, value in row.items()
-            if str(field) in allowed_fields
-        }
+        _public_projected_row(row, allowed_fields)
         for row in rows
         if isinstance(row, Mapping)
     ]
@@ -252,21 +278,28 @@ def _retain_latest_series_rows(
     payload[key] = [row for bucket in by_series.values() for row in bucket]
 
 
-def sanitize_taifex_status(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _price_display_notice(*, private_prices: bool, include_paper_reports: bool = False) -> dict[str, Any]:
+    if private_prices:
+        return {"contract": "owner_private_quote_display_v1", "private_view": True,
+                "message": "本人私人檢視：顯示既有來源觀測與帳本原始價格；缺值仍為未知，模擬成交仍非券商成交。"}
+    return public_quote_display_notice(include_paper_reports=include_paper_reports)
+
+
+def sanitize_taifex_status(payload: Mapping[str, Any], *, private_prices: bool = False) -> dict[str, Any]:
     """Return the TAIFEX status payload without local receipt/file identities."""
 
     _require_simulation_only(payload)
-    output = _scrub_public_value(dict(payload))
+    output = _scrub_public_value(dict(payload), private_prices=private_prices)
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized status is not an object")
     active_cycle = output.get("active_cycle")
     if isinstance(active_cycle, dict):
         active_cycle.pop("cycle_id", None)
-    output["price_display_policy"] = public_quote_display_notice()
+    output["price_display_policy"] = _price_display_notice(private_prices=private_prices)
     return output
 
 
-def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
+def sanitize_taifex_history(payload: Mapping[str, Any], *, private_prices: bool = False) -> dict[str, Any]:
     """Return bounded display history; it contains no order or account fields."""
 
     allowed = {
@@ -288,7 +321,7 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
     # with a regular expression made cold requests CPU-bound. Unexpected nested
     # values still take the conservative recursive scrub path.
     output = {
-        key: _scrub_public_value(value)
+        key: _scrub_public_value(value, private_prices=private_prices)
         for key, value in payload.items()
         if key in allowed and key != "history"
     }
@@ -311,7 +344,7 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
                         elif field == "fixed_capital_return":
                             value = round(value, 8)
                 elif isinstance(value, (Mapping, list)):
-                    value = _scrub_public_value(value)
+                    value = _scrub_public_value(value, private_prices=private_prices)
                 row[field] = value
             for optional_field in (
                 "history_source",
@@ -330,6 +363,7 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def sanitize_tw_status(
     payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+    private_prices: bool = False,
 ) -> dict[str, Any]:
     """Return the stock dashboard status with operational identities removed."""
 
@@ -471,7 +505,7 @@ def sanitize_tw_status(
         series_field="benchmark_id",
     )
     output = _scrub_public_value(projected, quote_source=quote_source,
-                                 record_collections={"positions": "paper_position"})
+                                 record_collections={"positions": "paper_position"}, private_prices=private_prices)
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized status is not an object")
 
@@ -495,11 +529,11 @@ def sanitize_tw_status(
             "complete selected-range order and fill ledgers are available through "
             "the bounded read-only event pages"
         )
-    output["price_display_policy"] = public_quote_display_notice(include_paper_reports=True)
+    output["price_display_policy"] = _price_display_notice(private_prices=private_prices, include_paper_reports=True)
     return output
 
 
-def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
+def sanitize_tw_history(payload: Mapping[str, Any], *, private_prices: bool = False) -> dict[str, Any]:
     """Project the bounded cross-session curve endpoint for public use."""
 
     _require_simulation_only(payload)
@@ -540,7 +574,7 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "history",
     }
     output = {
-        key: _scrub_public_value(value)
+        key: _scrub_public_value(value, private_prices=private_prices)
         for key, value in payload.items()
         if key in allowed
     }
@@ -714,6 +748,7 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def sanitize_tw_signals(
     payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+    private_prices: bool = False,
 ) -> dict[str, Any]:
     """Return one public signal page without the internal signal identifiers."""
 
@@ -807,10 +842,7 @@ def sanitize_tw_signals(
         if isinstance(position, dict):
             # Reuse the lifecycle endpoint's public projection. Embedding a
             # valuation must not expose internal ledger IDs or private fields.
-            projected = {
-                key: value for key, value in position.items()
-                if key in _TW_PUBLIC_POSITION_FIELDS
-            }
+            projected = _public_projected_row(position, _TW_PUBLIC_POSITION_FIELDS)
             if position.get("contract") == "signal_ledger_valuation_v1":
                 projected["contract"] = "signal_ledger_valuation_v1"
             row["position"] = projected
@@ -822,11 +854,12 @@ def sanitize_tw_signals(
                 "status", "products", "as_of", "scope", "reason", "source_url"
             ) if key in membership}
     return _scrub_public_value(output, quote_source=quote_source,
-                               record_collections={"rows": "paper_signal"})
+                               record_collections={"rows": "paper_signal"}, private_prices=private_prices)
 
 
 def sanitize_tw_positions(
     payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+    private_prices: bool = False,
 ) -> dict[str, Any]:
     """Return a bounded public position page without internal ledger IDs."""
 
@@ -855,11 +888,12 @@ def sanitize_tw_positions(
         allowed_fields=_TW_PUBLIC_POSITION_FIELDS,
     )
     return _scrub_public_value(output, quote_source=quote_source,
-                               record_collections={"rows": "paper_position"})
+                               record_collections={"rows": "paper_position"}, private_prices=private_prices)
 
 
 def sanitize_tw_events(
     payload: Mapping[str, Any], *, quote_source: OfficialDailyQuoteSource | None = None,
+    private_prices: bool = False,
 ) -> dict[str, Any]:
     """Return one public event page after enforcing the simulation boundary."""
 
@@ -890,6 +924,7 @@ def sanitize_tw_events(
         {key: value for key, value in payload.items() if key in allowed},
         quote_source=quote_source,
         record_collections={"rows": "paper_event"},
+        private_prices=private_prices,
     )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized event page is not an object")

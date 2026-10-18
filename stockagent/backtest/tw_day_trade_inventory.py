@@ -36,6 +36,7 @@ from stockagent.backtest.tw_day_trade_contract import (
 
 
 INVENTORY_STATE_ABI = "tw_day_trade_fifo_physical_inventory_v3_pending_stock"
+INVENTORY_VOLUME_ADJOINT_ABI = "cumulative_closed_telescoping_volume_adjoint_v1"
 
 
 class CohortField(IntEnum):
@@ -779,10 +780,15 @@ def reduce_inventory_fifo_path(
         absolute - state.cohorts[..., F.LOCKED_SHARES].abs()
     ).clamp_min(0)
     total = tradable.sum(0)
-    minute_fills = torch.minimum(
-        capacity, (total[:, None] - (cumulative - capacity)).clamp_min(0)
-    )
-    closed = minute_fills.sum(-1)
+    # Physical capacities/positions are exact whole shares. Differencing the
+    # cumulative executed curve preserves those fills and makes their VJP
+    # telescope to min(total, total_capacity). Independent min/clamp branches
+    # assign inconsistent kink derivatives: at a capacity boundary, even an
+    # absent zero-capacity minute could previously add another 0.5*d(total).
+    closed_by_minute = torch.minimum(total[:, None], cumulative)
+    minute_fills = closed_by_minute - torch.cat(
+        (torch.zeros_like(closed_by_minute[:, :1]), closed_by_minute[:, :-1]), -1)
+    closed = closed_by_minute[:, -1]
     cohort_end = fifo_cumsum(tradable, 0)
     cohort_start = cohort_end - tradable
     taken = torch.minimum(tradable, (closed - cohort_start).clamp_min(0))

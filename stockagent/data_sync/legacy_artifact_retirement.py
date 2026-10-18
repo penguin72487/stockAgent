@@ -45,6 +45,17 @@ def _active_service_references(source: Path, repo_root: Path) -> list[str]:
             + active_configuration_references(source, repo_root))
 
 
+def _assert_legacy_unlink_gates(
+    spec: LegacyArchiveSpec, plan: Mapping[str, Any], quarantine: Path, **options: Any,
+) -> dict[str, Any]:
+    """Use the same reviewed consumer domain in capture, plan and final unlink."""
+    return _assert_unlink_gates(
+        plan, quarantine,
+        _process_scope_root=legacy_process_scope(spec, Path(options["artifact_root"])),
+        **options,
+    )
+
+
 def _state_path(state_root: Path, dataset: str) -> Path:
     return state_root / "retirements" / f"{dataset}.json"
 
@@ -420,7 +431,7 @@ def apply_legacy_retirement(
             or resolved.manifest_sha256 != plan["manifest_sha256"]):
             raise SnapshotError("legacy cold head changed after rename; quarantine retained")
         verify_cold_resilience(Path(options["sync_root"]), resolved, Path(options["backup_config"]))
-        unlink_peer_proof = _assert_unlink_gates(plan, quarantine, **options)
+        unlink_peer_proof = _assert_legacy_unlink_gates(spec, plan, quarantine, **options)
         reclaimed_bytes = _reclaimable_file_bytes(quarantine / "source", quarantine / "hot")
         if (quarantine / "hot").is_dir():
             shutil.rmtree(quarantine / "hot")
@@ -488,7 +499,7 @@ def plan_legacy_quarantine_resume(spec: LegacyArchiveSpec, prior_plan: Mapping[s
                                   **options: Any) -> dict[str, Any]:
     """Fresh full audit outside the common mutation owner; no rename or unlink."""
     quarantine, binding = _quarantine_resume_binding(spec, prior_plan, **options)
-    _assert_unlink_gates(prior_plan, quarantine, **options)
+    _assert_legacy_unlink_gates(spec, prior_plan, quarantine, **options)
     sync_root = Path(options["sync_root"])
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     archive = spec.stage_root/spec.dataset/"archive"
@@ -500,7 +511,7 @@ def plan_legacy_quarantine_resume(spec: LegacyArchiveSpec, prior_plan: Mapping[s
                   "sha256":r["original_sha256"]} for r in proof["manifest"]["files"]]
     _hot_mirror(quarantine/"source", quarantine/"hot", inventory)
     cold = verify_cold_resilience(sync_root, resolved, Path(options["backup_config"]))
-    peer = _assert_unlink_gates(prior_plan, quarantine, **options)
+    peer = _assert_legacy_unlink_gates(spec, prior_plan, quarantine, **options)
     if _quarantine_resume_binding(spec, prior_plan, **options)[1] != binding:
         raise SnapshotError("interrupted legacy retirement changed during full audit")
     return {**prior_plan, **cold, "quarantine_resume":True, "peer_proof":peer,
@@ -534,7 +545,7 @@ def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: s
         _hot_mirror(quarantine/"source", quarantine/"hot", inventory)
         resolved = resolve_latest_packed(Path(options["sync_root"]), spec.dataset)
         verify_cold_resilience(Path(options["sync_root"]), resolved, Path(options["backup_config"]))
-        peer = _assert_unlink_gates(plan, quarantine, **options)
+        peer = _assert_legacy_unlink_gates(spec, plan, quarantine, **options)
         if (_quarantine_resume_binding(spec, original, **options)[1] != binding
                 or not 0 <= time.time()-float(full["verified_at_epoch"]) <= 1500):
             raise SnapshotError("interrupted legacy retirement changed or expired after quarantine audit")

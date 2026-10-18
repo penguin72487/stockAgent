@@ -290,10 +290,19 @@ def test_finlab_packaging_requires_every_recent_key_and_verified_bytes(tmp_path,
     assert catalog_readiness(root, now=datetime.now(UTC))["stale"] == 1
     receipt["source_checked_at_utc"] = datetime.now(UTC).isoformat()
     _write(receipt_path, receipt)
-    with (root / receipt["parquet_path"]).open("ab") as handle:
+    target = root / receipt["parquet_path"]
+    target_stat = target.stat()
+    # Exact immutable payloads may share an inode. Corrupting that inode must
+    # invalidate every referencing key, not pretend only one logical name broke.
+    affected = 0
+    for key in ('price:a', 'price:b'):
+        referenced = json.loads((root / 'receipts' / f'{safe_stem(key)}.json').read_text())
+        info = (root / referenced['parquet_path']).stat()
+        affected += (info.st_dev, info.st_ino) == (target_stat.st_dev, target_stat.st_ino)
+    with target.open("ab") as handle:
         handle.write(b"corrupt")
     invalid = catalog_readiness(root, now=datetime.now(UTC), verify_hashes=True)
-    assert not invalid["ready"] and invalid["invalid"] == 1
+    assert not invalid["ready"] and invalid["invalid"] == affected
 
 
 def test_per_key_eta_uses_measured_fetches_and_never_invents_queue_finish(tmp_path):

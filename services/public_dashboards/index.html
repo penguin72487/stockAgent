@@ -31,7 +31,7 @@
     </section>
 
     <section id="dashboards" class="cards" aria-label="即時面板">
-      <a class="dashboard-card taifex" href="taifex/">
+      <a class="dashboard-card taifex" href="taifex/" data-owner-only>
         <div class="card-topline">
           <span class="market">TAIFEX</span>
           <span id="taifex-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -79,7 +79,7 @@
         <span class="card-action">開啟隔日沖面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card shioaji" href="shioaji/">
+      <a class="dashboard-card shioaji" href="shioaji/" data-owner-only>
         <div class="card-topline">
           <span class="market">SHIOAJI API</span>
           <span id="shioaji-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -95,7 +95,7 @@
         <span class="card-action">開啟 API 面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card finlab" href="finlab/">
+      <a class="dashboard-card finlab" href="finlab/" data-owner-only>
         <div class="card-topline">
           <span class="market">FINLAB API</span>
           <span id="finlab-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -111,7 +111,7 @@
         <span class="card-action">開啟 FinLab 面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card finmind" href="finmind/">
+      <a class="dashboard-card finmind" href="finmind/" data-owner-only>
         <div class="card-topline">
           <span class="market">FINMIND API</span>
           <span id="finmind-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -127,21 +127,21 @@
         <span class="card-action">開啟 FinMind 面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card finmind" href="news/">
+      <a class="dashboard-card finmind" href="news/" data-owner-only>
         <div class="card-topline"><span class="market">NEWS FULLTEXT</span><span class="health">公開唯讀</span></div>
         <div><strong>新聞爬蟲進度</strong><p>已保存全文、待抓網址、各媒體限流、來源問題與條件估時；不把標題當全文。</p></div>
         <dl class="card-stats" aria-label="新聞面板範圍"><div><dt>進度範圍</dt><dd>已清點唯一網址</dd></div><div><dt>頁面更新</dt><dd>每 15 秒讀取快照</dd></div></dl>
         <span class="card-action">開啟新聞爬蟲面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card finlab" href="tej/">
+      <a class="dashboard-card finlab" href="tej/" data-owner-only>
         <div class="card-topline"><span class="market">TEJ SMART WIZARD</span><span id="tej-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span></div>
         <div><strong>TEJ 歷史資料監控</strong><p>帳號完整目錄、逐欄原始單位、桌面匯出量、查詢範圍、容量與條件式估時。</p></div>
         <dl class="card-stats" aria-label="TEJ 資料管線摘要"><div><dt>完整目錄</dt><dd id="tej-catalog">—</dd></div><div><dt>實際匯出</dt><dd id="tej-progress">—</dd></div></dl>
         <span class="card-action">開啟 TEJ 面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card openbb" href="openbb/">
+      <a class="dashboard-card openbb" href="openbb/" data-owner-only>
         <div class="card-topline">
           <span class="market">OPENBB ARCHIVE</span>
           <span id="openbb-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -157,7 +157,7 @@
         <span class="card-action">開啟 OpenBB 面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card data" href="data-monitor/">
+      <a class="dashboard-card data" href="data-monitor/" data-owner-only>
         <div class="card-topline">
           <span class="market">ALL DATA SOURCES</span>
           <span id="data-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -173,7 +173,7 @@
         <span class="card-action">開啟全資料面板 <b aria-hidden="true">→</b></span>
       </a>
 
-      <a class="dashboard-card traffic" href="traffic/">
+      <a class="dashboard-card traffic" href="traffic/" data-owner-only>
         <div class="card-topline">
           <span class="market">PUBLIC TRAFFIC</span>
           <span id="traffic-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
@@ -200,7 +200,7 @@
   </main>
   <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
   <script src="dashboard-core.js?v=15" defer></script>
-  <script src="dashboard-acquisition.js?v=3" defer></script>
-  <script src="public.js?v=15" defer></script>
+  <script src="dashboard-acquisition.js?v=4" defer></script>
+  <script src="public.js?v=16" defer></script>
 </body>
 </html>

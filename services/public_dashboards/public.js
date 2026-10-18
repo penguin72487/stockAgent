@@ -42,6 +42,7 @@ function ageLabel(seconds) {
 
 function setHealth(prefix, value, overrideLabel = null) {
   const target = $(`${prefix}-health`);
+  if (!target) return;
   const {health, label} = healthPresentation(value);
   const className = `health ${health}`;
   if (target.className !== className) target.className = className;
@@ -142,6 +143,14 @@ function renderTraffic(data) {
 }
 
 function renderUnavailable() {
+  if (!Dashboard.isOwnerView()) {
+    for (const prefix of ["tw", "overnight"]) {
+      setHealth(prefix, "unavailable");
+      $(`${prefix}-freshness`).textContent = "無法取得";
+      $(`${prefix}-summary`).textContent = "進入面板查看";
+    }
+    return;
+  }
   for (const prefix of ["taifex", "tw", "overnight", "shioaji", "finlab", "finmind", "tej", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
@@ -172,16 +181,18 @@ async function refresh() {
   refreshInFlight = true;
   try {
     const data = await fetchJson("api/overview");
-    renderTaifex(data.taifex || {});
     renderTw(data.tw || {});
     renderOvernight(data.overnight || {});
-    renderShioaji(data.shioaji || {});
-    renderFinlab(data.finlab || {});
-    renderFinmind(data.finmind || {});
-    renderTej(data.tej || {});
-    renderOpenbb(data.openbb || {});
-    renderDataMonitor(data.data_monitor || {});
-    renderTraffic(data.traffic || {});
+    if (Dashboard.isOwnerView()) {
+      renderTaifex(data.taifex || {});
+      renderShioaji(data.shioaji || {});
+      renderFinlab(data.finlab || {});
+      renderFinmind(data.finmind || {});
+      renderTej(data.tej || {});
+      renderOpenbb(data.openbb || {});
+      renderDataMonitor(data.data_monitor || {});
+      renderTraffic(data.traffic || {});
+    }
     lastSuccessfulOverview = data;
   } catch (_error) {
     if (!lastSuccessfulOverview) renderUnavailable();

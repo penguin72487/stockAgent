@@ -1,0 +1,1027 @@
+version: 1
+# Maintained human descriptions; no credentials, provider calls or acquisition policy.
+datasets:
+  data_tw_public:
+    title: 台灣股票與總體公開資料
+    category: 台股與台灣衍生品
+    role: 官方來源、逐股日資料與研究特徵並存
+    purpose: >-
+      用來研究台灣股票價格、籌碼、公司公告、財務與總體環境。這裡既保存 TWSE、TPEx、
+      MOPS、央行、主計總處等來源的回應，也有供模型讀取的逐股日表；兩者不是同一層資料。
+    grains:
+      - 個股行情通常是一個交易日、一檔證券；公告是一個事件，財報是一個公司、期間與會計概念。
+      - 總體資料可能每月或每季一筆；對齊到交易日不表示每天都有一個新發布值。
+    layout:
+      - ["stocks/", "公開來源合併後的逐股日行情／特徵，相容欄名不代表全部是原始值。"]
+      - ["raw/、metadata/、state/", "來源回應、下載說明與回補游標；用來核對觀測和來源版本。"]
+      - ["mops_xbrl/", "季度 XBRL 原件、會計事實與發布時間候選，須保留公司、期間、單位與合併範圍。"]
+      - ["features/", "嚴格可用表與帶有研究假設的寬表；必須依各自 manifest／研究 ABI 選用。"]
+      - ["execution_actions/、shioaji/、fallback/", "公司行動、永豐補充行情與替代源；不能不分優先序直接疊加。"]
+    fields:
+      - ["date、symbol／證券代號", "交易日與字串證券代碼；保留 ETF 的前導零。"]
+      - ["open、max、min、close、Trading_Volume", "逐股行情；股票標準成交量以股為目標，不能把原始來源的張數直接當股數。"]
+      - ["_dataset、_source、_downloaded_at_utc、_payload_sha256", "來源與實際觀測證據，不是歷史發布時刻。"]
+      - ["period、published_on、observed_at_utc", "統計期間、公告日期與取得時間，回答不同問題。"]
+      - ["twpub_*", "由公開資料產生的模型欄位；不同研究／嚴格版本的欄位與可用性不可互換。"]
+    timing:
+      - 日行情、盤後籌碼按交易日更新；財報、營收、總體與公告按各自發布週期更新，不是統一每日發布。
+      - 有明確發布時間就保留；理論發布日、目前修訂值與當日快照都必須保留估計／觀測標記，不能回填成當年的已知事實。
+    cautions:
+      - features 內的 research 寬表不等於 strict/live 可用資料；使用哪些欄位由已選定的研究契約決定。
+      - 公司行動、上市下市、停牌與無成交會影響可交易性；缺值不是自動為零，也不是自動刪除該股票。
+    sources: [downloader/download_tw_public_data.py, scripts/rebuild_tw_public_data_layer.py, docs/agents/tw_public.md]
+    evidence: [download_summary.json, features/tw_public_stock_daily.summary.json, shioaji/download_summary.json]
+    samples: [features/tw_public_stock_daily.parquet, cbc_fx_reserve_release_vintages.parquet, "stocks/*_features.parquet"]
+    related: [data_finlab, data_finmind, data_tw_minute]
+
+  data_tw_minute:
+    title: 台股一分鐘行情與分鐘研究資料
+    category: 台股與台灣衍生品
+    role: 分鐘原始行情、缺口證據與衍生訓練表
+    purpose: >-
+      用來研究台股盤中路徑與當沖決策。來源一分鐘 K 棒、缺口回補證據、模型衍生欄位與日模型指引
+      分開保存，避免把「某日有檔案」誤當作「每檔每分鐘都完整」。
+    grains:
+      - 行情是一檔股票、一個已完成的一分鐘區間；研究表另附有效性、前一分鐘與可交易資訊。
+      - daily_guidance 是日模型的逐日目標權重，不是逐筆交易、券商成交或新的原始行情。
+    layout:
+      - ["shioaji_1m/", "永豐一分鐘資料、分段回補、游標與回補報告；minute_chunks 是來源分段保存。"]
+      - ["research_dataset/", "按 trade_date 分區的合併分鐘研究表，含來源與可用性欄位。"]
+      - ["daily_guidance/", "walk-forward／OOF 日模型指引，須與對應模型及日期範圍一起使用。"]
+      - ["audits/、quarantine/", "分鐘完整性稽核與隔離舊版本；隔離內容不能直接納入現行訓練。"]
+    fields:
+      - ["ts、date、symbol、market", "分鐘市場時間、日期、字串證券代碼及市場。"]
+      - ["Open、High、Low、Close、Amount", "來源分鐘 OHLC 與成交金額；缺價格不能用插值冒充可執行行情。"]
+      - ["Volume、contract_unit、source_volume_multiplier", "來源成交量與單位換算證據，不能假設 Volume 一律是股。"]
+      - ["volume_shares、volume_unit_proof", "有證據的股數與單位判定；unresolved 不是零股成交。"]
+      - ["has_exact_previous_minute、minutes_from_open", "分鐘連續性與盤中位置；缺分鐘會影響衍生報酬。"]
+      - ["log_close_return_1m 等衍生欄位", "研究特徵可能含 log 報酬；原始 OHLCV 仍獨立保留，不能稱整張表都未處理。"]
+    timing:
+      - 一般盤採 09:01–13:30 的 270 個完成分鐘標記，對應 09:00–13:30 的交易區間；不能額外要求每檔都出現另一根 09:00 棒。
+      - Shioaji 行情 ts 解碼後是台灣市場牆鐘時間，不要再加 8 小時；來源、交易日與研究表版本須一起核對。
+    cautions:
+      - 無成交、停牌、尚未上市、已下市與真的下載缺口不是同一狀況；不能為湊滿格點而捏造 K 棒。
+      - 2020-03-02 起的分區存在，不代表所有股票從該日開始每分鐘皆完整；完整度以逐檔／逐日稽核為準。
+    sources: [downloader/download_shioaji_tw_minute_kbars.py, scripts/merge_tw_minute_sources.py, stockagent/data/tw_minute.py, downloader/stock_volume_units.py]
+    evidence: [shioaji_1m/download_summary.json, shioaji_1m/latest_run_summary.json, research_dataset/manifest.json, audits/latest.json]
+    samples: ["research_dataset/trade_date=*/data.parquet"]
+    related: [data_tw_public, data_tw_microstructure, data_tw_shioaji_history]
+
+  data_tw_microstructure:
+    title: 台股逐筆成交、五檔委託簿與盤中微結構
+    category: 台股與台灣衍生品
+    role: 前瞻串流原件與重建的研究快照
+    purpose: >-
+      用來研究成交順序、買賣價差、掛單深度、資料延遲與短期流動性。
+      原始 tick／bid-ask 事件與重建的一秒快照分開保存；快照不是每秒一定有真實成交。
+    grains:
+      - captures/ticks 是一個來源成交事件；book_events 是一次委託簿更新。
+      - book_1s 與 hft_dataset 是按時間對齊的狀態快照或研究樣本，不是 L3 個別委託生命週期。
+    layout:
+      - ["captures/", "ticks、book_events、book_1s 與其 manifests，保留事件與接收時間。"]
+      - ["hft_dataset/", "按 trade_date 分區的研究表，包含五檔、陳舊程度與對齊資訊。"]
+      - ["universe/", "串流標的選擇及 top_200 清單；不是全市場歷史涵蓋證明。"]
+      - ["audits/", "當日事件數、品質與缺口證據。"]
+    fields:
+      - ["code、exchange、trade_date", "股票代碼、市場與交易日。"]
+      - ["snapshot_ts_ns、book_exchange_ts_ns、book_receive_ts_ns", "快照、交易所與本機接收時鐘；ns 表示精度單位，不保證來源每奈秒都有事件。"]
+      - ["bid_price_1…5、ask_price_1…5", "五檔買賣價格，不是已成交價格。"]
+      - ["book_age_ms、stale、suspend", "報價年齡、陳舊／停牌標記，不能忽略後直接當成可成交深度。"]
+      - ["volume／各檔掛單量", "原始量的股／張語意須依來源契約與正規化證據，不能對每個欄位一律乘 1000。"]
+    timing:
+      - 盤中訂閱持續寫入，歷史僅涵蓋當時實際保存的日期與標的；今日訂閱不能重建過往未保存的委託簿。
+      - 事件順序需區分交易所時間與接收時間；Shioaji 市場時間不可重複加 8 小時。
+    cautions:
+      - 本機有 top_200 標的選擇，不能宣稱全市場全 tick／全深度都已取得。
+      - 五檔狀態、逐筆成交與 L3 逐委託不同；無事件或 stale 不能以未標記的補值當作新觀測。
+    sources: [downloader/stream_shioaji_tw_microstructure.py, scripts/build_shioaji_hft_dataset.py, scripts/audit_shioaji_microstructure.py]
+    evidence: [hft_dataset/manifest.json, universe/top_200.summary.json]
+    samples: ["hft_dataset/trade_date=*/data.parquet"]
+    related: [data_tw_minute, data_tw_public]
+
+  data_tw_shioaji_history:
+    title: 永豐期貨、選擇權與指數歷史行情原件
+    category: 台股與台灣衍生品
+    role: 逐合約查詢結果、可查範圍與收據
+    purpose: >-
+      把永豐可查的合約目錄、分鐘 K 棒與逐筆歷史依合約與查詢區間保存。
+      它回答「來源對這個合約實際回了什麼」，不是已轉倉、已補保證金的策略績效表。
+    grains:
+      - 合約清冊是一個合約的屬性／被觀測紀錄；行情是該合約的一根分鐘棒或一筆 tick。
+      - 查詢分段與 availability 是工作及來源可用性證據，不是額外的行情樣本。
+    layout:
+      - ["contracts/", "按 futures／options／index 與合約代碼保存 kbars／ticks 和分段收據。"]
+      - ["inventory/", "歷史看過的與目前合約清冊；目前名單不是過去全市場的完整成分股。"]
+      - ["availability/", "來源空值、可查深度與已查區間證據。"]
+      - ["summary.json、progress.json", "逐合約、分段與配額工作進度；不能只看服務 active。"]
+    fields:
+      - ["code、root、delivery_date、delivery_month、option_right", "合約識別、商品根代碼、到期與買賣權別。"]
+      - ["ts、event_ts、trading_date", "來源市場時間與交易日；夜盤的日曆日期不必等於交易日。"]
+      - ["Open、High、Low、Close、Volume、Amount", "來源 K 棒；衍生品成交量以口／契約語意處理，不能換成股票股數。"]
+      - ["query_contract、collection、security_type", "實際查詢合約與類別；連續合約別名不等於固定到期合約。"]
+    timing:
+      - 依來源可查範圍分段回補，並按交易日追新；最早資料因商品、上市時間與來源留存不同。
+      - Shioaji 行情 ts 是市場牆鐘時間；本機查詢時間、事件時間與交易日各自保留，不推導出不存在的歷史事件。
+    cautions:
+      - 空回應要區分無交易、合約不可查、配額與真的缺口；未經核對不能把所有空檔算完成。
+      - 與 data_tw_futures／data_tw_index_futures 的資料可能重疊，不能把分段、連續合約與官方日表直接相加。
+    sources: [downloader/download_shioaji_historical_market_data.py, scripts/audit_training_source_inventory.py]
+    evidence: [summary.json, progress.json]
+    samples: [inventory/contracts.parquet, "contracts/futures/**/kbars/**/data.parquet"]
+    related: [data_tw_futures, data_tw_index_futures, data_tw_minute]
+
+  data_taifex_public_history:
+    title: 期交所籌碼、風險指標與歷史規則公告
+    category: 台股與台灣衍生品
+    role: 官方原件、正規化統計與規則文件
+    purpose: >-
+      保存期交所公開的法人交易／未平倉、大額交易人、買賣權比、波動率等資料，以及歷史公告與附件。
+      用來研究期貨市場狀態與制度變更；公告被下載不代表其中所有保證金、限額與生效規則都已解析成數值。
+    grains:
+      - 統計通常是一個交易日、商品、投資人類別或選擇權方向；不同表的分組鍵不同。
+      - 公告、文件與公告－附件關聯是文件粒度，不能加到交易日統計筆數裡。
+    layout:
+      - ["normalized/", "法人、十大交易人、put-call ratio、VIX 等正規化表。"]
+      - ["raw/、receipts/、shards/", "官方回應、校驗收據與分段結果，保留可追溯的來源。"]
+      - ["rules/", "歷史公告索引、附件、解析結果與規則證據；索引與數值生效表不同。"]
+      - ["manifest.json、range_status/", "已請求／可取得範圍、可用性狀態與缺口，不保證全商品全歷史完成。"]
+    fields:
+      - ["date、product_name、participant_type、option_side", "交易日、商品、法人類別與買／賣權維度。"]
+      - ["trade_*_lots、open_interest_*_lots", "交易與未平倉口數；這裡的 lots 是契約口數，不是台股張數。"]
+      - ["*_value_thousand_twd", "新台幣千元；換成元時須乘 1000，但不能連口數也一起換。"]
+      - ["available_date、published_after_close", "統計何時可供下游使用及盤後發布標記，不等於統計日開盤前已知。"]
+      - ["source_sha256、公告／附件識別與生效日期", "來源文件與數值規則的證據；公告日和生效日需分開。"]
+    timing:
+      - 多數日籌碼屬盤後資料，按交易日追新；規則則以公告與各次生效時間為準。
+      - 不同端點歷史留存不同；manifest 的 requested 範圍不是已驗證取得範圍，也不能用當前規則覆蓋所有歷史。
+    cautions:
+      - 每日高低價不是漲跌停限制價；要由當時契約規格、參考價與生效規則推導。
+      - 解析不到的數值不能由文件存在就標成已完成；OCR／原始附件及待核對狀態仍須保留。
+    sources: [scripts/download_taifex_public_history.py, downloader/taifex_rule_parsing.py, scripts/audit_taifex_public_inventory.py]
+    evidence: [manifest.json, rules/manifest.json, openapi_latest.json]
+    samples: [normalized/institutional_futures.parquet, normalized/put_call_ratio.parquet, rules/normalized/announcements.parquet]
+    related: [data_tw_futures, data_tw_index_futures, data_finmind]
+
+  data_tw_futures:
+    title: 台灣期貨商品、結算、連續行情與組合研究資料
+    category: 台股與台灣衍生品
+    role: 商品／合約目錄、來源補充與多版本研究表
+    purpose: >-
+      支援台灣期貨、特別是股票期貨的商品辨識、歷史結算、連續行情與訓練資料組裝。
+      這不是只有一張表：官方結算、永豐分鐘補充、商品主檔與不同研究版本需要各自選用。
+    grains:
+      - 商品主檔是一個商品或合約；結算表是一個到期合約的結算紀錄。
+      - 連續日表與模型特徵是一個交易日、一個商品／槽位；轉倉政策屬研究契約，不是新增成交。
+    layout:
+      - ["taifex_contract_codes.csv、taifex_stock_futures_catalog.json", "官方商品代碼與股票期貨目錄及其來源。"]
+      - ["taifex_portfolio_daily/、taifex_portfolio_daily_v4/", "商品主檔、continuous_daily、model_features 與逐商品表；版本不可混讀。"]
+      - ["final_settlement_*/", "最後結算價及不同建置範圍；全商品、指數子集與舊版互有重疊。"]
+      - ["shioaji_history/、shioaji_gap_repair/", "永豐分鐘資料與缺口補查證據。"]
+      - [".margin-sources-previous/", "保留的舊保證金來源位置，不是現行規則的唯一入口；另查 data_tw_index_futures/preparation_sources。"]
+    fields:
+      - ["product、contract、contract_month", "商品、到期合約與月份；不能用股票代碼代替期貨合約鍵。"]
+      - ["date、settlement_date、final_settlement_price", "交易日、結算日與最後結算價；結算價不是當日可成交收盤報價。"]
+      - ["multiplier、volume、open_interest", "契約乘數、成交口數與未平倉口數；價格點數轉金額需要乘數。"]
+      - ["source_file、source_sha256、source_kind", "實際來源與可追溯證據。"]
+      - ["model_features／衍生報酬", "依各版本建出的研究輸入，不等於全部是未經運算的原始值。"]
+    timing:
+      - 官方日資料、結算、合約上市下市及保證金生效時點不同，需依各自來源與 manifest 更新。
+      - 日盤／夜盤、公告日／生效日及連續合約換月必須分開；當前商品規格不能直接代入歷史。
+    cautions:
+      - 期貨數量單位是口，保證金是資金需求，不是價格或交易成本；補入保證金不應偽裝成交易獲利。
+      - 此處與其他 TAIFEX 根目錄有視圖／來源重疊，不可用資料夾數或重複結算版本加總涵蓋率。
+    sources: [scripts/build_taifex_futures_portfolio_daily.py, scripts/download_taifex_futures_final_settlement_history.py, stockagent/data/tw_index_futures.py]
+    evidence: [taifex_contract_codes.manifest.json, taifex_portfolio_daily_v4/manifest.json]
+    samples: [taifex_portfolio_daily_v4/product_master.parquet, final_settlement_all_history_20260929/futures_final_settlement_history.parquet]
+    related: [data_tw_index_futures, data_taifex_public_history, data_tw_shioaji_history]
+
+  data_tw_index_futures:
+    title: 期交所全期貨日表、指數近月視圖與規則準備來源
+    category: 台股與台灣衍生品
+    role: 官方日資料主表與可重建的研究視圖
+    purpose: >-
+      保存期交所期貨日交易資料，並產生指數期貨日盤、近月及轉倉研究視圖。
+      雖然目錄名稱含 index，all_futures_daily_sessions 主表涵蓋的範圍不只一種指數商品；要看 product 與 session。
+    grains:
+      - 主表是一個交易日、商品、合約與盤別；近月表是依明確換月規則選出的衍生視圖。
+      - preparation_sources 是保證金、規則及結算準備來源，不是額外的日 K 棒。
+    layout:
+      - ["all_futures_daily_sessions.parquet", "保留商品、到期合約與盤別的官方日資料主表。"]
+      - ["day_session_contracts.parquet、day_session_front_month.parquet", "日盤及近月衍生視圖，與主表重疊，不能相加。"]
+      - ["preparation_sources/", "保證金來源、生效規則及官方最後結算等準備資料。"]
+      - ["raw/、manifest.json", "官方年檔／區間檔、來源校驗及選月／轉倉政策。"]
+    fields:
+      - ["date、product、contract、session", "交易日、商品、合約與盤別；夜盤不是另一個可任意合併的日曆日。"]
+      - ["open、high、low、close、settlement", "OHLC 與結算價；結算價不可當作必定能成交的價格。"]
+      - ["volume、open_interest", "成交與未平倉契約口數。"]
+      - ["multiplier、is_front_month、front_month_roll", "乘數、是否近月及換月標記。"]
+      - ["log_return、rolling_buy_hold_log_return", "既有衍生研究報酬，並非原始來源價格。"]
+    timing:
+      - 日行情在當盤結束後取得，歷史年檔與近期區間持續銜接；實際起訖須看 manifest 與主表，而不是請求 end_date。
+      - 換月切換與跨月價差的處理依 manifest；不能把拼接造成的跳價當成同一合約的市場報酬。
+    cautions:
+      - 目錄名不代表主表僅有 TX；訓練前要明確篩商品、盤別與合約類型。
+      - 下游期貨策略仍需有效保證金、部位限額、到期結算、費稅與可交易遮罩；日表存在不代表執行資料已全部完備。
+    sources: [scripts/run_taifex_all_futures_daily.sh, stockagent/data/tw_index_futures.py, stockagent/storage_layout.py]
+    evidence: [manifest.json]
+    samples: [all_futures_daily_sessions.parquet, day_session_front_month.parquet]
+    related: [data_tw_futures, data_tw_index_options_daily, data_taifex_public_history]
+
+  data_tw_index_options_daily:
+    title: 台指選日行情、月週選全鏈與 ATM 配對
+    category: 台股與台灣衍生品
+    role: 官方日行情正規化與選擇權槽位視圖
+    purpose: >-
+      用來研究 TXO 不同到期日、履約價與買賣權的日行情，及與台指期開盤對齊的價平配對。
+      全鏈和 ATM 配對是同一來源的不同選取方式，不是兩份互相獨立的市場樣本。
+    grains:
+      - 全鏈是一個交易日、到期系列、履約價與 call／put；配對表是一個交易日選定的一組買賣權。
+      - 最後結算表是到期結算事件，不是盤中的 option quote。
+    layout:
+      - ["monthly_full_chain.parquet、weekly_full_chain.parquet", "月選與週選全鏈，保留系列與履約價。"]
+      - ["monthly_opening_atm_pairs.parquet、weekly_nearest_expiry_opening_atm_pairs.parquet", "按開盤參考選出的 ATM 買賣權配對。"]
+      - ["txo_final_settlement_history.parquet", "TXO 最後結算歷史，與正常日 close 分開。"]
+      - ["manifest*.json、raw/", "來源檔、全鏈範圍、價格邊界與 ATM 選取契約。"]
+    fields:
+      - ["date、option_series、expiry、strike、option_right", "交易日、到期系列、履約價與買／賣權；合起來才足以辨識合約。"]
+      - ["option_slot、expiry_rank、moneyness_rank", "研究槽位與排序，不是交易所固定不變的合約代碼。"]
+      - ["open、close、settlement、last_bid、last_ask", "權利金點數與買賣報價；last quote 與開盤成交並非同一時點。"]
+      - ["volume、executable、exclusion_reason", "口數、既有執行條件與排除理由；零／缺值價格不能任意變成免費選擇權。"]
+      - ["tx_open、call_*、put_*", "用於配對的台指期參考與兩邊行情，不能遺漏任一腿的時點限制。"]
+    timing:
+      - 月選、週選與到期日曆分開處理；實際更新以各 manifest 的來源範圍及收據為準。
+      - 日表同時含開盤與收盤／結算資訊，做開盤決策時不能把當日收盤欄當作已知特徵。
+    cautions:
+      - 日資料不能證明盤中任意時刻的 bid/ask 或成交能力；需要逐筆時應另用對應事件資料。
+      - 權利金點數、契約乘數、保證金和台股股數是不同單位；買方與賣方風險也不能共用簡化帳務。
+    sources: [scripts/download_taifex_option_daily_history.py, stockagent/data/tw_index_options_daily.py]
+    evidence: [manifest.json, manifest_weekly.json, manifest_final_settlement.json]
+    samples: [monthly_full_chain.parquet, monthly_opening_atm_pairs.parquet, txo_final_settlement_history.parquet]
+    related: [data_tw_index_futures, data_tw_index_derivatives_ticks]
+
+  data_tw_index_derivatives_ticks:
+    title: 台指期與台指選逐筆成交及事件研究表
+    category: 台股與台灣衍生品
+    role: 官方逐筆原件、TX／TXO 分區與串流補充
+    purpose: >-
+      保存期交所逐筆公開檔，建立 TX 與 TXO 按交易日的成交事件，再另產生研究決策表。
+      官方原始 ZIP 可能包含其他商品，但本目錄正規化的 tx／txo 不能因此宣稱所有期貨商品都已正規化。
+    grains:
+      - tx／txo 是官方成交報告列；原始來源沒有提供的逐筆識別碼或次秒精度不會被憑空製造。
+      - strategy_dataset 是經決策／執行時鐘對齊的研究樣本；shioaji_fop_captures 另含串流 tick 與委託簿。
+    layout:
+      - ["raw/", "近期官方逐筆 ZIP 與 listing pages，保留原件。"]
+      - ["tx/、txo/", "按 trading_date 分區的台指期／台指選 transactions。"]
+      - ["strategy_dataset/", "研究決策、下一執行事件與兩腿價格資料，與來源事件表不同。"]
+      - ["shioaji_fop_captures/", "另行保存的永豐衍生品 ticks、book_events、book_1s 及其 manifests。"]
+    fields:
+      - ["trading_date、event_date、event_ts、session", "交易日、實際日曆日與事件時間；夜盤可能跨日。"]
+      - ["product、delivery_month_week、strike_price、option_right", "期貨或選擇權的商品、到期、履約價及方向。"]
+      - ["reported_b_plus_s_quantity、matched_quantity", "期貨來源 B+S 雙邊量及換算後成交口數，不能再重複除二。"]
+      - ["reported_side_quantity、matched_quantity_equivalent", "選擇權來源單邊列量及可加總的配對量等值，與原生單筆契約數不同。"]
+      - ["execution_event_ts、call_execution_event_ts、put_execution_event_ts", "研究執行所選事件時間，不能把目前成交直接當作稍後能成交的價格。"]
+      - ["interval_log_return 等", "研究衍生欄位；不是所有表都是純原始 tick。"]
+    timing:
+      - 來源是近期滾動逐筆公開檔加上本機累積保存，不保證可以向來源一次回抓任意多年逐筆。
+      - 時間精度、夜盤歸屬與事件／執行分離依 manifest 的 timestamp_contract，不把同秒多列當作錯誤重複。
+    cautions:
+      - 選擇權買賣雙邊報告不能不分單位直接加總；成交量、事件列數與配對口數是不同指標。
+      - 官方成交記錄不是完整歷史委託簿；串流委託簿只涵蓋實際訂閱保存的時段。
+    sources: [scripts/download_taifex_recent_index_derivatives_ticks.py, scripts/build_taifex_index_derivatives_tick_dataset.py, stockagent/data/tw_index_derivatives_tick.py]
+    evidence: [manifest.json, strategy_dataset/manifest.json]
+    samples: ["tx/trading_date=*/transactions.parquet", "txo/trading_date=*/transactions.parquet", "strategy_dataset/trading_date=*/decisions.parquet"]
+    related: [data_tw_index_futures, data_tw_index_options_daily]
+
+  data_finlab:
+    title: FinLab 原始表、分鐘／逐筆與研究正規化
+    category: 台股與台灣衍生品
+    role: 授權來源的不可變表版本與可追溯研究資料
+    purpose: >-
+      保存目前帳戶實際取得的 FinLab 表格與來源版本，包括行情、財務、籌碼及其他研究欄位。
+      大多數原始表是寬表：一個日期／期間一列、很多標的一起放在欄上；不能用列數直接當有效數值總量。
+    grains:
+      - 每張 datasets 表通常是一個資料欄位的日期乘標的矩陣；有些表是事件／其他索引，需看 dataset 定義。
+      - normalized 是為特定研究映射的長表／特徵；intraday 另保存分鐘與逐筆相關資料，與日表分開。
+    layout:
+      - ["catalog/、receipts/", "可見資料鍵與已接受版本的指向／校驗碼，應先讀 receipt 再定位資料。"]
+      - ["datasets/、raw/、raw_receipts/、versions/", "目前可讀原始寬表、來源 Feather 與保留版本；多個版本不是新增觀測。"]
+      - ["normalized/", "研究用途的欄位映射及正規化結果，不代表所有原表已注入模型。"]
+      - ["intraday/", "分鐘／逐筆下載、游標、derived_minute 與個別收據；實際範圍需看該子管線。"]
+      - ["attempts/、empty_evidence/、runs/", "失敗、來源空表與每輪摘要；attempt 不是成功資料。"]
+    fields:
+      - ["source_index", "來源索引，可能是日期、期間或其他鍵，不能不看表定義就當精確發布時刻。"]
+      - ["0050、2330 等動態欄名", "寬表的標的識別；必須保留字串與前導零，欄數不等於有值標的數。"]
+      - ["date、symbol、twfl_*_raw", "研究正規化表的日期、標的及映射原值；raw 不代表已驗證歷史發布版本。"]
+      - ["dataset、parquet_path、sha256", "收據中的資料鍵、不可變檔路徑與完整性證據。"]
+    timing:
+      - 不同鍵有日、月、季、事件或盤中頻率；追新依既有配額、發布視窗與優先序，不是所有鍵每分鐘重抓。
+      - 報表所屬期間、FinLab 索引、取得時間與公司原始公告不同；目前取得的歷史值也可能是修訂後版本。
+    cautions:
+      - 原始寬表可能達數萬欄；以 receipt 定位所需鍵，投影少數欄分批讀，不把全庫一次轉成 pandas。
+      - 相同內容的不可變歷史 Parquet 可共用唯讀實體；來源 receipt 與邏輯路徑保留，硬連結數不是資料筆數。不同版本的值不會因此被合併。
+      - 缺值、來源全空、帳戶權限與下載失敗分開處理；不能拿空值補零後宣稱歷史抓齊。
+      - 已下載不等於所有用途都已授權；保留來源使用範圍，這份文件不更改遠端匯出或訓練注入權限。
+    sources: [scripts/download_finlab_history.py, scripts/download_finlab_market_intraday.py, stockagent/data/finlab_acquisition_contract.py, stockagent/data/finlab_research_overlay.py, stockagent/data/finlab_storage.py]
+    evidence: [runs/latest.json, core_acquisition_status.json, intraday/status.json]
+    samples: ["normalized/*.parquet", "datasets/*.parquet"]
+    related: [data_finmind, data_tw_public, data_news]
+
+  data_finmind:
+    title: FinMind 台股、衍生品、總體與新聞資料
+    category: 台股與台灣衍生品
+    role: 分資料集的來源分區、配額與增量／修正證據
+    purpose: >-
+      補充台股與衍生品的歷史行情、財務、籌碼、事件、總體及新聞清單。
+      不同 dataset 是不同資料模型：日價格、財報項目、五秒指標、逐筆與股票－新聞關聯不能當作同一種列加總。
+    grains:
+      - 日價格常是一日一檔；法人、經紀商、財報與事件還有類別、分點、期間或項目等鍵。
+      - TaiwanStockNews 是股票與新聞的關聯觀測，不是每列一篇獨立全文。
+    layout:
+      - ["sponsor/parquet/、complement/parquet/", "兩個既有工作分工的資料集／查詢範圍／版本物件；不是兩份可直接串接的獨立市場。"]
+      - ["receipts/、snapshots/、versions/", "來源回應及版本；快照名單與歷史成分須分開。"]
+      - ["market_intraday/、futures_intraday/", "五秒市場指標與衍生品盤中資料，保留原生頻率。"]
+      - ["announcements/、update_observations.sqlite3", "來源更正公告與實際更新時間觀測。"]
+      - ["request_traffic.sqlite3、*_status.json", "配額、排程與工作狀態；不是可直接訓練的經濟觀測。"]
+    fields:
+      - ["date、stock_id／futures_id、contract_date", "日期、標的與到期合約；需要連同 dataset 的其他鍵去重。"]
+      - ["open、max、min、close、Trading_Volume、Trading_money", "日行情與股數／成交金額；各種盤中 volume 的原生單位可能不同。"]
+      - ["minute、volume", "期貨分鐘欄與口數，不能乘 1000 轉成股票股數。"]
+      - ["title、link、stock_id", "新聞標題、網址與股票關聯；全文由 data_news_fulltext 另取得。"]
+      - ["create_time／來源更新觀測", "可能是供應商建檔或觀測時間，不可一律當作公司首次發布時間。"]
+    timing:
+      - 追新依各資料集發布視窗與交易日曆；歷史回補、來源更正與剩餘配額校驗各有佇列。
+      - 下載摘要、滾動小時流量與預估剩餘工作不是同一種量；最新覆蓋以當前成功物件及收據為準。
+    cautions:
+      - 不可 glob 全部版本直接 concat；相同查詢的修訂、校驗結果與跨來源重複必須依鍵及來源優先序處理。
+      - 下載成功／有效空回應只證明被查的範圍，不自動證明所有標的、欄位與歷史都完整。
+    sources: [downloader/download_finmind_sponsor.py, downloader/download_finmind_complement.py, downloader/finmind_scheduling.py, downloader/finmind_volume_units.py, downloader/finmind_news.py]
+    evidence: [worker_status.json, sponsor/integrity_status.json, eta_status.json, calendar.json]
+    samples: ["sponsor/parquet/TaiwanStockPrice/**/*.parquet", "complement/parquet/TaiwanFuturesKBar/**/*.parquet"]
+    related: [data_finlab, data_tw_public, data_news, data_news_fulltext]
+
+  data_tej:
+    title: TEJ Smart Wizard 與試用 API 歷史資料
+    category: 台股與台灣衍生品
+    role: 授權表格原值、查詢範圍與雙路徑取得證據
+    purpose: >-
+      保存 TEJ 桌面 Smart Wizard 匯出的表格及帳戶 API 可取得的資料。
+      表格可能涵蓋公司財務、交易、基金、房地產等；實際可用範圍由本機清冊、帳戶權限與成功收據決定，不能從產品名稱推定全部都有。
+    grains:
+      - 各 TEJ 表有各自公司／證券、期間、科目或事件鍵；GUI 與 API 欄名大小寫及鍵型態可能不同。
+      - request、query lifecycle、桌面進度與 API 分頁是工作證據，不是另一份經濟觀測。
+    layout:
+      - ["datasets/、raw/、receipts/", "Smart Wizard 已匯出的原值、原件與接受收據，按表與查詢範圍保存。"]
+      - ["api_trial_v1/", "試用 API 的表清冊、metadata、pages、請求、配額與佇列；分頁要按接受收據組合。"]
+      - ["api_source_allocation.json、value_priority.json", "API／桌面分工及資料價值優先序，不是歷史完整證明。"]
+      - ["query_lifecycle/、progress/、input_acceptance/", "查詢、操作、接受與來源範圍的證據。"]
+    fields:
+      - ["CO_ID／coid、Date／mdate", "常見公司／標的與日期鍵，真正語意依表的 metadata 及鍵解析紀錄。"]
+      - ["各表原欄名與數值", "保留來源原值；幣別、千元／百萬元、百分數／比率等必須逐欄看表定義。"]
+      - ["表代碼、查詢範圍、來源校驗碼", "用來知道哪個表、哪些標的、哪段歷史真的被取得。"]
+      - ["頁碼／cursor、範圍與空結果證據", "API／GUI 分頁與有效空查詢的證明；空表不能一律代表整段歷史不存在。"]
+    timing:
+      - API 與桌面共用資料分工，但不是相同的配額或併發模型；桌面已送出和資料持久化成功須分開看。
+      - 財報期間、公告／修訂時點與下載時間不能混用；目前取得的表可能包含後來修正值。
+    cautions:
+      - 目錄中可能有合法的零列查詢、保留重試與孤兒操作證據；不能只數 parquet 檔案宣稱抓完。
+      - 試用 API 只代表試用表權限，不等於 Smart Wizard 全部授權表可透過 API 取得；API／桌面重複範圍需排除。
+      - 此文件不更改帳戶登入、授權、配額、桌面服務或跨主機使用範圍。
+    sources: [downloader/download_tej_history.py, downloader/download_tej_api.py, downloader/tej_api_ownership.py, downloader/tej_query_lifecycle.py, configs/tej_history.json]
+    evidence: [worker_status.json, scheduler_status.json, api_trial_v1/scope_inventory.json]
+    samples: ["api_trial_v1/pages/**/*.parquet", "datasets/*/*.parquet"]
+    related: [data_finlab, data_finmind, data_tw_public]
+
+  data_news:
+    title: 新聞標題與全文研究資料集
+    category: 新聞
+    role: 已驗證固定版本的文章、去重文字與來源關聯
+    purpose: >-
+      把已保留新聞整理為 title／body 分開的版本化 Parquet；無內文為真正 NULL。
+      版本是完整邏輯視圖，後續 refresh 共用不變分區，只寫新增／異動，不另存全量副本。
+      本目錄已有較完整的專屬 README，由新聞資料集建置程式維護，這次清點保留其內容。
+    preserve_existing: true
+    grains:
+      - 網址文章、精確去重文字、股票關聯與中繼資料觀測分成四張表。
+      - 精確相同文字可共用 document，但不代表改寫文章或同一事件已做語意去重。
+    layout:
+      - ["manifest.json、schema.json、verification.json", "固定邏輯版本入口與完整驗證證據。"]
+      - ["versions/", "舊基準、新版清單及新增／異動分區；讀 manifest，不把所有版本一起讀取。"]
+    fields: [["title、body、text_kind", "標題、可為 NULL 的內文及取得狀態。"]]
+    timing: [目前回補取得的版本不等於當年已持有的歷史全文，發布與取得時間分開。]
+    cautions:
+      - 完整歷史仍未獲證實，來源範圍與使用旗標繼續保留。
+      - title 與 body 供不同任務選用，缺少內文維持 NULL，不把標題或 RSS 摘要冒充內文。
+    sources: [stockagent/data/news_dataset.py, scripts/build_news_dataset.py]
+    evidence: [manifest.json, verification.json, schema.json]
+    samples: []
+    related: [data_news_fulltext, data_finlab, data_finmind]
+
+  data_news_fulltext:
+    title: 新聞下載來源庫、原始正文與抓取證據
+    category: 新聞
+    role: 持續變動的來源權威庫，不是固定訓練切分
+    purpose: >-
+      保存已知新聞網址、標題、原始回應、抽取正文、使用範圍與各來源的成功／失敗證據。
+      它是下載器持續工作的來源庫；給模型使用的固定版本另在 data_news，不能把佇列的網址數當作已取得全文數。
+    grains:
+      - queue 的網址 head、來源新聞清單、正文版本與 HTTP／抽取收據是不同粒度。
+      - bodies 一個檔可含多篇正文，歷史版本也可能重複；讀取目前正文須依佇列指向與接受收據。
+    layout:
+      - ["queue.sqlite3、status.json、source_inventory.csv", "網址與來源的工作狀態；活躍來源不等於歷史完成。"]
+      - ["bodies/、receipts/", "已抽取正文、原件與接受證據；不應無條件把所有批次當作目前文章版本。"]
+      - ["list_metadata/、identity_metadata/、discovery_responses/、metadata_feeds/", "發現網址、身分及 RSS 清單；發現不是正文接受。"]
+      - ["robots/、access_problems/、transport_problems/、cooldowns/", "來源規範、存取失敗、網路與重試證據，不是可訓練正文。"]
+      - ["quarantine/", "待核對或拒絕接受的物件，不應直接灌入訓練。"]
+    fields:
+      - ["title、body、body_sha256", "抽取文字與原字串校驗碼；RSS 摘要與標題不冒充全文。"]
+      - ["published_at_raw、modified_at_raw、captured_at_utc", "來源發布／修改字串與本機取得時刻，不能互相替代。"]
+      - ["authors_json、attribution_status、declared_canonical_url", "作者、轉載與來源宣告的網址，不保證網址媒體就是原作者。"]
+      - ["extraction_method、body_completeness", "抽取方式與來源記錄的完整性，需保留失敗／部分正文狀態。"]
+      - ["rights_status、declared_license_urls_json、training_injection_enabled", "使用範圍與來源宣告，不因 HTTP 200 就自動開放訓練或轉載。"]
+    timing:
+      - 各來源獨立追新／回補並依回應退避，這份 README 不是即時抓取進度。
+      - 過去日期新聞在今天抓到的正文可能已修訂；不把 capture 時間回填成原發布時間。
+    cautions:
+      - 不直接掃描整個 SQLite 大表或 glob 所有正文來當訓練全集；使用已接受 head／收據，或讀 data_news 的固定 manifest。
+      - 403、來源空值、無全文權限、尚未實作與真的不存在是不同狀態；保留證據而不偽造文字。
+    sources: [downloader/news_fulltext_queue.py, downloader/news_fulltext_policy.py, configs/news/publisher_catalog.json, scripts/audit_news_providers.py]
+    evidence: [source_inventory.csv, status.json]
+    samples: ["bodies/*/*.parquet"]
+    related: [data_news, data_finmind, data_finlab]
+
+  data_binance:
+    title: Binance 永續合約一分鐘行情與交易特徵
+    category: 加密貨幣
+    role: 單交易所分鐘主資料、日視圖與相容舊表
+    purpose: >-
+      用來研究 Binance 合約價格、成交、標記／指數價格及來源可提供的衍生統計。
+      完成的一分鐘 K 棒是目前盤中基準，日資料、近期 hot tail 與根目錄相容表不能當成互不重複的新資料。
+    grains:
+      - 一分鐘行情是一個 Binance 合約、一個已完成區間；原生較慢的資金費率／OI 等保留原頻率。
+      - 日資料是日視圖，根目錄 *_features.parquet 的頻率須查來源／欄位，不由檔名推定。
+    layout:
+      - ["1m/", "標準分鐘基底、近期 hot tail 與各自更新資訊。"]
+      - ["daily/", "日行情／聚合與覆蓋資訊，不能再加到分鐘觀測總數。"]
+      - ["*_features.parquet", "歷史／相容行情與衍生欄位；與 1m、daily 可能重疊。"]
+    fields:
+      - ["date、open、max、min、close、adjclose", "來源時間及 OHLC 相容欄；max／min 對應 high／low，不代表股票復權語意。"]
+      - ["binance_volume_base、binance_volume_quote", "基礎資產量與計價資產金額，不可互相當作同單位相加。"]
+      - ["binance_trade_count、binance_taker_buy_*", "成交筆數與主動買量；不是委託筆數或完整 L2。"]
+      - ["binance_mark_*、binance_index_*、資金費率／OI 欄位", "標記、指數與原生慢頻統計；可用性及涵蓋率各自核對。"]
+    timing:
+      - 加密市場連續交易，一分鐘增量以已完成來源棒為界，不把未收盤棒當完整歷史。
+      - UTC 日界、來源上市／到期與原生統計發布時間都需要保留，不能把五分鐘數值捏造成每分鐘新觀測。
+    cautions:
+      - Binance、OKX、Bybit 是不同市場，不能以另一交易所價格補成 Binance 原生觀測。
+      - hot tail 與基底重疊，讀取需用既有 OHLCV reader 的合併規則；根目錄舊摘要可能不是分鐘子管線的最新覆蓋。
+    sources: [downloader/download_binance_perp_1m.py, downloader/binance_historical_features.py, downloader/ohlcv_hot_tail.py]
+    evidence: [download_summary.json, "1m/download_summary.json", "daily/download_summary.json"]
+    samples: ["1m/*_features.parquet", "daily/*_features.parquet"]
+    related: [data_binance_archive, data_okx, data_bybit]
+
+  data_okx:
+    title: OKX 永續合約一分鐘行情與交易特徵
+    category: 加密貨幣
+    role: OKX 單交易所行情、原生統計與日視圖
+    purpose: >-
+      保存 OKX swap 行情、成交量、mark／index 與來源可供的資金費率等資料。
+      訓練 OKX 專屬模型時，必須保留 OKX 合約與單位；其他交易所的同名資產不等於同一個市場。
+    grains:
+      - 行情主資料是一個 OKX instrument、一根完成的一分鐘 K 棒；慢頻統計不是分鐘新增事件。
+      - 日資料、根目錄舊表及 panel_cache_v2 屬不同視圖／計算產物，不能加總成獨立來源。
+    layout:
+      - ["1m/", "完成分鐘行情與近期 hot tail，保留基底／近期合併規則。"]
+      - ["daily/", "日視圖與其覆蓋，按日使用，不和分鐘列混為同一頻率。"]
+      - ["*_features.parquet、panel_cache_v2/", "相容表及來源綁定的模型面板快取，不是額外原始成交。"]
+    fields:
+      - ["date、open、max、min、close、Trading_Volume", "時間與行情相容欄；成交量真正單位仍需看 OKX 專屬欄。"]
+      - ["okx_volume_contract、okx_volume_base、okx_volume_quote", "契約張／口數、基礎幣量及計價金額，三者不能混淆。"]
+      - ["okx_confirm", "來源 K 棒是否確認完成的標記，不是全歷史完整旗標。"]
+      - ["okx_mark_*、okx_index_*", "標記與指數價格，和可成交 last price 不是同一概念。"]
+    timing:
+      - 一分鐘追新保留 UTC 來源時鐘與已完成棒界線；上市前／到期後不應要求無限 K 棒。
+      - 資金費率與其他較慢統計只在其真正可用後對齊，不能往前填入尚未發布的值。
+    cautions:
+      - 不能把 Binance／Bybit 資金費率或價格偷偷併成 OKX 原生特徵。
+      - 不要把 panel cache 或 hot tail 當成新的歷史來源；資料存在不保證每個 instrument 都有同長度歷史。
+    sources: [downloader/download_okx_perp_1m.py, downloader/okx_historical_features.py, downloader/download_okx_perp_daily.py]
+    evidence: [download_summary.json, 1m/download_summary.json, daily/download_summary.json]
+    samples: ["1m/*_features.parquet", "daily/*_features.parquet"]
+    related: [data_binance, data_bybit, data_crypto_reference]
+
+  data_bybit:
+    title: Bybit 合約分鐘、資金費率與單交易所日特徵
+    category: 加密貨幣
+    role: 原生行情、資金費率及明確區分的研究表
+    purpose: >-
+      保存 Bybit 合約的一分鐘行情、日視圖、資金費率與研究特徵。
+      專屬 Bybit 表和混合公開背景的研究表分開命名，不能把跨交易所訊號誤當成 Bybit 原生資料。
+    grains:
+      - 一分鐘表是一個 Bybit 合約、一根完成棒；funding 是一個實際結算／發布時點。
+      - perpetual_daily 與 public_features 是日級衍生視圖，與分鐘基底可能完全重疊。
+    layout:
+      - ["1m/、daily/", "原生分鐘基底／hot tail 與日視圖。"]
+      - ["funding/", "來源資金費率歷史，保留合約與原生時點。"]
+      - ["perpetual_daily/", "日級交易與資金費率研究資料。"]
+      - ["public_features/", "bybit_venue_daily 是單交易所表；bybit_crypto_public_daily 是混合公開背景研究表，不能混用。"]
+      - ["*_features.parquet", "根目錄相容歷史，不能直接與 1m、daily 再次加總。"]
+    fields:
+      - ["date、open、max、min、close", "來源時間及行情，不由檔名判斷頻率。"]
+      - ["bybit_volume、bybit_turnover、Trading_Volume", "量與成交額的來源欄；線性／反向商品的幣種語意須依商品契約確認。"]
+      - ["資金費率與 funding timestamp", "費率與適用／結算時點，不是每分鐘都有的新觀測。"]
+      - ["bybit_venue_daily／公開背景欄位", "單一交易所輸入與混合來源的研究層必須明確分開。"]
+    timing:
+      - 行情以已完成分鐘持續追新；日資料及 funding 依各自來源時鐘更新，不能以台股休市日停掉加密市場。
+      - 本目錄目前經符號連結指向服務資料區；路徑別名不代表另存了一份獨立歷史。
+    cautions:
+      - 讀者要保留 Bybit category、合約生命週期及來源單位，不把反向合約與線性合約量直接相加。
+      - 嚴格單交易所研究不可誤用混合 public table；共享總體背景需由選定模型設定明示。
+    sources: [downloader/download_bybit_perp_1m.py, downloader/download_bybit_funding_history.py, scripts/build_bybit_venue_daily_features.py, scripts/build_bybit_crypto_public_daily_features.py]
+    evidence: [download_summary.json, 1m/download_summary.json, daily/download_summary.json]
+    samples: ["1m/*_features.parquet", public_features/bybit_venue_daily.parquet]
+    related: [data_binance, data_okx, data_crypto_historical_public]
+
+  data_binance_archive:
+    title: Binance 官方公開歷史封存與合約生命週期
+    category: 加密貨幣
+    role: 批次封存分區、下載計畫與物件接受狀態
+    purpose: >-
+      從官方公開封存補充交易所歷史，依市場、標的與日／月檔保存。
+      它和即時 REST 分鐘下載器有不同角色；封存物件、計畫列與行情列不是同一種數量。
+    grains:
+      - archive_plan 每列是一個預定下載物件；partitions 是實際行情分區；instrument_lifecycle 是合約的來源生命週期。
+      - 月檔與日檔可能覆蓋相同期間，需依既有優先規則及經濟鍵去重。
+    layout:
+      - ["partitions/spot、partitions/um、partitions/cm", "現貨、USD-M 與 COIN-M 市場分開保存，不能當作同一合約。"]
+      - ["archive_plan.parquet、plan_summary.json", "來源物件工作清單與計畫摘要，不是全部已取得的行情。"]
+      - ["instrument_lifecycle.parquet", "合約上市／到期等生命週期證據。"]
+      - ["state/、download_errors.parquet、capacity_receipt.json", "下載狀態、來源錯誤與容量估計證據。"]
+    fields:
+      - ["market、symbol、archive_granularity、period", "來源市場、標的、日月封存粒度及期間。"]
+      - ["key、etag、compressed_bytes、archive_last_modified_utc", "官方物件身分、壓縮大小及物件修改時間，不是行情發布時間。"]
+      - ["source_priority、state", "重疊來源取捨與工作狀態，不可當模型特徵。"]
+    timing:
+      - 日檔／月檔依官方封存產生後回補，近期資料可由既有交易所管線補充；不是每個封存物件都即時更新。
+      - 來源最早年月因市場、商品與檔案種類不同；計畫起點不能當作每個合約的實際上市日。
+    cautions:
+      - 不能把計畫列數當作成交筆數或下載完成數；以每物件接受證據為準。
+      - 底層有 tick／逐筆可用格式，不表示所有逐筆類型都已排入或完成；這次文件不擴大下載範圍。
+    sources: [downloader/download_binance_public_archive.py, scripts/run_binance_public_archive.sh]
+    evidence: [plan_summary.json, download_summary.json, capacity_receipt.json]
+    samples: [archive_plan.parquet, instrument_lifecycle.parquet]
+    related: [data_binance]
+
+  data_coinmetrics_community:
+    title: Coin Metrics Community 資產指標與觀測版本
+    category: 加密貨幣
+    role: 公開資產指標、可用欄位目錄與本機版本
+    purpose: >-
+      保存 Community 方案實際提供的加密資產指標，可補充鏈上活動、市值或成交等背景。
+      每個資產與指標可用範圍不同；指標目錄列得出來不代表該資產所有年份都已有數值。
+    grains:
+      - assets 是按資產與原生頻率展開的指標時間列；vintages 額外保留本機觀測版本。
+      - catalog 是資產－指標－頻率的可查清單，不是經濟數值資料。
+    layout:
+      - ["assets/", "每個資產的指標表，欄位由實際 Community 可用指標決定。"]
+      - ["vintages/", "本機看見的版本與可用性，不能假定等於供應商完整歷史修訂檔。"]
+      - ["catalog/asset_metrics.json", "資產、指標、頻率與來源宣告範圍。"]
+      - ["raw/、download_receipt.json、download_report.csv", "來源回應與逐項接受結果。"]
+    fields:
+      - ["date、coinmetrics_*", "來源原生日期與各指標；不是股票 OHLCV，也不是每欄單位相同。"]
+      - ["volume_reported_spot_usd_1d 類型欄位", "來源申報的現貨美元成交量，不能當作某家交易所原生成交量。"]
+      - ["觀測／available 時間與 raw SHA", "版本及來源證據；對齊歷史日期不能抹去後來才觀測到的事實。"]
+    timing:
+      - 以原生日頻等頻率追新，最早日期按資產／指標目錄與實際回應分別判定。
+      - 來源修訂與本機首次觀測分開，不能把今天的 Community 快照倒灌成多年前已知的版本。
+    cautions:
+      - Community 不等於全站所有商業指標；缺欄位可能是適用性、權限或歷史範圍差異。
+      - 指標計數、資產數、寬表列數與非空數值數不能互相代替。
+    sources: [downloader/download_coinmetrics_community.py]
+    evidence: [download_summary.json, download_receipt.json, download_report.csv]
+    samples: ["assets/*_features.parquet", "vintages/*_vintages.parquet"]
+    related: [data_crypto_reference, data_crypto_historical_public]
+
+  data_crypto_reference:
+    title: 加密資產身分、供應商目錄與市場快照
+    category: 加密貨幣
+    role: 跨來源參考快照，不是可回溯的全市場行情
+    purpose: >-
+      整理 CoinGecko、CoinMarketCap 替代名單、Etherscan 等已啟用來源的資產身分與市場／鏈狀態快照。
+      用來辨識幣種、鏈與來源；目前市場快照不是某家交易所的歷史分鐘成交資料。
+    grains:
+      - 每筆是某來源、某資產／市場狀態、某次實際觀測；同名 ticker 不是跨鏈唯一鍵。
+      - latest 是指向最近成功快照的入口，snapshots 才是保存的觀測版本，兩者不能當兩份資料相加。
+    layout:
+      - ["latest/", "最近成功資料的參照與來源證據。"]
+      - ["snapshots/", "按資料集與取得日期保存的正規化快照。"]
+      - ["source_status.json、state/", "逐來源可用性、工作狀態與配額退避。"]
+      - ["quarantine/", "隔離的異常物件，不納入正式觀測。"]
+    fields:
+      - ["asset_id、symbol、name、platforms_json", "供應商資產 ID、符號、名稱及鏈／地址資訊；symbol 單獨不唯一。"]
+      - ["observed_at_utc、available_at_utc、raw_sha256", "真實觀測時點、可用時點與原件證據。"]
+      - ["市場快照／鏈狀態指標", "欄位依資料集不同，單位需看供應商定義，不代表某交易所成交價。"]
+    timing:
+      - 依既有 TTL 與供應商配額追新；只有實際保存後才形成自己的快照歷史。
+      - 今天名單不能當作多年以前的幣種全集；快照未涵蓋的歷史維持未知。
+    cautions:
+      - 這是 reference／snapshot，不應被誤宣稱為所有幣種的完整早年歷史。
+      - 替代供應商映射須保留來源，不能只以重複 symbol 把不同鏈代幣合併。
+    sources: [downloader/download_crypto_keyed_context.py]
+    evidence: [download_summary.json, source_status.json]
+    samples: ["snapshots/coingecko_asset_catalog/*/*/*/*.parquet", "snapshots/coingecko_market_snapshot/*/*/*/*.parquet"]
+    related: [data_binance, data_okx, data_bybit, data_coinmetrics_community]
+
+  data_crypto_historical_public:
+    title: 加密資產 CFTC 部位與 Wikimedia 關注度歷史
+    category: 加密貨幣
+    role: 公開歷史背景與明確標示的研究可用時間
+    purpose: >-
+      用公開 CFTC 金融期貨交易人統計與 Wikimedia 頁面瀏覽，補充加密市場的部位與注意力背景。
+      這些不是 Binance／OKX／Bybit 的原生交易特徵，也沒有因為取得歷史數值就自動成為歷史當時版本。
+    grains:
+      - CFTC 是商品、週次及報告類型的部位；Wikimedia 是特定專案／文章、日期及存取類型的頁覽數。
+      - normalized/versions 與 raw 歷史保存是修訂／觀測版本，不能再加到目前主表筆數。
+    layout:
+      - ["normalized/cftc_tff_digital_assets.parquet", "數位資產相關 CFTC TFF 部位表，保留報告類型與商品。"]
+      - ["normalized/wikimedia_crypto_pageviews_daily.parquet", "指定加密主題文章每日頁覽，不代表全網搜尋／情緒。"]
+      - ["quality/wikimedia_article_coverage.csv", "文章別實際覆蓋情況。"]
+      - ["raw/、receipts/、versions/", "來源原件、接受證據與修訂保存。"]
+    fields:
+      - ["market_and_exchange_names、report_date_as_yyyy_mm_dd、open_interest_*", "CFTC 市場、報告所屬日與未平倉／分類部位；數量單位看契約。"]
+      - ["requested_article、project、event_date_utc、views", "查詢文章、Wikimedia 專案、UTC 日期與頁覽計數。"]
+      - ["assumed_available_at_utc、strict_available_at_utc", "研究假設可用時間與本機真正首次觀測時點，不能混用。"]
+      - ["point_in_time_state、causal_use_status", "修訂與因果可用性狀態，不是已驗證完整歷史發布的保證。"]
+    timing:
+      - CFTC 原生週頻，Wikimedia 原生日頻；可以按已發布狀態對齊，但不能製造分鐘新觀測。
+      - 推測／規律可用時間與嚴格觀測時鐘都保留；選研究近似時必須明示而不是覆蓋原始欄位。
+    cautions:
+      - 頁覽量不是唯一訪客或買賣情緒標籤；文章改名、缺日與機器人定義會影響比較。
+      - CFTC 期貨部位不代表全體鏈上持倉，也不能直接等同加密交易所未平倉量。
+    sources: [downloader/download_crypto_historical_public.py]
+    evidence: [download_summary.json, receipts/cftc.json, receipts/wikimedia.json]
+    samples: [normalized/cftc_tff_digital_assets.parquet, normalized/wikimedia_crypto_pageviews_daily.parquet]
+    related: [data_cftc_legacy, data_fred_crypto_macro, data_bybit]
+
+  data_dune_crypto:
+    title: Dune 鏈上查詢歷史與分區執行結果
+    category: 加密貨幣
+    role: 經查詢定義綁定的鏈上聚合，不是全鏈原始事件
+    purpose: >-
+      按已設定的 Dune SQL 查詢，取得 DEX 資產活動、穩定幣發行／銷毀等鏈上歷史聚合。
+      資料範圍取決於 query、SQL 版本、鏈與時間窗口；只有清冊而沒有成功結果的查詢不能算已下載。
+    grains:
+      - 一列通常是一日、鏈、協議、資產／代幣地址及流向等維度的聚合，不是一筆原始鏈上交易。
+      - 分區執行、execution ID 與收據是查詢工作證據；零列 Parquet 只代表該結果窗口為空。
+    layout:
+      - ["normalized/dex_asset_activity/", "按年與查詢時間窗口保存的 DEX 聚合。"]
+      - ["normalized/stablecoin_mint_burn/", "穩定幣發行／銷毀等來源結果。"]
+      - ["raw/、receipts/、state/executions/", "Dune 結果原件、execution 與接受證據。"]
+      - ["download_summary.json、progress.json", "已註冊、完成、失敗、額度／訂閱阻擋的分區狀態。"]
+    fields:
+      - ["event_date、blockchain、project、asset_symbol、token_address", "事件日與聚合維度；代幣以鏈加地址辨識，symbol 不是唯一鍵。"]
+      - ["transaction_count、trade_legs、taker_count、amount_usd", "各種查詢定義的數量及美元金額；交易腿不等於唯一交易筆數。"]
+      - ["_dune_execution_id、_dune_query_id、_dune_sql_sha256", "實際執行與 SQL 定義，查詢改寫後不得當相同特徵接續。"]
+      - ["_available_at_utc、_retrieved_at_utc、_window_start、_window_end", "結果可用／取得時間與查詢範圍，不是歷史發布的精確重建。"]
+    timing:
+      - 歷史分區與增量依已設定查詢、credits 與權限執行；查詢完成後才可接受結果。
+      - 事件日、區塊最終性、SQL 計算時點與結果取得時點不同，不能省略後兩者。
+    cautions:
+      - 本機抽樣可以是 0 列；不可將空結果、尚未執行、額度不足和全歷史完整混在一起。
+      - 本機未見 cex_labeled_flows 實體分區時，不能因清冊列得出名稱就宣稱已抓到交易所資金流。
+    sources: [downloader/download_dune_crypto_history.py]
+    evidence: [download_summary.json, progress.json]
+    samples: ["normalized/dex_asset_activity/year=*/*.parquet", "normalized/stablecoin_mint_burn/year=*/*.parquet"]
+    related: [data_crypto_reference, data_crypto_etf]
+
+  data_crypto_etf:
+    title: 加密 ETF 發行商指標、持倉及 SEC 申報
+    category: 加密貨幣
+    role: 基金歷史指標、持倉快照與法定申報事實
+    purpose: >-
+      保存加密 ETF／基金發行商可取得的資產、基金指標、持倉／儲備，以及 SEC 申報與財報事實。
+      基金市場價格、基金資產與鏈上資金流是不同資料，這裡不把資產淨值變化直接冒充申購／贖回淨流量。
+    grains:
+      - 每日指標是一個基金、一日、一個 metric；持倉是一次快照中的持有標的。
+      - SEC filings 是一份申報；companyfacts 是一個會計概念、期間、單位與申報版本。
+    layout:
+      - ["normalized/issuer_daily_fund_metrics.parquet", "發行商提供的基金日指標及單位。"]
+      - ["normalized/issuer_holdings_snapshots.parquet、normalized/issuer_reserve_snapshots.parquet", "持倉／儲備快照；只能代表實際可取得的日期。"]
+      - ["normalized/sec/", "逐實體申報索引與 companyfacts，與基金日指標分開。"]
+      - ["raw/、receipts/", "發行商／SEC 原件及取得證據。"]
+    fields:
+      - ["source_id、provider、ticker、asset", "來源、基金與追蹤資產，基金 ticker 不等於加密交易所合約。"]
+      - ["event_date／as_of_date、metric、value、unit", "指標所屬日、數值與原生單位；USD、份數、幣數及百分比不能混加。"]
+      - ["market_value_usd、weight_percent、quantity、currency", "持倉美元價值、百分比、數量及幣別，與實際成交量不同。"]
+      - ["observed_at_utc、available_at_utc、point_in_time_state、raw_sha256", "觀測、可用狀態與原件證據；歷史所屬日不證明當日盤前已知。"]
+    timing:
+      - 日基金指標、持倉快照與 SEC 申報依各自發布節奏更新；不能硬套同一固定盤前時刻。
+      - SEC 的期間結束日、申報日、接受時間與後續修訂分開，回測需選正確申報版本。
+    cautions:
+      - 發行商只提供當前持倉時，不能逆推不存在的多年每日持倉。
+      - 指標缺值、來源 degraded 與映射不明仍要保留，不以其他基金或推算流量假裝來源原值。
+    sources: [downloader/download_crypto_etf_history.py]
+    evidence: [download_summary.json, progress.json]
+    samples: [normalized/issuer_daily_fund_metrics.parquet, normalized/issuer_holdings_snapshots.parquet]
+    related: [data_dune_crypto, data_crypto_historical_public]
+
+  data_fred_crypto_macro:
+    title: FRED 初次發布版本的金融與流動性總體指標
+    category: 全球金融、總體與公共資料
+    role: 發布日期版本與明確的日界可用政策
+    purpose: >-
+      為市場研究提供利率、公債殖利率、美元、波動率、信用利差、央行資產與流動性等背景。
+      名稱含 crypto 但經濟內容不只適用加密市場；本表採 FRED 初次發布查詢契約，不是把目前修訂值一律回填過去。
+    grains:
+      - 一列是一個 series、觀測日期及 realtime_start 版本；不是每列代表另一個獨立經濟事件。
+      - 各序列原生可能為日、週、月等頻率，發布日期與觀測所屬日期分開。
+    layout:
+      - ["observations.parquet", "合併的初次發布觀測與版本時鐘。"]
+      - ["raw/、receipts/", "逐序列與 realtime 窗口的來源回應及接受證據。"]
+      - ["download_summary.json、progress.json", "序列／窗口下載進度與 point-in-time 缺口資訊。"]
+    fields:
+      - ["series_id、observation_date、value", "序列、經濟觀測所屬日與數值；利率常以百分數、資產常有倍率，單位須查序列。"]
+      - ["realtime_start、realtime_end", "FRED 提供的版本日期，不是精確發布秒數。"]
+      - ["available_at_utc、point_in_time_state", "現行程式採 realtime_start 下一個 UTC 日界，明確標為 fred_initial_release_next_utc_day。"]
+      - ["retrieved_at_utc、raw_sha256", "實際取得時間及原件證據，與 FRED 版本日期分開。"]
+    timing:
+      - 按各序列原生頻率及 realtime 窗口追新；現行日界政策是本資料集既有處理，不是對官方精確發布時間的聲明。
+      - 若另研究精確發布時刻，要保留原版本欄位並另建已核對規則；這次文件不修改原可用時間政策。
+    cautions:
+      - 不能和 OpenBB 的同名 FRED 序列直接串接成雙倍樣本；要核對版本及值的定義。
+      - 來源 point-in-time gap 或缺值不能當作零，初次發布可用也不等於所有歷史修訂已保存。
+    sources: [downloader/download_fred_crypto_macro_vintages.py]
+    evidence: [download_summary.json, progress.json]
+    samples: [observations.parquet]
+    related: [data_openBB, data_public_economic, data_crypto_historical_public]
+
+  data_cftc_legacy:
+    title: CFTC 2000 年前 Legacy 交易人部位歷史
+    category: 全球金融、總體與公共資料
+    role: 官方壓縮年史補充與分報告類型視圖
+    purpose: >-
+      補足較早期 CFTC Legacy COT 部位資料，區分僅期貨與期貨加選擇權報告。
+      這是 2000 年前的歷史補充，不取代其他既有來源的較新資料，也不是加密貨幣專用持倉庫。
+    grains:
+      - 一列是一個報告所屬日、合約市場及 report_mode；同市場不同報告模式不是同一組可直接相加的持倉。
+      - 合併主表已包含兩種報告，不能再把兩個子表串進去當新增資料。
+    layout:
+      - ["normalized/legacy_pre2000.parquet", "2000 年前合併主表。"]
+      - ["normalized/legacy_futures_only_pre2000.parquet", "只含期貨的子視圖。"]
+      - ["normalized/legacy_futures_and_options_combined_pre2000.parquet", "期貨加選擇權的子視圖。"]
+      - ["raw/、receipts/、manifest.json", "官方 ZIP、來源雜湊、範圍及較新權威來源銜接資訊。"]
+    fields:
+      - ["date、report_mode、cftc_contract_market_code", "報告所屬日、報告模式與字串市場代碼。"]
+      - ["open_interest_all、commercial_*、noncommercial_*", "未平倉與交易人分類部位；數量依原契約定義，不能一律換成美元或股票股數。"]
+      - ["conservative_available_date、availability_rule", "現行程式採所屬日加 7 日的保守研究界線，不是已查證的精確歷史發布日。"]
+      - ["source_zip_sha256", "對應官方原始壓縮檔的校驗碼。"]
+    timing:
+      - 這是固定早期歷史補充；較新資料另由既有 CFTC／OpenBB 路徑接手，不需要每天把舊 ZIP 當增量重抓。
+      - 報告所屬日不等於公開日，README 只描述目前可用性規則，不修改或宣稱已精確重建發布時刻。
+    cautions:
+      - 僅期貨與合併報告的數值口徑不同，不能混成一條無標記序列。
+      - 商品更名、分類與合約規格可能改變，跨年比較需保留代碼、報告模式及單位。
+    sources: [scripts/download_cftc_legacy_pre2000.py]
+    evidence: [manifest.json]
+    samples: [normalized/legacy_pre2000.parquet]
+    related: [data_openBB, data_crypto_historical_public]
+
+  data_forex_frankfurter:
+    title: Frankfurter 官方參考匯率與來源分離的長期歷史
+    category: 全球金融、總體與公共資料
+    role: 日參考匯率，相容 OHLC 外觀但非盤中成交行情
+    purpose: >-
+      提供貨幣之間的官方日參考匯率，供跨幣別估值、總體與資產報酬研究使用。
+      根目錄為既有 v1／ECB 相容表，official_v2 另外保留按官方來源區分的長期資料，不能任意接成無來源差異的序列。
+    grains:
+      - 一列是一個 base／quote 貨幣對與來源參考日期，表示每一單位 base 可換多少 quote。
+      - 相容 OHLC 欄位可能都放同一個日參考值，不是日內真正開高低收。
+    layout:
+      - ["*_features.parquet、*_features.head.json", "貨幣對相容表與較早端點補齊證據。"]
+      - ["official_v2/", "按官方資料源分離的歷史、原件與收據；各貨幣／來源可查起點不同。"]
+      - [".head_sources/", "補早期歷史所用參考值與交叉匯率證據。"]
+    fields:
+      - ["date、base、quote、rate", "來源日期及每 1 base 的 quote 數量，反向匯率要取倒數而不是換標籤。"]
+      - ["open、max、min、close、adjclose", "v1 相容欄，可相等於同一參考匯率，不能用來推論盤中波動。"]
+      - ["Trading_Volume", "參考匯率沒有交易所成交量；空值不能補成可研究流動性的零成交。"]
+    timing:
+      - 依各官方來源的營業日／發布週期更新，不是加密市場的每分鐘連續成交。
+      - 可查最早年份依貨幣、官方來源與實際回應而變；設定更早 start_date 不代表每一對都有那一年資料。
+    cautions:
+      - 歐元啟用、舊幣與貨幣制度變更需保留證據，不能為補早期資料而無標記重定基準。
+      - v1、v2、不同官方來源及反向貨幣對互有關係，不可當互不重複觀測加總。
+    sources: [downloader/download_forex_frankfurter.py, downloader/frankfurter_official_history.py]
+    evidence: [download_summary.json]
+    samples: ["*_features.parquet", "official_v2/normalized/**/*.parquet"]
+    related: [data_yahoo, data_peperstone, data_public_economic]
+
+  data_openBB:
+    title: OpenBB 多供應商金融經濟資料與端點封存
+    category: 全球金融、總體與公共資料
+    role: 多端點原件、壓實封存與查詢視圖
+    purpose: >-
+      透過既有 OpenBB 管線取得總體、外匯、股債、ETF、大宗商品與 CFTC 等資料。
+      OpenBB 是整合入口，不是單一原始資料供應商；真正經濟鍵、單位、發布頻率與授權要看 endpoint 和 provider。
+    grains:
+      - 每個 endpoint／provider／scope 有自己的時間、標的與維度，不能把所有資料夾合併成同一張行情表。
+      - data、compact、compact_l1 及 DuckDB views 可能代表相同來源的不同保存／查詢層。
+    layout:
+      - ["data/", "分端點保存的來源結果及來源欄位。"]
+      - ["compact/、compact_l1/", "壓實封存與 L1 segments；讀取時依目前 catalog／狀態選定版本。"]
+      - ["catalog/", "資料範圍、工作、端點與來源目錄，目錄列不等於實際經濟觀測。"]
+      - ["_state/、openbb_l1.duckdb", "下載／壓實狀態及讀取視圖；tmp／WAL 不是額外已接受資料。"]
+    fields:
+      - ["date 與各端點數值欄", "日期與經濟數值，需依 endpoint 判斷是交易日、期間或發布日。"]
+      - ["_openbb_endpoint、_provider、_scope_key", "端點、真正供應商與查詢範圍，跨源去重不能省略。"]
+      - ["_retrieved_at、_query_json", "實際取得時刻與查詢條件；查詢條件不是模型訊號。"]
+      - ["min_date／max_date、source_rows／output_rows", "catalog 中的覆蓋與壓實統計，不能不分粒度當作全庫唯一筆數。"]
+    timing:
+      - 依端點原生日／週／月／季頻及既有下載佇列更新，下載、壓實與視圖重建是不同階段。
+      - 期間值、目前修訂歷史、發布版本與 retrieved_at 要分開；不是所有 OpenBB 回應都有歷史當時版本證據。
+    cautions:
+      - 不能同時 concat data 與 compact／L1 而把相同觀測重算多次；暫存檔不代表成功接受。
+      - catalog 可能記錄可用清單或阻擋狀態，不能把 provider 目錄存在當成所有端點都已抓齊。
+    sources: [downloader/download_openbb_archive.py, scripts/run_openbb_l1_compaction.sh, docs/columnar_storage_architecture.md]
+    evidence: [_state/l1_compaction_latest.json, catalog/completeness_contract_summary.json]
+    samples: ["compact_l1/economy/**/segments/*.parquet", catalog/compaction_summary.parquet]
+    related: [data_fred_crypto_macro, data_cftc_legacy, data_public_economic]
+
+  data_free_public:
+    title: 免費公開市場、鏈狀態與風險背景觀測
+    category: 全球金融、總體與公共資料
+    role: 多來源長格式觀測表及原始回應
+    purpose: >-
+      用統一長表保存已啟用的公開背景，例如恐懼貪婪、比特幣算力／難度、mempool、穩定幣與部分市場快照。
+      它收的是不同指標與來源，不是單一交易所行情，也不是所有已註冊端點都一定有完整歷史。
+    grains:
+      - 一列是一個 source／dataset／entity／metric 在某個事件與觀測時點的值。
+      - 同一來源回應可拆成很多 metric 列；列數不是 HTTP 請求數、標的數或獨立時間點數。
+    layout:
+      - ["observations.parquet", "統一數值／文字長表，保留單位及多種時鐘。"]
+      - ["raw/", "按來源與取得時間保存的原始回應。"]
+      - ["download_manifest.json、download_receipt.json", "逐資料集的取得／接受與範圍證據。"]
+      - ["download_summary.json、progress.json", "當輪與累積工作摘要，不取代各資料集覆蓋。"]
+    fields:
+      - ["source、dataset、entity、metric", "來源、端點資料集、標的與指標，四者共同識別指標語意。"]
+      - ["value_float、value_text、unit", "數值、原生文字與單位；兩種值分開，缺值不補零。"]
+      - ["event_ts_utc、published_at_utc、observed_at_utc、available_at_utc", "事件、發布、實際觀測與可用時刻，未知發布不由事件時間冒充。"]
+      - ["point_in_time_state、raw_sha256", "時間版本狀態及來源原件證據。"]
+    timing:
+      - 依各端點原生頻率與已設定 TTL 更新，快照只有保存後才有自己的歷史。
+      - 慢頻指標可在發布後沿用狀態，但不應重複計為每日／每分鐘新發布觀測。
+    cautions:
+      - 不同 unit 的 value_float 不能直接加總；穩定幣美元量與非美元掛鉤資產不能當同單位。
+      - 多次觀測的相同事件值可能屬版本／快照，不可只按 event_ts 去重而丟失修訂證據。
+    sources: [downloader/download_free_public_context.py]
+    evidence: [download_summary.json, download_manifest.json, download_receipt.json]
+    samples: [observations.parquet]
+    related: [data_crypto_reference, data_coinmetrics_community, data_fred_crypto_macro]
+
+  data_public_economic:
+    title: BEA、Census 與台灣實價登錄歷史原值
+    category: 全球金融、總體與公共資料
+    role: 官方經濟觀測與逐批可追溯的不動產資料
+    purpose: >-
+      保存美國 BEA 國民所得／支出、Census 經濟時間序列，以及台灣內政部實價登錄等已排入的官方歷史。
+      數值與維度保留來源字串，避免把缺值符號、倍率或季調標記在下載時就默默抹掉。
+    grains:
+      - BEA 是表、科目、頻率與期間；Census 還有類別、地理、資料型態與季調維度。
+      - 實價登錄是一筆申報／交易或土地／建物等明細，不是每天一個全國房價。
+    layout:
+      - ["normalized/bea/、normalized/census/、normalized/moi/", "按資料集與取得版本保存的正規化表，可能仍是來源原字串。"]
+      - ["objects/、raw_receipts/、receipts/、receipt_history/", "官方回應、最新接受入口與歷史取得證據。"]
+      - ["catalog/、status/、attempts/", "可取得期別、工作狀態與失敗證據；目錄存在不是歷史完成。"]
+    fields:
+      - ["TimePeriod、SeriesCode、LineNumber、DataValue", "BEA 期間、序列、科目與原值；逗號、抑制符號不能直接視為 0。"]
+      - ["CL_UNIT、UNIT_MULT、METRIC_NAME", "BEA 原單位與十進位倍率，金額不一定直接是美元元數。"]
+      - ["time、cell_value、data_type_code、seasonally_adj、geo_level_code", "Census 原值與維度；季調與未季調、國家與州級不能混成同一序列。"]
+      - ["交易／地政中文欄位", "依內政部檔案類型保留原欄名；民國日期、面積平方公尺、總價／單價及土地建物需分別解析。"]
+      - ["來源表 metadata／receipt 的 observed_at 與 SHA", "實際取得版本，不是觀測所屬期間的精確公開時刻。"]
+    timing:
+      - BEA／Census 依各表月、季或年週期，地政按實際釋出的批次／季別更新。
+      - 目前可取得的歷史可能是修訂後值，期間不是發布日；缺精確發布時間維持未確認，不捏造盤前時間。
+    cautions:
+      - 不要 glob 所有取得版本直接串接，應由最新成功 receipt 選定來源，再按經濟鍵處理修訂。
+      - 不動產可能含地址等敏感明細；研究、彙總與輸出需依來源範圍，不把原始地政明細當公開展示頁。
+    sources: [downloader/download_public_economic_history.py, downloader/public_economic_sources.py]
+    evidence: [status/bea.json, status/census.json, status/moi.json]
+    samples: ["normalized/bea/**/*.parquet", "normalized/census/**/*.parquet", "normalized/moi/**/*.parquet"]
+    related: [data_keyed_public_catalogs, data_openBB, data_forex_frankfurter]
+
+  data_keyed_public_catalogs:
+    title: 需金鑰公開來源的目錄、範圍與當前快照
+    category: 全球金融、總體與公共資料
+    role: 發現／容量規劃資料，部分端點為實際前瞻快照
+    purpose: >-
+      盤點 NOAA、BEA、Census、Finnhub、NASA FIRMS、中央氣象署與環境部等來源目前可查的目錄或小範圍快照。
+      核心用途是知道「有哪些、能查多早、下一步要排什麼」；取得目錄不等於已下載全球逐站、火點或所有年份歷史。
+    grains:
+      - 有些是一個資料集／產品／證券的目錄項目；氣象與 AQI 等端點是某次取得的測站快照。
+      - 一份成功回應可能同時含 metadata 與多筆快照，不能將 catalog_entries 與觀測數混為同一統計。
+    layout:
+      - ["objects/", "按 provider 保存的來源物件，格式可能為 JSON／CSV，不保證每個來源都有 Parquet。"]
+      - ["receipts/、receipt_history/", "目前成功入口與歷史接受證據。"]
+      - ["attempts/、download_summary.json", "未成功的請求與各 adapter 可用狀態；不含任何完整歷史保證。"]
+    fields:
+      - ["來源 dataset／product／symbol 識別", "依各來源定義，不是可直接合併的統一市場代碼。"]
+      - ["mindate／maxdate／datacoverage 等來源目錄欄", "來源宣告可查範圍，不是本機已抓到的最早／最新時間。"]
+      - ["快照事件時間、觀測時間及 receipt SHA", "實際取得的測站／環境快照與來源證據，不回補成先前未保存的歷史。"]
+    timing:
+      - 目錄按既有 TTL 重新確認；氣象／空品的原生更新與本機實際取樣是不同時鐘。
+      - 歷史觀測另由有明確地理、時間、容量與配額範圍的 downloader 負責，例如 data_public_economic；這裡不自動啟動全球原始資料下載。
+    cautions:
+      - 金鑰有效、目錄成功或 HTTP 200 都不代表全部歷史已取得；planned／scope pending 要繼續視為未執行。
+      - README 不讀 .env、不輸出 token 或原始含憑證 URL，也不變更帳戶權限。
+    sources: [downloader/download_keyed_public_catalogs.py]
+    evidence: [download_summary.json]
+    samples: []
+    related: [data_public_economic, data_crypto_reference]
+
+  data_yahoo:
+    title: Yahoo 股票、外匯與加密資產行情
+    category: 全球金融、總體與公共資料
+    role: 供應商行情、公司行動與相容特徵
+    purpose: >-
+      透過既有 Yahoo／yfinance 管線取得美股、台股、外匯與加密資產歷史行情。
+      這是 Yahoo 彙整來源，不是券商成交回報，也不能因同時含 crypto 就當作 Binance／OKX／Bybit 原生行情。
+    grains:
+      - 股票與外匯依既有日頻契約；crypto 的現行基準為完成的一分鐘 K，實際舊表仍須確認頻率。
+      - 每個 *_features 表是一個來源 symbol 的時間序列，可能同時有來源行情與衍生／公司行動欄。
+    layout:
+      - ["us_stocks/、tw_stocks/", "各市場股票與 ETF 等行情，上市下市及證券類型需另核對。"]
+      - ["forex/", "Yahoo 外匯報價，不是 Frankfurter 官方參考匯率。"]
+      - ["crypto/", "Yahoo 加密資產行情，受來源頻率與歷史留存限制。"]
+      - ["daily_update_summary.*.json、repair_summary*.json", "分市場增量、修復與實際下載結果。"]
+    fields:
+      - ["date、open、max、min、close、adjclose", "行情時間、OHLC 與調整價格；復權設定需看來源契約，不能默默混用。"]
+      - ["Trading_Volume", "股票目標為股數；FX 可能無量、crypto 是來源交易量口徑，不可一律解讀成股。"]
+      - ["Dividends、Stock Splits", "來源公司行動欄位，不等於每個資產都有同樣公司行動語意。"]
+      - ["symbol／檔名代碼", "Yahoo 身分含市場尾碼及歷史別名；下市股票不能只因今日不交易就刪除歷史。"]
+    timing:
+      - 按市場與資料頻率增量更新；來源調整／修訂可改變過去數值，因此要保留下載與修復證據。
+      - 股票交易日、外匯日期與加密 UTC 日界不同；來源未提供的早期分鐘歷史不由日線反推。
+    cautions:
+      - 有歷史檔案不等於沒有生存者偏差；需要核對下市、重用代碼與不可交易證券種類。
+      - 某檔缺 Trading_Volume 或 schema 漂移不應悄悄當成零；不同市場也不能共用一個量單位假設。
+    sources: [downloader/download_yahoo_ohlcv.py, docs/agents/data.md]
+    evidence: [daily_update_summary.us_stocks.json, daily_update_summary.forex.json, daily_update_summary.crypto.json]
+    samples: ["us_stocks/*_features.parquet", "forex/*_features.parquet", "crypto/*_features.parquet"]
+    related: [data_parquet, data_peperstone, data_forex_frankfurter]
+
+  data_peperstone:
+    title: Pepperstone 名單分組的 Yahoo 行情
+    category: 全球金融、總體與公共資料
+    role: 分組研究清單的行情代理，不是券商原生交易紀錄
+    purpose: >-
+      這個目錄保留既有拼字 data_peperstone。它依 Pepperstone 分組名單管理標的，但目前
+      download_pepperstone.py 實際委派 download_yahoo_ohlcv.py，因此內容是 Yahoo 行情，不是 Pepperstone 帳戶、成交或可執行 bid/ask。
+    grains:
+      - 每個檔是一個 Yahoo symbol 的時間序列；外匯、商品與加密等分組可能指向重疊標的。
+      - 分組名稱只是研究清單，不保證原生合約、交易時段、點值或 broker 規格相同。
+    layout:
+      - ["fores/、24hTrading/", "既有外匯與 24 小時交易分組，拼字為相容路徑，不在本次改名。"]
+      - ["commodites/", "商品相關 Yahoo 標的，可能是期貨代碼而不是券商 CFD 報價。"]
+      - ["crypto/", "Yahoo 加密標的，不是指定交易所原生成交。"]
+      - ["download_summary.json", "分組下載／修復摘要，各組另有來源結果。"]
+    fields:
+      - ["date、open、max、min、close、adjclose", "Yahoo 提供的行情相容欄，不能由組名推導 Pepperstone 的價格／復權語意。"]
+      - ["Trading_Volume（若有）", "是否提供與單位依資產／來源，不可拿缺量估 broker 流動性。"]
+      - ["Dividends、Stock Splits（若有）", "Yahoo 通用欄，不表示外匯或 CFD 真有股利／分割事件。"]
+    timing:
+      - 隨既有分組下載器執行增量／修復；實際頻率與可查歷史受 Yahoo 來源和標的類別限制。
+      - 最早日期以實際檔案／收據為準；清單設定開始年份不是每個標的都有的歷史。
+    cautions:
+      - 不可用此資料宣稱已取得 Pepperstone 逐筆、歷史點差、融資費率或實際成交。
+      - 與 data_yahoo 的同標的資料可能重複，研究時應以來源、symbol、時間及調整設定核對，不加倍計樣本。
+    sources: [downloader/download_pepperstone.py, downloader/download_yahoo_ohlcv.py]
+    evidence: [download_summary.json]
+    samples: ["fores/*_features.parquet", "commodites/*_features.parquet", "crypto/*_features.parquet"]
+    related: [data_yahoo, data_forex_frankfurter]
+
+  data_parquet:
+    title: 舊版台股逐股行情與財務衍生特徵
+    category: 舊版相容資料
+    role: 保留的歷史特徵庫，不是現行唯一來源
+    purpose: >-
+      保存較早版本的逐股行情與財務／比率特徵，供重現舊實驗與來源比較。
+      本目錄不因名稱叫 Parquet 就是新的標準資料集；它可能和現行台股公開／Yahoo 來源重疊，也可能含舊的縮放與工程欄位。
+    grains:
+      - 每檔股票一個 *_features.parquet，列通常為來源日期；schema 不一定每檔一致。
+      - 價格、財務原值、比率與標準化衍生欄混存，不能宣稱整張表都是未處理原始值。
+    layout:
+      - ["*_features.parquet", "舊版逐股行情／特徵，含不同歷史長度及欄位組合。"]
+      - [".panel_meta.pkl", "舊面板中繼資料，不是另一份市場觀測；不要載入不可信來源的 pickle。"]
+    fields:
+      - ["date、open、max、min、close、Trading_Volume", "舊行情與成交量相容欄；來源與量單位仍需獨立核對。"]
+      - ["PER、ROE、Debt_Ratio", "本益比、股東權益報酬與負債比等財務／比率欄，來源版本與發布日期不能由價格日期推定。"]
+      - ["PER_Z_Score、Debt_Ratio_Scaled", "已計算的標準化／縮放欄位，不是未經處理原值。"]
+      - ["index（部分檔案）", "舊序列化保留欄，不一定是新的經濟維度。"]
+    timing:
+      - 這是相容／舊實驗保存層；是否仍追新須核對實際 owner 與收據，不能因資料夾存在就保證定期更新。
+      - 歷史財務可用時點與原來源證據可能不足，不能直接把整庫升格成嚴格歷史當時可用特徵。
+    cautions:
+      - 需要純原始輸入時，應明確排除或另選衍生欄位；這次寫文件不逆轉縮放、不修改任何舊數值。
+      - 新訓練優先依已選定的現行資料契約；舊庫可供重現／校驗，但不得和現行主表無條件 concat。
+    sources: [downloader/download_yahoo_ohlcv.py, stockagent/live/data_monitor_inventory.py]
+    evidence: []
+    samples: ["*_features.parquet"]
+    related: [data_tw_public, data_yahoo]

@@ -88,6 +88,15 @@ except ModuleNotFoundError:  # Direct execution from downloader/.
 ARCHIVE_SCHEMA_VERSION = 1
 PLANNER_STATE_VERSION = 10
 RESUME_MAINTENANCE_VERSION = 2
+OUTPUT_CONTRACT_VIOLATION_PREDICATE = (
+    "active=1 AND output_path IS NOT NULL AND output_path!='' AND ("
+    "task_id IS NULL OR length(task_id)!=64 OR task_id GLOB '*[^0-9a-f]*' OR "
+    "substr(output_path,-25)!=('-'||substr(task_id,1,16)||'.parquet'))"
+)
+OUTPUT_CONTRACT_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_tasks_output_contract_violations_v1 "
+    "ON tasks(plan_token) WHERE " + OUTPUT_CONTRACT_VIOLATION_PREDICATE
+)
 CATALOG_FOLLOWUP_REPAIR_VERSION = 2
 
 # Request-cost observations are implementation-specific.  When an adapter
@@ -4511,6 +4520,10 @@ class Manifest:
             ON tasks(active, plan_token, status, endpoint)
             """
             )
+            # Index only violations, not millions of healthy output paths.
+            # SQLite maintains this proof atomically as tasks change, avoiding
+            # a full table/rowid scan each time the owner reconciles outputs.
+            self.connection.execute(OUTPUT_CONTRACT_INDEX_SQL)
             # L1 compaction selects the earliest unassigned successful task
             # per endpoint. Keep that order in a partial covering index so a
             # bounded batch does not sort the entire multi-million-task plan.
@@ -7137,6 +7150,119 @@ class Manifest:
         self.connection.commit()
         return len(malformed)
 
+    def _outputs_follow_task_id_contract(self, *, plan_token: str) -> bool:
+        # Without ANALYZE, SQLite can prefer the broad active-plan index even
+        # though the exception index is empty. Bind this proof to its exact
+        # partial index; a read-only, not-yet-migrated manifest can still scan.
+        migrated = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_tasks_output_contract_violations_v1' AND tbl_name='tasks'"
+        ).fetchone() is not None
+        source = (
+            "tasks INDEXED BY idx_tasks_output_contract_violations_v1"
+            if migrated else "tasks"
+        )
+        return self.connection.execute(
+            f"SELECT 1 FROM {source} WHERE plan_token=? AND "
+            + OUTPUT_CONTRACT_VIOLATION_PREDICATE + " LIMIT 1",
+            (plan_token,),
+        ).fetchone() is None
+
+    def _task_id_primary_key_index(self) -> str | None:
+        for row in self.connection.execute("PRAGMA index_list(tasks)"):
+            if row[3] == "pk":
+                name = str(row[1])
+                quoted = '"' + name.replace('"', '""') + '"'
+                columns = [
+                    entry[2]
+                    for entry in self.connection.execute(f"PRAGMA index_info({quoted})")
+                ]
+                if columns == ["task_id"]:
+                    return quoted
+        return None
+
+    def _quarantine_canonical_output_shards(
+        self,
+        data_dir: Path,
+        *,
+        plan_token: str,
+        batch_size: int,
+        primary_index: str,
+    ) -> tuple[int, int]:
+        """Exact path ownership via the existing unique task ID primary key.
+
+        The caller first certifies the real _safe_scope + 16-hex-prefix filename
+        contract and the unique full task ID primary key. An exact path comparison
+        is still required: a copy in another directory is not that owner.
+        This is the reconciliation's lexical-path policy, not the independent
+        file audit's resolved-path/symlink ownership policy.
+        """
+        scanned = quarantined = 0
+        # Stay below older SQLite's 999 variable ceiling, including plan_token.
+        limit = min(256, max(1, int(batch_size)))
+
+        def reconcile(paths: list[Path]) -> None:
+            nonlocal scanned, quarantined
+            prefixes = sorted({
+                match.group(1)
+                for path in paths
+                if (match := re.search(r"-([0-9a-f]{16})\.parquet\Z", path.name))
+            })
+            statuses: dict[str, str] = {}
+            if prefixes:
+                wanted = {str(path) for path in paths}
+                # CROSS JOIN + the verified primary index prevent SQLite from
+                # scanning the entire active plan for each prefix. A 16-hex
+                # prefix is NOT assumed unique: stream every match and compare
+                # its exact output path. Even adversarial collisions stay bounded.
+                values = ",".join("(?,?)" for _ in prefixes)
+                cursor = self.connection.execute(
+                    f"WITH requested(lo,hi) AS (VALUES {values}) "
+                    "SELECT task.output_path,task.status FROM requested "
+                    f"CROSS JOIN tasks AS task INDEXED BY {primary_index} "
+                    "WHERE task.task_id>=requested.lo AND task.task_id<=requested.hi "
+                    "AND task.active=1 AND task.plan_token=?",
+                    (
+                        *(bound for prefix in prefixes
+                          for bound in (prefix + "0" * 48, prefix + "f" * 48)),
+                        plan_token,
+                    ),
+                )
+                try:
+                    for row in cursor:
+                        path_key = str(row["output_path"])
+                        if path_key in wanted:
+                            if path_key in statuses:
+                                raise RuntimeError(
+                                    "ambiguous duplicate OpenBB output owners; "
+                                    "refusing quarantine"
+                                )
+                            statuses[path_key] = str(row["status"])
+                finally:
+                    cursor.close()
+            for path in paths:
+                scanned += 1
+                if statuses.get(str(path)) not in {"success", "pending", "running"}:
+                    if _quarantine_obsolete_output_path(path) is not None:
+                        quarantined += 1
+
+        with tqdm(
+            desc="openbb:reconcile canonical parquet",
+            unit="shard",
+            disable=not self.show_progress,
+        ) as progress:
+            batch: list[Path] = []
+            for path in data_dir.rglob("*.parquet"):
+                batch.append(path)
+                if len(batch) >= limit:
+                    reconcile(batch)
+                    progress.update(len(batch))
+                    batch.clear()
+            if batch:
+                reconcile(batch)
+                progress.update(len(batch))
+        return scanned, quarantined
+
     def quarantine_terminal_output_shards(
         self, *, plan_token: str, batch_size: int = 1000
     ) -> tuple[int, int]:
@@ -7150,83 +7276,90 @@ class Manifest:
         data_dir = self.path.parent.parent / "data"
         if not data_dir.is_dir():
             return 0, 0
-        paths: list[Path] = []
-        scan_progress = tqdm(
-            desc="openbb:reconcile parquet ownership",
-            unit="shard",
-            disable=not self.show_progress,
-        )
+        # Prove the real make_task filename contract before using indexed full
+        # task-ID ranges; arbitrary/legacy paths retain the spillable join.
+        # No source index/table is created or raw shard treated as success.
+        self.connection.execute("SAVEPOINT openbb_output_contract")
         try:
-            for path in data_dir.rglob("*.parquet"):
-                paths.append(path)
-                scan_progress.update(1)
+            if self._outputs_follow_task_id_contract(plan_token=plan_token):
+                primary_index = self._task_id_primary_key_index()
+                if primary_index is not None:
+                    return self._quarantine_canonical_output_shards(
+                        data_dir,
+                        plan_token=plan_token,
+                        batch_size=batch_size,
+                        primary_index=primary_index,
+                    )
         finally:
-            scan_progress.close()
-
+            # The proof and all ID lookups share one SQLite snapshot, including
+            # when the caller already has a transaction. Never commit its work.
+            self.connection.execute("RELEASE openbb_output_contract")
         self.connection.execute(
             "DROP TABLE IF EXISTS temp.openbb_existing_output_paths"
         )
         self.connection.execute(
             "CREATE TEMP TABLE openbb_existing_output_paths("
-            "path TEXT PRIMARY KEY) WITHOUT ROWID"
+            "path TEXT PRIMARY KEY,status TEXT) WITHOUT ROWID"
         )
         insert_size = max(1, int(batch_size))
-        insert_progress = tqdm(
-            total=len(paths),
-            desc="openbb:index active parquet paths",
-            unit="shard",
-            disable=not self.show_progress,
-        )
+        scanned = quarantined = 0
         try:
-            for offset in range(0, len(paths), insert_size):
-                batch = paths[offset : offset + insert_size]
-                self.connection.executemany(
-                    "INSERT OR IGNORE INTO openbb_existing_output_paths(path) VALUES (?)",
-                    ((str(path),) for path in batch),
-                )
-                insert_progress.update(len(batch))
-        finally:
-            insert_progress.close()
-        with _sqlite_progress(
-            self.connection,
-            "manifest:join parquet ownership",
-            enabled=self.show_progress,
-        ):
-            rows = self.connection.execute(
-                """
-                SELECT tasks.output_path,tasks.status
-                FROM tasks
-                JOIN openbb_existing_output_paths AS existing
-                  ON existing.path=tasks.output_path
-                WHERE tasks.active=1 AND tasks.plan_token=?
-                """,
-                (plan_token,),
-            ).fetchall()
-        statuses = {str(row["output_path"]): str(row["status"]) for row in rows}
-        quarantined = 0
-        reconcile_progress = tqdm(
-            paths,
-            total=len(paths),
-            desc="openbb:quarantine terminal parquet",
-            unit="shard",
-            disable=not self.show_progress,
-        )
-        try:
-            for path in reconcile_progress:
-                status = statuses.get(str(path))
-                if status in {"success", "pending", "running"}:
-                    continue
-                if _quarantine_obsolete_output_path(path) is not None:
-                    quarantined += 1
-                    reconcile_progress.set_postfix(
-                        quarantined=quarantined, refresh=False
+            # Keep the filesystem inventory and joined statuses in SQLite's
+            # spillable TEMP index, not millions of Path objects, Rows and a
+            # second Python dictionary. Source rows and move policy are the
+            # same; only bounded batches cross the Python/SQLite boundary.
+            with tqdm(
+                desc="openbb:reconcile parquet ownership", unit="shard",
+                disable=not self.show_progress,
+            ) as progress:
+                batch: list[tuple[str]] = []
+                for path in data_dir.rglob("*.parquet"):
+                    batch.append((str(path),))
+                    scanned += 1
+                    progress.update(1)
+                    if len(batch) >= insert_size:
+                        self.connection.executemany(
+                            "INSERT OR IGNORE INTO openbb_existing_output_paths(path) VALUES (?)", batch
+                        )
+                        batch.clear()
+                if batch:
+                    self.connection.executemany(
+                        "INSERT OR IGNORE INTO openbb_existing_output_paths(path) VALUES (?)", batch
                     )
+                batch.clear()
+            with _sqlite_progress(
+                self.connection, "manifest:join parquet ownership", enabled=self.show_progress,
+            ):
+                self.connection.execute(
+                    """
+                    INSERT INTO openbb_existing_output_paths(path,status)
+                    SELECT tasks.output_path,tasks.status
+                    FROM tasks
+                    JOIN openbb_existing_output_paths AS existing
+                      ON existing.path=tasks.output_path
+                    WHERE tasks.active=1 AND tasks.plan_token=?
+                    ON CONFLICT(path) DO UPDATE SET status=excluded.status
+                    """, (plan_token,),
+                )
+            with tqdm(
+                total=scanned, desc="openbb:quarantine terminal parquet", unit="shard",
+                disable=not self.show_progress,
+            ) as progress:
+                # A last-good pending/running file remains available exactly
+                # as before; absence of a current owner is not made success.
+                for row in self.connection.execute(
+                    "SELECT path FROM openbb_existing_output_paths "
+                    "WHERE status IS NULL OR status NOT IN ('success','pending','running')"
+                ):
+                    if _quarantine_obsolete_output_path(Path(str(row["path"]))) is not None:
+                        quarantined += 1
+                        progress.set_postfix(quarantined=quarantined, refresh=False)
+                progress.update(scanned)
         finally:
-            reconcile_progress.close()
             self.connection.execute(
                 "DROP TABLE IF EXISTS temp.openbb_existing_output_paths"
             )
-        return len(paths), quarantined
+        return scanned, quarantined
 
     def finalize_provider_only_unavailable(
         self,

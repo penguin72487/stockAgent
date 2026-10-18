@@ -1,5 +1,7 @@
 numpy>=1.26
+urllib3>=2.2,<3
 pyarrow>=16.0
+fastcdc==1.7.0
 lxml>=5.0
 PyYAML>=6.0
 torch>=2.3

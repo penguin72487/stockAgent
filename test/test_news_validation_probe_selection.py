@@ -6,7 +6,7 @@ from test_news_fulltext import config
 
 
 queue = existing.queue
-CODES = ('invalid_bulk_publication_clock', 'article_rights_or_scope_excluded')
+CODES = ('invalid_bulk_publication_clock', 'article_rights_or_scope_excluded', 'article_license_not_verified')
 
 
 @pytest.mark.parametrize('code', CODES)

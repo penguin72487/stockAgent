@@ -1,0 +1,11 @@
+# Candidate shared performance recipe; all nine cases retain the v8 research axes.
+# manual_fp32_last changes the numerical/kernel ABI: start every policy randomly.
+base_spec: tw_scratch_strategy_20261017_v8.yaml
+output_root: artifacts/markets/tw_scratch_strategy_20261017_v9
+matrix:
+  fixed_overrides:
+    training:
+      curve_plot_async: true
+      financial_transformer:
+        compiled_cross_attention_backend: manual_fp32_last
+        factorized_sparse_cache_bytes: 15032385536

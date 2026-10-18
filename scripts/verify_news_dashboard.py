@@ -25,6 +25,12 @@ from scripts.probe_browser_runtime import browser_profile_launch_options  # noqa
 BODY_PROGRESS_SELECTOR = 'progress.news-provider-progress.mini-progress-track:not([data-news-manifest-progress])'
 
 
+def require_owner_transport(headers):
+    """News is owner-only; neither public caching nor public access is valid."""
+    assert headers.get('x-stockagent-audience') == 'owner'
+    assert headers.get('cache-control') == 'private, no-store'
+
+
 def required_source_role(source: dict | None, *, api_setup: bool = False) -> str:
     """A configured API phase is not an enabled full-text collector."""
     assert source and source.get('configured') is True
@@ -111,7 +117,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     assert status['cnyes_list_progress_projection_contract_version'] == 1
                     source = next(row for row in status['providers'] if row['id'] == 'cnyes')
                     assert source['public_index_progress'] and source['history_list_progress']
-                assert response.headers.get("cache-control") == "no-store"
+                require_owner_transport(response.headers)
                 assert context.request.head(urljoin(url, "api/status"), timeout=30000).status == 200
                 # Explicitly rejected control request: no crawler operation.
                 assert context.request.post(urljoin(url, "api/status"), timeout=30000).status == 405
@@ -563,7 +569,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default="https://penguin72487.ddnsgeek.com/news/")
+    parser.add_argument("--base-url", default="https://www.penguin72487.dpdns.org/news/")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--require-provider", action="append", default=[], help="Enabled source ID whose displayed counts must reconcile")
     parser.add_argument("--require-api-setup-provider", action="append", default=[],

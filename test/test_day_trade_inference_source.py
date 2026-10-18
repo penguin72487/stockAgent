@@ -213,6 +213,36 @@ def inference_config():
     return config
 
 
+@pytest.mark.parametrize("replay_version", [None, 1, 2])
+def test_completed_fifo_reports_require_current_policy_replay(
+    tmp_path, monkeypatch, replay_version,
+):
+    fold_dir = trainer._fold_dir(tmp_path, 1)
+    fold_dir.mkdir()
+    for name in ("metrics.json", "model.pt", "test_backtest.npz", "checkpoint_best.pt"):
+        (fold_dir / name).write_bytes(b"placeholder")
+    contract = {
+        "metrics_contract_version": trainer.RETURN_METRICS_CONTRACT_VERSION,
+        "mode_details": {
+            "execution_variant": "exact_board_lot_minute_physical_fifo_v1",
+        },
+    }
+    if replay_version is not None:
+        contract["mode_details"]["physical_policy_replay_version"] = replay_version
+    (fold_dir / "mode_artifact_contract.json").write_text(json.dumps(contract))
+    sentinel = object()
+    loads = []
+    monkeypatch.setattr(trainer, "_has_completed_fold_marker", lambda path: True)
+    monkeypatch.setattr(trainer, "_load_checkpoint", lambda path: loads.append(path) or {})
+    monkeypatch.setattr(trainer, "_validate_checkpoint_manifest", lambda *a, **k: None)
+    monkeypatch.setattr(trainer, "_load_fold_result", lambda path: sentinel)
+    result = trainer._load_completed_fold_result(tmp_path, 1, expected_manifest={})
+    if replay_version == 2:
+        assert result is sentinel and len(loads) == 1
+    else:
+        assert result is None and loads == []
+
+
 def test_full_owned_prefix_reuses_exact_endpoint_without_source_decode():
     split, runtime, _ = fixture(rows=3)
     tensor, _, _ = trainer._evaluate_windowed_tensor_batch_decoupled(

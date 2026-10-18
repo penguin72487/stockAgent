@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import stat
 from pathlib import Path
@@ -26,6 +27,21 @@ def _marker(root: Path) -> Path:
         )
     )
     return marker
+
+
+@pytest.mark.parametrize("failure,detail", [
+    (OSError(errno.EMFILE, "private command arguments"), "OSError errno=24"),
+    (PermissionError(errno.EACCES, "private command arguments"), "PermissionError errno=13"),
+    (cold_primary.subprocess.TimeoutExpired(["private command arguments"], 30), "timed out after 30s"),
+])
+def test_mount_check_preserves_safe_failure_class_without_relaxing_guard(monkeypatch, failure, detail):
+    def fail(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(cold_primary.subprocess, "run", fail)
+    with pytest.raises(SnapshotError, match=detail) as raised:
+        cold_primary._check_d_primary_mount(Path("/srv/stockagent-packed"))
+    assert "private command arguments" not in str(raised.value)
+    assert raised.value.__cause__ is failure
 
 
 def test_d_primary_reports_single_volume_not_independent_backup(

@@ -2,7 +2,10 @@
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,164 @@ from stockagent.control import lakehouse
 from stockagent.data_sync import immutable_transport_cache as cache
 from stockagent.data_sync.immutable_replication import ACK, digest, seal
 from stockagent.runtime_identity import identity_sha256
+
+
+def test_worker_identity_includes_loaded_packed_reader_and_manifest_contract(monkeypatch):
+    from scripts import manage_lakehouse as worker
+    seen, changed = set(), {}
+    def source_digest(path):
+        relative = str(path.relative_to(worker.ROOT))
+        seen.add(relative)
+        return changed.get(relative, "a" * 64)
+    monkeypatch.setattr(worker, "digest", source_digest)
+    baseline = worker.worker_code_identity()
+    for relative in ("stockagent/data_sync/packed_snapshots.py",
+                     "stockagent/data_sync/packed_metadata.py",
+                     "stockagent/data_sync/packing_checkpoint.py",
+                     "stockagent/data_sync/packed_backup.py",
+                     "stockagent/data_sync/desync_snapshots.py",
+                     "configs/training_rescue.json"):
+        assert relative in seen
+        changed[relative] = "b" * 64
+        assert worker.worker_code_identity() != baseline
+        changed.clear()
+
+
+@pytest.mark.parametrize("seconds", [0, 86401, 21600, 86400])
+def test_safe_handoff_deadline_is_bounded_without_touching_production(tmp_path, monkeypatch, seconds):
+    from scripts import rollout_lakehouse_source_policy as rollout
+    def no_production_configuration():
+        raise RuntimeError("test reached configuration without service changes")
+    monkeypatch.setattr(rollout, "configuration", no_production_configuration)
+    monkeypatch.setattr(rollout, "worker_code_identity", lambda: "a" * 64)
+    args = ["--output", str(tmp_path / "receipt.json"), "--deadline-seconds", str(seconds)]
+    if 1 <= seconds <= 86400:
+        with pytest.raises(RuntimeError, match="without service changes"):
+            rollout.main(args)
+    else:
+        with pytest.raises(SystemExit) as error:
+            rollout.main(args)
+        assert error.value.code == 2
+
+
+def test_active_restart_requires_explicit_code_only_scope_before_any_configuration(tmp_path, monkeypatch):
+    from scripts import rollout_lakehouse_source_policy as rollout
+    monkeypatch.setattr(rollout, 'configuration', lambda: pytest.fail('unscoped restart reached configuration'))
+    with pytest.raises(SystemExit) as error:
+        rollout.main(['--output', str(tmp_path / 'receipt.json'), '--restart-active-owner'])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize('fault', [None, 'candidate_drift', 'lost_verified_release'])
+def test_authorized_restart_preserves_checkpoint_and_releases_old_owner_before_locks(tmp_path, monkeypatch, fault):
+    import fcntl
+    from scripts import rollout_lakehouse_source_policy as rollout
+    state = tmp_path / 'state'
+    operation = state / 'dataset-versions/operations/test'
+    operation.mkdir(parents=True)
+    checkpoint = {'plan_sha256': 'p', 'datasets': {
+        'accepted': {'state': 'verified', 'snapshot_id': 'v1', 'manifest_sha256': 'm1'},
+        'interrupted': {'state': 'processing', 'attempt_id': 'attempt1'}}}
+    atomic_write_json(operation / 'progress.json', checkpoint)
+    atomic_write_json(state / 'dataset-versions/current.json', {
+        'plan_sha256': 'p', 'operation_directory': str(operation)})
+    ready = tmp_path / 'readiness.json'
+    atomic_write_json(ready, {'producer_device_id': 'p', 'receiver_device_id': 'r', 'ingress_free_bytes': 1})
+    private = tmp_path / 'private.json'
+    private.write_bytes(b'{}')
+    monkeypatch.setattr(rollout, 'RECEIVER_READINESS', ready)
+    monkeypatch.setattr(rollout, 'PRIVATE_CONFIGURATION', private)
+    c = {'state_root': str(state), 'producer_device_id': 'p', 'receiver_device_id': 'r', 'source_replication': {}}
+    monkeypatch.setattr(rollout, 'configuration', lambda: c)
+    monkeypatch.setattr(rollout, 'guard', lambda *_: None)
+    monkeypatch.setattr(rollout, 'source_wave_policy', lambda *_: None)
+    processes, changed, events = {'worker': '100'}, [], []
+    monkeypatch.setattr(rollout, 'worker_code_identity', lambda: ('b' if changed else 'a') * 64)
+    monkeypatch.setattr(rollout, 'pid', lambda unit: processes['worker'] if unit == rollout.OWNER else unit)
+    async def workflows(_):
+        return {name: {'status': 'RUNNING', 'first_run_id': name, 'run_id': name}
+                for name in (*rollout.IDS, *rollout.OPTIONAL_IDS)}
+    monkeypatch.setattr(rollout, 'workflows', workflows)
+    original_run = subprocess.run
+    lock = state / 'dataset-versions/owner.lock'
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    inode = lock.stat().st_ino
+    def run(command, **options):
+        if command[0] == 'flock':
+            events.append('lock')
+            return original_run(command, **options)
+        assert command[:2] in (['systemctl', 'stop'], ['systemctl', 'start'])
+        events.append(command[1])
+        if command[1] == 'stop':
+            assert (tmp_path / 'receipt-before.json').is_file(), 'durable intent must precede stopping'
+            processes['worker'] = '0'
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if fault == 'candidate_drift':
+                changed.append(True)
+            if fault == 'lost_verified_release':
+                altered = deepcopy(checkpoint)
+                altered['datasets']['accepted']['snapshot_id'] = 'wrong-version'
+                atomic_write_json(operation / 'progress.json', altered)
+        else:
+            processes['worker'] = '200'
+            atomic_write_json(state / 'worker-ready.json', {'code_identity_sha256': 'a' * 64})
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(rollout.subprocess, 'run', run)
+    try:
+        args = ['--output', str(tmp_path / 'receipt.json'), '--deadline-seconds', '2',
+                '--reload-code-only', '--restart-active-owner']
+        if fault:
+            with pytest.raises(ValueError, match='candidate changed|release was lost'):
+                rollout.main(args)
+            assert not (tmp_path / 'receipt.json').exists()
+        else:
+            rollout.main(args)
+            receipt = json.loads((tmp_path / 'receipt.json').read_bytes())
+            assert receipt['authorized_active_owner_restart'] is True
+            assert receipt['verified_migration_releases_preserved'] == 1
+            assert receipt['workflow_chains_preserved'] is True
+            assert receipt['postgres_and_temporal_server_not_restarted'] is True
+        assert events[0] == 'stop' and events[-1] == 'start'
+        assert lock.stat().st_ino == inode
+        assert private.read_bytes() == b'{}' and processes['worker'] == '200'
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize('enrollment,existing,expected', [
+    ('registered-node', None, 'registered-node'),
+    ('registered-node', 'explicit-node', 'explicit-node'),
+    ('invalid;command', None, None),
+    ('', None, None),
+])
+def test_unattended_lakehouse_uses_enrolled_wsl_identity_not_a_default(
+        tmp_path, enrollment, existing, expected):
+    # Execute the exact bootstrap block without launching a worker, mounting D,
+    # reading private configuration, or requiring a Windows host in CI.
+    root = Path(__file__).resolve().parents[1]
+    wrapper = (root / 'scripts/run_lakehouse_control.sh').read_text()
+    block = wrapper.split('source scripts/runtime_env.sh\n', 1)[1].split(
+        'stockagent_lakehouse_prefix=', 1)[0]
+    (tmp_path / 'configs').mkdir()
+    atomic_write_json(tmp_path / 'configs/training_rescue.json', {
+        'contract': 'stockagent.training_rescue.v1', 'schema_version': 1,
+        'windows_distribution': enrollment})
+    environment = dict(os.environ)
+    environment.pop('WSL_DISTRO_NAME', None)
+    if existing is not None:
+        environment['WSL_DISTRO_NAME'] = existing
+    shell = ('set -euo pipefail\n'
+             "uname() { printf 'microsoft\\n'; }\n"
+             f'run_fintech_python() {{ "{sys.executable}" "$@"; }}\n')
+    shell += block + '\nprintf "%s\\n" "$WSL_DISTRO_NAME"\n'
+    result = subprocess.run(['bash', '-c', shell], cwd=tmp_path, env=environment,
+                            text=True, capture_output=True)
+    if expected is None:
+        assert result.returncode != 0
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
 
 
 @pytest.fixture
@@ -126,6 +287,38 @@ def test_scan_timeout_and_new_delivery_preserve_both_intents(tmp_path, monkeypat
     assert value['state'] == 'scan_requested' and not value['paths']
     assert scans == [a, a, b]
     assert all(p != 'lakehouse' for p in scans)
+
+
+def test_control_backup_scan_timeout_is_retryable_without_dumping_or_republishing(tmp_path, monkeypatch):
+    fail, calls = True, []
+    def api(base, key, route, query=None, **kwargs):
+        if route.endswith('system/status'):
+            return {'myID': 'penguin'}
+        if route.endswith('db/status'):
+            return {'state': 'idle'}
+        calls.append(query['sub'])
+        if fail:
+            raise TimeoutError('Syncthing scan is still running')
+    monkeypatch.setattr(transport, 'credentials', lambda: ('local', 'private'))
+    monkeypatch.setattr(transport, 'request', api)
+    c = {'state_root': str(tmp_path), 'transport_root': str(tmp_path / 'ingress/lakehouse'),
+         'producer_device_id': 'penguin'}
+    identity = 'a' * 64
+    first = lakehouse.notify_transport(c, control_backup_identity=identity)
+    assert first['state'] == 'retry_scan' and first['error_type'] == 'TimeoutError'
+    assert set(first['paths']) == {'tools/dispatch', 'batch-' + identity}
+    fail = False
+    second = lakehouse.notify_transport(c, control_backup_identity=identity)
+    assert second['state'] == 'scan_requested' and not second['paths']
+    assert lakehouse.notify_transport(c, control_backup_identity=identity) == second
+    assert len(calls) == 3  # one failed request, then only the two retained paths
+    assert not (tmp_path / 'pending-transport-scan.json').exists()
+
+
+@pytest.mark.parametrize('identity,paths', [('not-a-hash', ()), ('a' * 64, ('lakehouse',))])
+def test_control_backup_scan_cannot_widen_to_other_deliveries(tmp_path, identity, paths):
+    with pytest.raises(ValueError):
+        lakehouse.notify_transport({'state_root': str(tmp_path)}, paths, control_backup_identity=identity)
 
 
 @pytest.fixture
@@ -441,6 +634,73 @@ def test_source_pipeline_prioritizes_unbacked_bytes_and_keeps_disjoint_pending_w
     keys = [row['file_keys'][0] for row in persisted['deliveries'].values()]
     assert len(set(keys)) == 2 and backed[0] + '@' + backed[1] not in keys
     assert second['pending_bytes'] <= c['source_replication']['maximum_pending_bytes']
+
+
+@pytest.mark.parametrize('has_acceptance', [False, True])
+@pytest.mark.parametrize('redelivery_enabled', [False, True])
+def test_source_monitoring_skips_restic_priority_without_new_candidates(
+        source_wave, monkeypatch, has_acceptance, redelivery_enabled):
+    from stockagent.data_sync import nas_coverage
+    c, entries, physical, _, _, source = source_wave
+    state = Path(c['state_root'])
+    c['receipt_root'] = str(state / 'receipts')
+    Path(c['receipt_root']).mkdir()
+    c['source_replication'] = {
+        'decouple_nas_acceptance': True, 'prioritize_uncovered_nas': True,
+        'restic_state_root': str(state / 'restic'),
+        'receiver_requested_redelivery': redelivery_enabled,
+    }
+    identity = 'a' * 64
+    delivery = {'file_keys': [entries[0][0] + '@' + entries[0][1]], 'bytes': entries[0][2]}
+    if has_acceptance:
+        delivery['nas_acceptance'] = {'state': 'nas_archive_file_recovery_verified',
+                                      'delivery_identity_sha256': identity}
+    ledger_path = state / 'source-replication-ledger.json'
+    atomic_write_json(ledger_path, {'deliveries': {identity: delivery}})
+    original_ledger, original_source = ledger_path.read_bytes(), source.read_bytes()
+
+    class Catalog:
+        def execute(self, sql): return self
+        def fetchall(self): return entries
+        def close(self): pass
+
+    monkeypatch.setattr(lakehouse, 'guard', lambda policy: None)
+    monkeypatch.setattr(lakehouse, 'connect', lambda *args, **kwargs: Catalog())
+    monkeypatch.setattr(nas_coverage, 'read_ledger',
+                        lambda *args: pytest.fail('no candidate needs a Restic priority ledger'))
+    monkeypatch.setattr(lakehouse, '_publish_source_wave',
+                        lambda *args, **kwargs: pytest.fail('published source must not be sent again'))
+    result = lakehouse.stage_source_wave(c)
+    assert result['unpublished_source_object_count'] == 0
+    assert result['minimum_next_source_object_bytes'] is None
+    assert result['pending_delivery_ids'] == ([] if has_acceptance else [identity])
+    assert result['nas_archive_covered_objects'] == int(has_acceptance)
+    assert ledger_path.read_bytes() == original_ledger
+    assert source.read_bytes() == original_source
+    assert not list(physical.iterdir())
+
+
+def test_source_priority_still_reads_and_rejects_invalid_ledger_for_new_candidates(
+        source_wave, monkeypatch):
+    from stockagent.data_sync import nas_coverage
+    c, entries, *_ = source_wave
+    c['receipt_root'] = str(Path(c['state_root']) / 'receipts')
+    c['source_replication'] = {'prioritize_uncovered_nas': True}
+
+    class Catalog:
+        def execute(self, sql): return self
+        def fetchall(self): return entries
+        def close(self): pass
+
+    monkeypatch.setattr(lakehouse, 'guard', lambda policy: None)
+    monkeypatch.setattr(lakehouse, 'connect', lambda *args, **kwargs: Catalog())
+
+    def invalid_ledger(path):
+        raise ValueError('invalid NAS authority ledger')
+
+    monkeypatch.setattr(nas_coverage, 'read_ledger', invalid_ledger)
+    with pytest.raises(ValueError, match='invalid NAS authority ledger'):
+        lakehouse.stage_source_wave(c)
 
 
 @pytest.mark.parametrize('policy', [{'maximum_pending_deliveries': True}, {'maximum_wave_bytes': 9 * 1024**3},

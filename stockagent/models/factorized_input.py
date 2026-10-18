@@ -6,6 +6,8 @@ No feature bottleneck, pruning, new attention architecture or sparse-event
 execution is introduced. Raw observations remain in their source packages.
 """
 from __future__ import annotations
+from collections import OrderedDict
+import hashlib
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -135,7 +137,8 @@ def _factorized_stock_chunk_size(model, slab, mask, *, raw_basis=False):
 
 
 def forward_factorized_live_window(model, window, mask, *, return_aux=None,
-                                   symbol_indices=None, portfolio_context=None):
+                                   symbol_indices=None, portfolio_context=None,
+                                   materialize_candle_aux=True):
     """Lossless bounded transport, full-shape original math, private workspace."""
     if model.training or not torch.is_inference_mode_enabled():
         raise RuntimeError("factorized live windows require eval and inference mode")
@@ -161,7 +164,8 @@ def forward_factorized_live_window(model, window, mask, *, return_aux=None,
     # Only storage transport is chunked. This freshly reconstructed allocation
     # is owned by this call, so RMS can normalize in place without a 5 GiB clone.
     raw = window.materialize(model.candle_encoder.candle_query.device)
-    h, token_aux = model.candle_encoder(raw, return_aux=collect, owned_inference=True)
+    h, token_aux = model.candle_encoder(raw, return_aux=collect, owned_inference=True,
+                                      materialize_aux=materialize_candle_aux)
     del raw
     h = model._add_window_positions(h, int(mask.size(1)), symbol_indices)
     output = model._forward_embedded(h, mask, return_aux=return_aux,
@@ -169,9 +173,142 @@ def forward_factorized_live_window(model, window, mask, *, return_aux=None,
     return model._attach_candle_aux(output, token_aux, return_aux)
 
 
+def _frozen_encoder_cache_key(model, slab, mask, symbol_indices, *, policy_inputs=False):
+    # This cache is process-local. The immutable source fingerprint, exact row
+    # order/mask/IDs, AMP policy and every frozen parameter/buffer generation
+    # define an embedding. No learned projection is reused while trainable.
+    allowed = ("score_head.", "risk_calibration_head.")
+    if any(p.requires_grad and not name.startswith(allowed)
+           for name, p in model.named_parameters()):
+        raise ValueError("frozen encoder cache requires only score/risk heads trainable")
+    if any(isinstance(m, nn.Dropout) and m.p != 0 for m in model.modules()):
+        raise ValueError("frozen encoder cache requires zero dropout")
+    fingerprint = getattr(slab.source, "content_fingerprint", {}).get("sha256")
+    if not fingerprint:
+        raise ValueError("frozen encoder cache requires an immutable source fingerprint")
+    device = model.candle_encoder.candle_query.device
+    excluded = ("risk_calibration_head.",) if policy_inputs else allowed
+    parameters = [(name, p) for name, p in model.named_parameters()
+                  if not name.startswith(excluded)]
+    parameters += list(model.named_buffers())
+    generation = (str(device), policy_inputs,
+        tuple((name, p.data_ptr(), p._version, str(p.dtype), tuple(p.shape)) for name, p in parameters))
+    owner = model.__dict__.setdefault("_frozen_encoder_cache", dict(
+        entries=OrderedDict(), bytes=0, hits=0, misses=0, evictions=0, generation=None))
+    if owner["generation"] != generation:
+        owner["entries"].clear()
+        owner.update(bytes=0, generation=generation)
+    owner['policy_inputs'] = policy_inputs
+    digest = hashlib.sha256(mask.detach().to(device='cpu', dtype=torch.bool).contiguous().numpy().tobytes())
+    if symbol_indices is not None:
+        digest.update(symbol_indices.detach().to(device='cpu', dtype=torch.int64).contiguous().numpy().tobytes())
+    policy = (model.training, torch.is_grad_enabled(), torch.is_autocast_enabled(device.type),
+        str(torch.get_autocast_dtype(device.type)), torch.is_inference_mode_enabled())
+    return owner, (policy, fingerprint, tuple(slab.shape), slab.rows.tobytes(),
+        symbol_indices is None, digest.hexdigest())
+
+
+def _frozen_cache_size(value):
+    if isinstance(value, tuple):
+        return sum(_frozen_cache_size(v) for v in value)
+    return value.numel() * value.element_size()
+
+
+def _own_frozen_cache_value(value):
+    if isinstance(value, tuple):
+        return tuple(_own_frozen_cache_value(v) for v in value)
+    return value.detach().clone()
+
+
+def _frozen_policy_risk_output(model, inputs, mask):
+    fn = model.__dict__.get('_factorized_risk_readout_fn')
+    if fn is None:
+        fn = model._calibrate_portfolio_risk_from_features
+        if mask.is_cuda and model.factorized_input_compile:
+            # Freeze/cache the large graphed producer; fuse this tiny trainable
+            # readout without graph-owned backward buffers. Several pending
+            # risk forwards may then share one backward without aliasing.
+            options = _partition_compile_options(model, stage='head')
+            options['triton.cudagraphs'] = False
+            fn = torch.compile(fn, dynamic=False, fullgraph=True, options=options)
+        object.__setattr__(model, '_factorized_risk_readout_fn', fn)
+    return _call_partition(model, fn, *inputs, mask)[0]
+
+
 @torch.compiler.disable
-def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
-                            symbol_indices=None,portfolio_context=None):
+def forward_factorized_slab(model, slab, mask, *, temperature=None, return_aux=None,
+                            symbol_indices=None, portfolio_context=None):
+    budget = int(getattr(model, "factorized_frozen_encoder_cache_bytes", 0))
+    if not budget:
+        return _forward_factorized_slab_uncached(model, slab, mask, temperature=temperature,
+            return_aux=return_aux, symbol_indices=symbol_indices, portfolio_context=portfolio_context)
+    if return_aux is True or (return_aux is None and model.return_aux and model.return_aux_details):
+        raise ValueError("frozen encoder cache does not omit requested detailed diagnostics")
+    # With only the risk head trainable, the entire original policy is fixed.
+    # Retain its weights and sufficient risk features, rather than repeating
+    # market/score computation or retaining a trainable CUDA-graph backward.
+    policy_inputs = (getattr(model, "risk_calibration_head", None) is not None
+        and (return_aux is False or (return_aux is None and not model.return_aux))
+        and not any(p.requires_grad and not n.startswith("risk_calibration_head.")
+                    for n, p in model.named_parameters())
+        and not (isinstance(temperature, torch.Tensor) and temperature.requires_grad))
+    owner, key = _frozen_encoder_cache_key(model, slab, mask, symbol_indices,
+        policy_inputs=policy_inputs)
+    if policy_inputs:
+        # Temperature affects the fixed policy, but not temporal embeddings.
+        temperature_key = (None if temperature is None else
+            (str(temperature.dtype), tuple(temperature.shape),
+             temperature.detach().float().cpu().contiguous().numpy().tobytes())
+            if isinstance(temperature, torch.Tensor) else float(temperature))
+        key = (*key, temperature_key)
+    device = model.candle_encoder.candle_query.device
+    device_mask = mask.to(device=device, dtype=torch.bool)
+    entry = owner['entries'].get(key)
+    if entry is None:
+        owner['misses'] += 1
+        embeddings = _forward_factorized_slab_uncached(model, slab, device_mask,
+            symbol_indices=symbol_indices, return_aux=False, _return_embeddings=True)
+        if policy_inputs:
+            embeddings = _factorized_head_output(model, embeddings, device_mask,
+                temperature=temperature, return_aux=False, portfolio_context=portfolio_context,
+                _risk_calibration_inputs_only=True)
+            # Even an entry too large for the retained budget must have private
+            # saved tensors while its risk backward is pending.
+            with torch.inference_mode(False), torch.no_grad():
+                embeddings = _own_frozen_cache_value(embeddings)
+        size = _frozen_cache_size(embeddings)
+        if size <= budget:
+            while owner['entries'] and owner['bytes'] + size > budget:
+                _, (discarded, _) = owner['entries'].popitem(last=False)
+                owner['bytes'] -= _frozen_cache_size(discarded)
+                owner['evictions'] += 1
+            # Own the storage beyond the producer CUDA-graph replay. A normal
+            # no-grad tensor can safely be saved by a later trainable head.
+            with torch.inference_mode(False), torch.no_grad():
+                if not policy_inputs:
+                    embeddings = _own_frozen_cache_value(embeddings)
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            owner['entries'][key] = (embeddings, ready)
+            owner['bytes'] += size
+    else:
+        owner['hits'] += 1
+        owner['entries'].move_to_end(key)
+        embeddings, ready = entry
+        if ready is not None:
+            torch.cuda.current_stream(device).wait_event(ready)
+    if policy_inputs:
+        # Normal private tensors own every saved input and parameter gradient.
+        # The tiny trainable readout runs outside the frozen compiled producer.
+        return _frozen_policy_risk_output(model, embeddings, device_mask)
+    return _factorized_head_output(model, embeddings, device_mask,
+        temperature=temperature, return_aux=return_aux, portfolio_context=portfolio_context)
+
+
+def _forward_factorized_slab_uncached(model,slab,mask,*,temperature=None,return_aux=None,
+                            symbol_indices=None,portfolio_context=None,_return_embeddings=False):
     """Eager source boundary around compiled, ordinary Tensor computations."""
     if model.attention_mode in {"full","axial"}:
         raise ValueError("wide factorized streaming requires the selected separable compact attention model")
@@ -295,7 +432,18 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
         else:output=read_and_encode(stock_mask,stock_ids,kernels)
         outputs.append(output)
     embeddings=torch.cat(outputs,dim=1)
-    head_fn=model.__dict__.get("_factorized_head_fn")
+    if _return_embeddings:
+        return embeddings
+    return _factorized_head_output(model, embeddings, mask, temperature=temperature,
+        return_aux=return_aux, portfolio_context=portfolio_context)
+
+
+def _factorized_head_output(model, embeddings, mask, *, temperature=None,
+        return_aux=None, portfolio_context=None, _risk_calibration_inputs_only=False):
+    device = embeddings.device
+    fn_key = ("_factorized_frozen_policy_fn" if _risk_calibration_inputs_only
+        else "_factorized_head_fn")
+    head_fn=model.__dict__.get(fn_key)
     if head_fn is None:
         head_fn=model._forward_stock_embeddings
         if device.type=="cuda" and model.factorized_input_compile:
@@ -306,8 +454,11 @@ def forward_factorized_slab(model,slab,mask,*,temperature=None,return_aux=None,
             if narrow:
                 print("[model-compile] narrow FP32 head: Inductor fullgraph; "
                       "logical attention retained with aligned SDPA tiles", flush=True)
-        object.__setattr__(model,"_factorized_head_fn",head_fn)
-    result = _call_partition(model,head_fn,embeddings,mask,temperature=temperature,return_aux=return_aux,portfolio_context=portfolio_context)
+        object.__setattr__(model,fn_key,head_fn)
+    kwargs = dict(temperature=temperature, return_aux=return_aux, portfolio_context=portfolio_context)
+    if _risk_calibration_inputs_only:
+        kwargs['_risk_calibration_inputs_only'] = True
+    result = _call_partition(model,head_fn,embeddings,mask,**kwargs)
     if bool(getattr(model, "factorized_portfolio_cuda_graphs", False)):
         # Annual training retains several forwards before a single backward.
         # Preserve caller-owned outputs across subsequent graph replays.

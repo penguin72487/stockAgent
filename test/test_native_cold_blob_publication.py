@@ -33,7 +33,6 @@ def test_bounded_small_pack_keeps_complete_sha_and_final_generation(tmp_path, mo
 def test_large_many_member_and_subset_packs_keep_native_admission(tmp_path, monkeypatch, bytes_count, members, stored):
     from contextlib import contextmanager
     from types import SimpleNamespace
-    import stockagent.data_sync.training_return as admission
     path=tmp_path/'pack.zip';payload=b'X'*bytes_count;path.write_bytes(payload)
     item={'bytes':bytes_count,'sha256':hashlib.sha256(payload).hexdigest(),'file_count':members}
     if stored is not None:item['stored_file_count']=stored
@@ -44,7 +43,7 @@ def test_large_many_member_and_subset_packs_keep_native_admission(tmp_path, monk
         with path.open('rb') as source:yield source
     monkeypatch.setattr(native,'binary_reader',reader)
     monkeypatch.setattr(packed.shutil,'disk_usage',lambda path:SimpleNamespace(free=64*1024**3))
-    monkeypatch.setattr(admission,'admit_workspace',lambda *a:calls.append('physical-admission'))
+    monkeypatch.setattr(native,'admit_workspace',lambda *a:calls.append('physical-admission'))
     with packed._native_pack_source(path,item,enabled=True) as source:
         assert source.read()==payload
     assert calls==['physical-admission','native']

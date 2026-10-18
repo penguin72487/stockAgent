@@ -3,7 +3,7 @@
 import {writeFileSync} from "node:fs";
 
 const port = Number(process.argv[2] || 9229);
-const url = process.argv[3] || "https://penguin72487.ddnsgeek.com/data-monitor/";
+const url = process.argv[3] || "https://www.penguin72487.dpdns.org/data-monitor/";
 const output = process.argv[4] || "";
 const target = await (await fetch(
   `http://127.0.0.1:${port}/json/new?about:blank`,

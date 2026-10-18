@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import time
 from typing import Any
@@ -34,6 +35,69 @@ from stockagent.data.tw_stock_context_futures_portfolio import (
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
 )
+
+
+class ImmutableWindowedBatchCache:
+    """Fold-owned, byte-bounded metadata copies; never learned activations."""
+
+    def __init__(self, budget_bytes):
+        if budget_bytes < 0:
+            raise ValueError('windowed device cache budget must be nonnegative')
+        self.budget_bytes = int(budget_bytes)
+        self.source = None
+        self.source_version = None
+        self.entries = OrderedDict()
+        self.bytes = self.hits = self.misses = 0
+
+    @staticmethod
+    def _token(value):
+        return (id(value), value._version, tuple(value.shape), value.stride(),
+                value.dtype, value.device, value.requires_grad)
+
+    def _bind(self, source):
+        names = getattr(source, '__dataclass_fields__', None) or vars(source)
+        version = tuple((name, self._token(value)) for name in names
+                        if isinstance(value := getattr(source, name), torch.Tensor))
+        settings = tuple((name, value) for name in names
+                         if isinstance(value := getattr(source, name), (str, int, float, bool, type(None))))
+        if any(token[-1] for _, token in version):
+            raise ValueError('learned windowed data cannot enter an immutable device cache')
+        if source is not self.source or (version, settings) != self.source_version:
+            self.entries.clear()
+            self.bytes = 0
+            self.source, self.source_version = source, (version, settings)
+
+    def get(self, source, key):
+        self._bind(source)
+        entry = self.entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        batch, tokens, _ = entry
+        if any(self._token(batch[name]) != token for name, token in tokens):
+            raise RuntimeError('immutable windowed device batch was mutated')
+        self.entries.move_to_end(key)
+        self.hits += 1
+        return dict(batch)
+
+    def put(self, source, key, batch):
+        self._bind(source)
+        tensors = [(name, value) for name, value in batch.items() if isinstance(value, torch.Tensor)]
+        if any(value.requires_grad for _, value in tensors):
+            raise ValueError('learned activations cannot enter the windowed device cache')
+        storages = {(value.device, value.untyped_storage().data_ptr()): value.untyped_storage().nbytes()
+                    for _, value in tensors}
+        size = sum(storages.values())
+        if size > self.budget_bytes or not self.budget_bytes:
+            return
+        previous = self.entries.pop(key, None)
+        if previous is not None:
+            self.bytes -= previous[2]
+        while self.entries and self.bytes + size > self.budget_bytes:
+            _, old = self.entries.popitem(last=False)
+            self.bytes -= old[2]
+        self.entries[key] = (dict(batch), tuple((name, self._token(value)) for name, value in tensors), size)
+        self.bytes += size
 
 
 @dataclass(slots=True)

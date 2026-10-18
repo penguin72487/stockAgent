@@ -6,12 +6,26 @@ import numpy as np
 import torch
 
 
-def _rank_from_sorted_indices(sorted_idx: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Construct row-wise rank tensor from argsort indices using scatter."""
-    row_rank = torch.arange(sorted_idx.size(1), device=sorted_idx.device, dtype=dtype)
-    row_rank = row_rank.unsqueeze(0).expand_as(sorted_idx)
-    ranks = torch.empty(sorted_idx.shape, device=sorted_idx.device, dtype=dtype)
-    ranks.scatter_(1, sorted_idx, row_rank)
+def _average_tie_ranks(values: torch.Tensor) -> torch.Tensor:
+    """Row-wise Spearman ranks, invariant to the order of equal values.
+
+    Ordinal argsort ranks invent information for sparse or constant holdings.
+    Compute each equal-value run's midpoint before scattering back to symbols.
+    Masked -inf values may share a rank; callers exclude them from correlation.
+    """
+    sorted_values, sorted_idx = values.sort(dim=1)
+    width = values.size(1)
+    row_rank = torch.arange(width, device=values.device, dtype=torch.float32)
+    row_rank = row_rank.unsqueeze(0).expand_as(values)
+    boundary = torch.ones_like(sorted_values, dtype=torch.bool)
+    boundary[:, 1:] = sorted_values[:, 1:] != sorted_values[:, :-1]
+    start = torch.where(boundary, row_rank, 0.0).cummax(dim=1).values
+    boundary[:, :-1] = sorted_values[:, :-1] != sorted_values[:, 1:]
+    boundary[:, -1:] = True
+    end = torch.where(boundary, row_rank, float(width - 1))
+    end = end.flip((1,)).cummin(dim=1).values.flip((1,))
+    ranks = torch.empty_like(row_rank)
+    ranks.scatter_(1, sorted_idx, (start + end) * 0.5)
     return ranks
 
 
@@ -60,11 +74,10 @@ def compute_ic_series_torch(
     mask_f = valid_mask.float()
     valid_count = mask_f.sum(dim=1)
 
-    # Single argsort + scatter rank construction is faster than argsort(argsort()).
     s_fill = scores_t.masked_fill(~valid_mask, float("-inf"))
     r_fill = returns_t.masked_fill(~valid_mask, float("-inf"))
-    s_rank = _rank_from_sorted_indices(torch.argsort(s_fill, dim=1), dtype=torch.float32)
-    r_rank = _rank_from_sorted_indices(torch.argsort(r_fill, dim=1), dtype=torch.float32)
+    s_rank = _average_tie_ranks(s_fill)
+    r_rank = _average_tie_ranks(r_fill)
 
     denom_count = valid_count.clamp_min(1.0).unsqueeze(1)
     s_mean = (s_rank * mask_f).sum(dim=1, keepdim=True) / denom_count

@@ -7,6 +7,13 @@
 [文件索引](docs/README.md)。原始資料與訓練產物不進 Git，實際路徑由市場 YAML、
 資料集 catalog 與本機 storage root 決定。
 
+每個 `data_*` 的用途、欄位與讀取入口見 [資料集導覽](docs/data_datasets.md)；
+所有資料集共用「完整邏輯版本、只保存新增／異動 payload」的
+[增量版本架構](docs/dataset_incremental_storage.md)。33 個來源根目錄及外部來源共 60 個處理項
+已登錄原 Temporal worker 的持久遷移，逐項發布、完整還原後才回收可刪副本；
+處理／等待不代表已完成。可執行 `run_fintech_python scripts/dataset_migration_status.py`
+查看原日誌；原件與唯一歷史不因登錄而自動刪除。
+
 ## 目錄
 
 - [第一性架構](#第一性架構)
@@ -236,6 +243,9 @@ run_fintech_python scripts/audit_training_source_inventory.py \
 
 未使用訓練 panel 的無損去重、精確重建檢查及本次清理收據，見
 [源本保留紀錄的安全清理章節](docs/penguin_source_only_storage_2026-10-01.md#10-本次後續安全清理)。
+
+最新本機磁碟盤點、已驗證回收量與尚在驗證的候選，見
+[2026-10-15 penguin 儲存清理](docs/penguin_storage_cleanup_2026-10-15.md)。
 
 ## 資料冷庫與多機同步
 
@@ -768,6 +778,152 @@ run_fintech_python scripts/deduplicate_artifacts.py \
 # 核對報告後才加 --apply；不可對整個 artifacts/cache 盲目執行。
 ```
 
+### 服務分鐘快取：保留路徑、共用相同內容
+
+canonical writer 現在直接重用既有資料，不需另外執行去重才生效：
+
+- 分鐘資料按 session 的完整來源／有序股票軸／價格與政策建立輸入 key；日更只
+  重算新增或實際改變的 session。原始 partition 仍逐檔驗 SHA，不以快取取代來源驗收。
+- 相同的不可變 session 直接共用既有檔案，不先寫另一份 NPZ。舊 manifest 沒有
+  session key 時，首次仍需計算，但可在記憶體序列化後按完整 SHA 重用原檔。
+- Panel 不同 backend 的相同陣列直接共用；大型追加歷史進一步以 8 MiB 不變 byte
+  chunks 重用，新增一天不再重寫完整陣列，Linux reader 保持連續 NumPy mmap。
+  小陣列及滑動 live tail 仍用 NPY；不刪 backend、不裁短輸入或降精度。完整真實
+  panel append 新寫量 1,257.33 → 15.86 MB，含全量讀回平均 10.389 → 8.324 秒；
+  冷建置略慢。Discord／postclose 已啟用，舊檔不強制重建，詳見
+  [分塊產生端驗收及部署邊界](docs/penguin_service_storage_layout_2026-10-15.md#1016-續修panel-追加只寫變動塊共用歷史而不另組整份副本)。
+- Completed forward 不同輸入仍各自計算、驗收及保留 receipt；若完整輸出 bytes
+  相同，寫入端直接共用既有唯讀 payload，不再落地另一份大型 tensor 檔。
+- 盤後訊號在 CPU 複製／序列化**之前**選出實際消費的權重、分數與風險診斷，
+  以 `completed_tw_signal_values_v1` 納入 input key。完整模型／訓練／解釋 ABI 不變；
+  `output_projection.source_aux_fields` 保留原欄位名稱，`retained_aux_fields` 明列真正
+  保存的值，不把欄位名稱當作完整診斷 payload。五個現行模式實測合計
+  1.285 GB → 1.664 MB；舊 payload／receipt 保留，這不是已回收的硬碟空間。
+- Completed-session 模型內進一步按需產生診斷：保留原數值路徑，只略過未消費的
+  candle／basis 額外拼接、遮罩副本與反事實診斷。原訓練、開盤及完整解釋仍預設
+  保存完整輸出。年度模式有界模型峰值顯存 1.856 → 0.188 GB；五模式完整模型／
+  非省略值／訊號 byte oracle、652 項回歸及正式冷 owner 已驗收。這不是所有模式
+  或完整流程均加速，詳見[產生端驗收與限制](docs/penguin_service_storage_layout_2026-10-15.md#1016-0200模型診斷按需生成不再先算再丟)。
+- 在分鐘 `manifest.json` 查看 `storage_contract`／`storage_build`，Panel
+  `panel_cache_v2/meta.json` 也有 `storage_build`，可分辨真正新寫與避免寫入的 bytes。
+  Forward 的回傳收據也有 `storage_build`；舊有效快取不會為補欄位被強制重建。
+
+### 共用 Panel：先重用，不先產生再丟棄
+
+完整、即時尾段和稽核入口共用欄位解析；`include/exclude`、wildcard、原值欄位及
+開盤 gap 都先按原契約驗證，再讀取必要欄位。交易規則獨立保留，來源與模型維度
+不縮減。市場／個股陣列直接切成共用視圖，不另複製整份 stock subset。
+
+原快取鍵及有效舊檔繼續使用；稽核也能讀取明確的 `--panel-cache-root` 或設定中的
+`data.panel_cache_root`，缺少時才用原設定寫入同一位置，不另造「投影版」快取。
+來源變更仍失效，舊 projected key 只作相容讀取。新 generation 保留每個檔案的
+資料 fsync，將未發布目錄的同步集中於提交前；失敗不發布，舊版本可讀。
+這是原產生端的行為，**不需要新增 timer 或清理 daemon**，也不會自動刪冷庫。
+
+```bash
+source scripts/runtime_env.sh
+# 查參數，不會下載、建置或重啟服務：
+run_fintech_python scripts/audit_tw_public_data_layer.py --help
+run_fintech_python scripts/benchmark_panel_producer_projection.py --help
+# 原預設 source/cache 位置；自訂 root 則讀該 root 的 panel_cache_v2/meta.json：
+jq '.storage_build' data_tw_public/stocks/panel_cache_v2/meta.json
+```
+
+固定輸入完整 ABBA、重跑指令、原生採用與未完成邊界見
+[共用產生端驗收](docs/penguin_service_storage_layout_2026-10-15.md#shared-panel-producer-20261016)。
+單一有界測速不代表全歷史速度或已回收硬碟 GB。
+
+### Factorized 準備：失敗重試不再寫第二份
+
+原 `update_tw_day_trade_factorized_live.py` 的盤前／盤後 hook 會自動使用此機制，
+不需新增排程或手動搬檔。完整上一代及同一來源／設定／程式世代的失敗 attempt，
+只有完成輸入 bits 與全檔 SHA 驗證的唯讀區塊才可重用；有變的區塊照常重新產生。
+每個 attempt 只有一份原子更新的 `storage_progress.json`，不是每個區塊一個小檔。
+
+```bash
+# 查看最新完整準備的實際新寫／避免寫入／中斷續用 bytes：
+jq '.storage_build' \
+  artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/projection_receipt.json
+# 原準備器與排程入口的參數；--help 不會啟動準備或模型：
+source scripts/runtime_env.sh
+run_fintech_python scripts/prepare_tw_day_trade_factorized_live.py --help
+run_fintech_python scripts/update_tw_day_trade_factorized_live.py --help
+```
+
+失敗進度不代表資料已部署或已進冷庫，不能據此刪除舊世代／暫存。盤中不強制
+重建現役 projection；下一次原生準備才會產生新收據。範圍、實測與待辦見
+[factorized 產生端與重試驗收](docs/penguin_service_storage_layout_2026-10-15.md#1016-續修factorized-失敗重試重用已完成區塊)。
+
+### 歷史服務快取壓實：另行盤點再套用
+
+既有歷史副本另有 ABI-aware 壓實入口，不套用上方 generic dedup。它核對
+manifest／READY、完整 SHA、程序引用和外部 hardlink，在原 writer locks 下共用
+相同內容；所有 logical paths、唯一內容及 manifest 原 bytes 都保留。忙碌／未知／
+損壞者保留，不是七日回收或冷庫 GC。新 payload 唯讀，writer 只 atomic replace；
+不建立第二個 CAS、永久索引或同步服務。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/deduplicate_artifacts.py \
+  --service-cache-policy configs/data_sync/service_cache_compaction.json \
+  --report-dir artifacts/operations/service-cache-compaction
+# 查看輸出的 result／plan；確認 scope 後使用該次 fingerprint：
+run_fintech_python scripts/deduplicate_artifacts.py \
+  --service-cache-policy configs/data_sync/service_cache_compaction.json \
+  --report-dir artifacts/operations/service-cache-compaction \
+  --apply --expected-plan-fingerprint PLAN_FINGERPRINT
+```
+
+Completed-forward 的已提交 v3 payload 也有獨立入口，保留每個 key／receipt。
+它只接受 canonical `artifacts/cache/completed_live_inference`，不處理未知／缺收據
+項目；不能拿其他 key 的 input identity 略過模型計算：
+
+```bash
+run_fintech_python scripts/deduplicate_artifacts.py \
+  --completed-forward-cache-policy configs/data_sync/completed_forward_compaction.json \
+  --report-dir artifacts/operations/service-cache-compaction
+# 套用同樣另加 --apply --expected-plan-fingerprint 該次計畫的指紋。
+```
+
+預設為完整 SHA 稽核。日常只找副本時可加 `--sharing-candidates-only`：仍完整驗證
+實際重複候選，但唯一 payload 不重讀；沒有副本時為 0 payload I/O。這不是全量
+完整性稽核，也不改變原生讀取端驗證。
+
+Forward 成功讀取／提交後會沿原 key lock 取樣使用時間；每 key 每分鐘最多寫一次
+小型 `.usage.json`，不改 immutable payload／receipt。失敗取樣不觸發 GPU 重算，
+紀錄次數也不是總 hit 次數。原日常維護結果新增 `working_set`：按 inode 計算實體
+配置量、列出未知／忙碌／被引用者及需先證明可恢復的最舊群組。不遞迴掃來源、不為
+此清冊重讀整份 payload；`--forward-capacity-bytes BYTES` 可做容量壓力規劃，但只是
+soft target，**不會依年齡或超額直接刪檔**。全量 consumer pins 與 cold recovery 是
+後續退休的獨立門檻；沒有 usage 的舊 key 保留，不偽造歷史使用時間。
+同一日常入口會沿 canonical 市場／模型選擇與最新訊號，自動保護當前 TW day-trade
+forward keys；控制檔缺失、格式不明或前後變動就保留整份清冊。這是有界現役引用，
+不是全 fleet ownership，也不授權容量超額自動淘汰；不新增常駐掃描器或呼叫模型。
+
+每日自動化沿用 `stockagent-artifact-dedup.timer`；只有另外登錄 root-owned 本機設定
+`/etc/stockagent/service-cache-compaction.json` 才啟用，不因 repo 收到新設定自行啟用。
+首次啟用時，先完成上述套用與一次不帶 `--apply` 的獨立回讀，再登錄設定；已有設定
+時先比較，不直接覆蓋不同的 scope：
+
+```bash
+if sudo test -e /etc/stockagent/service-cache-compaction.json || sudo test -L /etc/stockagent/service-cache-compaction.json; then
+  sudo cmp configs/data_sync/service_cache_compaction.json /etc/stockagent/service-cache-compaction.json
+else
+  sudo install -o root -g root -m 0600 configs/data_sync/service_cache_compaction.json /etc/stockagent/service-cache-compaction.json
+fi
+```
+
+Forward 另明確登錄 `/etc/stockagent/completed-forward-compaction.json`，範本為
+`configs/data_sync/completed_forward_compaction.json`；同樣先比較既有設定，不覆蓋
+不同 scope，以 root:root／0600 安裝。兩者沿用同一 wrapper／flock，日常自動化
+採 candidate-only；不新增 timer，也不放寬 generic artifact 去重範圍。
+
+查排程用 `systemctl status stockagent-artifact-dedup.timer`；查結果與進度用
+`jq . /var/lib/stockagent-artifact-dedup/receipts/physical-minute/*/latest.json` 及同層
+`progress.json`；forward 收據位於同一 receipts 根下的 `completed-forward/`。
+完整原理、限制與實測見
+[服務儲存瘦身](docs/penguin_service_storage_layout_2026-10-15.md)。
+
 完整 artifact run 的冷藏與七日退役則使用：
 
 ```bash
@@ -1106,6 +1262,48 @@ Edge hot cache 的 TTL 上限為七天；仍在使用會自動續租，刻意長
 [packed 冷庫文件](docs/packed_dataset_storage.md)。
 
 ## Windows 與 WSL 暫存清理
+
+### WSL 容量與 VHDX 回收
+
+Linux `df` 可用量、VHD 虛擬容量上限、Windows VHDX 實體用量是三件事。
+刪檔後 ext4 可立即重用空間；hourly `fstrim.timer` 通知 VHD 丟棄不用的區塊，
+但不保證 Windows 檔案立刻縮小。Windows 的 `StockAgent WSL Offline Compaction`
+每小時只在 WSL **已停止且 VHD 未掛載**時做 read-only／Quick compaction；
+服務運行時只記錄 `skipped-running`，不替你關機。24 小時常駐服務因此仍需另排
+維護窗口才能離線壓縮。現行 WSL 2.7.13 的 sparse 啟用被官方標為資料毀損風險，
+未強制啟用，不能宣稱已達到在線即時縮檔。
+
+擴容／離線壓縮使用同一個 Windows worker。先在 **Windows PowerShell** 複製並
+核對 SHA，不能讓即將關閉的 WSL UNC 路徑承載 worker：
+
+```powershell
+$wslStorageDistro = 'Ubuntu-26.04'
+$wslStorageSource = "\\wsl.localhost\$wslStorageDistro\root\stockAgent\scripts\maintain_windows_wsl_storage.ps1"
+$wslStorageHash = (Get-FileHash -LiteralPath $wslStorageSource).Hash.ToLowerInvariant()
+$wslStorageRoot = Join-Path $env:LOCALAPPDATA 'StockAgent\WslStorage'
+New-Item -ItemType Directory -Force $wslStorageRoot | Out-Null
+$wslStorageWorker = Join-Path $wslStorageRoot "worker-$wslStorageHash.ps1"
+Copy-Item -LiteralPath $wslStorageSource -Destination $wslStorageWorker
+if ((Get-FileHash -LiteralPath $wslStorageWorker).Hash.ToLowerInvariant() -ne $wslStorageHash) { throw 'SHA mismatch' }
+$wslStorageRegistration = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' |
+    Get-ItemProperty | Where-Object DistributionName -eq $wslStorageDistro
+$wslStorageVhd = Join-Path $wslStorageRegistration.BasePath 'ext4.vhdx'
+
+# 預設唯讀 Plan；先核對 distro、精確 VHD、容量及 Windows 排程。
+& $wslStorageWorker -Mode Plan -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd
+# 不啟停 WSL；若目前正在使用，只留下 skipped-running 收據。
+& $wslStorageWorker -Mode CompactIfStopped -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd -Apply
+# 明確允許停機後，在原生 Windows 的系統管理員終端執行：
+& $wslStorageWorker -Mode Expand -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd -Apply
+```
+
+`Expand` 上限為 2,499,999,170,560 bytes（不超過十進位 2.5 TB），不縮小虛擬容量。
+它保存三個已知 Windows 自動啟動排程，正常 systemd 關機後沿官方 `wsl --manage`
+擴容、離線壓縮，最後恢復原排程。需要系統管理員權限；IDE／Codex 會短暫斷線。
+收據在 `%LOCALAPPDATA%\StockAgent\WslStorage\receipts\<time>-<mode>\status.json`，
+`needs-attention` 需查同目錄 `wsl.log`；不能把排程啟動視為擴容或業務恢復完成。
+維護程序中斷時用同目錄 task XML／`tasks` 原狀態恢復排程，勿啟用舊 filesystem-repair
+或原本 disabled 的備份任務。詳見 [本次清理與維護紀錄](docs/penguin_storage_cleanup_2026-10-15.md)。
 
 若 Windows 顯示 `vmmemWSL` 佔用高，先看
 `/usr/bin/python3 scripts/reclaim_wsl_backfill_memory.py` 的唯讀報告與

@@ -329,7 +329,7 @@ def verify(url: str, output: Path) -> dict:
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--url',default='https://penguin72487.ddnsgeek.com/tej/')
+    parser.add_argument('--url',default='https://www.penguin72487.dpdns.org/tej/')
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args(argv)
     print(json.dumps(verify(args.url,args.output),ensure_ascii=False))

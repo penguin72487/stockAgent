@@ -106,6 +106,7 @@ def capture(output: Path, source: Path, symbols: Path) -> None:
     from downloader.artifact_io import atomic_write_json
     from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
     from stockagent.data.tw_public_features import _symbol_universe_receipt
+    from stockagent.data_sync.benchmark_fixtures import ImmutableFixtureInputs
 
     if output.exists() or output.is_symlink() or not output.resolve().is_relative_to(ROOT / "artifacts/benchmarks"):
         raise ValueError("capture requires a new private artifacts/benchmarks directory")
@@ -116,38 +117,40 @@ def capture(output: Path, source: Path, symbols: Path) -> None:
     size = sum(path.stat().st_size for path in paths)
     if not paths or shutil.disk_usage(output.parent).free < size + 15 * 1024**3:
         raise ValueError("insufficient private scratch for retained source and full trials")
-    output.mkdir(mode=0o700)
     copied = []
     with live_tw_public_source_read_guard(source / "stocks"):
-        names_before = _symbol_universe_receipt(symbols)
-        current_paths = sorted(source.glob("*.parquet"))
-        if supplemental.is_file():
-            current_paths.append(supplemental)
-        if current_paths != paths:
-            raise RuntimeError("source inventory changed before coherent capture")
-        for path in paths:
-            relative = path.relative_to(source)
-            target = output / "source" / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            before = file_hash(path)
-            shutil.copyfile(path, target)
-            if before != file_hash(target) or before != file_hash(path):
-                raise RuntimeError("source changed or private copy differs")
-            target.chmod(0o400)
-            copied.append({"name": relative.as_posix(), "size": target.stat().st_size, "sha256": before})
-        if names_before != _symbol_universe_receipt(symbols):
-            raise RuntimeError("symbol universe changed during coherent capture")
-        original = ROOT / "stockagent/data/tw_public_features.py"
-        shutil.copyfile(original, output / "original_features.py")
-        (output / "original_features.py").chmod(0o400)
-        if file_hash(original) != file_hash(output / "original_features.py"):
-            raise RuntimeError("builder changed during capture")
+        # Busy native producers must not create another abandoned fixture root.
+        output.mkdir(mode=0o700)
+        with ImmutableFixtureInputs(output) as inputs:
+            names_before = _symbol_universe_receipt(symbols)
+            current_paths = sorted(source.glob("*.parquet"))
+            if supplemental.is_file():
+                current_paths.append(supplemental)
+            if current_paths != paths:
+                raise RuntimeError("source inventory changed before coherent capture")
+            for path in paths:
+                relative = path.relative_to(source)
+                target = output / "source" / relative
+                item = inputs.copy(path, f"source/{relative.as_posix()}")
+                before = item["sha256"]
+                if before != file_hash(target) or before != file_hash(path):
+                    raise RuntimeError("source changed or private copy differs")
+                copied.append({"name": relative.as_posix(), "size": target.stat().st_size, "sha256": before})
+            if names_before != _symbol_universe_receipt(symbols):
+                raise RuntimeError("symbol universe changed during coherent capture")
+            original = ROOT / "stockagent/data/tw_public_features.py"
+            shutil.copyfile(original, output / "original_features.py")
+            (output / "original_features.py").chmod(0o400)
+            if file_hash(original) != file_hash(output / "original_features.py"):
+                raise RuntimeError("builder changed during capture")
+            storage = inputs.commit()
     atomic_write_json(output / "fixture.json", {
         "contract": "tw_public_private_full_builder_fixture_v1",
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_files": copied, "source_bytes": size, "original_code_sha256": file_hash(original),
         "symbols_root": str(symbols.resolve()), "symbol_universe": names_before,
         "production_writes": False, "providers_called": 0,
+        "storage_build": {key: value for key, value in storage.items() if key != "files"},
     })
     print(json.dumps({"event": "private_source_captured", "files": len(copied), "bytes": size}), flush=True)
 

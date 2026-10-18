@@ -13,13 +13,17 @@ import tempfile
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
+from downloader import shioaji_daily_calendar
 from downloader.shioaji_daily_calendar import (
     DAILY_CALENDAR_CONTRACT,
     calendar_prefix_matches,
     load_daily_calendar,
 )
+from stockagent.data_sync.immutable_cache_files import payload_info, stable_payload_hash
+from stockagent.data_sync.source_validation import signature, validator_identity
 
 
 SOURCE_NAME = "tw_public_before_shioaji_after"
@@ -70,6 +74,8 @@ def parse_args() -> argparse.Namespace:
         help="Diagnostics/pilot only: build from a subset download receipt.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-rebuild", action="store_true",
+                        help="Run the unchanged merge oracle even when exact inputs/output can be reused.")
     return parser.parse_args()
 
 
@@ -456,6 +462,39 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _reuse_inputs(base: Path, daily: Path, report: dict | None, *, cutover: date,
+                  calendar_identity: str) -> dict[str, Any]:
+    """Hash actual input bytes, not row counts, dates or a global timestamp."""
+    paths = [base]
+    if report is not None and report.get("status") == "complete":
+        paths.extend((daily, daily.with_suffix(".summary.json")))
+    return {
+        "files": {str(path): stable_payload_hash(path, payload_info(path)) for path in paths},
+        "report": report, "cutover": cutover.isoformat(), "calendar": calendar_identity,
+    }
+
+
+def _reusable_symbol(entry: Any, inputs: dict, output: Path, symbol: str) -> BuildResult | None:
+    if not isinstance(entry, dict) or entry.get("inputs") != inputs:
+        return None
+    try:
+        result = BuildResult(**entry["result"])
+        if (result.symbol != symbol or result.output_path != str(output)
+                or result.status == "failed" or result.rows <= 0
+                or stable_payload_hash(output, payload_info(output)) != entry.get("output_sha256")
+                or pq.ParquetFile(output).metadata.num_rows != result.rows):
+            return None
+        return result
+    except (OSError, KeyError, TypeError, ValueError, pa.ArrowException):
+        return None
+
+
+def _remember_symbol(result: BuildResult, inputs: dict) -> dict:
+    output = Path(result.output_path)
+    return {"inputs": inputs, "result": asdict(result),
+            "output_sha256": stable_payload_hash(output, payload_info(output))}
+
+
 def main() -> None:
     args = parse_args()
     cutover = date.fromisoformat(str(args.cutover_date))
@@ -511,6 +550,25 @@ def main() -> None:
             )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    # This small derived index stores hashes/statistics only, never copies of
+    # source frames. Every hit still validates actual input/output SHA and the
+    # daily source receipt. The downstream strict audit is unchanged.
+    cache_path = args.output_dir / "_build_reuse.json"
+    builder_identity = validator_identity(Path(__file__), Path(shioaji_daily_calendar.__file__))
+    cache_contract = f"shioaji-hybrid-exact-reuse-v1:{builder_identity}:{pl.__version__}:{pa.__version__}"
+    try:
+        previous_cache = _read_json(cache_path)
+    except (OSError, RuntimeError):
+        previous_cache = {}
+    reusable = previous_cache.get("symbols", {}) if previous_cache.get("contract") == cache_contract else {}
+    if not isinstance(reusable, dict):
+        reusable = {}
+    calendar_identity = hashlib.sha256(json.dumps(
+        sorted(day.isoformat() for day in official_sessions), separators=(",", ":")
+    ).encode()).hexdigest() if local_materialization else "not_local_minute"
+    next_cache: dict[str, dict] = {}
+    input_signatures: dict[Path, list[int]] = {}
+    reused_symbols = 0
     results: list[BuildResult] = []
     for symbol in target_symbols:
         base_path = args.base_stock_root / f"{symbol}_features.parquet"
@@ -518,6 +576,23 @@ def main() -> None:
         report = download_report.get(symbol)
         daily_path = args.shioaji_root / "daily" / f"{symbol}.parquet"
         try:
+            complete_daily = report is not None and str(report.get("status")) == "complete"
+            input_paths = [base_path]
+            if complete_daily:
+                input_paths.extend((daily_path, daily_path.with_suffix(".summary.json")))
+            before = {path: signature(path) for path in input_paths}
+            daily_summary = _validate_daily_receipt(daily_path) if complete_daily else None
+            inputs = _reuse_inputs(base_path, daily_path, report, cutover=cutover,
+                                   calendar_identity=calendar_identity)
+            input_signatures.update(before)
+            cached = None if args.force_rebuild else _reusable_symbol(
+                reusable.get(symbol), inputs, output_path, symbol,
+            )
+            if cached is not None:
+                results.append(cached)
+                next_cache[symbol] = reusable[symbol]
+                reused_symbols += 1
+                continue
             if report is None or str(report.get("status")) != "complete":
                 if report is not None and str(report.get("status")) not in {
                     "contract_unavailable",
@@ -557,8 +632,8 @@ def main() -> None:
                         ),
                     )
                 )
+                next_cache[symbol] = _remember_symbol(results[-1], inputs)
                 continue
-            daily_summary = _validate_daily_receipt(daily_path)
             base = pl.read_parquet(base_path)
             shioaji = pl.read_parquet(daily_path)
             if local_materialization and not (
@@ -590,6 +665,7 @@ def main() -> None:
                     **stats,
                 )
             )
+            next_cache[symbol] = _remember_symbol(results[-1], inputs)
         except Exception as exc:
             results.append(
                 BuildResult(
@@ -619,6 +695,12 @@ def main() -> None:
         raise RuntimeError("official symbol build changed during Shioaji hybrid materialization")
     if download_summary_receipt != _receipt(args.shioaji_root / "download_summary.json"):
         raise RuntimeError("Shioaji download summary changed during hybrid materialization")
+    for path, expected in input_signatures.items():
+        if signature(path) != expected:
+            raise RuntimeError(f"Shioaji hybrid input changed during build: {path}")
+    if builder_identity != validator_identity(Path(__file__), Path(shioaji_daily_calendar.__file__)):
+        raise RuntimeError("Shioaji hybrid builder contract changed during build")
+    _atomic_write_json(cache_path, {"contract": cache_contract, "symbols": next_cache})
     shutil.copy2(symbols_path, args.output_dir / "symbols.csv")
     provenance = {
         "schema_version": 1,
@@ -645,6 +727,8 @@ def main() -> None:
     summary = {
         "schema_version": 2,
         "source": SOURCE_NAME,
+        "incremental_build": {"contract": "shioaji-hybrid-exact-reuse-v1",
+                              "reused_symbols": reused_symbols, "built_symbols": len(results) - reused_symbols},
         "daily_calendar_contract": DAILY_CALENDAR_CONTRACT if local_materialization else None,
         "official_calendar": official_calendar,
         "quarantined_non_session_source_rows": int(
@@ -693,6 +777,7 @@ def main() -> None:
     print(
         f"[tw-shioaji-build] symbols={len(results)} "
         f"hybrid={summary['hybrid_symbols']} "
+        f"reused={reused_symbols} built={len(results) - reused_symbols} "
         f"public_only_unavailable={summary['public_only_contract_unavailable_symbols']} "
         f"public_only_not_yet_listed={summary['public_only_not_yet_listed_symbols']} "
         f"public_only_outside_window="

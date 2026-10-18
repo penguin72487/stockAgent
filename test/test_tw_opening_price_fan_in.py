@@ -21,11 +21,13 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 
 @pytest.fixture
 def owner(monkeypatch, tmp_path):
+    monkeypatch.setattr(acquisition, "_FINMIND_SNAPSHOT_OWNER", acquisition._FinMindSnapshotOwner())
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts"))
     monkeypatch.setattr(quotes, "_TW_MIS_OPENING_CACHE_KEY", None)
     monkeypatch.setattr(quotes, "_TW_MIS_OPENING_CACHE", {})
     monkeypatch.setattr(quotes, "_TW_MIS_OPENING_REQUESTED", set())
     monkeypatch.setattr(quotes, "_TW_MIS_OPENING_DIRTY", False)
+    monkeypatch.setattr(quotes, "_TW_MIS_OPENING_REVISION", 0)
     fixed = datetime.now(TAIPEI).replace(hour=9, minute=0, second=0, microsecond=0)
 
     class Clock(datetime):
@@ -78,6 +80,31 @@ def test_every_provider_starts_and_slow_loser_does_not_delay_quorum(owner, tmp_p
         release.set()
 
 
+def test_repeated_full_scope_jobs_retain_independent_coverage_without_duplicate_prices(owner, tmp_path):
+    def provider(names, values, progress):
+        return snapshot([100.] * len(names))
+
+    fetch(owner, tmp_path, list("AB"), {"source": provider})
+    assert owner.wait_idle(timeout_seconds=2)
+    owner.close()
+    second = acquisition.OpeningPriceFanIn()
+    try:
+        fetch(second, tmp_path, list("AB"), {"source": provider}, force_refresh=True)
+        assert second.wait_idle(timeout_seconds=2)
+    finally:
+        second.close()
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat()).with_suffix(".acquisition.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    progress = [row for row in events if row["event"] == "coverage_progress"]
+    assert len(progress) == 2
+    assert len({row["job_id"] for row in progress}) == 2
+    assert all(row["valid_open_count"] == row["resolved_count"] == row["response_count"] == 2 for row in progress)
+    assert all(row["elapsed_ms"] >= 0 and row["measurement_clock"] == "provider_job_perf_counter_v1" for row in progress)
+    # A fresh owner legitimately restates the full raw observations; the
+    # per-request job clock remains distinct even within the same process.
+    assert len([row for row in events if row["event"] == "observations_delta"]) == 2
+
+
 def test_partial_batches_merge_before_either_source_finishes(owner, tmp_path):
     barrier, release = threading.Barrier(2), threading.Event()
 
@@ -103,6 +130,42 @@ def test_partial_batches_merge_before_either_source_finishes(owner, tmp_path):
     assert np.isnan(result.open_prices[-1])
     receipt = json.loads(quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat()).read_text())
     assert receipt["requested_count"] == 10
+
+
+def test_quorum_retains_flush_measurements_in_transport_and_daily_evidence(owner, tmp_path):
+    result = fetch(owner, tmp_path, ["A"], {"source": lambda *a: snapshot([100.])})
+    flush = result.transport_timing["opening_durable_flush"]
+    assert flush["contract"] == "captured_opening_input_revision_durable_flush_v1"
+    # The provider's final barrier may win before the caller's quorum barrier.
+    assert type(flush["receipt_written"]) is bool
+    assert flush["captured_row_count"] == flush["requested_symbol_count"] == 1
+    assert flush["captured_revision"] > 0
+    assert all(flush[name] >= 0 for name in (
+        "total_ms", "writer_queue_ms", "snapshot_capture_ms", "scope_check_ms",
+        "durable_write_ms", "commit_ack_ms",
+    ))
+    assert result.transport_timing["opening_telemetry_recorded"]
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+    merged = [event for event in events if event["provider"] == "merged"]
+    assert len(merged) == 1 and merged[0]["input_flush"] == flush
+    assert owner.wait_idle(timeout_seconds=1)
+
+    # A hot quorum is still checked against its durable revision, but does not
+    # invent a second write or reuse the previous call's write duration.
+    cached = fetch(owner, tmp_path, ["A"], {})
+    hot_flush = cached.transport_timing["opening_durable_flush"]
+    assert cached.transport_timing["opening_cache_ready"]
+    assert not hot_flush["receipt_written"]
+    assert hot_flush["captured_revision"] == flush["captured_revision"]
+    assert hot_flush["captured_row_count"] == 1
+    assert hot_flush["durable_write_ms"] == 0.0
+    owner.close()
+    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+    finished = [event for event in events if event["provider"] == "source" and event["event"] == "finished"]
+    assert len(finished) == 1
+    assert finished[0]["input_flush"]["contract"] == flush["contract"]
+    assert finished[0]["source_and_persistence_ms"] >= finished[0]["last_total_ms"]
 
 
 def test_provider_failure_isolated_and_error_text_never_written(owner, tmp_path):
@@ -512,6 +575,173 @@ def test_failed_source_durability_remains_dirty_and_can_recover(owner, tmp_path,
     assert set(json.loads(path.read_text())["rows"]) == {"A", "B"}
 
 
+def test_source_flush_does_not_hold_the_quote_merge_or_read_lock(owner, tmp_path, monkeypatch):
+    """A slow fsync cannot stall an independent provider's accepted facts."""
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path, persist=False)
+    entered, release = threading.Event(), threading.Event()
+    original = quotes._persist_tw_mis_opening_receipt
+
+    def slow_flush(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(**kwargs)
+
+    monkeypatch.setattr(quotes, "_persist_tw_mis_opening_receipt", slow_flush)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+    timings = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        flushing = pool.submit(quotes.persist_tw_opening_snapshot_cache,
+                               parquet_root=tmp_path, session_date=day, timings=timings)
+        assert entered.wait(2)
+        merge = pool.submit(quotes.seed_tw_opening_snapshot_cache, ["B"], snapshot([101.]),
+                            parquet_root=tmp_path, persist=False)
+        read = pool.submit(quotes.fetch_tw_mis_opening_snapshot, ["A"], np.array([99.]),
+                           parquet_root=tmp_path, allow_network=False)
+        try:
+            assert merge.result(timeout=0.5)["accepted_count"] == 1
+            assert read.result(timeout=0.5).open_prices.tolist() == [100.]
+            assert not flushing.done(), "non-durable input must not release the quorum"
+        finally:
+            release.set()
+        path = flushing.result(timeout=2)
+    # A flush owns a frozen input set. A later merge is dirty, not erased by
+    # the older writer or falsely acknowledged as already durable.
+    assert set(json.loads(path.read_text())["rows"]) == {"A"}
+    assert timings["newer_input_pending"]
+    assert timings["captured_row_count"] == 1
+    assert quotes._TW_MIS_OPENING_DIRTY
+    quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day, timings=timings)
+    assert set(json.loads(path.read_text())["rows"]) == {"A", "B"}
+    assert not timings["newer_input_pending"]
+    assert timings["captured_row_count"] == 2
+    assert not quotes._TW_MIS_OPENING_DIRTY
+
+
+def test_source_flushes_serialize_without_losing_later_facts(owner, tmp_path, monkeypatch):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path, persist=False)
+    entered, release, merged = threading.Event(), threading.Event(), threading.Event()
+    original = quotes._persist_tw_mis_opening_receipt
+    writes, in_writer = [], []
+
+    def writer(**kwargs):
+        assert not in_writer
+        in_writer.append(True)
+        try:
+            writes.append(set(kwargs["rows"]))
+            if len(writes) == 1:
+                entered.set()
+                assert release.wait(5)
+            return original(**kwargs)
+        finally:
+            in_writer.pop()
+
+    monkeypatch.setattr(quotes, "_persist_tw_mis_opening_receipt", writer)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+
+    def later_provider():
+        quotes.seed_tw_opening_snapshot_cache(["B"], snapshot([101.]),
+                                             parquet_root=tmp_path, persist=False)
+        merged.set()
+        return quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(quotes.persist_tw_opening_snapshot_cache,
+                            parquet_root=tmp_path, session_date=day)
+        assert entered.wait(2)
+        second = pool.submit(later_provider)
+        try:
+            assert merged.wait(0.5)
+            assert not second.done()
+        finally:
+            release.set()
+        first.result(timeout=2)
+        path = second.result(timeout=2)
+    assert writes == [{"A"}, {"A", "B"}]
+    assert set(json.loads(path.read_text())["rows"]) == {"A", "B"}
+    assert not quotes._TW_MIS_OPENING_DIRTY
+
+
+@pytest.mark.parametrize("return_to_original_root", [False, True])
+def test_source_flush_rejects_replaced_cache_generation(owner, tmp_path, monkeypatch, return_to_original_root):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path, persist=False)
+    entered, release = threading.Event(), threading.Event()
+    original = quotes._persist_tw_mis_opening_receipt
+
+    def slow_flush(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(**kwargs)
+
+    monkeypatch.setattr(quotes, "_persist_tw_mis_opening_receipt", slow_flush)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        flushing = pool.submit(quotes.persist_tw_opening_snapshot_cache,
+                               parquet_root=tmp_path, session_date=day)
+        assert entered.wait(2)
+        def replace_generation():
+            result = quotes.seed_tw_opening_snapshot_cache(["B"], snapshot([101.]),
+                parquet_root=tmp_path / "different-root", persist=False)
+            if return_to_original_root:
+                result = quotes.seed_tw_opening_snapshot_cache(["C"], snapshot([102.]),
+                    parquet_root=tmp_path, persist=False)
+            return result
+
+        replacement = pool.submit(replace_generation)
+        try:
+            assert replacement.result(timeout=0.5)["accepted_count"] == 1
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match="generation changed"):
+            flushing.result(timeout=2)
+    assert quotes._TW_MIS_OPENING_DIRTY
+    root = tmp_path if return_to_original_root else tmp_path / "different-root"
+    path = quotes.persist_tw_opening_snapshot_cache(parquet_root=root, session_date=day)
+    receipt = json.loads(path.read_text())
+    assert receipt["parquet_root"] == str(root.resolve())
+    assert set(receipt["rows"]) == ({"C"} if return_to_original_root else {"B"})
+
+
+def test_source_flush_failure_keeps_concurrent_facts_and_retries(owner, tmp_path, monkeypatch):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path, persist=False)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+    timings = {}
+
+    def failing_writer(**kwargs):
+        quotes.seed_tw_opening_snapshot_cache(["B"], snapshot([101.]), parquet_root=tmp_path, persist=False)
+        raise OSError("injected durable flush failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(quotes, "_persist_tw_mis_opening_receipt", failing_writer)
+        with pytest.raises(OSError, match="flush failure"):
+            quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day, timings=timings)
+    assert timings == {}, "failed storage must not emit a successful flush measurement"
+    assert quotes._TW_MIS_OPENING_DIRTY
+    path = quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day)
+    assert set(json.loads(path.read_text())["rows"]) == {"A", "B"}
+    assert not quotes._TW_MIS_OPENING_DIRTY
+
+
+def test_source_flush_does_not_release_yesterdays_quorum_after_midnight(owner, tmp_path, monkeypatch):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path, persist=False)
+    now = acquisition.datetime.now(TAIPEI)
+    original = quotes._persist_tw_mis_opening_receipt
+
+    class NextDay(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (now + timedelta(days=1)).astimezone(tz)
+
+    def writer(**kwargs):
+        result = original(**kwargs)
+        monkeypatch.setattr(quotes, "datetime", NextDay)
+        return result
+
+    monkeypatch.setattr(quotes, "_persist_tw_mis_opening_receipt", writer)
+    with pytest.raises(RuntimeError, match="generation changed"):
+        quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=now.date().isoformat())
+    assert quotes._TW_MIS_OPENING_DIRTY
+
+
 def test_float64_fast_conversion_matches_text_contract_bit_for_bit():
     values = np.random.default_rng(726).lognormal(0., 100., 1000)
     values = np.r_[values, np.nextafter(0., 1.), np.finfo(np.float64).max, 100.12345678901235]
@@ -576,9 +806,36 @@ def test_fugle_adapter_validates_date_market_and_microsecond_clock(owner, monkey
     result = acquisition.fugle_market_provider("TSE")(["A"], np.array([99.0]), lambda *a: None)
     assert result.open_prices.tolist() == [100.0]
     assert result.exchange_timestamps_ms.tolist() == [int(now.timestamp() * 1000)]
+    assert result.transport_timing["row_validation_projection_ms"] >= 0
+    assert result.transport_timing["http_headers_ms"] >= 0
     payload["date"] = (now - timedelta(days=1)).date().isoformat()
     with pytest.raises(ValueError, match="date/market"):
         acquisition.fugle_market_provider("TSE")(["A"], np.array([99.0]), lambda *a: None)
+
+
+def test_fugle_permission_failure_is_closed_timed_and_does_not_block_other_sources(owner, tmp_path, monkeypatch):
+    closed = []
+    def denied():
+        raise acquisition.requests.HTTPError("private-error-must-not-be-persisted", response=response)
+    response = SimpleNamespace(status_code=403, raise_for_status=denied, close=lambda: closed.append(True))
+    def request(_url, **kwargs):
+        assert kwargs["params"] == {"type": "ALLBUT0999"}
+        return response
+    monkeypatch.setenv("FUGLE_API_KEY", "private-test-token")
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=request))
+    result = fetch(owner, tmp_path, ["A"], {
+        "fugle_tse": acquisition.fugle_market_provider("TSE"),
+        "healthy": lambda *args: snapshot([100.]),
+    })
+    assert result.transport_timing["opening_quorum_ready"] and owner.wait_idle(timeout_seconds=2)
+    assert closed == [True]
+    key = (str(tmp_path.resolve()), acquisition.datetime.now(TAIPEI).date().isoformat())
+    status = owner._sessions[key].metrics["fugle_tse"]
+    assert status["http_status"] == 403 and status["retry_delay_seconds"] == 60.
+    failure = status["last_completed_job"]["transport_timing"]
+    assert failure["http_failure_phase"] == "http_status" and failure["http_request_to_failure_ms"] >= 0
+    journal = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat()).with_suffix(".acquisition.jsonl").read_text()
+    assert "private-test-token" not in journal and "private-error-must-not-be-persisted" not in journal
 
 
 def test_shioaji_wall_clock_is_localized_not_shifted(owner):
@@ -726,6 +983,321 @@ def test_optional_provider_retry_obeys_its_published_cadence(owner, tmp_path):
     fetch(owner, tmp_path, ["A"], providers, resolve_no_prints=False)
     fetch(owner, tmp_path, ["A"], providers, resolve_no_prints=False, force_refresh=True)
     assert calls == [1]
+
+
+@pytest.mark.parametrize("second,expected", [(0, 1.), (10, 1.), (11, 10.), (30, 10.)])
+def test_finmind_short_poll_is_bounded_to_the_opening_deadline(second, expected):
+    observed = datetime(2026, 10, 16, 9, 0, second, tzinfo=TAIPEI)
+    assert acquisition._snapshot_poll_interval("finmind_snapshot", observed) == expected
+    assert acquisition._snapshot_poll_interval("shioaji", observed) is None
+
+
+def test_finmind_retries_inside_one_wait_without_waiting_for_slow_provider(owner, tmp_path, monkeypatch):
+    release, retried = threading.Event(), threading.Event()
+    calls = []
+    monkeypatch.setattr(acquisition, "_snapshot_poll_interval", lambda name, now: .03 if name.startswith("finmind") else None)
+
+    def finmind(symbols, fallback, progress):
+        calls.append(time.monotonic())
+        result = snapshot([100. if len(calls) > 1 else np.nan] * len(symbols))
+        result.transport_timing = {"response_schema_valid": True}
+        if len(calls) > 1:
+            retried.set()
+        return result
+
+    def slow(*args):
+        assert release.wait(2)
+        raise ConnectionError("loser does not own FinMind's retry clock")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(fetch, owner, tmp_path, ["A", "B"],
+                {"finmind_snapshot": finmind, "slow": slow}, poll_opening_snapshots=True)
+            assert retried.wait(1)
+            result = future.result(timeout=1)
+            assert not release.is_set()
+            assert result.transport_timing["opening_snapshot_poll_owner"] == "bounded_shared_fan_in"
+            assert quotes.tw_session_open_observed_mask(result).all()
+            assert len(calls) == 2 and calls[1] - calls[0] >= .025
+    finally:
+        release.set()
+
+
+def test_finmind_one_wait_retries_only_unknown_and_stops_at_quorum(owner, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(acquisition, "_snapshot_poll_interval", lambda *a: .01)
+
+    def provider(symbols, fallback, progress):
+        calls.append(symbols)
+        result = snapshot([100., np.nan] if len(calls) == 1 else [101.])
+        result.transport_timing = {"response_schema_valid": True}
+        return result
+
+    result = fetch(owner, tmp_path, ["A", "B"], {"finmind_snapshot": provider},
+        minimum_coverage=1., poll_opening_snapshots=True)
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [["A", "B"], ["B"]]
+    np.testing.assert_array_equal(result.open_prices, [100., 101.])
+
+
+@pytest.mark.parametrize("failure", ["quota", "permission"])
+def test_finmind_inside_wait_never_shortens_error_backoff(owner, tmp_path, monkeypatch, failure):
+    calls = []
+    monkeypatch.setattr(acquisition, "_snapshot_poll_interval", lambda *a: .001)
+
+    def provider(*args):
+        calls.append(1)
+        if failure == "permission":
+            raise PermissionError("private credential")
+        import requests
+        raise requests.HTTPError(response=SimpleNamespace(status_code=429))
+
+    result = fetch(owner, tmp_path, ["A"], {"finmind_snapshot": provider},
+        poll_opening_snapshots=True, timeout_seconds=.04)
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [1]
+    assert not result.transport_timing["opening_quorum_ready"]
+    assert next(iter(owner._sessions.values())).metrics["finmind_snapshot"]["retry_delay_seconds"] == 60.
+
+
+def test_finmind_inside_wait_is_bounded_and_closed_owner_wakes(owner, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(acquisition, "_snapshot_poll_interval", lambda *a: .03)
+
+    def provider(*args):
+        calls.append(1)
+        result = snapshot([np.nan])
+        result.transport_timing = {"response_schema_valid": True}
+        return result
+
+    result = fetch(owner, tmp_path, ["A"], {"finmind_snapshot": provider},
+        poll_opening_snapshots=True, timeout_seconds=.08)
+    assert not result.transport_timing["opening_quorum_ready"]
+    assert 1 <= len(calls) <= 3
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fetch, owner, tmp_path, ["B"], {"finmind_snapshot": provider},
+            poll_opening_snapshots=True)
+        time.sleep(.01)
+        owner.close()
+        with pytest.raises(RuntimeError, match="superseded|closed"):
+            future.result(timeout=1)
+
+
+def test_finmind_valid_old_snapshot_uses_start_clock_not_failure_backoff(owner, tmp_path, monkeypatch):
+    clock, calls = [100.], []
+    monkeypatch.setattr(acquisition, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], perf_counter=time.perf_counter))
+
+    def provider(symbols, fallback, progress):
+        calls.append(clock[0])
+        clock[0] += .8  # Transfer/decode time is inside the start cadence.
+        result = snapshot([np.nan] * len(symbols))
+        result.available_mask[:] = False
+        result.available_count = 0
+        result.transport_timing = {"response_schema_valid": True}
+        return result
+
+    providers = {"finmind_snapshot": provider}
+    fetch(owner, tmp_path, ["A"], providers, resolve_no_prints=False)
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["finmind_snapshot"]
+    assert metric["consecutive_source_failures"] == 0
+    assert metric["consecutive_source_no_progress"] == 1
+    assert metric["retry_after_monotonic"] == 101.
+    assert metric["last_completed_job"]["poll_clock_basis"] == "request_start_not_completion"
+    clock[0] = 100.99
+    fetch(owner, tmp_path, ["A"], providers, resolve_no_prints=False)
+    assert len(calls) == 1
+    clock[0] = 101.
+    fetch(owner, tmp_path, ["A"], providers, resolve_no_prints=False)
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [100., 101.]
+    assert metric["consecutive_source_failures"] == 0
+
+
+def test_finmind_disjoint_model_delta_cannot_start_another_full_market_request(owner, tmp_path):
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def provider(symbols, fallback, progress):
+        calls.append(tuple(symbols))
+        started.set()
+        assert release.wait(timeout=3)
+        return snapshot([100.] * len(symbols))
+
+    providers = {"finmind_snapshot": provider}
+    try:
+        fetch(owner, tmp_path, ["A"], providers, timeout_seconds=.01)
+        assert started.wait(timeout=1)
+        # B is not in A's per-symbol in-flight set. The endpoint still must
+        # remain single-flight because data_id="" fetches the whole market.
+        fetch(owner, tmp_path, ["B"], providers, timeout_seconds=.01)
+        assert calls == [("A",)]
+    finally:
+        release.set()
+    assert owner.wait_idle(timeout_seconds=1)
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 429])
+def test_finmind_short_poll_never_overrides_permission_or_quota_backoff(owner, tmp_path, monkeypatch, status):
+    monkeypatch.setenv("FINMIND_TOKEN", "private-test-token")
+    calls = []
+
+    def get(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": status})
+
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=get))
+    providers = {"finmind_snapshot": acquisition.fetch_finmind_opening_prices}
+    fetch(owner, tmp_path, ["A"], providers)
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["finmind_snapshot"]
+    assert metric["retry_delay_seconds"] == 60.
+    fetch(owner, tmp_path, ["B"], providers)
+    assert calls == [1]
+
+
+def test_finmind_diagnostics_explain_old_rows_without_publishing_old_prices(owner, monkeypatch):
+    now = acquisition.datetime.now(TAIPEI)
+    rows = [
+        {"stock_id": "A", "date": now.isoformat(), "open": 100, "total_volume": 1},
+        {"stock_id": "B", "date": (now - timedelta(days=1)).isoformat(), "open": 100, "total_volume": 1},
+        {"stock_id": "C", "date": now.isoformat(), "open": 100, "total_volume": 0},
+        {"stock_id": "D", "date": now.isoformat(), "open": 100, "total_volume": float("nan")},
+        {"stock_id": "E", "date": now.isoformat(), "open": 0, "total_volume": 1},
+        {"stock_id": "F", "date": now.isoformat(), "open": 100, "total_volume": 1, "isTrial": True},
+        {"stock_id": "G", "date": (now + timedelta(seconds=5)).isoformat(), "open": 100, "total_volume": 1},
+        {"stock_id": "H", "date": "malformed", "open": 100, "total_volume": 1},
+        {"stock_id": "outside-request", "date": now.isoformat(), "open": 100, "total_volume": 1},
+    ]
+    monkeypatch.setenv("FINMIND_TOKEN", "private-test-token")
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=lambda *a, **k:
+        SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": 200, "data": rows})))
+    result = acquisition.fetch_finmind_opening_prices(list("ABCDEFGH"), np.full(8, 99.), lambda *a: None)
+    assert quotes.tw_session_open_observed_mask(result).tolist() == [True] + [False] * 7
+    assert result.transport_timing["provider_row_quality"] == {
+        "requested_rows": 8, "malformed_rows": 1, "trial_rows": 1,
+        "no_positive_volume_rows": 2, "invalid_open_rows": 1,
+        "other_session_rows": 1, "future_timestamp_rows": 1, "accepted_rows": 1}
+    full = result.transport_timing["provider_snapshot_coverage"]
+    assert full["valid_open_symbols"] == ["A", "outside-request"]
+    assert full["rejected_symbols"]["other_session_rows"] == ["B"]
+
+
+def test_finmind_full_view_and_connection_follow_owner_not_pool_thread(owner, monkeypatch):
+    now = acquisition.datetime.now(TAIPEI)
+    payload = {"status": 200, "data": [{"stock_id": symbol, "date": now.isoformat(),
+        "open": 100 + i, "total_volume": 1} for i, symbol in enumerate("AB")]}
+    calls, sessions, closed = [], [], []
+    body = json.dumps(payload).encode()
+
+    def make_session():
+        sessions.append(threading.get_ident())
+        def get(*args, **kwargs):
+            assert kwargs["stream"] is True
+            calls.append(threading.get_ident())
+            return SimpleNamespace(content=body, raise_for_status=lambda: None,
+                json=lambda: pytest.fail("real body must use the shared fast decoder"),
+                close=lambda: closed.append(1))
+        return SimpleNamespace(get=get)
+
+    monkeypatch.setenv("FINMIND_TOKEN", "private-test-token")
+    monkeypatch.setattr(acquisition, "_http_session", make_session)
+    first = acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        second = pool.submit(acquisition.fetch_finmind_opening_prices,
+            ["B"], np.array([99.]), lambda *a: None).result(timeout=1)
+        third = pool.submit(acquisition.fetch_finmind_opening_prices,
+            ["A", "B"], np.full(2, 99.), lambda *a: None, force_network=True).result(timeout=1)
+    assert len(calls) == len(closed) == 2 and len(sessions) == 1
+    assert calls[0] != calls[1]
+    assert not first.transport_timing["provider_response_reused"]
+    assert second.transport_timing["provider_response_reused"]
+    assert not third.transport_timing["provider_response_reused"]
+    assert first.transport_timing["provider_snapshot_coverage"]["snapshot_id"] == second.transport_timing["provider_snapshot_coverage"]["snapshot_id"]
+    assert first.timestamps_ms[0] == second.timestamps_ms[0]
+    np.testing.assert_array_equal(third.open_prices, [100., 101.])
+
+
+def test_finmind_token_and_open_gate_invalidate_view_not_the_connection(owner, monkeypatch):
+    clock = [acquisition.datetime.now(TAIPEI).replace(hour=8, minute=59, second=59)]
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+    calls, sessions = [], []
+    def make_session():
+        sessions.append(1)
+        def get(*args, **kwargs):
+            calls.append(kwargs["headers"]["Authorization"])
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": 200,
+                "data": [{"stock_id": "A", "date": clock[0].isoformat(), "open": 100, "total_volume": 1}]})
+        return SimpleNamespace(get=get)
+    monkeypatch.setattr(acquisition, "datetime", Clock)
+    monkeypatch.setattr(acquisition, "_http_session", make_session)
+    monkeypatch.setenv("FINMIND_TOKEN", "one")
+    before = acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None)
+    clock[0] = clock[0].replace(hour=9, minute=0, second=0)
+    after = acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None)
+    monkeypatch.setenv("FINMIND_TOKEN", "two")
+    rotated = acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None)
+    assert calls == ["Bearer one", "Bearer one", "Bearer two"] and sessions == [1]
+    assert before.available_count == 0 and after.available_count == rotated.available_count == 1
+    assert not rotated.transport_timing["provider_response_reused"]
+
+
+def test_finmind_cooldown_cannot_be_bypassed_by_other_consumers_or_force(owner, monkeypatch):
+    calls = []
+    def get(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": 429})
+    monkeypatch.setenv("FINMIND_TOKEN", "private-test-token")
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=get))
+    for force in (False, False, True):
+        with pytest.raises(PermissionError):
+            acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None, force_network=force)
+    assert calls == [1]
+
+
+def test_full_provider_snapshot_is_journalled_once_but_each_axis_is_projected(owner, tmp_path, monkeypatch):
+    now = acquisition.datetime.now(TAIPEI)
+    monkeypatch.setenv("FINMIND_TOKEN", "private-test-token")
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=lambda *a, **k:
+        SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": 200, "data": [
+            {"stock_id": symbol, "date": now.isoformat(), "open": 100, "total_volume": 1} for symbol in "AB"]})))
+    providers = {"finmind_snapshot": acquisition.fetch_finmind_opening_prices}
+    assert fetch(owner, tmp_path, ["A"], providers).available_count == 1
+    assert owner.wait_idle(timeout_seconds=1)
+    # Exercise a disjoint consumer after the owner cadence; the HTTP view is
+    # still fresh and no prices are copied from A to B.
+    session = next(iter(owner._sessions.values()))
+    session.metrics["finmind_snapshot"].pop("retry_after_monotonic", None)
+    assert fetch(owner, tmp_path, ["B"], providers).available_count == 1
+    assert owner.wait_idle(timeout_seconds=1)
+    journal = quotes._tw_mis_opening_receipt_path(now.date().isoformat()).with_suffix(".acquisition.jsonl")
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    snapshots = [row for row in events if row["event"] == "provider_snapshot"]
+    assert len(snapshots) == 1 and snapshots[0]["coverage"]["valid_open_symbols"] == ["A", "B"]
+    assert snapshots[0]["owner_pid"] == os.getpid()
+    assert all("provider_snapshot_coverage" not in row.get("transport_timing", {})
+               for row in events if row["event"] == "finished")
+
+
+@pytest.mark.parametrize("override,workers", [(None, 4), ("16", 16)])
+def test_mis_measured_default_is_source_local_and_never_shrinks_the_axis(owner, tmp_path, monkeypatch, override, workers):
+    if override is None:
+        monkeypatch.delenv("STOCKAGENT_TW_OPENING_PARALLEL_REQUESTS", raising=False)
+    else:
+        monkeypatch.setenv("STOCKAGENT_TW_OPENING_PARALLEL_REQUESTS", override)
+    calls = []
+    def mis(symbols, fallback, **kwargs):
+        calls.append((symbols, kwargs))
+        return snapshot([100.] * len(symbols))
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", mis)
+    result = acquisition.configured_opening_providers(tmp_path)["official_mis"](list("AB"), np.full(2, 99.), lambda *a: None)
+    assert result.requested_count == 2 and calls[0][0] == list("AB")
+    assert calls[0][1]["max_parallel_requests"] == workers
+    assert calls[0][1]["empty_chunk_retry_attempts"] == 0
 
 
 def test_native_partial_callback_precedes_last_batch_and_releases_stock_lock(owner, monkeypatch):

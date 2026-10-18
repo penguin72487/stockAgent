@@ -28,7 +28,7 @@ from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_metrics import (
     CNYES_NATIVE_BODY_FAILURE_OBSERVATION_CONTRACT_VERSION, CNYES_NATIVE_BODY_FAILURE_STAGES,
 )
-from downloader.news_fulltext_policy import NewsError, normalize_url
+from downloader.news_fulltext_policy import ETTODAY_LAYOUT_VERSIONS, NewsError, normalize_url
 from downloader.news_fulltext_failure_focus import RECEIPT_CONTRACT_VERSION as FOCUS_RECEIPT_CONTRACT_VERSION
 from downloader.news_fulltext_failure_focus import METADATA_UPGRADE_RECEIPT_CONTRACT_VERSION
 
@@ -59,7 +59,7 @@ HOURLY_EVIDENCE_PROVIDERS = frozenset({'cnyes', 'globalvoices', 'taiwanhot'})
 IDENTITY_METADATA_CONTRACT_VERSION = 1
 VALIDATION_METADATA_CODES = frozenset({
     'invalid_bulk_publication_clock', 'article_attribution_not_verified',
-    'article_rights_or_scope_excluded',
+    'article_rights_or_scope_excluded', 'article_license_not_verified',
 })
 
 
@@ -87,11 +87,62 @@ def _public_taiwanhot_scope(context, source):
         return False
 
 
+def article_license_validation_metadata(soup, source):
+    """Article-scoped license facts, never footer substitution or a grant.
+
+    Inspect the already received HTML. URLs omit credentials/query/fragments;
+    unknown labels remain length/hash only. A visible reserved-rights label is
+    evidence of that declaration, not a legal conclusion about every use.
+    """
+    prefix = source.required_license_url_prefix
+
+    def link(node):
+        value = str(node.get('href', ''))
+        try:
+            parts = urlsplit(value)
+            display = (_display_url(value)[:512] if parts.scheme in {'http', 'https'}
+                       and parts.netloc and not parts.username and not parts.password else None)
+        except ValueError:
+            display = None
+        return {'display_url': display, 'original_value_sha256': hashlib.sha256(value.encode()).hexdigest(),
+            'matches_current_required_prefix': bool(prefix and value.startswith(prefix))}
+
+    selections = []
+    for selector in source.license_selectors[:16]:
+        nodes = soup.select(selector)
+        selections.append({'selector': selector, 'node_count': len(nodes),
+            'values': [link(n) for n in nodes[:16]], 'truncated': len(nodes) > 16})
+    facts = {'contract_version': 1, 'configured_article_license_selections': selections,
+        'selector_list_truncated': len(source.license_selectors) > 16,
+        'body_text_retained': False, 'raw_response_retained': False,
+        'license_or_article_acceptance_granted': False, 'additional_requests': 0}
+    if source.provider == 'peopo':
+        # This is the current configured article's logo, not the site footer
+        # or a broad "creativecommons" search. Missing anchors need the marker
+        # shape too, otherwise a reserved label and obsolete CSS look identical.
+        logos = soup.select('#block-peopo-content article.node--view-mode-full > '
+            '.node-pre-content .view-node-field .license-logo')
+        known_labels = {'版權所有', '保留所有權利', '創用CC', 'Creative Commons'}
+
+        def label(value):
+            value = value.strip()
+            return {'recognized_public_label': value if value in known_labels else None,
+                'characters': len(value), 'sha256': hashlib.sha256(value.encode()).hexdigest()}
+
+        facts['peopo_current_article_scope_count'] = len(soup.select('#block-peopo-content article.node--view-mode-full'))
+        facts['peopo_current_article_logo_count'] = len(logos)
+        facts['peopo_current_article_logos'] = [dict(label(n.get_text(' ', strip=True)),
+            anchor_count=len(n.select('a[href]')), image_count=len(n.find_all('img')),
+            image_labels=[label(str(img.get('alt', ''))) for img in n.find_all('img')[:8]]) for n in logos[:8]]
+        facts['peopo_current_article_logos_truncated'] = len(logos) > 8
+    return facts
+
+
 def retain_identity_metadata(queue, row, error, context):
     """Bounded metadata-only witnesses, never a raw body or new request.
 
     Keep the original two identity witnesses/provider/UTC day unchanged.
-    Three static validation outcomes have two witnesses each; they never
+    Four static validation outcomes have two witnesses each; they never
     refill identity/body/raw budgets, including on restart/parser upgrades.
     Reserve before DOM/I/O; no worker write, request, raw body, body permission,
     retry change, acceptance or per-URL/parser reset. Failed writes stay charged.
@@ -147,12 +198,14 @@ def retain_identity_metadata(queue, row, error, context):
                  'title_sha256': [hashlib.sha256(n.get_text(' ', strip=True).encode()).hexdigest() for n in titles[:16]],
                  'configured_containers': [{'selector': selector, 'nodes': len(soup.select(selector))}
                                            for selector in source.selectors[:16]]}
+        if error.code == 'article_license_not_verified':
+            facts['native_article_license_validation'] = article_license_validation_metadata(soup, source)
         if provider == 'taiwanhot':
             from downloader.news_fulltext_public_originals import taiwanhot_request_ids
             facts['requested_admission_candidates'] = sorted(taiwanhot_request_ids(row['url']))
             facts['response_admission_candidates'] = sorted(taiwanhot_request_ids(context.response.url))
             facts['candidates_are_not_verified_article_ids'] = True
-        if provider == 'ftnn' and source.embedded_article_layout == 'ftnn_visible_article_v1':
+        if provider == 'ftnn' and source.embedded_article_layout in {'ftnn_visible_article_v1', 'ftnn_visible_article_v2', 'ftnn_visible_article_v3', 'ftnn_visible_article_v4', 'ftnn_visible_article_v5', 'ftnn_visible_article_v6'}:
             # Body/parser failures must be diagnosable without another fetch
             # or retaining an unproved raw body. Compare bounded source facts;
             # no headline/byline, cookie, query, script or body text is exported.
@@ -178,7 +231,17 @@ def retain_identity_metadata(queue, row, error, context):
             else:
                 schema_error = True
             scoped_heads = soup.select('.news-page-all > .news-show > .news-page-top > .news-main-title > h1')
-            bylines = soup.select('.news-page-all > .news-show > .news-box > .news-body > p:first-child')
+            native_version = int(source.embedded_article_layout.rsplit('_v', 1)[1])
+            native_v2 = native_version >= 2
+            bylines = soup.select('.news-page-all > .news-show > .news-box > .news-body > p:'
+                                  + ('first-of-type' if native_v2 else 'first-child'))
+            if native_version >= 3:
+                from downloader.news_fulltext_ftnn import _native_byline
+                bodies = soup.select('.news-page-all > .news-show > .news-box > .news-body')
+                try:
+                    bylines = [_native_byline(bodies[0], adapter_contract_version=native_version)] if len(bodies) == 1 else []
+                except NewsError:
+                    bylines = []
             releases = soup.select('.news-page-all > .news-show > .news-page-top > .news-detail-text > .ndt-left > p')
             news = schemas[0] if len(schemas) == 1 and not schema_error else {}
             author = news.get('author')
@@ -200,7 +263,7 @@ def retain_identity_metadata(queue, row, error, context):
             last_item = last_crumb.get('item') if isinstance(last_crumb, dict) else None
             ogtitles = soup.select('meta[property="og:title"][content]')
             facts['ftnn_native_validation'] = {
-                'contract_version': 2, 'schema_error': schema_error,
+                'contract_version': native_version + 1, 'schema_error': schema_error,
                 'article_schema_count': len(schemas), 'breadcrumb_schema_count': len(crumbs),
                 'scoped_heading_count': len(scoped_heads),
                 'heading_compact_sha256': [compact_hash(n.get_text(' ', strip=True)) for n in scoped_heads[:16]],
@@ -212,7 +275,9 @@ def retain_identity_metadata(queue, row, error, context):
                 'byline_count': len(bylines), 'byline_compact_sha256': compact_hash(credit),
                 'declared_author_in_visible_byline': bool(isinstance(author_name, str)
                     and author_name.strip() and re.sub(r'\s+', '', author_name) in re.sub(r'\s+', '', credit)),
-                'native_reporter_byline_shape': bool(re.fullmatch(r'(?:FTNN新聞網)?記者[^／\s]+／[^／\s]{1,16}報導', re.sub(r'\s+', '', credit))),
+                'native_reporter_byline_shape': bool(re.fullmatch(r'(?:FTNN新聞網)?'
+                    + (r'(?:實習)?記者' if native_v2 else '記者')
+                    + r'[^／\s]+／[^／\s]{1,16}報導', re.sub(r'\s+', '', credit))),
                 'release_node_count': len(releases),
                 'visible_release': release if re.fullmatch(r'發布時間：[0-9]{4}/[0-9]{1,2}/[0-9]{1,2} [0-9]{1,2}:[0-9]{1,2}', release) else None,
                 'native_clock_labels': clock_labels, 'clock_labels_truncated': len(releases) > 4,
@@ -220,12 +285,15 @@ def retain_identity_metadata(queue, row, error, context):
                 'declared_modification': safe_clock(news.get('dateModified')),
                 'body_text_retained': False,
             }
-        if provider == 'tvbs' and source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
+        if provider == 'tvbs' and source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2', 'tvbs_visible_article_v3', 'tvbs_visible_article_v4'}:
             from downloader.news_fulltext_tvbs import tvbs_validation_metadata
-            facts['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=context.response.url)
-        if provider == 'ettoday' and source.embedded_article_layout in {'ettoday_visible_article_v1', 'ettoday_visible_article_v2'}:
+            facts['tvbs_native_validation'] = tvbs_validation_metadata(soup, page_url=context.response.url,
+                adapter_contract_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]))
+        if provider == 'ettoday' and source.embedded_article_layout in ETTODAY_LAYOUT_VERSIONS:
             from downloader.news_fulltext_ettoday import ettoday_validation_metadata
-            facts['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=context.response.url)
+            facts['ettoday_native_validation'] = ettoday_validation_metadata(soup, page_url=context.response.url,
+                adapter_contract_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]),
+                allow_house='house.ettoday.net' in source.reviewed_article_subsites)
         stamp = clock.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + uuid.uuid4().hex[:8]
         target = queue.root / 'identity_metadata' / day / provider / (stamp + '.json')
         value = {'contract_version': IDENTITY_METADATA_CONTRACT_VERSION, 'provider': provider,

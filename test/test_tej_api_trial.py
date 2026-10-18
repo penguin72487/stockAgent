@@ -226,6 +226,27 @@ def test_full_budget_has_no_hourly_api_calls(tmp_path):
     assert len(api.transport.calls) == before
 
 
+@pytest.mark.parametrize('gate',['quota','cooldown','auth'])
+def test_unavailable_api_skips_global_ranking_but_preserves_received_page_recovery(tmp_path,monkeypatch,gate):
+    api=client(tmp_path,HttpResponse(403,b'PRIVATE BODY',{},1))
+    if gate=='quota':
+        for _ in range(5):api._claim(10_000)
+    elif gate=='cooldown':
+        with closing(connect(api.root)) as con,con:
+            con.execute("INSERT OR REPLACE INTO meta VALUES('provider_cooldown_until',?)",
+                        ((NOW+timedelta(seconds=60)).isoformat(),))
+    recovered=[]
+    monkeypatch.setattr(api,'recover_saved_pages',lambda:recovered.append(True))
+    def unexpected_refresh(*args,**kwargs):
+        pytest.fail('No acquisition eligibility: do not scan or rerank other providers')
+    monkeypatch.setattr('downloader.tej_value_priority.refresh_if_due',unexpected_refresh)
+    before=len(api.transport.calls)
+    result=run_queue(api)
+    assert result['reason']=={'quota':'waiting_quota','cooldown':'provider_cooldown','auth':'access_denied'}[gate]
+    assert result['pages_received_this_run']==0 and recovered==[True]
+    assert len(api.transport.calls)==before+(gate=='auth')
+
+
 def test_retry_after_is_durable_and_suppresses_other_requests(tmp_path):
     api = client(tmp_path, HttpResponse(429, b'{}', {'Retry-After': '60'}, 1))
     with pytest.raises(TejAPIError, match='waiting_quota'):

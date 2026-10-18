@@ -30,6 +30,16 @@ CNYES_NATIVE_BODY_FAILURE_STAGES = frozenset({
     'schema_mismatch_without_verified_figure_view', 'schema_comparison_mismatch',
     'table_grid_mismatch',
 })
+ETTODAY_ATTRIBUTION_FAILURE_OBSERVATION_CONTRACT_VERSION = 1
+ETTODAY_ATTRIBUTION_FAILURE_STAGES = frozenset({
+    'bare_reporter_creator_mismatch', 'image_credit_structure',
+    'image_caption_structure', 'image_caption_ambiguous_credit',
+    'image_credit_missing_following_prose', 'caption_credit_structure',
+    'caption_credit_boundaries', 'caption_credit_reporter',
+    'caption_credit_duplicate_reporters', 'caption_credit_missing_following_prose',
+    'newsroom_credit_markup', 'duplicate_or_late_credit', 'duplicate_reporters',
+    'late_caption_credit', 'unrecognized_precredit_paragraph', 'missing_visible_credit',
+})
 TRANSPORT_PHASES = frozenset({'awaiting_headers', 'response_policy', 'reading_body', 'assembling_body', 'complete'})
 
 
@@ -260,6 +270,7 @@ class NewsMetrics:
         return {"version": 1, "owner_id": self.owner_id, "cnyes_bulk_page_classification_version": 2,
                 "html_selector_candidate_contract_version": HTML_SELECTOR_CANDIDATE_CONTRACT_VERSION,
                 "cnyes_native_body_failure_observation_contract_version": CNYES_NATIVE_BODY_FAILURE_OBSERVATION_CONTRACT_VERSION,
+                "ettoday_attribution_failure_observation_contract_version": ETTODAY_ATTRIBUTION_FAILURE_OBSERVATION_CONTRACT_VERSION,
                 "snapshot_clock_contract_version": METRICS_SNAPSHOT_CLOCK_CONTRACT_VERSION,
                 "snapshot_at_utc": snapshot_at,
                 "http_terminal_observation_contract_version": 1,

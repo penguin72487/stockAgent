@@ -864,10 +864,17 @@ def _build_configs(
         # Fixed controls are applied last so no discrete variant can silently
         # change a contract that the matrix declares invariant.
         raw = _deep_merge(raw, fixed_overrides)
-        raw["experiment_name"] = f"{base_raw.get('experiment_name', base_path.stem)}-ablation-{name}"
+        config_path = generated_root / f"{name}.yaml"
+        base_name = base_raw.get("experiment_name", base_path.stem)
+        # A one-case continuation can use its own generated config as the
+        # base. Retain that existing identity on preparation/retry instead of
+        # appending another suffix and invalidating the capacity resume SHA.
+        raw["experiment_name"] = (
+            base_name if base_path.resolve() == config_path.resolve()
+            else f"{base_name}-ablation-{name}"
+        )
         raw.setdefault("runner", {})
         raw["runner"]["output_dir"] = str(run_dir)
-        config_path = generated_root / f"{name}.yaml"
         with config_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(raw, handle, sort_keys=False, allow_unicode=True)
         # Validate every effective config before launching the first expensive run.

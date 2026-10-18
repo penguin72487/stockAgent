@@ -160,9 +160,9 @@ def validate_spec(spec: dict) -> dict:
 def checkpoint_summary(path: Path, spec: dict) -> dict:
     # This executes in the SELECTED training runtime, always on CPU. A newer
     # control checkout never rewrites a frozen trainer's compatibility schema.
-    import torch
+    from stockagent.training.runtime import load_checkpoint
     before = signature(path)
-    saved = torch.load(path, map_location="cpu", weights_only=True)
+    saved = load_checkpoint(path)
     if not isinstance(saved, dict) or not RESUME_FIELDS <= set(saved):
         raise ValueError("weights-only/best checkpoint is not an optimizer recovery point")
     if (not saved["model_state_dict"] or not saved["optimizer_state_dict"].get("param_groups")

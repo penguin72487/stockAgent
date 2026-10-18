@@ -18,21 +18,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import hashlib
+from io import BytesIO
 import json
 import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 import threading
 import time
 from typing import Any, Iterable
+from types import CodeType
 from zoneinfo import ZoneInfo
 
+import bs4
 from bs4 import BeautifulSoup
 import polars as pl
 import requests
+import soupsieve
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +45,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.common import describe_rate_limit
-from downloader.artifact_io import atomic_write_parquet
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet
 from downloader.download_tw_public_data import (
     _configure_tw_public_rate_limiter,
     _global_tw_public_rate_limiter,
@@ -57,6 +62,48 @@ TPEX_ETF_DIVIDEND_URL = "https://info.tpex.org.tw/api/etfExDiv"
 SCHEMA_VERSION = 5
 PARSER_CONTRACT_VERSION = 4
 ETF_PARSER_CONTRACT_VERSION = 1
+
+
+def _loaded_code_identity(code: CodeType) -> str:
+    """Stable loaded semantics, independent of paths and marshal interning.
+
+    ``marshal.dumps(code)`` differs between source, pyc and __main__ loading.
+    Canonicalize instructions, signatures, exception tables and typed constants
+    recursively; filenames/line tables do not affect parsing. Never read a newer
+    on-disk file to label code this process loaded earlier.
+    """
+    def canonical(value: Any) -> Any:
+        if isinstance(value, CodeType):
+            return ["code", value.co_code.hex(), value.co_exceptiontable.hex(),
+                    value.co_argcount, value.co_posonlyargcount, value.co_kwonlyargcount,
+                    value.co_nlocals, value.co_stacksize, value.co_flags,
+                    value.co_name, value.co_qualname, value.co_names, value.co_varnames,
+                    value.co_freevars, value.co_cellvars, [canonical(c) for c in value.co_consts]]
+        if isinstance(value, (tuple, frozenset)):
+            items = [canonical(item) for item in value]
+            if isinstance(value, frozenset):
+                items.sort(key=lambda item: json.dumps(item, sort_keys=True))
+            return [type(value).__name__, items]
+        if isinstance(value, bytes):
+            return ["bytes", value.hex()]
+        if isinstance(value, float):
+            return ["float", value.hex()]
+        if isinstance(value, complex):
+            return ["complex", value.real.hex(), value.imag.hex()]
+        if value is Ellipsis:
+            return ["ellipsis"]
+        if value is None or isinstance(value, (str, bool, int)):
+            return [type(value).__name__, value]
+        raise TypeError(f"unsupported loaded code constant: {type(value).__name__}")
+    return hashlib.sha256(json.dumps(canonical(code), separators=(",", ":")).encode()).hexdigest()
+
+
+# Fingerprint the code actually executing, not a file another process may edit
+# after import. All local parser helpers/constants belong to this module. A
+# conservative module-wide invalidation is cheap compared with reparsing HTML.
+_LOADED_MODULE_SHA256 = _loaded_code_identity(sys._getframe().f_code)
+_BULK_PARSE_CACHE_VERSION = 1
+_BULK_PARSE_CACHE_MAX_BYTES = 64 << 20
 SYMBOL_PATTERN = re.compile(r"[0-9A-Z]{4,6}")
 DETAIL_BUTTON_PATTERN = re.compile(
     r'DATE1\.value="(?P<date>[0-9]{8})";'
@@ -1134,6 +1181,98 @@ def parse_mops_bulk_dividends(
     return output
 
 
+def _read_regular_cache_bytes(path: Path, *, maximum: int) -> bytes:
+    """Read a bounded owned descriptor; a FIFO/link is never a cache hit."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+            raise ValueError("parsed dividend cache is not a bounded regular file")
+        content = handle.read(maximum + 1)
+        after = os.fstat(handle.fileno())
+    signature = lambda info: (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    )
+    if (len(content) != before.st_size or len(content) > maximum
+            or signature(before) != signature(after)):
+        raise ValueError("parsed dividend cache changed during read")
+    return content
+
+
+def _parse_mops_bulk_dividends_cached(
+    content: bytes, *, key: BulkDividendKey, cache_root: Path
+) -> list[dict[str, Any]]:
+    """Cache only a successful pure parse, never source or recovery acceptance.
+
+    Callers still obtain/verify the complete raw response and official request
+    receipt first. Cross-year collapse, missing-key selection, raw copying and
+    stock-delivery enrichment remain outside this disposable derived cache.
+    Source bytes, key, loaded code or parser dependency changes all invalidate it.
+    """
+    identity = {
+        "cache_version": _BULK_PARSE_CACHE_VERSION,
+        "response_sha256": _sha256_bytes(content),
+        "response_size": len(content),
+        "market": key.market,
+        "roc_year": key.roc_year,
+        "parser_contract_version": PARSER_CONTRACT_VERSION,
+        "loaded_module_sha256": _LOADED_MODULE_SHA256,
+        "python": sys.version,
+        "beautifulsoup": bs4.__version__,
+        "soupsieve": soupsieve.__version__,
+        "polars": pl.__version__,
+    }
+    digest = _sha256_bytes(json.dumps(identity, sort_keys=True).encode())
+    data_path = cache_root / f"{digest}.parquet"
+    receipt_path = cache_root / f"{digest}.json"
+    cache_errors = (OSError, ValueError, TypeError, KeyError, pl.exceptions.PolarsError)
+    try:
+        receipt_bytes = _read_regular_cache_bytes(receipt_path, maximum=65536)
+        receipt = json.loads(receipt_bytes)
+        if not isinstance(receipt, dict) or receipt.get("identity") != identity:
+            raise ValueError("parsed dividend cache identity mismatch")
+        payload = _read_regular_cache_bytes(data_path, maximum=_BULK_PARSE_CACHE_MAX_BYTES)
+        if (receipt.get("bytes") != len(payload)
+                or receipt.get("sha256") != _sha256_bytes(payload)):
+            raise ValueError("parsed dividend cache payload mismatch")
+        frame = pl.read_parquet(BytesIO(payload))
+        schema = [[name, str(dtype)] for name, dtype in frame.schema.items()]
+        if (receipt.get("rows") != frame.height or receipt.get("schema") != schema
+                or receipt_bytes != _read_regular_cache_bytes(receipt_path, maximum=65536)):
+            raise ValueError("parsed dividend cache changed or has an invalid schema")
+        # Fresh dictionaries: later delivery enrichment must not mutate a cache.
+        return frame.to_dicts()
+    except cache_errors:
+        pass
+
+    # Parser failures propagate normally and must never create an empty hit.
+    rows = parse_mops_bulk_dividends(content, key=key)
+    try:
+        frame = pl.DataFrame(rows, infer_schema_length=None, strict=True)
+        # JSON also distinguishes signed zero; reject any serialization that
+        # would coerce an original scalar or lose a field before publishing it.
+        encode = lambda value: json.dumps(value, default=str, allow_nan=False)
+        if encode(frame.to_dicts()) != encode(rows):
+            return rows
+        buffer = BytesIO()
+        frame.write_parquet(buffer, compression="zstd", statistics=True)
+        payload = buffer.getvalue()
+        if len(payload) > _BULK_PARSE_CACHE_MAX_BYTES:
+            return rows
+        receipt = {
+            "identity": identity, "bytes": len(payload),
+            "sha256": _sha256_bytes(payload), "rows": frame.height,
+            "schema": [[name, str(dtype)] for name, dtype in frame.schema.items()],
+        }
+        # Payload before receipt. Interrupted/concurrent publication is a miss;
+        # rebuilding this derivative never needs another upstream request.
+        atomic_write_bytes(data_path, payload)
+        atomic_write_json(receipt_path, receipt, durable=False)
+    except cache_errors:
+        pass  # Optional cache I/O cannot turn a valid disclosure into a failure.
+    return rows
+
+
 def _collapse_bulk_event_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse cross-year revisions without hiding multiple action kinds."""
 
@@ -1396,7 +1535,10 @@ def _fetch_bulk_dividends(
         timeout=args.timeout,
         retries=args.retries,
     )
-    return parse_mops_bulk_dividends(content, key=key)
+    return _parse_mops_bulk_dividends_cached(
+        content, key=key,
+        cache_root=raw_root.parent.parent / "state" / "parsed_corporate_actions" / "bulk_dividends",
+    )
 
 
 def _recover_retained_bulk_rows(
@@ -1457,7 +1599,11 @@ def _recover_retained_bulk_rows(
         canonical = json.dumps(request, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
         if _sha256_bytes(canonical) != item["request_sha256"]:
             raise ValueError("retained corporate-action request hash mismatch")
-        selected = [row for row in _collapse_bulk_event_rows(parse_mops_bulk_dividends(content, key=key))
+        parsed = _parse_mops_bulk_dividends_cached(
+            content, key=key,
+            cache_root=(target_output_dir or output_dir) / "state" / "parsed_corporate_actions" / "bulk_dividends",
+        )
+        selected = [row for row in _collapse_bulk_event_rows(parsed)
                     if (row["date"], row["symbol"]) in remaining]
         if selected:
             if target_output_dir is not None:

@@ -13,7 +13,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from stockagent.control.lakehouse import configuration, guard, sql_text
+from stockagent.control.lakehouse import configuration, guard, sql_text, notify_transport
 from stockagent.control.backup import logical_database_state
 from stockagent.data_sync.backup_auxiliary import CONTROL
 from stockagent.data_sync.immutable_replication import digest
@@ -45,6 +45,8 @@ with (state / 'control-backup-owner.lock').open('a') as owner:
             previous['state']='waiting_encrypted_nas_backup'
             atomic_write_json(previous_path,previous)
         if not ack_path.exists():
+            previous['transport_scan'] = notify_transport(c,
+                control_backup_identity=dispatch['envelope_identity_sha256'])
             previous.update(state='waiting_encrypted_nas_backup', observed_at_utc=datetime.now(timezone.utc).isoformat())
             atomic_write_json(previous_path, previous)
             print(json.dumps({'state':previous['state'],'delivery_identity_sha256':dispatch['envelope_identity_sha256']}))
@@ -105,8 +107,6 @@ with (state / 'control-backup-owner.lock').open('a') as owner:
     atomic_public(physical/'tools/dispatch'/(envelope['identity_sha256']+'.json'),dispatch)
     result['state']='waiting_encrypted_nas_backup'
     atomic_write_json(previous_path,result)
-    from scripts.configure_artifact_ingress_syncthing import credentials,request
-    base,key=credentials()
-    for sub in ('tools/dispatch',target.name):
-        request(base,key,'/rest/db/scan',{'folder':'stockagent-backup-ingress-lab203','sub':sub},method='POST',timeout=30)
+    result['transport_scan'] = notify_transport(c, control_backup_identity=envelope['identity_sha256'])
+    atomic_write_json(previous_path,result)
     print(json.dumps({'state':result['state'],'delivery_identity_sha256':envelope['identity_sha256'],'complete_files':len(files)+2}))

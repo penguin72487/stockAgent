@@ -25,9 +25,9 @@ fi
 command -v timeout >/dev/null || { echo "[finlab] GNU timeout is required" >&2; exit 2; }
 finlab_policy_settings="$(run_fintech_python "$finlab_repo_root/scripts/finlab_refresh_policy.py")"
 finlab_policy_fields="$(run_fintech_python -c \
-  'import json,sys; p=json.loads(sys.argv[1]); print(p["minute_partitions_per_pass"], p["maximum_intraday_passes"], int(p["catalog_current"]), p["history_floor_mb"], p["general_batch_size"], p["processing_threads"])' \
+  'import json,sys; p=json.loads(sys.argv[1]); print(p["minute_partitions_per_pass"], p["maximum_intraday_passes"], int(p["catalog_current"]), p["history_floor_mb"], p["general_batch_size"], p["processing_threads"], p["tick_partitions_per_pass"])' \
   "$finlab_policy_settings")"
-read -r finlab_minute_default_limit finlab_max_intraday_passes finlab_catalog_current finlab_default_history_floor finlab_general_default_limit finlab_processing_threads <<< "$finlab_policy_fields"
+read -r finlab_minute_default_limit finlab_max_intraday_passes finlab_catalog_current finlab_default_history_floor finlab_general_default_limit finlab_processing_threads finlab_tick_default_limit <<< "$finlab_policy_fields"
 # Parallelism belongs to stock/range workers, not workers × all host cores.
 # These variables affect this collector's children only, never other services.
 export POLARS_MAX_THREADS="$finlab_processing_threads"
@@ -154,7 +154,7 @@ fi
 # This avoids repeated ~million-row table work during a long quota backfill.
 if [[ -f "$finlab_repo_root/artifacts/research_features/tw_public_research_all_2014_v3.parquet" ]]; then
   if run_fintech_python "$finlab_repo_root/scripts/finlab_release_gate.py"; then
-    run_fintech_python "$finlab_repo_root/scripts/build_finlab_research_overlay.py"
+    run_fintech_python "$finlab_repo_root/scripts/build_finlab_research_overlay.py" --refresh-canonical-base
     # Stage rechecks every source SHA-256; catalog publication requires the
     # resulting freshness receipt. Raw data_finlab stays publish:false.
     if [[ "${FINLAB_PRIVATE_RESEARCH_PUBLISH:-1}" == "1" ]]; then
@@ -233,9 +233,13 @@ if [[ "$finlab_state" == "pass_complete" ]]; then
         echo "[finlab] continuing minute pass under the same account owner ($finlab_intraday_pass/$finlab_max_intraday_passes)"
       done
       if [[ "$finlab_minute_succeeded" == "1" && "$finlab_minute_cleared" == "true" ]]; then
+        # Amortize SDK/pool/index startup and the timer's idle gap across useful
+        # stock-days. This is a work quantum, never 1,024 in-flight objects:
+        # the existing bounded pool, per-dispatch quota and minute/general
+        # preemption, disk guard and 1,140-second watchdog remain unchanged.
         if ! timeout --signal=TERM --kill-after=10s 1200s \
             "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
-              --kind tw_tick --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-256}" \
+              --kind tw_tick --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-$finlab_tick_default_limit}" \
               --sync-lock-fd 9 --max-run-seconds 1140 --reserve-mb "$finlab_tick_reserve_mb"; then
           echo "[finlab] residual Tick pass incomplete; next invocation starts with minutes" >&2
         fi

@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -21,6 +22,36 @@ from typing import Any, Mapping
 
 
 RUNTIME_IDENTITY_VERSION = 1
+
+
+def enrolled_wsl_distribution(root: Path, *, environ: Mapping[str, str] | None = None) -> str:
+    """Resolve missing unattended WSL identity from the existing node enrollment.
+
+    systemd does not inherit login's WSL_DISTRO_NAME. Never choose the Windows
+    default distro or guess from uname; the downstream native capacity probe
+    still verifies the named distribution's registered VHDX backing volume.
+    """
+    environment = os.environ if environ is None else environ
+    name = environment.get("WSL_DISTRO_NAME")
+    if not name:
+        root = Path(root).resolve()
+        path = root / "configs/training_rescue.json"
+        if path.is_symlink() or path.resolve().parent != root / "configs":
+            raise ValueError("node WSL enrollment path differs")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o022 or info.st_size > 1_000_000):
+                raise ValueError("node WSL enrollment ownership/mode differs")
+            value = json.load(handle)
+        if (not isinstance(value, dict) or value.get("contract") != "stockagent.training_rescue.v1"
+                or value.get("schema_version") != 1):
+            raise ValueError("node WSL enrollment contract differs")
+        name = value.get("windows_distribution")
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", name) is None:
+        raise ValueError("node WSL enrollment is missing or invalid")
+    return name
 
 
 def identity_sha256(value: Any) -> str:

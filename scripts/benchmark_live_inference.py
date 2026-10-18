@@ -155,12 +155,41 @@ def require_equal_forward_outputs(control, candidate, path: str = "output") -> N
         raise RuntimeError(f"{path}: output value differs from forward control")
 
 
-def forward_control_wrapper(control_path: Path, evidence: list):
+def require_equal_metadata_only_candle_outputs(control, candidate, fields):
+    """Only declared diagnostic values may be None; every other byte is exact."""
+    if (not isinstance(control, tuple) or len(control) != 3
+            or not isinstance(control[2], dict) or not fields
+            or not set(fields).issubset(control[2])):
+        raise RuntimeError("metadata-only candle oracle requires a complete tuple/field inventory")
+    expected = (*control[:2], {key: None if key in fields else value
+                              for key, value in control[2].items()})
+    require_equal_forward_outputs(expected, candidate)
+
+
+def measured_model_call(compute):
+    """Bounded oracle telemetry, separate from production end-to-end timing."""
+    cuda = torch.cuda.is_initialized()
+    if cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline = torch.cuda.memory_allocated()
+    start = time.perf_counter()
+    value = compute()
+    if cuda:
+        torch.cuda.synchronize()
+    return value, {"wall_seconds": time.perf_counter() - start,
+                   "peak_allocated_bytes": torch.cuda.max_memory_allocated() if cuda else None,
+                   "incremental_peak_bytes": torch.cuda.max_memory_allocated() - baseline if cuda else None}
+
+
+def forward_control_wrapper(control_path: Path, evidence: list, *, diagnostic_pairs: int = 0):
     """Qualify one new-code candidate against a verified old-generation tensor.
 
-    Only the code component may differ. The old payload remains labelled by
-    its original identity. Never install the candidate into the control root
-    or substitute the old tensor for a new model forward.
+    Only code and the explicitly versioned projection/diagnostic policies may
+    differ. Metadata-only candidates additionally compute the new DEFAULT full
+    model as an independent oracle, then compare every non-omitted output and
+    the complete signal projection. Oracle work is reported separately; it is
+    not a production model call or a production first-miss latency measurement.
     """
     with control_path.open("rb") as handle:
         raw = handle.read(1024**2 + 1)
@@ -182,7 +211,18 @@ def forward_control_wrapper(control_path: Path, evidence: list):
         identity = json.loads(json.dumps(identity, sort_keys=True, allow_nan=False))
         differences = sorted(key for key in identity.keys() | control["identity"].keys()
                              if identity.get(key) != control["identity"].get(key))
-        changed_inputs = sorted(set(differences) - {"code"})
+        projection_changed = (
+            identity.get("output_profile") == signal_engine._COMPLETED_SIGNAL_PROJECTION
+            and "output_profile" not in control["identity"])
+        allowed = {"code", "output_profile"} if projection_changed else {"code"}
+        candle_policy_changed = (
+            identity.get("candle_aux_policy") == signal_engine._COMPLETED_CANDLE_AUX_POLICY
+            and "candle_aux_policy" not in control["identity"])
+        if candle_policy_changed:
+            if not projection_changed:
+                raise RuntimeError("metadata-only qualification requires the original full model control")
+            allowed.add("candle_aux_policy")
+        changed_inputs = sorted(set(differences) - allowed)
         if changed_inputs:
             raise RuntimeError("forward control has different canonical inputs: " + ", ".join(changed_inputs))
         if validate_before_commit is None:
@@ -196,23 +236,105 @@ def forward_control_wrapper(control_path: Path, evidence: list):
             with control_path.open("rb") as handle:
                 if handle.read(1024**2 + 1) != raw:
                     raise RuntimeError("forward control receipt changed during verification")
+        expected = signal_engine._completed_signal_projection(value) if projection_changed else value
         model_calls = 0
+        full_model_checks = 0
+        default_model_checks = 0
+        candle_fields = ()
+        model_timings = {}
 
         def verified_compute():
-            nonlocal model_calls
+            nonlocal model_calls, full_model_checks, default_model_checks, candle_fields
             model_calls += 1
-            computed = compute()
-            require_equal_forward_outputs(value, computed)
+            if projection_changed:
+                project = signal_engine._completed_signal_projection
+                call_model = signal_engine.call_model
+
+                def verify_model(model, *args, **kwargs):
+                    nonlocal default_model_checks, candle_fields
+                    if kwargs.get("materialize_candle_aux") is not False:
+                        raise RuntimeError("metadata-only candidate did not request diagnostic omission")
+                    from stockagent.training.runtime import unwrap_model
+                    target = unwrap_model(model)
+                    inventory = getattr(target, "candle_diagnostic_aux_fields", None)
+                    if not callable(inventory):
+                        raise RuntimeError("metadata-only candidate has no explicit diagnostic inventory")
+                    candle_fields = inventory()
+                    full, model_timings["full_default"] = measured_model_call(lambda:
+                        call_model(model, *args, **{**kwargs, "materialize_candle_aux": True}))
+                    require_equal_forward_outputs(value, full)
+                    default_model_checks += 1
+                    del full
+                    lean, model_timings["metadata_only"] = measured_model_call(lambda:
+                        call_model(model, *args, **kwargs))
+                    require_equal_metadata_only_candle_outputs(value, lean, candle_fields)
+                    paired = []
+                    for pair in range(diagnostic_pairs):
+                        # AB/BA avoids crediting only the second, warmed path.
+                        order = (True, False) if pair % 2 == 0 else (False, True)
+                        for materialize in order:
+                            sample, timing = measured_model_call(lambda:
+                                call_model(model, *args,
+                                           **{**kwargs, "materialize_candle_aux": materialize}))
+                            if materialize:
+                                require_equal_forward_outputs(value, sample)
+                            else:
+                                require_equal_metadata_only_candle_outputs(value, sample, candle_fields)
+                            paired.append({"pair": pair,
+                                           "mode": "full_default" if materialize else "metadata_only",
+                                           **timing})
+                            del sample
+                    model_timings["balanced_pairs"] = paired
+                    return lean
+
+                def verify_then_project(full_output):
+                    nonlocal full_model_checks
+                    if candle_policy_changed:
+                        require_equal_metadata_only_candle_outputs(value, full_output, candle_fields)
+                    else:
+                        require_equal_forward_outputs(value, full_output)
+                    full_model_checks += 1
+                    return project(full_output)
+
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(signal_engine, "_completed_signal_projection", verify_then_project))
+                    if candle_policy_changed:
+                        stack.enter_context(patch.object(signal_engine, "call_model", verify_model))
+                    computed = compute()
+                if full_model_checks != 1:
+                    raise RuntimeError("projection bypassed its complete new-model output oracle")
+                if candle_policy_changed and default_model_checks != 1:
+                    raise RuntimeError("metadata-only projection bypassed its default full-model oracle")
+            else:
+                computed = compute()
+            require_equal_forward_outputs(expected, computed)
             return computed
 
         candidate, receipt = original(root, identity, verified_compute,
                                       validate_before_commit=validate_before_commit)
-        require_equal_forward_outputs(value, candidate)
+        require_equal_forward_outputs(expected, candidate)
         evidence.append({"control_receipt": str(control_path), "control_key": control_key,
                          "control_receipt_sha256": hashlib.sha256(raw).hexdigest(),
                          "control_payload_sha256": control["payload_sha256"],
                          "candidate_key": receipt["key"], "different_components": differences,
-                         "whole_output_bitwise_equal": True, "model_calls": model_calls})
+                         "whole_output_bitwise_equal": not projection_changed,
+                         "model_calls": model_calls,
+                         **({"projection_contract": signal_engine._COMPLETED_SIGNAL_PROJECTION,
+                             "complete_signal_projection_bitwise_equal": True,
+                             "full_model_output_bitwise_equal":
+                                 True if full_model_checks and not candle_policy_changed else None}
+                            if projection_changed else {})})
+        if candle_policy_changed:
+            evidence[-1].update(
+                candle_aux_policy=signal_engine._COMPLETED_CANDLE_AUX_POLICY,
+                oracle_model_calls=default_model_checks,
+                full_default_model_output_bitwise_equal=True if default_model_checks else None,
+                non_candle_output_bitwise_equal=True if full_model_checks else None,
+                omitted_candle_fields=list(candle_fields),
+                model_timings=model_timings,
+                diagnostic_benchmark_model_calls=2 * diagnostic_pairs if default_model_checks else 0,
+                first_sample_includes_additional_full_model_oracle=bool(default_model_checks),
+            )
         return candidate, receipt
     return compare
 
@@ -239,6 +361,8 @@ def main() -> None:
                         help="Observe exact canonical CPU input identity; forbid model/CUDA/HTTP")
     parser.add_argument("--forward-control", type=Path,
                         help="Verify every tensor against an existing receipt; only code may differ")
+    parser.add_argument("--candle-aux-pairs", type=int, default=0,
+                        help="Additional balanced full/metadata-only model pairs; not production timing")
     args = parser.parse_args()
     if args.repeats < 1 or (args.cpu_threads is not None and args.cpu_threads < 1):
         parser.error("repeats and cpu-threads must be positive")
@@ -254,6 +378,10 @@ def main() -> None:
             parser.error("identity observation is not a forward benchmark or output comparison")
     if args.forward_control and not args.completed_session_cache:
         parser.error("forward-control requires --completed-session-cache")
+    if args.candle_aux_pairs < 0 or args.candle_aux_pairs > 10:
+        parser.error("candle-aux-pairs must be between 0 and 10")
+    if args.candle_aux_pairs and (not args.forward_control or args.cache_hit_only):
+        parser.error("candle-aux-pairs requires a new-model forward-control benchmark")
     cfg = load_market_config(args.market_config)
     config_path = args.config or cfg.config_path
     config = load_config(config_path)
@@ -286,9 +414,16 @@ def main() -> None:
     expected = (json.loads(args.compare_to.read_text())["output_sha256"]
                 if args.compare_to else None)
     with ExitStack() as stack:
+        import requests
+
+        # Guard the transport too: enumerating today's quote fetchers is not
+        # proof that a future input/helper cannot unexpectedly issue HTTP.
+        stack.enter_context(patch.object(requests.sessions.Session, "request",
+            side_effect=AssertionError("offline inference benchmark forbids network")))
         if args.forward_control:
             stack.enter_context(patch.object(forward_cache, "cached_forward",
-                forward_control_wrapper(args.forward_control, forward_controls)))
+                forward_control_wrapper(args.forward_control, forward_controls,
+                                        diagnostic_pairs=args.candle_aux_pairs)))
         if args.cache_hit_only:
             if torch.cuda.is_initialized():
                 raise RuntimeError("cache-hit-only must start without initialized CUDA")
@@ -401,7 +536,8 @@ def main() -> None:
         "factorized_host_cache_bytes": config.data.factorized_host_cache_bytes,
         "factorized_manifest_sha256": (file_sha256(Path(config.data.factorized_feature_manifest))
             if config.data.factorized_feature_manifest else None),
-        "network_requests": 0, "production_writes": False,
+        "network_requests": 0, "network_guard": "requests_session_and_quote_fetchers",
+        "production_writes": False,
         "completed_session_cache": args.completed_session_cache,
         "cache_root": str(args.cache_root) if args.cache_root else None,
         "cache_hit_only": args.cache_hit_only,

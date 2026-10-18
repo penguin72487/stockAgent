@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import run_discord_artifact_maintenance as runner
+from stockagent.live.market_config import LiveMarketConfig
 
 
 @pytest.fixture
@@ -27,7 +28,7 @@ def stale(tmp_path, monkeypatch):
                                     "contract": "factorized_paper_projection_lag1_v1",
                                     "decision_session": "2020-03-03"}}
     path.write_text(json.dumps(manifest))
-    cfg = SimpleNamespace(market="factorized", completed_session_command=(
+    cfg = LiveMarketConfig(market="factorized", label="factorized", config_path="", completed_session_command=(
         "scripts/update_tw_day_trade_factorized_live.py", "--phase", "completed"))
     return cfg, completed, path, manifest
 
@@ -105,6 +106,35 @@ def test_current_projection_has_no_refresh_request(stale):
     assert runner._stale_factorized_projection_request() is None
 
 
+def test_current_tail_still_requests_the_selected_formal_history_scope(stale, monkeypatch):
+    from stockagent import config as config_module
+
+    _cfg, _completed, path, manifest = stale
+    manifest["dates"].append("2020-03-03")
+    manifest["paper_inference"]["source_identity"] = {"start_date": "2020-03-02"}
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(config_module, "load_config", lambda _: SimpleNamespace(
+        data=SimpleNamespace(panel_start_date="2014-01-06")))
+    # A metadata-only retry probe needs no config/model import.
+    assert runner._stale_factorized_projection_request() is None
+    hint = runner._stale_factorized_projection_request(config_path="selected.yaml")
+    assert hint["reason"] == "formal_history_scope_missing"
+    assert hint["required_start_date"] == "2014-01-06"
+    assert hint["projection_source_start"] == "2020-03-02"
+
+
+def test_requested_non_session_start_does_not_cause_endless_refresh(stale, monkeypatch):
+    from stockagent import config as config_module
+
+    _cfg, _completed, path, manifest = stale
+    manifest["dates"].append("2020-03-03")
+    manifest["paper_inference"]["source_identity"] = {"start_date": "2020-03-01"}
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(config_module, "load_config", lambda _: SimpleNamespace(
+        data=SimpleNamespace(panel_start_date="2020-03-01")))
+    assert runner._stale_factorized_projection_request(config_path="selected.yaml") is None
+
+
 def test_future_completed_clock_is_not_accepted(stale):
     _cfg, completed, _path, _manifest = stale
     completed.write_text(json.dumps({"status": "ok", "expected_date": "2999-01-01",
@@ -151,7 +181,9 @@ def test_source_receipt_and_real_calendar_are_both_required_after_recovery(stale
     calls = []
 
     def command(got, *, bypass_cache):
-        assert got is cfg and bypass_cache is True
+        assert got is not cfg and bypass_cache is True
+        assert got.completed_session_command == cfg.completed_session_command
+        assert got.completed_session_timeout_seconds == runner.FACTORIZED_SOURCE_RECOVERY_SECONDS
         calls.append("configured_canonical_updater")
         source_receipt.write_text('{"status":"verified"}')
         if refresh:
